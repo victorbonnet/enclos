@@ -8,3 +8,6 @@ license = "MIT"
 repository = "https://github.com/victorbonnet/enclos"
 
 [dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
