@@ -8,5 +8,6 @@ The first backend is Seatbelt on macOS: enclos compiles the policy into a `.sb` 
 
 ## Consequences
 
-- A compiled Seatbelt policy is fixed for the life of the process. File, program and resource changes need a restart; network changes are live because the proxy enforces them.
+- A compiled Seatbelt policy is fixed for the life of the process. File, program and resource changes need a restart, which enclos asks for; if the user declines, the change stays pending ([0018](0018-immutable-policy-snapshots.md)). Network changes are live because the proxy enforces them.
 - CPU and memory limits are only partly enforced (`ulimit`, `taskpolicy`).
+- Delegation to host services must be blocked separately, whatever the baseline ([0016](0016-seatbelt-blocks-host-service-delegation.md)).
