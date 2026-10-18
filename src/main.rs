@@ -35,6 +35,11 @@ enum Command {
     Audit(AuditArgs),
     /// Show or change a sandbox's policy.
     Policy(cli::policy::PolicyArgs),
+    /// A sandbox's network log and refused destinations.
+    Net(cli::net::NetArgs),
+    /// Run a sandbox's egress proxy; started by enclos itself.
+    #[command(hide = true)]
+    Proxy(cli::proxy::ProxyArgs),
 }
 
 #[derive(Args)]
@@ -93,6 +98,8 @@ fn run(cli: Cli) -> Result<u8> {
             ..
         }) => Ok(print_verify(&engine.verify_audit()?)),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
+        Command::Net(args) => cli::net::run(&engine, args),
+        Command::Proxy(args) => cli::proxy::run(&engine, args),
     }
 }
 

@@ -19,6 +19,12 @@ pub enum Error {
     NoSuchSandbox { name: String },
     #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
     NoPolicy { sandbox: String },
+    #[error("the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}")]
+    ProxyListen {
+        sandbox: String,
+        addr: String,
+        source: std::io::Error,
+    },
     /// The policy does not allow the command; see design principle 6.
     #[error("refused by policy: {reason}")]
     Refused { reason: String },
@@ -49,7 +55,8 @@ impl Error {
             | Error::Audit(_)
             | Error::Policy(_)
             | Error::NoSuchSandbox { .. }
-            | Error::NoPolicy { .. } => exit::ERROR,
+            | Error::NoPolicy { .. }
+            | Error::ProxyListen { .. } => exit::ERROR,
         }
     }
 }

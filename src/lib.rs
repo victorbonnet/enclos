@@ -12,4 +12,5 @@ pub mod layout;
 pub mod model;
 pub mod net;
 pub mod policy;
+pub mod proxy;
 pub mod state;

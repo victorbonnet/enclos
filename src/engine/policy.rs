@@ -240,15 +240,6 @@ impl Engine {
     fn adapter_layer(&self, _name: &SandboxName) -> Option<AdapterLayer> {
         None
     }
-
-    fn require_sandbox(&self, name: &SandboxName) -> Result<()> {
-        match self.state.get(name)? {
-            Some(_) => Ok(()),
-            None => Err(Error::NoSuchSandbox {
-                name: name.to_string(),
-            }),
-        }
-    }
 }
 
 fn needs_confirmation(entry: &str, also: &[String]) -> Error {

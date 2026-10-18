@@ -178,3 +178,66 @@ fn policy_versions_append_and_identical_snapshots_are_stored_once() {
     store.remove(&lock, &name).unwrap();
     assert!(store.policy_history(&name).unwrap().is_empty());
 }
+
+#[test]
+fn the_network_log_filters_by_agent_and_time_and_groups_denials() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    use crate::state::NetLogStore;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let event = |at: &str, agent: &str, host: &str, verdict, reason| NetEvent {
+        at: at.parse().unwrap(),
+        sandbox: name.clone(),
+        agent: Some(agent.into()),
+        host: host.into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict,
+        reason,
+        bytes_up: 1,
+        bytes_down: 2,
+        duration_ms: 3,
+    };
+    // Whole seconds and milliseconds mixed: the order must still be by time.
+    for e in [
+        event(
+            "2026-01-01T10:00:05Z",
+            "main",
+            "api.example.com",
+            Verdict::Allowed,
+            None,
+        ),
+        event(
+            "2026-01-01T10:00:05.500Z",
+            "main",
+            "evil.example.com",
+            Verdict::Denied,
+            Some(Reason::NotAllowed),
+        ),
+        event(
+            "2026-01-01T10:00:06Z",
+            "writer",
+            "evil.example.com",
+            Verdict::Denied,
+            Some(Reason::NotAllowed),
+        ),
+    ] {
+        store.record(&e).unwrap();
+    }
+    assert_eq!(store.events(&name, None, None).unwrap().len(), 3);
+    assert_eq!(store.events(&name, Some("writer"), None).unwrap().len(), 1);
+    let since = "2026-01-01T10:00:05.200Z".parse().unwrap();
+    assert_eq!(store.events(&name, None, Some(since)).unwrap().len(), 2);
+
+    let denied = store.denied(&name).unwrap();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        (denied[0].host.as_str(), denied[0].count),
+        ("evil.example.com", 2)
+    );
+    assert_eq!(denied[0].first, "2026-01-01T10:00:05.500Z".parse().unwrap());
+}

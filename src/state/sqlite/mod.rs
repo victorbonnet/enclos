@@ -1,6 +1,7 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod netlog;
 mod policy;
 mod schema;
 #[cfg(test)]
@@ -14,8 +15,10 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
-use super::{Migration, Result, StateError, StateLock, StateStore};
+use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore};
+use crate::model::Timestamp;
 use crate::model::audit::Actor;
+use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -116,7 +119,7 @@ impl SqliteStateStore {
         }
     }
 
-    fn record(&self, row: &Row<'_>) -> Result<SandboxRecord> {
+    fn sandbox_row(&self, row: &Row<'_>) -> Result<SandboxRecord> {
         let corrupt = |detail: String| StateError::Corrupt {
             path: self.db.clone(),
             detail,
@@ -244,7 +247,7 @@ impl StateStore for SqliteStateStore {
             .query(params![name.as_str()])
             .map_err(self.sqlite_err())?;
         let row = rows.next().map_err(self.sqlite_err())?;
-        row.map(|row| self.record(row)).transpose()
+        row.map(|row| self.sandbox_row(row)).transpose()
     }
 
     fn list(&self) -> Result<Vec<SandboxRecord>> {
@@ -258,7 +261,7 @@ impl StateStore for SqliteStateStore {
         let mut rows = stmt.query([]).map_err(self.sqlite_err())?;
         let mut records = Vec::new();
         while let Some(row) = rows.next().map_err(self.sqlite_err())? {
-            records.push(self.record(row)?);
+            records.push(self.sandbox_row(row)?);
         }
         Ok(records)
     }
@@ -314,5 +317,27 @@ impl StateStore for SqliteStateStore {
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>> {
         let conn = self.open()?;
         policy::history(&conn, name).map_err(|e| self.read_err(e))
+    }
+}
+
+impl NetLogStore for SqliteStateStore {
+    fn record(&self, event: &NetEvent) -> Result<()> {
+        let conn = self.open()?;
+        netlog::record(&conn, event).map_err(self.sqlite_err())
+    }
+
+    fn events(
+        &self,
+        sandbox: &SandboxName,
+        agent: Option<&str>,
+        since: Option<Timestamp>,
+    ) -> Result<Vec<NetEvent>> {
+        let conn = self.open()?;
+        netlog::events(&conn, sandbox, agent, since).map_err(|e| self.read_err(e))
+    }
+
+    fn denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        let conn = self.open()?;
+        netlog::denied(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 }

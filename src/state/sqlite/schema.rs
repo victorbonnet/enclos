@@ -31,6 +31,23 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (sandbox, version)
     ) STRICT;
     ALTER TABLE sandboxes ADD COLUMN active_version INTEGER;",
+    // 3: the network log, one row per connection the proxy handled
+    "CREATE TABLE net_events (
+        id          INTEGER PRIMARY KEY,
+        at          TEXT NOT NULL,
+        sandbox     TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        agent     TEXT,
+        host        TEXT NOT NULL,
+        port        INTEGER NOT NULL,
+        method      TEXT NOT NULL,
+        address     TEXT,
+        verdict     TEXT NOT NULL,
+        reason      TEXT,
+        bytes_up    INTEGER NOT NULL,
+        bytes_down  INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX net_events_by_sandbox ON net_events (sandbox, at);",
 ];
 
 /// The schema version this enclos reads and writes.
