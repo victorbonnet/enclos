@@ -1,6 +1,7 @@
 //! Typed models that cross component boundaries (design principle 5).
 
 pub mod audit;
+pub mod net;
 pub mod plan;
 pub mod policy;
 pub mod sandbox;

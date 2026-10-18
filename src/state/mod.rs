@@ -8,7 +8,9 @@ pub mod sqlite;
 use std::fs::File;
 use std::path::PathBuf;
 
+use crate::model::Timestamp;
 use crate::model::audit::Actor;
+use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 
@@ -49,8 +51,9 @@ impl Migration {
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
-/// Sandbox records, each change made under the state lock.
-pub trait StateStore {
+/// Sandbox records, each change made under the state lock, and the network
+/// log beside them.
+pub trait StateStore: NetLogStore {
     /// Takes the exclusive state lock, waiting a few seconds for another
     /// enclos command to finish.
     fn lock(&self) -> Result<StateLock>;
@@ -76,6 +79,22 @@ pub trait StateStore {
     fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
     /// Every policy version of the sandbox, oldest first.
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>>;
+}
+
+/// The network log (design §6). The proxy appends to it as connections
+/// close, without the state lock: a log row changes no state.
+pub trait NetLogStore {
+    fn record(&self, event: &NetEvent) -> Result<()>;
+    /// The sandbox's connections, oldest first, optionally for one profile
+    /// and from `since` on.
+    fn events(
+        &self,
+        sandbox: &SandboxName,
+        profile: Option<&str>,
+        since: Option<Timestamp>,
+    ) -> Result<Vec<NetEvent>>;
+    /// Each destination the proxy denied for the sandbox, most recent first.
+    fn denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>>;
 }
 
 /// Why the state store could not do what was asked.

@@ -2,6 +2,7 @@
 //! meet (design §9). Reads are not audited. Every write takes the state lock,
 //! opens an audit entry, does the work and closes the entry, also on failure.
 
+mod net;
 mod policy;
 #[cfg(test)]
 mod tests;
@@ -14,12 +15,12 @@ use crate::audit::AuditLog;
 use crate::audit::jsonl::JsonlAuditLog;
 use crate::backend::{self, Backend, Probe};
 use crate::config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::model::audit::{Actor, AuditEntry, AuditFilter, Intent, Outcome, Since, VerifyReport};
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::sandbox::BackendKind;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::state::sqlite::SqliteStateStore;
 use crate::state::{Migration, StateLock, StateStore};
 
@@ -131,6 +132,16 @@ impl Engine {
     pub fn verify_audit(&self) -> Result<VerifyReport> {
         let _lock = self.state.lock()?;
         Ok(self.audit.verify()?)
+    }
+
+    /// Fails with the sandbox's name when it does not exist.
+    fn require_sandbox(&self, name: &SandboxName) -> Result<()> {
+        match self.state.get(name)? {
+            Some(_) => Ok(()),
+            None => Err(Error::NoSuchSandbox {
+                name: name.to_string(),
+            }),
+        }
     }
 
     /// The first registered backend that works on this host.

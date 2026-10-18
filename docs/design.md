@@ -143,7 +143,7 @@ The proxy connects only to addresses that passed, by address. Falling back from 
 
 **Server name check.** For a TLS tunnel, the proxy reads the server name in the client's first, unencrypted message (the ClientHello), without decrypting anything. If it differs from the host the tunnel was opened for, the tunnel is closed with the reason `name-mismatch`. If no name is visible, because it is absent or encrypted (Encrypted Client Hello), the tunnel is allowed, since its host and address were already checked, and the log records that no name was seen. This stops simple attempts to reach another site through an allowed one, not fronting through an encrypted name.
 
-**Unknown destinations.** A destination not on the allowlist is denied at once and logged; nothing is held waiting for an answer. `enclos net denied <sandbox>` lists denied destinations with counts and times, and the user allows what is needed from the host with `enclos policy allow`, which takes effect without a restart. The agent cannot widen its own policy: the proxy listener serves only proxy traffic, its control socket is a protected path, and enclos's state is not writable from the sandbox.
+**Unknown destinations.** A destination not on the allowlist is denied at once and logged; nothing is held waiting for an answer. `enclos net denied <sandbox>` lists denied destinations with counts and times, and the user allows what is needed from the host with `enclos policy allow`, which takes effect without a restart: the proxy reads the sandbox's active policy from `state.db` for each new connection (milestone 1; reloads over its control socket come later). The agent cannot widen its own policy: the proxy listener serves only proxy traffic, its control socket is a protected path, and enclos's state is not writable from the sandbox.
 
 **What the network log shows.** For HTTPS, one record per tunnel: the host and port asked for, the address connected to, the server name seen in the ClientHello (or that none was visible), the verdict and reason, bytes each way, and duration. The proxy does not see the HTTP requests inside an encrypted tunnel, so the log never shows paths, methods or the number of requests made through one tunnel. For plain HTTP, the proxy also records each request's method and host.
 
@@ -423,7 +423,7 @@ src/
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       sessions.rs  stop.rs
   backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, members.rs, probes.rs, denials.rs, base.sb}
-  proxy/           decide.rs  server.rs  control.rs
+  proxy/           decide.rs (pure checks)  request.rs  server.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
   state/           mod.rs (trait)  sqlite/
