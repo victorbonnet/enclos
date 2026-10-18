@@ -5,7 +5,7 @@ enclos creates sandboxes, installs AI agents in them, and keeps a state and an a
 ## Language
 
 **Host**:
-A machine where the enclos CLI runs and keeps its state. Another host is managed by running the CLI there over SSH.
+A machine where the enclos CLI runs and keeps its state. Each host is managed locally, by running enclos on it.
 _Avoid_: machine, node, server
 
 **Sandbox**:

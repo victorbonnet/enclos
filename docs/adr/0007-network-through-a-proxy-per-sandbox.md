@@ -15,6 +15,7 @@ A connection to a destination not on the allowlist is denied at once and logged 
 ## Consequences
 
 - For HTTPS the proxy sees one tunnel per connection: the host and port asked for, the address connected to, bytes and duration. It does not see the individual HTTP requests inside the encrypted tunnel, so the network log never claims to.
+- For TLS tunnels, the proxy compares the server name in the unencrypted ClientHello with the host the tunnel was opened for and closes mismatches, without decrypting anything. A tunnel with no visible name (absent or encrypted) is allowed and logged as such.
 - The proxy controls which destinations the sandbox connects to, not what those destinations do. A remote browser, search service, MCP server or the model provider's own tools can fetch other sites on the agent's behalf, so allowing such a service grants that capability, and the design describes it that way.
 - Exfiltration through an allowed destination is possible and is addressed by a narrow allowlist and the network log.
 - Programs that ignore `HTTPS_PROXY` cannot connect, which is the safe failure.

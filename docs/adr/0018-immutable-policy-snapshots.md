@@ -18,4 +18,4 @@ A snapshot is the fully resolved policy together with the inputs it was resolved
 ## Consequences
 
 - Audit entries and session records reference snapshot hashes, so it is always known which policy a process started under ([0019](0019-sandbox-members-and-effective-policy.md)).
-- Rules that enclos itself always adds (protected paths, host-service blocks) belong to the compiler, not to snapshots, and only restrict. Compiled policies are cached per snapshot and enclos version, so an upgrade recompiles at the next session start; whether stricter enclos-owned rules then apply without asking is an open decision.
+- Rules that enclos itself always adds (protected paths, host-service blocks) belong to the compiler, not to snapshots, and only restrict. Compiled policies are cached per snapshot and enclos version, so an upgrade recompiles at the next session start, and stricter enclos-owned rules apply to new sessions without asking; `enclos doctor` lists what changed. An upgrade never loosens these rules this way.
