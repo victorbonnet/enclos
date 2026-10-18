@@ -99,7 +99,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per runn
 
 **Filesystem defaults** ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are broad, except a sensitive-path deny list. Writes go only to the sandbox home and to workspaces the user grants. The initial deny list on macOS covers `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.config/gh`, shell history files, `~/Library/Keychains`, browser profile folders, `~/Library/Mail`, `~/Library/Messages`, `~/Library/Cookies`, password-manager folders, the host's own agent configuration (`~/.claude`, `~/.codex`, `~/.hermes`), other sandboxes and enclos's protected paths. Policies can add entries; removing a default entry is an explicit, audited change. The agent installs skills, dependencies and tools into its home: `HOME`, `TMPDIR`, caches, Python and Node environments and a `bin/` on `PATH` all point inside it, and programs installed there may run. The shared runtime under `runtimes/` stays read-only. Writes to device files the runtime needs (`/dev/null`, `/dev/tty` and similar) are part of every backend's baseline.
 
-**Protected paths.** Whatever the policy says, every backend denies the sandbox write access anywhere in the enclos data and config folders (`~/.enclos` on macOS; `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos` on Linux) except its own `home/`, and read access to `state.db`, `audit.jsonl`, `config.toml`, the file secret store, the proxies' control sockets and other sandboxes' folders. The compiler adds these rules itself, and `validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains them. `validate` compares paths after resolving symlinks and `..`, so a workspace symlinked into these folders is rejected too. This is also why the agent cannot widen its own policy. See [ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md).
+**Protected paths.** Whatever the policy says, every backend denies the sandbox write access anywhere in the enclos data and config folders (`~/.enclos` on macOS; `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos` on Linux) except its own `home/`, and read access to `state.db`, `audit.jsonl` and its `audit.jsonl.torn-*` files, `config.toml`, the file secret store, the proxies' control sockets and other sandboxes' folders. The compiler adds these rules itself, and `validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains them. `validate` compares paths after resolving symlinks and `..`, so a workspace symlinked into these folders is rejected too. This is also why the agent cannot widen its own policy. See [ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md).
 
 **Host-service delegation** ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). On macOS a sandboxed process can ask a host service to act for it, outside the sandbox. Whatever the Seatbelt baseline, the compiled policy must deny these routes with the Seatbelt operation that actually governs each one (`mach-lookup` for named services, `appleevent-send` for Apple Events, and whatever the prototype shows blocks launchd job submission, which goes through the bootstrap port rather than a named service), with executable denials only as an extra layer. The routes are:
 
@@ -413,7 +413,10 @@ impl Engine {
 ```text
 src/
   main.rs          CLI: parse args into models, call Engine, print the result
+  lib.rs           the core library every client uses
   engine.rs        the API above; the only place components meet
+  error.rs         the engine's typed errors and their exit codes
+  layout.rs        where enclos keeps its files (§11);  config.rs  config.toml
   model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs
   policy/          resolve.rs  snapshot.rs  validate.rs  diff.rs  templates/*.toml
   lifecycle/       sessions.rs  stop.rs
@@ -421,8 +424,8 @@ src/
   proxy/           decide.rs  addrs.rs  server.rs  control.rs
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
-  state/           mod.rs (trait)  sqlite.rs
-  audit/           mod.rs (trait)  jsonl.rs
+  state/           mod.rs (trait)  sqlite/
+  audit/           mod.rs (trait)  jsonl/
   agent/           mod.rs (trait)  hermes.rs  claude_code.rs  codex.rs
 ```
 
@@ -523,7 +526,8 @@ enclos policy allow community mcp.example.org
 ~/.enclos/
   config.toml                  default backend, secret store, UI port, allowed UI actions
   state.db                     SQLite: sandbox records, policy snapshots, sessions and members, network log, denials
-  audit.jsonl                  append-only, one hash-chained line per state-changing command
+  state.lock                   held while a command changes state
+  audit.jsonl                  append-only and hash-chained: one line when a state-changing command starts, one when it ends
   runtimes/<agent>/<version>/  shared, read-only to every sandbox
   templates/                   user templates
   run/<sandbox>/               proxy control sockets
@@ -535,7 +539,7 @@ enclos policy allow community mcp.example.org
     logs/<profile>/
 ```
 
-On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-changing command takes a lock, records its intent, does the work, then records result and new state. A crash leaves an unfinished entry; `enclos state check` compares records with reality (service units, sessions and their members, files, compiled policy).
+On Linux: `config.toml` and `templates/` in `$XDG_CONFIG_HOME/enclos`, everything else in `$XDG_DATA_HOME/enclos`. `ENCLOS_HOME` puts everything in one folder instead, on either system. Every state-changing command takes a lock, records its intent, does the work, then records result and new state. A crash leaves an unfinished entry, which `enclos audit verify` lists as a warning. A crash in the middle of writing a line leaves that line incomplete: `audit verify` warns about it, and the next state-changing command moves it to `audit.jsonl.torn-<line>` and records the move, with the removed bytes' hash, as a `recovered` line in the chain. Any other damage still stops every write until it is repaired. `enclos state check` compares records with reality (service units, sessions and their members, files, compiled policy).
 
 ## 12. Secrets and subscriptions
 
