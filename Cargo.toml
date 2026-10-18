@@ -2,5 +2,9 @@
 name = "enclos"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
+description = "Run AI agents in sandboxes you control, with policy and an audit log"
+license = "MIT"
+repository = "https://github.com/victorbonnet/enclos"
 
 [dependencies]

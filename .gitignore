@@ -25,6 +25,7 @@ rustc-ice-*.txt
 
 # Local secrets, config and logs
 .env*
+!.env.example
 *.local.toml
 .claude/settings.local.json
 .enclos/
