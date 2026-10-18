@@ -7,4 +7,7 @@ clippy:
 test:
     cargo test --all-features
 
-ci: fmt clippy test
+deny:
+    cargo deny check
+
+ci: fmt clippy test deny
