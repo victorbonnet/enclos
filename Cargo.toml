@@ -11,3 +11,6 @@ repository = "https://github.com/victorbonnet/enclos"
 
 [lints.rust]
 unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
