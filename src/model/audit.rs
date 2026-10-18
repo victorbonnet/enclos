@@ -100,6 +100,22 @@ pub struct VerifyReport {
     pub unfinished: Vec<AuditEntry>,
     /// The first place where the chain is broken, if any.
     pub broken: Option<ChainBreak>,
+    /// The size in bytes of an incomplete last line, as a crash while writing
+    /// leaves. It is not a break: the next write moves it aside.
+    pub torn_tail: Option<u64>,
+    /// Incomplete last lines that earlier writes moved aside, oldest first.
+    pub recoveries: Vec<Recovery>,
+}
+
+/// An incomplete last line that a write moved aside, as recorded in the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Recovery {
+    /// The line that records the recovery.
+    pub line: u64,
+    pub at: Timestamp,
+    pub removed_bytes: u64,
+    /// The file the incomplete line was saved to, next to the audit log.
+    pub saved_to: String,
 }
 
 impl VerifyReport {

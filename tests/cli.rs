@@ -257,6 +257,35 @@ fn verify_reports_an_unfinished_entry() {
 }
 
 #[test]
+fn a_crash_mid_write_is_recovered_by_the_next_command() {
+    let home = Home::new();
+    home.init(1);
+    // A line cut short, as when enclos stops while writing it.
+    let audit = home.root.join("audit.jsonl");
+    let mut content = std::fs::read(&audit).unwrap();
+    content.extend_from_slice(b"{\"schema_version\":1,\"seq\":3");
+    std::fs::write(&audit, content).unwrap();
+
+    let out = home.run(&["audit", "verify"]);
+    out.ok();
+    assert!(
+        out.stdout().contains("the last line is incomplete"),
+        "{}",
+        out.stdout()
+    );
+
+    home.run(&["init"]).ok();
+    let out = home.run(&["audit", "verify"]);
+    out.ok();
+    assert!(
+        out.stdout().contains("was moved to audit.jsonl.torn-3"),
+        "{}",
+        out.stdout()
+    );
+    assert!(home.root.join("audit.jsonl.torn-3").exists());
+}
+
+#[test]
 fn commands_before_init_say_to_run_init() {
     let home = Home::new();
     for args in [&["audit"][..], &["audit", "verify"]] {

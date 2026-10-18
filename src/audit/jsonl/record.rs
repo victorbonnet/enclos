@@ -7,7 +7,11 @@
 //! ```text
 //! {"schema_version":1,"seq":1,"prev":"000…","at":"…","kind":"begin","user":"alice","host":"mac","command":"init","hash":"…"}
 //! {"schema_version":1,"seq":2,"prev":"…","at":"…","kind":"finish","entry":1,"result":"ok","message":"…","hash":"…"}
+//! {"schema_version":1,"seq":3,"prev":"…","at":"…","kind":"recovered","removed_bytes":27,"removed_sha256":"…","saved_to":"audit.jsonl.torn-3","hash":"…"}
 //! ```
+//!
+//! A `recovered` line records that a write found an incomplete last line, as
+//! a crash while writing leaves, and moved it to `saved_to` first.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,6 +52,13 @@ pub enum Body {
         entry: u64,
         result: ResultField,
         message: String,
+    },
+    /// An incomplete last line, left by a crash while writing it, that was
+    /// moved to `saved_to` before this line was written.
+    Recovered {
+        removed_bytes: u64,
+        removed_sha256: String,
+        saved_to: String,
     },
 }
 

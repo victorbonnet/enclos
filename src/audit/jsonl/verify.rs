@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::record::{Body, Decoded, GENESIS, Record, decode};
 use crate::model::audit::{
-    Actor, AuditEntry, BreakKind, ChainBreak, Finished, Intent, Outcome, VerifyReport,
+    Actor, AuditEntry, BreakKind, ChainBreak, Finished, Intent, Outcome, Recovery, VerifyReport,
 };
 
 /// One line of the file, numbered from 1.
@@ -31,10 +31,12 @@ pub fn split_lines(content: &str) -> Vec<Line<'_>> {
 }
 
 /// Folds records into entries: a `begin` opens one, a `finish` closes it.
+/// `recovered` lines are kept apart; they are not entries.
 #[derive(Default)]
 pub struct Entries {
     open: BTreeMap<u64, AuditEntry>,
     done: Vec<AuditEntry>,
+    recoveries: Vec<Recovery>,
 }
 
 impl Entries {
@@ -76,6 +78,16 @@ impl Entries {
                 });
                 self.done.push(opened);
             }
+            Body::Recovered {
+                removed_bytes,
+                saved_to,
+                ..
+            } => self.recoveries.push(Recovery {
+                line: record.seq,
+                at: record.at,
+                removed_bytes,
+                saved_to,
+            }),
         }
         Ok(())
     }
@@ -95,7 +107,9 @@ impl Entries {
 }
 
 /// Checks every line: complete, unedited, in order, and closing open entries.
-pub fn verify(lines: &[Line<'_>]) -> VerifyReport {
+/// `torn_tail` is the size of an incomplete last line already split off by
+/// the caller; it is reported, not treated as a break.
+pub fn verify(lines: &[Line<'_>], torn_tail: Option<u64>) -> VerifyReport {
     let mut entries = Entries::default();
     let mut opened = 0;
     let mut prev = GENESIS.to_owned();
@@ -129,6 +143,8 @@ pub fn verify(lines: &[Line<'_>]) -> VerifyReport {
         entries: opened,
         unfinished: entries.unfinished(),
         broken,
+        torn_tail,
+        recoveries: entries.recoveries,
     }
 }
 
@@ -163,7 +179,7 @@ mod tests {
 
     #[test]
     fn an_empty_log_is_intact() {
-        let report = verify(&[]);
+        let report = verify(&[], None);
         assert!(report.intact());
         assert_eq!((report.lines, report.entries), (0, 0));
     }

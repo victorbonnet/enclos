@@ -11,7 +11,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-use record::{Body, GENESIS, Record, SCHEMA_VERSION, decode, encode};
+use record::{Body, GENESIS, Record, SCHEMA_VERSION, decode, encode, sha256_hex};
 use verify::{Entries, split_lines};
 
 use super::{AuditError, AuditLog, AuditTicket, Result};
@@ -50,9 +50,17 @@ impl JsonlAuditLog {
         }
     }
 
-    fn read_all(&self) -> Result<String> {
-        let bytes = std::fs::read(&self.path).map_err(|e| self.io_err(e))?;
-        String::from_utf8(bytes).map_err(|_| self.damaged("the file is not valid UTF-8"))
+    /// The complete lines of the file, and the size of an incomplete last
+    /// line if a crash left one. That line is split off before decoding,
+    /// since a crash can also cut a character in half.
+    fn read_all(&self) -> Result<(String, Option<u64>)> {
+        let mut bytes = std::fs::read(&self.path).map_err(|e| self.io_err(e))?;
+        let complete = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let torn = (complete < bytes.len()).then(|| (bytes.len() - complete) as u64);
+        bytes.truncate(complete);
+        let text =
+            String::from_utf8(bytes).map_err(|_| self.damaged("the file is not valid UTF-8"))?;
+        Ok((text, torn))
     }
 
     /// The sequence number and hash of the last line, read from the end of
@@ -63,7 +71,14 @@ impl JsonlAuditLog {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, GENESIS.to_owned())),
             Err(e) => return Err(self.io_err(e)),
         };
-        let Some(last) = last_line(&mut file).map_err(|e| self.io_err(e))? else {
+        let end = file.metadata().map_err(|e| self.io_err(e))?.len();
+        self.tail_before(&mut file, end)
+    }
+
+    /// The sequence number and hash of the last line ending at or before
+    /// byte `end`.
+    fn tail_before(&self, file: &mut File, end: u64) -> Result<(u64, String)> {
+        let Some(last) = last_line(file, end).map_err(|e| self.io_err(e))? else {
             return Ok((0, GENESIS.to_owned()));
         };
         let text = last
@@ -76,8 +91,63 @@ impl JsonlAuditLog {
         Ok((decoded.record.seq, decoded.hash))
     }
 
-    /// Appends one record after the current last line, and flushes it to disk.
+    /// If a crash left an incomplete last line, moves it to
+    /// `audit.jsonl.torn-<seq>` and records that in the log. Only that damage
+    /// is recovered: if the line before it is not intact either, nothing is
+    /// moved and the log stays `Damaged`. Called under the state lock, so the
+    /// incomplete line cannot be a write still in progress.
+    fn recover_torn_tail(&self) -> Result<()> {
+        let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(self.io_err(e)),
+        };
+        let end = file.metadata().map_err(|e| self.io_err(e))?.len();
+        let Some(last) = last_line(&mut file, end).map_err(|e| self.io_err(e))? else {
+            return Ok(());
+        };
+        if last.ends_with(b"\n") {
+            return Ok(());
+        }
+        let keep = end - last.len() as u64;
+        let (seq, _) = self.tail_before(&mut file, keep)?;
+        let saved_to = format!("{}.torn-{}", self.file_name(), seq + 1);
+        let saved_path = self.path.with_file_name(&saved_to);
+        let mut saved = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&saved_path)
+            .map_err(|e| self.io_err(e))?;
+        saved
+            .write_all(&last)
+            .and_then(|()| saved.sync_all())
+            .and_then(|()| file.set_len(keep))
+            .and_then(|()| file.sync_all())
+            .map_err(|e| self.io_err(e))?;
+        self.write_record(Body::Recovered {
+            removed_bytes: last.len() as u64,
+            removed_sha256: sha256_hex(&last),
+            saved_to,
+        })?;
+        Ok(())
+    }
+
+    fn file_name(&self) -> String {
+        self.path.file_name().map_or_else(
+            || "audit.jsonl".into(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// Appends one record, first recovering an incomplete last line.
     fn append(&self, body: Body) -> Result<u64> {
+        self.recover_torn_tail()?;
+        self.write_record(body)
+    }
+
+    /// Writes one record after the current last line, and flushes it to disk.
+    fn write_record(&self, body: Body) -> Result<u64> {
         let (last_seq, prev) = self.tail()?;
         let record = Record {
             schema_version: SCHEMA_VERSION,
@@ -101,9 +171,9 @@ impl JsonlAuditLog {
     }
 }
 
-/// Reads the last line of `file`, with its newline if it has one.
-fn last_line(file: &mut File) -> std::io::Result<Option<Vec<u8>>> {
-    let mut end = file.metadata()?.len();
+/// Reads the last line of `file` that ends at or before byte `end`, with its
+/// newline if it has one.
+fn last_line(file: &mut File, mut end: u64) -> std::io::Result<Option<Vec<u8>>> {
     let mut tail: Vec<u8> = Vec::new();
     while end > 0 {
         let start = end.saturating_sub(TAIL_CHUNK);
@@ -143,7 +213,7 @@ impl AuditLog for JsonlAuditLog {
     }
 
     fn entries(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>> {
-        let content = self.read_all()?;
+        let (content, _torn) = self.read_all()?;
         let mut entries = Entries::default();
         for line in split_lines(&content) {
             let unreadable = |problem| self.damaged(format!("line {} {problem}", line.number));
@@ -159,7 +229,7 @@ impl AuditLog for JsonlAuditLog {
     }
 
     fn verify(&self) -> Result<VerifyReport> {
-        let content = self.read_all()?;
-        Ok(verify::verify(&split_lines(&content)))
+        let (content, torn) = self.read_all()?;
+        Ok(verify::verify(&split_lines(&content), torn))
     }
 }

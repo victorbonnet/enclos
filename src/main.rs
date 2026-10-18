@@ -212,5 +212,20 @@ fn print_verify(report: &VerifyReport) -> u8 {
             println!("  line {seq}  {at}  {by}  {command}");
         }
     }
+    if let Some(bytes) = report.torn_tail {
+        println!(
+            "warning: the last line is incomplete ({bytes} bytes), as when enclos stops while writing it. \
+             The next command moves it aside and records that in the log."
+        );
+    }
+    for recovery in &report.recoveries {
+        println!(
+            "note: line {}, {}: an incomplete line of {} bytes was moved to {}.",
+            recovery.line,
+            recovery.at.strftime("%Y-%m-%d %H:%M:%S"),
+            recovery.removed_bytes,
+            recovery.saved_to
+        );
+    }
     exit::OK
 }
