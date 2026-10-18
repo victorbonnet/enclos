@@ -413,7 +413,10 @@ impl Engine {
 ```text
 src/
   main.rs          CLI: parse args into models, call Engine, print the result
+  lib.rs           the core library every client uses
   engine.rs        the API above; the only place components meet
+  error.rs         the engine's typed errors and their exit codes
+  layout.rs        where enclos keeps its files (§11);  config.rs  config.toml
   model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs
   policy/          resolve.rs  snapshot.rs  validate.rs  diff.rs  templates/*.toml
   lifecycle/       sessions.rs  stop.rs
@@ -421,8 +424,8 @@ src/
   proxy/           decide.rs  addrs.rs  server.rs  control.rs
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
-  state/           mod.rs (trait)  sqlite.rs
-  audit/           mod.rs (trait)  jsonl.rs
+  state/           mod.rs (trait)  sqlite/
+  audit/           mod.rs (trait)  jsonl/
   agent/           mod.rs (trait)  hermes.rs  claude_code.rs  codex.rs
 ```
 
@@ -523,7 +526,8 @@ enclos policy allow community mcp.example.org
 ~/.enclos/
   config.toml                  default backend, secret store, UI port, allowed UI actions
   state.db                     SQLite: sandbox records, policy snapshots, sessions and members, network log, denials
-  audit.jsonl                  append-only, one hash-chained line per state-changing command
+  state.lock                   held while a command changes state
+  audit.jsonl                  append-only and hash-chained: one line when a state-changing command starts, one when it ends
   runtimes/<agent>/<version>/  shared, read-only to every sandbox
   templates/                   user templates
   run/<sandbox>/               proxy control sockets
@@ -535,7 +539,7 @@ enclos policy allow community mcp.example.org
     logs/<profile>/
 ```
 
-On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-changing command takes a lock, records its intent, does the work, then records result and new state. A crash leaves an unfinished entry; `enclos state check` compares records with reality (service units, sessions and their members, files, compiled policy).
+On Linux: `config.toml` and `templates/` in `$XDG_CONFIG_HOME/enclos`, everything else in `$XDG_DATA_HOME/enclos`. `ENCLOS_HOME` puts everything in one folder instead, on either system. Every state-changing command takes a lock, records its intent, does the work, then records result and new state. A crash leaves an unfinished entry; `enclos state check` compares records with reality (service units, sessions and their members, files, compiled policy).
 
 ## 12. Secrets and subscriptions
 

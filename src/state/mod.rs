@@ -1,0 +1,100 @@
+//! The state store: sandbox records, behind one interface (ADR 0010).
+//!
+//! Every write takes a [`StateLock`], so writing outside the lock does not
+//! compile. Policy snapshots, sessions and members are added by later issues.
+
+pub mod sqlite;
+
+use std::fs::File;
+use std::path::PathBuf;
+
+use crate::model::sandbox::{SandboxName, SandboxRecord};
+
+/// Proof that this process holds the exclusive state lock. Released on drop.
+///
+/// Only a state store can create one, by taking the lock.
+#[derive(Debug)]
+pub struct StateLock {
+    _file: Option<File>,
+}
+
+impl StateLock {
+    /// Wraps a file on which this process holds an exclusive lock.
+    fn held(file: File) -> Self {
+        StateLock { _file: Some(file) }
+    }
+
+    /// A lock that guards nothing, for unit tests of other components.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        StateLock { _file: None }
+    }
+}
+
+/// A change of the state database schema made by [`StateStore::migrate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Migration {
+    /// The schema version before; 0 when the database was just created.
+    pub from: u32,
+    pub to: u32,
+}
+
+impl Migration {
+    pub fn changed(self) -> bool {
+        self.from != self.to
+    }
+}
+
+pub type Result<T> = std::result::Result<T, StateError>;
+
+/// Sandbox records, each change made under the state lock.
+pub trait StateStore {
+    /// Takes the exclusive state lock, waiting a few seconds for another
+    /// enclos command to finish.
+    fn lock(&self) -> Result<StateLock>;
+    /// Creates the database if needed and applies pending schema migrations.
+    fn migrate(&self, lock: &StateLock) -> Result<Migration>;
+    fn get(&self, name: &SandboxName) -> Result<Option<SandboxRecord>>;
+    fn list(&self) -> Result<Vec<SandboxRecord>>;
+    fn put(&self, lock: &StateLock, rec: &SandboxRecord) -> Result<()>;
+    fn remove(&self, lock: &StateLock, name: &SandboxName) -> Result<()>;
+}
+
+/// Why the state store could not do what was asked.
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    #[error("enclos is not initialized: {path} is missing. Run `enclos init` first")]
+    NotInitialized { path: PathBuf },
+    #[error(
+        "another enclos command is changing state and holds {path}. Try again when it finishes"
+    )]
+    Locked { path: PathBuf },
+    #[error(
+        "{path} uses schema {found}, older than this enclos ({current}). Run `enclos init` to upgrade it"
+    )]
+    OutdatedSchema {
+        path: PathBuf,
+        found: u32,
+        current: u32,
+    },
+    #[error(
+        "{path} uses schema {found}, written by a newer enclos (this one knows {current}). Upgrade enclos"
+    )]
+    NewerSchema {
+        path: PathBuf,
+        found: u32,
+        current: u32,
+    },
+    #[error("{path} holds a value enclos cannot read ({detail}). Restore state.db from a backup")]
+    Corrupt { path: PathBuf, detail: String },
+    #[error("cannot use {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("state database {path}: {source}")]
+    Sqlite {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+}
