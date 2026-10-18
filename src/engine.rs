@@ -2,6 +2,7 @@
 //! meet (design §9). Reads are not audited. Every write takes the state lock,
 //! opens an audit entry, does the work and closes the entry, also on failure.
 
+mod compile;
 mod net;
 mod policy;
 #[cfg(test)]

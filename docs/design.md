@@ -420,7 +420,7 @@ src/
   policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       sessions.rs  stop.rs
-  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, members.rs, probes.rs, denials.rs, base.sb}
+  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, probes.rs, denials.rs}
   proxy/           decide.rs (pure checks)  request.rs  server.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
