@@ -34,6 +34,8 @@ impl Os {
 pub struct Layout {
     data: PathBuf,
     config: PathBuf,
+    /// The user's home folder, which `~` in policies means.
+    user_home: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,13 +54,21 @@ pub enum LayoutError {
 }
 
 impl Layout {
-    /// Everything in one folder.
+    /// Everything in one folder; `~` is the folder that holds it.
     pub fn at(root: impl Into<PathBuf>) -> Layout {
         let root = root.into();
+        let user_home = root.parent().unwrap_or(&root).to_owned();
         Layout {
             data: root.clone(),
             config: root,
+            user_home,
         }
+    }
+
+    /// The same layout, with `~` meaning `home`.
+    pub fn with_user_home(mut self, home: impl Into<PathBuf>) -> Layout {
+        self.user_home = home.into();
+        self
     }
 
     /// The layout for this host and its environment variables.
@@ -74,11 +84,15 @@ impl Layout {
                 .map(PathBuf::from)
         };
         if let Some(root) = set(HOME_VAR) {
-            return absolute(HOME_VAR, root).map(Layout::at);
+            let layout = Layout::at(absolute(HOME_VAR, root)?);
+            return Ok(match set("HOME").filter(|h| h.is_absolute()) {
+                Some(home) => layout.with_user_home(home),
+                None => layout,
+            });
         }
         let home = absolute("HOME", set("HOME").ok_or(LayoutError::NoHome)?)?;
         Ok(match os {
-            Os::MacOs => Layout::at(home.join(".enclos")),
+            Os::MacOs => Layout::at(home.join(".enclos")).with_user_home(home),
             Os::Linux => {
                 // The XDG spec says to ignore relative values.
                 let xdg = |name: &str, default: &str| {
@@ -90,6 +104,7 @@ impl Layout {
                 Layout {
                     data: xdg("XDG_DATA_HOME", ".local/share"),
                     config: xdg("XDG_CONFIG_HOME", ".config"),
+                    user_home: home.clone(),
                 }
             }
         })
@@ -101,6 +116,31 @@ impl Layout {
 
     pub fn config(&self) -> &Path {
         &self.config
+    }
+
+    pub fn user_home(&self) -> &Path {
+        &self.user_home
+    }
+
+    /// The enclos data and config folders: what sandboxes may never write
+    /// outside their own home (ADR 0010).
+    pub fn protected(&self) -> Vec<PathBuf> {
+        self.roots()
+    }
+
+    pub fn sandbox_dir(&self, name: &str) -> PathBuf {
+        self.data.join("sandboxes").join(name)
+    }
+
+    /// The sandbox's home folder: the agent's home and the one place it may
+    /// write by default.
+    pub fn sandbox_home(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("home")
+    }
+
+    /// The sandbox's `policy.toml`: its overrides of the template.
+    pub fn policy_file(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("policy.toml")
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -187,6 +227,38 @@ impl Layout {
             .map_err(io_err)?;
         Ok(true)
     }
+
+    /// Creates a sandbox's folder and its home.
+    pub fn create_sandbox_dirs(&self, name: &str) -> Result<(), LayoutError> {
+        create_dir(&self.sandbox_home(name))
+    }
+
+    pub fn read_policy(&self, name: &str) -> Result<String, LayoutError> {
+        let path = self.policy_file(name);
+        std::fs::read_to_string(&path).map_err(|source| LayoutError::Io { path, source })
+    }
+
+    /// Replaces a sandbox's `policy.toml` in one step: written beside it,
+    /// then renamed over it, so a crash leaves the old or the new file.
+    pub fn write_policy(&self, name: &str, contents: &str) -> Result<(), LayoutError> {
+        let path = self.policy_file(name);
+        let tmp = path.with_extension("toml.new");
+        let io_err = |path: &Path| {
+            let path = path.to_owned();
+            move |source| LayoutError::Io { path, source }
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(io_err(&tmp))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
+    }
 }
 
 fn absolute(var: &'static str, path: PathBuf) -> Result<PathBuf, LayoutError> {
@@ -258,7 +330,7 @@ mod tests {
         for os in [Os::MacOs, Os::Linux] {
             assert_eq!(
                 Layout::resolve(os, env(&vars)).unwrap(),
-                Layout::at("/tmp/e")
+                Layout::at("/tmp/e").with_user_home("/home/alice")
             );
         }
     }

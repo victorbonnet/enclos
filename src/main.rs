@@ -1,6 +1,8 @@
 //! The enclos CLI: parse arguments into models, call the engine, print the
 //! result. Commands follow `enclos <noun> <verb>` (design §10).
 
+mod cli;
+
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -31,6 +33,8 @@ enum Command {
     Init,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),
+    /// Show or change a sandbox's policy.
+    Policy(cli::policy::PolicyArgs),
 }
 
 #[derive(Args)]
@@ -88,6 +92,7 @@ fn run(cli: Cli) -> Result<u8> {
             verb: Some(AuditVerb::Verify),
             ..
         }) => Ok(print_verify(&engine.verify_audit()?)),
+        Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
     }
 }
 
@@ -104,10 +109,10 @@ fn current_actor() -> Actor {
 
 fn print_init(planned: Planned<InitReport>) {
     match planned {
-        Planned::DryRun(Plan { create }) if create.is_empty() => {
+        Planned::DryRun(Plan { create, .. }) if create.is_empty() => {
             println!("Nothing to create: enclos is already initialized.");
         }
-        Planned::DryRun(Plan { create }) => {
+        Planned::DryRun(Plan { create, .. }) => {
             println!("Would create:");
             for path in create {
                 println!("  {}", path.display());

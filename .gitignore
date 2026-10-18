@@ -30,3 +30,6 @@ rustc-ice-*.txt
 .claude/settings.local.json
 .enclos/
 *.log
+
+# Git worktrees that Claude Code agents work in
+.claude/worktrees/

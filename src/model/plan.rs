@@ -35,6 +35,8 @@ pub enum Planned<T> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub create: Vec<PathBuf>,
+    /// Other changes, one sentence each.
+    pub changes: Vec<String>,
 }
 
 #[cfg(test)]

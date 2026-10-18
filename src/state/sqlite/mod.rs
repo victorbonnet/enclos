@@ -1,6 +1,7 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod policy;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -13,6 +14,9 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
 use super::{Migration, Result, StateError, StateLock, StateStore};
+use crate::model::audit::Actor;
+use crate::model::now;
+use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 
 /// How long `lock` waits for another enclos command to release the lock.
@@ -42,6 +46,8 @@ impl SqliteStateStore {
     fn connect(&self, flags: OpenFlags) -> Result<Connection> {
         let conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
         conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(self.sqlite_err())?;
         Ok(conn)
     }
 
@@ -70,6 +76,16 @@ impl SqliteStateStore {
             });
         }
         Ok(conn)
+    }
+
+    fn read_err(&self, e: policy::ReadError) -> StateError {
+        match e {
+            policy::ReadError::Sqlite(source) => self.sqlite_err()(source),
+            policy::ReadError::Corrupt(detail) => StateError::Corrupt {
+                path: self.db.clone(),
+                detail,
+            },
+        }
     }
 
     fn record(&self, row: &Row<'_>) -> Result<SandboxRecord> {
@@ -237,5 +253,27 @@ impl StateStore for SqliteStateStore {
         )
         .map_err(self.sqlite_err())?;
         Ok(())
+    }
+
+    fn save_policy(
+        &self,
+        _lock: &StateLock,
+        name: &SandboxName,
+        snapshot: &PolicySnapshot,
+        by: &Actor,
+        restores: Option<u32>,
+    ) -> Result<PolicyVersion> {
+        let mut conn = self.open()?;
+        policy::save(&mut conn, name, snapshot, by, now(), restores).map_err(self.sqlite_err())
+    }
+
+    fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>> {
+        let conn = self.open()?;
+        policy::active(&conn, name).map_err(|e| self.read_err(e))
+    }
+
+    fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>> {
+        let conn = self.open()?;
+        policy::history(&conn, name).map_err(|e| self.read_err(e))
     }
 }
