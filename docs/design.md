@@ -27,7 +27,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 
 - Create, start, stop, connect to and remove sandboxes from the CLI.
 - Per-sandbox policy for files, network, programs, secrets and resources: edit, diff, roll back, test, with an active and a pending version.
-- Install an agent runtime in a sandbox and run one or more of its profiles there, starting with one Hermes profile in a terminal, then profiles as background services, then several profiles per sandbox.
+- Install an agent runtime in a sandbox and run several of its profiles there, starting with several Hermes sandboxes on a Mac, each with several profiles running as background services.
 - See each sandbox's network log, denied connections and other denials.
 - Keep a state of every sandbox, its sessions and their processes, and an audit entry for every state-changing command.
 - Seatbelt backend on macOS first, running while the user is logged in; then bubblewrap on Linux.
@@ -78,7 +78,7 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
      (every session runs inside the sandbox's policy, under the snapshot it started with)
 ```
 
-Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3, one unit per running profile, `enclos.<sandbox>.<profile>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that profile, and then runs the wrapped agent command. A profile unit runs `enclos launch <sandbox>/<profile>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each profile gets its own listener port on the proxy, taken from a block of ports reserved for the sandbox when it is created, so the network log is per profile and adding a profile does not change the compiled policy; this attribution is informative, not a security boundary, since profiles share a policy.
+Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running profile, `enclos.<sandbox>.<profile>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that profile, and then runs the wrapped agent command. A profile unit runs `enclos launch <sandbox>/<profile>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each profile gets its own listener port on the proxy, taken from a block of ports reserved for the sandbox when it is created, so the network log is per profile and adding a profile does not change the compiled policy; this attribution is informative, not a security boundary, since profiles share a policy.
 
 ## 5. Isolation backends
 
@@ -89,7 +89,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3
 | File read deny list | yes | yes (paths not mounted) | yes | yes |
 | Programs allowed | yes (`process-exec` rules) | partial (mounted binaries + Landlock execute) | yes | yes |
 | Network (via proxy) | yes (the sandbox's localhost proxy ports only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
-| Host-service delegation blocked | to verify (§5, §14) | planned: host sockets masked (§5), to verify in milestone 4 | yes | yes |
+| Host-service delegation blocked | to verify (§5, §14) | planned: host sockets masked (§5), to verify in milestone 3 | yes | yes |
 | CPU and memory limits | partial (`ulimit`, `taskpolicy`) | yes (cgroups via `systemd-run --user`) | yes | yes |
 | Tracking every process | to verify (§8) | yes (cgroup) | yes | yes |
 | Change without restart | network only | network only | network only | network only |
@@ -115,7 +115,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3
 
 macOS privacy permissions (TCC) are not part of the sandbox: a process started from Terminal is attributed to Terminal, so it inherits whatever Full Disk Access, Accessibility or Automation grants Terminal has. The read deny list and the rules above must hold without relying on TCC.
 
-The exact rule list is **to verify**: the milestone 2 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. Logins therefore use a device-code flow: the agent prints a URL and a code, and the user opens the URL on the host.
+The exact rule list is **to verify**: the milestone 1 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. Logins therefore use a device-code flow: the agent prints a URL and a code, and the user opens the URL on the host.
 
 **Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each profile gets its own socket and relay, which keeps the network log per profile. The relay is the enclos binary, so bubblewrap always mounts it read-only and the program allowlist always permits it, even with `shell = false`. The agent can kill or replace its relay, which is harmless: the relay can only reach the proxy socket, and per-profile attribution is informative anyway.
 
@@ -123,7 +123,7 @@ The exact rule list is **to verify**: the milestone 2 prototype produces it with
 
 ### Seatbelt specifics (first backend)
 
-- `compile` renders a compiled policy (`.sb` file). The current plan is `(allow default)`, then: `(deny file-write*)` with writes allowed only to the sandbox home, granted workspaces and the device files the runtime needs; `(deny file-read*)` on the sensitive deny list, with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's reserved proxy ports on localhost, which also denies Unix sockets; the host-service denials above; an optional `process-exec` allowlist when `shell = false`; and last, so no policy rule can override them, the protected paths. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; the milestone 2 prototype decides on evidence, not on Hermes merely running.
+- `compile` renders a compiled policy (`.sb` file). The current plan is `(allow default)`, then: `(deny file-write*)` with writes allowed only to the sandbox home, granted workspaces and the device files the runtime needs; `(deny file-read*)` on the sensitive deny list, with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's reserved proxy ports on localhost, which also denies Unix sockets; the host-service denials above; an optional `process-exec` allowlist when `shell = false`; and last, so no policy rule can override them, the protected paths. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; milestone 2 decides on evidence, not on Hermes merely running. Milestone 1 uses `(allow default)` with these rules.
 - `wrap` returns `/usr/bin/sandbox-exec -f <compiled.sb> -D HOME=<home> -- <cmd>`, with the environment set for the sandbox: `HOME`, `TMPDIR`, `PATH` and the tool caches inside the home, and the proxy set for every common client: `HTTPS_PROXY`, `HTTP_PROXY` and their lowercase forms (curl reads only lowercase `http_proxy`), plus `NODE_USE_ENV_PROXY=1` for Node's built-in `fetch`. Clients that ignore all of these cannot connect.
 - A compiled Seatbelt policy is fixed for the life of the process and its children. Network allowlist changes are live because the proxy enforces them; file, program and resource changes need a restart, which enclos asks for, and which stays pending if the user declines (§7).
 - **Denials.** Two sources:
@@ -149,7 +149,7 @@ The proxy connects only to addresses that passed, by address. Falling back from 
 
 **What the proxy can and cannot promise.** enclos constrains the connections the sandbox makes, not what the services it reaches do. A remote browser, a search service, an MCP server, or the model provider's own tools (a hosted web search, for example) can fetch other sites on the agent's behalf. Allowing such a service grants that capability: the policy and `enclos policy show` describe it as "remote fetching through <service>", not as network isolation. The same applies to any allowed destination that relays data.
 
-**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: no host-service forward before milestone 4.1, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15).
+**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: no host-service forward before milestone 3.1, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15).
 
 ## 7. Policy
 
@@ -212,7 +212,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 6. When the session ends, take the lock, record the end and any surviving members, and append an audit entry.
 7. On failure at any step: stop what started, save `Failed { reason }`, and close the audit entry as failed.
 
-`enclos sandbox start <name>` (milestone 3) does the same for the proxy and every autostart profile's service.
+`enclos sandbox start <name>` does the same for the proxy and every autostart profile's service.
 
 ## 9. Component APIs
 
@@ -456,8 +456,8 @@ enclos policy test <name>                     enforcement and escape probes
 enclos template list | show <template>
 
 enclos agent install <type> --sandbox <name> [--version x]
-enclos agent configure <name>[/<profile>] [--model ...] [--mcp-add name=https://...]
-enclos agent login <name> --api-key secret:<ref> | --subscription
+enclos agent configure <name>[/<profile>] [--model ...] [--mcp-add name=https://...] [--channel ...]
+enclos agent login <name>[/<profile>] --api-key secret:<ref> | --subscription
 
 enclos secret set | list | rm <ref>
 enclos net log <name>[/<profile>] [-f] | net denied <name>
@@ -471,40 +471,50 @@ enclos ui
 enclos mcp
 ```
 
-**The first working flow** (milestone 2): one sandbox, one Hermes profile, in the terminal.
+**The first working flow** (milestone 1): two sandboxes, each with two Hermes profiles running as background services.
 
 ```bash
 enclos init
 enclos sandbox create home --backend seatbelt --template assistant
 enclos agent install hermes --sandbox home
 enclos profile add home/main
-enclos agent login home --subscription      # Hermes's ChatGPT login, inside the sandbox; prints the URL to open
-enclos policy test home                     # probes: ~/.ssh unreadable, writes outside home refused, `open` and osascript refused,
-                                            # unlisted destinations and private addresses refused
+enclos profile add home/research
+enclos agent login home/main --subscription     # Hermes's device-code login: prints a URL and a code to open on the host
+enclos agent login home/research --subscription # if Hermes keeps one login per profile (to verify, §14)
+
+enclos sandbox create lab --backend seatbelt --template assistant
+enclos agent install hermes --sandbox lab
+enclos profile add lab/scout
+enclos profile add lab/writer
+enclos agent login lab/scout --subscription
+enclos agent login lab/writer --subscription
+
+enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
+enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused
+enclos sandbox start home lab                   # proxies + all four profiles as launchd agents
+enclos sandbox show home                        # profiles, sessions, members, policy each started under
+
 enclos connect home/main
 #   > What's the weather right now in Paris, Cali and Tokyo?
-enclos net log home/main                    # every tunnel Hermes opened
-enclos net denied home                      # what was refused; allow what you trust with `enclos policy allow`
+enclos net log home/main                        # every tunnel that profile opened
+enclos net denied home                          # what was refused; allow what you trust with `enclos policy allow`
+enclos sandbox stop home lab                    # every member, services and sessions alike
 ```
 
-**Later** (milestones 3 and 4): a dev sandbox writing to a project folder, and a community sandbox with two Hermes profiles running as services that reach their data through a remote MCP server.
+**Later** (milestones 2 and 3): profiles that answer on Telegram with secrets granted per profile, a dev sandbox writing to a project folder, and a community sandbox whose profiles reach their data through a remote MCP server.
 
 ```bash
+enclos secret set home/telegram-main
+enclos agent configure home/main --channel telegram --secret home/telegram-main
+
 enclos sandbox create dev --backend seatbelt --template coding --workspace ~/dev/app
 enclos agent install claude-code --sandbox dev
 
 enclos sandbox create community --backend seatbelt --template mcp-only
 enclos agent install hermes --sandbox community
 enclos profile add community/support
-enclos profile add community/writer
 enclos agent configure community --mcp-add data=https://mcp.example.org/data   # every profile; a remote endpoint
 enclos policy allow community mcp.example.org
-enclos policy allow community api.telegram.org
-enclos secret set community/telegram-support
-enclos secret set community/telegram-writer
-
-enclos sandbox start community              # proxy + support, writer as services
-enclos net log community/support -f
 ```
 
 ## 11. State, audit and files
@@ -535,30 +545,48 @@ On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-cha
 
 ## 13. Milestones
 
-1. **Foundations** — CLI, `~/.enclos` layout, state store, audit log with hash chain, built-in templates, policy resolution with immutable snapshots, active and pending policy, `policy edit`, diff, refresh and rollback, session and member records, stop over every member, `state check` and `repair`, the `Backend` trait with a fake backend for tests, `init`, `doctor`, `audit verify`. Done when `enclos audit verify` passes, and against the fake backend: policy changes, pending changes, refresh and rollback behave as §7 says; stop ends every fake member or reports survivors; `state check` finds a deliberately orphaned member; every step leaves an audit entry.
-2. **Hermes in a Mac terminal** — Seatbelt backend with protected paths, the sensitive deny list and host-service blocks; the per-sandbox proxy with destination validation, immediate deny and logging (`net log`, `net denied`); the `assistant` template; the Hermes adapter with the shared runtime and writable install space; one persistent sandbox with one profile; `agent login --subscription`; `connect`, `exec`, `stop`; member tracking; `policy test` with escape probes; the prototype work in §14. Done when the acceptance scenario below passes, and ADR 0006 is accepted or rejected on the evidence it asks for.
-3. **Persistent services and messaging** — profile services as launchd agents while the user is logged in, autostart, `sandbox start`/`stop`/`restart` over every member, logs, Keychain secrets through `enclos launch`, and Hermes messaging (Telegram first). Done when a Hermes profile answers on Telegram from a service, survives a terminal closing, and stop leaves no member.
-4. **Breadth**, in this order unless needs change:
-   1. Several profiles per sandbox, with secrets granted per profile, and the host-service forward (one named host port to one sandbox).
+Each milestone holds only what its goal needs; everything else waits for a later one.
+
+1. **Hermes sandboxes on a Mac** — goal: several Hermes sandboxes on the user's Mac, each with several profiles running as background services, safe enough to start testing. In scope:
+   - a prototype first, which settles the milestone 1 items in §14 before the code depends on them;
+   - CLI, `init`, the `~/.enclos` layout, the state store with its lock, and the hash-chained audit log with `audit verify`;
+   - the `assistant` template, policy resolution into immutable snapshots (§7), `policy show` and `policy allow`;
+   - the Seatbelt backend: write rules, the sensitive deny list, protected paths, host-service blocks and proxy-only network, on the `(allow default)` baseline;
+   - the per-sandbox proxy with a listener per profile, the allowlist, immediate deny, address validation, `net log` and `net denied`;
+   - the Hermes adapter: the shared runtime, writable install space in the home, profiles, and the device-code subscription login;
+   - `sandbox create`, `list`, `show`, `rm`; `profile add`, `list`, `rm`; `connect`;
+   - launchd agents for each sandbox's proxy and each profile while the user is logged in, autostart, `sandbox` and `profile` `start`, `stop`, `restart`, and `logs`;
+   - sessions and member tracking, with stop over every member;
+   - `policy test` with the escape probes listed in the acceptance scenario.
+
+   Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the agent's own login in the sandbox home.
+
+   Done when the acceptance scenario below passes.
+2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per profile, stored in the Keychain and passed through `enclos launch`; Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
+3. **Breadth**, in this order unless needs change:
+   1. The host-service forward (one named host port to one sandbox).
    2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
    3. Linux: the bubblewrap backend with Landlock, seccomp and cgroups; the same policy file runs on Mac and Pi.
    4. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
    5. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
 
-**Acceptance scenario (milestone 2).** On a Mac, with the user logged in and an existing ChatGPT subscription:
+**Acceptance scenario (milestone 1).** On a Mac, with the user logged in and an existing ChatGPT subscription:
 
-1. The steps in §10's first working flow run without manual edits to files, and `enclos agent login home --subscription` completes through Hermes's supported flow.
-2. Asked for the current weather in several locations, Hermes answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
-3. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in the sandbox home, and the shared runtime and enclos's files are unchanged.
-4. Every connection appears in `enclos net log`. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
-5. `enclos policy test home` runs at least these probes, all of which must fail to do what they try: every host-service route in §5 (including DNS), reads of each default sensitive path and protected path, a write outside the home, a connection to an unlisted destination, and connections to loopback, link-local and private addresses through an allowed name. The report lists every probe run.
-6. `enclos sandbox stop home` ends every member, including any browser or installer Hermes started, and `enclos sandbox show home` reports none left.
-7. `enclos audit verify` passes, and the audit log holds an entry for every state-changing command in the scenario.
+1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes profiles, every profile logged in through Hermes's device-code flow.
+2. `enclos sandbox start` on both sandboxes leaves each proxy and each profile running as a launchd agent, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every profile, session and member, and the snapshot each session started under.
+3. In `enclos connect` to each profile, Hermes is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
+4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and the shared runtime, enclos's files and the other sandbox are unchanged.
+5. Every connection appears in `enclos net log` for the profile that made it. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again, without a restart. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
+6. `enclos policy test` on each sandbox runs at least these probes, all of which must fail to do what they try: every host-service route in §5 (including DNS), reads of each default sensitive path and protected path, reads and writes of the other sandbox's folder, a write outside the home, a connection to an unlisted destination, and connections to loopback, link-local and private addresses through an allowed name. The report lists every probe run.
+7. `enclos sandbox stop` ends every member, including services, interactive sessions and any browser or installer Hermes started, and `enclos sandbox show` reports none left.
+8. `enclos audit verify` passes, and the audit log holds an entry for every state-changing command in the scenario.
 
 ## 14. Awaiting prototype verification
 
-The design depends on these, and none has been shown to work yet. The milestone 2 prototype resolves each one, and the result is recorded in the design or an ADR.
+The design depends on these, and none has been shown to work yet. The milestone 1 prototype resolves each one, except the ADR 0006 evidence, which milestone 2 gathers; the result is recorded in the design or an ADR.
 
+- How Hermes profiles are created and selected (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), and whether each profile needs its own login or shares one per sandbox.
+- What Hermes runs as a background service when no messaging platform is configured, and that a `connect` session to a profile can run alongside that profile's service.
 - The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)).
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.
 - How macOS members are tracked, including processes that leave their process group (§8).
@@ -576,4 +604,4 @@ Decided since the first draft: Rust as the language; a domain-level CONNECT prox
 
 | Decision | Recommendation |
 | --- | --- |
-| Host-service forward mechanism | Decided: milestone 4.1, one named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |
+| Host-service forward mechanism | Decided: milestone 3.1, one named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |
