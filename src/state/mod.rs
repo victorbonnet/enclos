@@ -1,13 +1,15 @@
 //! The state store: sandbox records, behind one interface (ADR 0010).
 //!
 //! Every write takes a [`StateLock`], so writing outside the lock does not
-//! compile. Policy snapshots, sessions and members are added by later issues.
+//! compile. Sessions and members are added by later issues.
 
 pub mod sqlite;
 
 use std::fs::File;
 use std::path::PathBuf;
 
+use crate::model::audit::Actor;
+use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
@@ -58,6 +60,22 @@ pub trait StateStore {
     fn list(&self) -> Result<Vec<SandboxRecord>>;
     fn put(&self, lock: &StateLock, rec: &SandboxRecord) -> Result<()>;
     fn remove(&self, lock: &StateLock, name: &SandboxName) -> Result<()>;
+
+    /// Stores `snapshot` unless an identical one is stored, appends a policy
+    /// version pointing to it, and makes that version the sandbox's active
+    /// policy (ADR 0018).
+    fn save_policy(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        snapshot: &PolicySnapshot,
+        by: &Actor,
+        restores: Option<u32>,
+    ) -> Result<PolicyVersion>;
+    /// The sandbox's active policy version and its snapshot.
+    fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
+    /// Every policy version of the sandbox, oldest first.
+    fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>>;
 }
 
 /// Why the state store could not do what was asked.

@@ -13,6 +13,24 @@ pub const MIGRATIONS: &[&str] = &[
         failed_reason TEXT,
         created_at    TEXT NOT NULL
     ) STRICT;",
+    // 2: policy snapshots, insert-only, and each sandbox's append-only
+    // history of policy versions (ADR 0018)
+    "CREATE TABLE policy_snapshots (
+        id     TEXT PRIMARY KEY,
+        inputs TEXT NOT NULL,
+        policy TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE policy_versions (
+        sandbox  TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        version  INTEGER NOT NULL,
+        snapshot TEXT NOT NULL REFERENCES policy_snapshots (id),
+        by_user  TEXT NOT NULL,
+        by_host  TEXT NOT NULL,
+        at       TEXT NOT NULL,
+        restores INTEGER,
+        PRIMARY KEY (sandbox, version)
+    ) STRICT;
+    ALTER TABLE sandboxes ADD COLUMN active_version INTEGER;",
 ];
 
 /// The schema version this enclos reads and writes.

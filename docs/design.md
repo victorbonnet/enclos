@@ -413,15 +413,17 @@ impl Engine {
 ```text
 src/
   main.rs          CLI: parse args into models, call Engine, print the result
+  cli/             one file per command group (policy.rs, ...): its arguments and output
   lib.rs           the core library every client uses
-  engine.rs        the API above; the only place components meet
+  engine.rs        the API above; the only place components meet; engine/ holds its parts (policy.rs, ...)
   error.rs         the engine's typed errors and their exit codes
   layout.rs        where enclos keeps its files (§11);  config.rs  config.toml
   model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs
-  policy/          resolve.rs  snapshot.rs  validate.rs  diff.rs  templates/*.toml
+  policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
+  net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       sessions.rs  stop.rs
   backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, members.rs, probes.rs, denials.rs, base.sb}
-  proxy/           decide.rs  addrs.rs  server.rs  control.rs
+  proxy/           decide.rs  server.rs  control.rs
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
   state/           mod.rs (trait)  sqlite/
