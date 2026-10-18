@@ -10,4 +10,4 @@ Your training data is older than today. Never write a version number from memory
 - After any version change, run `just ci`.
 - In the PR description, list each version you chose and how you checked it.
 
-Renovate also opens update PRs on its own (see `renovate.json`).
+Dependabot also opens weekly update PRs for crates, actions and the Rust toolchain (see `.github/dependabot.yml`).
