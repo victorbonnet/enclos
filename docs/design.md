@@ -82,18 +82,22 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per runn
 | File writes | yes | yes (mount namespace + Landlock) | yes | yes |
 | File read deny list | yes | yes (paths not mounted) | yes | yes |
 | Programs allowed | yes (`process-exec` rules) | partial (mounted binaries + Landlock execute) | yes | yes |
-| Network (via proxy) | yes (localhost port only) | yes (no network namespace + proxy socket) | yes | yes (vsock or host IP) |
+| Network (via proxy) | yes (localhost port only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
 | CPU and memory limits | partial (`ulimit`, `taskpolicy`) | yes (cgroups via `systemd-run --user`) | yes | yes |
 | Change without restart | network only | network only | network only | network only |
 | Subscriptions work as-is | yes | yes | needs token delivery | needs token delivery |
 
 **Security level, honestly stated.** Seatbelt and bubblewrap share the host kernel and user: they stop a misled agent from reading `~/.ssh` or deleting repos, not deliberately malicious code exploiting a kernel bug. That fits personal agents and coding agents. Agents that read untrusted outside content with a shell, or run untrusted code, belong in a container or microVM backend. Most real risk is an agent misusing permissions it was given (exfiltration through an allowed domain, deleting its workspace), which only a narrow policy and logging address, on every backend.
 
+**Protected paths.** Whatever the policy says, every backend denies the sandbox write access anywhere in `~/.enclos` except its own `home/`, and read access to `state.db`, `audit.jsonl`, `config.toml`, the file secret store and other sandboxes' folders. The compiler adds these rules itself, and `validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains `~/.enclos`. See [ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md).
+
+**Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each profile gets its own socket and relay, which keeps the network log per profile.
+
 ### Seatbelt specifics (first backend)
 
-- `compile` renders an `.sb` profile: `(allow default)`, then `(deny file-write*)` with writes allowed only to the sandbox home, workspace and temp folders; `(deny file-read*)` on a deny list (`~/.ssh`, `~/.aws`, `~/.config/gh`, other sandboxes' homes, other agents' config folders) with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's proxy port on localhost; optional `process-exec` allowlist when `shell = false`. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; the milestone 2 prototype decides.
-- `wrap` returns `/usr/bin/sandbox-exec -f <profile> -D HOME=<home> -- <cmd>` with `HTTPS_PROXY` and `HTTP_PROXY` set to the sandbox's proxy.
-- A Seatbelt profile is fixed for the life of the process and its children. Network allowlist changes are live because the proxy enforces them; file, program and resource changes need a restart, which the CLI announces and offers.
+- `compile` renders a compiled policy (`.sb` file): `(allow default)`, then `(deny file-write*)` with writes allowed only to the sandbox home, workspace and temp folders; `(deny file-read*)` on a deny list (`~/.ssh`, `~/.aws`, `~/.config/gh`, other sandboxes' homes, other agents' config folders) with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's proxy port on localhost; optional `process-exec` allowlist when `shell = false`; and last, so no policy rule can override them, the protected paths below. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; the milestone 2 prototype decides.
+- `wrap` returns `/usr/bin/sandbox-exec -f <compiled.sb> -D HOME=<home> -- <cmd>` with `HTTPS_PROXY` and `HTTP_PROXY` set to the sandbox's proxy.
+- A compiled Seatbelt policy is fixed for the life of the process and its children. Network allowlist changes are live because the proxy enforces them; file, program and resource changes need a restart, which the CLI announces and offers.
 - **Denials.** Two sources:
   1. The proxy log: every request with its domain, allowed or blocked. This is the main network view.
   2. The macOS unified log: the kernel logs Seatbelt denials, for example `Sandbox: python3(4182) deny(1) file-read-data /Users/x/.ssh/id_ed25519` and `deny(1) network-outbound 140.82.112.4:443`, readable with `log stream --predicate 'sender == "Sandbox"'`. Lines are attributed to a sandbox by process ID or a tag. macOS collapses repeated identical denials.
@@ -140,7 +144,7 @@ env = { TELEGRAM_BOT_TOKEN = "secret:community/telegram" }
 | `assistant` | own home, read-only documents folder | runtime, MCP servers | model provider, messaging, listed APIs | personal agents |
 | `coding` | own home + one workspace read-write | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 
-Network validation: no loopback, link-local or wildcard entries; private IP literals only with an explicit opt-in. Each agent adapter contributes the endpoints its runtime needs to work at all. Every change is stored as a version with author and time.
+Network validation: no loopback, link-local or wildcard entries; private IP literals only with an explicit opt-in. Filesystem validation: no grant may cover the protected paths (§5). Each agent adapter contributes the endpoints its runtime needs to work at all. Every change is stored as a version with author and time.
 
 ## 7. Component APIs
 

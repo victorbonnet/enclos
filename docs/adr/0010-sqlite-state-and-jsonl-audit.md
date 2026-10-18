@@ -1,6 +1,12 @@
+---
+status: accepted
+---
+
 # State in SQLite, audit in hash-chained JSON Lines
 
-Sandbox records, policy versions, the network log and denials live in a SQLite database. The audit log is a separate append-only JSON Lines file with one entry per state-changing command, where each entry holds the SHA-256 of the previous one, and `enclos audit verify` checks the chain. Both live under `~/.enclos/` (`$XDG_DATA_HOME/enclos` on Linux), which sandboxes cannot write outside their own home folder.
+Sandbox records, policy versions, the network log and denials live in a SQLite database. The audit log is a separate append-only JSON Lines file with one entry per state-changing command, where each entry holds the SHA-256 of the previous one, and `enclos audit verify` checks the chain. Both live under `~/.enclos/` (`$XDG_DATA_HOME/enclos` on Linux).
+
+Whatever the policy says, the policy compiler always denies the sandbox write access anywhere in `~/.enclos` except its own `home/`, and read access to `state.db`, `audit.jsonl`, `config.toml`, the file secret store and other sandboxes' folders. These rules are added last, so no policy rule overrides them, and `enclos policy validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains `~/.enclos`. Without this, a sandbox could rewrite its own audit trail or read other sandboxes' policies, network logs and secrets.
 
 ## Considered options
 

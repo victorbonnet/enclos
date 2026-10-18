@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # enclos manages only the sandboxes it creates
 
 enclos creates named, persistent sandboxes, installs an agent in each, and governs them through a policy, a state and an audit log. It never discovers, scans or collects agents it did not start, and it never routes work between agents. This keeps the state complete (everything enclos manages, it created) and keeps the product a control tool rather than an orchestrator.

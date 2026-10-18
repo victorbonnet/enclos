@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # Policies are layered TOML, and each backend declares how well it enforces each area
 
 A policy is TOML that extends a template and overrides only what differs (built-in defaults, then the template, then the sandbox's `policy.toml`), and it is compiled separately for each backend. Each backend declares, per policy area, whether it is `Enforced`, `Partial` (with a note) or `Unsupported`. Policy fields stay in the format even when one backend cannot fully enforce them, so the same policy file runs on macOS and Linux.

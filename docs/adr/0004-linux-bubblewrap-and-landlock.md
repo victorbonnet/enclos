@@ -1,3 +1,7 @@
+---
+status: accepted
+---
+
 # Linux: bubblewrap with Landlock and seccomp
 
 On Linux, the sandbox is built with bubblewrap: a mount namespace where denied paths are simply not mounted, a network namespace with no network except a Unix socket to the sandbox's proxy, Landlock to restrict writes and which programs can run, seccomp to block dangerous system calls, and cgroups (through `systemd-run --user`) for CPU and memory limits.
