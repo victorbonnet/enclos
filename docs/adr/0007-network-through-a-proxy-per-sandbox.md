@@ -4,7 +4,7 @@ status: accepted
 
 # Network: one egress proxy per sandbox, enforced by enclos
 
-Each sandbox reaches the outside only through its own egress proxy, a domain-level CONNECT proxy without TLS interception that applies the policy's domain allowlist and logs every connection. Backends only have to make the proxy the sole way out: on macOS the compiled Seatbelt policy allows outbound connections to the proxy's localhost port only, and on Linux the sandbox runs in an empty network namespace whose only way out is a Unix socket to the proxy. Network rules are therefore the same on every backend and can change without a restart. The proxy connects only to resolved addresses it has validated ([0017](0017-proxy-connects-only-to-validated-addresses.md)).
+Each sandbox reaches the outside only through its own egress proxy, a domain-level CONNECT proxy without TLS interception that applies the policy's domain allowlist and logs every connection. Backends only have to make the proxy the sole way out: on macOS the compiled Seatbelt policy allows outbound connections only to the sandbox's reserved proxy ports on localhost (one per profile), and on Linux the sandbox runs in an empty network namespace whose only way out is a Unix socket to the proxy. Network rules are therefore the same on every backend and can change without a restart. The proxy connects only to resolved addresses it has validated ([0017](0017-proxy-connects-only-to-validated-addresses.md)).
 
 A connection to a destination not on the allowlist is denied at once and logged for the user to review later. The agent cannot widen its own policy: only the user, from the host, can allow a destination, and the proxy's control channel and enclos's state are out of the sandbox's reach.
 

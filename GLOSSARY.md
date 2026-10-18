@@ -45,12 +45,24 @@ A named configuration of the agent with its own memory, skills, model and channe
 _Avoid_: instance, persona
 
 **Session**:
-One run inside a sandbox: an interactive `connect`, an `exec`, or a profile's service, with every process it starts. A session records the policy snapshot it started under.
+A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a profile's service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance
 
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
 _Avoid_: child, worker
+
+**Workspace**:
+A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
+_Avoid_: mount, share, volume
+
+**Protected path**:
+A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
+_Avoid_: system path, reserved path
+
+**Escape probe**:
+A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail.
+_Avoid_: test case, attack
 
 **Audit entry**:
 The record of one state-changing command: time, user, host, command, state before and after, and result. Audit entries form an append-only, hash-chained audit log.

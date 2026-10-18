@@ -27,7 +27,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 
 - Create, start, stop, connect to and remove sandboxes from the CLI.
 - Per-sandbox policy for files, network, programs, secrets and resources: edit, diff, roll back, test, with an active and a pending version.
-- Install an agent runtime in a sandbox and run one or more of its profiles there, starting with one Hermes profile in a terminal, then several profiles as background services.
+- Install an agent runtime in a sandbox and run one or more of its profiles there, starting with one Hermes profile in a terminal, then profiles as background services, then several profiles per sandbox.
 - See each sandbox's network log, denied connections and other denials.
 - Keep a state of every sandbox, its sessions and their processes, and an audit entry for every state-changing command.
 - Seatbelt backend on macOS first, running while the user is logged in; then bubblewrap on Linux.
@@ -47,7 +47,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Concept | What it is | Example |
 | --- | --- | --- |
 | Host | A machine where the CLI runs and keeps its state. Another host is managed by running the CLI there over SSH. | `mac`, `pi` |
-| Sandbox | A named, persistent isolated environment created by enclos: backend, policy, home folder, mounts, lifecycle state. | `home` (Seatbelt), `community` (bubblewrap) |
+| Sandbox | A named, persistent isolated environment created by enclos: backend, policy, home folder, mounts, lifecycle state. | `home` (Seatbelt), `pi-bot` (bubblewrap) |
 | Policy | What a sandbox may do. Layered on a template, stored as immutable snapshots, compiled per backend. A sandbox has one active policy and at most one pending policy. | `extends = "assistant"` plus overrides |
 | Agent | The agent runtime installed in a sandbox. One agent per sandbox. | Hermes, Claude Code, Codex |
 | Profile | A named configuration of the agent with its own memory, skills, model and channels, run as an interactive session or as its own service. A sandbox can hold several profiles; they share the sandbox's policy, proxy and secrets. Agents without profiles (Claude Code, Codex) have one `default` profile. | Hermes profile `main` in sandbox `home` |
@@ -74,10 +74,10 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
    Per sandbox:
      [interactive session: enclos connect] --+
      [profile service: enclos launch]  ------+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
-     (every session runs inside the same sandbox policy)
+     (every session runs inside the sandbox's policy, under the snapshot it started with)
 ```
 
-Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3, one unit per running profile, `enclos.<sandbox>.<profile>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets, and then runs the wrapped agent command. A profile unit runs `enclos launch <sandbox>/<profile>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each profile gets its own listener port on the proxy, so the network log is per profile; this attribution is informative, not a security boundary, since profiles share a policy.
+Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3, one unit per running profile, `enclos.<sandbox>.<profile>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets, and then runs the wrapped agent command. A profile unit runs `enclos launch <sandbox>/<profile>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each profile gets its own listener port on the proxy, taken from a block of ports reserved for the sandbox when it is created, so the network log is per profile and adding a profile does not change the compiled policy; this attribution is informative, not a security boundary, since profiles share a policy.
 
 ## 5. Isolation backends
 
@@ -87,38 +87,43 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and, from milestone 3
 | File writes | yes | yes (mount namespace + Landlock) | yes | yes |
 | File read deny list | yes | yes (paths not mounted) | yes | yes |
 | Programs allowed | yes (`process-exec` rules) | partial (mounted binaries + Landlock execute) | yes | yes |
-| Network (via proxy) | yes (localhost port only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
+| Network (via proxy) | yes (the sandbox's localhost proxy ports only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
 | Host-service delegation blocked | to verify (§5, §14) | planned: host sockets masked (§5), to verify in milestone 4 | yes | yes |
 | CPU and memory limits | partial (`ulimit`, `taskpolicy`) | yes (cgroups via `systemd-run --user`) | yes | yes |
 | Tracking every process | to verify (§8) | yes (cgroup) | yes | yes |
 | Change without restart | network only | network only | network only | network only |
-| Subscriptions work as-is | yes | yes | needs token delivery | needs token delivery |
+| Subscriptions work as-is | to verify (§12) | to verify (§12) | needs token delivery | needs token delivery |
 
-**Security level, honestly stated.** Seatbelt and bubblewrap share the host kernel and user: they stop a misled agent from reading `~/.ssh` or deleting repos, not deliberately malicious code exploiting a kernel bug. That fits the threat model. Agents that read untrusted outside content with a shell, or run untrusted code, belong in a container or microVM backend. Most real risk is an agent misusing permissions it was given (exfiltration through an allowed destination, deleting its workspace), which only a narrow policy and logging address, on every backend.
+**Security level, honestly stated.** Seatbelt and bubblewrap share the host kernel and user: they are designed to stop a misled agent from reading `~/.ssh` or deleting repos, not deliberately malicious code exploiting a kernel bug. That fits the threat model. Agents that read untrusted outside content with a shell, or run untrusted code, belong in a container or microVM backend. Most real risk is an agent misusing permissions it was given (exfiltration through an allowed destination, deleting its workspace), which only a narrow policy and logging address, on every backend.
 
 **Filesystem defaults** ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are broad, except a sensitive-path deny list. Writes go only to the sandbox home and to workspaces the user grants. The initial deny list on macOS covers `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.config/gh`, shell history files, `~/Library/Keychains`, browser profile folders, `~/Library/Mail`, `~/Library/Messages`, `~/Library/Cookies`, password-manager folders, the host's own agent configuration (`~/.claude`, `~/.codex`, `~/.hermes`), other sandboxes and enclos's protected paths. Policies can add entries; removing a default entry is an explicit, audited change. The agent installs skills, dependencies and tools into its home: `HOME`, `TMPDIR`, caches, Python and Node environments and a `bin/` on `PATH` all point inside it, and programs installed there may run. The shared runtime under `runtimes/` stays read-only. Writes to device files the runtime needs (`/dev/null`, `/dev/tty` and similar) are part of every backend's baseline.
 
 **Protected paths.** Whatever the policy says, every backend denies the sandbox write access anywhere in the enclos data and config folders (`~/.enclos` on macOS; `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos` on Linux) except its own `home/`, and read access to `state.db`, `audit.jsonl`, `config.toml`, the file secret store, the proxies' control sockets and other sandboxes' folders. The compiler adds these rules itself, and `validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains them. `validate` compares paths after resolving symlinks and `..`, so a workspace symlinked into these folders is rejected too. This is also why the agent cannot widen its own policy. See [ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md).
 
-**Host-service delegation** ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). On macOS a sandboxed process can ask a host service to act for it, outside the sandbox. Whatever the Seatbelt baseline, the compiled policy denies these routes at the Mach service level, with executable denials only as an extra layer:
+**Host-service delegation** ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). On macOS a sandboxed process can ask a host service to act for it, outside the sandbox. Whatever the Seatbelt baseline, the compiled policy must deny these routes with the Seatbelt operation that actually governs each one (`mach-lookup` for named services, `appleevent-send` for Apple Events, and whatever the prototype shows blocks launchd job submission, which goes through the bootstrap port rather than a named service), with executable denials only as an extra layer. The routes are:
 
 - LaunchServices: `open`, opening apps, documents and URLs;
 - Apple Events: `osascript`, scripting Terminal or any other app;
-- launchd: submitting or bootstrapping jobs, `launchctl`; writing LaunchAgents is already denied by the write rules;
+- synthetic keyboard and mouse events posted through WindowServer, and the pasteboard;
+- launchd: submitting or bootstrapping jobs, `launchctl`; login items through ServiceManagement; writing LaunchAgents is already denied by the write rules;
+- cfprefsd, which writes `~/Library/Preferences` on the caller's behalf, so the file-write rules never see those writes;
 - `at` and `crontab`;
 - Unix sockets to host services, such as the SSH agent and the Docker socket (denied by the network rules, which allow only the proxy port);
-- the Keychain (the security daemon).
+- the Keychain (the security daemon);
+- name lookups through mDNSResponder (`com.apple.dnssd.service`), so the sandbox cannot resolve or leak data through DNS and every lookup happens in the proxy.
+
+macOS privacy permissions (TCC) are not part of the sandbox: a process started from Terminal is attributed to Terminal, so it inherits whatever Full Disk Access, Accessibility or Automation grants Terminal has. The read deny list and the rules above must hold without relying on TCC.
 
 The exact rule list is **to verify**: the milestone 2 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. A login flow that would open a browser prints its URL or device code for the user to open on the host instead.
 
 **Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each profile gets its own socket and relay, which keeps the network log per profile. The relay is the enclos binary, so bubblewrap always mounts it read-only and the program allowlist always permits it, even with `shell = false`. The agent can kill or replace its relay, which is harmless: the relay can only reach the proxy socket, and per-profile attribution is informative anyway.
 
-**Linux host services.** Linux has its own routes out: the D-Bus session bus, the `systemd --user` manager (which can start units outside the sandbox), and host sockets such as the SSH agent and Docker. A network namespace does not block Unix sockets that live on the filesystem, and a read-only mount does not stop a process from connecting to one, so broad reads must not expose them: bubblewrap masks `/run/user/<uid>`, the Docker socket and any socket named in `SSH_AUTH_SOCK`, and the escape probes cover them.
+**Linux host services.** Linux has its own routes out: the D-Bus session bus, the `systemd --user` manager (which can start units outside the sandbox), and host sockets such as the SSH agent and Docker. A network namespace does not block Unix sockets that live on the filesystem, and a read-only mount does not stop a process from connecting to one, so broad reads must not expose them: bubblewrap masks `/run/user/<uid>` (which also holds the Wayland socket), `/tmp/.X11-unix` (X11 allows keystroke injection), the Docker socket and any socket named in `SSH_AUTH_SOCK`, and the escape probes cover them.
 
 ### Seatbelt specifics (first backend)
 
-- `compile` renders a compiled policy (`.sb` file). The current plan is `(allow default)`, then: `(deny file-write*)` with writes allowed only to the sandbox home, granted workspaces and the device files the runtime needs; `(deny file-read*)` on the sensitive deny list, with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's proxy port on localhost, which also denies Unix sockets and DNS; the host-service denials above; an optional `process-exec` allowlist when `shell = false`; and last, so no policy rule can override them, the protected paths. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; the milestone 2 prototype decides on evidence, not on Hermes merely running.
-- `wrap` returns `/usr/bin/sandbox-exec -f <compiled.sb> -D HOME=<home> -- <cmd>`, with the environment set for the sandbox: `HOME`, `TMPDIR`, `PATH` and the tool caches inside the home, and `HTTPS_PROXY` and `HTTP_PROXY` set to the sandbox's proxy.
+- `compile` renders a compiled policy (`.sb` file). The current plan is `(allow default)`, then: `(deny file-write*)` with writes allowed only to the sandbox home, granted workspaces and the device files the runtime needs; `(deny file-read*)` on the sensitive deny list, with the sandbox's own home re-allowed (later rules win); `(deny network*)` with outbound allowed only to the sandbox's reserved proxy ports on localhost, which also denies Unix sockets; the host-service denials above; an optional `process-exec` allowlist when `shell = false`; and last, so no policy rule can override them, the protected paths. [ADR 0006](adr/0006-seatbelt-deny-by-default.md) proposes starting from `(deny default)` instead; the milestone 2 prototype decides on evidence, not on Hermes merely running.
+- `wrap` returns `/usr/bin/sandbox-exec -f <compiled.sb> -D HOME=<home> -- <cmd>`, with the environment set for the sandbox: `HOME`, `TMPDIR`, `PATH` and the tool caches inside the home, and the proxy set for every common client: `HTTPS_PROXY`, `HTTP_PROXY` and their lowercase forms (curl reads only lowercase `http_proxy`), plus `NODE_USE_ENV_PROXY=1` for Node's built-in `fetch`. Clients that ignore all of these cannot connect.
 - A compiled Seatbelt policy is fixed for the life of the process and its children. Network allowlist changes are live because the proxy enforces them; file, program and resource changes need a restart, which enclos asks for, and which stays pending if the user declines (§7).
 - **Denials.** Two sources:
   1. The proxy log: every connection with its destination and verdict. This is the main network view.
@@ -127,11 +132,11 @@ The exact rule list is **to verify**: the milestone 2 prototype produces it with
 
 ## 6. Network
 
-**Destinations** ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md), [ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)). The proxy accepts a CONNECT (or a plain-HTTP request) for a host and port, normalizes the host (lowercase, trailing dot removed, IDNA to ASCII), and checks it against the allowlist; entries default to port 443 unless they name a port. It then resolves the host itself, since the sandbox has no DNS, and validates every IPv4 and IPv6 address it gets:
+**Destinations** ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md), [ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)). The proxy accepts a CONNECT (or a plain-HTTP request) for a host and port, normalizes the host (lowercase, trailing dot removed, IDNA to ASCII), and checks it against the allowlist; entries default to port 443 unless they name a port. It then resolves the host itself, since the sandbox is meant to have no DNS of its own (§5, to verify), and validates every IPv4 and IPv6 address it gets:
 
-- blocked: loopback, unspecified, link-local (including cloud metadata addresses), private and carrier-grade NAT ranges, unique-local IPv6, multicast, broadcast and reserved ranges;
-- IPv6 forms that carry an IPv4 address (IPv4-mapped, NAT64, 6to4) are checked as that IPv4 address;
-- private addresses are allowed only for a host named in the policy's private opt-in, and the opt-in applies the same way to IP literals and to hostnames that resolve to private addresses.
+- always blocked: every entry in the IANA IPv4 and IPv6 special-purpose address registries that is not globally reachable, including loopback, unspecified and `0.0.0.0/8`, link-local (and with it cloud metadata addresses), multicast, broadcast, benchmarking (`198.18.0.0/15`), documentation ranges and the deprecated IPv4-compatible `::/96`;
+- IPv6 forms that carry an IPv4 address (IPv4-mapped, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`, Teredo `2001::/32`) are checked as the IPv4 address they carry;
+- private ranges (RFC 1918, carrier-grade NAT `100.64.0.0/10`, unique-local IPv6 `fc00::/7`) are blocked unless the host is both on the allowlist and named in the policy's `private` opt-in. The opt-in unlocks only these private ranges, never loopback, link-local or multicast, and applies the same way to IP literals and to hostnames that resolve to private addresses.
 
 The proxy connects only to addresses that passed, by address. Falling back from one address to the next uses the same validated list, and a retry that resolves again validates again. If no address passes, the connection is denied with the reason `blocked-address`.
 
@@ -156,8 +161,8 @@ write_add = ["~/Documents/notes"]        # a granted workspace
 read_deny_add = ["~/dev/work"]
 
 [network]
-allow_add = ["api.telegram.org"]
-private = ["printer.lan"]                # private addresses allowed only for these hosts
+allow_add = ["api.telegram.org", "printer.lan"]
+private = ["printer.lan"]                # must also be allowed; unlocks private ranges only for these hosts
 log = "metadata"                         # per tunnel: host, port, address, bytes, duration; never contents
 
 [resources]
@@ -175,13 +180,13 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 | `assistant` | own home | any, including what the agent installs in its home | model provider, the agent's install sources, listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 
-Every template reads the host broadly, minus the sensitive deny list (§5). Validation: no loopback, link-local or wildcard network entries; private addresses only through `private`; no filesystem grant may cover the protected paths. Each agent adapter contributes the endpoints its runtime needs to work at all (for Hermes: the model provider, its login endpoints and its install sources, listed after the prototype). No template or adapter contributes a weather service or any task-specific API.
+Every template reads the host broadly, minus the sensitive deny list (§5). Validation: no loopback or link-local entries; a wildcard may only cover the subdomains of a named domain (`*.example.com`), never everything (`*`) or a public suffix (`*.com`, `*.co.uk`); private addresses only through `private`, for hosts that are also on the allowlist; no filesystem grant may cover the protected paths. Each agent adapter contributes the endpoints its runtime needs to work at all (for Hermes: the model provider, its login endpoints and its install sources, listed after the prototype). No template or adapter contributes a weather service or any task-specific API.
 
-**Snapshots** ([ADR 0018](adr/0018-immutable-policy-snapshots.md)). Every policy version is an immutable snapshot of the fully resolved policy, identified by its content hash, with its inputs: enclos version and built-in defaults, template name and content hash, adapter version and contributed endpoints, and the overrides. Audit entries and session records reference snapshot hashes.
+**Snapshots** ([ADR 0018](adr/0018-immutable-policy-snapshots.md)). A snapshot is the fully resolved policy together with its inputs (enclos version and built-in defaults, template name and content hash, adapter version and contributed endpoints, and the overrides), identified by the SHA-256 of both. Snapshots are insert-only, and identical content reuses the existing snapshot. A sandbox's history is an append-only list of numbered policy versions, each pointing to a snapshot and recording who made it, when, and which version it restores if it is a rollback. Audit entries and session records reference both the version number and the snapshot hash.
 
-- **Active and pending.** New sessions use the active snapshot. A change that needs a restart asks first; if the user declines, it becomes the pending snapshot, the active one stays, and `enclos policy show` and `enclos sandbox show` display both. `enclos policy apply` restarts and makes the pending snapshot active; `enclos policy discard` drops it. A change mixing restart-requiring and network parts is pending as a whole. A network-only change takes effect at once as a new active snapshot, and if a change is pending, it is re-resolved into a new pending snapshot that includes the network change.
+- **Active and pending.** New sessions use the active snapshot. A file, program or resource change applies at once if no session is running; if sessions are running, it needs a restart and asks first; if the user declines, it becomes the pending snapshot, the active one stays, and `enclos policy show` and `enclos sandbox show` display both. `enclos policy apply` restarts and makes the pending snapshot active; `enclos policy discard` drops it. A change mixing restart-requiring and network parts is pending as a whole. A network-only change takes effect at once as a new active snapshot, and if a change is pending, it is re-resolved into a new pending snapshot that includes the network change.
 - **Updates.** A new enclos version or template never silently changes grants: launch uses the active snapshot as stored. `enclos policy refresh` resolves again against the current template and adapter and turns any difference into a change for the user to accept.
-- **Rollback.** `enclos policy rollback --to <version>` makes that snapshot's effective policy the target again, as a new version recording what it restores, and restores its overrides so later edits start from it. It follows the restart rules above.
+- **Rollback.** `enclos policy rollback --to <version>` makes that snapshot's effective policy the target again, as a new version recording what it restores, and restores its overrides so later edits start from it. It follows the restart rules above. A rollback or refresh made while a change is pending replaces that pending change, after showing it and asking.
 
 ## 8. Lifecycle
 
@@ -192,12 +197,12 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 **Stop and restart.** `stop` ends every member: a signal, a grace period, then a forced kill, then a check that no member remains. Survivors are reported, and the sandbox is marked `Failed` instead of `Stopped`. `restart` stops every member and starts the sandbox's services again under the active snapshot; an interactive session ends and the CLI tells the user to reconnect.
 
-**Effective policy.** Network rules follow the active snapshot live; file, program and resource rules are fixed when a session starts. `enclos sandbox show` lists each session with both, for example `network: v7 (live)  files, programs, resources: v5 (at launch)`, and flags sessions running under an older snapshot as needing a restart. A pending snapshot never applies to anything running.
+**Effective policy.** Network rules follow the active snapshot live; file, program and resource rules are fixed when a session starts. `enclos sandbox show` lists each session with both, for example `network: v7 (live)  files, programs, resources: v5 (at launch)`, and flags a session as needing a restart only when its file, program or resource rules differ from the active snapshot's, not merely because the version number moved. A pending snapshot never applies to anything running.
 
 **Starting a session: `enclos connect home/main`, step by step**
 
 1. Take the state lock; open an audit entry.
-2. Load the record and the active snapshot; compile it if the compiled policy for this snapshot is missing; `prepare`.
+2. Load the record and the active snapshot; compile it if no compiled policy exists for this snapshot and this enclos version (an upgrade recompiles, which is how stricter enclos-owned rules reach new sessions); `prepare`.
 3. Start the proxy unit if it is not running, with the active network policy and one listener per profile.
 4. Record the session with its snapshot and compiled-policy hashes; close the audit entry; release the lock.
 5. `enclos launch` reads the granted secrets, wraps the profile's interactive command and runs it in the terminal, tracking its members.
@@ -230,16 +235,16 @@ pub enum SandboxState { Created, Running, Stopped, Failed { reason: String } }
 
 pub struct Target { pub sandbox: SandboxName, pub profile: Option<ProfileName> }  // "home" or "home/main"
 
-pub struct SnapshotId([u8; 32]);             // SHA-256 of the resolved policy
-pub struct PolicySnapshot { pub id: SnapshotId, pub version: u32, pub inputs: PolicyInputs,
-                            pub policy: Policy, pub by: Actor, pub at: Timestamp,
-                            pub restores: Option<u32> }   // set by a rollback
+pub struct SnapshotId([u8; 32]);             // SHA-256 of the resolved policy and its inputs
+pub struct PolicySnapshot { pub id: SnapshotId, pub inputs: PolicyInputs, pub policy: Policy }   // insert-only
+pub struct PolicyVersion { pub version: u32, pub snapshot: SnapshotId, pub by: Actor, pub at: Timestamp,
+                           pub restores: Option<u32> }    // append-only history; set by a rollback
 pub struct PolicyInputs { pub enclos_version: Version, pub defaults: ContentHash,
                           pub template: (TemplateName, ContentHash),
                           pub adapter: Option<(AgentKind, Version, ContentHash)>, pub overrides: ContentHash }
 
 pub struct SessionRecord { pub id: SessionId, pub target: Target, pub kind: SessionKind,  // Interactive | Exec | Service
-                           pub snapshot: SnapshotId, pub compiled: ContentHash,
+                           pub version: u32, pub snapshot: SnapshotId, pub compiled: ContentHash,
                            pub started_at: Timestamp, pub ended_at: Option<Timestamp> }
 pub struct Member { pub pid: u32, pub session: Option<SessionId>, pub command: String, pub started_at: Timestamp }
 
@@ -315,7 +320,7 @@ pub trait SecretStore {
 }
 ```
 
-**State store and audit log.** A write requires a `StateLock`, so writing outside the lock does not compile; an `AuditTicket` is consumed by `finish`. Snapshots are insert-only.
+**State store and audit log.** A write requires a `StateLock`, so writing outside the lock does not compile; an `AuditTicket` is consumed by `finish`. Snapshots are insert-only and versions append-only.
 
 ```rust
 pub trait StateStore {
@@ -324,9 +329,10 @@ pub trait StateStore {
     fn list(&self) -> Result<Vec<SandboxRecord>>;
     fn put(&self, lock: &StateLock, rec: &SandboxRecord) -> Result<()>;
     fn remove(&self, lock: &StateLock, name: &SandboxName) -> Result<()>;
-    fn save_snapshot(&self, lock: &StateLock, name: &SandboxName, snap: &PolicySnapshot) -> Result<()>;
+    fn add_version(&self, lock: &StateLock, name: &SandboxName, snap: &PolicySnapshot,
+                   by: &Actor, restores: Option<u32>) -> Result<PolicyVersion>;   // stores the snapshot if new
     fn snapshot(&self, id: &SnapshotId) -> Result<PolicySnapshot>;
-    fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicySnapshot>>;
+    fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>>;
     fn put_session(&self, lock: &StateLock, session: &SessionRecord) -> Result<()>;
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>>;
 }
@@ -510,7 +516,7 @@ enclos net log community/support -f
   sandboxes/<name>/
     sandbox.toml               backend, agent, profiles (autostart, proxy port), created_at
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
-    compiled/<snapshot>/       what the backend received (.sb, bwrap argv), per snapshot
+    compiled/<snapshot>-<enclos version>/   what the backend received (.sb, bwrap argv)
     home/                      the agent's home: profiles, skills, environments, bin/, caches, tmp/
     logs/<profile>/
 ```
@@ -519,14 +525,14 @@ On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-cha
 
 ## 12. Secrets and subscriptions
 
-- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)). The sandbox itself cannot reach the Keychain.
-- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, the flow must print a URL or device code (to verify). It works, but the agent can read its own refresh token; enclos flags it.
+- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)). The sandbox itself is meant to have no Keychain access (planned, to verify with the host-service probes).
+- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, the flow must print a URL or device code. A device-code flow is preferred: a flow that waits for a callback on a localhost port needs that bind and inbound connection allowed for the login session only, which the prototype must check (to verify). It works, but the agent can read its own refresh token; enclos flags it.
 - **Subscriptions, v2:** one refresh owner on the host keeps the renewable credential; sandboxes get only short-lived access tokens.
 
 ## 13. Milestones
 
-1. **Foundations** — CLI, `~/.enclos` layout, state store, audit log with hash chain, policy resolution with immutable snapshots, active and pending policy, diff, refresh and rollback, session and member records, the `Backend` trait with a fake backend for tests, `init`, `doctor`, `audit verify`. Done when `enclos audit verify` passes and policy changes, pending changes, refresh and rollback behave as §7 says against the fake backend, each step leaving an audit entry.
-2. **Hermes in a Mac terminal** — Seatbelt backend with protected paths, the sensitive deny list and host-service blocks; the per-sandbox proxy with destination validation, immediate deny and logging (`net log`, `net denied`); the Hermes adapter with the shared runtime and writable install space; one persistent sandbox with one profile; `agent login --subscription`; `connect`, `exec`, `stop`; member tracking; `policy test` with escape probes; the prototype work in §14. Done when the acceptance scenario below passes, and ADR 0006 is accepted or rejected on the evidence it asks for.
+1. **Foundations** — CLI, `~/.enclos` layout, state store, audit log with hash chain, built-in templates, policy resolution with immutable snapshots, active and pending policy, `policy edit`, diff, refresh and rollback, session and member records, stop over every member, `state check` and `repair`, the `Backend` trait with a fake backend for tests, `init`, `doctor`, `audit verify`. Done when `enclos audit verify` passes, and against the fake backend: policy changes, pending changes, refresh and rollback behave as §7 says; stop ends every fake member or reports survivors; `state check` finds a deliberately orphaned member; every step leaves an audit entry.
+2. **Hermes in a Mac terminal** — Seatbelt backend with protected paths, the sensitive deny list and host-service blocks; the per-sandbox proxy with destination validation, immediate deny and logging (`net log`, `net denied`); the `assistant` template; the Hermes adapter with the shared runtime and writable install space; one persistent sandbox with one profile; `agent login --subscription`; `connect`, `exec`, `stop`; member tracking; `policy test` with escape probes; the prototype work in §14. Done when the acceptance scenario below passes, and ADR 0006 is accepted or rejected on the evidence it asks for.
 3. **Persistent services and messaging** — profile services as launchd agents while the user is logged in, autostart, `sandbox start`/`stop`/`restart` over every member, logs, Keychain secrets through `enclos launch`, and Hermes messaging (Telegram first). Done when a Hermes profile answers on Telegram from a service, survives a terminal closing, and stop leaves no member.
 4. **Breadth**, in this order unless needs change:
    1. Several profiles per sandbox, and the host-service forward if its design is settled.
@@ -541,7 +547,7 @@ On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-cha
 2. Asked for the current weather in several locations, Hermes answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
 3. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in the sandbox home, and the shared runtime and enclos's files are unchanged.
 4. Every connection appears in `enclos net log`. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
-5. `enclos policy test home` passes every probe it runs, and the report lists the routes it covered.
+5. `enclos policy test home` runs at least these probes, all of which must fail to do what they try: every host-service route in §5 (including DNS), reads of each default sensitive path and protected path, a write outside the home, a connection to an unlisted destination, and connections to loopback, link-local and private addresses through an allowed name. The report lists every probe run.
 6. `enclos sandbox stop home` ends every member, including any browser or installer Hermes started, and `enclos sandbox show home` reports none left.
 7. `enclos audit verify` passes, and the audit log holds an entry for every state-changing command in the scenario.
 
@@ -556,6 +562,8 @@ The design depends on these, and none has been shown to work yet. The milestone 
 - That Hermes, its model calls, its installers (Python and Node package managers, skill downloads) and any headless browser it starts work through `HTTPS_PROXY` with writes limited to the home, and which install sources the Hermes adapter must allow.
 - Whether a browser started inside Seatbelt needs its own sandbox disabled to run, which would leave only enclos's.
 - Whether runtimes need writes to system temp or cache folders beyond `TMPDIR`.
+- That denying mDNSResponder removes DNS from the sandbox without breaking clients that use the proxy.
+- That the proxy environment variables reach every client Hermes and its installers use, including curl and Node's `fetch`.
 - The unified-log predicate for Seatbelt denials, how lines are attributed to a sandbox, and whether streaming needs admin rights.
 
 ## 15. Open decisions

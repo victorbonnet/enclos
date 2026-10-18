@@ -6,7 +6,7 @@ status: accepted
 
 Every process running inside a sandbox is one of its members: interactive sessions, agent processes, browsers and helpers the agent starts, installers, and all their children. enclos records each session with the policy snapshot and compiled policy it was started with, and keeps track of its members. Stopping a sandbox stops every member, with a grace period, and checks that none remain; restarting stops every member and starts the sandbox's services again under the active policy. If members survive a stop, enclos reports them and marks the sandbox as failed instead of claiming it stopped.
 
-A process keeps the restrictions it was started with. Network rules are enforced by the proxy and follow the active snapshot live; file, program and resource rules are fixed at launch. `enclos sandbox show` displays both versions for each session and flags sessions running under an older snapshot, so an older process is never presented as running under a newer restriction.
+A process keeps the restrictions it was started with. Network rules are enforced by the proxy and follow the active snapshot live; file, program and resource rules are fixed at launch. `enclos sandbox show` displays both versions for each session and flags a session whose file, program or resource rules differ from the active snapshot's, so an older process is never presented as running under a newer restriction.
 
 ## Consequences
 

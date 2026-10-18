@@ -14,5 +14,5 @@ On Linux, the sandbox is built with bubblewrap: a mount namespace where denied p
 ## Consequences
 
 - On Ubuntu 24.04+, AppArmor blocks capabilities inside unprivileged user namespaces unless bubblewrap has a profile that allows them. `enclos doctor` must detect this and say how to fix it.
-- Reads are broad ([0015](0015-broad-reads-narrow-writes.md)), but a network namespace does not block Unix sockets on the filesystem and a read-only mount does not prevent connecting to one. bubblewrap must mask `/run/user/<uid>` (the session bus and the `systemd --user` manager), the Docker socket and the SSH agent socket, and the escape probes must cover them.
+- Reads are broad ([0015](0015-broad-reads-narrow-writes.md)), but a network namespace does not block Unix sockets on the filesystem and a read-only mount does not prevent connecting to one. bubblewrap must mask `/run/user/<uid>` (the session bus, the `systemd --user` manager and Wayland), `/tmp/.X11-unix`, the Docker socket and the SSH agent socket, and the escape probes must cover them.
 - Landlock must be enabled in the kernel. This is unconfirmed on Raspberry Pi OS and must be checked (`cat /sys/kernel/security/lsm`) before the Linux backend is built in milestone 4.
