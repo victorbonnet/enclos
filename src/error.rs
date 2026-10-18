@@ -19,6 +19,15 @@ pub enum Error {
     NoSuchSandbox { name: String },
     #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
     NoPolicy { sandbox: String },
+    /// A backend this host cannot run; never overridden (ADR 0009).
+    #[error("sandbox `{sandbox}` uses the {backend} backend, which this host cannot run: {reason}")]
+    BackendUnavailable {
+        sandbox: String,
+        backend: String,
+        reason: String,
+    },
+    #[error(transparent)]
+    Compile(#[from] crate::backend::CompileError),
     #[error("the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}")]
     ProxyListen {
         sandbox: String,
@@ -56,7 +65,9 @@ impl Error {
             | Error::Policy(_)
             | Error::NoSuchSandbox { .. }
             | Error::NoPolicy { .. }
-            | Error::ProxyListen { .. } => exit::ERROR,
+            | Error::ProxyListen { .. }
+            | Error::Compile(_) => exit::ERROR,
+            Error::BackendUnavailable { .. } => exit::REFUSED,
         }
     }
 }

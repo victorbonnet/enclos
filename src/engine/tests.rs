@@ -141,7 +141,11 @@ mod policy {
     /// An initialized engine with sandbox `home` and its first policy, made
     /// the way `sandbox create` will make it.
     fn with_sandbox() -> (TempDir, Engine, SandboxName) {
-        let (dir, engine) = engine();
+        with_sandbox_on(Vec::new())
+    }
+
+    fn with_sandbox_on(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine, SandboxName) {
+        let (dir, engine) = engine_with(backends);
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "home".parse().unwrap();
         engine
@@ -266,5 +270,66 @@ mod policy {
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let err = engine.policy(&"nope".parse().unwrap()).unwrap_err();
         assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
+    }
+}
+
+mod compile {
+    use super::*;
+    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
+
+    fn sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
+        let (dir, engine) = engine_with(vec![Box::new(backend)]);
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let name: SandboxName = "home".parse().unwrap();
+        engine
+            .write(
+                &alice(),
+                "sandbox create",
+                None,
+                |_| String::new(),
+                |lock| {
+                    engine.state.put(
+                        lock,
+                        &SandboxRecord {
+                            name: name.clone(),
+                            backend: BackendKind::Seatbelt,
+                            state: SandboxState::Created,
+                            created_at: now(),
+                        },
+                    )?;
+                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
+                },
+            )
+            .unwrap();
+        (dir, engine, name)
+    }
+
+    #[test]
+    fn the_active_policy_compiles_once_into_the_sandbox_folder() {
+        let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let file = engine.compile_policy(&name, &[41001]).unwrap();
+        assert!(file.starts_with(engine.layout.sandbox_dir("home").join("compiled")));
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("write {home}")
+        );
+        assert_eq!(engine.compile_policy(&name, &[41001]).unwrap(), file);
+        // A new grant is a new compiled policy.
+        done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
+                .unwrap(),
+        );
+        assert_ne!(engine.compile_policy(&name, &[41001]).unwrap(), file);
+    }
+
+    #[test]
+    fn a_backend_this_host_cannot_run_is_refused() {
+        let (_dir, engine, name) =
+            sandbox_on(FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS"));
+        let err = engine.compile_policy(&name, &[41001]).unwrap_err();
+        assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
+        assert_eq!(err.exit_code(), 2);
     }
 }

@@ -47,6 +47,9 @@ read_deny = [
     "~/Library/Group Containers/2BUA8C4S2C.com.1password",
     "~/Library/Application Support/Bitwarden",
     "~/Library/Application Support/Proton Pass",
+    # Launch agents: Hermes finds the real home through the user database, not
+    # $HOME, and read the host's own gateway job here (prototype, issue #5).
+    "~/Library/LaunchAgents",
     # The host's own agent configuration
     "~/.claude",
     "~/.claude.json",
