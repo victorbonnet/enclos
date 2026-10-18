@@ -1,0 +1,9 @@
+;; Signals only within this sandbox. Under (allow default) a sandboxed process
+;; can signal every process of the same user. Shown: Hermes in the sandbox
+;; listed the host's own Hermes gateway by PID (`hermes gateway status`), and
+;; `hermes gateway run --replace` would stop such a process. This rule keeps
+;; signals inside the sandbox. NOT yet probed across the boundary: that probe
+;; moves to the macOS VM work. Shown only that the sandbox still stops its own
+;; children (gateway shutdown, run-capped.sh cleanup from outside).
+(deny signal (with message (param "SANDBOX_TAG")))
+(allow signal (target same-sandbox))

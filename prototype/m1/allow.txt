@@ -1,0 +1,2 @@
+# Prototype allowlist: one host[:port] (default 443) or *.domain per line.
+example.com

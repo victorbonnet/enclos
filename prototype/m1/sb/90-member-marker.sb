@@ -1,0 +1,8 @@
+;; Member marker (REFUTED as a membership test; kept to record the attempt).
+;; Idea: a path that does not exist, denied only by this sandbox's compiled
+;; policy, so that from outside sandbox_check(pid, "file-read-data", marker)
+;; would say "denied" exactly for this sandbox's processes. Shown on macOS
+;; 26.5.2: sandbox_check on another pid returned 1 for every process tried,
+;; sandboxed or not, launchd included. It cannot tell members apart. Never use
+;; its result to choose processes to signal (see members.sh).
+(deny file-read* (literal (string-append "/private/var/empty/enclos-member-" (param "SANDBOX_TAG"))))

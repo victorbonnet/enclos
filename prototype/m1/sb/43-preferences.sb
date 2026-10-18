@@ -1,0 +1,4 @@
+;; cfprefsd writes ~/Library/Preferences for the caller, so file-write rules
+;; never see it; cfprefsd asks the caller's sandbox about `user-preference-write`.
+;; Reads stay allowed: nearly every macOS program reads preferences.
+(deny user-preference-write (with message (param "SANDBOX_TAG")))

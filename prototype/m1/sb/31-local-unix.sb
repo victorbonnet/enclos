@@ -1,0 +1,9 @@
+;; Unix sockets inside the sandbox home only. Hermes's gateway binds a control
+;; socket and a loop-tick socket under HERMES_HOME; 30-network.sb refuses every
+;; bind. Shown (probes/unix-local.sh): without this rule bind() fails with
+;; EPERM; with it, bind and connect inside the home work. Host sockets (SSH
+;; agent, Docker, mDNSResponder) are outside the home and stay denied.
+;; The home path must also be short: sun_path is 104 bytes on macOS, and Hermes
+;; falls back to TMPDIR, then /tmp, when <HERMES_HOME>/gateway.sock is too long.
+(allow network-bind network-inbound (local unix-socket (subpath (param "SANDBOX_HOME"))))
+(allow network-outbound (remote unix-socket (subpath (param "SANDBOX_HOME"))))

@@ -10,7 +10,8 @@ Every compiled Seatbelt policy is checked by escape probes in `enclos policy tes
 
 ## Consequences
 
-- The exact list of denied services is not known yet. The milestone 1 prototype produces it, together with the probes, and records which routes were tested. Until then the design lists the routes, not a verified rule set.
+- The milestone 1 prototype found the operation that governs each route and showed most of them closed (design §5): `lsopen` for LaunchServices, `appleevent-send` for Apple Events, `job-creation` for launchd jobs, `user-preference-write` for cfprefsd, the network rules for host sockets and mDNSResponder, and setuid exec being refused for `at` and `crontab`. Posting synthetic input, registering a login item and signalling host processes are not shown yet. Escape probes now run in a disposable macOS VM, where the whole set is re-run with the final rules.
+- Signals are a route too: under `(allow default)` a sandboxed process can signal every process of the user, so the compiled policy allows signals only within the sandbox.
 - macOS privacy permissions (TCC) are not a sandbox: a process started from Terminal inherits Terminal's grants. The rules must hold without relying on them.
 - Flows that normally open a browser, such as a subscription login, must use a device code: the agent prints a URL and a code for the user to open on the host.
 - Passing probes show that the listed routes are closed, not that no route exists. New routes found later become new probes.

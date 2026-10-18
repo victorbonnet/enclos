@@ -1,0 +1,6 @@
+;; Apple Events: osascript, scripting Terminal, Finder, System Events or any app.
+;; Shown: each of these two rules alone makes an event to Finder fail with -600
+;; ("Application isn't running") instead of being delivered.
+(deny appleevent-send (with message (param "SANDBOX_TAG")))
+(deny mach-lookup (with message (param "SANDBOX_TAG"))
+  (global-name "com.apple.coreservices.appleevents"))

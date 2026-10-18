@@ -1,0 +1,12 @@
+;; Synthetic keyboard and mouse events and the pasteboard.
+;; Shown: the lookups below are refused and `pbpaste` fails. Not shown: that
+;; CGEventPost itself is stopped (no event is ever posted by the probes, and
+;; TCC refused posting for the test terminal anyway); CGEventSourceCreate still
+;; succeeds with these rules. hid-control and the IOHIDParamUserClient denial
+;; are extra layers whose effect was not observed.
+(deny hid-control (with message (param "SANDBOX_TAG")))
+(deny mach-lookup (with message (param "SANDBOX_TAG"))
+  (global-name "com.apple.windowserver.active")
+  (global-name "com.apple.pasteboard.1"))
+(deny iokit-open (with message (param "SANDBOX_TAG"))
+  (iokit-user-client-class "IOHIDParamUserClient"))

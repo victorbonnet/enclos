@@ -1,0 +1,6 @@
+;; Name lookups. Shown: getaddrinfo and dscacheutil resolve through the Unix
+;; socket /var/run/mDNSResponder, which 30-network.sb closes; with that rule
+;; removed they resolve even with this Mach rule in place. This rule closes the
+;; DNS-SD Mach service as well; port 53 is closed by 30-network.sb.
+(deny mach-lookup (with message (param "SANDBOX_TAG"))
+  (global-name "com.apple.dnssd.service"))

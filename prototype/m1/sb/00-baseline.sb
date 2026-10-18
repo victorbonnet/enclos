@@ -1,0 +1,4 @@
+(version 1)
+;; Milestone 1 baseline: allow by default, then deny (design §5, ADR 0006 open).
+;; Parameters (sandbox-exec -D): SANDBOX_HOME, REAL_HOME, PROXY_PORT, SANDBOX_TAG.
+(allow default)

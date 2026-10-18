@@ -1,0 +1,29 @@
+;; Broad reads minus the sensitive deny list (design §5; abridged for the prototype).
+(deny file-read* (with message (param "SANDBOX_TAG"))
+  (subpath (string-append (param "REAL_HOME") "/.ssh"))
+  (subpath (string-append (param "REAL_HOME") "/.gnupg"))
+  (subpath (string-append (param "REAL_HOME") "/.aws"))
+  (subpath (string-append (param "REAL_HOME") "/.docker"))
+  (subpath (string-append (param "REAL_HOME") "/.config/gh"))
+  (subpath (string-append (param "REAL_HOME") "/.claude"))
+  (subpath (string-append (param "REAL_HOME") "/.codex"))
+  (subpath (string-append (param "REAL_HOME") "/.hermes"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Keychains"))
+  ;; Hermes's launchd helper finds the home through the password database, not
+  ;; $HOME, so inside the sandbox `hermes gateway status` read the host's own
+  ;; ~/Library/LaunchAgents/ai.hermes.gateway.plist. Deny the folder.
+  (subpath (string-append (param "REAL_HOME") "/Library/LaunchAgents"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Cookies"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Mail"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Messages"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Application Support/Google/Chrome"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Application Support/Firefox"))
+  (subpath (string-append (param "REAL_HOME") "/Library/Safari"))
+  (literal (string-append (param "REAL_HOME") "/.netrc"))
+  (literal (string-append (param "REAL_HOME") "/.npmrc"))
+  (literal (string-append (param "REAL_HOME") "/.pypirc"))
+  (literal (string-append (param "REAL_HOME") "/.git-credentials"))
+  (literal (string-append (param "REAL_HOME") "/.zsh_history"))
+  (literal (string-append (param "REAL_HOME") "/.bash_history")))
+;; The sandbox's own home stays readable even if it sits under a denied path.
+(allow file-read* (subpath (param "SANDBOX_HOME")))
