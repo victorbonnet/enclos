@@ -37,14 +37,14 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 
 ## Quick start
 
-On a Mac with Rust and a ChatGPT subscription:
+On a Mac with Rust and an account with a model provider Hermes supports:
 
 ```bash
 cargo install --path .
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab   # Hermes's own installer, inside the sandbox
-enclos runtime login lab                      # device-code login, opened on your Mac
+enclos runtime login lab                      # Hermes's own login: your provider and model
 enclos agent add lab/main
 enclos policy test lab                        # escape probes; every one must fail
 enclos sandbox start lab                      # proxy and gateway in the background
