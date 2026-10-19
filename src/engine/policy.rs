@@ -9,7 +9,7 @@ use super::Engine;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{PolicySnapshot, PolicyVersion, TemplateName};
+use crate::model::policy::{Policy, PolicySnapshot, PolicyVersion, TemplateName};
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
@@ -34,6 +34,19 @@ pub struct PolicyApplied {
     pub version: PolicyVersion,
     /// False when the policy already allowed it.
     pub changed: bool,
+    /// What the new version changes besides the entry asked for, one
+    /// sentence each: edits to `policy.toml` not applied yet, or a newer
+    /// template or built-in defaults.
+    pub also: Vec<String>,
+}
+
+/// What `policy allow` would do, worked out without changing anything.
+struct AllowPlan {
+    active: PolicyView,
+    /// The file to write and what it resolves to; `None` when the active
+    /// policy already allows the entry.
+    change: Option<(String, PolicySnapshot)>,
+    also: Vec<String>,
 }
 
 impl Engine {
@@ -56,7 +69,9 @@ impl Engine {
 
     /// Allows the sandbox to reach `destination` (`host`, `host:port` or
     /// `*.domain`). A network change applies at once: the proxy enforces it,
-    /// so nothing restarts.
+    /// so nothing restarts. The new version is what `policy.toml` resolves
+    /// to, so when it changes more than this entry (edits not applied yet, a
+    /// newer template or built-in defaults), it asks first.
     pub fn policy_allow(
         &self,
         by: &Actor,
@@ -69,16 +84,37 @@ impl Engine {
                 problems: vec![format!("`{destination}`: {e}")],
             })?
             .to_string();
-        if confirm == Confirm::DryRun {
-            self.require_sandbox(name)?;
-            return Ok(Planned::DryRun(Plan {
-                changes: vec![format!("allow {entry} in sandbox {name}; applies at once")],
-                ..Plan::default()
-            }));
+        let plan = self.plan_allow(name, &entry)?;
+        match confirm {
+            Confirm::DryRun => {
+                let changes = match plan.change {
+                    None => vec![format!(
+                        "change nothing: sandbox {name} already allows {entry}"
+                    )],
+                    Some(_) => {
+                        std::iter::once(format!("allow {entry} in sandbox {name}; applies at once"))
+                            .chain(plan.also.iter().map(|c| format!("also {c}")))
+                            .collect()
+                    }
+                };
+                return Ok(Planned::DryRun(Plan {
+                    changes,
+                    ..Plan::default()
+                }));
+            }
+            Confirm::Ask if !plan.also.is_empty() => {
+                return Err(needs_confirmation(&entry, &plan.also));
+            }
+            _ => {}
         }
-        let summary = |applied: &PolicyApplied| match applied.changed {
-            true => format!("policy v{}", applied.version.version),
-            false => "already allowed; nothing changed".to_owned(),
+        let summary = |applied: &PolicyApplied| match (applied.changed, applied.also.len()) {
+            (false, _) => "already allowed; nothing changed".to_owned(),
+            (true, 0) => format!("policy v{}", applied.version.version),
+            (true, n) => format!(
+                "policy v{}, with {n} other changes: {}",
+                applied.version.version,
+                applied.also.join("; ")
+            ),
         };
         let applied = self.write(
             by,
@@ -86,29 +122,49 @@ impl Engine {
             Some(format!("{name} {entry}")),
             summary,
             |lock| {
-                self.require_sandbox(name)?;
-                let current = self.layout.read_policy(name.as_str())?;
-                let updated = with_allowed(&current, &entry)?;
-                let overrides = updated.as_deref().unwrap_or(&current);
-                // The file may already list the entry, edited by hand but not
-                // applied yet: only the active snapshot says what the proxy
-                // enforces.
-                let active = self.policy(name)?;
-                let snapshot = policy::resolve(overrides, self.adapter_layer(name).as_ref())?;
-                if snapshot.id == active.snapshot.id {
+                // Again under the lock: the policy may have changed since.
+                let plan = self.plan_allow(name, &entry)?;
+                let Some((overrides, snapshot)) = plan.change else {
                     return Ok(PolicyApplied {
-                        version: active.version,
+                        version: plan.active.version,
                         changed: false,
+                        also: Vec::new(),
                     });
+                };
+                if confirm == Confirm::Ask && !plan.also.is_empty() {
+                    return Err(needs_confirmation(&entry, &plan.also));
                 }
-                let version = self.save_policy(lock, by, name, overrides)?;
+                let version = self.store_policy(lock, by, name, &overrides, &snapshot)?;
                 Ok(PolicyApplied {
                     version,
                     changed: true,
+                    also: plan.also,
                 })
             },
         )?;
         Ok(Planned::Done(applied))
+    }
+
+    fn plan_allow(&self, name: &SandboxName, entry: &str) -> Result<AllowPlan> {
+        let active = self.policy(name)?;
+        if active.snapshot.policy.net.allow.iter().any(|a| a == entry) {
+            return Ok(AllowPlan {
+                active,
+                change: None,
+                also: Vec::new(),
+            });
+        }
+        // The file may already list the entry, edited by hand but not applied
+        // yet: only the active snapshot says what the proxy enforces.
+        let current = self.layout.read_policy(name.as_str())?;
+        let overrides = with_allowed(&current, entry)?.unwrap_or(current);
+        let snapshot = self.checked_policy(name, &overrides)?;
+        let also = differences(&active.snapshot.policy, &snapshot.policy, entry);
+        Ok(AllowPlan {
+            active,
+            change: Some((overrides, snapshot)),
+            also,
+        })
     }
 
     /// Writes a new sandbox's `policy.toml` from `template` and makes its
@@ -126,8 +182,8 @@ impl Engine {
         self.save_policy(lock, by, name, &overrides)
     }
 
-    /// Resolves and checks `overrides`, records the snapshot as the active
-    /// version, then writes the file it came from.
+    /// Resolves and checks `overrides`, writes them to `policy.toml`, then
+    /// records the snapshot as the active version.
     fn save_policy(
         &self,
         lock: &StateLock,
@@ -135,11 +191,39 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
     ) -> Result<PolicyVersion> {
+        let snapshot = self.checked_policy(name, overrides)?;
+        self.store_policy(lock, by, name, overrides, &snapshot)
+    }
+
+    /// `overrides` resolved and validated for this sandbox.
+    fn checked_policy(&self, name: &SandboxName, overrides: &str) -> Result<PolicySnapshot> {
         let snapshot = policy::resolve(overrides, self.adapter_layer(name).as_ref())?;
         validate(&snapshot.policy, &self.validation_context(name))?;
-        let version = self.state.save_policy(lock, name, &snapshot, by, None)?;
+        Ok(snapshot)
+    }
+
+    /// Writes the file first, so the active version never runs ahead of it:
+    /// if recording the version fails, the file goes back to what it was, and
+    /// if that fails too, the next change applies what the file lists.
+    fn store_policy(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        overrides: &str,
+        snapshot: &PolicySnapshot,
+    ) -> Result<PolicyVersion> {
+        let previous = self.layout.read_policy(name.as_str()).ok();
         self.layout.write_policy(name.as_str(), overrides)?;
-        Ok(version)
+        match self.state.save_policy(lock, name, snapshot, by, None) {
+            Ok(version) => Ok(version),
+            Err(e) => {
+                if let Some(previous) = previous {
+                    let _ = self.layout.write_policy(name.as_str(), &previous);
+                }
+                Err(e.into())
+            }
+        }
     }
 
     fn validation_context(&self, name: &SandboxName) -> ValidationContext {
@@ -165,6 +249,57 @@ impl Engine {
             }),
         }
     }
+}
+
+fn needs_confirmation(entry: &str, also: &[String]) -> Error {
+    Error::NeedsConfirmation {
+        what: format!(
+            "allowing {entry} together with {} other changes to the policy ({})",
+            also.len(),
+            also.join("; ")
+        ),
+    }
+}
+
+/// What `new` grants differently from `old`, besides allowing `entry`.
+fn differences(old: &Policy, new: &Policy, entry: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut compare = |old: &[String], new: &[String], added: &str, removed: &str| {
+        for e in new
+            .iter()
+            .filter(|e| !old.contains(e) && e.as_str() != entry)
+        {
+            found.push(added.replace("{}", e));
+        }
+        for e in old.iter().filter(|e| !new.contains(e)) {
+            found.push(removed.replace("{}", e));
+        }
+    };
+    compare(
+        &old.fs.write,
+        &new.fs.write,
+        "let it write {} (sessions started from now on)",
+        "stop it writing {} (sessions started from now on)",
+    );
+    compare(
+        &old.fs.read_deny,
+        &new.fs.read_deny,
+        "hide {} from it (sessions started from now on)",
+        "let it read {} (sessions started from now on)",
+    );
+    compare(
+        &old.net.allow,
+        &new.net.allow,
+        "allow {}",
+        "stop allowing {}",
+    );
+    compare(
+        &old.net.private,
+        &new.net.private,
+        "let {} reach private addresses",
+        "stop {} reaching private addresses",
+    );
+    found
 }
 
 /// `policy.toml` with `entry` added to `[network] allow_add`, keeping the
@@ -196,7 +331,7 @@ fn with_allowed(text: &str, entry: &str) -> Result<Option<String>> {
     let network = doc
         .entry("network")
         .or_insert(Item::Table(Table::new()))
-        .as_table_mut()
+        .as_table_like_mut()
         .ok_or_else(not_a_table)?;
     let list = network
         .entry("allow_add")
@@ -221,6 +356,19 @@ mod tests {
         );
         assert!(updated.contains("\"weather.example.com\""), "{updated}");
         assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
+        // An inline or dotted network table is edited where it is.
+        for text in [
+            "network = { allow_add = [\"a.example.com\"] }\n",
+            "network.allow_add = [\"a.example.com\"]\n",
+        ] {
+            let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
+            let parsed = policy::resolve(&updated, None).unwrap();
+            assert_eq!(
+                parsed.policy.net.allow,
+                ["a.example.com", "b.example.com"],
+                "{updated}"
+            );
+        }
         // A file without a [network] table gets one.
         let bare = with_allowed("extends = \"assistant\"\n", "a.example.com")
             .unwrap()
@@ -229,5 +377,24 @@ mod tests {
             bare.contains("[network]") && bare.contains("allow_add = [\"a.example.com\"]"),
             "{bare}"
         );
+    }
+
+    #[test]
+    fn differences_leave_out_the_entry_asked_for() {
+        let mut old = Policy::default();
+        old.fs.read_deny = vec!["~/.ssh".into(), "~/dev/work".into()];
+        let mut new = old.clone();
+        new.net.allow = vec!["a.example.com".into(), "b.example.com".into()];
+        new.fs.write = vec!["~/work".into()];
+        new.fs.read_deny.pop();
+        assert_eq!(
+            differences(&old, &new, "a.example.com"),
+            [
+                "let it write ~/work (sessions started from now on)",
+                "let it read ~/dev/work (sessions started from now on)",
+                "allow b.example.com",
+            ]
+        );
+        assert!(differences(&old, &old, "a.example.com").is_empty());
     }
 }

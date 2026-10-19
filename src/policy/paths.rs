@@ -47,12 +47,22 @@ impl PathContext {
     }
 }
 
+/// How many symlinks `real_path` follows by hand before it stops, as the
+/// kernel does for a loop.
+const MAX_LINKS: usize = 40;
+
 /// Where `path` really is: each existing component's symlinks resolved, and
-/// `..` taken after resolving what it climbs out of. The part that does not
-/// exist yet is kept as written, without `.` and with its `..` applied.
+/// `..` taken after resolving what it climbs out of. A symlink to something
+/// that does not exist yet is followed to where it points. The part that does
+/// not exist yet is kept as written, without `.` and with its `..` applied.
 pub fn real_path(path: &Path) -> PathBuf {
+    follow(path, 0)
+}
+
+fn follow(path: &Path, links: usize) -> PathBuf {
     let mut real = PathBuf::new();
-    for component in path.components() {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
         match component {
             Component::RootDir => real = PathBuf::from("/"),
             Component::CurDir | Component::Prefix(_) => {}
@@ -61,10 +71,20 @@ pub fn real_path(path: &Path) -> PathBuf {
             }
             Component::Normal(name) => {
                 real.push(name);
-                if real.symlink_metadata().is_ok()
-                    && let Ok(resolved) = real.canonicalize()
-                {
+                let Ok(meta) = real.symlink_metadata() else {
+                    continue;
+                };
+                if let Ok(resolved) = real.canonicalize() {
                     real = resolved;
+                } else if meta.is_symlink()
+                    && links < MAX_LINKS
+                    && let Ok(target) = std::fs::read_link(&real)
+                {
+                    // A dangling link: what it points to, relative to its
+                    // folder, then the rest of the path.
+                    real.pop();
+                    let next = real.join(target).join(components.as_path());
+                    return follow(&next, links + 1);
                 }
             }
         }
@@ -122,6 +142,40 @@ mod tests {
         // `..` after a symlink climbs out of where it points, not where it sits.
         assert_eq!(real_path(&base.join("work/link/../x")), base.join("x"));
         assert_eq!(real_path(&base.join("work/./a/../b")), base.join("work/b"));
+    }
+
+    #[test]
+    fn real_path_follows_a_link_to_what_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("protected")).unwrap();
+        std::fs::create_dir(base.join("work")).unwrap();
+        let link = |target: &str, at: &str| {
+            std::os::unix::fs::symlink(target, base.join(at)).unwrap();
+        };
+        link(
+            base.join("protected/later").to_str().unwrap(),
+            "work/absolute",
+        );
+        link("../protected/later", "work/relative");
+        link("relative", "work/chained");
+
+        for at in ["work/absolute", "work/relative", "work/chained"] {
+            assert_eq!(
+                real_path(&base.join(at)),
+                base.join("protected/later"),
+                "{at}"
+            );
+            assert_eq!(
+                real_path(&base.join(at).join("x")),
+                base.join("protected/later/x"),
+                "{at}"
+            );
+        }
+        // A loop ends instead of following forever.
+        link("loop-b", "work/loop-a");
+        link("loop-a", "work/loop-b");
+        real_path(&base.join("work/loop-a/x"));
     }
 
     #[test]

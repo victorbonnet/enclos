@@ -1,16 +1,18 @@
 //! Checking a resolved policy before it is stored (design §5, §7).
 //!
 //! A policy may not grant writes to enclos's own folders except the sandbox's
-//! own home, including through a broad path or a symlink, and its network
-//! entries must be ones the proxy can enforce.
+//! own home, including through a broad path or a symlink, may not drop the
+//! built-in read-deny entries, and its network entries must be ones the proxy
+//! can enforce.
 
 use std::path::PathBuf;
 
 use super::PolicyError;
+use super::file::PolicyFile;
 use super::paths::{PathContext, is_within, real_path};
 use crate::model::policy::Policy;
 use crate::net::addr::{AddrClass, classify};
-use crate::net::host::{AllowEntry, HostPattern, normalize_host};
+use crate::net::host::{AllowEntry, HostPattern, canonical_private};
 
 /// What a policy is checked against.
 #[derive(Debug, Clone)]
@@ -28,6 +30,7 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
             problems.push(format!("filesystem.read_deny: {e}"));
         }
     }
+    check_default_denies(policy, &mut problems);
     check_network(policy, &mut problems);
     if problems.is_empty() {
         Ok(())
@@ -61,6 +64,28 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Str
     }
 }
 
+/// A layer that writes `read_deny = [...]` replaces the list below it; it may
+/// not leave out what the built-in defaults hide (design §5).
+fn check_default_denies(policy: &Policy, problems: &mut Vec<String>) {
+    let mut defaults = Policy::default();
+    PolicyFile::parse("built-in defaults", super::DEFAULTS)
+        .expect("the built-in defaults parse")
+        .apply(&mut defaults);
+    let dropped: Vec<&str> = defaults
+        .fs
+        .read_deny
+        .iter()
+        .filter(|entry| !policy.fs.read_deny.contains(entry))
+        .map(String::as_str)
+        .collect();
+    if !dropped.is_empty() {
+        problems.push(format!(
+            "filesystem.read_deny leaves out paths enclos always hides: {}; add your own with read_deny_add instead",
+            dropped.join(", ")
+        ));
+    }
+}
+
 fn check_network(policy: &Policy, problems: &mut Vec<String>) {
     let mut allowed = Vec::new();
     for entry in &policy.net.allow {
@@ -71,15 +96,12 @@ fn check_network(policy: &Policy, problems: &mut Vec<String>) {
     }
     let mut private = Vec::new();
     for entry in &policy.net.private {
-        let host = match entry.parse::<std::net::IpAddr>() {
-            Ok(ip) => ip.to_string(),
-            Err(_) => match normalize_host(entry) {
-                Ok(host) => host,
-                Err(e) => {
-                    problems.push(format!("network.private: `{entry}`: {e}"));
-                    continue;
-                }
-            },
+        let host = match canonical_private(entry) {
+            Ok(host) => host,
+            Err(e) => {
+                problems.push(format!("network.private: `{entry}`: {e}"));
+                continue;
+            }
         };
         if !allowed.iter().any(|a| a.host_text() == host) {
             problems.push(format!(
@@ -128,6 +150,9 @@ mod tests {
 
     fn policy(write: &[&str], allow: &[&str], private: &[&str]) -> Policy {
         let mut p = Policy::default();
+        PolicyFile::parse("built-in defaults", crate::policy::DEFAULTS)
+            .unwrap()
+            .apply(&mut p);
         p.fs.write = write.iter().map(|s| s.to_string()).collect();
         p.net.allow = allow.iter().map(|s| s.to_string()).collect();
         p.net.private = private.iter().map(|s| s.to_string()).collect();
@@ -156,12 +181,20 @@ mod tests {
             f.ctx.paths.user_home.join("work/link"),
         )
         .unwrap();
+        // A link to a sandbox folder that does not exist yet.
+        std::os::unix::fs::symlink(
+            f.ctx.protected[0].join("sandboxes/later"),
+            f.ctx.paths.user_home.join("work/dangling"),
+        )
+        .unwrap();
         for entry in [
             "~",
             "~/.enclos",
             "~/.enclos/state.db",
             "~/.enclos/sandboxes/other",
             "~/work/link",
+            "~/work/dangling",
+            "~/work/dangling/inner",
             "~/work/../.enclos",
             "/",
         ] {
@@ -191,5 +224,17 @@ mod tests {
         );
         assert_eq!(problems(&policy(&[], &["192.168.1.5"], &[]), &f).len(), 1);
         assert!(problems(&policy(&[], &["192.168.1.5"], &["192.168.1.5"]), &f).is_empty());
+    }
+
+    #[test]
+    fn a_policy_may_add_to_the_built_in_read_denies_but_not_drop_them() {
+        let f = fixture();
+        let mut p = policy(&[], &[], &[]);
+        p.fs.read_deny.push("~/dev/work".into());
+        assert!(problems(&p, &f).is_empty());
+        p.fs.read_deny.retain(|e| e != "~/.ssh");
+        let found = problems(&p, &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("~/.ssh"), "{found:?}");
     }
 }

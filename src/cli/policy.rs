@@ -87,17 +87,24 @@ fn print_allowed(sandbox: &SandboxName, destination: &str, planned: Planned<Poli
         Planned::Done(PolicyApplied {
             changed: false,
             version,
+            ..
         }) => {
             println!(
                 "Sandbox {sandbox} already allows {destination} (policy v{}).",
                 version.version
             );
         }
-        Planned::Done(PolicyApplied { version, .. }) => {
+        Planned::Done(PolicyApplied { version, also, .. }) => {
             println!(
                 "Sandbox {sandbox} now allows {destination}: policy v{}, in force at once.",
                 version.version
             );
+            if !also.is_empty() {
+                println!("Policy v{} also changes this:", version.version);
+                for change in also {
+                    println!("  {change}");
+                }
+            }
         }
     }
 }

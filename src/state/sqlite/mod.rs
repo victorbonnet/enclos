@@ -9,6 +9,7 @@ mod tests;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
@@ -26,6 +27,9 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 pub struct SqliteStateStore {
     db: PathBuf,
     lock_file: PathBuf,
+    /// Set once `open` has compared the schema with the migrations: one
+    /// command opens the database several times.
+    schema_checked: OnceLock<()>,
 }
 
 impl SqliteStateStore {
@@ -33,6 +37,7 @@ impl SqliteStateStore {
         SqliteStateStore {
             db: db.into(),
             lock_file: lock_file.into(),
+            schema_checked: OnceLock::new(),
         }
     }
 
@@ -75,7 +80,10 @@ impl SqliteStateStore {
                 current,
             });
         }
-        self.check_schema(&conn, found)?;
+        if self.schema_checked.get().is_none() {
+            self.check_schema(&conn, found)?;
+            let _ = self.schema_checked.set(());
+        }
         Ok(conn)
     }
 

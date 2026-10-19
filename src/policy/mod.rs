@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::model::policy::{
     AdapterInput, Policy, PolicyInputs, PolicySnapshot, SnapshotId, TemplateName,
 };
-use crate::net::host::{AllowEntry, normalize_host};
+use crate::net::host::{AllowEntry, canonical_private};
 use file::PolicyFile;
 
 /// The built-in defaults every template builds on.
@@ -138,11 +138,8 @@ fn normalize(policy: &mut Policy) {
     }
     // The same canonical form validation and the proxy compare against.
     for entry in &mut policy.net.private {
-        *entry = match entry.parse::<std::net::IpAddr>() {
-            Ok(ip) => ip.to_string(),
-            Err(_) => normalize_host(entry)
-                .unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_ascii_lowercase()),
-        };
+        *entry = canonical_private(entry)
+            .unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_ascii_lowercase());
     }
     for list in [
         &mut policy.fs.write,

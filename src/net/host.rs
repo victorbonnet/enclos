@@ -136,6 +136,15 @@ fn split_port(entry: &str) -> Result<(&str, u16), String> {
     }
 }
 
+/// A `network.private` entry in the form the allowlist and the proxy compare
+/// against: an IP address as Rust prints it, or a normalized host name.
+pub fn canonical_private(entry: &str) -> Result<String, String> {
+    match entry.parse::<IpAddr>() {
+        Ok(ip) => Ok(ip.to_string()),
+        Err(_) => normalize_host(entry),
+    }
+}
+
 /// Lowercases a host name, drops a trailing dot, and checks it is a domain
 /// name: dot-separated labels of letters, digits and hyphens.
 pub fn normalize_host(host: &str) -> Result<String, String> {
@@ -163,6 +172,18 @@ pub fn normalize_host(host: &str) -> Result<String, String> {
     if !host.contains('.') {
         return Err(format!(
             "`{host}` is not a full domain name, such as api.example.com"
+        ));
+    }
+    // No top-level domain is a number. A resolver reads `127.1`, `0x7f.1` or
+    // `0177.0.0.1` as an IPv4 address, so these would get past the checks on
+    // IP literals.
+    let last = host.rsplit('.').next().unwrap_or_default();
+    let hex = last.strip_prefix("0x").unwrap_or(last);
+    if last.bytes().all(|b| b.is_ascii_digit())
+        || (last.starts_with("0x") && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(format!(
+            "`{host}` reads as an IP address: write an IPv4 address as four decimal numbers, such as 192.0.2.10"
         ));
     }
     if host == "localhost" || host.ends_with(".localhost") {
@@ -214,6 +235,14 @@ mod tests {
             "exa mple.com",
             "-bad.example.com",
             "ünïcode.example",
+            // IPv4 addresses in the forms a resolver also accepts.
+            "127.1",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "192.168.1",
+            "169.254.43518",
+            "a.0x7f",
+            "*.127.1",
         ] {
             assert!(AllowEntry::parse(bad).is_err(), "{bad}");
         }
