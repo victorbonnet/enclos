@@ -44,17 +44,25 @@ impl Proxy {
             duration_ms: 0,
         };
         let outcome = self.serve_one(&mut client, &mut event);
+        event.duration_ms = started.elapsed().as_millis() as u64;
         if let Err(reason) = outcome {
             event.reason = Some(reason);
             if reason != Reason::ConnectFailed {
                 event.verdict = Verdict::Denied;
             }
+            // Logged before the answer, so whoever is refused already finds
+            // the refusal in `enclos net denied`.
+            self.record(&event);
             let _ = refuse(&mut client, &event, reason);
+            return;
         }
-        event.duration_ms = started.elapsed().as_millis() as u64;
+        self.record(&event);
+    }
+
+    fn record(&self, event: &NetEvent) {
         // A request that never said where it was going is not worth a row.
         if !event.host.is_empty()
-            && let Err(e) = self.log.record(&event)
+            && let Err(e) = self.log.record(event)
         {
             eprintln!(
                 "enclos proxy: could not log a connection to {}: {e}",
