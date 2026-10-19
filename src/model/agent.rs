@@ -50,8 +50,6 @@ impl fmt::Display for AgentName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub name: AgentName,
-    /// Its own proxy listener, so the network log is per agent.
-    pub port: u16,
     pub created_at: Timestamp,
 }
 

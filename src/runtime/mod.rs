@@ -37,8 +37,9 @@ pub trait RuntimeAdapter {
     /// The runtime's own login and model choice, run in the terminal.
     fn login(&self) -> Vec<OsString>;
     fn create_agent(&self, name: &AgentName) -> Vec<OsString>;
-    /// An interactive session for an agent, or the default one.
-    fn interactive(&self, agent: Option<&AgentName>) -> Vec<OsString>;
+    /// What a person runs in the sandbox to talk to an agent, for enclos's
+    /// messages: `enclos connect <sandbox> -- <this>` (ADR 0024).
+    fn talk(&self, agent: &AgentName) -> String;
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {
