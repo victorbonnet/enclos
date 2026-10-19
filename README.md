@@ -44,7 +44,7 @@ cargo install --path .
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab   # Hermes's own installer, inside the sandbox
-enclos runtime login lab                      # Hermes's own login: your provider and model
+enclos connect lab -- hermes setup            # Hermes's own setup: your provider, its login, a model
 enclos agent add lab/main
 enclos policy test lab                        # escape probes; every one must fail
 enclos sandbox start lab                      # proxy and gateway in the background
@@ -60,7 +60,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 | --- | --- |
 | `enclos init` | Create `~/.enclos`, the state database and the audit log |
 | `enclos sandbox create \| list \| show \| start \| stop \| restart \| rm` | Manage sandboxes and their background services |
-| `enclos runtime install \| login` | Install a runtime in a sandbox and log it in |
+| `enclos runtime install` | Install a runtime in a sandbox; log it in with its own command through `connect` |
 | `enclos agent add \| list \| rm` | Manage a sandbox's agents |
 | `enclos connect <sandbox> [-- <command>]` | Open a shell in a sandbox, or run a command there, such as the runtime's own to talk to an agent |
 | `enclos policy show \| allow \| test` | Read or widen a sandbox's policy, and run its escape probes |
