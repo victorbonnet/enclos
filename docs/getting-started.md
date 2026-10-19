@@ -41,9 +41,20 @@ enclos agent add lab/scout
 enclos agent list lab
 ```
 
-Each agent gets its own proxy port, so the network log shows which agent made each connection.
+## Reach an agent
 
-Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Those commands run inside the sandbox: open a shell there with `enclos connect lab` and run them from it. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
+You reach the sandbox with `enclos connect lab`: a shell, or the command you put after `--`. To talk to an agent or change it, run Hermes's own commands that way:
+
+```bash
+enclos connect lab -- main                # talk to the agent main (Hermes's wrapper for `hermes -p main`)
+enclos connect lab -- scout model         # change the model of the agent scout
+enclos connect lab -- hermes -p scout     # the same agent, without the wrapper
+enclos connect lab                        # a shell in the sandbox, for anything else
+```
+
+enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
+
+Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
 
 ## Check the sandbox
 
@@ -57,13 +68,13 @@ This runs escape probes from inside the sandbox: reading `~/.ssh` and other sens
 
 ```bash
 enclos sandbox start lab     # the proxy and the Hermes gateway, in the background, now and at each login
-enclos connect lab/main      # talk to the agent `main`
+enclos connect lab -- main   # talk to the agent main
 ```
 
 Ask it something that needs the web, such as the current weather in three cities. Then look at what it reached:
 
 ```bash
-enclos net log lab/main      # every connection the agent made
+enclos net log lab           # every connection the sandbox made
 enclos net denied lab        # what the sandbox was refused
 ```
 
