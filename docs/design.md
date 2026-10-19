@@ -63,20 +63,12 @@ Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
 
 There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's proxy, and later its agent services, are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that the core creates. Interactive sessions run in the user's terminal.
 
-```text
-  enclos (CLI)      enclos ui      enclos mcp / scripts
-        \               |               /
-         +------- Core library --------+
-         | State + audit | Policy (snapshots) | Runtime adapters | Backend API | Lifecycle |
-                                   |
-          +------------+-----------+-----------+
-       Seatbelt    bubblewrap   OpenShell   MicroVM        (first: Seatbelt, then bubblewrap)
-          |
-   Per sandbox:
-     [interactive session: enclos connect] --+
-     [runtime gateway: enclos launch]  -----+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
-     (every session runs inside the sandbox's policy, under the snapshot it started with)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/architecture-dark.svg">
+  <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="diagrams/architecture-light.svg">
+</picture>
+
+Every session runs inside the sandbox's policy, under the snapshot it started with.
 
 Each sandbox has at most two units while the user is logged in ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)): its proxy, `enclos.<install>.<sandbox>.proxy`, and its runtime's gateway, `enclos.<install>.<sandbox>.gateway`, one per sandbox because the gateway serves every agent. `enclos sandbox start` installs both, so they come back at each login, and `enclos sandbox stop` removes them. `<install>` is the first 8 hex digits of the SHA-256 of the enclos data folder: launchd labels are shared by every enclos install of the user (`ENCLOS_HOME`), and a sandbox name is unique only within one. The gateway starts the runtime only once the sandbox's own proxy holds its port: `proxy run --record` records itself after binding it, so a proxy session whose process still runs is the proof. The gateway unit runs `enclos launch <sandbox>`, which runs outside the sandbox, records the session, and runs the runtime's background command under the compiled policy in a process group of its own; interactive sessions (`enclos connect <sandbox>`, a shell or the command after `--`) run the same way in the user's terminal. Secrets never sit in a plist or unit file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 

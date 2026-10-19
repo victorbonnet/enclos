@@ -28,36 +28,10 @@ More in the [glossary](GLOSSARY.md).
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  you(["You, in a terminal"])
-  net(("Allowed destinations"))
-
-  subgraph mac["Your Mac"]
-    cli["enclos CLI"]
-    launchd["launchd"]
-    proxy["Egress proxy<br/>one per sandbox"]
-    data[("~/.enclos<br/>state.db, audit.jsonl")]
-
-    subgraph sb["Sandbox lab (Seatbelt)"]
-      gateway["Hermes gateway"]
-      main["agent main"]
-      scout["agent scout"]
-    end
-  end
-
-  you --> cli
-  cli -->|"connect lab/main"| main
-  cli -->|"sandbox start"| launchd
-  launchd --> gateway
-  launchd --> proxy
-  cli --> data
-  gateway --> proxy
-  main --> proxy
-  scout --> proxy
-  proxy -->|"allowlist, validated addresses"| net
-  proxy -->|"policy, network log"| data
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.svg">
+  <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="docs/diagrams/architecture-light.svg">
+</picture>
 
 Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defaults, a template, the runtime's endpoints, your overrides). Its only network route is an egress proxy on the host. Background services are plain launchd jobs; there is no enclos daemon. See [architecture](docs/architecture.md) for the components and a session step by step.
 
