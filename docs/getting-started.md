@@ -26,12 +26,12 @@ cargo install --path .
 enclos init                                  # the ~/.enclos folder, state database and audit log
 enclos sandbox create lab                    # Seatbelt backend, `assistant` template
 enclos runtime install hermes --sandbox lab  # Hermes's own installer, run inside the sandbox; takes a few minutes
-enclos runtime login lab                     # Hermes's own login: pick your provider and model
+enclos connect lab -- hermes setup           # Hermes's own setup: your provider and its login, then a model
 ```
 
 `enclos runtime install` downloads Hermes's installer on your Mac and runs it only if it is the version enclos was reviewed against. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
-`enclos runtime login` runs Hermes's own login in your terminal: pick your provider, log in the way Hermes asks, then pick a model. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login.
+`enclos connect lab -- hermes setup` runs Hermes's own setup wizard inside the sandbox, in your terminal: pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes model`.
 
 The sandbox reaches only the hosts its policy allows, and Hermes's adapter allows only the OpenAI hosts its first login used so far (`chatgpt.com`, `auth.openai.com`). For another provider, allow its API host before you log in, for example `enclos policy allow lab api.example.com`; `enclos net denied lab` shows what the login was refused.
 
