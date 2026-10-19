@@ -178,3 +178,84 @@ fn policy_versions_append_and_identical_snapshots_are_stored_once() {
     store.remove(&lock, &name).unwrap();
     assert!(store.policy_history(&name).unwrap().is_empty());
 }
+
+#[test]
+fn the_network_log_filters_by_time_and_groups_denials() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    use crate::state::NetLogStore;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let event = |at: &str, host: &str, verdict, reason| NetEvent {
+        at: at.parse().unwrap(),
+        sandbox: name.clone(),
+        host: host.into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict,
+        reason,
+        bytes_up: 1,
+        bytes_down: 2,
+        duration_ms: 3,
+    };
+    // Whole seconds and milliseconds mixed: the order must still be by time.
+    for e in [
+        event(
+            "2026-01-01T10:00:05Z",
+            "api.example.com",
+            Verdict::Allowed,
+            None,
+        ),
+        event(
+            "2026-01-01T10:00:05.500Z",
+            "evil.example.com",
+            Verdict::Denied,
+            Some(Reason::NotAllowed),
+        ),
+        event(
+            "2026-01-01T10:00:06Z",
+            "evil.example.com",
+            Verdict::Denied,
+            Some(Reason::NotAllowed),
+        ),
+    ] {
+        store.record(&e).unwrap();
+    }
+    // A tunnel opened first and closed last: listed by when it opened, with
+    // the bytes it moved once it closed.
+    let long = event(
+        "2026-01-01T10:00:04Z",
+        "long.example.com",
+        Verdict::Allowed,
+        None,
+    );
+    let row = store.record(&long).unwrap();
+    store
+        .finish(
+            row,
+            &NetEvent {
+                bytes_down: 5_000_000,
+                ..long
+            },
+        )
+        .unwrap();
+    let all = store.events(&name, None).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(
+        (all[0].host.as_str(), all[0].bytes_down),
+        ("long.example.com", 5_000_000)
+    );
+    let since = "2026-01-01T10:00:05.200Z".parse().unwrap();
+    assert_eq!(store.events(&name, Some(since)).unwrap().len(), 2);
+
+    let denied = store.denied(&name).unwrap();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(
+        (denied[0].host.as_str(), denied[0].count),
+        ("evil.example.com", 2)
+    );
+    assert_eq!(denied[0].first, "2026-01-01T10:00:05.500Z".parse().unwrap());
+}
