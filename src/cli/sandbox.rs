@@ -17,7 +17,7 @@ pub struct SandboxArgs {
 
 #[derive(Subcommand)]
 enum SandboxVerb {
-    /// Create a sandbox with its own home, policy and proxy ports.
+    /// Create a sandbox with its own home, policy and proxy port.
     Create {
         name: SandboxName,
         /// The isolation technology.
@@ -60,13 +60,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             )? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(r) => println!(
-                    "Created sandbox {} ({}, template {}), policy v1, proxy ports {}-{}.\nConnect with `enclos connect {}`.",
-                    r.name,
-                    r.backend,
-                    r.template,
-                    r.port_base,
-                    r.port_base + 15,
-                    r.name
+                    "Created sandbox {} ({}, template {}), policy v1, proxy port {}.\nConnect with `enclos connect {}`.",
+                    r.name, r.backend, r.template, r.proxy_port, r.name
                 ),
             }
         }
@@ -127,11 +122,8 @@ fn print_show(v: &SandboxView) {
     let r = &v.record;
     println!("Sandbox {}: {}", r.name, state(&r.state));
     println!(
-        "  backend {}, template {}, proxy ports {}-{}",
-        r.backend,
-        r.template,
-        r.port_base,
-        r.port_base + 15
+        "  backend {}, template {}, proxy port {}",
+        r.backend, r.template, r.proxy_port
     );
     if let Some(p) = &v.policy {
         println!(
@@ -151,13 +143,9 @@ fn print_show(v: &SandboxView) {
             ""
         };
         println!(
-            "  session {} {}{}: network v{active} (live), files v{} (at launch){stale}",
+            "  session {} {}: network v{active} (live), files v{} (at launch){stale}",
             s.id,
             s.kind.as_str(),
-            s.agent
-                .as_deref()
-                .map(|p| format!(" {p}"))
-                .unwrap_or_default(),
             s.version
         );
         for m in members {

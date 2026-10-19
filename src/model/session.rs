@@ -21,7 +21,7 @@ impl fmt::Display for SessionId {
 pub enum SessionKind {
     /// `enclos connect`, in the user's terminal.
     Interactive,
-    /// An agent running as a background service.
+    /// The runtime's background service, which serves every agent.
     Service,
     /// The sandbox's egress proxy, outside the sandbox.
     Proxy,
@@ -65,7 +65,6 @@ pub struct ProcessRef {
 pub struct SessionRecord {
     pub id: SessionId,
     pub sandbox: SandboxName,
-    pub agent: Option<String>,
     pub kind: SessionKind,
     /// The policy version and snapshot the session started under.
     pub version: u32,

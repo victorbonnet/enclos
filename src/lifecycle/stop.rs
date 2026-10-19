@@ -77,7 +77,6 @@ mod tests {
         SessionRecord {
             id: SessionId(1),
             sandbox: "home".parse().unwrap(),
-            agent: None,
             kind: SessionKind::Service,
             version: 1,
             snapshot: crate::model::policy::SnapshotId("x".into()),

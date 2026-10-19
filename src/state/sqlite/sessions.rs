@@ -10,12 +10,11 @@ use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 pub fn insert(conn: &Connection, s: &SessionRecord) -> rusqlite::Result<SessionId> {
     conn.execute(
-        "INSERT INTO sessions (sandbox, agent, kind, version, snapshot, compiled, root_pid,
+        "INSERT INTO sessions (sandbox, kind, version, snapshot, compiled, root_pid,
              root_start, pgid, started_at, ended_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
         params![
             s.sandbox.as_str(),
-            s.agent,
             s.kind.as_str(),
             s.version,
             s.snapshot.0,
@@ -43,9 +42,9 @@ fn corrupt(detail: String) -> ReadError {
 
 fn session(row: &Row<'_>) -> Result<SessionRecord, ReadError> {
     let sandbox: String = row.get(1)?;
-    let kind: String = row.get(3)?;
-    let started_at: String = row.get(10)?;
-    let ended_at: Option<String> = row.get(11)?;
+    let kind: String = row.get(2)?;
+    let started_at: String = row.get(9)?;
+    let ended_at: Option<String> = row.get(10)?;
     let time = |t: &str| {
         t.parse::<Timestamp>()
             .map_err(|e| corrupt(format!("session time `{t}`: {e}")))
@@ -53,16 +52,15 @@ fn session(row: &Row<'_>) -> Result<SessionRecord, ReadError> {
     Ok(SessionRecord {
         id: SessionId(row.get(0)?),
         sandbox: sandbox.parse().map_err(|e| corrupt(format!("{e}")))?,
-        agent: row.get(2)?,
         kind: kind.parse().map_err(corrupt)?,
-        version: row.get(4)?,
-        snapshot: SnapshotId(row.get(5)?),
-        compiled: row.get(6)?,
+        version: row.get(3)?,
+        snapshot: SnapshotId(row.get(4)?),
+        compiled: row.get(5)?,
         root: ProcessRef {
-            pid: row.get(7)?,
-            started: row.get(8)?,
+            pid: row.get(6)?,
+            started: row.get(7)?,
         },
-        pgid: row.get(9)?,
+        pgid: row.get(8)?,
         started_at: time(&started_at)?,
         ended_at: ended_at.as_deref().map(time).transpose()?,
     })
@@ -74,7 +72,7 @@ pub fn list(
     running_only: bool,
 ) -> Result<Vec<SessionRecord>, ReadError> {
     let mut stmt = conn.prepare(
-        "SELECT id, sandbox, agent, kind, version, snapshot, compiled, root_pid, root_start,
+        "SELECT id, sandbox, kind, version, snapshot, compiled, root_pid, root_start,
                 pgid, started_at, ended_at
          FROM sessions WHERE sandbox = ?1 AND (?2 = 0 OR ended_at IS NULL) ORDER BY id",
     )?;

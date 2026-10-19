@@ -130,13 +130,13 @@ impl SqliteStateStore {
         let (name, backend, state, created_at) = (text(0)?, text(1)?, text(2)?, text(4)?);
         let template = text(5)?;
         let reason: Option<String> = row.get(3).map_err(self.sqlite_err())?;
-        let port_base: i64 = row.get(6).map_err(self.sqlite_err())?;
+        let proxy_port: i64 = row.get(6).map_err(self.sqlite_err())?;
         Ok(SandboxRecord {
             name: name.parse().map_err(|e| corrupt(format!("{e}")))?,
             backend: backend.parse().map_err(|e| corrupt(format!("{e}")))?,
             template: template.parse().map_err(|e| corrupt(format!("{e}")))?,
-            port_base: u16::try_from(port_base)
-                .map_err(|_| corrupt(format!("port_base {port_base}")))?,
+            proxy_port: u16::try_from(proxy_port)
+                .map_err(|_| corrupt(format!("proxy_port {proxy_port}")))?,
             state: match (state.as_str(), reason) {
                 ("created", _) => SandboxState::Created,
                 ("running", _) => SandboxState::Running,
@@ -246,7 +246,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at, template, port_base
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
                  FROM sandboxes WHERE name = ?1",
             )
             .map_err(self.sqlite_err())?;
@@ -261,7 +261,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at, template, port_base
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
                  FROM sandboxes ORDER BY name",
             )
             .map_err(self.sqlite_err())?;
@@ -277,12 +277,12 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let (state, reason) = state_columns(&rec.state);
         conn.execute(
-            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, port_base)
+            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
                  state = excluded.state, failed_reason = excluded.failed_reason,
                  created_at = excluded.created_at, template = excluded.template,
-                 port_base = excluded.port_base",
+                 proxy_port = excluded.proxy_port",
             params![
                 rec.name.as_str(),
                 rec.backend.as_str(),
@@ -290,7 +290,7 @@ impl StateStore for SqliteStateStore {
                 reason,
                 rec.created_at.to_string(),
                 rec.template.as_str(),
-                rec.port_base
+                rec.proxy_port
             ],
         )
         .map_err(self.sqlite_err())?;

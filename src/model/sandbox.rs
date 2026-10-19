@@ -110,16 +110,13 @@ pub struct SandboxRecord {
     pub backend: BackendKind,
     pub template: TemplateName,
     pub state: SandboxState,
-    /// The first of the sandbox's block of proxy ports on localhost (design
-    /// §4): the first serves sessions without an agent, the next ones its
-    /// agents.
-    pub port_base: u16,
+    /// The sandbox's proxy port on localhost (design §4), reserved when it
+    /// is created.
+    pub proxy_port: u16,
     pub created_at: Timestamp,
 }
 
-/// How many localhost ports each sandbox reserves for its proxy.
-pub const PORT_BLOCK: u16 = 16;
-/// Where the blocks start, and the last port a block may use.
+/// The range sandbox proxy ports are taken from.
 pub const PORT_FIRST: u16 = 41000;
 pub const PORT_LAST: u16 = 48999;
 
