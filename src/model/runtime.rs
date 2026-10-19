@@ -18,6 +18,13 @@ impl RuntimeKind {
             RuntimeKind::Hermes => "hermes",
         }
     }
+
+    /// Its name as people write it.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            RuntimeKind::Hermes => "Hermes",
+        }
+    }
 }
 
 impl fmt::Display for RuntimeKind {

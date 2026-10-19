@@ -211,6 +211,11 @@ impl Engine {
         )
     }
 
+    /// The sandbox's home folder, which is `~` for everything that runs in it.
+    pub fn sandbox_home(&self, name: &SandboxName) -> std::path::PathBuf {
+        self.layout.sandbox_home(name.as_str())
+    }
+
     pub fn agents(&self, name: &SandboxName) -> Result<Vec<AgentRecord>> {
         self.runtime_of(name)?;
         Ok(self.state.agents(name)?)
