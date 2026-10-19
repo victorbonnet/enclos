@@ -438,6 +438,30 @@ mod compile {
     }
 
     #[test]
+    fn a_cut_off_compiled_policy_is_never_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let file = engine.compile_policy(&name, 41001).unwrap();
+        let full = std::fs::read_to_string(&file).unwrap();
+
+        // What an interrupted write would have left: a valid start, no end.
+        std::fs::write(&file, &full[..full.len() / 2]).unwrap();
+        assert_eq!(engine.compile_policy(&name, 41001).unwrap(), file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), full);
+
+        // A write that fails leaves no file at all, and the retry succeeds.
+        std::fs::remove_file(&file).unwrap();
+        let compiled = file.parent().unwrap();
+        std::fs::set_permissions(compiled, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(engine.compile_policy(&name, 41001).is_err());
+        assert!(!file.exists());
+        std::fs::set_permissions(compiled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(engine.compile_policy(&name, 41001).unwrap(), file);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), full);
+        assert_eq!(std::fs::read_dir(compiled).unwrap().count(), 1);
+    }
+
+    #[test]
     fn a_backend_this_host_cannot_run_is_refused() {
         let (_dir, engine, name) =
             sandbox_on(FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS"));

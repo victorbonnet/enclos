@@ -3,7 +3,11 @@
 //! new enclos version or a new snapshot gets a new file and an unchanged one
 //! is reused.
 
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Engine;
 use crate::backend::{Backend, Probe, SandboxContext};
@@ -51,7 +55,10 @@ impl Engine {
     }
 
     /// Compiles the sandbox's active policy for its backend, with the proxy
-    /// port it may reach, and returns the file the backend reads.
+    /// port it may reach, and returns the file the backend reads. A file
+    /// already there is reused only when it holds exactly the compiled text:
+    /// a cut-off Seatbelt profile can still be valid and leave out every
+    /// restriction after the cut.
     pub fn compile_policy(&self, name: &SandboxName, proxy_port: u16) -> Result<PathBuf> {
         let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
@@ -60,14 +67,36 @@ impl Engine {
         let digest = sha256_hex(compiled.text.as_bytes());
         let dir = ctx.dir.join("compiled");
         let file = dir.join(format!("{}.{}", &digest[..16], compiled.extension));
-        if !file.exists() {
-            let io = |path: &PathBuf| {
-                let path = path.clone();
-                move |source| Error::Layout(LayoutError::Io { path, source })
-            };
+        if std::fs::read(&file).ok().as_deref() != Some(compiled.text.as_bytes()) {
             std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-            std::fs::write(&file, &compiled.text).map_err(io(&file))?;
+            publish(&file, compiled.text.as_bytes())?;
         }
         Ok(file)
     }
+}
+
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
+    let path = path.to_owned();
+    move |source| Error::Layout(LayoutError::Io { path, source })
+}
+
+/// Puts `contents` at `path` in one step: written in full to a new file
+/// beside it, then renamed over it, so `path` never holds part of it.
+fn publish(path: &Path, contents: &[u8]) -> Result<()> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.{}.{nanos}.new", std::process::id()));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(contents).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map_err(io(path))
 }
