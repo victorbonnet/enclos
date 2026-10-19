@@ -95,6 +95,7 @@ impl Engine {
                     template: spec.template.clone(),
                     state: SandboxState::Created,
                     proxy_port: self.free_port()?,
+                    runtime: None,
                     created_at: now(),
                 };
                 let dir = self.layout.sandbox_dir(spec.name.as_str());

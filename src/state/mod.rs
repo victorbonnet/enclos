@@ -9,6 +9,7 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use crate::model::Timestamp;
+use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
@@ -92,6 +93,13 @@ pub trait StateStore: NetLogStore {
     /// The sandbox's sessions, oldest first; only those not ended yet when
     /// `running_only`.
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>>;
+
+    fn put_agent(&self, lock: &StateLock, sandbox: &SandboxName, agent: &AgentRecord)
+    -> Result<()>;
+    fn remove_agent(&self, lock: &StateLock, sandbox: &SandboxName, name: &AgentName)
+    -> Result<()>;
+    /// The sandbox's agents, in port order.
+    fn agents(&self, sandbox: &SandboxName) -> Result<Vec<AgentRecord>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections

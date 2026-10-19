@@ -184,7 +184,7 @@ impl Engine {
 
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
     /// records the snapshot as the active version.
-    fn save_policy(
+    pub(super) fn save_policy(
         &self,
         lock: &StateLock,
         by: &Actor,
@@ -215,6 +215,12 @@ impl Engine {
     ) -> Result<PolicyVersion> {
         let previous = self.layout.read_policy(name.as_str()).ok();
         self.layout.write_policy(name.as_str(), overrides)?;
+        // The same policy as the active one is not a new version.
+        if let Some((active, current)) = self.state.active_policy(name)?
+            && current.id == snapshot.id
+        {
+            return Ok(active);
+        }
         match self.state.save_policy(lock, name, snapshot, by, None) {
             Ok(version) => Ok(version),
             Err(e) => {
@@ -236,9 +242,15 @@ impl Engine {
         }
     }
 
-    /// The installed runtime's endpoints. Agents arrive with the adapter issue.
-    fn adapter_layer(&self, _name: &SandboxName) -> Option<AdapterLayer> {
-        None
+    /// The installed runtime's endpoints, as a policy layer (design §7).
+    fn adapter_layer(&self, name: &SandboxName) -> Option<AdapterLayer> {
+        let kind = self.state.get(name).ok().flatten()?.runtime?;
+        let runtime = crate::runtime::adapter(kind);
+        Some(AdapterLayer {
+            runtime: kind.to_string(),
+            version: runtime.version().to_owned(),
+            text: runtime.endpoints().to_owned(),
+        })
     }
 }
 

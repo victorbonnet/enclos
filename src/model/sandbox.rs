@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use super::Timestamp;
 use super::policy::TemplateName;
+use super::runtime::RuntimeKind;
 
 /// A sandbox name: a lowercase letter, then 1 to 40 lowercase letters, digits
 /// or hyphens.
@@ -113,6 +114,8 @@ pub struct SandboxRecord {
     /// The sandbox's proxy port on localhost (design §4), reserved when it
     /// is created.
     pub proxy_port: u16,
+    /// The runtime installed in it, if any (at most one, ADR 0003).
+    pub runtime: Option<RuntimeKind>,
     pub created_at: Timestamp,
 }
 

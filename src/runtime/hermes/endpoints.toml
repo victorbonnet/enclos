@@ -1,0 +1,31 @@
+# Hermes adapter's policy layer: what Hermes needs to install and run at all
+# (design §7). Learned through the proxy in the milestone 1 prototype
+# (issue #5) on macOS with Hermes 0.22.2. Task-specific APIs are not here:
+# allow those with `enclos policy allow`.
+#
+# Some entries are broad hosts (github.com, storage.googleapis.com): allowing
+# them grants whatever those services serve, and they could carry data out.
+# They are needed by the installer and its downloads.
+
+[network]
+allow_add = [
+    # Model calls and the model list (ChatGPT subscription)
+    "chatgpt.com",
+    # Device-code login and token refresh
+    "auth.openai.com",
+    # Installer: the Hermes checkout and releases
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+    # Installer: uv and Python
+    "releases.astral.sh",
+    "pypi.org",
+    "files.pythonhosted.org",
+    # Installer: Node and npm packages
+    "nodejs.org",
+    "registry.npmjs.org",
+    # Installer: the browser tools and media helpers
+    "cdn.playwright.dev",
+    "storage.googleapis.com",
+    "ffmpeg.martin-riedl.de",
+]

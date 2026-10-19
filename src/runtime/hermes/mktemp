@@ -1,0 +1,23 @@
+#!/bin/bash
+# mktemp wrapper on the sandbox PATH, put there by enclos. macOS
+# /usr/bin/mktemp ignores TMPDIR when called with no template or with -t: it
+# uses the per-user temp folder (/var/folders/../T), which the sandbox may not
+# write. This turns those calls into an explicit template under $TMPDIR.
+# Calls that name a template, or use long options, pass through unchanged.
+set -u
+for a in "$@"; do
+    case "$a" in --*) exec /usr/bin/mktemp "$@" ;; esac
+done
+flags=() prefix=tmp
+OPTIND=1
+while getopts ":dqup:t:" opt; do
+    case "$opt" in
+        d|q|u) flags+=("-$opt") ;;
+        t) prefix="$OPTARG" ;;
+        p) ;;                      # TMPDIR wins over -p, as the man page says
+        *) exec /usr/bin/mktemp "$@" ;;
+    esac
+done
+[ $# -ge "$OPTIND" ] && exec /usr/bin/mktemp "$@"
+dir="${TMPDIR:-/tmp}"
+exec /usr/bin/mktemp ${flags[@]+"${flags[@]}"} "${dir%/}/$prefix.XXXXXXXXXX"

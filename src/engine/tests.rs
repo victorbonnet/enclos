@@ -759,3 +759,79 @@ mod sandbox {
         );
     }
 }
+
+mod runtime {
+    use super::policy::with_sandbox_on;
+    use super::*;
+    use crate::model::runtime::RuntimeKind;
+
+    #[test]
+    fn an_installed_runtime_adds_its_endpoints_as_a_new_policy_version() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    let overrides = engine.layout.read_policy("home")?;
+                    engine.save_policy(lock, &alice(), &name, &overrides)
+                },
+            )
+            .unwrap();
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 2);
+        assert!(
+            view.snapshot
+                .policy
+                .net
+                .allow
+                .contains(&"chatgpt.com".to_owned())
+        );
+        assert_eq!(
+            view.snapshot.inputs.adapter.as_ref().unwrap().runtime,
+            "hermes"
+        );
+    }
+
+    #[test]
+    fn saving_the_active_policy_again_adds_no_version() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        for _ in 0..2 {
+            engine
+                .write(
+                    &alice(),
+                    "test",
+                    None,
+                    |_| String::new(),
+                    |lock| {
+                        let overrides = engine.layout.read_policy("home")?;
+                        engine.save_policy(lock, &alice(), &name, &overrides)
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+        assert_eq!(engine.state.policy_history(&name).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agents_and_logins_need_a_runtime_first() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let err = engine.runtime_login(&alice(), &name).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("enclos runtime install hermes --sandbox home"),
+            "{err}"
+        );
+        let err = engine
+            .connect(&alice(), &name, Some("main"), Vec::new())
+            .unwrap_err();
+        assert!(err.to_string().contains("no runtime yet"), "{err}");
+        assert!(engine.agents(&name).is_err());
+    }
+}
