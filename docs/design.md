@@ -14,7 +14,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 
 1. **Control, not coordinate.** enclos isolates and governs agents. It never routes tasks between agents, delegates work, or models organizations.
 2. **The CLI is the product.** Every operation is a command with readable and `--json` output. The web UI, an MCP server and scripts are clients of the same core and write the same audit log.
-3. **Manage only what you create.** No background collector, no scanning for agents enclos did not start.
+3. **Manage only what you create.** No background collector, and no scanning the host for agents enclos did not start. Inside a sandbox it created, enclos reads the runtime's own list of agents, to report the ones made there ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)).
 4. **Interfaces everywhere.** Each component has one job behind one interface. A new sandbox technology, secret store or runtime is one new implementation, with no change in the core.
 5. **Typed models at every boundary.** Nothing untyped crosses a component boundary. Files on disk carry a `schema_version`.
 6. **Never claim isolation that is not enforced or tested.** If a backend cannot enforce a policy field, enclos says so and refuses unless told otherwise. `enclos policy test` checks enforcement with probes that must fail, and reports only what it probed.
@@ -35,7 +35,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 **Non-goals**
 
 - Agent-to-agent delegation, task routing, organizations, pull request workflows.
-- A collector or discovery of agents enclos did not create.
+- A collector, or discovery on the host of agents enclos did not create. Agents made inside an enclos sandbox are reported (§9).
 - Remote control over chat channels.
 - Writing our own isolation primitives: backends wrap OS features and existing VMs.
 - Containing deliberately malicious code on the shared-kernel backends.
@@ -355,10 +355,13 @@ pub trait RuntimeAdapter {
     fn remove_agent(&self, sb: &SandboxRecord, agent: &AgentName, keep_data: bool) -> Result<()>;
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
     fn service(&self, sb: &SandboxRecord) -> Option<Command>;                   // the background process serving every agent
+    fn agents_in(&self, home: &Path) -> Option<Vec<String>>;                     // read on the host; None: cannot tell
 }
 ```
 
 For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the same shared Hermes install, and `command` selects the profile. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
+
+**Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so they get no proxy port of their own and `connect <sandbox>/<agent>` refuses them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/` with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link, reads a bounded number of entries, and answers `None` (cannot tell) rather than guess. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session and when a name is not found, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. `enclos agent add` adopts an agent the runtime already has: it records it and gives it a port without creating it again. enclos never adopts or removes an agent on its own.
 
 **Engine** — the API every client calls. Reads are not audited. Every write takes the lock, opens an audit entry, does the work, saves state and closes the entry, also on failure. `Confirm::DryRun` returns the plan without changing anything.
 
@@ -372,7 +375,8 @@ impl Engine {
     pub fn denials(&self, name: &SandboxName, since: Timestamp) -> Result<Vec<Denial>>;
 
     pub fn create(&self, by: &Actor, spec: SandboxSpec, confirm: Confirm) -> Result<Planned<SandboxRecord>>;
-    pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentSpec) -> Result<AgentRecord>;
+    pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentSpec) -> Result<AddedAgent>;   // or adopts one made inside
+    pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck>;   // the runtime's agents vs the records
     pub fn remove_agent(&self, by: &Actor, agent: &AgentRef, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
     pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + agent services
     pub fn stop(&self, by: &Actor, name: &SandboxName) -> Result<StopReport>;       // every member; survivors reported
@@ -436,8 +440,8 @@ enclos connect <name> [-- <command...>]       a shell, or a command such as the 
 enclos exec <name> -- <cmd...>
 enclos logs <name> [-f]
 
-enclos agent add <name>/<agent> [--model ...] [--no-autostart]
-enclos agent list <name>
+enclos agent add <name>/<agent> [--model ...] [--no-autostart]   also adopts an agent made inside the sandbox
+enclos agent list <name>                      with the agents made inside that enclos does not track
 enclos agent start | stop | restart <name>/<agent>
 enclos agent rm <name>/<agent> [--keep-data]
 

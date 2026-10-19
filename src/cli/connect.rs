@@ -35,5 +35,10 @@ pub fn run(engine: &Engine, by: &Actor, args: ConnectArgs) -> Result<u8> {
             args.sandbox
         );
     }
+    // Agents made or deleted in the session with the runtime's own commands.
+    // On stderr, so a command's output stays clean.
+    for note in super::agent::check_notes(engine, &args.sandbox, false) {
+        eprintln!("{note}");
+    }
     Ok(u8::try_from(end.exit).unwrap_or(1))
 }

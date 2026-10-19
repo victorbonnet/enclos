@@ -81,6 +81,23 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 };
                 println!("  service {label}: {state}");
             }
+            if let Ok(agents) = engine.agents(&name) {
+                let list: Vec<String> = agents
+                    .iter()
+                    .map(|a| format!("{} (port {})", a.name, a.port))
+                    .collect();
+                println!(
+                    "  agents: {}",
+                    if list.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        list.join(", ")
+                    }
+                );
+            }
+            for note in super::agent::check_notes(engine, &name, true) {
+                println!("  {note}");
+            }
         }
         SandboxVerb::Start { name } if confirm == Confirm::DryRun => {
             print_would_start(&name, &engine.service_labels(&name)?)

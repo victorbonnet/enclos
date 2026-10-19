@@ -58,6 +58,16 @@ enclos does not need to know how a runtime picks an agent: whatever its document
 
 Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
 
+### Agents made inside the sandbox
+
+You can also create an agent with Hermes's own commands, from a shell in the sandbox (`enclos connect lab`, then `hermes profile create scout`). It works right away, but enclos does not know about it yet: it has no proxy port of its own, so its connections are not labelled with its name, and `enclos connect lab/scout` refuses it. enclos tells you when it sees one, at the end of the `connect` session, in `enclos agent list lab` and in `enclos sandbox show lab`:
+
+```text
+lab/scout: made inside the sandbox, not tracked by enclos. Track it with `enclos agent add lab/scout`.
+```
+
+`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record. Agent names in enclos are a lowercase letter followed by lowercase letters, digits or hyphens; a Hermes agent named otherwise (`my_bot`) is reported but cannot be tracked.
+
 ## Check the sandbox
 
 ```bash

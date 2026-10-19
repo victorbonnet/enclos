@@ -52,10 +52,17 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
         AgentVerb::Add { agent } => {
             let AgentTarget { sandbox, agent } = agent;
             let added = engine.add_agent(by, &sandbox, agent)?;
-            let name = &added.name;
-            let kind = engine.show_sandbox(&sandbox)?.record.runtime;
-            let runtime = kind.map_or("The runtime", |r| r.display_name());
-            let talk = kind.map_or(String::new(), |k| enclos::runtime::adapter(k).talk(name));
+            let name = &added.record.name;
+            let runtime = runtime_name(engine, &sandbox);
+            let talk = engine
+                .runtime(&sandbox)?
+                .map_or(String::new(), |k| enclos::runtime::adapter(k).talk(name));
+            if added.adopted {
+                println!(
+                    "Tracked agent {sandbox}/{name}, which {runtime} already had. Talk to it with `enclos connect {sandbox} -- {talk}`."
+                );
+                return Ok(exit::OK);
+            }
             let shell = format!("enclos connect {sandbox}");
             let talk = format!("{shell} -- {talk}");
             let w = talk.len() + 3;
@@ -76,14 +83,19 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
         }
         AgentVerb::List { sandbox } => {
             let agents = engine.agents(&sandbox)?;
-            if agents.is_empty() {
+            let notes = check_notes(engine, &sandbox, true);
+            if agents.is_empty() && notes.is_empty() {
                 println!(
                     "Sandbox {sandbox} has no agents yet. Add one with `enclos agent add {sandbox}/main`."
                 );
             }
-            for p in agents {
+            for p in &agents {
                 println!("{sandbox}/{}", p.name);
             }
+            if !agents.is_empty() && !notes.is_empty() {
+                println!();
+            }
+            notes.iter().for_each(|n| println!("{n}"));
         }
         AgentVerb::Rm { agent } => {
             engine.remove_agent(by, &agent.sandbox, &agent.agent)?;
@@ -91,4 +103,34 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
         }
     }
     Ok(exit::OK)
+}
+
+/// The runtime's name as people write it, for messages.
+pub fn runtime_name(engine: &Engine, sandbox: &SandboxName) -> &'static str {
+    engine
+        .runtime(sandbox)
+        .ok()
+        .flatten()
+        .map_or("The runtime", |r| r.display_name())
+}
+
+/// What differs between the agents the runtime has in the sandbox and the
+/// ones enclos tracks, one line each, with what to do about it (ADR 0023).
+/// `unnamed` adds the agents enclos cannot track by name, which only a
+/// rename inside the sandbox changes.
+pub fn check_notes(engine: &Engine, sandbox: &SandboxName, unnamed: bool) -> Vec<String> {
+    let Ok(check) = engine.check_agents(sandbox) else {
+        return Vec::new();
+    };
+    let runtime = runtime_name(engine, sandbox);
+    let untracked = check.untracked.iter().map(|a| {
+        format!("{sandbox}/{a}: made inside the sandbox, not tracked by enclos. Track it with `enclos agent add {sandbox}/{a}`.")
+    });
+    let unnamed = check.unnamed.iter().filter(|_| unnamed).map(|n| {
+        format!("{runtime} has an agent named `{n}`, which enclos cannot track: agent names are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens.")
+    });
+    let missing = check.missing.iter().map(|a| {
+        format!("{sandbox}/{a}: {runtime} no longer has this agent. Remove it with `enclos agent rm {sandbox}/{a}`.")
+    });
+    untracked.chain(unnamed).chain(missing).collect()
 }

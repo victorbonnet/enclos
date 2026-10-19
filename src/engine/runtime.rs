@@ -17,6 +17,52 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::runtime::{HomeFile, RuntimeAdapter, adapter};
 
+/// What `add_agent` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddedAgent {
+    pub record: AgentRecord,
+    /// The runtime already had the agent, made inside the sandbox, so
+    /// enclos only started tracking it.
+    pub adopted: bool,
+}
+
+/// How the agents a runtime has in a sandbox compare with the ones enclos
+/// tracks (ADR 0023).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentCheck {
+    /// Agents the runtime has that enclos does not track: made inside the
+    /// sandbox with the runtime's own commands.
+    pub untracked: Vec<AgentName>,
+    /// Names the runtime uses that are not valid agent names, so enclos
+    /// cannot track them.
+    pub unnamed: Vec<String>,
+    /// Agents enclos tracks that the runtime no longer has.
+    pub missing: Vec<AgentName>,
+}
+
+impl AgentCheck {
+    pub fn compare(found: Vec<String>, tracked: &[AgentRecord]) -> AgentCheck {
+        let mut check = AgentCheck::default();
+        for name in &found {
+            match name.parse::<AgentName>() {
+                Ok(agent) if tracked.iter().any(|t| t.name == agent) => {}
+                Ok(agent) => check.untracked.push(agent),
+                Err(_) => check.unnamed.push(name.clone()),
+            }
+        }
+        check.missing = tracked
+            .iter()
+            .filter(|t| !found.iter().any(|n| n == t.name.as_str()))
+            .map(|t| t.name.clone())
+            .collect();
+        check
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.untracked.is_empty() && self.unnamed.is_empty() && self.missing.is_empty()
+    }
+}
+
 impl Engine {
     /// The runtime installed in the sandbox.
     pub(super) fn runtime_of(&self, name: &SandboxName) -> Result<RuntimeKind> {
@@ -29,14 +75,45 @@ impl Engine {
     }
 
     pub(super) fn agent_of(&self, name: &SandboxName, agent: &str) -> Result<AgentRecord> {
-        self.runtime_of(name)?;
-        self.state
+        let kind = self.runtime_of(name)?;
+        let tracked = self
+            .state
             .agents(name)?
             .into_iter()
-            .find(|p| p.name.as_str() == agent)
-            .ok_or_else(|| Error::Session {
-                what: format!("sandbox {name} has no agent `{agent}`. Add it with `enclos agent add {name}/{agent}`"),
-            })
+            .find(|p| p.name.as_str() == agent);
+        tracked.ok_or_else(|| {
+            let made_inside = adapter(kind)
+                .agents_in(&self.sandbox_home(name))
+                .is_some_and(|found| found.iter().any(|n| n == agent));
+            let what = if made_inside {
+                format!(
+                    "enclos does not track agent `{agent}`, which {} has in sandbox {name}. Track it with `enclos agent add {name}/{agent}`",
+                    kind.display_name()
+                )
+            } else {
+                format!("sandbox {name} has no agent `{agent}`. Add it with `enclos agent add {name}/{agent}`")
+            };
+            Error::Session { what }
+        })
+    }
+
+    /// The runtime installed in the sandbox, if any.
+    pub fn runtime(&self, name: &SandboxName) -> Result<Option<RuntimeKind>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(record.runtime)
+    }
+
+    /// Compares the agents the runtime has in the sandbox with the ones
+    /// enclos tracks (ADR 0023). Empty when the runtime cannot tell.
+    pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck> {
+        let kind = self.runtime_of(name)?;
+        let tracked = self.state.agents(name)?;
+        Ok(adapter(kind)
+            .agents_in(&self.sandbox_home(name))
+            .map(|found| AgentCheck::compare(found, &tracked))
+            .unwrap_or_default())
     }
 
     /// Installs `kind` in the sandbox: its endpoints join the policy as a new
@@ -161,39 +238,50 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         agent: AgentName,
-    ) -> Result<AgentRecord> {
+    ) -> Result<AddedAgent> {
         let kind = self.runtime_of(name)?;
         if self.state.agents(name)?.iter().any(|p| p.name == agent) {
             return Err(Error::Session {
                 what: format!("sandbox {name} already has agent {agent}"),
             });
         }
-        let created = self.run_in_sandbox(
-            by,
-            name,
-            adapter(kind).create_agent(&agent),
-            "agent add run",
-        )?;
-        if created.exit != 0 {
-            return Err(Error::Session {
-                what: format!(
-                    "{kind} could not create agent {agent} (exit {})",
-                    created.exit
-                ),
-            });
+        // An agent made inside the sandbox with the runtime's own commands
+        // is adopted as it is: creating it again would fail (ADR 0023).
+        let adopted = adapter(kind)
+            .agents_in(&self.sandbox_home(name))
+            .is_some_and(|found| found.iter().any(|n| n == agent.as_str()));
+        if !adopted {
+            let created = self.run_in_sandbox(
+                by,
+                name,
+                adapter(kind).create_agent(&agent),
+                "agent add run",
+            )?;
+            if created.exit != 0 {
+                return Err(Error::Session {
+                    what: format!(
+                        "{kind} could not create agent {agent} (exit {})",
+                        created.exit
+                    ),
+                });
+            }
         }
+        let summary = |p: &AddedAgent| (if p.adopted { "adopted" } else { "added" }).to_owned();
         self.write(
             by,
             "agent add",
             Some(format!("{name}/{agent}")),
-            |_| "added".to_owned(),
+            summary,
             |lock| {
                 let added = AgentRecord {
                     name: agent.clone(),
                     created_at: now(),
                 };
                 self.state.put_agent(lock, name, &added)?;
-                Ok(added)
+                Ok(AddedAgent {
+                    record: added,
+                    adopted,
+                })
             },
         )
     }

@@ -4,6 +4,7 @@
 pub mod hermes;
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -45,6 +46,12 @@ pub trait RuntimeAdapter {
     /// The one background process serving every agent of the sandbox,
     /// if the runtime has one (ADR 0021).
     fn service(&self) -> Option<Vec<OsString>>;
+    /// The names of the agents the runtime has in this sandbox home, as it
+    /// would list them, read on the host without running anything. `None`
+    /// when the runtime has no named agents, or when its listing cannot be
+    /// read safely. The sandbox writes its home, so implementations never
+    /// follow a link and read a bounded number of entries (ADR 0023).
+    fn agents_in(&self, home: &Path) -> Option<Vec<String>>;
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {

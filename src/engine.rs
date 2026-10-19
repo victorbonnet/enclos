@@ -17,6 +17,7 @@ pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use runtime::home_files_script;
+pub use runtime::{AddedAgent, AgentCheck};
 pub use sandbox::{SandboxSpec, SandboxView, StopReport};
 pub use session::SessionEnd;
 
