@@ -54,9 +54,9 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
             let added = engine.add_agent(by, &sandbox, agent)?;
             let name = &added.record.name;
             let runtime = runtime_name(engine, &sandbox);
-            let talk = engine
-                .runtime(&sandbox)?
-                .map_or(String::new(), |k| enclos::runtime::adapter(k).talk(name));
+            let adapter = engine.runtime(&sandbox)?.map(enclos::runtime::adapter);
+            let talk = adapter.as_ref().map_or(String::new(), |a| a.talk(name));
+            let login = adapter.as_ref().map_or(String::new(), |a| a.login());
             if added.adopted {
                 println!(
                     "Tracked agent {sandbox}/{name}, which {runtime} already had. Talk to it with `enclos connect {sandbox} -- {talk}`."
@@ -78,7 +78,7 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
             );
             println!(
                 "`{name} setup` is optional: the agent already uses the sandbox's login (`enclos connect {sandbox} -- {}`).",
-                kind.map_or(String::new(), |k| enclos::runtime::adapter(k).login())
+                login
             );
         }
         AgentVerb::List { sandbox } => {
