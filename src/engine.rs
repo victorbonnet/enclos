@@ -2,8 +2,11 @@
 //! meet (design §9). Reads are not audited. Every write takes the state lock,
 //! opens an audit entry, does the work and closes the entry, also on failure.
 
+mod policy;
 #[cfg(test)]
 mod tests;
+
+pub use policy::{PolicyApplied, PolicyView};
 
 use std::path::PathBuf;
 
@@ -91,7 +94,10 @@ impl Engine {
     pub fn init(&self, by: &Actor, confirm: Confirm) -> Result<Planned<InitReport>> {
         let created = self.layout.missing();
         if confirm == Confirm::DryRun {
-            return Ok(Planned::DryRun(Plan { create: created }));
+            return Ok(Planned::DryRun(Plan {
+                create: created,
+                ..Plan::default()
+            }));
         }
         // The top folders hold the lock and the audit log, so they come first.
         self.layout.create_roots()?;

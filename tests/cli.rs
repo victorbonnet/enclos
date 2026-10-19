@@ -310,3 +310,30 @@ fn a_relative_enclos_home_is_refused() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("must be an absolute path"));
 }
+
+#[test]
+fn policy_commands_name_an_unknown_sandbox() {
+    let home = Home::new();
+    home.init(1);
+    for args in [
+        &["policy", "show", "home"][..],
+        &["policy", "allow", "home", "api.example.com"],
+    ] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 1);
+        assert!(
+            out.stderr().contains("no sandbox named `home`"),
+            "{}",
+            out.stderr()
+        );
+    }
+}
+
+#[test]
+fn policy_allow_refuses_an_unsafe_destination_before_anything_else() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["policy", "allow", "home", "*.com"]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("public suffix"), "{}", out.stderr());
+}

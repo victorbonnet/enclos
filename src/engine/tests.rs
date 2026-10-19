@@ -72,7 +72,8 @@ fn dry_run_changes_nothing() {
     assert_eq!(
         planned,
         Planned::DryRun(Plan {
-            create: engine.layout.paths()
+            create: engine.layout.paths(),
+            ..Plan::default()
         })
     );
     assert!(!engine.layout.data().exists());
@@ -131,4 +132,252 @@ fn audit_since_keeps_recent_entries() {
     done(engine.init(&alice(), Confirm::Ask).unwrap());
     let recent = engine.audit(Some("1h".parse().unwrap())).unwrap();
     assert_eq!(recent.len(), 1);
+}
+
+mod policy {
+    use super::*;
+    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
+
+    /// An initialized engine with sandbox `home` and its first policy, made
+    /// the way `sandbox create` will make it.
+    fn with_sandbox() -> (TempDir, Engine, SandboxName) {
+        let (dir, engine) = engine();
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let name: SandboxName = "home".parse().unwrap();
+        engine
+            .write(
+                &alice(),
+                "sandbox create",
+                Some("home".into()),
+                |_| String::new(),
+                |lock| {
+                    engine.state.put(
+                        lock,
+                        &SandboxRecord {
+                            name: name.clone(),
+                            backend: BackendKind::Seatbelt,
+                            state: SandboxState::Created,
+                            created_at: now(),
+                        },
+                    )?;
+                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
+                },
+            )
+            .unwrap();
+        (dir, engine, name)
+    }
+
+    #[test]
+    fn a_new_sandbox_gets_version_1_of_its_template() {
+        let (_dir, engine, name) = with_sandbox();
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 1);
+        assert_eq!(view.snapshot.inputs.template.as_str(), "assistant");
+        assert_eq!(view.snapshot.policy.fs.write, ["{home}"]);
+        assert!(view.file.exists());
+        assert!(engine.layout.sandbox_home("home").is_dir());
+    }
+
+    #[test]
+    fn allow_adds_a_version_and_an_audit_entry() {
+        let (_dir, engine, name) = with_sandbox();
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "API.Example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(applied.changed);
+        assert_eq!(applied.version.version, 2);
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.snapshot.policy.net.allow, ["api.example.com"]);
+        assert!(
+            std::fs::read_to_string(&view.file)
+                .unwrap()
+                .contains("\"api.example.com\"")
+        );
+
+        // Allowing it again changes nothing.
+        let again = done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(!again.changed);
+        assert_eq!(engine.state.policy_history(&name).unwrap().len(), 2);
+
+        let entries = engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "policy allow");
+        assert_eq!(last.intent.target.as_deref(), Some("home api.example.com"));
+    }
+
+    #[test]
+    fn unsafe_destinations_are_refused_and_change_nothing() {
+        let (_dir, engine, name) = with_sandbox();
+        for bad in ["*.com", "localhost", "169.254.169.254"] {
+            let err = engine
+                .policy_allow(&alice(), &name, bad, Confirm::Ask)
+                .unwrap_err();
+            assert!(matches!(err, Error::Policy(_)), "{bad}: {err}");
+        }
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing() {
+        let (_dir, engine, name) = with_sandbox();
+        let planned = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::DryRun)
+            .unwrap();
+        assert!(
+            matches!(planned, Planned::DryRun(ref plan) if plan.changes.len() == 1),
+            "{planned:?}"
+        );
+        assert!(
+            engine
+                .policy(&name)
+                .unwrap()
+                .snapshot
+                .policy
+                .net
+                .allow
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allowing_an_entry_the_file_already_lists_applies_it() {
+        let (_dir, engine, name) = with_sandbox();
+        let file = engine.layout.policy_file("home");
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("allow_add = []", "allow_add = [\"new.example.com\"]");
+        std::fs::write(&file, text).unwrap();
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "new.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(applied.changed);
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 2);
+        assert_eq!(view.snapshot.policy.net.allow, ["new.example.com"]);
+    }
+
+    /// Rewrites the sandbox's `policy.toml`, as a user editing it would.
+    fn edit_policy(engine: &Engine, from: &str, to: &str) {
+        let file = engine.layout.policy_file("home");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(from), "{text}");
+        std::fs::write(&file, text.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn allowing_with_other_edits_pending_asks_and_names_them() {
+        let (dir, engine, name) = with_sandbox();
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        let work = dir.path().join("work").display().to_string();
+        edit_policy(
+            &engine,
+            "write_add = []",
+            &format!("write_add = [\"{work}\"]"),
+        );
+
+        let planned = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::DryRun)
+            .unwrap();
+        let Planned::DryRun(plan) = planned else {
+            panic!("{planned:?}")
+        };
+        assert_eq!(plan.changes.len(), 2, "{plan:?}");
+        assert!(plan.changes[1].contains(&work), "{plan:?}");
+
+        let err = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+            .unwrap_err();
+        assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+        assert!(err.to_string().contains(&work), "{err}");
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(applied.version.version, 2);
+        assert_eq!(applied.also.len(), 1, "{:?}", applied.also);
+        let summary = engine.audit(None).unwrap().pop().unwrap();
+        assert!(format!("{summary:?}").contains(&work), "{summary:?}");
+    }
+
+    #[test]
+    fn a_dry_run_reports_what_the_real_run_would() {
+        let (_dir, engine, name) = with_sandbox();
+        done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        let planned = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::DryRun)
+            .unwrap();
+        assert!(
+            matches!(&planned, Planned::DryRun(plan) if plan.changes[0].contains("change nothing")),
+            "{planned:?}"
+        );
+        // A private address without its opt-in is refused by a dry run too.
+        let err = engine
+            .policy_allow(&alice(), &name, "192.168.1.5", Confirm::DryRun)
+            .unwrap_err();
+        assert!(matches!(err, Error::Policy(_)), "{err}");
+    }
+
+    #[test]
+    fn a_failed_file_write_adds_no_version_and_the_retry_applies() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, engine, name) = with_sandbox();
+        let folder = engine
+            .layout
+            .policy_file("home")
+            .parent()
+            .unwrap()
+            .to_owned();
+        let mode = |m| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(m));
+        mode(0o500).unwrap();
+        let failed = engine.policy_allow(&alice(), &name, "api.example.com", Confirm::Ask);
+        mode(0o700).unwrap();
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(applied.changed);
+        assert_eq!(applied.version.version, 2);
+    }
+
+    #[test]
+    fn a_hand_edit_that_grants_enclos_files_is_refused() {
+        let (_dir, engine, name) = with_sandbox();
+        let file = engine.layout.policy_file("home");
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("write_add = []", "write_add = [\"~\"]");
+        std::fs::write(&file, text).unwrap();
+        let err = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+            .unwrap_err();
+        assert!(err.to_string().contains("enclos's own files"), "{err}");
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+    }
+
+    #[test]
+    fn unknown_sandboxes_are_named_in_the_error() {
+        let (_dir, engine) = engine();
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let err = engine.policy(&"nope".parse().unwrap()).unwrap_err();
+        assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
+    }
 }

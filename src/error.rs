@@ -2,6 +2,7 @@
 
 use crate::audit::AuditError;
 use crate::layout::LayoutError;
+use crate::policy::PolicyError;
 use crate::state::StateError;
 
 #[derive(Debug, thiserror::Error)]
@@ -12,6 +13,12 @@ pub enum Error {
     State(#[from] StateError),
     #[error(transparent)]
     Audit(#[from] AuditError),
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    #[error("there is no sandbox named `{name}`. Run `enclos sandbox list` to see them")]
+    NoSuchSandbox { name: String },
+    #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
+    NoPolicy { sandbox: String },
     /// The policy does not allow the command; see design principle 6.
     #[error("refused by policy: {reason}")]
     Refused { reason: String },
@@ -37,7 +44,12 @@ impl Error {
         match self {
             Error::Refused { .. } => exit::REFUSED,
             Error::NeedsConfirmation { .. } => exit::NEEDS_CONFIRMATION,
-            Error::Layout(_) | Error::State(_) | Error::Audit(_) => exit::ERROR,
+            Error::Layout(_)
+            | Error::State(_)
+            | Error::Audit(_)
+            | Error::Policy(_)
+            | Error::NoSuchSandbox { .. }
+            | Error::NoPolicy { .. } => exit::ERROR,
         }
     }
 }

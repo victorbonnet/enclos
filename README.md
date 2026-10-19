@@ -1,2 +1,2 @@
 # enclos
-Run AI agents in sandboxes you control, with policy and an audit log
+Creates sandboxes, installs agent runtimes in them and runs agents there, with policy and an audit log

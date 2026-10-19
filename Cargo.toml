@@ -3,18 +3,21 @@ name = "enclos"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "Run AI agents in sandboxes you control, with policy and an audit log"
+description = "Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log"
 license = "MIT"
 repository = "https://github.com/victorbonnet/enclos"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 jiff = { version = "0.2.38", features = ["serde"] }
+psl = "2.1.242"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "2.0.21"
+toml = "1.1.8"
+toml_edit = "0.25.17"
 whoami = { version = "2.1.3", default-features = false, features = ["std"] }
 
 [lints.rust]

@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod plan;
+pub mod policy;
 pub mod sandbox;
 
 /// A point in time, stored and printed in RFC 3339 (UTC).

@@ -1,6 +1,6 @@
 # enclos
 
-enclos creates sandboxes, installs AI agents in them, and keeps a state and an audit log of every command that changes them. It manages only the sandboxes it creates.
+enclos creates sandboxes, installs agent runtimes in them and runs agents there, and keeps a state and an audit log of every command that changes them. It manages only the sandboxes it creates.
 
 ## Language
 
@@ -36,16 +36,16 @@ _Avoid_: draft, staged policy
 A reusable policy that a sandbox's policy extends, such as `minimal`, `mcp-only`, `assistant` or `coding`.
 _Avoid_: preset, base policy
 
-**Agent**:
-The agent runtime installed in a sandbox, such as Hermes, Claude Code or Codex. A sandbox holds at most one agent.
-_Avoid_: bot, assistant, program
+**Runtime**:
+The software installed in a sandbox to run its agents, such as Hermes, Claude Code or Codex. A sandbox holds at most one runtime.
+_Avoid_: agent (for the software), platform, program
 
-**Profile**:
-A named configuration of the agent with its own memory, skills, model and channels, run as its own service or session. Profiles in a sandbox share its policy. Agents without profiles have one profile named `default`.
-_Avoid_: instance, persona
+**Agent**:
+A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime without several agents has one agent named `default`.
+_Avoid_: profile (Hermes's word for it), instance, persona, bot
 
 **Session**:
-A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a profile's service, with every process it starts. A session records the policy snapshot it started under.
+A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or an agent's service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance
 
 **Member**:

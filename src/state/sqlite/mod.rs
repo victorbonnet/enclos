@@ -1,6 +1,7 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod policy;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -8,11 +9,15 @@ mod tests;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
 use super::{Migration, Result, StateError, StateLock, StateStore};
+use crate::model::audit::Actor;
+use crate::model::now;
+use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 
 /// How long `lock` waits for another enclos command to release the lock.
@@ -22,6 +27,9 @@ const LOCK_POLL: Duration = Duration::from_millis(50);
 pub struct SqliteStateStore {
     db: PathBuf,
     lock_file: PathBuf,
+    /// Set once `open` has compared the schema with the migrations: one
+    /// command opens the database several times.
+    schema_checked: OnceLock<()>,
 }
 
 impl SqliteStateStore {
@@ -29,6 +37,7 @@ impl SqliteStateStore {
         SqliteStateStore {
             db: db.into(),
             lock_file: lock_file.into(),
+            schema_checked: OnceLock::new(),
         }
     }
 
@@ -42,6 +51,8 @@ impl SqliteStateStore {
     fn connect(&self, flags: OpenFlags) -> Result<Connection> {
         let conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
         conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(self.sqlite_err())?;
         Ok(conn)
     }
 
@@ -69,7 +80,40 @@ impl SqliteStateStore {
                 current,
             });
         }
+        if self.schema_checked.get().is_none() {
+            self.check_schema(&conn, found)?;
+            let _ = self.schema_checked.set(());
+        }
         Ok(conn)
+    }
+
+    /// Refuses a database whose tables and columns differ from what this
+    /// enclos's own migrations make at its version: one written by an
+    /// unreleased build whose migrations changed since.
+    fn check_schema(&self, conn: &Connection, version: u32) -> Result<()> {
+        let expected = Connection::open_in_memory().map_err(self.sqlite_err())?;
+        for sql in &schema::MIGRATIONS[..version as usize] {
+            expected.execute_batch(sql).map_err(self.sqlite_err())?;
+        }
+        if columns(conn).map_err(self.sqlite_err())?
+            != columns(&expected).map_err(self.sqlite_err())?
+        {
+            return Err(StateError::UnknownSchema {
+                path: self.db.clone(),
+                found: version,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_err(&self, e: policy::ReadError) -> StateError {
+        match e {
+            policy::ReadError::Sqlite(source) => self.sqlite_err()(source),
+            policy::ReadError::Corrupt(detail) => StateError::Corrupt {
+                path: self.db.clone(),
+                detail,
+            },
+        }
     }
 
     fn record(&self, row: &Row<'_>) -> Result<SandboxRecord> {
@@ -101,6 +145,16 @@ impl SqliteStateStore {
 
 fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+/// Every table's columns, in order.
+fn columns(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.name, c.name FROM sqlite_schema AS m, pragma_table_info(m.name) AS c
+         WHERE m.type = 'table' ORDER BY m.name, c.cid",
+    )?;
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
 }
 
 fn state_columns(state: &SandboxState) -> (&'static str, Option<&str>) {
@@ -168,6 +222,7 @@ impl StateStore for SqliteStateStore {
                 current,
             });
         }
+        self.check_schema(&tx, from)?;
         for sql in &schema::MIGRATIONS[from as usize..] {
             tx.execute_batch(sql).map_err(self.sqlite_err())?;
         }
@@ -237,5 +292,27 @@ impl StateStore for SqliteStateStore {
         )
         .map_err(self.sqlite_err())?;
         Ok(())
+    }
+
+    fn save_policy(
+        &self,
+        _lock: &StateLock,
+        name: &SandboxName,
+        snapshot: &PolicySnapshot,
+        by: &Actor,
+        restores: Option<u32>,
+    ) -> Result<PolicyVersion> {
+        let mut conn = self.open()?;
+        policy::save(&mut conn, name, snapshot, by, now(), restores).map_err(self.sqlite_err())
+    }
+
+    fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>> {
+        let conn = self.open()?;
+        policy::active(&conn, name).map_err(|e| self.read_err(e))
+    }
+
+    fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>> {
+        let conn = self.open()?;
+        policy::history(&conn, name).map_err(|e| self.read_err(e))
     }
 }

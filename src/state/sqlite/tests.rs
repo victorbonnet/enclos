@@ -106,13 +106,33 @@ fn rejects_a_newer_schema() {
 }
 
 #[test]
+fn rejects_a_schema_its_migrations_do_not_make() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    // An unreleased build that named a column differently, at the same version.
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute_batch("ALTER TABLE sandboxes RENAME COLUMN backend TO kind")
+        .unwrap();
+    assert!(matches!(
+        store.list(),
+        Err(StateError::UnknownSchema { .. })
+    ));
+    assert!(matches!(
+        store.migrate(&lock),
+        Err(StateError::UnknownSchema { .. })
+    ));
+}
+
+#[test]
 fn reports_a_corrupt_record() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();
     store.migrate(&lock).unwrap();
     let conn = Connection::open(&store.db).unwrap();
     conn.execute(
-        "INSERT INTO sandboxes VALUES ('home', 'docker', 'created', NULL, 'x')",
+        "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at)
+         VALUES ('home', 'docker', 'created', NULL, 'x')",
         [],
     )
     .unwrap();
@@ -127,4 +147,34 @@ fn the_lock_is_exclusive_until_dropped() {
     assert!(matches!(other.try_lock(), Err(TryLockError::WouldBlock)));
     drop(lock);
     assert!(other.try_lock().is_ok());
+}
+
+#[test]
+fn policy_versions_append_and_identical_snapshots_are_stored_once() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+
+    let v1 = store.save_policy(&lock, &name, &snap, &by, None).unwrap();
+    let v2 = store
+        .save_policy(&lock, &name, &snap, &by, Some(1))
+        .unwrap();
+    assert_eq!((v1.version, v2.version, v2.restores), (1, 2, Some(1)));
+
+    let (active, stored) = store.active_policy(&name).unwrap().unwrap();
+    assert_eq!(active, v2);
+    assert_eq!(stored, snap);
+    assert_eq!(store.policy_history(&name).unwrap(), [v1, v2]);
+
+    // Removing the sandbox removes its history.
+    store.remove(&lock, &name).unwrap();
+    assert!(store.policy_history(&name).unwrap().is_empty());
 }
