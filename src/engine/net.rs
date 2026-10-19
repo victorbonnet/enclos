@@ -53,7 +53,15 @@ impl Engine {
         if let Some(by) = record {
             self.record_proxy(by, name)?;
         }
-        let _ = Arc::new(proxy).serve(socket).join();
-        Ok(())
+        let stopped = |source| Error::ProxyStopped {
+            sandbox: name.to_string(),
+            source,
+        };
+        let _ = Arc::new(proxy).serve(socket).map_err(stopped)?.join();
+        // Serving ends only if the accept loop died: an error, so the
+        // service manager starts the proxy again.
+        Err(stopped(std::io::Error::other(
+            "it stopped accepting connections",
+        )))
     }
 }

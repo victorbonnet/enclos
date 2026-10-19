@@ -58,6 +58,11 @@ pub enum Error {
         addr: String,
         source: std::io::Error,
     },
+    #[error("the proxy of sandbox `{sandbox}` stopped serving: {source}")]
+    ProxyStopped {
+        sandbox: String,
+        source: std::io::Error,
+    },
     /// The policy does not allow the command; see design principle 6.
     #[error("refused by policy: {reason}")]
     Refused { reason: String },
@@ -90,6 +95,7 @@ impl Error {
             | Error::NoSuchSandbox { .. }
             | Error::NoPolicy { .. }
             | Error::ProxyListen { .. }
+            | Error::ProxyStopped { .. }
             | Error::Compile(_)
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
