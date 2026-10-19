@@ -13,5 +13,6 @@ Every compiled Seatbelt policy is checked by escape probes in `enclos policy tes
 - The exact list of denied services is not known yet. The milestone 1 prototype produces it, together with the probes, and records which routes were tested. Until then the design lists the routes, not a verified rule set.
 - macOS privacy permissions (TCC) are not a sandbox: a process started from Terminal inherits Terminal's grants. The rules must hold without relying on them.
 - Flows that normally open a browser, such as a subscription login, must use a device code: the runtime prints a URL and a code for the user to open on the host.
+- A probe's exit code is not always evidence: `open -R` exits 0 inside the sandbox although Finder reveals nothing (shown in CI on macOS 14, 15 and 26 by checking Finder's front window from outside), so the LaunchServices probe uses `open <folder>`, which reports the refusal.
 - Passing probes show that the listed routes are closed, not that no route exists. New routes found later become new probes.
 - Linux has equivalent routes (the D-Bus session bus, the `systemd --user` manager, host sockets). They are masked by the bubblewrap backend and probed the same way when it is built.
