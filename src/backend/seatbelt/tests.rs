@@ -85,6 +85,14 @@ impl World {
 }
 
 #[test]
+fn an_installer_can_create_folders_in_its_home_with_mkdir_p() {
+    let w = world();
+    // mkdir -p checks every parent, from the root down to the home.
+    assert!(w.sh("/bin/mkdir -p \"$HOME/.hermes/hermes-agent/venv\""));
+    assert!(w.ctx.home.join(".hermes/hermes-agent/venv").is_dir());
+}
+
+#[test]
 fn the_sandbox_writes_only_in_its_home() {
     let w = world();
     assert!(w.sh("echo ok > \"$HOME/written\""));
