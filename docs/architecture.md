@@ -21,7 +21,7 @@ flowchart LR
   subgraph mac["Your Mac"]
     cli["enclos CLI"]
     launchd["launchd"]
-    proxy["Egress proxy<br/>one per sandbox,<br/>a port per agent"]
+    proxy["Egress proxy<br/>one per sandbox,<br/>on one port"]
 
     subgraph data["~/.enclos (protected: sandboxes cannot write it)"]
       state[("state.db<br/>sandboxes, policy snapshots,<br/>sessions, network log")]
@@ -37,7 +37,7 @@ flowchart LR
   end
 
   you --> cli
-  cli -->|"connect lab/main"| main
+  cli -->|"connect lab -- main"| main
   cli -->|"sandbox start"| launchd
   launchd -->|"enclos launch lab"| gateway
   launchd -->|"enclos proxy run"| proxy
@@ -52,7 +52,7 @@ flowchart LR
 
 - **The sandbox** is the permission boundary ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)). Every process in it runs under `sandbox-exec` with the sandbox's compiled policy: it writes only to its home and to devices, cannot read the sensitive deny list (`~/.ssh`, keychains, browser data, other agents' configuration, other sandboxes, enclos's files), connects only to its proxy's ports, and cannot reach host services such as LaunchServices, Apple Events, launchd, preferences or the pasteboard, or signal processes outside it.
 - **The runtime** (Hermes) is installed inside the sandbox's home by its own installer, run in the sandbox ([ADR 0020](adr/0020-runtimes-installed-per-sandbox.md)). Its **agents** share it, the policy, the proxy, the login and the secrets; each has its own configuration, memory, skills and sessions.
-- **The egress proxy** runs on the host, outside the sandbox. It allows only destinations on the policy's allowlist, resolves names itself, connects only to addresses it has validated ([ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)), and logs every connection. It reads the active policy for each new connection, so `enclos policy allow` applies without a restart. Each agent has its own proxy port, so the network log says which agent made a connection; that attribution is informative, not a boundary.
+- **The egress proxy** runs on the host, outside the sandbox. It allows only destinations on the policy's allowlist, resolves names itself, connects only to addresses it has validated ([ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)), and logs every connection. It reads the active policy for each new connection, so `enclos policy allow` applies without a restart. Each sandbox has one proxy port, so the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 - **Services**: `enclos sandbox start` installs two launchd jobs per sandbox, its proxy and its runtime's gateway, which serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). There is no enclos daemon ([ADR 0002](adr/0002-no-daemon.md)). Interactive sessions run in your terminal and use the same proxy.
 - **State and audit**: `state.db` (SQLite) holds the sandboxes, every policy snapshot, sessions and the network log; `audit.jsonl` holds one hash-chained entry per state-changing command ([ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md)).
 
@@ -83,7 +83,7 @@ A sandbox's policy is resolved from four layers: built-in defaults, a template (
 
 ## A session, step by step
 
-`enclos connect lab/main`:
+`enclos connect lab -- main`, which runs Hermes's own command for the agent `main`:
 
 ```mermaid
 sequenceDiagram
@@ -93,11 +93,11 @@ sequenceDiagram
   participant Proxy as Egress proxy
   participant SB as Sandbox lab
 
-  You->>CLI: enclos connect lab/main
+  You->>CLI: enclos connect lab -- main
   CLI->>Data: take the lock, open an audit entry, read the active snapshot
   CLI->>CLI: compile the policy (reused if unchanged)
   CLI->>Proxy: start it if it is not running (its own recorded session)
-  CLI->>SB: sandbox-exec hermes -p main, with an empty environment plus the proxy variables
+  CLI->>SB: sandbox-exec main, with an empty environment plus the proxy variables
   CLI->>Data: record the session, close the audit entry
   SB->>Proxy: CONNECT chatgpt.com:443
   Proxy->>Data: read the active policy, log the connection

@@ -48,8 +48,8 @@ enclos runtime login lab                      # device-code login, opened on you
 enclos agent add lab/main
 enclos policy test lab                        # escape probes; every one must fail
 enclos sandbox start lab                      # proxy and gateway in the background
-enclos connect lab/main                       # talk to the agent
-enclos net log lab/main                       # what it connected to
+enclos connect lab -- main                    # talk to the agent, with Hermes's own command
+enclos net log lab                            # what it connected to
 ```
 
 The [getting started guide](docs/getting-started.md) explains each step and what does not work yet.
@@ -62,7 +62,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 | `enclos sandbox create \| list \| show \| start \| stop \| restart \| rm` | Manage sandboxes and their background services |
 | `enclos runtime install \| login` | Install a runtime in a sandbox and log it in |
 | `enclos agent add \| list \| rm` | Manage a sandbox's agents |
-| `enclos connect <sandbox>[/<agent>]` | Talk to an agent, or open a shell, inside a sandbox |
+| `enclos connect <sandbox> [-- <command>]` | Open a shell in a sandbox, or run a command there, such as the runtime's own to talk to an agent |
 | `enclos policy show \| allow \| test` | Read or widen a sandbox's policy, and run its escape probes |
 | `enclos net log \| denied` | The network log, and what was refused |
 | `enclos logs <sandbox>` | The background services' logs |
