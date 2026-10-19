@@ -49,7 +49,7 @@ fn print(view: &StatusView) {
     println!(
         "{}, {}, {} in {}",
         count(view.sandboxes.len(), "sandbox", "sandboxes"),
-        count(view.tracked_agents(), "agent", "agents"),
+        count(view.agent_count(), "agent", "agents"),
         size(view.bytes()),
         tilde(&view.data.display().to_string())
     );
@@ -129,10 +129,8 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     }
     facts.push(format!("last connect {}", ago(s.last_connect, now)));
     facts.push(format!("last network {}", ago(s.last_network, now)));
-    match (&s.runtime, &s.agents) {
-        (Some(_), None) => facts.push("agent default".into()),
-        (_, Some(a)) if a.is_empty() => facts.push("no agents".into()),
-        _ => {}
+    if s.agents.as_ref().is_some_and(|a| a.is_empty()) {
+        facts.push("no agents".into());
     }
     println!("  {}", facts.join(" · "));
 
@@ -180,6 +178,9 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
 }
 
 fn note(a: &AgentStatus) -> Option<&'static str> {
+    if a.builtin {
+        return Some("built in");
+    }
     match (a.tracked, a.in_runtime) {
         (false, Some(true)) if a.trackable => Some("made inside the sandbox, not tracked"),
         (false, Some(true)) => Some("a name enclos cannot track"),

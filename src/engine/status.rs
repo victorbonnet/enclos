@@ -58,12 +58,12 @@ impl StatusView {
         )
     }
 
-    /// The agents enclos tracks, in every sandbox.
-    pub fn tracked_agents(&self) -> usize {
+    /// The agents in every sandbox: tracked, or built into their runtime.
+    pub fn agent_count(&self) -> usize {
         self.sandboxes
             .iter()
             .flat_map(|s| s.agents.iter().flatten())
-            .filter(|a| a.tracked)
+            .filter(|a| a.tracked || a.builtin)
             .count()
     }
 }
@@ -93,7 +93,7 @@ pub struct SandboxStatus {
     pub last_network: Option<Timestamp>,
     /// Destinations refused in the last 7 days.
     pub refused_recently: usize,
-    /// `None` when the runtime has no named agents (one `default`).
+    /// `None` when the runtime cannot tell what agents it has.
     pub agents: Option<Vec<AgentStatus>>,
     pub disk: Disk,
 }
@@ -134,6 +134,8 @@ pub struct ServiceLine {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentStatus {
     pub name: String,
+    /// The runtime's built-in agent: no record, never added or removed.
+    pub builtin: bool,
     /// enclos has a record of it.
     pub tracked: bool,
     /// Whether the runtime has it; `None`: cannot tell.
@@ -323,12 +325,14 @@ impl Engine {
     ) -> Result<Option<Vec<AgentStatus>>> {
         let tracked = self.state.agents(name)?;
         // `Err`: the list cannot be read (ADR 0023), so `in_runtime` is
-        // unknown for every agent.
+        // unknown for every agent but the built-in one.
         let found = runtime.agents_in(home).ok();
-        if found.is_none() && tracked.is_empty() {
+        let builtin = runtime.builtin_agent();
+        if found.is_none() && tracked.is_empty() && builtin.is_none() {
             return Ok(None);
         }
-        let mut names: Vec<String> = tracked.iter().map(|a| a.name.to_string()).collect();
+        let mut names: Vec<String> = builtin.into_iter().map(str::to_owned).collect();
+        names.extend(tracked.iter().map(|a| a.name.to_string()));
         for n in found.iter().flatten() {
             if !names.iter().any(|m| m == n.as_str()) {
                 names.push(n.to_string());
@@ -338,9 +342,14 @@ impl Engine {
             .into_iter()
             .map(|agent| {
                 let facts = runtime.agent_facts(&agent);
+                let is_builtin = builtin == Some(agent.as_str());
                 AgentStatus {
+                    builtin: is_builtin,
                     tracked: tracked.iter().any(|t| t.name.as_str() == agent),
-                    in_runtime: found.as_ref().map(|f| f.iter().any(|n| n.as_str() == agent)),
+                    in_runtime: match is_builtin {
+                        true => Some(true),
+                        false => found.as_ref().map(|f| f.iter().any(|n| n.as_str() == agent)),
+                    },
                     trackable: agent.parse::<crate::model::agent::AgentName>().is_ok(),
                     last_active: facts
                         .activity
@@ -389,6 +398,7 @@ pub fn suggest(sandboxes: &[SandboxStatus], now: Timestamp) -> Vec<Suggestion> {
         for a in s.agents.iter().flatten() {
             let target = format!("{sb}/{}", a.name);
             match (a.tracked, a.in_runtime) {
+                _ if a.builtin => {}
                 (false, Some(true)) if a.trackable => add(
                     target.clone(),
                     "made inside the sandbox, not tracked".into(),

@@ -1466,16 +1466,19 @@ echo \"installed $*\" > \"$HOME/installed\"
             name: n.parse().unwrap(),
             created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         };
-        let found: Vec<RuntimeAgentName> = ["main", "scout", "a"]
-            .iter()
-            .map(|n| RuntimeAgentName::new(n).unwrap())
-            .collect();
-        let diff = AgentDiff::compare(&found, &[tracked("main"), tracked("gone")]);
+        let names = |names: &[&str]| -> Vec<RuntimeAgentName> {
+            names.iter().map(|n| RuntimeAgentName::new(n).unwrap()).collect()
+        };
+        let found = names(&["main", "scout", "a"]);
+        let diff = AgentDiff::compare(&found, &[tracked("main"), tracked("gone")], None);
         assert_eq!(diff.untracked, [agent("scout")]);
         assert_eq!(diff.untrackable, [RuntimeAgentName::new("a").unwrap()]);
         assert_eq!(diff.missing, [agent("gone")]);
         assert!(!diff.is_clean());
-        assert!(AgentDiff::compare(&found[..1], &[tracked("main")]).is_clean());
+        assert!(AgentDiff::compare(&found[..1], &[tracked("main")], None).is_clean());
+        // A runtime that lists its built-in agent: never untracked.
+        let both = names(&["main", "default"]);
+        assert!(AgentDiff::compare(&both, &[tracked("main")], Some("default")).is_clean());
     }
 
     #[cfg(target_os = "macos")]
@@ -2247,13 +2250,29 @@ mod status {
         std::fs::write(scout.join(".hermes_history"), "hello").unwrap();
         std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
         std::fs::write(home.join(".hermes/hermes-agent/big"), vec![0u8; 200_000]).unwrap();
+        // Hermes's own `default` profile, at the root of its home.
+        std::fs::write(
+            home.join(".hermes/config.yaml"),
+            "model:\n  model: gpt-6.1-terra\n",
+        )
+        .unwrap();
+        std::fs::write(home.join(".hermes/state.db"), vec![0u8; 50_000]).unwrap();
 
         let view = engine.status(None).unwrap();
         let s = &view.sandboxes[0];
         assert_eq!(s.runtime.as_ref().unwrap().logged_in, Some(false));
         let agents = s.agents.as_ref().unwrap();
-        assert_eq!(agents.len(), 1);
-        let a = &agents[0];
+        assert_eq!(agents.len(), 2);
+        let d = &agents[0];
+        assert_eq!(
+            (d.name.as_str(), d.builtin, d.tracked, d.model.as_deref()),
+            ("default", true, false, Some("gpt-6.1-terra"))
+        );
+        // Its size is the root data, not the runtime install under it.
+        let size = d.bytes.unwrap();
+        assert!((50_000..200_000).contains(&size), "{size}");
+        assert!(d.last_active.is_some());
+        let a = &agents[1];
         assert_eq!(
             (a.name.as_str(), a.tracked, a.in_runtime, a.model.as_deref()),
             ("scout", false, Some(true), Some("gpt-6.1-sol"))
@@ -2273,8 +2292,24 @@ mod status {
             commands.contains(&"enclos runtime login home"),
             "{commands:?}"
         );
-        assert_eq!(view.tracked_agents(), 0);
+        assert!(
+            !commands.contains(&"enclos agent add home/main"),
+            "{commands:?}"
+        );
+        assert_eq!(view.agent_count(), 1);
         assert_eq!(engine.status(Some(&name)).unwrap().sandboxes.len(), 1);
+
+        // enclos neither adds nor removes the built-in agent.
+        let default: AgentName = "default".parse().unwrap();
+        let err = engine
+            .add_agent(&alice(), &name, default.clone())
+            .unwrap_err();
+        assert!(err.to_string().contains("built-in agent"), "{err}");
+        let err = engine
+            .remove_agent(&alice(), &name, &default, false, Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("built-in agent"), "{err}");
+        assert_eq!(engine.builtin_agent(&name).unwrap(), Some("default"));
         assert!(engine.status(Some(&"nope".parse().unwrap())).is_err());
     }
 }

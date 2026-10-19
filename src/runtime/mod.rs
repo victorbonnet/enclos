@@ -151,6 +151,13 @@ pub trait RuntimeAdapter {
     /// read a bounded number of entries, and answer [`Unreadable`], with
     /// the reason, rather than guess (ADR 0023).
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    /// The name of the agent the runtime always has once installed, such as
+    /// Hermes's `default`: it exists as long as the runtime, so enclos lists
+    /// it without a record and neither adds nor removes it. `None`: every
+    /// agent is one enclos adds.
+    fn builtin_agent(&self) -> Option<&'static str> {
+        None
+    }
     /// The runtime's own command that deletes an agent and its data, run in
     /// the sandbox by `enclos agent rm`. `None`: the files stay.
     fn delete_agent(&self, _name: &AgentName) -> Option<Vec<OsString>> {
