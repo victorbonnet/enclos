@@ -128,8 +128,13 @@ impl Layout {
         self.roots()
     }
 
+    /// The folder holding every sandbox's folder.
+    pub fn sandboxes_dir(&self) -> PathBuf {
+        self.data.join("sandboxes")
+    }
+
     pub fn sandbox_dir(&self, name: &str) -> PathBuf {
-        self.data.join("sandboxes").join(name)
+        self.sandboxes_dir().join(name)
     }
 
     /// The sandbox's home folder: the runtime's home and the one place it may
@@ -160,6 +165,28 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
+    /// The proxies' control sockets.
+    pub fn run_dir(&self) -> PathBuf {
+        self.data.join("run")
+    }
+
+    /// Files no sandbox may read (ADR 0010). Each covers every file whose
+    /// name starts with it too, such as `state.db-journal` or
+    /// `audit.jsonl.torn-12`.
+    pub fn hidden_files(&self) -> Vec<PathBuf> {
+        vec![
+            self.state_db(),
+            self.state_lock(),
+            self.audit_log(),
+            self.config_file(),
+        ]
+    }
+
+    /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
+    pub fn hidden_dirs(&self) -> Vec<PathBuf> {
+        vec![self.run_dir()]
+    }
+
     fn roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![self.data.clone()];
         if self.config != self.data {
@@ -177,8 +204,8 @@ impl Layout {
             self.audit_log(),
             self.data.join("runtimes"),
             self.config.join("templates"),
-            self.data.join("run"),
-            self.data.join("sandboxes"),
+            self.run_dir(),
+            self.sandboxes_dir(),
         ]);
         paths
     }
@@ -198,8 +225,8 @@ impl Layout {
         [
             self.data.join("runtimes"),
             self.config.join("templates"),
-            self.data.join("run"),
-            self.data.join("sandboxes"),
+            self.run_dir(),
+            self.sandboxes_dir(),
         ]
         .iter()
         .try_for_each(|dir| create_dir(dir))
@@ -228,9 +255,10 @@ impl Layout {
         Ok(true)
     }
 
-    /// Creates a sandbox's folder and its home.
+    /// Creates a sandbox's folder, its home, and the home's `tmp`, which
+    /// `TMPDIR` points at: the sandbox cannot write `/tmp`.
     pub fn create_sandbox_dirs(&self, name: &str) -> Result<(), LayoutError> {
-        create_dir(&self.sandbox_home(name))
+        create_dir(&self.sandbox_home(name).join("tmp"))
     }
 
     pub fn read_policy(&self, name: &str) -> Result<String, LayoutError> {

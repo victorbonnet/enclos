@@ -1,7 +1,13 @@
 //! A backend for tests: it reports whatever kind and probe it is given and
 //! touches nothing on the host.
 
-use super::{Backend, Probe};
+use std::path::Path;
+use std::process::Command;
+
+use super::{
+    Backend, Capabilities, CompileError, Compiled, Enforcement, Launch, Probe, SandboxContext,
+};
+use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 
 pub struct FakeBackend {
@@ -36,6 +42,38 @@ impl Backend for FakeBackend {
 
     fn probe(&self) -> Probe {
         self.probe.clone()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            fs: Enforcement::Enforced,
+            network: Enforcement::Enforced,
+            exec: Enforcement::Unsupported,
+            resources: Enforcement::Unsupported,
+            members: Enforcement::Enforced,
+        }
+    }
+
+    /// One line per grant, so tests can see what reached the backend.
+    fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
+        let mut text = format!("fake policy for {}\n", ctx.name);
+        for w in &policy.fs.write {
+            text.push_str(&format!("write {w}\n"));
+        }
+        for d in &policy.net.allow {
+            text.push_str(&format!("allow {d}\n"));
+        }
+        Ok(Compiled {
+            text,
+            extension: "fake",
+        })
+    }
+
+    /// Runs the program as it is, outside any sandbox.
+    fn wrap(&self, _compiled: &Path, _ctx: &SandboxContext, launch: &Launch) -> Command {
+        let mut command = Command::new(&launch.program);
+        command.args(&launch.args);
+        command
     }
 }
 
