@@ -432,6 +432,39 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn a_session_stays_open_while_its_command_left_processes_running() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    // The command exits at once and leaves a short sleep in its group, with
+    // its output closed so this test does not wait for it.
+    let script = "/bin/sleep 3 >/dev/null 2>&1 & exit 0";
+    let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
+    assert_eq!(out.code(), 0, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("left 1 processes running"),
+        "{}",
+        out.stderr()
+    );
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains("session 2 interactive"), "{show}");
+    assert!(show.contains("sleep"), "{show}");
+    // Its home cannot be removed while the process runs.
+    let rm = home.run(&["sandbox", "rm", "home", "--yes"]);
+    assert_ne!(rm.code(), 0, "{}", rm.stdout());
+
+    // Once the sleep ends, stop finds the group empty and ends the session.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    home.run(&["sandbox", "stop", "home"]).ok();
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains("no sessions running"), "{show}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn connect_refuses_a_port_another_program_listens_on() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
