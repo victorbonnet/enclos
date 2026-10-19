@@ -52,7 +52,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Policy | What a sandbox may do. Layered on a template, stored as immutable snapshots, compiled per backend. A sandbox has one active policy and at most one pending policy. | `extends = "assistant"` plus overrides |
 | Runtime | The software installed in a sandbox to run its agents. One runtime per sandbox. | Hermes, Claude Code, Codex |
 | Agent | A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. Runtimes without several agents (Claude Code, Codex) have one agent named `default`. | agent `main` in sandbox `home` |
-| Session | One run inside a sandbox (an interactive `connect`, an `exec`, or an agent's service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home/main` |
+| Session | One run inside a sandbox (an interactive `connect`, an `exec`, or an agent's service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
 | Audit entry | One record per state-changing command: time, user, host, command, state before and after, result. Append-only, hash-chained. | `enclos policy allow home api.telegram.org` |
 
 Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
@@ -78,7 +78,7 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
      (every session runs inside the sandbox's policy, under the snapshot it started with)
 ```
 
-Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running agent, `enclos.<sandbox>.<agent>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that agent, and then runs the agent's wrapped command. An agent unit runs `enclos launch <sandbox>/<agent>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each agent gets its own listener port on the proxy, taken from a block of ports reserved for the sandbox when it is created, so the network log is per agent and adding an agent does not change the compiled policy; this attribution is informative, not a security boundary, since agents share a policy.
+Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running agent, `enclos.<sandbox>.<agent>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that agent, and then runs the agent's wrapped command. An agent unit runs `enclos launch <sandbox>/<agent>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 
 ## 5. Isolation backends
 
@@ -88,7 +88,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per runn
 | File writes | yes | yes (mount namespace + Landlock) | yes | yes |
 | File read deny list | yes | yes (paths not mounted) | yes | yes |
 | Programs allowed | yes (`process-exec` rules) | partial (mounted binaries + Landlock execute) | yes | yes |
-| Network (via proxy) | yes (the sandbox's localhost proxy ports only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
+| Network (via proxy) | yes (the sandbox's localhost proxy port only) | yes (own network namespace, Unix socket to proxy) | yes | yes (vsock or host IP) |
 | Host-service delegation blocked | to verify (§5, §14) | planned: host sockets masked (§5), to verify in milestone 3 | yes | yes |
 | CPU and memory limits | partial (`ulimit`, `taskpolicy`) | yes (cgroups via `systemd-run --user`) | yes | yes |
 | Tracking every process | to verify (§8) | yes (cgroup) | yes | yes |
@@ -117,7 +117,7 @@ macOS privacy permissions (TCC) are not part of the sandbox: a process started f
 
 The exact rule list is **to verify**: the milestone 1 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. Logins therefore use a device-code flow: the runtime prints a URL and a code, and the user opens the URL on the host.
 
-**Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each agent gets its own socket and relay, which keeps the network log per agent. The relay is the enclos binary, so bubblewrap always mounts it read-only and the program allowlist always permits it, even with `shell = false`. The agent can kill or replace its relay, which is harmless: the relay can only reach the proxy socket, and per-agent attribution is informative anyway.
+**Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each sandbox gets one socket and one relay. The relay is the enclos binary, so bubblewrap always mounts it read-only and the program allowlist always permits it, even with `shell = false`. The agent can kill or replace its relay, which is harmless: the relay can only reach the proxy socket.
 
 **Linux host services.** Linux has its own routes out: the D-Bus session bus, the `systemd --user` manager (which can start units outside the sandbox), and host sockets such as the SSH agent and Docker. A network namespace does not block Unix sockets that live on the filesystem, and a read-only mount does not stop a process from connecting to one, so broad reads must not expose them: bubblewrap masks `/run/user/<uid>` (which also holds the Wayland socket), `/tmp/.X11-unix` (X11 allows keystroke injection), the Docker socket and any socket named in `SSH_AUTH_SOCK`, and the escape probes cover them.
 
@@ -202,13 +202,13 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 **Effective policy.** Network rules follow the active snapshot live; file, program and resource rules are fixed when a session starts. `enclos sandbox show` lists each session with both, for example `network: v7 (live)  files, programs, resources: v5 (at launch)`, and flags a session as needing a restart only when its file, program or resource rules differ from the active snapshot's, not merely because the version number moved. A pending snapshot never applies to anything running.
 
-**Starting a session: `enclos connect home/main`, step by step**
+**Starting a session: `enclos connect home -- main`, step by step**
 
 1. Take the state lock; open an audit entry.
 2. Load the record and the active snapshot; compile it if no compiled policy exists for this snapshot and this enclos version (an upgrade recompiles, which is how stricter enclos-owned rules reach new sessions without asking; `enclos doctor` lists what changed); `prepare`.
-3. Start the proxy unit if it is not running, with the active network policy and one listener per agent.
+3. Start the proxy unit if it is not running, with the active network policy and the sandbox's listener.
 4. Record the session with its snapshot and compiled-policy hashes; close the audit entry; release the lock.
-5. `enclos launch` reads the secrets granted to the agent, wraps the agent's interactive command and runs it in the terminal, tracking its members.
+5. `enclos launch` reads the secrets granted to the agent, wraps the command (`main`, Hermes's own command for that agent; a login shell when none is given) and runs it in the terminal, tracking its members.
 6. When the session ends, take the lock, record the end and any surviving members, and append an audit entry.
 7. On failure at any step: stop what started, save `Failed { reason }`, and close the audit entry as failed.
 
@@ -232,11 +232,10 @@ pub struct SandboxSpec { pub name: SandboxName, pub backend: BackendKind, pub te
 pub struct SandboxRecord { pub spec: SandboxSpec, pub state: SandboxState,
                            pub active_policy: SnapshotId, pub pending_policy: Option<SnapshotId>,
                            pub agents: Vec<AgentRecord>, pub created_at: Timestamp }
-pub struct AgentRecord { pub name: AgentName, pub autostart: bool, pub state: SandboxState,
-                         pub proxy_port: u16 }            // per-agent listener, for the network log
+pub struct AgentRecord { pub name: AgentName, pub autostart: bool, pub state: SandboxState }
 pub enum SandboxState { Created, Running, Stopped, Failed { reason: String } }
 
-pub struct Target { pub sandbox: SandboxName, pub agent: Option<AgentName> }      // "home" or "home/main"
+pub struct AgentRef { pub sandbox: SandboxName, pub agent: AgentName }    // "home/main", in the agent commands
 
 pub struct SnapshotId([u8; 32]);             // SHA-256 of the resolved policy and its inputs
 pub struct PolicySnapshot { pub id: SnapshotId, pub inputs: PolicyInputs, pub policy: Policy }   // insert-only
@@ -292,9 +291,9 @@ pub trait Backend {
 ```rust
 pub fn decide(net: &NetPolicy, host: &Host, port: u16) -> Decision;                // Allow | Deny { reason }
 pub fn validate_addrs(net: &NetPolicy, host: &Host, addrs: &[IpAddr]) -> Vec<IpAddr>; // only addresses that passed
-pub struct ProxyConfig { pub sandbox: SandboxName, pub listeners: Vec<(AgentName, SocketAddr)>,
+pub struct ProxyConfig { pub sandbox: SandboxName, pub listen: SocketAddr,
                          pub control: PathBuf, pub net: NetPolicy, pub events: PathBuf }
-pub struct NetEvent { pub at: Timestamp, pub agent: Option<AgentName>, pub host: String, pub port: u16,
+pub struct NetEvent { pub at: Timestamp, pub sandbox: SandboxName, pub host: String, pub port: u16,
                       pub addr: Option<IpAddr>, pub server_name: Option<String>,   // from the ClientHello, if visible
                       pub verdict: Verdict, pub reason: Option<DenyReason>,
                       pub bytes_up: u64, pub bytes_down: u64, pub duration: Duration }
@@ -363,7 +362,7 @@ pub trait RuntimeAdapter {
     fn add_agent(&self, sb: &SandboxRecord, agent: &AgentSpec) -> Result<()>;          // model, skills, channels
     fn remove_agent(&self, sb: &SandboxRecord, agent: &AgentName, keep_data: bool) -> Result<()>;
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
-    fn command(&self, sb: &SandboxRecord, agent: &AgentName, mode: RunMode) -> Command;       // Interactive | Service
+    fn service(&self, sb: &SandboxRecord) -> Option<Command>;                   // the background process serving every agent
 }
 ```
 
@@ -382,9 +381,9 @@ impl Engine {
 
     pub fn create(&self, by: &Actor, spec: SandboxSpec, confirm: Confirm) -> Result<Planned<SandboxRecord>>;
     pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentSpec) -> Result<AgentRecord>;
-    pub fn remove_agent(&self, by: &Actor, target: &Target, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
-    pub fn start(&self, by: &Actor, target: &Target) -> Result<SandboxRecord>;   // proxy + autostart agent services
-    pub fn stop(&self, by: &Actor, target: &Target) -> Result<StopReport>;       // every member; survivors reported
+    pub fn remove_agent(&self, by: &Actor, agent: &AgentRef, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
+    pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + agent services
+    pub fn stop(&self, by: &Actor, name: &SandboxName) -> Result<StopReport>;       // every member; survivors reported
     pub fn remove(&self, by: &Actor, name: &SandboxName, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
     pub fn change_policy(&self, by: &Actor, name: &SandboxName, change: PolicyChange, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
     pub fn apply_pending(&self, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
@@ -393,7 +392,7 @@ impl Engine {
     pub fn rollback_policy(&self, by: &Actor, name: &SandboxName, to: u32, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
     pub fn test_policy(&self, by: &Actor, name: &SandboxName) -> Result<TestReport>;
     pub fn login(&self, by: &Actor, name: &SandboxName, method: LoginMethod) -> Result<Command>;
-    pub fn connect(&self, by: &Actor, target: &Target) -> Result<Command>;   // a shell, or an agent's interactive session
+    pub fn connect(&self, by: &Actor, name: &SandboxName, command: Vec<OsString>) -> Result<Command>;   // a shell, or the command
     pub fn exec(&self, by: &Actor, name: &SandboxName, cmd: Command) -> Result<Command>;
     pub fn launch(&self, target: &Target, kind: SessionKind) -> Result<Infallible>;   // every session goes through here
 }
@@ -442,9 +441,9 @@ enclos backend list | probe <name>
 enclos sandbox create <name> --backend seatbelt --template assistant [--workspace ~/dev/x]
 enclos sandbox list | show <name> | start | stop | restart    show: sessions, members, active and pending policy
 enclos sandbox rm <name> [--keep-data]
-enclos connect <name>[/<agent>]               a shell, or an agent's interactive session
+enclos connect <name> [-- <command...>]       a shell, or a command such as the runtime's own, in the sandbox
 enclos exec <name> -- <cmd...>
-enclos logs <name>[/<agent>] [-f]
+enclos logs <name> [-f]
 
 enclos agent add <name>/<agent> [--model ...] [--no-autostart]
 enclos agent list <name>
@@ -465,7 +464,7 @@ enclos runtime configure <name>[/<agent>] [--model ...] [--mcp-add name=https://
 enclos runtime login <name>[/<agent>] --api-key secret:<ref> | --subscription
 
 enclos secret set | list | rm <ref>
-enclos net log <name>[/<agent>] [-f] | net denied <name>
+enclos net log <name> [-f] | net denied <name>
 enclos denials <name>
 
 enclos state show | check | repair <name>
@@ -499,9 +498,9 @@ enclos policy test lab                          # `open` and osascript refused, 
 enclos sandbox start home lab                   # proxies + all four agents, under launchd
 enclos sandbox show home                        # agents, sessions, members, policy each started under
 
-enclos connect home/main
+enclos connect home -- main                     # Hermes's own command for the agent main
 #   > What's the weather right now in Paris, Cali and Tokyo?
-enclos net log home/main                        # every tunnel that agent opened
+enclos net log home                             # every tunnel the sandbox opened
 enclos net denied home                          # what was refused; allow what you trust with `enclos policy allow`
 enclos sandbox stop home lab                    # every member, services and sessions alike
 ```
@@ -534,11 +533,11 @@ enclos policy allow community mcp.example.org
   templates/                   user templates
   run/<sandbox>/               proxy control sockets
   sandboxes/<name>/
-    sandbox.toml               backend, runtime, agents (autostart, proxy port), created_at
+    sandbox.toml               backend, runtime, agents (autostart), created_at
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
     compiled/<snapshot>-<enclos version>/   what the backend received (.sb, bwrap argv)
     home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/
-    logs/<agent>/
+    logs/                      its services' output
 ```
 
 On Linux: `config.toml` and `templates/` in `$XDG_CONFIG_HOME/enclos`, everything else in `$XDG_DATA_HOME/enclos`. `ENCLOS_HOME` puts everything in one folder instead, on either system. Every state-changing command takes a lock, records its intent, does the work, then records result and new state. A crash leaves an unfinished entry, which `enclos audit verify` lists as a warning. A crash in the middle of writing a line leaves that line incomplete: `audit verify` warns about it, and the next state-changing command moves it to `audit.jsonl.torn-<line>` and records the move, with the removed bytes' hash, as a `recovered` line in the chain. Any other damage still stops every write until it is repaired. `enclos state check` compares records with reality (service units, sessions and their members, files, compiled policy).
@@ -558,7 +557,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - CLI, `init`, the `~/.enclos` layout, the state store with its lock, and the hash-chained audit log with `audit verify`;
    - the `assistant` template, policy resolution into immutable snapshots (§7), `policy show` and `policy allow`;
    - the Seatbelt backend: write rules, the sensitive deny list, protected paths, host-service blocks and proxy-only network, on the `(allow default)` baseline;
-   - the per-sandbox proxy with a listener per agent, the allowlist, immediate deny, address validation, `net log` and `net denied`;
+   - the per-sandbox proxy, the allowlist, immediate deny, address validation, `net log` and `net denied`;
    - the Hermes adapter: the shared runtime, writable install space in the home, agents, and the device-code subscription login;
    - `sandbox create`, `list`, `show`, `rm`; `agent add`, `list`, `rm`; `connect`;
    - launchd agents for each sandbox's proxy and each agent while the user is logged in, autostart, `sandbox` and `agent` `start`, `stop`, `restart`, and `logs`;
@@ -580,9 +579,9 @@ Each milestone holds only what its goal needs; everything else waits for a later
 
 1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes agents, every agent logged in through Hermes's device-code flow.
 2. `enclos sandbox start` on both sandboxes leaves each proxy and each agent running under launchd, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every agent, session and member, and the snapshot each session started under.
-3. In `enclos connect` to each agent, Hermes is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
+3. Through `enclos connect <sandbox> -- <hermes command>`, each agent is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
 4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and the shared runtime, enclos's files and the other sandbox are unchanged.
-5. Every connection appears in `enclos net log` for the agent that made it. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again, without a restart. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
+5. Every connection appears in `enclos net log` for the sandbox that made it. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again, without a restart. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
 6. `enclos policy test` on each sandbox runs at least these probes, all of which must fail to do what they try: every host-service route in §5 (including DNS), reads of each default sensitive path and protected path, reads and writes of the other sandbox's folder, a write outside the home, a connection to an unlisted destination, and connections to loopback, link-local and private addresses through an allowed name. The report lists every probe run.
 7. `enclos sandbox stop` ends every member, including services, interactive sessions and any browser or installer Hermes started, and `enclos sandbox show` reports none left.
 8. `enclos audit verify` passes, and the audit log holds an entry for every state-changing command in the scenario.

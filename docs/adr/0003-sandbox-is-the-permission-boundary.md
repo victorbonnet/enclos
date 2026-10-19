@@ -8,5 +8,5 @@ Each sandbox holds one runtime and any number of its agents. All agents in a san
 
 ## Consequences
 
-- The proxy gives each agent its own listener so the network log is per agent, but that attribution is informative, not a security boundary.
+- The network log is per sandbox, not per agent ([0024](0024-agents-reached-through-the-runtime.md); a per-agent listener was planned first).
 - Secrets are granted per agent, so each agent's session receives only its own variables. That limits mistakes, not a determined agent: every agent can still read the shared home, and a secret written there by one agent is readable by the others.
