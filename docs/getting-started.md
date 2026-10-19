@@ -62,7 +62,7 @@ Hermes prints its own next steps after creating an agent, such as `main setup` a
 
 ### Agents made inside the sandbox
 
-You can also create an agent with Hermes's own commands, from a shell in the sandbox (`enclos connect lab`, then `hermes profile create scout`). It works right away, but enclos does not know about it yet: it has no proxy port of its own, so its connections are not labelled with its name, and `enclos connect lab/scout` refuses it. enclos tells you when it sees one, at the end of the `connect` session, in `enclos agent list lab` and in `enclos sandbox show lab`:
+You can also create an agent with Hermes's own commands, from a shell in the sandbox (`enclos connect lab`, then `hermes profile create scout`). It works right away (`enclos connect lab -- scout`), but enclos has no record of it yet, so `enclos agent list lab` would not show it. enclos tells you when it sees one, at the end of the `connect` session, in `enclos agent list lab` and in `enclos sandbox show lab`:
 
 ```text
 lab/scout: made inside the sandbox, not tracked by enclos. Track it with `enclos agent add lab/scout`.
