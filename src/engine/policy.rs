@@ -88,14 +88,20 @@ impl Engine {
             |lock| {
                 self.require_sandbox(name)?;
                 let current = self.layout.read_policy(name.as_str())?;
-                let Some(updated) = with_allowed(&current, &entry)? else {
-                    let version = self.policy(name)?.version;
+                let updated = with_allowed(&current, &entry)?;
+                let overrides = updated.as_deref().unwrap_or(&current);
+                // The file may already list the entry, edited by hand but not
+                // applied yet: only the active snapshot says what the proxy
+                // enforces.
+                let active = self.policy(name)?;
+                let snapshot = policy::resolve(overrides, self.adapter_layer(name).as_ref())?;
+                if snapshot.id == active.snapshot.id {
                     return Ok(PolicyApplied {
-                        version,
+                        version: active.version,
                         changed: false,
                     });
-                };
-                let version = self.save_policy(lock, by, name, &updated)?;
+                }
+                let version = self.save_policy(lock, by, name, overrides)?;
                 Ok(PolicyApplied {
                     version,
                     changed: true,

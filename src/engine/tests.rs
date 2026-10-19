@@ -246,6 +246,25 @@ mod policy {
     }
 
     #[test]
+    fn allowing_an_entry_the_file_already_lists_applies_it() {
+        let (_dir, engine, name) = with_sandbox();
+        let file = engine.layout.policy_file("home");
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("allow_add = []", "allow_add = [\"new.example.com\"]");
+        std::fs::write(&file, text).unwrap();
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "new.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(applied.changed);
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 2);
+        assert_eq!(view.snapshot.policy.net.allow, ["new.example.com"]);
+    }
+
+    #[test]
     fn a_hand_edit_that_grants_enclos_files_is_refused() {
         let (_dir, engine, name) = with_sandbox();
         let file = engine.layout.policy_file("home");

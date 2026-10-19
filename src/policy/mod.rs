@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::model::policy::{
     AdapterInput, Policy, PolicyInputs, PolicySnapshot, SnapshotId, TemplateName,
 };
-use crate::net::host::AllowEntry;
+use crate::net::host::{AllowEntry, normalize_host};
 use file::PolicyFile;
 
 /// The built-in defaults every template builds on.
@@ -136,8 +136,13 @@ fn normalize(policy: &mut Policy) {
             *entry = parsed.to_string();
         }
     }
+    // The same canonical form validation and the proxy compare against.
     for entry in &mut policy.net.private {
-        *entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        *entry = match entry.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.to_string(),
+            Err(_) => normalize_host(entry)
+                .unwrap_or_else(|_| entry.trim().trim_end_matches('.').to_ascii_lowercase()),
+        };
     }
     for list in [
         &mut policy.fs.write,
@@ -165,6 +170,17 @@ mod tests {
     fn overrides(allow: &str) -> String {
         initial_overrides("home", &"assistant".parse().unwrap())
             .replace("allow_add = []", &format!("allow_add = [{allow}]"))
+    }
+
+    #[test]
+    fn private_entries_take_the_canonical_form_allow_entries_take() {
+        let text = overrides("\"[fd00:0:0::1]:8443\", \"Printer.LAN.\"").replace(
+            "[network]",
+            "[network]\nprivate = [\"fd00:0:0::1\", \"Printer.LAN.\"]",
+        );
+        let snap = resolve(&text, None).unwrap();
+        assert_eq!(snap.policy.net.private, ["fd00::1", "printer.lan"]);
+        assert!(snap.policy.net.allow.contains(&"[fd00::1]:8443".to_owned()));
     }
 
     #[test]
