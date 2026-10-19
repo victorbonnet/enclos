@@ -34,8 +34,10 @@ pub trait RuntimeAdapter {
     fn endpoints(&self) -> &'static str;
     fn installer(&self) -> Installer;
     fn home_files(&self) -> Vec<HomeFile>;
-    /// The runtime's own login and model choice, run in the terminal.
-    fn login(&self) -> Vec<OsString>;
+    /// What a person runs in the sandbox to log the runtime in and set it
+    /// up, for enclos's messages: `enclos connect <sandbox> -- <this>`.
+    /// enclos shows it, never runs it (ADR 0024).
+    fn login(&self) -> String;
     fn create_agent(&self, name: &AgentName) -> Vec<OsString>;
     /// What a person runs in the sandbox to talk to an agent, for enclos's
     /// messages: `enclos connect <sandbox> -- <this>` (ADR 0024).

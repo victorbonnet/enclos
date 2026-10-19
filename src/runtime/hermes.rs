@@ -56,10 +56,11 @@ impl RuntimeAdapter for Hermes {
         }]
     }
 
-    fn login(&self) -> Vec<OsString> {
-        // Picks the provider (OpenAI Codex, the ChatGPT subscription), runs its
-        // device-code login and lists the models this account may use.
-        args(&[HERMES, "model"])
+    fn login(&self) -> String {
+        // Hermes's setup wizard: the provider and its login, the model, and
+        // optional sections. `hermes model` covers only provider, login and
+        // model, which the prototype used (`setup` in the sandbox: to verify).
+        format!("{HERMES} setup")
     }
 
     fn create_agent(&self, name: &AgentName) -> Vec<OsString> {
@@ -98,6 +99,7 @@ mod tests {
     fn commands_name_the_agent() {
         let main: AgentName = "main".parse().unwrap();
         assert_eq!(Hermes.talk(&main), "hermes -p main");
+        assert_eq!(Hermes.login(), "hermes setup");
         assert_eq!(
             Hermes.create_agent(&main),
             args(&["hermes", "profile", "create", "main"])

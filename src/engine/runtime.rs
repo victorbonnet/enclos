@@ -153,12 +153,6 @@ impl Engine {
         Ok(path)
     }
 
-    /// The runtime's own login and model choice, in this terminal.
-    pub fn runtime_login(&self, by: &Actor, name: &SandboxName) -> Result<SessionEnd> {
-        let kind = self.runtime_of(name)?;
-        self.run_in_sandbox(by, name, adapter(kind).login(), "runtime login")
-    }
-
     /// Adds an agent: the runtime creates it inside the sandbox, and enclos
     /// records it. Nothing else changes: the policy and the proxy are the
     /// sandbox's (ADR 0024).
