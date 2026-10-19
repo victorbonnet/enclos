@@ -12,7 +12,7 @@ use std::path::PathBuf;
 /// One service, as enclos defines it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceUnit {
-    /// Unique on the host, such as `enclos.home.proxy`.
+    /// Unique on the host, such as `enclos.1f2e3d4c.home.proxy`.
     pub label: String,
     pub program: PathBuf,
     pub args: Vec<OsString>,

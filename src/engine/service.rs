@@ -4,7 +4,7 @@
 //! at each login; `sandbox stop` removes them.
 
 use std::ffi::OsString;
-use std::net::{SocketAddr, TcpStream};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -13,11 +13,12 @@ use super::Engine;
 use super::session::SessionEnd;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_members, group_of, reference};
+use crate::lifecycle::process::{group_members, group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
+use crate::policy::sha256_hex;
 use crate::runtime::adapter;
 use crate::service::{ServiceStatus, ServiceUnit};
 
@@ -39,14 +40,36 @@ impl Unit {
     }
 }
 
-pub fn label(name: &SandboxName, unit: Unit) -> String {
-    format!("enclos.{name}.{}", unit.as_str())
-}
-
 /// How long the gateway waits for the proxy service to listen.
 const PROXY_WAIT: Duration = Duration::from_secs(15);
 
 impl Engine {
+    /// The launchd label of one of the sandbox's units. Labels are shared by
+    /// every enclos install of the user (`ENCLOS_HOME`), and a sandbox name
+    /// is unique only within one, so the label names the install too: the
+    /// first 8 hex digits of the SHA-256 of its data folder.
+    pub fn label(&self, name: &SandboxName, unit: Unit) -> String {
+        let data = self.layout.data().as_os_str().as_bytes();
+        let install = &sha256_hex(data)[..8];
+        format!("enclos.{install}.{name}.{}", unit.as_str())
+    }
+
+    /// The units `start_sandbox` installs: the proxy, and the runtime's
+    /// gateway when it has one.
+    pub fn service_labels(&self, name: &SandboxName) -> Result<Vec<String>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let mut labels = vec![self.label(name, Unit::Proxy)];
+        if record
+            .runtime
+            .is_some_and(|kind| adapter(kind).service().is_some())
+        {
+            labels.push(self.label(name, Unit::Gateway));
+        }
+        Ok(labels)
+    }
+
     fn log_file(&self, name: &SandboxName, unit: Unit) -> PathBuf {
         self.layout
             .sandbox_dir(name.as_str())
@@ -96,7 +119,7 @@ impl Engine {
                     format!("127.0.0.1:{}", record.proxy_port).into(),
                 ];
                 let mut units = vec![ServiceUnit {
-                    label: label(name, Unit::Proxy),
+                    label: self.label(name, Unit::Proxy),
                     program: exe.clone(),
                     args,
                     log: self.log_file(name, Unit::Proxy),
@@ -107,7 +130,7 @@ impl Engine {
                     .is_some_and(|kind| adapter(kind).service().is_some())
                 {
                     units.push(ServiceUnit {
-                        label: label(name, Unit::Gateway),
+                        label: self.label(name, Unit::Gateway),
                         program: exe,
                         args: vec!["launch".into(), name.to_string().into()],
                         log: self.log_file(name, Unit::Gateway),
@@ -130,7 +153,7 @@ impl Engine {
     pub(super) fn stop_services(&self, name: &SandboxName) -> Result<()> {
         for unit in [Unit::Gateway, Unit::Proxy] {
             self.services
-                .stop(&label(name, unit))
+                .stop(&self.label(name, unit))
                 .map_err(|e| Error::Session {
                     what: e.to_string(),
                 })?;
@@ -142,7 +165,7 @@ impl Engine {
     pub fn service_status(&self, name: &SandboxName) -> Vec<(String, ServiceStatus)> {
         Unit::ALL
             .iter()
-            .map(|u| label(name, *u))
+            .map(|u| self.label(name, *u))
             .map(|l| {
                 let status = self.services.status(&l);
                 (l, status)
@@ -161,12 +184,22 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
+        // The sandbox's own proxy, not whatever listens on its port: a proxy
+        // records itself only once it holds the port, so a recorded proxy
+        // session whose process still runs is the proof (`proxy run --record`).
         let start = Instant::now();
-        while TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        while !self
+            .state
+            .sessions(name, true)?
+            .iter()
+            .any(|s| s.kind == SessionKind::Proxy && is_same(&s.root))
+        {
             if start.elapsed() > PROXY_WAIT {
                 return Err(Error::Session {
-                    what: format!("the proxy of sandbox {name} is not listening on {addr}"),
+                    what: format!(
+                        "the proxy of sandbox {name} did not start on port {}; see `enclos logs {name}`",
+                        record.proxy_port
+                    ),
                 });
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -246,7 +279,7 @@ impl Engine {
     }
 
     /// Records a proxy that a service started, so `connect` knows it runs.
-    pub fn record_proxy(&self, by: &Actor, name: &SandboxName) -> Result<SessionId> {
+    pub(super) fn record_proxy(&self, by: &Actor, name: &SandboxName) -> Result<SessionId> {
         let me = std::process::id();
         self.write(
             by,

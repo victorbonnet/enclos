@@ -83,6 +83,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 println!("  service {label}: {state}");
             }
         }
+        SandboxVerb::Start { name } if confirm == Confirm::DryRun => {
+            print_would_start(&name, &engine.service_labels(&name)?)
+        }
         SandboxVerb::Start { name } => print_started(&name, &engine.start_sandbox(by, &name)?),
         SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
             Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
@@ -91,7 +94,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::Restart { name } => match engine.stop_sandbox(by, &name, confirm)? {
             Planned::DryRun(plan) => {
                 plan.changes.iter().for_each(|c| println!("Would {c}."));
-                println!("Would start sandbox {name} again.");
+                print_would_start(&name, &engine.service_labels(&name)?);
             }
             Planned::Done(report) => {
                 let code = print_stop(&name, &report);
@@ -216,6 +219,12 @@ fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
         "End them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses."
     );
     exit::ERROR
+}
+
+fn print_would_start(name: &SandboxName, labels: &[String]) {
+    for label in labels {
+        println!("Would install and load the launchd job {label} for sandbox {name}.");
+    }
 }
 
 fn print_started(name: &SandboxName, labels: &[String]) {
