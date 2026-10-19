@@ -15,28 +15,32 @@ jobs:
       - run: rustup toolchain install
       - run: cargo build -q
       - name: probe variants
+        shell: bash {0}
         run: |
           set -u
-          sw_vers
+          sw_vers | grep ProductVersion
           export ENCLOS_HOME="$RUNNER_TEMP/e"
           E=./target/debug/enclos
           $E init >/dev/null
           $E sandbox create home >/dev/null
-          $E policy test home >/dev/null 2>&1 || true
+          $E policy test home >/dev/null 2>&1
           base=$(ls "$ENCLOS_HOME"/sandboxes/home/compiled/*.sb | head -1)
+          finder_front() { osascript -e 'tell application "Finder" to if (count of Finder windows) > 0 then get name of front Finder window' 2>&1; }
+          close_finder() { osascript -e 'tell application "Finder" to close every Finder window' >/dev/null 2>&1; }
           try() {  # name, extra SBPL, command...
             local name="$1" extra="$2"; shift 2
-            local sb="$RUNNER_TEMP/$name.sb"
+            local sb="$RUNNER_TEMP/x.sb"
             { cat "$base"; printf '%s\n' "$extra"; } > "$sb"
+            close_finder; sleep 1
             out=$(/usr/bin/sandbox-exec -f "$sb" "$@" 2>&1); st=$?
-            printf '%-34s exit=%-3s %s\n' "$name" "$st" "$(echo "$out" | tail -1 | cut -c1-120)"
+            sleep 2
+            printf '%-26s exit=%-3s finder-front=[%s] out=[%s]\n' "$name" "$st" "$(finder_front)" "$(echo "$out" | tr '\n' ' ' | cut -c1-160)"
           }
-          for cmd in "reveal:/usr/bin/open -g -R /System" "url:/usr/bin/open -g https://example.com" "app:/usr/bin/open -g -a TextEdit" "file:/usr/bin/open -g /System/Library/CoreServices/SystemVersion.plist"; do
-            n="${cmd%%:*}"; c="${cmd#*:}"
-            try "$n compiled" "" $c
-            try "$n +launchservicesd" '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))' $c
-            try "$n +coreservicesd" '(deny mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))' $c
-            try "$n +finder" '(deny mach-lookup (global-name-prefix "com.apple.finder"))' $c
-            try "$n +all-three" '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.CoreServices.coreservicesd") (global-name-prefix "com.apple.finder"))' $c
-          done
-          pkill -x TextEdit || true
+          echo "outside the sandbox:"; close_finder; /usr/bin/open -g -R /System; sleep 2; echo "  finder-front=[$(finder_front)]"
+          try "reveal compiled" "" /usr/bin/open -g -R /System
+          try "reveal +deny-all-mach" '(deny mach-lookup)' /usr/bin/open -g -R /System
+          try "reveal +deny-lsopen-again" '(deny lsopen)' /usr/bin/open -g -R /System
+          try "url compiled" "" /usr/bin/open -g https://example.com
+          try "folder compiled" "" /usr/bin/open -g /System
+          try "folder +deny-all-mach" '(deny mach-lookup)' /usr/bin/open -g /System
+          exit 0
