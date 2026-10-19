@@ -87,22 +87,14 @@ impl Engine {
                 // A proxy `connect` started would hold the ports the service needs.
                 self.stop_proxy(lock, name)?;
 
-                let mut args: Vec<OsString> = vec![
+                let args: Vec<OsString> = vec![
                     "proxy".into(),
                     "run".into(),
                     name.to_string().into(),
                     "--record".into(),
-                ];
-                args.extend([
                     "--listen".into(),
-                    format!("127.0.0.1:{}", record.port_base).into(),
-                ]);
-                for p in self.state.agents(name)? {
-                    args.extend([
-                        "--listen".into(),
-                        format!("127.0.0.1:{}={}", p.port, p.name).into(),
-                    ]);
-                }
+                    format!("127.0.0.1:{}", record.proxy_port).into(),
+                ];
                 let mut units = vec![ServiceUnit {
                     label: label(name, Unit::Proxy),
                     program: exe.clone(),
@@ -169,7 +161,7 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], record.port_base));
+        let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
         let start = Instant::now();
         while TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
             if start.elapsed() > PROXY_WAIT {
@@ -182,8 +174,7 @@ impl Engine {
         let summary = |(id, _): &(SessionId, _)| format!("session {id}");
         let (session, mut child) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
-                let ports = self.ports_of(&record)?;
-                let compiled = self.compile_policy(name, &ports)?;
+                let compiled = self.compile_policy(name, record.proxy_port)?;
                 let (version, snapshot) =
                     self.state
                         .active_policy(name)?
@@ -196,10 +187,9 @@ impl Engine {
                 let launch = Launch {
                     program: program.clone(),
                     args: args.to_vec(),
-                    proxy_port: record.port_base,
                     env: Vec::new(),
                 };
-                let ctx = self.sandbox_context(name, &ports);
+                let ctx = self.sandbox_context(name, record.proxy_port);
                 let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
                 let child = wrapped
                     .process_group(0)
@@ -213,7 +203,6 @@ impl Engine {
                 let session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
-                    agent: None,
                     kind: SessionKind::Service,
                     version: version.version,
                     snapshot: snapshot.id,
@@ -258,7 +247,6 @@ impl Engine {
                 let session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
-                    agent: None,
                     kind: SessionKind::Proxy,
                     version: version.version,
                     snapshot: snapshot.id,

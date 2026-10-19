@@ -1270,7 +1270,7 @@ mod services {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args[..4], ["proxy", "run", "home", "--record"]);
-        let port = engine.show_sandbox(&name).unwrap().record.port_base;
+        let port = engine.show_sandbox(&name).unwrap().record.proxy_port;
         assert!(args.contains(&format!("127.0.0.1:{port}")), "{args:?}");
         assert!(unit.env.iter().any(|(k, _)| k == "ENCLOS_HOME"));
         assert!(unit.log.ends_with("sandboxes/home/logs/proxy.log"));
