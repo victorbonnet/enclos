@@ -1,0 +1,42 @@
+# Throwaway experiment (not to merge): which Seatbelt rule closes `open -R`?
+name: lsopen-experiment
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - run: cargo build -q
+      - name: probe variants
+        run: |
+          set -u
+          sw_vers
+          export ENCLOS_HOME="$RUNNER_TEMP/e"
+          E=./target/debug/enclos
+          $E init >/dev/null
+          $E sandbox create home >/dev/null
+          $E policy test home >/dev/null 2>&1 || true
+          base=$(ls "$ENCLOS_HOME"/sandboxes/home/compiled/*.sb | head -1)
+          try() {  # name, extra SBPL, command...
+            local name="$1" extra="$2"; shift 2
+            local sb="$RUNNER_TEMP/$name.sb"
+            { cat "$base"; printf '%s\n' "$extra"; } > "$sb"
+            out=$(/usr/bin/sandbox-exec -f "$sb" "$@" 2>&1); st=$?
+            printf '%-34s exit=%-3s %s\n' "$name" "$st" "$(echo "$out" | tail -1 | cut -c1-120)"
+          }
+          for cmd in "reveal:/usr/bin/open -g -R /System" "url:/usr/bin/open -g https://example.com" "app:/usr/bin/open -g -a TextEdit" "file:/usr/bin/open -g /System/Library/CoreServices/SystemVersion.plist"; do
+            n="${cmd%%:*}"; c="${cmd#*:}"
+            try "$n compiled" "" $c
+            try "$n +launchservicesd" '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd"))' $c
+            try "$n +coreservicesd" '(deny mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))' $c
+            try "$n +finder" '(deny mach-lookup (global-name-prefix "com.apple.finder"))' $c
+            try "$n +all-three" '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.CoreServices.coreservicesd") (global-name-prefix "com.apple.finder"))' $c
+          done
+          pkill -x TextEdit || true
