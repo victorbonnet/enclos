@@ -828,10 +828,7 @@ mod runtime {
                 .contains("enclos runtime install hermes --sandbox home"),
             "{err}"
         );
-        let err = engine
-            .connect(&alice(), &name, Some("main"), Vec::new())
-            .unwrap_err();
+        let err = engine.agents(&name).unwrap_err();
         assert!(err.to_string().contains("no runtime yet"), "{err}");
-        assert!(engine.agents(&name).is_err());
     }
 }

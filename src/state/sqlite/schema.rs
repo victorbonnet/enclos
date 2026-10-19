@@ -70,7 +70,6 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE TABLE agents (
         sandbox    TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
         name       TEXT NOT NULL,
-        port       INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (sandbox, name)
     ) STRICT;",

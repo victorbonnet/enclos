@@ -69,11 +69,10 @@ impl RuntimeAdapter for Hermes {
         args(&[HERMES, "profile", "create", name.as_str()])
     }
 
-    fn interactive(&self, agent: Option<&AgentName>) -> Vec<OsString> {
-        match agent {
-            Some(p) => args(&[HERMES, "-p", p.as_str()]),
-            None => args(&[HERMES]),
-        }
+    fn talk(&self, agent: &AgentName) -> String {
+        // Hermes also writes a wrapper named after the agent (`main` runs
+        // `hermes -p main`), but not for one created with `--no-alias`.
+        format!("{HERMES} -p {agent}")
     }
 }
 
@@ -98,10 +97,7 @@ mod tests {
     #[test]
     fn commands_name_the_agent() {
         let main: AgentName = "main".parse().unwrap();
-        assert_eq!(
-            Hermes.interactive(Some(&main)),
-            args(&["hermes", "-p", "main"])
-        );
+        assert_eq!(Hermes.talk(&main), "hermes -p main");
         assert_eq!(
             Hermes.create_agent(&main),
             args(&["hermes", "profile", "create", "main"])

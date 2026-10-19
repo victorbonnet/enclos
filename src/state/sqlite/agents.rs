@@ -8,13 +8,8 @@ use crate::model::sandbox::SandboxName;
 
 pub fn put(conn: &Connection, sandbox: &SandboxName, p: &AgentRecord) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO agents (sandbox, name, port, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            sandbox.as_str(),
-            p.name.as_str(),
-            p.port,
-            p.created_at.to_string()
-        ],
+        "INSERT INTO agents (sandbox, name, created_at) VALUES (?1, ?2, ?3)",
+        params![sandbox.as_str(), p.name.as_str(), p.created_at.to_string()],
     )?;
     Ok(())
 }
@@ -29,17 +24,16 @@ pub fn remove(conn: &Connection, sandbox: &SandboxName, name: &AgentName) -> rus
 
 pub fn list(conn: &Connection, sandbox: &SandboxName) -> Result<Vec<AgentRecord>, ReadError> {
     let mut stmt =
-        conn.prepare("SELECT name, port, created_at FROM agents WHERE sandbox = ?1 ORDER BY port")?;
+        conn.prepare("SELECT name, created_at FROM agents WHERE sandbox = ?1 ORDER BY name")?;
     let mut rows = stmt.query(params![sandbox.as_str()])?;
     let mut agents = Vec::new();
     while let Some(row) = rows.next()? {
         let name: String = row.get(0)?;
-        let at: String = row.get(2)?;
+        let at: String = row.get(1)?;
         agents.push(AgentRecord {
             name: name
                 .parse()
                 .map_err(|e| ReadError::Corrupt(format!("{e}")))?,
-            port: row.get(1)?,
             created_at: at
                 .parse()
                 .map_err(|e| ReadError::Corrupt(format!("agent time `{at}`: {e}")))?,

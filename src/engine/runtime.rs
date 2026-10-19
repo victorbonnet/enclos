@@ -11,15 +11,12 @@ use super::Engine;
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::stop::{GRACE, stop};
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
-use crate::model::sandbox::{PORT_BLOCK, SandboxName};
-use crate::model::session::SessionKind;
+use crate::model::sandbox::SandboxName;
 use crate::runtime::{RuntimeAdapter, adapter};
-use crate::state::StateLock;
 
 impl Engine {
     /// The runtime installed in the sandbox.
@@ -81,7 +78,7 @@ impl Engine {
         )?;
         let mut command = vec!["/bin/bash".into(), installer_file.into_os_string()];
         command.extend(runtime.installer().args.iter().map(Into::into));
-        self.run_in_sandbox(by, name, None, command, "runtime install run")
+        self.run_in_sandbox(by, name, command, "runtime install run")
     }
 
     fn put_home_files(&self, home: &std::path::Path, runtime: &dyn RuntimeAdapter) -> Result<()> {
@@ -150,12 +147,12 @@ impl Engine {
     /// The runtime's own login and model choice, in this terminal.
     pub fn runtime_login(&self, by: &Actor, name: &SandboxName) -> Result<SessionEnd> {
         let kind = self.runtime_of(name)?;
-        self.run_in_sandbox(by, name, None, adapter(kind).login(), "runtime login")
+        self.run_in_sandbox(by, name, adapter(kind).login(), "runtime login")
     }
 
-    /// Adds an agent: the runtime creates it inside the sandbox, then it gets
-    /// its own proxy port. A running proxy restarts at the next session to
-    /// listen on it.
+    /// Adds an agent: the runtime creates it inside the sandbox, and enclos
+    /// records it. Nothing else changes: the policy and the proxy are the
+    /// sandbox's (ADR 0024).
     pub fn add_agent(
         &self,
         by: &Actor,
@@ -171,7 +168,6 @@ impl Engine {
         let created = self.run_in_sandbox(
             by,
             name,
-            None,
             adapter(kind).create_agent(&agent),
             "agent add run",
         )?;
@@ -183,29 +179,17 @@ impl Engine {
                 ),
             });
         }
-        let summary = |p: &AgentRecord| format!("port {}", p.port);
         self.write(
             by,
             "agent add",
             Some(format!("{name}/{agent}")),
-            summary,
+            |_| "added".to_owned(),
             |lock| {
-                let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-                    name: name.to_string(),
-                })?;
-                let used: Vec<u16> = self.state.agents(name)?.iter().map(|p| p.port).collect();
-                let port = (record.port_base + 1..record.port_base + PORT_BLOCK)
-                    .find(|p| !used.contains(p))
-                    .ok_or_else(|| Error::Session {
-                        what: format!("sandbox {name} has no free agent port left (15 at most)"),
-                    })?;
                 let added = AgentRecord {
                     name: agent.clone(),
-                    port,
                     created_at: now(),
                 };
                 self.state.put_agent(lock, name, &added)?;
-                self.stop_proxy(lock, name)?;
                 Ok(added)
             },
         )
@@ -221,44 +205,20 @@ impl Engine {
         Ok(self.state.agents(name)?)
     }
 
-    /// Removes an agent's record and port. Its files stay in the sandbox
-    /// home; the runtime's own commands remove them.
+    /// Removes an agent's record. Its files stay in the sandbox home; the
+    /// runtime's own commands remove them.
     pub fn remove_agent(&self, by: &Actor, name: &SandboxName, agent: &AgentName) -> Result<()> {
         self.agent_of(name, agent.as_str())?;
-        let running = self
-            .state
-            .sessions(name, true)?
-            .into_iter()
-            .any(|s| s.agent.as_deref() == Some(agent.as_str()));
-        if running {
-            return Err(Error::SandboxRunning {
-                name: format!("{name}/{agent}"),
-            });
-        }
         self.write(
             by,
             "agent rm",
             Some(format!("{name}/{agent}")),
             |_| "removed".to_owned(),
             |lock| {
-                self.state.remove_agent(lock, name, agent)?;
-                self.stop_proxy(lock, name)
+                self.state
+                    .remove_agent(lock, name, agent)
+                    .map_err(Into::into)
             },
         )
-    }
-
-    /// Stops the sandbox's proxy so the next session starts it with the
-    /// current listeners.
-    fn stop_proxy(&self, lock: &StateLock, name: &SandboxName) -> Result<()> {
-        for session in self
-            .state
-            .sessions(name, true)?
-            .into_iter()
-            .filter(|s| s.kind == SessionKind::Proxy)
-        {
-            stop(&session, GRACE);
-            self.state.end_session(lock, session.id)?;
-        }
-        Ok(())
     }
 }
