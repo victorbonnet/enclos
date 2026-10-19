@@ -42,9 +42,15 @@ pub struct AgentCheck {
 }
 
 impl AgentCheck {
-    pub fn compare(found: Vec<String>, tracked: &[AgentRecord]) -> AgentCheck {
+    /// `builtin` is the runtime's built-in agent: never untracked, since it
+    /// needs no record.
+    pub fn compare(
+        found: Vec<String>,
+        tracked: &[AgentRecord],
+        builtin: Option<&str>,
+    ) -> AgentCheck {
         let mut check = AgentCheck::default();
-        for name in &found {
+        for name in found.iter().filter(|n| Some(n.as_str()) != builtin) {
             match name.parse::<AgentName>() {
                 Ok(agent) if tracked.iter().any(|t| t.name == agent) => {}
                 Ok(agent) => check.untracked.push(agent),
@@ -77,6 +83,7 @@ impl Engine {
 
     pub(super) fn agent_of(&self, name: &SandboxName, agent: &str) -> Result<AgentRecord> {
         let kind = self.runtime_of(name)?;
+        self.refuse_builtin(name, kind, agent)?;
         let tracked = self
             .state
             .agents(name)?
@@ -98,6 +105,27 @@ impl Engine {
         })
     }
 
+    /// The runtime's built-in agent comes and goes with the runtime: enclos
+    /// neither adds nor removes it.
+    fn refuse_builtin(&self, name: &SandboxName, kind: RuntimeKind, agent: &str) -> Result<()> {
+        if adapter(kind).builtin_agent() == Some(agent) {
+            return Err(Error::Session {
+                what: format!(
+                    "agent `{agent}` is {}'s built-in agent: it exists as long as the runtime is installed in sandbox {name}, so enclos neither adds nor removes it",
+                    kind.display_name()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The runtime's built-in agent in this sandbox, if it has one.
+    pub fn builtin_agent(&self, name: &SandboxName) -> Result<Option<&'static str>> {
+        Ok(self
+            .runtime(name)?
+            .and_then(|kind| adapter(kind).builtin_agent()))
+    }
+
     /// The runtime installed in the sandbox, if any.
     pub fn runtime(&self, name: &SandboxName) -> Result<Option<RuntimeKind>> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
@@ -111,9 +139,10 @@ impl Engine {
     pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck> {
         let kind = self.runtime_of(name)?;
         let tracked = self.state.agents(name)?;
-        Ok(adapter(kind)
+        let runtime = adapter(kind);
+        Ok(runtime
             .agents_in(&self.sandbox_home(name))
-            .map(|found| AgentCheck::compare(found, &tracked))
+            .map(|found| AgentCheck::compare(found, &tracked, runtime.builtin_agent()))
             .unwrap_or_default())
     }
 
@@ -241,6 +270,7 @@ impl Engine {
         agent: AgentName,
     ) -> Result<AddedAgent> {
         let kind = self.runtime_of(name)?;
+        self.refuse_builtin(name, kind, agent.as_str())?;
         if self.state.agents(name)?.iter().any(|p| p.name == agent) {
             return Err(Error::Session {
                 what: format!("sandbox {name} already has agent {agent}"),

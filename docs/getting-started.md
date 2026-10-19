@@ -37,17 +37,22 @@ The sandbox reaches only the hosts its policy allows, and Hermes's adapter allow
 
 ## Add agents
 
+Hermes already has one agent once it is installed: its built-in `default`, which `hermes` uses when you name no agent. `enclos agent add` adds more:
+
 ```bash
 enclos agent add lab/main
 enclos agent add lab/scout
-enclos agent list lab
+enclos agent list lab        # lab/default (built in), lab/main, lab/scout
 ```
+
+enclos lists `default` but neither adds nor removes it: it exists as long as Hermes is installed in the sandbox.
 
 ## Reach an agent
 
 You reach the sandbox with `enclos connect lab`: a shell, or the command you put after `--`. To talk to an agent or change it, run Hermes's own commands that way:
 
 ```bash
+enclos connect lab -- hermes              # talk to the built-in agent default
 enclos connect lab -- main                # talk to the agent main (Hermes's wrapper for `hermes -p main`)
 enclos connect lab -- scout model         # change the model of the agent scout
 enclos connect lab -- hermes -p scout     # the same agent, without the wrapper

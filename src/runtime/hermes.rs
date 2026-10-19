@@ -26,6 +26,9 @@ fn args(list: &[&str]) -> Vec<OsString> {
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
 
+/// Hermes's built-in profile, the root of its home.
+const DEFAULT_PROFILE: &str = "default";
+
 /// The files that make a folder under `~/.hermes/profiles/` a profile, as
 /// Hermes decides it (`_PROFILE_IDENTITY_MARKERS`, Hermes 0.22).
 const PROFILE_MARKERS: [&str; 6] = [
@@ -125,7 +128,14 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn agent_facts(&self, agent: &str) -> AgentFacts {
-        let folder = Path::new(".hermes/profiles").join(agent);
+        // The built-in agent's folder is the whole home of Hermes: the parts
+        // counted on their own (runtime, caches, other profiles) leave it its
+        // own data.
+        let folder = if agent == DEFAULT_PROFILE {
+            PathBuf::from(".hermes")
+        } else {
+            Path::new(".hermes/profiles").join(agent)
+        };
         AgentFacts {
             model: Some(ValueAt {
                 file: folder.join("config.yaml"),
@@ -142,9 +152,18 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn talk(&self, agent: &AgentName) -> String {
+        if Some(agent.as_str()) == self.builtin_agent() {
+            return HERMES.to_owned();
+        }
         // Hermes also writes a wrapper named after the agent (`main` runs
         // `hermes -p main`), but not for one created with `--no-alias`.
         format!("{HERMES} -p {agent}")
+    }
+
+    fn builtin_agent(&self) -> Option<&'static str> {
+        // Hermes's own `default` profile: the root of its home, which
+        // `hermes` uses when no `-p` is given.
+        Some(DEFAULT_PROFILE)
     }
 
     fn service(&self) -> Option<Vec<OsString>> {
@@ -253,6 +272,13 @@ mod tests {
         assert_eq!(
             Hermes.delete_agent(&main),
             Some(args(&["hermes", "profile", "delete", "main", "--yes"]))
+        );
+        let default: AgentName = "default".parse().unwrap();
+        assert_eq!(Hermes.builtin_agent(), Some("default"));
+        assert_eq!(Hermes.talk(&default), "hermes");
+        assert_eq!(
+            Hermes.agent_facts("default").folder.as_deref(),
+            Some(Path::new(".hermes"))
         );
         let facts = Hermes.agent_facts("main");
         assert_eq!(

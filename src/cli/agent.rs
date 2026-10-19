@@ -90,7 +90,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
         AgentVerb::List { sandbox } => {
             let agents = engine.agents(&sandbox)?;
             let notes = check_notes(engine, &sandbox, true);
-            if agents.is_empty() && notes.is_empty() {
+            let builtin = engine.builtin_agent(&sandbox)?;
+            if let Some(b) = builtin {
+                println!("{sandbox}/{b}  built in");
+            }
+            if builtin.is_none() && agents.is_empty() && notes.is_empty() {
                 println!(
                     "Sandbox {sandbox} has no agents yet. Add one with `enclos agent add {sandbox}/main`."
                 );
