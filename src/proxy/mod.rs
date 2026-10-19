@@ -20,6 +20,11 @@ use crate::model::sandbox::SandboxName;
 use crate::net::addr::{AddrClass, classify};
 use crate::state::{NetLogStore, StateStore};
 
+/// The most client connections a proxy serves at once. Each holds a thread,
+/// two while it relays, and two file descriptors; launchd starts services
+/// with a limit of 256 descriptors.
+const MAX_CONNECTIONS: usize = 100;
+
 /// Where the proxy gets the policy it enforces.
 pub trait PolicySource: Send + Sync {
     fn policy(&self) -> Result<Policy, String>;
@@ -62,6 +67,7 @@ pub struct Proxy {
     resolver: Box<dyn Resolve>,
     classify: fn(IpAddr) -> AddrClass,
     connect_timeout: Duration,
+    max_connections: usize,
 }
 
 impl Proxy {
@@ -77,6 +83,7 @@ impl Proxy {
             resolver: Box::new(SystemResolver),
             classify,
             connect_timeout: Duration::from_secs(10),
+            max_connections: MAX_CONNECTIONS,
         }
     }
 
@@ -90,10 +97,12 @@ impl Proxy {
     }
 
     /// Binds the sandbox's listener, then serves it until the process ends.
+    /// Returns only if serving stopped, as an error, so the service manager
+    /// restarts the proxy.
     pub fn run(self, addr: SocketAddr) -> io::Result<()> {
         let socket = TcpListener::bind(addr)?;
-        let _ = Arc::new(self).serve(socket).join();
-        Ok(())
+        let _ = Arc::new(self).serve(socket)?.join();
+        Err(io::Error::other("the proxy stopped accepting connections"))
     }
 }
 

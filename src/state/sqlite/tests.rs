@@ -224,7 +224,30 @@ fn the_network_log_filters_by_time_and_groups_denials() {
     ] {
         store.record(&e).unwrap();
     }
-    assert_eq!(store.events(&name, None).unwrap().len(), 3);
+    // A tunnel opened first and closed last: listed by when it opened, with
+    // the bytes it moved once it closed.
+    let long = event(
+        "2026-01-01T10:00:04Z",
+        "long.example.com",
+        Verdict::Allowed,
+        None,
+    );
+    let row = store.record(&long).unwrap();
+    store
+        .finish(
+            row,
+            &NetEvent {
+                bytes_down: 5_000_000,
+                ..long
+            },
+        )
+        .unwrap();
+    let all = store.events(&name, None).unwrap();
+    assert_eq!(all.len(), 4);
+    assert_eq!(
+        (all[0].host.as_str(), all[0].bytes_down),
+        ("long.example.com", 5_000_000)
+    );
     let since = "2026-01-01T10:00:05.200Z".parse().unwrap();
     assert_eq!(store.events(&name, Some(since)).unwrap().len(), 2);
 

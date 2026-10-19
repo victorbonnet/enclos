@@ -84,7 +84,10 @@ pub trait StateStore: NetLogStore {
 /// The network log (design §6). The proxy appends to it as connections
 /// close, without the state lock: a log row changes no state.
 pub trait NetLogStore {
-    fn record(&self, event: &NetEvent) -> Result<()>;
+    /// Records a connection; returns its row, for `finish`.
+    fn record(&self, event: &NetEvent) -> Result<i64>;
+    /// Sets a recorded connection's bytes and duration, once it closed.
+    fn finish(&self, row: i64, event: &NetEvent) -> Result<()>;
     /// The sandbox's connections, oldest first, from `since` on.
     fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>>;
     /// Each destination the proxy denied for the sandbox, most recent first.

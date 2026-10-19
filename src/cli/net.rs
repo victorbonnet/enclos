@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Since;
-use enclos::model::net::{DeniedDestination, NetEvent, Verdict};
+use enclos::model::net::{DeniedDestination, NetEvent, Verdict, destination};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
 
@@ -67,7 +67,7 @@ fn print_log(events: &[NetEvent]) {
             "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
             e.at.strftime("%Y-%m-%d %H:%M:%S"),
             verdict,
-            format!("{}:{}", e.host, e.port),
+            destination(&e.host, e.port),
             e.address.as_deref().unwrap_or("-"),
             bytes(e.bytes_up),
             bytes(e.bytes_down),
@@ -88,9 +88,8 @@ fn print_denied(sandbox: &SandboxName, denied: &[DeniedDestination]) {
             format!("{} times", d.count)
         };
         println!(
-            "  {}:{}  {}  {times}, last {}",
-            d.host,
-            d.port,
+            "  {}  {}  {times}, last {}",
+            destination(&d.host, d.port),
             d.reason,
             d.last.strftime("%Y-%m-%d %H:%M:%S UTC")
         );

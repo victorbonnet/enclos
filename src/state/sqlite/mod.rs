@@ -321,9 +321,14 @@ impl StateStore for SqliteStateStore {
 }
 
 impl NetLogStore for SqliteStateStore {
-    fn record(&self, event: &NetEvent) -> Result<()> {
+    fn record(&self, event: &NetEvent) -> Result<i64> {
         let conn = self.open()?;
         netlog::record(&conn, event).map_err(self.sqlite_err())
+    }
+
+    fn finish(&self, row: i64, event: &NetEvent) -> Result<()> {
+        let conn = self.open()?;
+        netlog::finish(&conn, row, event).map_err(self.sqlite_err())
     }
 
     fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>> {

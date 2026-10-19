@@ -32,9 +32,23 @@ impl Resolve for FakeResolver {
 #[derive(Clone, Default)]
 struct MemoryLog(Arc<Mutex<Vec<NetEvent>>>);
 
+/// Resolves nothing.
+struct NoResolver;
+
+impl Resolve for NoResolver {
+    fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<IpAddr>> {
+        Err(io::Error::other("no such name"))
+    }
+}
+
 impl NetLogStore for MemoryLog {
-    fn record(&self, event: &NetEvent) -> StateResult<()> {
-        self.0.lock().unwrap().push(event.clone());
+    fn record(&self, event: &NetEvent) -> StateResult<i64> {
+        let mut events = self.0.lock().unwrap();
+        events.push(event.clone());
+        Ok(events.len() as i64 - 1)
+    }
+    fn finish(&self, row: i64, event: &NetEvent) -> StateResult<()> {
+        self.0.lock().unwrap()[row as usize] = event.clone();
         Ok(())
     }
     fn events(&self, _: &SandboxName, _: Option<Timestamp>) -> StateResult<Vec<NetEvent>> {
@@ -46,12 +60,17 @@ impl NetLogStore for MemoryLog {
 }
 
 impl MemoryLog {
-    /// Waits for `n` records: the proxy logs a connection once it closes.
+    /// Waits for `n` records.
     fn wait_for(&self, n: usize) -> Vec<NetEvent> {
+        self.wait_until(|events| events.len() >= n)
+    }
+
+    /// Waits until the records are `done`, for at most five seconds.
+    fn wait_until(&self, done: impl Fn(&[NetEvent]) -> bool) -> Vec<NetEvent> {
         let start = Instant::now();
         loop {
             let events = self.0.lock().unwrap().clone();
-            if events.len() >= n || start.elapsed() > Duration::from_secs(5) {
+            if done(&events) || start.elapsed() > Duration::from_secs(5) {
                 return events;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -91,19 +110,29 @@ struct Running {
 }
 
 fn start(allow: &[String], resolve_to: IpAddr, check: fn(IpAddr) -> AddrClass) -> Running {
+    start_with(allow, Box::new(FakeResolver(resolve_to)), check, |_| {})
+}
+
+fn start_with(
+    allow: &[String],
+    resolver: Box<dyn Resolve>,
+    check: fn(IpAddr) -> AddrClass,
+    tweak: impl FnOnce(&mut Proxy),
+) -> Running {
     let mut p = Policy::default();
     p.net.allow = allow.to_vec();
     let policy = Arc::new(Mutex::new(p));
     let log = MemoryLog::default();
-    let proxy = Proxy::new(
+    let mut proxy = Proxy::new(
         "home".parse().unwrap(),
         Box::new(FixedPolicy(Arc::clone(&policy))),
         Box::new(log.clone()),
     )
-    .for_tests(Box::new(FakeResolver(resolve_to)), check);
+    .for_tests(resolver, check);
+    tweak(&mut proxy);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    Arc::new(proxy).serve(listener);
+    Arc::new(proxy).serve(listener).unwrap();
     Running { addr, log, policy }
 }
 
@@ -143,12 +172,19 @@ fn an_allowed_tunnel_relays_bytes_and_is_logged() {
         received.recv_timeout(Duration::from_secs(5)).unwrap(),
         b"ping"
     );
+    // Logged while it is still open.
+    let open = proxy.log.wait_for(1);
+    assert_eq!((open[0].verdict, open[0].bytes_down), (Verdict::Allowed, 0));
+
     let mut answer = String::new();
     conn.read_to_string(&mut answer).unwrap();
     assert_eq!(answer, "pong");
     drop(conn);
 
-    let events = proxy.log.wait_for(1);
+    let events = proxy
+        .log
+        .wait_until(|e| e.len() == 1 && e[0].bytes_down > 0);
+    assert_eq!(events.len(), 1);
     let e = &events[0];
     assert_eq!(
         (e.verdict, e.reason, e.method.as_str()),
@@ -232,4 +268,95 @@ fn garbage_gets_a_400_and_no_log_row() {
     assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
     std::thread::sleep(Duration::from_millis(100));
     assert!(proxy.log.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_host_that_is_not_a_name_is_logged_escaped() {
+    let proxy = start(&[], LOCAL, loopback_is_global);
+    let (_conn, reply) = send(
+        proxy.addr,
+        "CONNECT evil\x1b[2J\nnot-allowed.example.com:443 HTTP/1.1\r\n\r\n",
+    );
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    assert!(!reply.contains('\x1b'), "{reply}");
+    let events = proxy.log.wait_for(1);
+    assert_eq!(events[0].reason, Some(Reason::BadRequest));
+    assert_eq!(events[0].host, "evil\\u{1b}[2J\\nnot-allowed.example.com");
+}
+
+#[test]
+fn an_allowed_name_that_does_not_resolve_failed_and_was_not_refused() {
+    let proxy = start_with(
+        &["gone.example.com".to_owned()],
+        Box::new(NoResolver),
+        loopback_is_global,
+        |_| {},
+    );
+    let (_conn, reply) = send(proxy.addr, "CONNECT gone.example.com:443 HTTP/1.1\r\n\r\n");
+    assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
+    assert!(!reply.contains("policy allow"), "{reply}");
+    let events = proxy.log.wait_for(1);
+    assert_eq!(
+        (events[0].verdict, events[0].reason),
+        (Verdict::Allowed, Some(Reason::ResolveFailed))
+    );
+}
+
+#[test]
+fn connections_over_the_limit_are_turned_away() {
+    let proxy = start_with(
+        &[],
+        Box::new(FakeResolver(LOCAL)),
+        loopback_is_global,
+        |p| p.max_connections = 1,
+    );
+    // Holds the one place: it sends nothing yet.
+    let first = TcpStream::connect(proxy.addr).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let (_conn, reply) = send(proxy.addr, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n");
+    assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+    // Once it is gone, the place is free again.
+    drop(first);
+    let reply = (0..50)
+        .map(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            send(proxy.addr, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n").1
+        })
+        .find(|reply| !reply.starts_with("HTTP/1.1 503"))
+        .unwrap();
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+}
+
+#[test]
+fn a_head_sent_slowly_still_has_one_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    std::thread::spawn(move || {
+        // A byte every 50 ms, each well within any one read's timeout.
+        for _ in 0..40 {
+            if client.write_all(b"G").is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let started = Instant::now();
+    let mut slow = server::Until {
+        stream: &server,
+        deadline: Instant::now() + Duration::from_millis(300),
+    };
+    assert!(request::read_head(&mut slow).is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn address_families_take_turns() {
+    let v6 = |n: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, n));
+    let v4 = |n: u8| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n));
+    assert_eq!(
+        server::interleaved(&[v6(1), v6(2), v6(3), v4(1)]),
+        [v6(1), v4(1), v6(2), v6(3)]
+    );
+    assert_eq!(server::interleaved(&[v4(1), v4(2)]), [v4(1), v4(2)]);
 }

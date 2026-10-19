@@ -58,7 +58,7 @@ pub fn parse(head: &str) -> Option<Request> {
     let mut lines = head.split("\r\n").filter(|l| !l.is_empty());
     let mut parts = lines.next()?.split(' ');
     let (method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() || !version.starts_with("HTTP/1.") {
+    if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") || !is_token(method) {
         return None;
     }
     if method.eq_ignore_ascii_case("CONNECT") {
@@ -84,6 +84,14 @@ pub fn parse(head: &str) -> Option<Request> {
         version: version.to_owned(),
         headers: lines.map(str::to_owned).collect(),
     })
+}
+
+/// Whether `text` is an HTTP token, as a method must be.
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 fn split_host_port(authority: &str, default: Option<u16>) -> Option<(String, u16)> {
@@ -186,6 +194,8 @@ mod tests {
             "GET http://user@example.com/ HTTP/1.1\r\n\r\n",
             "GET https://example.com/ HTTP/1.1\r\n\r\n",
             "BREW pot HTCPCP/1.0\r\n\r\n",
+            "GET http://example.com/ HTTP/1.9x\r\n\r\n",
+            "G\x1b[2JET http://example.com/ HTTP/1.1\r\n\r\n",
         ] {
             assert_eq!(parse(bad), None, "{bad}");
         }

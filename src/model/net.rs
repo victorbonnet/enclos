@@ -71,6 +71,16 @@ impl FromStr for Reason {
     }
 }
 
+/// A host and port as one destination, with an IPv6 address in brackets, so
+/// that the text reads back as the same destination in `enclos policy allow`.
+pub fn destination(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// One connection through a sandbox's proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetEvent {
@@ -104,6 +114,12 @@ pub struct DeniedDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ipv6_destination_is_bracketed() {
+        assert_eq!(destination("2606:4700::1111", 443), "[2606:4700::1111]:443");
+        assert_eq!(destination("api.example.com", 8443), "api.example.com:8443");
+    }
 
     #[test]
     fn reasons_round_trip_through_their_names() {
