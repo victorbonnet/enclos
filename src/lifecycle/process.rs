@@ -6,6 +6,7 @@
 //! leader is still the same process: same pid and same start time, so a pid
 //! reused by an unrelated process is never signalled.
 
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::model::session::{Member, ProcessRef};
@@ -46,8 +47,11 @@ pub fn group_of(pid: u32) -> Option<u32> {
 /// that exited but was not yet reaped by its parent (a zombie) runs nothing
 /// and is not counted.
 pub fn group_members(pgid: u32) -> Vec<Member> {
+    // In a group of its own, so `ps` never lists itself as a member of the
+    // group of the process asking.
     let Ok(out) = Command::new("/bin/ps")
         .args(["-A", "-o", "pid=,pgid=,stat=,lstart=,comm="])
+        .process_group(0)
         .stderr(Stdio::null())
         .output()
     else {

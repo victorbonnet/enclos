@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
+use std::io::IsTerminal;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -11,11 +12,11 @@ use std::time::{Duration, Instant};
 use super::Engine;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_of, is_same, reference};
+use crate::lifecycle::process::{group_members, group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::session::{SessionId, SessionKind, SessionRecord};
+use crate::model::session::{Member, SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
 /// How a session ended.
@@ -24,6 +25,9 @@ pub struct SessionEnd {
     pub session: SessionId,
     /// The program's exit status; 1 when a signal ended it.
     pub exit: i32,
+    /// Processes the program left running in the session's group. While
+    /// there are any, the session stays open.
+    pub left: Vec<Member>,
 }
 
 /// How long the proxy has to start listening.
@@ -38,8 +42,18 @@ impl Engine {
         name: &SandboxName,
         command: Vec<OsString>,
     ) -> Result<SessionEnd> {
-        let summary = |(id, _): &(SessionId, _)| format!("session {id}");
-        let (session, mut child) =
+        let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
+        // Which process group is the session's (design §8). In a terminal
+        // where this command leads its job, the job's group: the program
+        // keeps the terminal. Run by something else without a terminal (a
+        // script, CI), a new group for the program, so the session's group
+        // holds only its processes. Otherwise (a terminal, but not a job of
+        // its own) the group is the caller's, which is not the session's to
+        // signal or count.
+        let me = std::process::id();
+        let leads_group = group_of(me) == Some(me);
+        let own_group = !leads_group && !std::io::stdin().is_terminal();
+        let (session, mut child, pgid) =
             self.write(by, "connect", Some(name.to_string()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
@@ -65,19 +79,17 @@ impl Engine {
                 let ctx = self.sandbox_context(name, record.proxy_port);
                 std::fs::create_dir_all(ctx.home.join("tmp")).ok();
                 let backend = self.backend_of(name)?;
-                let child = backend
-                    .wrap(&compiled, &ctx, &launch)
-                    .spawn()
-                    .map_err(|e| Error::Session {
-                        what: format!(
-                            "could not start {} in sandbox {name}: {e}",
-                            launch.program.to_string_lossy()
-                        ),
-                    })?;
-
-                // The session's group is this command's own: the terminal's job
-                // for `enclos connect`, which `sandbox stop` may end as a whole.
-                let me = std::process::id();
+                let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
+                if own_group {
+                    wrapped.process_group(0);
+                }
+                let child = wrapped.spawn().map_err(|e| Error::Session {
+                    what: format!(
+                        "could not start {} in sandbox {name}: {e}",
+                        launch.program.to_string_lossy()
+                    ),
+                })?;
+                let leader = if own_group { child.id() } else { me };
                 let session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
@@ -85,34 +97,59 @@ impl Engine {
                     version: version.version,
                     snapshot: snapshot.id,
                     compiled: Some(compiled.display().to_string()),
-                    root: reference(me).ok_or_else(|| Error::Session {
-                        what: "cannot read this process's start time".into(),
+                    root: reference(leader).ok_or_else(|| Error::Session {
+                        what: "cannot read the session's start time".into(),
                     })?,
-                    pgid: group_of(me).unwrap_or(me),
+                    pgid: if own_group {
+                        leader
+                    } else {
+                        group_of(me).unwrap_or(me)
+                    },
                     started_at: now(),
                     ended_at: None,
                 };
                 let id = self.state.put_session(lock, &session)?;
                 record.state = SandboxState::Running;
                 self.state.put(lock, &record)?;
-                Ok((id, child))
+                Ok((id, child, session.pgid))
             })?;
 
         let status = child.wait().map_err(|e| Error::Session {
             what: format!("lost the session's program: {e}"),
         })?;
         let exit = status.code().unwrap_or(1);
+        // The program's exit is not the session's end: what it left running
+        // in the session's group keeps the session open, so `show`, `stop`
+        // and `rm` still see it. This process is not a member.
+        let left: Vec<Member> = if leads_group || own_group {
+            group_members(pgid)
+                .into_iter()
+                .filter(|m| m.pid != me)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let summary = |_: &()| match left.len() {
+            0 => format!("exit {exit}"),
+            n => format!("exit {exit}, {n} processes still running"),
+        };
         self.write(
             by,
             "session end",
             Some(format!("{name} session {session}")),
-            |_| format!("exit {exit}"),
+            summary,
             |lock| {
-                self.state.end_session(lock, session)?;
+                if left.is_empty() {
+                    self.state.end_session(lock, session)?;
+                }
                 Ok(())
             },
         )?;
-        Ok(SessionEnd { session, exit })
+        Ok(SessionEnd {
+            session,
+            exit,
+            left,
+        })
     }
 
     /// Starts the sandbox's proxy unless it runs already, and records it as
