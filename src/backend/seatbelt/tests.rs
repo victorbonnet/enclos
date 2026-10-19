@@ -48,7 +48,7 @@ fn world() -> World {
         sandboxes: data.join("sandboxes"),
         data: data.clone(),
         config_file: data.join("config.toml"),
-        proxy_ports: vec![allowed.local_addr().unwrap().port()],
+        proxy_port: allowed.local_addr().unwrap().port(),
     };
     let mut policy = Policy::default();
     policy.fs.write = vec!["{home}".into()];
@@ -71,7 +71,6 @@ impl World {
         let launch = Launch {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
-            proxy_port: self.ctx.proxy_ports[0],
             env: vec![],
         };
         let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);

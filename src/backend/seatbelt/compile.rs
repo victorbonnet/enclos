@@ -1,6 +1,6 @@
 //! Compiling a policy for Seatbelt (design §5): `(allow default)`,
 //! then writes only where granted, the sensitive read deny list, network only
-//! to the sandbox's proxy ports, the host-service denials, and last, so no
+//! to the sandbox's proxy port, the host-service denials, and last, so no
 //! rule above can override them, enclos's protected paths.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
@@ -90,11 +90,10 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
             .into(),
     );
     line(format!("(deny network* (with message \"{tag}\"))"));
-    for port in &ctx.proxy_ports {
-        line(format!(
-            "(allow network-outbound (remote ip \"localhost:{port}\"))"
-        ));
-    }
+    line(format!(
+        "(allow network-outbound (remote ip \"localhost:{}\"))",
+        ctx.proxy_port
+    ));
     line(format!(
         "(allow network-bind network-inbound (local unix-socket {}))",
         subpath(&home)?
@@ -197,7 +196,7 @@ mod tests {
             sandboxes: data.join("sandboxes"),
             data: data.clone(),
             config_file: data.join("config.toml"),
-            proxy_ports: vec![41001, 41002],
+            proxy_port: 41001,
         }
     }
 
@@ -219,10 +218,8 @@ mod tests {
         assert!(at("(allow default)") < at("(deny file-write* (with message \"enclos:home\"))"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/work\")"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/.ssh\")"));
-        assert!(
-            text.contains("(remote ip \"localhost:41001\")")
-                && text.contains("(remote ip \"localhost:41002\")")
-        );
+        assert_eq!(text.matches("(remote ip ").count(), 1);
+        assert!(text.contains("(remote ip \"localhost:41001\")"));
         assert!(at("(deny network*") < at("(deny lsopen"));
         // The protected paths come after every allow, so nothing overrides them.
         let protected = at(";; ---- enclos's own files");

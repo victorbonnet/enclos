@@ -36,11 +36,7 @@ impl Engine {
     }
 
     /// What the backend needs to know about the sandbox.
-    pub(crate) fn sandbox_context(
-        &self,
-        name: &SandboxName,
-        proxy_ports: &[u16],
-    ) -> SandboxContext {
+    pub(crate) fn sandbox_context(&self, name: &SandboxName, proxy_port: u16) -> SandboxContext {
         SandboxContext {
             name: name.clone(),
             dir: self.layout.sandbox_dir(name.as_str()),
@@ -50,16 +46,16 @@ impl Engine {
             sandboxes: self.layout.data().join("sandboxes"),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
-            proxy_ports: proxy_ports.to_vec(),
+            proxy_port,
         }
     }
 
     /// Compiles the sandbox's active policy for its backend, with the proxy
-    /// ports it may reach, and returns the file the backend reads.
-    pub fn compile_policy(&self, name: &SandboxName, proxy_ports: &[u16]) -> Result<PathBuf> {
+    /// port it may reach, and returns the file the backend reads.
+    pub fn compile_policy(&self, name: &SandboxName, proxy_port: u16) -> Result<PathBuf> {
         let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
-        let ctx = self.sandbox_context(name, proxy_ports);
+        let ctx = self.sandbox_context(name, proxy_port);
         let compiled = backend.compile(&policy, &ctx)?;
         let digest = sha256_hex(compiled.text.as_bytes());
         let dir = ctx.dir.join("compiled");
