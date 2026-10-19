@@ -1,12 +1,13 @@
-//! `enclos policy`: show a sandbox's policy, or allow a destination.
+//! `enclos policy`: show a sandbox's policy, allow a destination, or test it.
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Engine, PolicyApplied, PolicyView};
+use enclos::engine::{Engine, PolicyApplied, PolicyView, TestReport};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
+use enclos::probes::Outcome;
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -23,10 +24,25 @@ enum PolicyVerb {
         sandbox: SandboxName,
         destination: String,
     },
+    /// Try each way out of the sandbox from inside it; every probe must fail.
+    Test {
+        sandbox: SandboxName,
+        /// Also probe routes that could act on this Mac if a rule did not
+        /// hold (open, Apple Events, launchd, preferences). For CI and VMs.
+        #[arg(long)]
+        host_services: bool,
+    },
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> Result<u8> {
     match args.verb {
+        PolicyVerb::Test {
+            sandbox,
+            host_services,
+        } => {
+            let report = engine.policy_test(by, &sandbox, host_services)?;
+            return Ok(print_test(&sandbox, &report));
+        }
         PolicyVerb::Show { sandbox } => print_policy(&engine.policy(&sandbox)?),
         PolicyVerb::Allow {
             sandbox,
@@ -98,6 +114,38 @@ fn print_allowed(sandbox: &SandboxName, destination: &str, planned: Planned<Poli
                 "Sandbox {sandbox} now allows {destination}: policy v{}, in force at once.",
                 version.version
             );
+        }
+    }
+}
+
+fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
+    println!("Escape probes in sandbox {sandbox}: each tries one way out and must fail.");
+    for r in &report.results {
+        let (mark, detail) = match &r.outcome {
+            Outcome::Closed => ("closed ", String::new()),
+            Outcome::Open(why) => ("OPEN   ", format!("  <- {why}")),
+            Outcome::Skipped(why) => ("skipped", format!("  ({why})")),
+        };
+        println!("  {mark}  {:<16} {}{detail}", r.route, r.name);
+    }
+    if !report.host_services {
+        println!(
+            "Host-service routes (open, Apple Events, launchd, preferences) were not probed; CI probes them with --host-services."
+        );
+    }
+    println!(
+        "Only the routes listed were probed: closed means each probe failed as it should, not that no other way out exists."
+    );
+    match report.open() {
+        0 => {
+            println!("All {} probes failed as they should.", report.results.len());
+            exit::OK
+        }
+        n => {
+            eprintln!(
+                "error: {n} probes got through. Do not use this sandbox until this is fixed."
+            );
+            exit::ERROR
         }
     }
 }
