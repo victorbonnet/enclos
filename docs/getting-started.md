@@ -11,7 +11,7 @@ The words used here:
 ## Before you start
 
 - macOS 14 or later, with Rust installed through [rustup](https://rustup.rs).
-- A ChatGPT subscription, for Hermes's login.
+- An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
 Install enclos from a clone of the repository:
@@ -26,12 +26,14 @@ cargo install --path .
 enclos init                                  # the ~/.enclos folder, state database and audit log
 enclos sandbox create lab                    # Seatbelt backend, `assistant` template
 enclos runtime install hermes --sandbox lab  # Hermes's own installer, run inside the sandbox; takes a few minutes
-enclos runtime login lab                     # Hermes's login: pick OpenAI Codex, then open the URL and enter the code
+enclos runtime login lab                     # Hermes's own login: pick your provider and model
 ```
 
 `enclos runtime install` downloads Hermes's installer on your Mac and runs it only if it is the version enclos was reviewed against. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
-`enclos runtime login` runs Hermes's own login in your terminal. It prints a URL and a code: open the URL in your browser on the Mac and enter the code. Then pick a model from the list Hermes shows; it lists the ones your account can use. Every agent in the sandbox shares this login.
+`enclos runtime login` runs Hermes's own login in your terminal: pick your provider, log in the way Hermes asks, then pick a model. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login.
+
+The sandbox reaches only the hosts its policy allows, and Hermes's adapter allows only the OpenAI hosts its first login used so far (`chatgpt.com`, `auth.openai.com`). For another provider, allow its API host before you log in, for example `enclos policy allow lab api.example.com`; `enclos net denied lab` shows what the login was refused.
 
 ## Add agents
 
