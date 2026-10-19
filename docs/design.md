@@ -80,7 +80,7 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
 
 Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running profile, `enclos.<sandbox>.<profile>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that profile, and then runs the wrapped agent command. A profile unit runs `enclos launch <sandbox>/<profile>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. Each profile gets its own listener port on the proxy, taken from a block of ports reserved for the sandbox when it is created, so the network log is per profile and adding a profile does not change the compiled policy; this attribution is informative, not a security boundary, since profiles share a policy.
 
-**Hermes does not run one service per profile.** Shown by the prototype with Hermes 0.22.2: one gateway per Hermes home, started from the default profile, serves every profile under `~/.hermes/profiles/`; `hermes -p <profile> gateway run` refuses while no such gateway runs, and is meant to attach to it when one does. With no messaging platform, that gateway runs the cron scheduler, the kanban dispatcher and housekeeping for every profile and opens no TCP port. A per-profile gateway exists only behind a temporary compatibility setting (`gateway.standalone`). So for Hermes, the per-profile units above, and network attribution by per-profile listener for service traffic, do not fit as described; the choice is open (§15).
+**Hermes does not run one service per profile.** Shown by the prototype with Hermes 0.22.2: one gateway per Hermes home, started from the default profile, serves every profile under `~/.hermes/profiles/`; `hermes -p <profile> gateway run` refuses while no such gateway runs, and is meant to attach to it when one does. With no messaging platform, that gateway runs the cron scheduler, the kanban dispatcher and housekeeping for every profile and opens no TCP port, and a model call for a profile works while it runs. A per-profile gateway exists only behind a temporary compatibility setting (`gateway.standalone`). So for Hermes, the per-profile units above, and network attribution by per-profile listener for service traffic, do not fit as described; the choice is open (§15).
 
 ## 5. Isolation backends
 
@@ -193,7 +193,7 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 | `assistant` | own home | any, including what the agent installs in its home | model provider, the agent's install sources, listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 
-Every template reads the host broadly, minus the sensitive deny list (§5). Validation: no loopback or link-local entries; a wildcard may only cover the subdomains of a named domain (`*.example.com`), never everything (`*`) or a public suffix (`*.com`, `*.co.uk`); private addresses only through `private`, for hosts that are also on the allowlist; no filesystem grant may cover the protected paths. Each agent adapter contributes the endpoints its runtime needs to work at all (for Hermes: the model provider, its login endpoints and its install sources. The prototype's install of Hermes 0.22.2 needed `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, `releases.astral.sh`, `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `nodejs.org`, `cdn.playwright.dev`, `storage.googleapis.com` and `ffmpeg.martin-riedl.de`; the login needs `auth.openai.com`; model-call endpoints are still to verify, §14). No template or adapter contributes a weather service or any task-specific API.
+Every template reads the host broadly, minus the sensitive deny list (§5). Validation: no loopback or link-local entries; a wildcard may only cover the subdomains of a named domain (`*.example.com`), never everything (`*`) or a public suffix (`*.com`, `*.co.uk`); private addresses only through `private`, for hosts that are also on the allowlist; no filesystem grant may cover the protected paths. Each agent adapter contributes the endpoints its runtime needs to work at all (for Hermes: the model provider, its login endpoints and its install sources. The prototype's install of Hermes 0.22.2 needed `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, `releases.astral.sh`, `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `nodejs.org`, `cdn.playwright.dev`, `storage.googleapis.com` and `ffmpeg.martin-riedl.de`; the device-code login and token refreshes need `auth.openai.com`, and model calls and the model list need `chatgpt.com`, all shown by the prototype. Anything a task needs, such as a weather service, is not the adapter's: the prototype's weather run reached `wttr.in` only because the user's prompt named it). No template or adapter contributes a weather service or any task-specific API.
 
 **Snapshots** ([ADR 0018](adr/0018-immutable-policy-snapshots.md)). A snapshot is the fully resolved policy together with its inputs (enclos version and built-in defaults, template name and content hash, adapter version and contributed endpoints, and the overrides), identified by the SHA-256 of both. Snapshots are insert-only, and identical content reuses the existing snapshot. A sandbox's history is an append-only list of numbered policy versions, each pointing to a snapshot and recording who made it, when, and which version it restores if it is a rollback. Audit entries and session records reference both the version number and the snapshot hash.
 
@@ -489,15 +489,14 @@ enclos sandbox create home --backend seatbelt --template assistant
 enclos agent install hermes --sandbox home
 enclos profile add home/main
 enclos profile add home/research
-enclos agent login home/main --subscription     # Hermes's device-code login: prints a URL and a code to open on the host
-enclos agent login home/research --subscription # if Hermes keeps one login per profile (to verify, §14)
+enclos agent login home --subscription          # Hermes's device-code login: prints a URL and a code to open on the host;
+                                                # one login per sandbox serves all its profiles (§12)
 
 enclos sandbox create lab --backend seatbelt --template assistant
 enclos agent install hermes --sandbox lab
 enclos profile add lab/scout
 enclos profile add lab/writer
-enclos agent login lab/scout --subscription
-enclos agent login lab/writer --subscription
+enclos agent login lab --subscription
 
 enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
 enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused
@@ -550,7 +549,13 @@ On Linux: `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos`. Every state-cha
 ## 12. Secrets and subscriptions
 
 - Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)). The sandbox itself is meant to have no Keychain access (planned, to verify with the host-service probes).
-- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, enclos supports only device-code logins: Hermes prints a URL and a short code, and the user opens the URL on the host. enclos makes no network exception for logins (no localhost callback port), and does not copy tokens in from a login made on the host. Hermes documents this login (its OpenAI Codex provider, "ChatGPT OAuth") as a device-code flow, and stores the credential in its own home (`~/.hermes/auth.json` inside the sandbox). Hermes can also import a host Codex CLI login from `~/.codex/auth.json`; inside the sandbox that path is on the read deny list, so the import is unavailable by design. Shown by the prototype: inside the sandbox, `hermes auth add openai-codex --no-browser` reaches `auth.openai.com` through the proxy and prints `https://auth.openai.com/codex/device` with a code; `auth.openai.com` is the only host it contacts before the user approves. That the login completes, which further endpoints model calls and refreshes need, and that the credential survives across sessions are to verify (§14). Per Hermes's source and documentation (not yet shown), a profile without its own login for a provider uses the one in the root `~/.hermes/auth.json` and writes refreshes back there, so one login per sandbox would serve every profile; `hermes -p <profile> auth add` gives a profile its own. Once logged in, the agent can read its own refresh token; enclos flags it.
+- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, enclos supports only device-code logins: Hermes prints a URL and a short code, and the user opens the URL on the host. enclos makes no network exception for logins (no localhost callback port), and does not copy tokens in from a login made on the host. Hermes documents this login (its OpenAI Codex provider, "ChatGPT OAuth") as a device-code flow, and stores the credential in its own home (`~/.hermes/auth.json` inside the sandbox). Hermes can also import a host Codex CLI login from `~/.codex/auth.json`; inside the sandbox that path is on the read deny list, so the import is unavailable by design. Shown by the prototype, inside the sandbox through the proxy:
+  - **Login.** `hermes auth add openai-codex --no-browser` prints `https://auth.openai.com/codex/device` with a code; the user approved it on the host and the login completed, contacting only `auth.openai.com`.
+  - **Model calls.** They work and contact only `chatgpt.com`. The model must be one the account may use: two of Hermes's built-in default models were refused for a ChatGPT account, so the adapter picks the model from the account's live model list.
+  - **One login per sandbox.** The login lives in the sandbox's root `~/.hermes/auth.json` and serves every profile: profiles without their own login made model calls with it. A token refresh forced from a profile contacted `auth.openai.com` and was written back to the root file, after which the other profile and the root still worked.
+  - **Across sessions.** Every call was a separate sandboxed process after the login, and none needed a new login.
+  
+  A profile can still have its own login with `hermes -p <profile> auth add` (Hermes's documentation; not exercised). How long the credential lasts beyond one refresh is not shown. Once logged in, the agent can read its own refresh token; enclos flags it.
 - **Subscriptions, v2:** one refresh owner on the host keeps the renewable credential; sandboxes get only short-lived access tokens.
 
 ## 13. Milestones
@@ -582,7 +587,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
 
 **Acceptance scenario (milestone 1).** On a Mac, with the user logged in and an existing ChatGPT subscription:
 
-1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes profiles, every profile logged in through Hermes's device-code flow.
+1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes profiles, each sandbox logged in once through Hermes's device-code flow, a login its profiles share.
 2. `enclos sandbox start` on both sandboxes leaves each proxy and each profile running as a launchd agent, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every profile, session and member, and the snapshot each session started under.
 3. In `enclos connect` to each profile, Hermes is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
 4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and the shared runtime, enclos's files and the other sandbox are unchanged.
@@ -595,13 +600,10 @@ Each milestone holds only what its goal needs; everything else waits for a later
 
 The design depends on these, and they have not been shown yet. Items settled by the milestone 1 prototype (`prototype/m1/`, issue #5) moved into the sections above, recording what was shown. The ADR 0006 evidence is gathered in milestone 2. Items marked **VM** run in a disposable macOS VM: escape probes and member-tracking experiments no longer run on a development Mac.
 
-**Waiting on the device-code login** (the user logs in; then the prototype tests):
-
-- That Hermes's device-code login for a ChatGPT subscription completes inside the sandbox through the proxy (it already prints the URL and code, §12), which endpoints model calls and refreshes need (they go into the Hermes adapter), and that the refreshed credential keeps working across sessions.
-- That one login in the sandbox's root Hermes home serves every profile, as Hermes's source says, and that a per-profile login shadows it (§12).
-- That a model call works from a chat for a profile while the sandbox's gateway runs (shown up to the point of needing the provider, §4).
-
 **Open on this Mac**:
+
+- The acceptance weather task with Hermes choosing its own tools. Asked for the weather with every tool available, Hermes answered without calling any tool; the network log shows only the model provider, and nothing records a search. So the answer cannot be shown to be live. Told to use its terminal tool with `curl`, it fetched through the proxy. Whether Hermes reaches live data on its own, and how the scenario checks that from the tool calls and the network log, is open.
+- How long the subscription credential keeps working beyond one refresh (§12).
 
 - That `hermes -p <profile> gateway run` attaches to the running gateway once the sandbox home path is short enough for its control socket (§5, short home path).
 - Whether the headless browser Hermes installs can run under the write rules at all: Chrome for Testing did not start, apparently because it writes in Foundation's temp directory (§5, system temp); and then whether it needs its own sandbox disabled, which would leave only enclos's.

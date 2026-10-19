@@ -14,8 +14,10 @@ Everything the prototype creates lives in `.work/` (gitignored): the sandbox hom
 | `run-capped.sh` | Runs a sandboxed command with a time cap in its own process group, and signals only that group, from a leader that is still alive. Nothing found by searching is ever signalled. |
 | `proxy.py`, `proxy.sh`, `allow.txt` | The CONNECT proxy: allowlist, or `--learn` to allow any public destination and log it. |
 | `hermes-install.sh` | Runs the Hermes installer (read first, pinned by SHA-256) in the sandbox. |
-| `gateway-test.sh` | Runs the gateway, capped, and a chat for a profile alongside it. |
+| `gateway-test.sh` | Runs the gateway, capped, and a model call for a profile alongside it. |
 | `login-reach.sh` | Starts the device-code login, captures the endpoints, stops at the cap (code redacted). |
+| `model-call.sh` | One capped model call from the root home or a profile; prints the answer (tokens redacted), the endpoints, and `auth.json` size and mtime only. |
+| `probes/codex-models.py` | Lists the Codex models the logged-in account may use (Hermes's resolver, read-only; prints model ids only). |
 | `report.sh` | Endpoints from the proxy log; Seatbelt denials from `log show` (capped). |
 | `probes/clients.sh` | Python, uv, git, Node, npm and curl through the proxy with DNS denied. |
 | `probes/browser.sh` | Headless Chromium in the sandbox, with and without its own sandbox. |
@@ -83,14 +85,14 @@ With the full compiled policy (no DNS), these all worked through `HTTPS_PROXY`: 
 ### Profiles
 
 - `hermes profile create <name>` makes `~/.hermes/profiles/<name>/` (config, `.env`, `SOUL.md`, skills) and a wrapper `~/.local/bin/<name>` that runs `hermes -p <name>`. A profile is selected with `-p <name>`, the wrapper, or `HERMES_HOME`. Shown.
-- Logins (source and docs, **not yet shown**): a profile with no credential of its own for a provider reads it from the root `~/.hermes/auth.json`, and refreshes are written back there under a lock. `hermes -p <name> auth add <provider>` gives a profile its own login, which then shadows the root one. So one login per sandbox should serve every profile.
+- Logins: one login in the root `~/.hermes/auth.json` serves every profile (shown, below). `hermes -p <name> auth add <provider>` gives a profile its own login, which then shadows the root one (Hermes's source and docs; not exercised).
 
 ### Gateway
 
 - **Hermes 0.22.2 runs one gateway per Hermes root, not per profile.** `hermes -p main gateway run` with no gateway running refuses (exit 78): "Exactly one gateway per host is the inbound process for every profile". The default profile's gateway serves every profile. `gateway.standalone: true` in a profile's config is a temporary compatibility shim. Shown.
 - With no messaging platform, `hermes gateway run` starts, runs the cron scheduler for every profile (`default`, `main`, `research`), the kanban dispatcher and housekeeping, opens no TCP port, and on SIGTERM shuts down cleanly and exits 1 "so the service manager can revive the gateway". Shown.
 - It needs Unix sockets under `HERMES_HOME` (a control socket, a loop-tick socket). `30-network.sb` refuses every bind; `31-local-unix.sb` allows binding and connecting inside the sandbox home (shown with `probes/unix-local.sh`). The path must also fit in 104 bytes: with the prototype's long home path, the bind failed with `AF_UNIX path too long`, and Hermes's fallbacks (`TMPDIR`, then `/tmp`) were too long or not writable. Because of that, `hermes -p main gateway run` beside the running gateway could not attach (exit 75, "has not published its served set").
-- A chat for profile `main` ran alongside the gateway up to the point where it needs a model provider. A model call waits on the login.
+- A one-shot model call for profile `main` worked while the gateway ran (`gateway-test.sh`).
 
 ### Hermes looking at the host
 
@@ -101,9 +103,21 @@ Inside the sandbox, `hermes gateway status` read the host's own `~/Library/Launc
 
 Both rules compile, and signals inside the sandbox still work. Neither has been probed across the boundary yet (VM).
 
-### Device-code login
+### Device-code login and model calls
 
-`hermes auth add openai-codex --no-browser` inside the sandbox reached `auth.openai.com` through the proxy, and printed `https://auth.openai.com/codex/device` and a code. That was the only host contacted before the user's approval. The login was stopped at the cap; the code was never approved. The source names `auth.openai.com/oauth/token` for refresh and `chatgpt.com/backend-api/codex` for model calls; both are still to be seen in the proxy log after a real login.
+Shown, all inside the compiled policy through the proxy in learn mode:
+
+- **Login.** The user ran `hermes auth add openai-codex --no-browser` in the sandbox, opened the printed URL on the host and entered the code. The login completed. The only host contacted was `auth.openai.com`. The credential went into the root `~/.hermes/auth.json` of the sandbox home.
+- **Model calls.** `hermes -z <prompt> --provider openai-codex -m <model>` answered from the root home. The only host contacted was `chatgpt.com` (`https://chatgpt.com/backend-api/codex`), for model calls and for the model list.
+  - The model must be one the account may use. `gpt-5.4-mini` and `gpt-5.5`, from Hermes's built-in defaults, were refused with HTTP 400 ("not supported when using Codex with a ChatGPT account").
+  - `probes/codex-models.py` lists the account's models with Hermes's own read-only resolver; `gpt-5.6-luna` and `gpt-5.6-terra` worked.
+- **Profiles share the login.** Profiles `main` and `research`, with no `auth.json` of their own, made model calls with the root login. A token refresh forced from `main` (`hermes -p main auth refresh openai-codex`) contacted only `auth.openai.com` and was written back to the root `auth.json` (its mtime and size changed; no file appeared under the profile). After it, the root home and `research` still made calls.
+- **Across sessions.** Every call above was a separate `sbx.sh` invocation after the login; none asked to log in again.
+- **Weather task.**
+  - Asked for the current weather in Paris, Cali and Tokyo with all its tools, Hermes answered twice without calling any tool. The proxy saw only `chatgpt.com`, and neither Hermes's session store nor the provider's response items show a search. The answer cites a "weather tool" that does not appear anywhere, so it may not be live data.
+  - Restricted to its terminal tool and told to run one `curl` to `wttr.in`, Hermes ran it inside the sandbox through the proxy (`wttr.in` learned) and reported its output.
+  - Conclusion for the acceptance scenario: whether an answer is live must be checked against the tool calls and the network log, not taken from the answer.
+  - The headless browser was not used: Hermes reports its browser tools unavailable, and Chrome for Testing does not start under the write rules (above).
 
 ## Logging in (the user runs this)
 
