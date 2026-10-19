@@ -66,8 +66,8 @@ impl Engine {
             };
             let inputs = ProbeInputs {
                 user_home: ctx.user_home.clone(),
-                data: ctx.data.clone(),
-                config_file: ctx.config_file.clone(),
+                data: self.layout.data().to_owned(),
+                config_file: self.layout.config_file(),
                 other_sandboxes: self
                     .state
                     .list()?
