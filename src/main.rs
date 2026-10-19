@@ -37,7 +37,7 @@ enum Command {
     Sandbox(cli::sandbox::SandboxArgs),
     /// Open a shell, or run a command, inside a sandbox.
     Connect(cli::connect::ConnectArgs),
-    /// Install a runtime in a sandbox, or log it in.
+    /// Install a runtime in a sandbox; log it in with its own command through `connect`.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
