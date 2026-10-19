@@ -18,6 +18,10 @@ pub enum Expect {
     OutputLacks(&'static str),
     /// Closed when the proxy answered 403.
     ProxyRefuses,
+    /// Closed when no Apple Event got out. An answer, a refusal by TCC
+    /// (-1743) or a wait on Finder (-1712) all mean the event left the
+    /// sandbox: Seatbelt did not block it (ADR 0016).
+    AppleEventBlocked,
 }
 
 /// What the host checks after the probe, and removes if it is there.
@@ -238,7 +242,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             "apple events",
             "send an Apple Event to Finder",
             "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
-            Expect::Fails,
+            Expect::AppleEventBlocked,
         ));
         let label = format!("org.enclos.probe.{}", i.tag);
         let mut job = probe(
@@ -274,6 +278,16 @@ pub fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         Expect::ProxyRefuses => {
             Outcome::Open(format!("the proxy answered `{}`, not 403", output.trim()))
         }
+        Expect::AppleEventBlocked if succeeded => {
+            Outcome::Open(format!("Finder answered: {}", last_line(output)))
+        }
+        Expect::AppleEventBlocked if output.contains("-1743") => Outcome::Open(
+            "the event reached macOS's privacy check (TCC refused it, -1743), so Seatbelt did not block it".into(),
+        ),
+        Expect::AppleEventBlocked if output.contains("-1712") => Outcome::Open(
+            "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
+        ),
+        Expect::AppleEventBlocked => Outcome::Closed,
     }
 }
 
@@ -331,6 +345,20 @@ mod tests {
         let list = probes(&inputs(false));
         assert!(!list.iter().any(|p| p.name.contains("does-not-exist")));
         assert_eq!(sh_quote(Path::new("/a b/it's")), "'/a b/it'\\''s'");
+    }
+
+    #[test]
+    fn an_apple_event_that_left_the_sandbox_is_open_whoever_refused_it() {
+        let list = probes(&inputs(true));
+        let ae = list.iter().find(|p| p.route == "apple events").unwrap();
+        assert_eq!(ae.expect, Expect::AppleEventBlocked);
+        assert!(matches!(judge(ae, true, "3"), Outcome::Open(_)));
+        let tcc = "execution error: Not authorized to send Apple events to Finder. (-1743)";
+        assert!(matches!(judge(ae, false, tcc), Outcome::Open(_)));
+        let timeout = "execution error: Finder got an error: AppleEvent timed out. (-1712)";
+        assert!(matches!(judge(ae, false, timeout), Outcome::Open(_)));
+        let blocked = "execution error: An error of type -10004 has occurred. (-10004)";
+        assert_eq!(judge(ae, false, blocked), Outcome::Closed);
     }
 
     #[test]
