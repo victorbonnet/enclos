@@ -25,7 +25,7 @@ enum RuntimeVerb {
     /// Log the sandbox's runtime in and pick its model, with the runtime's own flow.
     Login {
         sandbox: SandboxName,
-        /// Log in with a subscription (Hermes: ChatGPT, by device code); the
+        /// Log in with a subscription, through the runtime's own flow; the
         /// only way for now, so it is the default.
         #[arg(long)]
         subscription: bool,
