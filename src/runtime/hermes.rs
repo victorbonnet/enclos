@@ -75,6 +75,12 @@ impl RuntimeAdapter for Hermes {
         // `hermes -p main`), but not for one created with `--no-alias`.
         format!("{HERMES} -p {agent}")
     }
+
+    fn service(&self) -> Option<Vec<OsString>> {
+        // One gateway per Hermes home serves every agent: cron, housekeeping
+        // and, later, messaging (prototype, issue #5).
+        Some(args(&[HERMES, "gateway", "run"]))
+    }
 }
 
 #[cfg(test)]

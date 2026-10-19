@@ -8,6 +8,7 @@ mod policy;
 mod probe;
 mod runtime;
 mod sandbox;
+mod service;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -41,6 +42,7 @@ pub struct Engine {
     backends: Vec<Box<dyn Backend>>,
     /// The enclos program, to start the proxy and services with.
     exe: Option<std::path::PathBuf>,
+    services: Box<dyn crate::service::ServiceManager>,
 }
 
 /// What `enclos init` did.
@@ -80,12 +82,14 @@ impl Engine {
     pub fn open(layout: Layout) -> Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
+        let agents_dir = layout.user_home().join("Library/LaunchAgents");
         Engine::new(
             layout,
             Box::new(state),
             Box::new(audit),
             backend::registered(),
         )
+        .with_services(Box::new(crate::service::launchd::Launchd { agents_dir }))
     }
 
     pub fn new(
@@ -100,7 +104,14 @@ impl Engine {
             audit,
             backends,
             exe: std::env::current_exe().ok(),
+            services: Box::new(NoServices),
         }
+    }
+
+    /// The same engine with another service manager.
+    pub fn with_services(mut self, services: Box<dyn crate::service::ServiceManager>) -> Engine {
+        self.services = services;
+        self
     }
 
     /// Creates the enclos folders, `config.toml`, `state.db` and
@@ -197,5 +208,28 @@ impl Engine {
                 Err(error)
             }
         }
+    }
+}
+
+/// The service manager of an engine built without one: refuses every start,
+/// so tests never reach the host's real service manager.
+struct NoServices;
+
+impl crate::service::ServiceManager for NoServices {
+    fn start(
+        &self,
+        unit: &crate::service::ServiceUnit,
+    ) -> std::result::Result<(), crate::service::ServiceError> {
+        Err(crate::service::ServiceError {
+            what: format!("this engine has no service manager to start {}", unit.label),
+        })
+    }
+
+    fn stop(&self, _label: &str) -> std::result::Result<(), crate::service::ServiceError> {
+        Ok(())
+    }
+
+    fn status(&self, _label: &str) -> crate::service::ServiceStatus {
+        crate::service::ServiceStatus::NotLoaded
     }
 }

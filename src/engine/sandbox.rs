@@ -145,6 +145,8 @@ impl Engine {
             true => format!("stopped {} sessions", r.stopped.len()),
             false => format!("{} sessions left members running", r.survivors.len()),
         };
+        // The services first, so launchd does not restart what is stopped.
+        self.stop_services(name)?;
         self.write(
             by,
             "sandbox stop",

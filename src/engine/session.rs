@@ -13,6 +13,7 @@ use super::Engine;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::lifecycle::process::{group_members, group_of, is_same, reference};
+use crate::lifecycle::stop::{GRACE, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -166,6 +167,21 @@ impl Engine {
             exit,
             left,
         })
+    }
+
+    /// Stops the sandbox's proxy session, so that a service can take its
+    /// port.
+    pub(super) fn stop_proxy(&self, lock: &StateLock, name: &SandboxName) -> Result<()> {
+        for session in self
+            .state
+            .sessions(name, true)?
+            .into_iter()
+            .filter(|s| s.kind == SessionKind::Proxy)
+        {
+            stop(&session, GRACE);
+            self.state.end_session(lock, session.id)?;
+        }
+        Ok(())
     }
 
     /// Starts the sandbox's proxy unless it runs already, and records it as

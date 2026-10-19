@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod connect;
+pub mod launch;
 pub mod net;
 pub mod policy;
 pub mod proxy;
