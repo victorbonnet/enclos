@@ -25,8 +25,13 @@ enum AgentVerb {
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
     List { sandbox: SandboxName },
-    /// Remove an agent's record; its files stay in the sandbox home.
-    Rm { agent: AgentTarget },
+    /// Remove an agent and its files, with the runtime's own command; `--keep-data` keeps the files.
+    Rm {
+        agent: AgentTarget,
+        /// Keep the agent's files in the sandbox home; remove only the record.
+        #[arg(long)]
+        keep_data: bool,
+    },
 }
 
 /// An agent of a sandbox, as the agent commands name it: `lab/main`.
@@ -115,19 +120,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             }
             notes.iter().for_each(|n| println!("{n}"));
         }
-        AgentVerb::Rm { agent } => {
+        AgentVerb::Rm { agent, keep_data } => {
             let AgentTarget { sandbox, agent } = agent;
-            match engine.remove_agent(by, &sandbox, &agent, confirm)? {
-                Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+            match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
+                Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
+                Planned::Done(removed) if removed.deleted => {
+                    println!("Removed agent {sandbox}/{agent} and its files.")
                 }
-                Planned::Done(removed) => {
-                    let runtime = removed.kind.display_name();
-                    println!(
-                        "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({}), so {runtime} still has the agent and enclos reports it as one it does not track; remove it with {runtime}'s own commands in `enclos connect {sandbox}`.",
-                        removed.files
-                    );
-                }
+                Planned::Done(removed) => println!(
+                    "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({}), so {} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again.",
+                    removed.files,
+                    removed.kind.display_name()
+                ),
             }
         }
     }

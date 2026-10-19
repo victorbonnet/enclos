@@ -1282,7 +1282,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(diff.untrackable, [RuntimeAgentName::new("my_bot").unwrap()]);
         assert!(diff.missing.is_empty());
         let err = engine
-            .remove_agent(&alice(), &name, &agent("scout"), Confirm::Yes)
+            .remove_agent(&alice(), &name, &agent("scout"), false, Confirm::Yes)
             .unwrap_err();
         assert!(
             err.to_string()
@@ -1357,6 +1357,55 @@ echo \"installed $*\" > \"$HOME/installed\"
         let diff = compared(engine.check_agents(&name).unwrap());
         assert_eq!(diff.missing, [agent("ranger"), agent("scout")]);
         assert!(diff.untracked.is_empty());
+        // Nothing left to delete: removing them takes only the record, and
+        // runs nothing in the sandbox (the fake backend would fail).
+        for a in ["scout", "ranger"] {
+            done(
+                engine
+                    .remove_agent(&alice(), &name, &agent(a), false, Confirm::Yes)
+                    .unwrap(),
+            );
+        }
+        assert!(engine.agents(&name).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_an_agent_with_its_files_asks_first() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        done(
+            engine
+                .add_agent(&alice(), &name, agent("scout"), Confirm::Yes)
+                .unwrap(),
+        );
+        let scout = agent("scout");
+        let err = engine
+            .remove_agent(&alice(), &name, &scout, false, Confirm::Ask)
+            .unwrap_err();
+        assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+        let Planned::DryRun(plan) = engine
+            .remove_agent(&alice(), &name, &scout, false, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run plans");
+        };
+        assert!(
+            plan.changes[0].contains("its files, with hermes's own command"),
+            "{plan:?}"
+        );
+        // `--keep-data` needs no confirmation and leaves the files.
+        done(
+            engine
+                .remove_agent(&alice(), &name, &scout, true, Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        assert!(
+            engine
+                .sandbox_home(&name)
+                .join(".hermes/profiles/scout")
+                .exists()
+        );
     }
 
     #[test]
@@ -1387,19 +1436,28 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
         assert_eq!(engine.audit(None).unwrap().len(), audited);
         let err = engine
-            .remove_agent(&alice(), &name, &agent("ranger"), Confirm::Yes)
+            .remove_agent(&alice(), &name, &agent("ranger"), false, Confirm::Yes)
             .unwrap_err();
         assert!(
             err.to_string()
                 .contains("has no agent `ranger`, and enclos cannot read"),
             "{err}"
         );
-        // A tracked agent can still be removed: its record is enclos's.
+        // Deleting a tracked agent's files would need the list; the record
+        // alone can still go, since it is enclos's.
+        let err = engine
+            .remove_agent(&alice(), &name, &agent("scout"), false, Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot read Hermes's agents") && err.to_string().contains("--keep-data"),
+            "{err}"
+        );
         done(
             engine
-                .remove_agent(&alice(), &name, &agent("scout"), Confirm::Yes)
+                .remove_agent(&alice(), &name, &agent("scout"), true, Confirm::Yes)
                 .unwrap(),
         );
+        assert!(engine.agents(&name).unwrap().is_empty());
     }
 
     #[test]
@@ -2073,5 +2131,150 @@ mod services {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(files, ["proxy.log", "gateway.log", "mail.log"]);
+    }
+}
+
+mod status {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::policy::with_sandbox_on;
+    use super::*;
+    use crate::engine::status::suggest;
+    use crate::model::agent::AgentName;
+    use crate::model::runtime::RuntimeKind;
+    use crate::runtime::{HomeFile, Installer, RuntimeAdapter};
+
+    /// A runtime adapter that implements none of the `status` methods.
+    struct Bare;
+
+    impl RuntimeAdapter for Bare {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Hermes
+        }
+        fn version(&self) -> &'static str {
+            "0"
+        }
+        fn endpoints(&self) -> &'static str {
+            ""
+        }
+        fn installer(&self) -> Installer {
+            Installer {
+                url: "",
+                sha256: "",
+                args: &[],
+            }
+        }
+        fn home_files(&self) -> Vec<HomeFile> {
+            Vec::new()
+        }
+        fn login(&self) -> Vec<OsString> {
+            Vec::new()
+        }
+        fn create_agent(&self, _: &AgentName) -> Vec<OsString> {
+            Vec::new()
+        }
+        fn talk(&self, _: &AgentName) -> String {
+            String::new()
+        }
+        fn service(&self) -> Option<Vec<OsString>> {
+            None
+        }
+        fn agents_in(&self, _: &Path) -> Option<Vec<String>> {
+            None
+        }
+    }
+
+    fn with_runtime() -> (TempDir, Engine, SandboxName) {
+        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        (dir, engine, name)
+    }
+
+    #[test]
+    fn a_runtime_that_names_nothing_still_gets_sizes_and_suggestions() {
+        let (_dir, engine, name) = with_runtime();
+        std::fs::write(engine.sandbox_home(&name).join("data"), vec![0u8; 300_000]).unwrap();
+        let record = engine.state.get(&name).unwrap().unwrap();
+        let created = record.created_at;
+        let status = engine.sandbox_status(record, Some(&Bare), created).unwrap();
+        assert!(status.disk.total.complete);
+        assert!(status.disk.total.bytes >= 300_000);
+        assert_eq!(status.disk.other, status.disk.total.bytes);
+        assert_eq!(
+            (status.disk.runtime, status.disk.caches, status.disk.agents),
+            (None, None, None)
+        );
+        assert_eq!(status.agents, None);
+        let rt = status.runtime.as_ref().unwrap();
+        assert_eq!((rt.version.as_deref(), rt.logged_in), (None, None));
+
+        // Forty days later, an unused sandbox is worth removing.
+        let later = created
+            .checked_add(jiff::SignedDuration::from_hours(24 * 40))
+            .unwrap();
+        let s = suggest(std::slice::from_ref(&status), later);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0].command, "enclos sandbox rm home");
+        assert!(s[0].reason.starts_with("unused for 40 days"), "{s:?}");
+        assert!(suggest(&[status], created).is_empty());
+    }
+
+    #[test]
+    fn hermes_agents_logins_and_models_show_with_what_to_do() {
+        let (_dir, engine, name) = with_runtime();
+        let home = engine.sandbox_home(&name);
+        let scout = home.join(".hermes/profiles/scout");
+        std::fs::create_dir_all(&scout).unwrap();
+        std::fs::write(
+            scout.join("config.yaml"),
+            "model:\n  default: gpt-6.1-sol\n",
+        )
+        .unwrap();
+        std::fs::write(scout.join(".hermes_history"), "hello").unwrap();
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        std::fs::write(home.join(".hermes/hermes-agent/big"), vec![0u8; 200_000]).unwrap();
+
+        let view = engine.status(None).unwrap();
+        let s = &view.sandboxes[0];
+        assert_eq!(s.runtime.as_ref().unwrap().logged_in, Some(false));
+        let agents = s.agents.as_ref().unwrap();
+        assert_eq!(agents.len(), 1);
+        let a = &agents[0];
+        assert_eq!(
+            (a.name.as_str(), a.tracked, a.in_runtime, a.model.as_deref()),
+            ("scout", false, Some(true), Some("gpt-6.1-sol"))
+        );
+        assert!(a.last_active.is_some() && a.bytes.unwrap() > 0);
+        assert!(s.disk.runtime.unwrap() >= 200_000);
+        let commands: Vec<&str> = view
+            .suggestions
+            .iter()
+            .map(|s| s.command.as_str())
+            .collect();
+        assert!(
+            commands.contains(&"enclos agent add home/scout"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&"enclos runtime login home"),
+            "{commands:?}"
+        );
+        assert_eq!(view.tracked_agents(), 0);
+        assert_eq!(engine.status(Some(&name)).unwrap().sandboxes.len(), 1);
+        assert!(engine.status(Some(&"nope".parse().unwrap())).is_err());
     }
 }

@@ -118,6 +118,10 @@ pub trait NetLogStore {
     fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>>;
     /// Each destination the proxy denied for the sandbox, most recent first.
     fn denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>>;
+    /// When the sandbox last made a connection.
+    fn last_event(&self, sandbox: &SandboxName) -> Result<Option<Timestamp>> {
+        Ok(self.events(sandbox, None)?.last().map(|e| e.at))
+    }
 }
 
 /// Why the state store could not do what was asked.

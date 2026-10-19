@@ -10,6 +10,7 @@ mod runtime;
 mod sandbox;
 mod service;
 mod session;
+mod status;
 #[cfg(test)]
 mod tests;
 
@@ -21,6 +22,10 @@ pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, Instal
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
+pub use status::{
+    AgentStatus, Disk, IDLE_DAYS, RuntimeStatus, SandboxStatus, ServiceLine, Size, StatusView,
+    Suggestion, human_bytes,
+};
 
 use std::path::PathBuf;
 

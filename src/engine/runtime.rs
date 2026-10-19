@@ -56,12 +56,15 @@ pub enum Added {
     Adopted,
 }
 
-/// What `agent rm` did: the record is gone; the files stay.
+/// What `agent rm` did: the record is gone, and the files with it unless
+/// they were kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRemoved {
     pub kind: RuntimeKind,
     /// Where the agent's files are, relative to the sandbox home.
     pub files: String,
+    /// Whether the runtime's own command deleted them.
+    pub deleted: bool,
 }
 
 /// What an install would change, worked out without changing anything.
@@ -628,25 +631,71 @@ impl Engine {
         Ok(self.state.agents(name)?)
     }
 
-    /// Removes an agent's record. Its files stay in the sandbox home; the
-    /// runtime's own commands remove them.
+    /// Removes an agent: its files, with the runtime's own command run in
+    /// the sandbox (design §10), then its record. With `keep_data`, or when
+    /// the runtime has no such command or no longer has the agent, only the
+    /// record goes. Deleting files asks for confirmation first.
     pub fn remove_agent(
         &self,
         by: &Actor,
         name: &SandboxName,
         agent: &AgentName,
+        keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<AgentRemoved>> {
-        let kind = self.runtime_of(name)?;
         self.agent_of(name, agent.as_str())?;
-        let files = adapter(kind).agent_files(agent);
-        if confirm == Confirm::DryRun {
-            return Ok(Planned::DryRun(Plan {
-                changes: vec![format!(
-                    "remove the record of agent {name}/{agent}; its files stay in the sandbox home ({files})"
-                )],
-                ..Plan::default()
-            }));
+        let kind = self.runtime_of(name)?;
+        let runtime = adapter(kind);
+        // Whether the runtime still has the files to delete: not when the
+        // list says it does not, and not known when it cannot be read, in
+        // which case only the record can go (ADR 0023).
+        let delete = match (keep_data, runtime.agents_in(&self.sandbox_home(name))) {
+            (true, _) => None,
+            (false, Ok(found)) if found.contains(&RuntimeAgentName::from(agent)) => {
+                runtime.delete_agent(agent)
+            }
+            (false, Ok(_)) => None,
+            (false, Err(why)) => {
+                return Err(Error::Session {
+                    what: format!(
+                        "enclos cannot read {}'s agents in sandbox {name} ({why}), so it cannot tell whether agent {agent} still has files to delete. `--keep-data` removes only the record",
+                        kind.display_name()
+                    ),
+                });
+            }
+        };
+        match confirm {
+            Confirm::DryRun => {
+                let what = match &delete {
+                    Some(_) => format!(
+                        "delete agent {name}/{agent} and its files, with {kind}'s own command"
+                    ),
+                    None => format!("remove the record of agent {name}/{agent}; its files stay"),
+                };
+                return Ok(Planned::DryRun(Plan {
+                    changes: vec![what],
+                    ..Plan::default()
+                }));
+            }
+            Confirm::Ask if delete.is_some() => {
+                return Err(Error::NeedsConfirmation {
+                    what: format!("deleting agent {name}/{agent} and its files"),
+                });
+            }
+            _ => {}
+        }
+        let files = runtime.agent_files(agent);
+        let deleted = delete.is_some();
+        if let Some(command) = delete {
+            let end = self.run_in_sandbox(by, name, command, "agent rm run")?;
+            if end.exit != 0 {
+                return Err(Error::Session {
+                    what: format!(
+                        "{kind} could not delete agent {agent} (exit {}); its record stays. `--keep-data` removes only the record",
+                        end.exit
+                    ),
+                });
+            }
         }
         self.write(
             by,
@@ -660,7 +709,11 @@ impl Engine {
                     .map_err(Into::into)
             },
         )?;
-        Ok(Planned::Done(AgentRemoved { kind, files }))
+        Ok(Planned::Done(AgentRemoved {
+            kind,
+            files,
+            deleted,
+        }))
     }
 }
 
