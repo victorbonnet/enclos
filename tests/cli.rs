@@ -337,3 +337,89 @@ fn policy_allow_refuses_an_unsafe_destination_before_anything_else() {
     assert_eq!(out.code(), 1);
     assert!(out.stderr().contains("public suffix"), "{}", out.stderr());
 }
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_seatbelt_sandbox_is_refused_off_macos() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "home"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(out.stderr().contains("cannot run"), "{}", out.stderr());
+    assert!(
+        home.run(&["sandbox", "list"])
+            .ok()
+            .stdout()
+            .contains("No sandboxes yet")
+    );
+}
+
+/// Stops the sandbox when the test ends, passed or not, so the proxy it
+/// started never outlives the test.
+#[cfg(target_os = "macos")]
+struct StopOnDrop<'a>(&'a Home, &'a str);
+
+#[cfg(target_os = "macos")]
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.run(&["sandbox", "stop", self.1]);
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "home"]);
+    out.ok();
+    assert!(
+        out.stdout().contains("Created sandbox home"),
+        "{}",
+        out.stdout()
+    );
+    let _stop = StopOnDrop(&home, "home");
+
+    // The command's exit code comes back; it wrote only in its home.
+    let script = "echo hi > \"$HOME/hello\"; echo no > \"$HOME/../escaped\" 2>/dev/null; exit 3";
+    let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
+    assert_eq!(out.code(), 3, "stderr: {}", out.stderr());
+    let sandbox = home.root.join("sandboxes/home");
+    assert!(sandbox.join("home/hello").exists());
+    assert!(!sandbox.join("escaped").exists());
+
+    // Through the proxy, a destination not on the allowlist is refused and logged.
+    let curl = "/usr/bin/curl -s -o /dev/null -w '%{http_code}' https://example.com/ || true";
+    home.run(&["connect", "home", "--", "/bin/sh", "-c", curl])
+        .ok();
+    let denied = home.run(&["net", "denied", "home"]);
+    assert!(
+        denied
+            .ok()
+            .stdout()
+            .contains("example.com:443  not-allowed"),
+        "{}",
+        denied.stdout()
+    );
+
+    // The proxy runs as its own session until the sandbox stops.
+    let show = home.run(&["sandbox", "show", "home"]);
+    assert!(show.ok().stdout().contains("proxy"), "{}", show.stdout());
+    let stop = home.run(&["sandbox", "stop", "home"]);
+    assert!(
+        stop.ok().stdout().contains("Stopped sandbox home"),
+        "{}",
+        stop.stdout()
+    );
+    assert!(
+        home.run(&["sandbox", "show", "home"])
+            .ok()
+            .stdout()
+            .contains("no sessions running")
+    );
+
+    // Removing deletes the home, after confirmation.
+    assert_eq!(home.run(&["sandbox", "rm", "home"]).code(), 3);
+    home.run(&["sandbox", "rm", "home", "--yes"]).ok();
+    assert!(!sandbox.exists());
+}
