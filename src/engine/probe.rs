@@ -44,11 +44,10 @@ impl Engine {
             let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
             })?;
-            let ports = [record.port_base];
-            let compiled = self.compile_policy(name, &ports)?;
+            let compiled = self.compile_policy(name, record.proxy_port)?;
             self.ensure_proxy(lock, &record)?;
             let policy = self.policy(name)?.snapshot.policy;
-            let ctx = self.sandbox_context(name, &ports);
+            let ctx = self.sandbox_context(name, record.proxy_port);
             std::fs::create_dir_all(ctx.home.join("tmp")).ok();
             let backend = self.backend_of(name)?;
 
@@ -93,7 +92,6 @@ impl Engine {
                 let launch = Launch {
                     program: "/bin/sh".into(),
                     args: vec!["-c".into(), probe.script.clone().into()],
-                    proxy_port: record.port_base,
                     env: Vec::new(),
                 };
                 let out = backend
