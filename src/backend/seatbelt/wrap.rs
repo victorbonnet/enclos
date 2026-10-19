@@ -6,7 +6,8 @@
 //! `TMPDIR`, caches and `PATH` point into the sandbox home, and every common
 //! proxy variable points at the sandbox's proxy (design §5).
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::super::{Launch, SandboxContext};
@@ -14,16 +15,25 @@ use super::super::{Launch, SandboxContext};
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Host variables a sandbox keeps: how to draw and which language to speak.
+/// Every `LC_*` variable is kept too.
 const PASSED_THROUGH: &[&str] = &[
     "TERM",
+    "TERMINFO",
+    "TERMINFO_DIRS",
     "COLORTERM",
     "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
     "TZ",
     "USER",
     "LOGNAME",
 ];
+
+/// Where ncurses looks for a terminal description when nothing says otherwise.
+const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
+
+/// The terminal type a sandbox gets when the host's has no description it
+/// can find; terminals that bring their own (Ghostty's `xterm-ghostty`)
+/// understand it.
+const FALLBACK_TERM: &str = "xterm-256color";
 
 pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     let mut command = Command::new(SANDBOX_EXEC);
@@ -38,6 +48,20 @@ pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
             command.env(name, value);
         }
     }
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("LC_")) {
+            command.env(name, value);
+        }
+    }
+    if let Some(term) = std::env::var_os("TERM")
+        && needs_fallback_term(
+            &term,
+            std::env::var_os("TERMINFO").is_some(),
+            std::env::var_os("TERMINFO_DIRS").as_deref(),
+        )
+    {
+        command.env("TERM", FALLBACK_TERM);
+    }
     for (name, value) in environment(ctx, launch.proxy_port) {
         command.env(name, value);
     }
@@ -46,6 +70,32 @@ pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     }
     command.current_dir(&ctx.home);
     command
+}
+
+/// Whether `term` has no description a sandboxed program would find: no
+/// `TERMINFO` names one, and neither `TERMINFO_DIRS` nor the system's
+/// folder holds it. ncurses files an entry under its first letter, or on
+/// macOS under that letter's hex code.
+fn needs_fallback_term(term: &OsStr, terminfo: bool, dirs: Option<&OsStr>) -> bool {
+    let Some(name) = term.to_str().filter(|n| !n.is_empty()) else {
+        return false;
+    };
+    if terminfo {
+        return false;
+    }
+    let first = name.chars().next().unwrap_or_default();
+    let mut folders = dirs
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|d| !d.as_os_str().is_empty())
+        .chain([PathBuf::from(SYSTEM_TERMINFO)]);
+    !folders.any(|dir| {
+        dir.join(first.to_string()).join(name).is_file()
+            || dir
+                .join(format!("{:x}", u32::from(first)))
+                .join(name)
+                .is_file()
+    })
 }
 
 /// The variables every sandboxed program gets.
@@ -125,6 +175,31 @@ mod tests {
         assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
         assert!(env["PATH"].starts_with("/Users/alice/.enclos/sandboxes/home/home/.local/bin:"));
         assert!(env["PATH"].contains(":/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn an_undescribed_terminal_falls_back_to_xterm_256color() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("78")).unwrap();
+        std::fs::write(dir.path().join("78/xterm-ghostty"), b"").unwrap();
+        std::fs::create_dir_all(dir.path().join("k")).unwrap();
+        std::fs::write(dir.path().join("k/kitty"), b"").unwrap();
+        let ghostty = OsStr::new("xterm-ghostty");
+        // Ghostty sets TERMINFO to its own folder: keep its TERM.
+        assert!(!needs_fallback_term(ghostty, true, None));
+        // Without it, nothing describes xterm-ghostty.
+        assert!(needs_fallback_term(ghostty, false, None));
+        // TERMINFO_DIRS may describe it, under a hex or a letter folder.
+        let dirs = dir.path().as_os_str();
+        assert!(!needs_fallback_term(ghostty, false, Some(dirs)));
+        assert!(!needs_fallback_term(OsStr::new("kitty"), false, Some(dirs)));
+        assert!(!needs_fallback_term(OsStr::new(""), false, None));
+        #[cfg(target_os = "macos")]
+        assert!(!needs_fallback_term(
+            OsStr::new("xterm-256color"),
+            false,
+            None
+        ));
     }
 
     #[test]
