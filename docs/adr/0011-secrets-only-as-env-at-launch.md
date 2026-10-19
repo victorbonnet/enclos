@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0022
 ---
 
 # Secrets reach a sandbox only as environment variables, through `enclos launch`

@@ -172,7 +172,7 @@ log = "metadata"                         # per tunnel: host, port, address, byte
 memory = "2G"
 cpu = 2.0
 
-[secrets.main]                           # per agent: only `main` receives these
+[secrets]                                # every session in the sandbox receives these
 env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 ```
 
@@ -208,7 +208,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 2. Load the record and the active snapshot; compile it if no compiled policy exists for this snapshot and this enclos version (an upgrade recompiles, which is how stricter enclos-owned rules reach new sessions without asking; `enclos doctor` lists what changed); `prepare`.
 3. Start the proxy unit if it is not running, with the active network policy and the sandbox's listener.
 4. Record the session with its snapshot and compiled-policy hashes; close the audit entry; release the lock.
-5. `enclos launch` reads the secrets granted to the agent, wraps the command (`main`, Hermes's own command for that agent; a login shell when none is given) and runs it in the terminal, tracking its members.
+5. `enclos launch` reads the sandbox's secrets, wraps the command (`main`, Hermes's own command for that agent; a login shell when none is given) and runs it in the terminal, tracking its members.
 6. When the session ends, take the lock, record the end and any surviving members, and append an audit entry.
 7. On failure at any step: stop what started, save `Failed { reason }`, and close the audit entry as failed.
 
@@ -501,7 +501,7 @@ enclos net denied home                          # what was refused; allow what y
 enclos sandbox stop home lab                    # every member, services and sessions alike
 ```
 
-**Later** (milestones 2 and 3): agents that answer on Telegram with secrets granted per agent, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
+**Later** (milestones 2 and 3): agents that answer on Telegram with the sandbox's secrets, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
 
 ```bash
 enclos secret set home/telegram-main
@@ -541,7 +541,7 @@ On Linux: `config.toml` and `templates/` in `$XDG_CONFIG_HOME/enclos`, everythin
 
 ## 12. Secrets and subscriptions
 
-- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)). The sandbox itself is meant to have no Keychain access (planned, to verify with the host-service probes).
+- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)). They are granted per sandbox: every session, whichever agent it runs, and the runtime's gateway receive the same variables, and agents that must not share a secret go in different sandboxes. The sandbox itself is meant to have no Keychain access (planned, to verify with the host-service probes).
 - **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, enclos supports only device-code logins: Hermes prints a URL and a short code, and the user opens the URL on the host. enclos makes no network exception for logins (no localhost callback port), and does not copy tokens in from a login made on the host. Hermes documents this login (its OpenAI Codex provider, "ChatGPT OAuth") as a device-code flow, and stores the credential in its own home (`~/.hermes/auth.json` inside the sandbox). Hermes can also import a host Codex CLI login from `~/.codex/auth.json`; inside the sandbox that path is on the read deny list, so the import is unavailable by design. That the login completes inside the sandbox is to verify (§14). Once logged in, every agent in the sandbox can read the runtime's refresh token; enclos flags it.
 - **Subscriptions, v2:** one refresh owner on the host keeps the renewable credential; sandboxes get only short-lived access tokens.
 
@@ -564,7 +564,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the runtime's own login in the sandbox home.
 
    Done when the acceptance scenario below passes.
-2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per agent, stored in the Keychain and passed through `enclos launch`; Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
+2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per sandbox, stored in the Keychain and passed through `enclos launch`; Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
 3. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
    2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
@@ -599,11 +599,12 @@ The design depends on these, and none has been shown to work yet. The milestone 
 - Whether runtimes need writes to system temp or cache folders beyond `TMPDIR`.
 - That denying mDNSResponder removes DNS from the sandbox without breaking clients that use the proxy.
 - That the proxy environment variables reach every client Hermes and its installers use, including curl and Node's `fetch`.
+- Whether Hermes's single gateway can take each agent's channel credentials (such as one Telegram bot token per agent) from environment variables, since secrets reach a sandbox only that way ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)). Milestone 2.
 - The unified-log predicate for Seatbelt denials, how lines are attributed to a sandbox, and whether streaming needs admin rights.
 
 ## 15. Open decisions
 
-Decided since the first draft: Rust as the language; a domain-level CONNECT proxy without TLS interception ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md)); one runtime per sandbox ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)); launchd and systemd user units ([ADR 0002](adr/0002-no-daemon.md)); the threat model ([ADR 0014](adr/0014-threat-model-accidental-damage.md)); unknown destinations denied without asking; stricter enclos-owned rules apply on upgrade without asking ([ADR 0018](adr/0018-immutable-policy-snapshots.md)); device-code logins only (§12); a server name check on TLS tunnels (§6); secrets granted per agent ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)); each host managed locally, with no `--host` option for now.
+Decided since the first draft: Rust as the language; a domain-level CONNECT proxy without TLS interception ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md)); one runtime per sandbox ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)); launchd and systemd user units ([ADR 0002](adr/0002-no-daemon.md)); the threat model ([ADR 0014](adr/0014-threat-model-accidental-damage.md)); unknown destinations denied without asking; stricter enclos-owned rules apply on upgrade without asking ([ADR 0018](adr/0018-immutable-policy-snapshots.md)); device-code logins only (§12); a server name check on TLS tunnels (§6); secrets granted per sandbox ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)); each host managed locally, with no `--host` option for now.
 
 | Decision | Recommendation |
 | --- | --- |
