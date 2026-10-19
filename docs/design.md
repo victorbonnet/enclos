@@ -525,7 +525,7 @@ enclos policy allow community mcp.example.org
   state.db                     SQLite: sandbox records, policy snapshots, sessions and members, network log, denials
   state.lock                   held while a command changes state
   audit.jsonl                  append-only and hash-chained: one line when a state-changing command starts, one when it ends
-  runtimes/<runtime>/<version>/  shared, read-only to every sandbox
+  runtimes/<runtime>/<version>/  shared, read-only to every sandbox (later: milestone 1 installs per sandbox, ADR 0020)
   templates/                   user templates
   run/<sandbox>/               proxy control sockets
   sandboxes/<name>/

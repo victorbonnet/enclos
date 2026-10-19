@@ -6,6 +6,7 @@ mod compile;
 mod net;
 mod policy;
 mod probe;
+mod runtime;
 mod sandbox;
 mod session;
 #[cfg(test)]

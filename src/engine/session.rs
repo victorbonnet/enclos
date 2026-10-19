@@ -42,6 +42,24 @@ impl Engine {
         name: &SandboxName,
         command: Vec<OsString>,
     ) -> Result<SessionEnd> {
+        let command = if command.is_empty() {
+            vec![OsString::from("/bin/zsh"), OsString::from("-l")]
+        } else {
+            command
+        };
+        self.run_in_sandbox(by, name, command, "connect")
+    }
+
+    /// Runs `command` in the sandbox, in this terminal, as a recorded
+    /// session (design §8 steps 1-6), and returns when it exits.
+    pub(super) fn run_in_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: Vec<OsString>,
+        audit_name: &str,
+    ) -> Result<SessionEnd> {
+        let target = name.to_string();
         let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
         // Which process group is the session's (design §8). In a terminal
         // where this command leads its job, the job's group: the program
@@ -54,7 +72,7 @@ impl Engine {
         let leads_group = group_of(me) == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
         let (session, mut child, pgid) =
-            self.write(by, "connect", Some(name.to_string()), summary, |lock| {
+            self.write(by, audit_name, Some(target.clone()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
@@ -66,14 +84,12 @@ impl Engine {
                         .ok_or_else(|| Error::NoPolicy {
                             sandbox: name.to_string(),
                         })?;
-
-                let (program, args) = match command.split_first() {
-                    Some((program, args)) => (program.clone(), args.to_vec()),
-                    None => (OsString::from("/bin/zsh"), vec![OsString::from("-l")]),
-                };
+                let (program, args) = command.split_first().ok_or_else(|| Error::Session {
+                    what: "no command to run".into(),
+                })?;
                 let launch = Launch {
-                    program,
-                    args,
+                    program: program.clone(),
+                    args: args.to_vec(),
                     env: Vec::new(),
                 };
                 let ctx = self.sandbox_context(name, record.proxy_port);
@@ -85,7 +101,7 @@ impl Engine {
                 }
                 let child = wrapped.spawn().map_err(|e| Error::Session {
                     what: format!(
-                        "could not start {} in sandbox {name}: {e}",
+                        "could not start {} in {target}: {e}",
                         launch.program.to_string_lossy()
                     ),
                 })?;
@@ -136,7 +152,7 @@ impl Engine {
         self.write(
             by,
             "session end",
-            Some(format!("{name} session {session}")),
+            Some(format!("{target} session {session}")),
             summary,
             |lock| {
                 if left.is_empty() {

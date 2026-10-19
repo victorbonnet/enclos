@@ -75,6 +75,7 @@ impl Engine {
                     template: spec.template.clone(),
                     state: SandboxState::Created,
                     proxy_port: self.free_port()?,
+                    runtime: None,
                     created_at: now(),
                 };
                 // The backend must run here before anything is created (ADR 0009).

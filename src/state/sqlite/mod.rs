@@ -1,6 +1,7 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod agents;
 mod netlog;
 mod policy;
 mod schema;
@@ -18,6 +19,7 @@ use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
 use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore};
 use crate::model::Timestamp;
+use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
@@ -131,12 +133,16 @@ impl SqliteStateStore {
         let template = text(5)?;
         let reason: Option<String> = row.get(3).map_err(self.sqlite_err())?;
         let proxy_port: i64 = row.get(6).map_err(self.sqlite_err())?;
+        let runtime: Option<String> = row.get(7).map_err(self.sqlite_err())?;
         Ok(SandboxRecord {
             name: name.parse().map_err(|e| corrupt(format!("{e}")))?,
             backend: backend.parse().map_err(|e| corrupt(format!("{e}")))?,
             template: template.parse().map_err(|e| corrupt(format!("{e}")))?,
             proxy_port: u16::try_from(proxy_port)
                 .map_err(|_| corrupt(format!("proxy_port {proxy_port}")))?,
+            runtime: runtime
+                .map(|a| a.parse().map_err(|e| corrupt(format!("{e}"))))
+                .transpose()?,
             state: match (state.as_str(), reason) {
                 ("created", _) => SandboxState::Created,
                 ("running", _) => SandboxState::Running,
@@ -246,7 +252,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port, runtime
                  FROM sandboxes WHERE name = ?1",
             )
             .map_err(self.sqlite_err())?;
@@ -261,7 +267,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port, runtime
                  FROM sandboxes ORDER BY name",
             )
             .map_err(self.sqlite_err())?;
@@ -277,12 +283,12 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let (state, reason) = state_columns(&rec.state);
         conn.execute(
-            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port, runtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
                  state = excluded.state, failed_reason = excluded.failed_reason,
                  created_at = excluded.created_at, template = excluded.template,
-                 proxy_port = excluded.proxy_port",
+                 proxy_port = excluded.proxy_port, runtime = excluded.runtime",
             params![
                 rec.name.as_str(),
                 rec.backend.as_str(),
@@ -290,7 +296,8 @@ impl StateStore for SqliteStateStore {
                 reason,
                 rec.created_at.to_string(),
                 rec.template.as_str(),
-                rec.proxy_port
+                rec.proxy_port,
+                rec.runtime.map(|a| a.as_str())
             ],
         )
         .map_err(self.sqlite_err())?;
@@ -342,6 +349,31 @@ impl StateStore for SqliteStateStore {
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>> {
         let conn = self.open()?;
         sessions::list(&conn, name, running_only).map_err(|e| self.read_err(e))
+    }
+
+    fn put_agent(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        agent: &AgentRecord,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        agents::put(&conn, sandbox, agent).map_err(self.sqlite_err())
+    }
+
+    fn remove_agent(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        name: &AgentName,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        agents::remove(&conn, sandbox, name).map_err(self.sqlite_err())
+    }
+
+    fn agents(&self, sandbox: &SandboxName) -> Result<Vec<AgentRecord>> {
+        let conn = self.open()?;
+        agents::list(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 }
 

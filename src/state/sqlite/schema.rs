@@ -64,6 +64,15 @@ pub const MIGRATIONS: &[&str] = &[
         ended_at    TEXT
     ) STRICT;
     CREATE INDEX sessions_running ON sessions (sandbox, ended_at);",
+    // 5: the runtime installed in each sandbox, and its agents
+    "ALTER TABLE sandboxes ADD COLUMN runtime TEXT;
+    CREATE TABLE agents (
+        sandbox    TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        port       INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (sandbox, name)
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.
