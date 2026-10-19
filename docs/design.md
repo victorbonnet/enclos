@@ -357,7 +357,7 @@ pub trait RuntimeAdapter {
     fn requirements(&self) -> PolicyFragment;                                   // versioned; recorded in snapshot inputs
     fn install(&self, runtimes: &Path, version: &Version) -> Result<Runtime>;   // shared, read-only
     fn init_home(&self, sb: &SandboxRecord, runtime: &Runtime) -> Result<()>;   // writable environments, bin, caches, skills
-    fn login(&self, sb: &SandboxRecord, method: LoginMethod) -> Command;        // runs inside the sandbox
+    fn login(&self) -> Command;                                                 // the runtime's own login and setup, shown as `connect <sandbox> -- <this>`
 
     fn add_agent(&self, sb: &SandboxRecord, agent: &AgentSpec) -> Result<()>;          // model, skills, channels
     fn remove_agent(&self, sb: &SandboxRecord, agent: &AgentName, keep_data: bool) -> Result<()>;
@@ -391,7 +391,6 @@ impl Engine {
     pub fn refresh_policy(&self, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
     pub fn rollback_policy(&self, by: &Actor, name: &SandboxName, to: u32, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
     pub fn test_policy(&self, by: &Actor, name: &SandboxName) -> Result<TestReport>;
-    pub fn login(&self, by: &Actor, name: &SandboxName, method: LoginMethod) -> Result<Command>;
     pub fn connect(&self, by: &Actor, name: &SandboxName, command: Vec<OsString>) -> Result<Command>;   // a shell, or the command
     pub fn exec(&self, by: &Actor, name: &SandboxName, cmd: Command) -> Result<Command>;
     pub fn launch(&self, target: &Target, kind: SessionKind) -> Result<Infallible>;   // every session goes through here
@@ -461,7 +460,6 @@ enclos template list | show <template>
 
 enclos runtime install <type> --sandbox <name> [--version x]
 enclos runtime configure <name>[/<agent>] [--model ...] [--mcp-add name=https://...] [--channel ...]
-enclos runtime login <name>[/<agent>] --api-key secret:<ref> | --subscription
 
 enclos secret set | list | rm <ref>
 enclos net log <name> [-f] | net denied <name>
@@ -483,15 +481,13 @@ enclos sandbox create home --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox home
 enclos agent add home/main
 enclos agent add home/research
-enclos runtime login home/main --subscription   # Hermes's device-code login: prints a URL and a code to open on the host
-enclos runtime login home/research --subscription # if Hermes keeps one login per agent (to verify, §14)
+enclos connect home -- hermes setup             # Hermes's own setup: provider, login (a URL to open on the host), model
 
 enclos sandbox create lab --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox lab
 enclos agent add lab/scout
 enclos agent add lab/writer
-enclos runtime login lab/scout --subscription
-enclos runtime login lab/writer --subscription
+enclos connect lab -- hermes setup
 
 enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
 enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused
@@ -596,6 +592,7 @@ The design depends on these, and none has been shown to work yet. The milestone 
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.
 - How macOS members are tracked, including processes that leave their process group (§8).
 - That Hermes's documented device-code login for a ChatGPT subscription completes inside the sandbox through the proxy, which endpoints it needs (they go into the Hermes adapter), and that the refreshed credential keeps working across sessions.
+- That Hermes's setup wizard, `hermes setup`, completes inside the sandbox through the proxy: the prototype logged in with `hermes model`, which covers only provider, login and model. A wizard section that acts on the host (installing a launchd job, for example) would be refused.
 - That Hermes, its model calls, its installers (Python and Node package managers, skill downloads) and any headless browser it starts work through `HTTPS_PROXY` with writes limited to the home, and which install sources the Hermes adapter must allow.
 - Whether a browser started inside Seatbelt needs its own sandbox disabled to run, which would leave only enclos's.
 - Whether runtimes need writes to system temp or cache folders beyond `TMPDIR`.
