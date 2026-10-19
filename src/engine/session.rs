@@ -154,7 +154,7 @@ impl Engine {
 
     /// Starts the sandbox's proxy unless it runs already, and records it as
     /// a session, so that `sandbox stop` ends it too.
-    fn ensure_proxy(&self, lock: &StateLock, record: &SandboxRecord) -> Result<()> {
+    pub(super) fn ensure_proxy(&self, lock: &StateLock, record: &SandboxRecord) -> Result<()> {
         let running = self
             .state
             .sessions(&record.name, true)?

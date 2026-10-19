@@ -432,6 +432,50 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn every_escape_probe_fails_in_a_new_sandbox() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // The host-service probes act on the host if a rule fails: CI runners only.
+    let mut args = vec!["policy", "test", "home"];
+    if std::env::var_os("CI").is_some() {
+        args.push("--host-services");
+    }
+    let out = home.run(&args);
+    assert_eq!(
+        out.code(),
+        0,
+        "stdout: {}\nstderr: {}",
+        out.stdout(),
+        out.stderr()
+    );
+    let report = out.stdout();
+    assert!(!report.contains("OPEN"), "{report}");
+    for route in [
+        "enclos files",
+        "other sandboxes",
+        "writes",
+        "network",
+        "dns",
+        "signals",
+        "synthetic input",
+    ] {
+        assert!(
+            report.contains(&format!("closed   {route}")),
+            "no closed {route} probe:\n{report}"
+        );
+    }
+    assert!(
+        report.contains("All ") && report.contains("probes failed as they should"),
+        "{report}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn a_session_stays_open_while_its_command_left_processes_running() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
