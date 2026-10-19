@@ -14,6 +14,8 @@ mod tests;
 
 pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use runtime::home_files_script;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use session::{Left, SessionEnd};
 

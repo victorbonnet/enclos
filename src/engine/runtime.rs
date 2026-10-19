@@ -1,7 +1,6 @@
 //! The engine's runtime calls: install a runtime in a sandbox, log it in, and
 //! manage its agents (design §9 "Runtime adapter", §12).
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -16,7 +15,7 @@ use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::runtime::{RuntimeAdapter, adapter};
+use crate::runtime::{HomeFile, RuntimeAdapter, adapter};
 
 impl Engine {
     /// The runtime installed in the sandbox.
@@ -71,48 +70,58 @@ impl Engine {
                 self.state.put(lock, &record)?;
                 let overrides = self.layout.read_policy(name.as_str())?;
                 self.save_policy(lock, by, name, &overrides)?;
-                let home = self.layout.sandbox_home(name.as_str());
-                self.put_home_files(&home, runtime.as_ref())?;
-                self.download_installer(&home, runtime.as_ref())
+                self.stage_install(name, runtime.as_ref())
             },
         )?;
-        let mut command = vec!["/bin/bash".into(), installer_file.into_os_string()];
-        command.extend(runtime.installer().args.iter().map(Into::into));
-        self.run_in_sandbox(by, name, command, "runtime install run")
+        self.run_in_sandbox(by, name, installer_file, "runtime install run")
     }
 
-    fn put_home_files(&self, home: &std::path::Path, runtime: &dyn RuntimeAdapter) -> Result<()> {
-        for file in runtime.home_files() {
-            let path = home.join(file.path);
-            let io = |source| {
-                Error::Layout(LayoutError::Io {
-                    path: path.clone(),
-                    source,
-                })
-            };
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).map_err(io)?;
-            }
-            std::fs::write(&path, file.contents).map_err(io)?;
-            let mode = if file.executable { 0o700 } else { 0o600 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).map_err(io)?;
+    /// Stages what an install needs in the sandbox's `installers/` folder,
+    /// beside its home: the sandbox can read it but not write it, so the
+    /// host never writes through a link the sandbox planted. Returns the
+    /// command that installs: it copies the adapter's files into the home
+    /// from inside the sandbox, under its policy, then runs the installer.
+    fn stage_install(
+        &self,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+    ) -> Result<Vec<std::ffi::OsString>> {
+        let dir = self.layout.sandbox_dir(name.as_str()).join("installers");
+        let io = |path: &std::path::Path| {
+            let path = path.to_owned();
+            move |source| Error::Layout(LayoutError::Io { path, source })
+        };
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        let files = runtime.home_files();
+        let mut staged = Vec::new();
+        for (i, file) in files.iter().enumerate() {
+            let path = dir.join(format!("home-{i}"));
+            std::fs::write(&path, file.contents).map_err(io(&path))?;
+            staged.push((path, file));
         }
-        Ok(())
+        let installer = self.download_installer(&dir, runtime)?;
+        let mut script = home_files_script(&staged);
+        script.push_str("exec /bin/bash \"$0\" \"$@\"\n");
+        let mut command: Vec<std::ffi::OsString> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            script.into(),
+            installer.into_os_string(),
+        ];
+        command.extend(runtime.installer().args.iter().map(Into::into));
+        Ok(command)
     }
 
-    /// Downloads the runtime's installer on the host into the sandbox home and
-    /// keeps it only if its SHA-256 is the reviewed one.
+    /// Downloads the runtime's installer on the host into `dir`, outside the
+    /// sandbox home, and keeps it only if its SHA-256 is the reviewed one.
     fn download_installer(
         &self,
-        home: &std::path::Path,
+        dir: &std::path::Path,
         runtime: &dyn RuntimeAdapter,
     ) -> Result<PathBuf> {
         let installer = runtime.installer();
-        let dir = home.join("dl");
         let path = dir.join(format!("{}-install.sh", runtime.kind()));
         let failed = |what: String| Error::Session { what };
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| failed(format!("cannot create {}: {e}", dir.display())))?;
         let status = Command::new("/usr/bin/curl")
             .args(["-fsSL", "--max-time", "120", "-o"])
             .arg(&path)
@@ -221,4 +230,25 @@ impl Engine {
             },
         )
     }
+}
+
+/// The `sh` lines that copy staged files into the sandbox home. They run
+/// inside the sandbox, so a link the sandbox planted can only lead where
+/// the sandbox may write anyway.
+pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
+    let mut script = String::from("set -e\n");
+    for (path, file) in staged {
+        let target = format!("\"$HOME\"/{}", sh_word(file.path));
+        let mode = if file.executable { "700" } else { "600" };
+        script.push_str(&format!(
+            "mkdir -p \"$(dirname {target})\"\ncp {} {target}\nchmod {mode} {target}\n",
+            sh_word(&path.display().to_string())
+        ));
+    }
+    script
+}
+
+/// `s` as one `sh` word.
+fn sh_word(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
