@@ -104,9 +104,27 @@ fn split_host_port(authority: &str, default: Option<u16>) -> Option<(String, u16
 }
 
 /// The head to send upstream for a plain-HTTP request: origin-form, without
-/// the proxy's own headers, and closed after one exchange.
-pub fn origin_head(method: &str, path: &str, version: &str, headers: &[String]) -> String {
+/// the proxy's own headers, and closed after one exchange. `Host` is made
+/// from the authorized `host` and `port`, never taken from the client: a
+/// different one could reach another site on the same address.
+pub fn origin_head(
+    method: &str,
+    path: &str,
+    version: &str,
+    headers: &[String],
+    host: &str,
+    port: u16,
+) -> String {
     let mut head = format!("{method} {path} {version}\r\n");
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    match port {
+        80 => head.push_str(&format!("Host: {host}\r\n")),
+        port => head.push_str(&format!("Host: {host}:{port}\r\n")),
+    }
     for line in headers {
         let name = line
             .split(':')
@@ -116,7 +134,7 @@ pub fn origin_head(method: &str, path: &str, version: &str, headers: &[String]) 
             .to_ascii_lowercase();
         if matches!(
             name.as_str(),
-            "proxy-connection" | "proxy-authorization" | "connection" | "keep-alive"
+            "host" | "proxy-connection" | "proxy-authorization" | "connection" | "keep-alive"
         ) {
             continue;
         }
@@ -191,11 +209,32 @@ mod tests {
                 "Host: example.com".into(),
                 "Proxy-Connection: keep-alive".into(),
                 "Connection: keep-alive".into(),
+                "Accept: */*".into(),
             ],
+            "example.com",
+            80,
         );
         assert_eq!(
             head,
-            "GET /x HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+            "GET /x HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn the_forwarded_host_is_the_authorized_one_not_the_clients() {
+        let head = origin_head(
+            "GET",
+            "/private",
+            "HTTP/1.1",
+            &["Host: blocked.example.net".into(), "host:x".into()],
+            "allowed.example.com",
+            8080,
+        );
+        assert_eq!(
+            head,
+            "GET /private HTTP/1.1\r\nHost: allowed.example.com:8080\r\nConnection: close\r\n\r\n"
+        );
+        let v6 = origin_head("GET", "/", "HTTP/1.1", &[], "fd00::1", 80);
+        assert!(v6.contains("Host: [fd00::1]\r\n"), "{v6}");
     }
 }

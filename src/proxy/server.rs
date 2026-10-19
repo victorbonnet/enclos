@@ -122,7 +122,7 @@ impl Proxy {
                 headers,
                 ..
             } => {
-                let head = origin_head(&method, &path, &version, &headers);
+                let head = origin_head(&method, &path, &version, &headers, &dest.host, dest.port);
                 upstream
                     .write_all(head.as_bytes())
                     .map_err(|_| Reason::ConnectFailed)?;
