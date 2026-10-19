@@ -41,10 +41,29 @@ fn agent_of(target: &Target) -> Result<AgentName> {
 pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
     match args.verb {
         AgentVerb::Add { target } => {
-            let added = engine.add_agent(by, &target.sandbox, agent_of(&target)?)?;
+            let sandbox = &target.sandbox;
+            let added = engine.add_agent(by, sandbox, agent_of(&target)?)?;
+            let runtime = engine.show_sandbox(sandbox)?.record.runtime;
+            let runtime = runtime.map_or("The runtime".to_owned(), |r| r.display_name().to_owned());
+            let name = &added.name;
+            let shell = format!("enclos connect {sandbox}");
+            let talk = format!("enclos connect {sandbox}/{name}");
+            let w = talk.len() + 3;
+            // The runtime's own output above suggests commands and `~` paths
+            // that only work inside the sandbox.
             println!(
-                "Added agent {}/{} (proxy port {}). Talk to it with `enclos connect {}/{}`.",
-                target.sandbox, added.name, added.port, target.sandbox, added.name
+                "\nAdded agent {sandbox}/{name} (proxy port {}).\n",
+                added.port
+            );
+            println!("{runtime}'s next steps above are commands to run inside the sandbox:");
+            println!("  {shell:<w$}a shell in the sandbox, for commands such as `{name} chat`");
+            println!("  {talk:<w$}talk to the agent directly");
+            println!(
+                "There, ~ is the sandbox's home: {}",
+                engine.sandbox_home(sandbox).display()
+            );
+            println!(
+                "`{name} setup` is optional: the agent already uses the sandbox's login (`enclos runtime login {sandbox}`)."
             );
         }
         AgentVerb::List { sandbox } => {
