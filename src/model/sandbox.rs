@@ -1,10 +1,10 @@
-//! Sandbox models. Only what the state store needs so far; later issues add
-//! the template, workspaces, agent, policy snapshots and profiles.
+//! Sandbox models. Later issues add workspaces, the agent and its profiles.
 
 use std::fmt;
 use std::str::FromStr;
 
 use super::Timestamp;
+use super::policy::TemplateName;
 
 /// A sandbox name: a lowercase letter, then 1 to 40 lowercase letters, digits
 /// or hyphens.
@@ -108,9 +108,20 @@ pub enum SandboxState {
 pub struct SandboxRecord {
     pub name: SandboxName,
     pub backend: BackendKind,
+    pub template: TemplateName,
     pub state: SandboxState,
+    /// The first of the sandbox's block of proxy ports on localhost (design
+    /// §4): the first serves sessions without a profile, the next ones its
+    /// profiles.
+    pub port_base: u16,
     pub created_at: Timestamp,
 }
+
+/// How many localhost ports each sandbox reserves for its proxy.
+pub const PORT_BLOCK: u16 = 16;
+/// Where the blocks start, and the last port a block may use.
+pub const PORT_FIRST: u16 = 41000;
+pub const PORT_LAST: u16 = 48999;
 
 #[cfg(test)]
 mod tests {

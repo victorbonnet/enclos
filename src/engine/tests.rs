@@ -136,38 +136,23 @@ fn audit_since_keeps_recent_entries() {
 
 mod policy {
     use super::*;
-    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
+    use crate::model::sandbox::SandboxName;
 
-    /// An initialized engine with sandbox `home` and its first policy, made
-    /// the way `sandbox create` will make it.
+    /// An initialized engine with sandbox `home`, created as the CLI does.
     fn with_sandbox() -> (TempDir, Engine, SandboxName) {
-        with_sandbox_on(Vec::new())
+        with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt))
     }
 
-    fn with_sandbox_on(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine, SandboxName) {
-        let (dir, engine) = engine_with(backends);
+    pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
+        let (dir, engine) = engine_with(vec![Box::new(backend)]);
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "home".parse().unwrap();
-        engine
-            .write(
-                &alice(),
-                "sandbox create",
-                Some("home".into()),
-                |_| String::new(),
-                |lock| {
-                    engine.state.put(
-                        lock,
-                        &SandboxRecord {
-                            name: name.clone(),
-                            backend: BackendKind::Seatbelt,
-                            state: SandboxState::Created,
-                            created_at: now(),
-                        },
-                    )?;
-                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
-                },
-            )
-            .unwrap();
+        let spec = crate::engine::SandboxSpec {
+            name: name.clone(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
         (dir, engine, name)
     }
 
@@ -274,39 +259,12 @@ mod policy {
 }
 
 mod compile {
+    use super::policy::with_sandbox_on;
     use super::*;
-    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-
-    fn sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
-        let (dir, engine) = engine_with(vec![Box::new(backend)]);
-        done(engine.init(&alice(), Confirm::Yes).unwrap());
-        let name: SandboxName = "home".parse().unwrap();
-        engine
-            .write(
-                &alice(),
-                "sandbox create",
-                None,
-                |_| String::new(),
-                |lock| {
-                    engine.state.put(
-                        lock,
-                        &SandboxRecord {
-                            name: name.clone(),
-                            backend: BackendKind::Seatbelt,
-                            state: SandboxState::Created,
-                            created_at: now(),
-                        },
-                    )?;
-                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
-                },
-            )
-            .unwrap();
-        (dir, engine, name)
-    }
 
     #[test]
     fn the_active_policy_compiles_once_into_the_sandbox_folder() {
-        let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let file = engine.compile_policy(&name, &[41001]).unwrap();
         assert!(file.starts_with(engine.layout.sandbox_dir("home").join("compiled")));
         assert!(
@@ -325,11 +283,83 @@ mod compile {
     }
 
     #[test]
-    fn a_backend_this_host_cannot_run_is_refused() {
-        let (_dir, engine, name) =
-            sandbox_on(FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS"));
-        let err = engine.compile_policy(&name, &[41001]).unwrap_err();
+    fn a_backend_this_host_cannot_run_is_refused_and_nothing_is_left() {
+        let backend = FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS");
+        let (_dir, engine) = engine_with(vec![Box::new(backend)]);
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let spec = crate::engine::SandboxSpec {
+            name: "home".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        let err = engine
+            .create_sandbox(&alice(), spec, Confirm::Yes)
+            .unwrap_err();
         assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
         assert_eq!(err.exit_code(), 2);
+        assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+}
+
+mod sandbox {
+    use super::policy::with_sandbox_on;
+    use super::*;
+    use crate::engine::SandboxSpec;
+
+    fn spec(name: &str) -> SandboxSpec {
+        SandboxSpec {
+            name: name.parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn each_sandbox_gets_its_own_port_block_and_names_are_unique() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let lab = done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+        let home = engine
+            .show_sandbox(&"home".parse().unwrap())
+            .unwrap()
+            .record;
+        assert_eq!((home.port_base, lab.port_base), (41000, 41016));
+        let err = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SandboxExists { .. }), "{err}");
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn removing_asks_first_and_deletes_the_folder() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let dir = engine.layout.sandbox_dir("home");
+        assert!(dir.join("policy.toml").exists());
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Ask)
+            .unwrap_err();
+        assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(!dir.exists());
+        assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stopping_a_sandbox_with_nothing_running_marks_it_stopped() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let report = engine.stop_sandbox(&alice(), &name).unwrap();
+        assert!(report.stopped.is_empty() && report.survivors.is_empty());
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            crate::model::sandbox::SandboxState::Stopped
+        );
     }
 }

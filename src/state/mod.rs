@@ -1,7 +1,7 @@
 //! The state store: sandbox records, behind one interface (ADR 0010).
 //!
 //! Every write takes a [`StateLock`], so writing outside the lock does not
-//! compile. Sessions and members are added by later issues.
+//! compile.
 
 pub mod sqlite;
 
@@ -13,6 +13,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
+use crate::model::session::{SessionId, SessionRecord};
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
 ///
@@ -79,6 +80,14 @@ pub trait StateStore: NetLogStore {
     fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
     /// Every policy version of the sandbox, oldest first.
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>>;
+
+    /// Records a session that started; its `id` is ignored and assigned.
+    fn put_session(&self, lock: &StateLock, session: &SessionRecord) -> Result<SessionId>;
+    /// Records that a session ended.
+    fn end_session(&self, lock: &StateLock, id: SessionId) -> Result<()>;
+    /// The sandbox's sessions, oldest first; only those not ended yet when
+    /// `running_only`.
+    fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections
