@@ -120,6 +120,8 @@ pub struct RuntimeStatus {
     pub name: &'static str,
     pub version: Option<String>,
     pub logged_in: Option<bool>,
+    /// The runtime's own command that logs it in, run through `connect`.
+    pub login: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -296,6 +298,7 @@ impl Engine {
                         name: kind.display_name(),
                         version: facts.version.as_ref().and_then(|v| read_value(&home, v)),
                         logged_in: facts.login.as_deref().and_then(|f| exists(&home, f)),
+                        login: rt.login(),
                     })
                 }
                 _ => None,
@@ -436,7 +439,7 @@ pub fn suggest(sandboxes: &[SandboxStatus], now: Timestamp) -> Vec<Suggestion> {
             Some(rt) if rt.logged_in == Some(false) => add(
                 sb.to_string(),
                 format!("{} is not logged in", rt.name),
-                format!("enclos runtime login {sb}"),
+                format!("enclos connect {sb} -- {}", rt.login),
             ),
             Some(_) => {}
         }
