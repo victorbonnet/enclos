@@ -43,6 +43,8 @@ enclos agent list lab
 
 Each agent gets its own proxy port, so the network log shows which agent made each connection.
 
+Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Those commands run inside the sandbox: open a shell there with `enclos connect lab` and run them from it. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
+
 ## Check the sandbox
 
 ```bash
