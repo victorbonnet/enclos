@@ -11,7 +11,7 @@ use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{PolicyVersion, TemplateName};
 use crate::model::sandbox::{
-    BackendKind, PORT_BLOCK, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
+    BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
 use crate::model::session::{Member, SessionId, SessionRecord};
 
@@ -40,7 +40,7 @@ pub struct StopReport {
 }
 
 impl Engine {
-    /// Creates a sandbox: its record, a block of proxy ports, its folder and
+    /// Creates a sandbox: its record, a proxy port, its folder and
     /// home, and version 1 of its policy from the template.
     pub fn create_sandbox(
         &self,
@@ -62,7 +62,7 @@ impl Engine {
                 )],
             }));
         }
-        let summary = |r: &SandboxRecord| format!("{} on ports {}+", r.backend, r.port_base);
+        let summary = |r: &SandboxRecord| format!("{} on port {}", r.backend, r.proxy_port);
         let record = self.write(
             by,
             "sandbox create",
@@ -74,7 +74,7 @@ impl Engine {
                     backend: spec.backend,
                     template: spec.template.clone(),
                     state: SandboxState::Created,
-                    port_base: self.free_port_block()?,
+                    proxy_port: self.free_port()?,
                     created_at: now(),
                 };
                 // The backend must run here before anything is created (ADR 0009).
@@ -90,18 +90,17 @@ impl Engine {
         Ok(Planned::Done(record))
     }
 
-    /// The first block no sandbox here uses and whose first port nothing on
-    /// this host listens on (other enclos installs or users included).
-    fn free_port_block(&self) -> Result<u16> {
-        let used: Vec<u16> = self.state.list()?.iter().map(|r| r.port_base).collect();
+    /// The first port no sandbox here uses and nothing on this host listens
+    /// on (other enclos installs or users included).
+    fn free_port(&self) -> Result<u16> {
+        let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let listening = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
             std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
                 .is_ok()
         };
-        (PORT_FIRST..=PORT_LAST - PORT_BLOCK + 1)
-            .step_by(PORT_BLOCK as usize)
-            .find(|base| !used.contains(base) && !listening(*base))
+        (PORT_FIRST..=PORT_LAST)
+            .find(|port| !used.contains(port) && !listening(*port))
             .ok_or(Error::NoFreePorts)
     }
 

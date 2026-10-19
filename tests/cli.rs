@@ -440,10 +440,10 @@ fn connect_refuses_a_port_another_program_listens_on() {
     let _stop = StopOnDrop(&home, "home");
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
     let port: u16 = show
-        .split("proxy ports ")
+        .split("proxy port ")
         .nth(1)
-        .and_then(|rest| rest.split('-').next())
-        .and_then(|p| p.parse().ok())
+        .and_then(|rest| rest.lines().next())
+        .and_then(|p| p.trim().parse().ok())
         .unwrap();
     // Another program takes the sandbox's proxy port first.
     let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();

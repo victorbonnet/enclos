@@ -36,24 +36,15 @@ impl Engine {
         &self,
         by: &Actor,
         name: &SandboxName,
-        agent: Option<&str>,
         command: Vec<OsString>,
     ) -> Result<SessionEnd> {
-        if let Some(agent) = agent {
-            return Err(Error::Session {
-                what: format!(
-                    "agents come with the runtime: `{name}/{agent}` needs `enclos runtime install` first"
-                ),
-            });
-        }
         let summary = |(id, _): &(SessionId, _)| format!("session {id}");
         let (session, mut child) =
             self.write(by, "connect", Some(name.to_string()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
-                let ports = [record.port_base];
-                let compiled = self.compile_policy(name, &ports)?;
+                let compiled = self.compile_policy(name, record.proxy_port)?;
                 self.ensure_proxy(lock, &record)?;
                 let (version, snapshot) =
                     self.state
@@ -69,10 +60,9 @@ impl Engine {
                 let launch = Launch {
                     program,
                     args,
-                    proxy_port: record.port_base,
                     env: Vec::new(),
                 };
-                let ctx = self.sandbox_context(name, &ports);
+                let ctx = self.sandbox_context(name, record.proxy_port);
                 std::fs::create_dir_all(ctx.home.join("tmp")).ok();
                 let backend = self.backend_of(name)?;
                 let child = backend
@@ -91,7 +81,6 @@ impl Engine {
                 let session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
-                    agent: None,
                     kind: SessionKind::Interactive,
                     version: version.version,
                     snapshot: snapshot.id,
@@ -152,12 +141,12 @@ impl Engine {
             .mode(0o600)
             .open(&log_path)
             .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], record.port_base));
+        let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
         // Anything else on this port would receive the sandbox's traffic.
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
             return Err(failed(format!(
-                "port {} of sandbox {} is in use by another program; stop it, or recreate the sandbox to get other ports",
-                record.port_base, record.name
+                "port {} of sandbox {} is in use by another program; stop it, or recreate the sandbox to get another port",
+                record.proxy_port, record.name
             )));
         }
         let mut child = Command::new(exe)
@@ -206,7 +195,6 @@ impl Engine {
         let session = SessionRecord {
             id: SessionId(0),
             sandbox: record.name.clone(),
-            agent: None,
             kind: SessionKind::Proxy,
             version: version.version,
             snapshot: snapshot.id,

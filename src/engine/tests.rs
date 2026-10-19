@@ -453,7 +453,7 @@ mod sandbox {
     }
 
     #[test]
-    fn each_sandbox_gets_its_own_port_block_and_names_are_unique() {
+    fn each_sandbox_gets_its_own_port_and_names_are_unique() {
         let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let lab = done(
             engine
@@ -464,8 +464,8 @@ mod sandbox {
             .show_sandbox(&"home".parse().unwrap())
             .unwrap()
             .record;
-        // A block another program listens on is skipped, so only the order is fixed.
-        assert!(home.port_base >= 41000 && lab.port_base >= home.port_base + 16);
+        // A port another program listens on is skipped, so only the order is fixed.
+        assert!(home.proxy_port >= 41000 && lab.proxy_port > home.proxy_port);
         let err = engine
             .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
             .unwrap_err();

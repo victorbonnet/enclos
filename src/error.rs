@@ -24,7 +24,7 @@ pub enum Error {
     #[error("sandbox `{name}` is running. Stop it first with `enclos sandbox stop {name}`")]
     SandboxRunning { name: String },
     #[error(
-        "no free block of proxy ports is left between 41000 and 48999. Remove a sandbox you no longer use"
+        "no free proxy port is left between 41000 and 48999. Remove a sandbox you no longer use"
     )]
     NoFreePorts,
     #[error("{what}")]
