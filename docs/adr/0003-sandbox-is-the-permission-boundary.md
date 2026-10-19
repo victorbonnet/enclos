@@ -9,4 +9,4 @@ Each sandbox holds one runtime and any number of its agents. All agents in a san
 ## Consequences
 
 - The network log is per sandbox, not per agent ([0024](0024-agents-reached-through-the-runtime.md); a per-agent listener was planned first).
-- Secrets are granted per agent, so each agent's session receives only its own variables. That limits mistakes, not a determined agent: every agent can still read the shared home, and a secret written there by one agent is readable by the others.
+- Secrets are granted per sandbox ([0022](0022-secrets-granted-per-sandbox.md)): every agent's session and the runtime's gateway receive the same variables. Agents that must not share a secret go in different sandboxes.

@@ -59,7 +59,7 @@ pub struct ServiceUnit {
     pub args: Vec<OsString>,
     /// Where its standard output and error go.
     pub log: PathBuf,
-    /// Variables it runs with; secrets never go here (ADR 0011).
+    /// Variables it runs with; secrets never go here (ADR 0022).
     pub env: Vec<(String, String)>,
     /// How long the manager waits, after telling the program to end, before
     /// it kills it: the program may be stopping what it runs.
