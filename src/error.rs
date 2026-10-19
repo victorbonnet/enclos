@@ -17,6 +17,18 @@ pub enum Error {
     Policy(#[from] PolicyError),
     #[error("there is no sandbox named `{name}`. Run `enclos sandbox list` to see them")]
     NoSuchSandbox { name: String },
+    #[error(
+        "a sandbox named `{name}` already exists. Pick another name, or remove it with `enclos sandbox rm {name}`"
+    )]
+    SandboxExists { name: String },
+    #[error("sandbox `{name}` is running. Stop it first with `enclos sandbox stop {name}`")]
+    SandboxRunning { name: String },
+    #[error(
+        "no free block of proxy ports is left between 41000 and 48999. Remove a sandbox you no longer use"
+    )]
+    NoFreePorts,
+    #[error("{what}")]
+    Session { what: String },
     #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
     NoPolicy { sandbox: String },
     /// A backend this host cannot run; never overridden (ADR 0009).
@@ -66,7 +78,11 @@ impl Error {
             | Error::NoSuchSandbox { .. }
             | Error::NoPolicy { .. }
             | Error::ProxyListen { .. }
-            | Error::Compile(_) => exit::ERROR,
+            | Error::Compile(_)
+            | Error::SandboxExists { .. }
+            | Error::SandboxRunning { .. }
+            | Error::NoFreePorts
+            | Error::Session { .. } => exit::ERROR,
             Error::BackendUnavailable { .. } => exit::REFUSED,
         }
     }
