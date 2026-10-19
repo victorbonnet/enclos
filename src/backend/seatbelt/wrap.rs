@@ -62,7 +62,7 @@ pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     {
         command.env("TERM", FALLBACK_TERM);
     }
-    for (name, value) in environment(ctx, launch.proxy_port) {
+    for (name, value) in environment(ctx) {
         command.env(name, value);
     }
     for (name, value) in &launch.env {
@@ -99,9 +99,9 @@ fn needs_fallback_term(term: &OsStr, terminfo: bool, dirs: Option<&OsStr>) -> bo
 }
 
 /// The variables every sandboxed program gets.
-pub fn environment(ctx: &SandboxContext, proxy_port: u16) -> Vec<(String, String)> {
+pub fn environment(ctx: &SandboxContext) -> Vec<(String, String)> {
     let home = ctx.home.display().to_string();
-    let proxy = format!("http://127.0.0.1:{proxy_port}");
+    let proxy = format!("http://127.0.0.1:{}", ctx.proxy_port);
     let mut path = vec![format!("{home}/.local/bin"), format!("{home}/bin")];
     // Host tools stay usable: reads are broad, and the network goes through the proxy.
     for dir in [
@@ -162,13 +162,13 @@ mod tests {
             sandboxes: data.join("sandboxes"),
             data: data.clone(),
             config_file: data.join("config.toml"),
-            proxy_ports: vec![41001],
+            proxy_port: 41001,
         }
     }
 
     #[test]
     fn the_environment_points_into_the_sandbox_and_at_its_proxy() {
-        let env: std::collections::HashMap<_, _> = environment(&ctx(), 41001).into_iter().collect();
+        let env: std::collections::HashMap<_, _> = environment(&ctx()).into_iter().collect();
         assert_eq!(env["HOME"], "/Users/alice/.enclos/sandboxes/home/home");
         assert_eq!(env["https_proxy"], "http://127.0.0.1:41001");
         assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:41001");
@@ -207,7 +207,6 @@ mod tests {
         let launch = Launch {
             program: "/bin/sh".into(),
             args: vec![],
-            proxy_port: 41001,
             env: vec![],
         };
         let command = wrap(Path::new("/x.sb"), &ctx(), &launch);

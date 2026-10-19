@@ -59,8 +59,8 @@ pub struct SandboxContext {
     pub data: PathBuf,
     /// `config.toml`.
     pub config_file: PathBuf,
-    /// The proxy ports the sandbox may connect to, on localhost.
-    pub proxy_ports: Vec<u16>,
+    /// The sandbox's proxy port on localhost: its only way out.
+    pub proxy_port: u16,
 }
 
 /// A policy compiled for one backend, as the backend reads it.
@@ -76,8 +76,6 @@ pub struct Compiled {
 pub struct Launch {
     pub program: OsString,
     pub args: Vec<OsString>,
-    /// The proxy port this run's traffic goes through (its agent's).
-    pub proxy_port: u16,
     /// Variables set on top of the sandbox's environment.
     pub env: Vec<(String, String)>,
 }

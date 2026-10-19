@@ -420,28 +420,28 @@ mod compile {
     #[test]
     fn the_active_policy_compiles_once_into_the_sandbox_folder() {
         let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
-        let file = engine.compile_policy(&name, &[41001]).unwrap();
+        let file = engine.compile_policy(&name, 41001).unwrap();
         assert!(file.starts_with(engine.layout.sandbox_dir("home").join("compiled")));
         assert!(
             std::fs::read_to_string(&file)
                 .unwrap()
                 .contains("write {home}")
         );
-        assert_eq!(engine.compile_policy(&name, &[41001]).unwrap(), file);
+        assert_eq!(engine.compile_policy(&name, 41001).unwrap(), file);
         // A new grant is a new compiled policy.
         done(
             engine
                 .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
                 .unwrap(),
         );
-        assert_ne!(engine.compile_policy(&name, &[41001]).unwrap(), file);
+        assert_ne!(engine.compile_policy(&name, 41001).unwrap(), file);
     }
 
     #[test]
     fn a_backend_this_host_cannot_run_is_refused() {
         let (_dir, engine, name) =
             sandbox_on(FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS"));
-        let err = engine.compile_policy(&name, &[41001]).unwrap_err();
+        let err = engine.compile_policy(&name, 41001).unwrap_err();
         assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
         assert_eq!(err.exit_code(), 2);
     }
