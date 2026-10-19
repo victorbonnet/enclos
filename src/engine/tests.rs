@@ -2171,8 +2171,8 @@ mod status {
         fn home_files(&self) -> Vec<HomeFile> {
             Vec::new()
         }
-        fn login(&self) -> Vec<OsString> {
-            Vec::new()
+        fn login(&self) -> String {
+            String::new()
         }
         fn create_agent(&self, _: &AgentName) -> Vec<OsString> {
             Vec::new()
@@ -2289,7 +2289,7 @@ mod status {
             "{commands:?}"
         );
         assert!(
-            commands.contains(&"enclos runtime login home"),
+            commands.contains(&"enclos connect home -- hermes setup"),
             "{commands:?}"
         );
         assert!(
