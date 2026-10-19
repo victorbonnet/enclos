@@ -142,3 +142,33 @@ fn processes_outside_the_sandbox_cannot_be_signalled() {
         "the sandbox could signal a process outside it"
     );
 }
+
+#[test]
+fn home_files_are_copied_from_inside_so_a_planted_link_reaches_nothing_outside() {
+    use crate::engine::home_files_script;
+    use crate::runtime::HomeFile;
+    let w = world();
+    // The sandbox planted a link where enclos puts its mktemp wrapper.
+    let sentinel = w.base.join("alice/sentinel");
+    std::fs::write(&sentinel, "host file").unwrap();
+    std::fs::create_dir_all(w.ctx.home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(&sentinel, w.ctx.home.join("bin/mktemp")).unwrap();
+    let staged = w.ctx.dir.join("installers/home-0");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, "wrapper").unwrap();
+    let file = HomeFile {
+        path: "bin/mktemp",
+        contents: "wrapper",
+        executable: true,
+    };
+    assert!(!w.sh(&home_files_script(&[(staged.clone(), &file)])));
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "host file");
+
+    // Without the link, the same lines put the file in place.
+    std::fs::remove_file(w.ctx.home.join("bin/mktemp")).unwrap();
+    assert!(w.sh(&home_files_script(&[(staged, &file)])));
+    assert_eq!(
+        std::fs::read_to_string(w.ctx.home.join("bin/mktemp")).unwrap(),
+        "wrapper"
+    );
+}

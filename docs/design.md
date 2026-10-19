@@ -532,6 +532,7 @@ enclos policy allow community mcp.example.org
     sandbox.toml               backend, runtime, agents (autostart), created_at
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
     compiled/<snapshot>-<enclos version>/   what the backend received (.sb, bwrap argv)
+    installers/                the runtime's installer and files for the home, checked on the host; the sandbox reads, never writes them
     home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/
     logs/                      its services' output
 ```
