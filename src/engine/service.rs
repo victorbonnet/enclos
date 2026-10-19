@@ -13,7 +13,7 @@ use super::Engine;
 use super::session::SessionEnd;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_of, reference};
+use crate::lifecycle::process::{group_members, group_of, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -171,8 +171,8 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let summary = |(id, _): &(SessionId, _)| format!("session {id}");
-        let (session, mut child) =
+        let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
+        let (session, mut child, pgid) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
                 let compiled = self.compile_policy(name, record.proxy_port)?;
                 let (version, snapshot) =
@@ -213,20 +213,36 @@ impl Engine {
                     ended_at: None,
                 };
                 let id = self.state.put_session(lock, &session)?;
-                Ok((id, child))
+                Ok((id, child, session.pgid))
             })?;
         let status = child.wait().map_err(|e| Error::Session {
             what: format!("lost the service: {e}"),
         })?;
         let exit = status.code().unwrap_or(1);
+        // As for `connect`: what the service left in its group keeps its
+        // session open.
+        let left = group_members(pgid);
+        let summary = |_: &()| match left.len() {
+            0 => format!("exit {exit}"),
+            n => format!("exit {exit}, {n} processes still running"),
+        };
         self.write(
             by,
             "service end",
             Some(format!("{name} session {session}")),
-            |_| format!("exit {exit}"),
-            |lock| Ok(self.state.end_session(lock, session)?),
+            summary,
+            |lock| {
+                if left.is_empty() {
+                    self.state.end_session(lock, session)?;
+                }
+                Ok(())
+            },
         )?;
-        Ok(SessionEnd { session, exit })
+        Ok(SessionEnd {
+            session,
+            exit,
+            left,
+        })
     }
 
     /// Records a proxy that a service started, so `connect` knows it runs.
