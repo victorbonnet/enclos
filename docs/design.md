@@ -63,20 +63,12 @@ Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
 
 There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's services, its proxy and its runtime's, are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that `sandbox start` installs. A `connect` with no proxy running and no services installed starts one as a plain process and records it as a session, which `sandbox stop` ends. Interactive sessions run in the user's terminal.
 
-```text
-  enclos (CLI)      enclos ui      enclos mcp / scripts
-        \               |               /
-         +------- Core library --------+
-         | State + audit | Policy (snapshots) | Runtime adapters | Backend API | Lifecycle |
-                                   |
-          +------------+-----------+-----------+
-       Seatbelt    bubblewrap   OpenShell   MicroVM        (first: Seatbelt, then bubblewrap)
-          |
-   Per sandbox:
-     [interactive session: enclos connect] --+
-     [runtime service: enclos launch]  -----+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
-     (every session runs inside the sandbox's policy, under the snapshot it started with)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="diagrams/architecture-dark.svg">
+  <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="diagrams/architecture-light.svg">
+</picture>
+
+Every session runs inside the sandbox's policy, under the snapshot it started with.
 
 Each sandbox has a proxy service, `enclos.<install>.<sandbox>.proxy`, and one service per background process its runtime declares, `enclos.<install>.<sandbox>.<service>`, while the user is logged in. A runtime adapter declares zero, one or several services, each under a stable name; Hermes declares one, `gateway`, because its gateway serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). `enclos sandbox start` installs them, replacing those already installed, so they come back at each login; if one cannot start, none stays installed. `enclos sandbox stop` removes every service installed under the sandbox's prefix, and `enclos sandbox rm` refuses while any remains, even one with no session recorded. `<install>` is the first 8 hex digits of the SHA-256 of the enclos data folder with links and `.` resolved: launchd labels are shared by every enclos install of the user (`ENCLOS_HOME`), a sandbox name is unique only within one, and every spelling of the folder must name the same services. Each service runs with the variables that resolve the same folders (`ENCLOS_HOME`, or both XDG folders). The service manager is chosen per system: launchd on macOS; other systems refuse to start services until their manager is implemented. A runtime service starts the runtime only once the sandbox's own proxy holds its port: `proxy run --record` records itself after binding it, so a proxy session whose process still runs is the proof. Its service runs `enclos launch <sandbox> <service>`, which runs outside the sandbox, records the session, and runs the declared command under the compiled policy in a process group of its own. That group is not the service manager's to signal, so when `launch` is told to end (TERM, as launchd's stop sends) it stops every member of the session, TERM then KILL, before recording the end; the service's stop timeout gives the service manager's wait room for both and for recording the end. Interactive sessions (`enclos connect <sandbox>`, a shell or the command after `--`) run the same way in the user's terminal. Secrets never sit in a service manager's file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 
