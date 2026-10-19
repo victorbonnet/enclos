@@ -123,9 +123,13 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         literal(&real_path(&ctx.config_file))?,
         subpath(&data.join("run"))?,
     ));
+    // Other sandboxes' folders, not the folder holding them: walking up from
+    // the home (`mkdir -p`) must still see that it exists.
+    let sandboxes = real_path(&ctx.sandboxes);
     line(format!(
-        "(deny file-read* (with message \"{tag}\")\n  (require-all {} (require-not {})))",
-        subpath(&real_path(&ctx.sandboxes))?,
+        "(deny file-read* (with message \"{tag}\")\n  (require-all {} (require-not {}) (require-not {})))",
+        subpath(&sandboxes)?,
+        literal(&sandboxes)?,
         subpath(&real_path(&ctx.dir))?
     ));
     Ok(Compiled {
