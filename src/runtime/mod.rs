@@ -4,7 +4,7 @@
 pub mod hermes;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -25,6 +25,46 @@ pub struct HomeFile {
     pub path: &'static str,
     pub contents: &'static str,
     pub executable: bool,
+}
+
+/// A part of a sandbox home that `enclos status` counts on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiskPart {
+    /// The runtime's own install: what reinstalling would put back.
+    Runtime,
+    /// Caches the runtime or its tools rebuild on their own.
+    Cache,
+}
+
+/// A value in a YAML file of the sandbox home: the file, relative to the
+/// home, and the dotted keys to try in order (`model.default`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueAt {
+    pub file: PathBuf,
+    pub keys: Vec<&'static str>,
+}
+
+/// Where a runtime keeps the facts `enclos status` shows about it. Paths
+/// only, relative to the sandbox home: the engine does every read, under
+/// ADR 0023's rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeFacts {
+    /// Its version, when it writes one to a file.
+    pub version: Option<ValueAt>,
+    /// A file that exists once the runtime is logged in. Only its presence
+    /// is read, never its content.
+    pub login: Option<PathBuf>,
+}
+
+/// Where a runtime keeps one agent's data and the facts `status` shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentFacts {
+    /// The folder holding the agent's own data.
+    pub folder: Option<PathBuf>,
+    pub model: Option<ValueAt>,
+    /// Files that change when the agent is used: the newest gives its last
+    /// activity.
+    pub activity: Vec<PathBuf>,
 }
 
 pub trait RuntimeAdapter {
@@ -52,6 +92,25 @@ pub trait RuntimeAdapter {
     /// read safely. The sandbox writes its home, so implementations never
     /// follow a link and read a bounded number of entries (ADR 0023).
     fn agents_in(&self, home: &Path) -> Option<Vec<String>>;
+    /// The runtime's own command that deletes an agent and its data, run in
+    /// the sandbox by `enclos agent rm`. `None`: the files stay.
+    fn delete_agent(&self, _name: &AgentName) -> Option<Vec<OsString>> {
+        None
+    }
+
+    // What `enclos status` shows (issue #29). Each answer may be "cannot
+    // tell", and a runtime that names nothing still gets sizes.
+
+    /// Parts of the home counted on their own, relative to it.
+    fn disk_parts(&self) -> Vec<(DiskPart, PathBuf)> {
+        Vec::new()
+    }
+    fn runtime_facts(&self) -> RuntimeFacts {
+        RuntimeFacts::default()
+    }
+    fn agent_facts(&self, _agent: &str) -> AgentFacts {
+        AgentFacts::default()
+    }
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {

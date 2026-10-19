@@ -228,6 +228,10 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         store.record(&e).unwrap();
     }
     assert_eq!(store.events(&name, None).unwrap().len(), 3);
+    assert_eq!(
+        store.last_event(&name).unwrap(),
+        Some("2026-01-01T10:00:06Z".parse().unwrap())
+    );
     let since = "2026-01-01T10:00:05.200Z".parse().unwrap();
     assert_eq!(store.events(&name, Some(since)).unwrap().len(), 2);
 

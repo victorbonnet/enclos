@@ -13,6 +13,7 @@ use crate::layout::LayoutError;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::now;
+use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::runtime::{HomeFile, RuntimeAdapter, adapter};
@@ -296,10 +297,59 @@ impl Engine {
         Ok(self.state.agents(name)?)
     }
 
-    /// Removes an agent's record. Its files stay in the sandbox home; the
-    /// runtime's own commands remove them.
-    pub fn remove_agent(&self, by: &Actor, name: &SandboxName, agent: &AgentName) -> Result<()> {
+    /// Removes an agent: its files, with the runtime's own command run in
+    /// the sandbox (design §10), then its record. With `keep_data`, or when
+    /// the runtime has no such command or no longer has the agent, only the
+    /// record goes. Deleting files asks for confirmation first.
+    pub fn remove_agent(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        keep_data: bool,
+        confirm: Confirm,
+    ) -> Result<Planned<()>> {
         self.agent_of(name, agent.as_str())?;
+        let kind = self.runtime_of(name)?;
+        let runtime = adapter(kind);
+        let present = runtime
+            .agents_in(&self.sandbox_home(name))
+            .map(|found| found.iter().any(|n| n == agent.as_str()));
+        let delete = match keep_data || present == Some(false) {
+            true => None,
+            false => runtime.delete_agent(agent),
+        };
+        match confirm {
+            Confirm::DryRun => {
+                let what = match &delete {
+                    Some(_) => format!(
+                        "delete agent {name}/{agent} and its files, with {kind}'s own command"
+                    ),
+                    None => format!("remove the record of agent {name}/{agent}; its files stay"),
+                };
+                return Ok(Planned::DryRun(Plan {
+                    changes: vec![what],
+                    ..Plan::default()
+                }));
+            }
+            Confirm::Ask if delete.is_some() => {
+                return Err(Error::NeedsConfirmation {
+                    what: format!("deleting agent {name}/{agent} and its files"),
+                });
+            }
+            _ => {}
+        }
+        if let Some(command) = delete {
+            let end = self.run_in_sandbox(by, name, command, "agent rm run")?;
+            if end.exit != 0 {
+                return Err(Error::Session {
+                    what: format!(
+                        "{kind} could not delete agent {agent} (exit {}); its record stays. `--keep-data` removes only the record",
+                        end.exit
+                    ),
+                });
+            }
+        }
         self.write(
             by,
             "agent rm",
@@ -310,7 +360,8 @@ impl Engine {
                     .remove_agent(lock, name, agent)
                     .map_err(Into::into)
             },
-        )
+        )?;
+        Ok(Planned::Done(()))
     }
 }
 

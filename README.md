@@ -59,6 +59,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 | Command | What it does |
 | --- | --- |
 | `enclos init` | Create `~/.enclos`, the state database and the audit log |
+| `enclos status [<sandbox>]` | Every sandbox and agent, its size on disk, and what you could do, such as removing an unused sandbox |
 | `enclos sandbox create \| list \| show \| start \| stop \| restart \| rm` | Manage sandboxes and their background services |
 | `enclos runtime install` | Install a runtime in a sandbox |
 | `enclos agent add \| list \| rm` | Manage a sandbox's agents, including ones made inside it with the runtime's own commands |

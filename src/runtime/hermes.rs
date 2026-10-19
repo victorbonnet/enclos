@@ -5,9 +5,9 @@
 //! root login.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{HomeFile, Installer, RuntimeAdapter};
+use super::{AgentFacts, DiskPart, HomeFile, Installer, RuntimeAdapter, RuntimeFacts, ValueAt};
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 
@@ -98,6 +98,47 @@ impl RuntimeAdapter for Hermes {
         // profile of the same name, created and selected with Hermes's
         // own `profile` command and `-p` flag.
         args(&[HERMES, "profile", "create", name.as_str()])
+    }
+
+    fn delete_agent(&self, name: &AgentName) -> Option<Vec<OsString>> {
+        // Hermes's own delete: the profile folder, its wrapper, and its
+        // records, which a plain `rm` would leave behind.
+        Some(args(&[HERMES, "profile", "delete", name.as_str(), "--yes"]))
+    }
+
+    fn disk_parts(&self) -> Vec<(DiskPart, PathBuf)> {
+        let runtime = ["hermes-agent", "tools", "installs"]
+            .map(|p| (DiskPart::Runtime, Path::new(".hermes").join(p)));
+        let caches =
+            [".hermes/cache", ".npm", ".cache", "tmp"].map(|p| (DiskPart::Cache, p.into()));
+        runtime.into_iter().chain(caches).collect()
+    }
+
+    fn runtime_facts(&self) -> RuntimeFacts {
+        RuntimeFacts {
+            // Not on disk where enclos can rely on it: `pyproject.toml` says
+            // 0.0.0 (to verify, design §14).
+            version: None,
+            // Agents share the root login (prototype, issue #5).
+            login: Some(".hermes/auth.json".into()),
+        }
+    }
+
+    fn agent_facts(&self, agent: &str) -> AgentFacts {
+        let folder = Path::new(".hermes/profiles").join(agent);
+        AgentFacts {
+            model: Some(ValueAt {
+                file: folder.join("config.yaml"),
+                // Hermes reads either key.
+                keys: vec!["model.default", "model.model"],
+            }),
+            // What changed when an agent was used; `sessions/` did not (to
+            // verify, design §14).
+            activity: [".hermes_history", "state.db", "state.db-wal"]
+                .map(|f| folder.join(f))
+                .to_vec(),
+            folder: Some(folder),
+        }
     }
 
     fn talk(&self, agent: &AgentName) -> String {
@@ -209,6 +250,21 @@ mod tests {
         let main: AgentName = "main".parse().unwrap();
         assert_eq!(Hermes.talk(&main), "hermes -p main");
         assert_eq!(Hermes.login(), "hermes setup");
+        assert_eq!(
+            Hermes.delete_agent(&main),
+            Some(args(&["hermes", "profile", "delete", "main", "--yes"]))
+        );
+        let facts = Hermes.agent_facts("main");
+        assert_eq!(
+            facts.folder.as_deref(),
+            Some(Path::new(".hermes/profiles/main"))
+        );
+        assert!(
+            facts
+                .activity
+                .iter()
+                .all(|f| f.starts_with(".hermes/profiles/main"))
+        );
         assert_eq!(
             Hermes.create_agent(&main),
             args(&["hermes", "profile", "create", "main"])

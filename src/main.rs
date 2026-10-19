@@ -47,6 +47,8 @@ enum Command {
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
+    /// What is on this host, what it costs on disk, and what you could do.
+    Status(cli::status::StatusArgs),
     /// Run a sandbox's runtime service; started by launchd.
     #[command(hide = true)]
     Launch(cli::launch::LaunchArgs),
@@ -113,12 +115,13 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), args),
-        Command::Agent(args) => cli::agent::run(&engine, &current_actor(), args),
+        Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
+        Command::Status(args) => cli::status::run(&engine, args),
     }
 }
 

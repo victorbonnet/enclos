@@ -8,6 +8,7 @@ use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
+use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -22,8 +23,13 @@ enum AgentVerb {
     Add { agent: AgentTarget },
     /// List a sandbox's agents.
     List { sandbox: SandboxName },
-    /// Remove an agent's record; its files stay in the sandbox home.
-    Rm { agent: AgentTarget },
+    /// Remove an agent and its files, with the runtime's own command; `--keep-data` keeps the files.
+    Rm {
+        agent: AgentTarget,
+        /// Keep the agent's files in the sandbox home; remove only the record.
+        #[arg(long)]
+        keep_data: bool,
+    },
 }
 
 /// An agent of a sandbox, as the agent commands name it: `lab/main`.
@@ -47,7 +53,7 @@ impl FromStr for AgentTarget {
     }
 }
 
-pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
+pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
         AgentVerb::Add { agent } => {
             let AgentTarget { sandbox, agent } = agent;
@@ -97,9 +103,12 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
             }
             notes.iter().for_each(|n| println!("{n}"));
         }
-        AgentVerb::Rm { agent } => {
-            engine.remove_agent(by, &agent.sandbox, &agent.agent)?;
-            println!("Removed agent {}/{}.", agent.sandbox, agent.agent);
+        AgentVerb::Rm { agent, keep_data } => {
+            let AgentTarget { sandbox, agent } = agent;
+            match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
+                Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
+                Planned::Done(()) => println!("Removed agent {sandbox}/{agent}."),
+            }
         }
     }
     Ok(exit::OK)

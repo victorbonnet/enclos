@@ -10,6 +10,7 @@ mod runtime;
 mod sandbox;
 mod service;
 mod session;
+mod status;
 #[cfg(test)]
 mod tests;
 
@@ -20,6 +21,10 @@ pub(crate) use runtime::home_files_script;
 pub use runtime::{AddedAgent, AgentCheck};
 pub use sandbox::{SandboxSpec, SandboxView, StopReport};
 pub use session::SessionEnd;
+pub use status::{
+    AgentStatus, Disk, IDLE_DAYS, RuntimeStatus, SandboxStatus, ServiceLine, Size, StatusView,
+    Suggestion, human_bytes,
+};
 
 use std::path::PathBuf;
 

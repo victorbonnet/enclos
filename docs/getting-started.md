@@ -66,7 +66,9 @@ You can also create an agent with Hermes's own commands, from a shell in the san
 lab/scout: made inside the sandbox, not tracked by enclos. Track it with `enclos agent add lab/scout`.
 ```
 
-`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record. Agent names in enclos are a lowercase letter followed by lowercase letters, digits or hyphens; a Hermes agent named otherwise (`my_bot`) is reported but cannot be tracked.
+`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record.
+
+`enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`); `--keep-data` removes only enclos's record and leaves the files. Agent names in enclos are a lowercase letter followed by lowercase letters, digits or hyphens; a Hermes agent named otherwise (`my_bot`) is reported but cannot be tracked.
 
 ## Check the sandbox
 
@@ -101,6 +103,7 @@ The agent cannot allow anything itself.
 ## Look around
 
 ```bash
+enclos status                # every sandbox and agent, what it costs on disk, what you could do
 enclos sandbox show lab      # state, policy version, sessions and their processes
 enclos logs lab -f           # the background services' logs
 enclos policy show lab       # what the sandbox may do
