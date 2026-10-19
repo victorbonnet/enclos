@@ -90,11 +90,18 @@ impl Engine {
         Ok(Planned::Done(record))
     }
 
+    /// The first block no sandbox here uses and whose first port nothing on
+    /// this host listens on (other enclos installs or users included).
     fn free_port_block(&self) -> Result<u16> {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.port_base).collect();
+        let listening = |port: u16| {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+                .is_ok()
+        };
         (PORT_FIRST..=PORT_LAST - PORT_BLOCK + 1)
             .step_by(PORT_BLOCK as usize)
-            .find(|base| !used.contains(base))
+            .find(|base| !used.contains(base) && !listening(*base))
             .ok_or(Error::NoFreePorts)
     }
 
