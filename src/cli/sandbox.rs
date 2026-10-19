@@ -9,6 +9,7 @@ use enclos::model::plan::{Confirm, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use enclos::model::session::SessionKind;
+use enclos::service::ServiceStatus;
 
 #[derive(Args)]
 pub struct SandboxArgs {
@@ -32,8 +33,12 @@ enum SandboxVerb {
     List,
     /// Show a sandbox: its state, policy version, sessions and their processes.
     Show { name: SandboxName },
-    /// Stop every session and process of a sandbox.
+    /// Run the sandbox's proxy and its runtime's gateway in the background, now and at each login.
+    Start { name: SandboxName },
+    /// Stop every service, session and process of a sandbox.
     Stop { name: SandboxName },
+    /// Stop the sandbox, then start its services again under the active policy.
+    Restart { name: SandboxName },
     /// Remove a stopped sandbox, and its home unless --keep-data.
     Rm {
         name: SandboxName,
@@ -67,10 +72,34 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             }
         }
         SandboxVerb::List => print_list(&engine.list_sandboxes()?),
-        SandboxVerb::Show { name } => print_show(&engine.show_sandbox(&name)?),
+        SandboxVerb::Show { name } => {
+            print_show(&engine.show_sandbox(&name)?);
+            for (label, status) in engine.service_status(&name) {
+                let state = match status {
+                    ServiceStatus::Running { pid } => format!("running (pid {pid})"),
+                    ServiceStatus::Loaded => "loaded, not running".to_owned(),
+                    ServiceStatus::NotLoaded => "not loaded".to_owned(),
+                };
+                println!("  service {label}: {state}");
+            }
+        }
+        SandboxVerb::Start { name } => print_started(&name, &engine.start_sandbox(by, &name)?),
         SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
             Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
             Planned::Done(report) => return Ok(print_stop(&name, &report)),
+        },
+        SandboxVerb::Restart { name } => match engine.stop_sandbox(by, &name, confirm)? {
+            Planned::DryRun(plan) => {
+                plan.changes.iter().for_each(|c| println!("Would {c}."));
+                println!("Would start sandbox {name} again.");
+            }
+            Planned::Done(report) => {
+                let code = print_stop(&name, &report);
+                if code != exit::OK {
+                    return Ok(code);
+                }
+                print_started(&name, &engine.start_sandbox(by, &name)?);
+            }
         },
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
@@ -187,4 +216,14 @@ fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
         "End them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses."
     );
     exit::ERROR
+}
+
+fn print_started(name: &SandboxName, labels: &[String]) {
+    println!(
+        "Started sandbox {name} in the background: {}.",
+        labels.join(", ")
+    );
+    println!(
+        "It starts again at each login until `enclos sandbox stop {name}`. Logs: `enclos logs {name}`."
+    );
 }

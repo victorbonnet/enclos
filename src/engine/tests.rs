@@ -1215,3 +1215,98 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(lab.allows("example.com") && lab.allows("chatgpt.com"));
     }
 }
+
+mod services {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::model::runtime::RuntimeKind;
+    use crate::service::fake::FakeServices;
+
+    fn sandbox_with_services(
+        runtime: Option<RuntimeKind>,
+    ) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+        let fake = Rc::new(FakeServices::default());
+        let (dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
+            BackendKind::Seatbelt,
+        ))]);
+        let engine = engine.with_services(Box::new(Rc::clone(&fake)));
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let name: SandboxName = "home".parse().unwrap();
+        let spec = crate::engine::SandboxSpec {
+            name: name.clone(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+        if runtime.is_some() {
+            engine
+                .write(
+                    &alice(),
+                    "test",
+                    None,
+                    |_| String::new(),
+                    |lock| {
+                        let mut record = engine.state.get(&name)?.unwrap();
+                        record.runtime = runtime;
+                        engine.state.put(lock, &record)?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        (dir, engine, fake, name)
+    }
+
+    #[test]
+    fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        let labels = engine.start_sandbox(&alice(), &name).unwrap();
+        assert_eq!(labels, ["enclos.home.proxy"]);
+        let unit = &fake.started.borrow()[0];
+        let args: Vec<_> = unit
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[..4], ["proxy", "run", "home", "--record"]);
+        let port = engine.show_sandbox(&name).unwrap().record.port_base;
+        assert!(args.contains(&format!("127.0.0.1:{port}")), "{args:?}");
+        assert!(unit.env.iter().any(|(k, _)| k == "ENCLOS_HOME"));
+        assert!(unit.log.ends_with("sandboxes/home/logs/proxy.log"));
+    }
+
+    #[test]
+    fn hermes_adds_one_gateway_for_the_whole_sandbox_and_stop_removes_both() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let labels = engine.start_sandbox(&alice(), &name).unwrap();
+        assert_eq!(labels, ["enclos.home.proxy", "enclos.home.gateway"]);
+        let gateway = fake.started.borrow()[1].clone();
+        assert_eq!(
+            gateway.args,
+            ["launch", "home"].map(std::ffi::OsString::from)
+        );
+        assert_eq!(engine.service_status(&name).len(), 2);
+
+        engine.stop_sandbox(&alice(), &name).unwrap();
+        assert!(fake.started.borrow().is_empty());
+        assert!(
+            fake.stopped
+                .borrow()
+                .contains(&"enclos.home.gateway".to_owned())
+        );
+        assert!(
+            fake.stopped
+                .borrow()
+                .contains(&"enclos.home.proxy".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_engine_without_a_service_manager_never_starts_services() {
+        let (_dir, engine, name) =
+            super::policy::with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(err.to_string().contains("no service manager"), "{err}");
+    }
+}

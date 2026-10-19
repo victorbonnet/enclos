@@ -16,4 +16,5 @@ pub mod policy;
 pub mod probes;
 pub mod proxy;
 pub mod runtime;
+pub mod service;
 pub mod state;

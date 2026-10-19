@@ -74,11 +74,11 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
           |
    Per sandbox:
      [interactive session: enclos connect] --+
-     [agent service: enclos launch]    --------+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
+     [runtime gateway: enclos launch]  -----+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
      (every session runs inside the sandbox's policy, under the snapshot it started with)
 ```
 
-Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running agent, `enclos.<sandbox>.<agent>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that agent, and then runs the agent's wrapped command. An agent unit runs `enclos launch <sandbox>/<agent>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
+Each sandbox has at most two units while the user is logged in ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)): its proxy, `enclos.<sandbox>.proxy`, and its runtime's gateway, `enclos.<sandbox>.gateway`, one per sandbox because the gateway serves every agent. `enclos sandbox start` installs both, so they come back at each login, and `enclos sandbox stop` removes them. The gateway unit runs `enclos launch <sandbox>`, which runs outside the sandbox, records the session, and runs the runtime's background command under the compiled policy in a process group of its own; interactive sessions (`enclos connect <sandbox>`, a shell or the command after `--`) run the same way in the user's terminal. Secrets never sit in a plist or unit file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 
 ## 5. Isolation backends
 

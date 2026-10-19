@@ -97,6 +97,9 @@ pub trait RuntimeAdapter {
     /// What a person runs in the sandbox to talk to an agent, for enclos's
     /// messages: `enclos connect <sandbox> -- <this>` (ADR 0024).
     fn talk(&self, agent: &AgentName) -> String;
+    /// The one background process serving every agent of the sandbox,
+    /// if the runtime has one (ADR 0021).
+    fn service(&self) -> Option<Vec<OsString>>;
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {

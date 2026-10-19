@@ -18,7 +18,8 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference, reference_of_child};
+use crate::lifecycle::stop::{GRACE, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -300,6 +301,21 @@ impl Engine {
                 self.state.track(lock, session.id, &sure)?;
             }
             Err(_) => self.state.track(lock, session.id, &waited.known)?,
+        }
+        Ok(())
+    }
+
+    /// Stops the sandbox's proxy session, so that a service can take its
+    /// port.
+    pub(super) fn stop_proxy(&self, lock: &StateLock, name: &SandboxName) -> Result<()> {
+        for session in self
+            .state
+            .sessions(name, true)?
+            .into_iter()
+            .filter(|s| s.kind == SessionKind::Proxy)
+        {
+            stop(&session, GRACE);
+            self.state.end_session(lock, session.id)?;
         }
         Ok(())
     }
