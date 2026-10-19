@@ -1,5 +1,5 @@
 //! Sandbox models. Only what the state store needs so far; later issues add
-//! the template, workspaces, agent, policy snapshots and profiles.
+//! the template, workspaces, runtime, policy snapshots and agents.
 
 use std::fmt;
 use std::str::FromStr;

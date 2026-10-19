@@ -11,7 +11,7 @@ use enclos::layout::Layout;
 use enclos::model::audit::{Actor, AuditEntry, AuditResult, Since, VerifyReport};
 use enclos::model::plan::{Confirm, Plan, Planned};
 
-/// Run AI agents in sandboxes you control, with policy and an audit log.
+/// Create sandboxes, install agent runtimes in them and run agents there, with policy and an audit log.
 #[derive(Parser)]
 #[command(name = "enclos", version)]
 struct Cli {
