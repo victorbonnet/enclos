@@ -326,14 +326,9 @@ impl NetLogStore for SqliteStateStore {
         netlog::record(&conn, event).map_err(self.sqlite_err())
     }
 
-    fn events(
-        &self,
-        sandbox: &SandboxName,
-        agent: Option<&str>,
-        since: Option<Timestamp>,
-    ) -> Result<Vec<NetEvent>> {
+    fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>> {
         let conn = self.open()?;
-        netlog::events(&conn, sandbox, agent, since).map_err(|e| self.read_err(e))
+        netlog::events(&conn, sandbox, since).map_err(|e| self.read_err(e))
     }
 
     fn denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {

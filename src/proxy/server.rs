@@ -17,28 +17,22 @@ use crate::model::now;
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Proxy {
-    /// Serves one listener until the process ends; `agent` tags its log.
-    pub fn serve(
-        self: &Arc<Self>,
-        listener: TcpListener,
-        agent: Option<String>,
-    ) -> thread::JoinHandle<()> {
+    /// Serves the listener until the process ends.
+    pub fn serve(self: &Arc<Self>, listener: TcpListener) -> thread::JoinHandle<()> {
         let proxy = Arc::clone(self);
         thread::spawn(move || {
             for client in listener.incoming().flatten() {
                 let proxy = Arc::clone(&proxy);
-                let agent = agent.clone();
-                thread::spawn(move || proxy.handle(client, agent));
+                thread::spawn(move || proxy.handle(client));
             }
         })
     }
 
-    fn handle(&self, mut client: TcpStream, agent: Option<String>) {
+    fn handle(&self, mut client: TcpStream) {
         let started = Instant::now();
         let mut event = NetEvent {
             at: now(),
             sandbox: self.sandbox.clone(),
-            agent,
             host: String::new(),
             port: 0,
             method: String::new(),

@@ -37,12 +37,7 @@ impl NetLogStore for MemoryLog {
         self.0.lock().unwrap().push(event.clone());
         Ok(())
     }
-    fn events(
-        &self,
-        _: &SandboxName,
-        _: Option<&str>,
-        _: Option<Timestamp>,
-    ) -> StateResult<Vec<NetEvent>> {
+    fn events(&self, _: &SandboxName, _: Option<Timestamp>) -> StateResult<Vec<NetEvent>> {
         Ok(self.0.lock().unwrap().clone())
     }
     fn denied(&self, _: &SandboxName) -> StateResult<Vec<DeniedDestination>> {
@@ -108,7 +103,7 @@ fn start(allow: &[String], resolve_to: IpAddr, check: fn(IpAddr) -> AddrClass) -
     .for_tests(Box::new(FakeResolver(resolve_to)), check);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    Arc::new(proxy).serve(listener, Some("main".into()));
+    Arc::new(proxy).serve(listener);
     Running { addr, log, policy }
 }
 
@@ -159,10 +154,7 @@ fn an_allowed_tunnel_relays_bytes_and_is_logged() {
         (e.verdict, e.reason, e.method.as_str()),
         (Verdict::Allowed, None, "CONNECT")
     );
-    assert_eq!(
-        (e.host.as_str(), e.port, e.agent.as_deref()),
-        ("allowed.example.com", port, Some("main"))
-    );
+    assert_eq!((e.host.as_str(), e.port), ("allowed.example.com", port));
     assert_eq!(e.address.as_deref(), Some("127.0.0.1"));
     assert_eq!((e.bytes_up, e.bytes_down), (4, 4));
 }

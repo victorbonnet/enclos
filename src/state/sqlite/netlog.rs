@@ -15,13 +15,12 @@ fn fixed(t: Timestamp) -> String {
 
 pub fn record(conn: &Connection, e: &NetEvent) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO net_events (at, sandbox, agent, host, port, method, address, verdict,
+        "INSERT INTO net_events (at, sandbox, host, port, method, address, verdict,
              reason, bytes_up, bytes_down, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             fixed(e.at),
             e.sandbox.as_str(),
-            e.agent,
             e.host,
             e.port,
             e.method,
@@ -57,43 +56,41 @@ fn reason(text: Option<String>) -> Result<Option<Reason>, ReadError> {
 }
 
 fn event(row: &Row<'_>) -> Result<NetEvent, ReadError> {
-    let verdict: String = row.get(7)?;
+    let verdict: String = row.get(6)?;
     let sandbox: String = row.get(1)?;
     Ok(NetEvent {
         at: time(row.get(0)?)?,
         sandbox: sandbox.parse().map_err(|e| corrupt(format!("{e}")))?,
-        agent: row.get(2)?,
-        host: row.get(3)?,
-        port: row.get(4)?,
-        method: row.get(5)?,
-        address: row.get(6)?,
+        host: row.get(2)?,
+        port: row.get(3)?,
+        method: row.get(4)?,
+        address: row.get(5)?,
         verdict: match verdict.as_str() {
             "allowed" => Verdict::Allowed,
             "denied" => Verdict::Denied,
             other => return Err(corrupt(format!("unknown verdict `{other}`"))),
         },
-        reason: reason(row.get(8)?)?,
-        bytes_up: row.get::<_, i64>(9)? as u64,
-        bytes_down: row.get::<_, i64>(10)? as u64,
-        duration_ms: row.get::<_, i64>(11)? as u64,
+        reason: reason(row.get(7)?)?,
+        bytes_up: row.get::<_, i64>(8)? as u64,
+        bytes_down: row.get::<_, i64>(9)? as u64,
+        duration_ms: row.get::<_, i64>(10)? as u64,
     })
 }
 
 pub fn events(
     conn: &Connection,
     sandbox: &SandboxName,
-    agent: Option<&str>,
     since: Option<Timestamp>,
 ) -> Result<Vec<NetEvent>, ReadError> {
     let mut stmt = conn.prepare(
-        "SELECT at, sandbox, agent, host, port, method, address, verdict, reason,
+        "SELECT at, sandbox, host, port, method, address, verdict, reason,
                 bytes_up, bytes_down, duration_ms
          FROM net_events
-         WHERE sandbox = ?1 AND (?2 IS NULL OR agent = ?2) AND (?3 IS NULL OR at >= ?3)
+         WHERE sandbox = ?1 AND (?2 IS NULL OR at >= ?2)
          ORDER BY id",
     )?;
     let since = since.map(fixed);
-    let mut rows = stmt.query(params![sandbox.as_str(), agent, since])?;
+    let mut rows = stmt.query(params![sandbox.as_str(), since])?;
     let mut events = Vec::new();
     while let Some(row) = rows.next()? {
         events.push(event(row)?);

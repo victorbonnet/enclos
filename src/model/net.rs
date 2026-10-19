@@ -76,9 +76,6 @@ impl FromStr for Reason {
 pub struct NetEvent {
     pub at: Timestamp,
     pub sandbox: SandboxName,
-    /// The agent whose listener took the connection; attribution is
-    /// informative, not a boundary (ADR 0003).
-    pub agent: Option<String>,
     /// The host and port asked for.
     pub host: String,
     pub port: u16,

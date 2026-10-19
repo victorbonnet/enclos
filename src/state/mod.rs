@@ -85,14 +85,8 @@ pub trait StateStore: NetLogStore {
 /// close, without the state lock: a log row changes no state.
 pub trait NetLogStore {
     fn record(&self, event: &NetEvent) -> Result<()>;
-    /// The sandbox's connections, oldest first, optionally for one agent
-    /// and from `since` on.
-    fn events(
-        &self,
-        sandbox: &SandboxName,
-        agent: Option<&str>,
-        since: Option<Timestamp>,
-    ) -> Result<Vec<NetEvent>>;
+    /// The sandbox's connections, oldest first, from `since` on.
+    fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>>;
     /// Each destination the proxy denied for the sandbox, most recent first.
     fn denied(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>>;
 }

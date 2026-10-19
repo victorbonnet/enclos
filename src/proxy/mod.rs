@@ -55,13 +55,6 @@ impl<S: StateStore + Send + Sync> PolicySource for ActivePolicy<S> {
     }
 }
 
-/// One listener: its address, and the agent whose traffic it carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Listener {
-    pub addr: SocketAddr,
-    pub agent: Option<String>,
-}
-
 pub struct Proxy {
     sandbox: SandboxName,
     policy: Box<dyn PolicySource>,
@@ -96,20 +89,10 @@ impl Proxy {
         self
     }
 
-    /// Binds every listener, then serves them until the process ends.
-    pub fn run(self, listeners: &[Listener]) -> io::Result<()> {
-        let bound = listeners
-            .iter()
-            .map(|l| TcpListener::bind(l.addr).map(|socket| (socket, l.agent.clone())))
-            .collect::<io::Result<Vec<_>>>()?;
-        let proxy = Arc::new(self);
-        let handles: Vec<_> = bound
-            .into_iter()
-            .map(|(socket, agent)| proxy.serve(socket, agent))
-            .collect();
-        for handle in handles {
-            let _ = handle.join();
-        }
+    /// Binds the sandbox's listener, then serves it until the process ends.
+    pub fn run(self, addr: SocketAddr) -> io::Result<()> {
+        let socket = TcpListener::bind(addr)?;
+        let _ = Arc::new(self).serve(socket).join();
         Ok(())
     }
 }

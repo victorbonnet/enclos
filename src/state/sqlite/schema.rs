@@ -36,7 +36,6 @@ pub const MIGRATIONS: &[&str] = &[
         id          INTEGER PRIMARY KEY,
         at          TEXT NOT NULL,
         sandbox     TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
-        agent     TEXT,
         host        TEXT NOT NULL,
         port        INTEGER NOT NULL,
         method      TEXT NOT NULL,

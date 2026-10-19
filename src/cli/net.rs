@@ -9,8 +9,6 @@ use enclos::model::net::{DeniedDestination, NetEvent, Verdict};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
 
-use super::target::Target;
-
 #[derive(Args)]
 pub struct NetArgs {
     #[command(subcommand)]
@@ -21,8 +19,7 @@ pub struct NetArgs {
 enum NetVerb {
     /// Every connection the sandbox made: one row per HTTPS tunnel, never its contents.
     Log {
-        /// A sandbox, or one agent of it: `home` or `home/main`.
-        target: Target,
+        sandbox: SandboxName,
         /// Only connections from this far back, such as 30m, 12h or 7d.
         #[arg(long, value_name = "DURATION")]
         since: Option<Since>,
@@ -33,9 +30,9 @@ enum NetVerb {
 
 pub fn run(engine: &Engine, args: NetArgs) -> Result<u8> {
     match args.verb {
-        NetVerb::Log { target, since } => {
+        NetVerb::Log { sandbox, since } => {
             let from = since.and_then(|s| now().checked_sub(s.duration()).ok());
-            print_log(&engine.net_log(&target.sandbox, target.agent.as_deref(), from)?);
+            print_log(&engine.net_log(&sandbox, from)?);
         }
         NetVerb::Denied { sandbox } => print_denied(&sandbox, &engine.net_denied(&sandbox)?),
     }
@@ -56,8 +53,8 @@ fn print_log(events: &[NetEvent]) {
         return;
     }
     println!(
-        "{:<19}  {:<10}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
-        "TIME (UTC)", "AGENT", "VERDICT", "DESTINATION", "ADDRESS", "UP", "DOWN"
+        "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
+        "TIME (UTC)", "VERDICT", "DESTINATION", "ADDRESS", "UP", "DOWN"
     );
     for e in events {
         let verdict = match (e.verdict, e.reason) {
@@ -67,9 +64,8 @@ fn print_log(events: &[NetEvent]) {
             (Verdict::Denied, None) => "denied".to_owned(),
         };
         println!(
-            "{:<19}  {:<10}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
+            "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
             e.at.strftime("%Y-%m-%d %H:%M:%S"),
-            e.agent.as_deref().unwrap_or("-"),
             verdict,
             format!("{}:{}", e.host, e.port),
             e.address.as_deref().unwrap_or("-"),
