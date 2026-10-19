@@ -106,6 +106,25 @@ fn rejects_a_newer_schema() {
 }
 
 #[test]
+fn rejects_a_schema_its_migrations_do_not_make() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    // An unreleased build that named a column differently, at the same version.
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute_batch("ALTER TABLE sandboxes RENAME COLUMN backend TO kind")
+        .unwrap();
+    assert!(matches!(
+        store.list(),
+        Err(StateError::UnknownSchema { .. })
+    ));
+    assert!(matches!(
+        store.migrate(&lock),
+        Err(StateError::UnknownSchema { .. })
+    ));
+}
+
+#[test]
 fn reports_a_corrupt_record() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();

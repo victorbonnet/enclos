@@ -69,7 +69,27 @@ impl SqliteStateStore {
                 current,
             });
         }
+        self.check_schema(&conn, found)?;
         Ok(conn)
+    }
+
+    /// Refuses a database whose tables and columns differ from what this
+    /// enclos's own migrations make at its version: one written by an
+    /// unreleased build whose migrations changed since.
+    fn check_schema(&self, conn: &Connection, version: u32) -> Result<()> {
+        let expected = Connection::open_in_memory().map_err(self.sqlite_err())?;
+        for sql in &schema::MIGRATIONS[..version as usize] {
+            expected.execute_batch(sql).map_err(self.sqlite_err())?;
+        }
+        if columns(conn).map_err(self.sqlite_err())?
+            != columns(&expected).map_err(self.sqlite_err())?
+        {
+            return Err(StateError::UnknownSchema {
+                path: self.db.clone(),
+                found: version,
+            });
+        }
+        Ok(())
     }
 
     fn record(&self, row: &Row<'_>) -> Result<SandboxRecord> {
@@ -101,6 +121,16 @@ impl SqliteStateStore {
 
 fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
+}
+
+/// Every table's columns, in order.
+fn columns(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.name, c.name FROM sqlite_schema AS m, pragma_table_info(m.name) AS c
+         WHERE m.type = 'table' ORDER BY m.name, c.cid",
+    )?;
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect()
 }
 
 fn state_columns(state: &SandboxState) -> (&'static str, Option<&str>) {
@@ -168,6 +198,7 @@ impl StateStore for SqliteStateStore {
                 current,
             });
         }
+        self.check_schema(&tx, from)?;
         for sql in &schema::MIGRATIONS[from as usize..] {
             tx.execute_batch(sql).map_err(self.sqlite_err())?;
         }
