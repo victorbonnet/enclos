@@ -70,7 +70,8 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
                 engine.sandbox_home(&sandbox).display()
             );
             println!(
-                "`{name} setup` is optional: the agent already uses the sandbox's login (`enclos runtime login {sandbox}`)."
+                "`{name} setup` is optional: the agent already uses the sandbox's login (`enclos connect {sandbox} -- {}`).",
+                kind.map_or(String::new(), |k| enclos::runtime::adapter(k).login())
             );
         }
         AgentVerb::List { sandbox } => {

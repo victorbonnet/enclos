@@ -820,15 +820,14 @@ mod runtime {
     }
 
     #[test]
-    fn agents_and_logins_need_a_runtime_first() {
+    fn agents_need_a_runtime_first() {
         let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
-        let err = engine.runtime_login(&alice(), &name).unwrap_err();
+        let err = engine.agents(&name).unwrap_err();
+        assert!(err.to_string().contains("no runtime yet"), "{err}");
         assert!(
             err.to_string()
                 .contains("enclos runtime install hermes --sandbox home"),
             "{err}"
         );
-        let err = engine.agents(&name).unwrap_err();
-        assert!(err.to_string().contains("no runtime yet"), "{err}");
     }
 }
