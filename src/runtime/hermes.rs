@@ -5,6 +5,8 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
+use std::path::Path;
+
 use super::{HomeFile, Installer, RuntimeAdapter, RuntimeService, SandboxCommand, ServiceName};
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -22,6 +24,35 @@ pub const INSTALLER_SHA256: &str =
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+
+/// The files that make a folder under `~/.hermes/profiles/` a profile, as
+/// Hermes decides it (`_PROFILE_IDENTITY_MARKERS`, Hermes 0.22).
+const PROFILE_MARKERS: [&str; 6] = [
+    "config.yaml",
+    ".env",
+    "SOUL.md",
+    "profile.yaml",
+    "auth.json",
+    "state.db",
+];
+
+/// At most this many entries of `~/.hermes/profiles/` are read.
+const MAX_ENTRIES: usize = 512;
+
+/// Hermes's profile id rule: `^[a-z0-9][a-z0-9_-]{0,63}$`.
+fn hermes_id(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && name.len() <= 64
+}
+
+/// Whether `path` exists, without following a link at its end.
+fn present(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
 
 impl RuntimeAdapter for Hermes {
     fn kind(&self) -> RuntimeKind {
@@ -98,6 +129,42 @@ impl RuntimeAdapter for Hermes {
             ]),
         }]
     }
+
+    fn agents_in(&self, home: &Path) -> Option<Vec<String>> {
+        // Hermes lists a profile when its folder under `~/.hermes/profiles/`
+        // has a valid id, one of its identity files, and no marker under
+        // `profiles/.deleted/`. The sandbox writes all of this, so a link is
+        // never followed: a linked `.hermes` or `profiles` means "cannot
+        // tell", and a linked profile folder is not listed.
+        let hermes = home.join(".hermes");
+        let profiles = hermes.join("profiles");
+        for dir in [&hermes, &profiles] {
+            match dir.symlink_metadata() {
+                Ok(meta) if meta.is_dir() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+                _ => return None,
+            }
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&profiles)
+            .ok()?
+            .take(MAX_ENTRIES)
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().into_string().ok()?;
+                let folder = entry.file_type().ok()?.is_dir();
+                let profile = folder
+                    && name != "default"
+                    && hermes_id(&name)
+                    && PROFILE_MARKERS
+                        .iter()
+                        .any(|m| present(&entry.path().join(m)))
+                    && !present(&profiles.join(".deleted").join(&name));
+                profile.then_some(name)
+            })
+            .collect();
+        names.sort();
+        Some(names)
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +202,43 @@ mod tests {
             crate::net::host::AllowEntry::parse(entry).unwrap();
             assert!(!entry.starts_with('*'), "no wildcard: {entry}");
         }
+    }
+
+    #[test]
+    fn agents_are_listed_as_hermes_lists_its_profiles() {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = home.path().join(".hermes/profiles");
+        let profile = |name: &str, marker: Option<&str>| {
+            std::fs::create_dir_all(profiles.join(name)).unwrap();
+            if let Some(m) = marker {
+                std::fs::write(profiles.join(name).join(m), "").unwrap();
+            }
+        };
+        profile("main", Some("config.yaml"));
+        profile("my_bot", Some("SOUL.md")); // a Hermes name enclos cannot use
+        profile("ghost", None); // no identity file: not a profile
+        profile("gone", Some(".env"));
+        std::fs::create_dir_all(profiles.join(".deleted/gone")).unwrap();
+        profile("Upper", Some(".env")); // not a Hermes id
+        std::fs::write(profiles.join("file"), "").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("config.yaml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), profiles.join("linked")).unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Some(vec!["main".to_owned(), "my_bot".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_missing_hermes_has_no_agents_and_a_linked_one_cannot_be_read() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(Hermes.agents_in(home.path()), Some(vec![]));
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("profiles/main")).unwrap();
+        std::fs::write(outside.path().join("profiles/main/config.yaml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".hermes")).unwrap();
+        assert_eq!(Hermes.agents_in(home.path()), None);
     }
 
     #[test]

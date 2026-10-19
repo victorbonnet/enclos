@@ -41,8 +41,12 @@ pub struct InstallEnd {
 pub struct AgentAdded {
     pub agent: AgentRecord,
     pub kind: RuntimeKind,
-    /// How the runtime's command that created the agent ended.
-    pub end: SessionEnd,
+    /// How the runtime's command that created the agent ended; none when
+    /// it was adopted.
+    pub end: Option<SessionEnd>,
+    /// The runtime already had the agent, made inside the sandbox, so
+    /// enclos only started tracking it (ADR 0023).
+    pub adopted: bool,
 }
 
 /// What `agent rm` did: the record is gone; the files stay.
@@ -69,6 +73,43 @@ struct InstallPlan {
 /// An installer larger than this is not the script enclos reviewed.
 const INSTALLER_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
+/// How the agents a runtime has in a sandbox compare with the ones enclos
+/// tracks (ADR 0023).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentCheck {
+    /// Agents the runtime has that enclos does not track: made inside the
+    /// sandbox with the runtime's own commands.
+    pub untracked: Vec<AgentName>,
+    /// Names the runtime uses that are not valid agent names, so enclos
+    /// cannot track them.
+    pub unnamed: Vec<String>,
+    /// Agents enclos tracks that the runtime no longer has.
+    pub missing: Vec<AgentName>,
+}
+
+impl AgentCheck {
+    pub fn compare(found: Vec<String>, tracked: &[AgentRecord]) -> AgentCheck {
+        let mut check = AgentCheck::default();
+        for name in &found {
+            match name.parse::<AgentName>() {
+                Ok(agent) if tracked.iter().any(|t| t.name == agent) => {}
+                Ok(agent) => check.untracked.push(agent),
+                Err(_) => check.unnamed.push(name.clone()),
+            }
+        }
+        check.missing = tracked
+            .iter()
+            .filter(|t| !found.iter().any(|n| n == t.name.as_str()))
+            .map(|t| t.name.clone())
+            .collect();
+        check
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.untracked.is_empty() && self.unnamed.is_empty() && self.missing.is_empty()
+    }
+}
+
 impl Engine {
     /// The runtime installed in the sandbox.
     pub(super) fn runtime_of(&self, name: &SandboxName) -> Result<RuntimeKind> {
@@ -81,14 +122,45 @@ impl Engine {
     }
 
     pub(super) fn agent_of(&self, name: &SandboxName, agent: &str) -> Result<AgentRecord> {
-        self.runtime_of(name)?;
-        self.state
+        let kind = self.runtime_of(name)?;
+        let tracked = self
+            .state
             .agents(name)?
             .into_iter()
-            .find(|p| p.name.as_str() == agent)
-            .ok_or_else(|| Error::Session {
-                what: format!("sandbox {name} has no agent `{agent}`. Add it with `enclos agent add {name}/{agent}`"),
-            })
+            .find(|p| p.name.as_str() == agent);
+        tracked.ok_or_else(|| {
+            let made_inside = adapter(kind)
+                .agents_in(&self.sandbox_home(name))
+                .is_some_and(|found| found.iter().any(|n| n == agent));
+            let what = if made_inside {
+                format!(
+                    "enclos does not track agent `{agent}`, which {} has in sandbox {name}. Track it with `enclos agent add {name}/{agent}`",
+                    kind.display_name()
+                )
+            } else {
+                format!("sandbox {name} has no agent `{agent}`. Add it with `enclos agent add {name}/{agent}`")
+            };
+            Error::Session { what }
+        })
+    }
+
+    /// The runtime installed in the sandbox, if any.
+    pub fn runtime(&self, name: &SandboxName) -> Result<Option<RuntimeKind>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(record.runtime)
+    }
+
+    /// Compares the agents the runtime has in the sandbox with the ones
+    /// enclos tracks (ADR 0023). Empty when the runtime cannot tell.
+    pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck> {
+        let kind = self.runtime_of(name)?;
+        let tracked = self.state.agents(name)?;
+        Ok(adapter(kind)
+            .agents_in(&self.sandbox_home(name))
+            .map(|found| AgentCheck::compare(found, &tracked))
+            .unwrap_or_default())
     }
 
     /// Installs `kind` in the sandbox (ADR 0020): its destinations join the
@@ -358,7 +430,14 @@ impl Engine {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         self.refuse_known_agent(name, &agent)?;
-        if let Some(path) = self.command_named(name, &agent)? {
+        // An agent made inside the sandbox with the runtime's own commands
+        // is adopted as it is: creating it again would fail (ADR 0023).
+        let adopted = runtime
+            .agents_in(&self.sandbox_home(name))
+            .is_some_and(|found| found.iter().any(|n| n == agent.as_str()));
+        // A new agent's alias would shadow a command of that name; an
+        // adopted one already has its alias there.
+        if !adopted && let Some(path) = self.command_named(name, &agent)? {
             return Err(Error::Session {
                 what: format!(
                     "`{agent}` is a command on the sandbox's PATH ({}); {kind} would shadow it with the agent's alias. Pick another name",
@@ -367,35 +446,47 @@ impl Engine {
             });
         }
         let command = runtime.create_agent(&agent);
+        let files = runtime.agent_files(&agent);
         if confirm == Confirm::DryRun {
             let version = self.policy(name)?.version.version;
-            return Ok(Planned::DryRun(Plan {
-                changes: vec![
+            let changes = match adopted {
+                true => vec![format!(
+                    "record agent {name}/{agent}, which {kind} already has in the sandbox (made there with its own commands)"
+                )],
+                false => vec![
                     format!(
                         "run `{}` in sandbox {name} under policy v{version}",
                         command.shown()
                     ),
                     format!("record agent {name}/{agent}"),
                 ],
+            };
+            return Ok(Planned::DryRun(Plan {
+                changes,
                 ..Plan::default()
             }));
         }
-        let files = runtime.agent_files(&agent);
-        let created = self.run_in_sandbox(by, name, command, "agent create")?;
-        if created.exit != 0 {
-            return Err(Error::Session {
-                what: format!(
-                    "{kind} could not create agent {agent} (exit {}): its output above says why. If it says the agent already exists, its files are in the sandbox home at {files}: remove them with {kind}'s own commands (`enclos connect {name}`) and add the agent again",
-                    created.exit
-                ),
-            });
-        }
+        let created = match adopted {
+            true => None,
+            false => {
+                let created = self.run_in_sandbox(by, name, command, "agent create")?;
+                if created.exit != 0 {
+                    return Err(Error::Session {
+                        what: format!(
+                            "{kind} could not create agent {agent} (exit {}): its output above says why. If it says the agent already exists, its files are in the sandbox home at {files}: remove them with {kind}'s own commands (`enclos connect {name}`) and add the agent again",
+                            created.exit
+                        ),
+                    });
+                }
+                Some(created)
+            }
+        };
         let record = self
             .write(
                 by,
                 "agent add",
                 Some(format!("{name}/{agent}")),
-                |_| "added".to_owned(),
+                |_| (if adopted { "adopted" } else { "added" }).to_owned(),
                 |lock| {
                     // Checked again under the lock: another add may have
                     // recorded it while the runtime worked.
@@ -410,13 +501,14 @@ impl Engine {
             )
             .map_err(|e| Error::Session {
                 what: format!(
-                    "{kind} created agent {agent} in sandbox {name}, but enclos could not record it: {e}. Its files are in the sandbox home at {files}: remove them with {kind}'s own commands (`enclos connect {name}`), then add the agent again"
+                    "{kind} has agent {agent} in sandbox {name}, but enclos could not record it: {e}. Run `enclos agent add {name}/{agent}` again: it adopts an agent the runtime already has"
                 ),
             })?;
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,
             end: created,
+            adopted,
         }))
     }
 

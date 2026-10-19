@@ -768,8 +768,7 @@ mod sandbox {
 mod runtime {
     use super::policy::with_sandbox_on;
     use super::*;
-    #[cfg(target_os = "macos")]
-    use crate::model::agent::AgentName;
+    use crate::model::agent::{AgentName, AgentRecord};
     use crate::model::runtime::RuntimeKind;
     #[cfg(target_os = "macos")]
     use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand, hermes::Hermes};
@@ -1225,6 +1224,92 @@ echo \"installed $*\" > \"$HOME/installed\"
         let end = done(lab.install(INSTALLS, Confirm::Yes).unwrap());
         assert!(end.installed);
         assert!(lab.allows("example.com") && lab.allows("chatgpt.com"));
+
+    /// A sandbox with Hermes recorded as its runtime, and a way to make a
+    /// Hermes profile in its home as `hermes profile create` would.
+    fn with_hermes() -> (TempDir, Engine, SandboxName, impl Fn(&str)) {
+        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let profiles = engine.sandbox_home(&name).join(".hermes/profiles");
+        let make = move |agent: &str| {
+            std::fs::create_dir_all(profiles.join(agent)).unwrap();
+            std::fs::write(profiles.join(agent).join("config.yaml"), "").unwrap();
+        };
+        (dir, engine, name, make)
+    }
+
+    #[test]
+    fn an_agent_made_inside_the_sandbox_is_reported_then_adopted() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        make("my_bot");
+        let check = engine.check_agents(&name).unwrap();
+        assert_eq!(check.untracked, ["scout".parse::<AgentName>().unwrap()]);
+        assert_eq!(check.unnamed, ["my_bot"]);
+        let err = engine
+            .connect(&alice(), &name, Some("scout"), Vec::new())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("enclos does not track agent `scout`, which Hermes has"),
+            "{err}"
+        );
+
+        // Adopting runs nothing in the sandbox: the fake backend would fail.
+        let added = engine
+            .add_agent(&alice(), &name, "scout".parse().unwrap())
+            .unwrap();
+        assert!(added.adopted);
+        let base = engine.show_sandbox(&name).unwrap().record.port_base;
+        assert_eq!(added.record.port, base + 1);
+        assert!(engine.check_agents(&name).unwrap().untracked.is_empty());
+        let entries = engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "agent add");
+        let message = &last.finished.as_ref().unwrap().outcome.message;
+        assert_eq!(message, &format!("port {}, adopted", base + 1));
+    }
+
+    #[test]
+    fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        engine
+            .add_agent(&alice(), &name, "scout".parse().unwrap())
+            .unwrap();
+        std::fs::remove_dir_all(engine.sandbox_home(&name).join(".hermes/profiles/scout")).unwrap();
+        let check = engine.check_agents(&name).unwrap();
+        assert_eq!(check.missing, ["scout".parse::<AgentName>().unwrap()]);
+        assert!(check.untracked.is_empty());
+    }
+
+    #[test]
+    fn the_check_compares_names_both_ways() {
+        let tracked = |n: &str| AgentRecord {
+            name: n.parse().unwrap(),
+            port: 41001,
+            created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+        };
+        let found = ["main", "scout", "a"].map(String::from).to_vec();
+        let check = AgentCheck::compare(found, &[tracked("main"), tracked("gone")]);
+        assert_eq!(check.untracked, ["scout".parse::<AgentName>().unwrap()]);
+        assert_eq!(check.unnamed, ["a"]);
+        assert_eq!(check.missing, ["gone".parse::<AgentName>().unwrap()]);
+        assert!(!check.is_clean());
+        assert!(AgentCheck::compare(vec!["main".into()], &[tracked("main")]).is_clean());
     }
 
     #[cfg(target_os = "macos")]

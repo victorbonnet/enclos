@@ -44,6 +44,10 @@ _Avoid_: agent (for the software), platform, program
 A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime without several agents has one agent named `default`.
 _Avoid_: profile (Hermes's word for it), instance, persona, bot
 
+**Untracked agent**:
+An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. enclos reports it and tracks it once it is added.
+_Avoid_: orphan, rogue agent, unknown agent
+
 **Session**:
 A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance

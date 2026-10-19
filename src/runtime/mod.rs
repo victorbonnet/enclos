@@ -8,6 +8,7 @@ pub mod hermes;
 
 use std::ffi::OsString;
 use std::fmt;
+use std::path::Path;
 
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -104,6 +105,12 @@ pub trait RuntimeAdapter {
     /// started: none, one or several, each with a name of its own. Hermes
     /// has one gateway serving every agent (ADR 0021).
     fn services(&self) -> Vec<RuntimeService>;
+    /// The names of the agents the runtime has in this sandbox home, as it
+    /// would list them, read on the host without running anything. `None`
+    /// when the runtime has no named agents, or when its listing cannot be
+    /// read safely. The sandbox writes its home, so implementations never
+    /// follow a link and read a bounded number of entries (ADR 0023).
+    fn agents_in(&self, home: &Path) -> Option<Vec<String>>;
 }
 
 /// One background process of a runtime, run by the host's service manager
