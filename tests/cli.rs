@@ -354,6 +354,11 @@ fn a_seatbelt_sandbox_is_refused_off_macos() {
     );
 }
 
+/// Tests that start proxies take turns: proxy ports are the host's, shared
+/// by every test's enclos folder.
+#[cfg(target_os = "macos")]
+static HOST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Stops the sandbox when the test ends, passed or not, so the proxy it
 /// started never outlives the test.
 #[cfg(target_os = "macos")]
@@ -369,6 +374,7 @@ impl Drop for StopOnDrop<'_> {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
     let out = home.run(&["sandbox", "create", "home"]);
@@ -422,4 +428,30 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
     assert_eq!(home.run(&["sandbox", "rm", "home"]).code(), 3);
     home.run(&["sandbox", "rm", "home", "--yes"]).ok();
     assert!(!sandbox.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_refuses_a_port_another_program_listens_on() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    let port: u16 = show
+        .split("proxy ports ")
+        .nth(1)
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|p| p.parse().ok())
+        .unwrap();
+    // Another program takes the sandbox's proxy port first.
+    let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let out = home.run(&["connect", "home", "--", "/usr/bin/true"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("in use by another program"),
+        "{}",
+        out.stderr()
+    );
 }

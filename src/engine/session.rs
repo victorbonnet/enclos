@@ -153,7 +153,14 @@ impl Engine {
             .open(&log_path)
             .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
         let addr = SocketAddr::from(([127, 0, 0, 1], record.port_base));
-        let child = Command::new(exe)
+        // Anything else on this port would receive the sandbox's traffic.
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return Err(failed(format!(
+                "port {} of sandbox {} is in use by another program; stop it, or recreate the sandbox to get other ports",
+                record.port_base, record.name
+            )));
+        }
+        let mut child = Command::new(exe)
             .args([
                 "proxy",
                 "run",
@@ -169,7 +176,18 @@ impl Engine {
             .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
         let pid = child.id();
         let start = Instant::now();
-        while TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        loop {
+            // Listening is not enough: it must be this proxy, still running.
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(failed(format!(
+                    "the proxy of sandbox {} exited ({status}); see {}",
+                    record.name,
+                    log_path.display()
+                )));
+            }
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                break;
+            }
             if start.elapsed() > PROXY_START {
                 return Err(failed(format!(
                     "the proxy of sandbox {} did not start listening on {addr}; see {}",
