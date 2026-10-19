@@ -554,6 +554,7 @@ mod services {
     use std::rc::Rc;
 
     use super::*;
+    use crate::engine::service::Unit;
     use crate::model::runtime::RuntimeKind;
     use crate::service::fake::FakeServices;
 
@@ -596,7 +597,8 @@ mod services {
     fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
         let (_dir, engine, fake, name) = sandbox_with_services(None);
         let labels = engine.start_sandbox(&alice(), &name).unwrap();
-        assert_eq!(labels, ["enclos.home.proxy"]);
+        assert_eq!(labels, [engine.label(&name, Unit::Proxy)]);
+        assert_eq!(engine.service_labels(&name).unwrap(), labels);
         let unit = &fake.started.borrow()[0];
         let args: Vec<_> = unit
             .args
@@ -614,7 +616,12 @@ mod services {
     fn hermes_adds_one_gateway_for_the_whole_sandbox_and_stop_removes_both() {
         let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
         let labels = engine.start_sandbox(&alice(), &name).unwrap();
-        assert_eq!(labels, ["enclos.home.proxy", "enclos.home.gateway"]);
+        let (proxy_label, gateway_label) = (
+            engine.label(&name, Unit::Proxy),
+            engine.label(&name, Unit::Gateway),
+        );
+        assert_eq!(labels, [proxy_label.clone(), gateway_label.clone()]);
+        assert_eq!(engine.service_labels(&name).unwrap(), labels);
         let gateway = fake.started.borrow()[1].clone();
         assert_eq!(
             gateway.args,
@@ -624,16 +631,24 @@ mod services {
 
         engine.stop_sandbox(&alice(), &name).unwrap();
         assert!(fake.started.borrow().is_empty());
-        assert!(
-            fake.stopped
-                .borrow()
-                .contains(&"enclos.home.gateway".to_owned())
+        assert!(fake.stopped.borrow().contains(&gateway_label));
+        assert!(fake.stopped.borrow().contains(&proxy_label));
+    }
+
+    #[test]
+    fn two_installs_never_share_a_launchd_label() {
+        let (_one, first, _, name) = sandbox_with_services(None);
+        let (_two, second, _, _) = sandbox_with_services(None);
+        let (a, b) = (
+            first.label(&name, Unit::Proxy),
+            second.label(&name, Unit::Proxy),
         );
+        assert_ne!(a, b);
         assert!(
-            fake.stopped
-                .borrow()
-                .contains(&"enclos.home.proxy".to_owned())
+            a.starts_with("enclos.") && a.ends_with(".home.proxy"),
+            "{a}"
         );
+        assert_eq!(a.len(), "enclos.12345678.home.proxy".len());
     }
 
     #[test]

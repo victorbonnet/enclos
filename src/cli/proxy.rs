@@ -58,10 +58,7 @@ pub fn run(engine: &Engine, by: &Actor, args: ProxyArgs) -> Result<u8> {
             listen,
             record,
         } => {
-            if record {
-                engine.record_proxy(by, &sandbox)?;
-            }
-            engine.run_proxy(&sandbox, listen.0)?;
+            engine.run_proxy(&sandbox, listen.0, record.then_some(by))?;
         }
     }
     Ok(exit::OK)
