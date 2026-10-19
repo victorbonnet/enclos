@@ -37,10 +37,10 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 
 ## Quick start
 
-On a Mac with Rust and an account with a model provider Hermes supports:
+On an Apple silicon Mac running macOS 14 or later, with an account with a model provider Hermes supports. The installer defaults to the latest published release binary and does not require Rust. No releases have been published yet; to try this checkout today, use `bash install.sh --source .` with Xcode Command Line Tools and the pinned Rust toolchain.
 
 ```bash
-cargo install --path .
+bash install.sh                              # latest published release into ~/.local/bin
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
@@ -52,7 +52,9 @@ enclos connect lab -- main                    # talk to the agent, with Hermes's
 enclos net log lab                            # what it connected to
 ```
 
-The [getting started guide](docs/getting-started.md) explains each step and what does not work yet.
+The installer resolves the latest release tag, downloads its binary and SHA-256 checksum, verifies the archive and executable version, then replaces the installed binary. It prints a PATH command if needed and does not use sudo, edit shell startup files, or create Enclos state. `--version <tag>` selects a specific release; `--source <path>` and `--ref <ref>` explicitly select source builds. A missing release is an error, with no automatic source fallback. The public `curl … | bash` command needs `install.sh` on `main` and a published binary release; it is not live yet.
+
+The [getting started guide](docs/getting-started.md) explains each step and what does not work yet. Developers can build with `bash install.sh --source .` or directly with `cargo install --locked --path .`. See [Publishing releases](docs/releases.md) for the release workflow and artifact format.
 
 ## Commands
 
@@ -71,6 +73,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
+- [Why enclos](docs/marketing/index.html): a visual introduction, everyday examples and common questions ([preview instructions](docs/marketing/README.md)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.

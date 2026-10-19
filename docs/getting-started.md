@@ -10,15 +10,33 @@ The words used here:
 
 ## Before you start
 
-- macOS 14 or later, with Rust installed through [rustup](https://rustup.rs).
+- An Apple silicon Mac running macOS 14 or later.
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
-Install enclos from a clone of the repository:
+## Install the latest release
+
+From a checkout containing `install.sh`, its default behavior is:
 
 ```bash
-cargo install --path .
+bash install.sh
 ```
+
+This downloads the latest published release binary for Apple silicon, verifies its SHA-256 checksum and executable version, and installs it into `~/.local/bin`. Rust and Xcode Command Line Tools are not required for this path. If that directory is not on your PATH, run the export command the installer prints before continuing.
+
+**The first binary release is not published yet.** Until then, use the explicit source build below. The installer reports an error if a release cannot be found or verified; it never silently builds `main` or the local checkout.
+
+Use `bash install.sh --version <tag>` to select a specific release, or `--prefix /absolute/path` to change the install directory. `bash install.sh --help` lists the options. The public `curl … | bash` command becomes available once the script is on `main` and a binary release has been published. The installer does not use sudo, edit shell startup files, or create sandboxes.
+
+### Build this checkout during development
+
+Source builds require Xcode Command Line Tools (`xcode-select --install`) and the pinned Rust toolchain, through [rustup](https://rustup.rs) or matching local Cargo and rustc binaries:
+
+```bash
+bash install.sh --source .
+```
+
+This builds the specified checkout using `Cargo.lock`. Missing prerequisites are reported with instructions rather than installed automatically. `bash install.sh --ref <branch-tag-or-commit>` explicitly downloads and builds a source ref. Direct Cargo installation remains available with `cargo install --locked --path .`.
 
 ## Create a sandbox and install Hermes
 
