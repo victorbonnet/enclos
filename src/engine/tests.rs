@@ -439,7 +439,6 @@ mod compile {
 
     #[test]
     fn a_cut_off_compiled_policy_is_never_reused() {
-        use std::os::unix::fs::PermissionsExt;
         let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let file = engine.compile_policy(&name, 41001).unwrap();
         let full = std::fs::read_to_string(&file).unwrap();
@@ -449,13 +448,15 @@ mod compile {
         assert_eq!(engine.compile_policy(&name, 41001).unwrap(), file);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), full);
 
-        // A write that fails leaves no file at all, and the retry succeeds.
+        // A write that fails, here because a folder stands where the file
+        // goes (which fails for root too), leaves nothing of the policy, and
+        // the retry succeeds.
         std::fs::remove_file(&file).unwrap();
-        let compiled = file.parent().unwrap();
-        std::fs::set_permissions(compiled, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::create_dir_all(file.join("in-the-way")).unwrap();
         assert!(engine.compile_policy(&name, 41001).is_err());
-        assert!(!file.exists());
-        std::fs::set_permissions(compiled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(file.is_dir());
+        std::fs::remove_dir_all(&file).unwrap();
+        let compiled = file.parent().unwrap();
         assert_eq!(engine.compile_policy(&name, 41001).unwrap(), file);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), full);
         assert_eq!(std::fs::read_dir(compiled).unwrap().count(), 1);

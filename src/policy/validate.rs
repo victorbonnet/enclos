@@ -26,8 +26,11 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
     let mut problems = Vec::new();
     check_writes(policy, ctx, &mut problems);
     for entry in &policy.fs.read_deny {
-        if let Err(e) = ctx.paths.expand(entry) {
-            problems.push(format!("filesystem.read_deny: {e}"));
+        match ctx.paths.expand(entry) {
+            Ok(path) => {
+                check_writable_in_a_profile("read_deny", entry, &real_path(&path), &mut problems)
+            }
+            Err(e) => problems.push(format!("filesystem.read_deny: {e}")),
         }
     }
     check_default_denies(policy, &mut problems);
@@ -50,6 +53,7 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Str
                 continue;
             }
         };
+        check_writable_in_a_profile("write", entry, &path, problems);
         for root in &protected {
             let contains_root = is_within(root, &path);
             let inside_root = is_within(&path, root) && !is_within(&path, &own_home);
@@ -61,6 +65,27 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Str
                 ));
             }
         }
+    }
+}
+
+/// A path the compiled policy can hold as is: a double quote or a backslash
+/// would change a Seatbelt rule, so the compiler refuses them, and a policy
+/// that holds one could never start its sandbox.
+fn check_writable_in_a_profile(
+    list: &str,
+    entry: &str,
+    path: &std::path::Path,
+    problems: &mut Vec<String>,
+) {
+    match path.to_str() {
+        Some(text) if !text.contains(['"', '\\']) => {}
+        Some(text) => problems.push(format!(
+            "filesystem.{list}: `{entry}` ({text}) holds a double quote or a backslash, which enclos cannot put in a sandbox profile"
+        )),
+        None => problems.push(format!(
+            "filesystem.{list}: `{entry}` ({}) is not valid UTF-8",
+            path.display()
+        )),
     }
 }
 
@@ -205,6 +230,18 @@ mod tests {
                 "{entry}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn paths_a_sandbox_profile_cannot_hold_are_refused_when_stored() {
+        let f = fixture();
+        let found = problems(&policy(&["~/work/\"Q3\" report"], &[], &[]), &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("double quote"), "{found:?}");
+        let mut p = policy(&[], &[], &[]);
+        p.fs.read_deny.push("~/back\\slash".into());
+        let found = problems(&p, &f);
+        assert!(found[0].starts_with("filesystem.read_deny"), "{found:?}");
     }
 
     #[test]

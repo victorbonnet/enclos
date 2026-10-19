@@ -26,8 +26,8 @@
 
 ;; Synthetic keyboard and mouse events and the pasteboard. Shown: the lookups
 ;; are refused and `pbpaste` fails. Not shown: that posting an event is
-;; stopped (no probe posts one); hid-control and the HID client are extra
-;; layers whose effect was not observed.
+;; stopped (no probe posts one). hid-control also refuses TIOCSTI (below);
+;; the HID client rule is an extra layer whose effect was not observed.
 (deny hid-control (with message "{tag}"))
 (deny mach-lookup (with message "{tag}")
   (global-name "com.apple.windowserver.active")
@@ -56,6 +56,14 @@
 ;; this closes the DNS-SD Mach service too. The proxy resolves names instead.
 (deny mach-lookup (with message "{tag}")
   (global-name "com.apple.dnssd.service"))
+
+;; Typing into the terminal: TIOCSTI pushes bytes into the input of the
+;; terminal a session runs in, which the user's shell reads and runs after
+;; the session ends. Shown on macOS 26: allowed under (allow default); the
+;; hid-control rule above refuses it, and so does this rule alone, while
+;; termios and window-size calls still work. Two rules, so either may change.
+(deny file-ioctl (with message "{tag}")
+  (ioctl-command TIOCSTI))
 
 ;; Signals stay inside the sandbox. Under (allow default) a sandboxed process
 ;; may signal every process of the user: shown, Hermes in the sandbox found

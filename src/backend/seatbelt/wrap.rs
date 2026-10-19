@@ -149,21 +149,12 @@ pub fn environment(ctx: &SandboxContext) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
     use std::path::PathBuf;
 
     fn ctx() -> SandboxContext {
-        let data = PathBuf::from("/Users/alice/.enclos");
-        SandboxContext {
-            name: "home".parse().unwrap(),
-            dir: data.join("sandboxes/home"),
-            home: data.join("sandboxes/home/home"),
-            user_home: "/Users/alice".into(),
-            protected: vec![data.clone()],
-            sandboxes: data.join("sandboxes"),
-            data: data.clone(),
-            config_file: data.join("config.toml"),
-            proxy_port: 41001,
-        }
+        let layout = Layout::at(PathBuf::from("/Users/alice/.enclos"));
+        SandboxContext::new(&layout, &"home".parse().unwrap(), 41001)
     }
 
     #[test]

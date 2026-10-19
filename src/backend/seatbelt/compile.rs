@@ -1,7 +1,8 @@
 //! Compiling a policy for Seatbelt (design §5): `(allow default)`,
-//! then writes only where granted, the sensitive read deny list, network only
-//! to the sandbox's proxy port, the host-service denials, and last, so no
-//! rule above can override them, enclos's protected paths.
+//! then writes only where granted, reads of the sandbox home, the sensitive
+//! deny list for reads and writes (after those allows, so no grant covers
+//! it), network only to the sandbox's proxy port, the host-service denials,
+//! and last, so no rule above can override them, enclos's protected paths.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use super::super::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
-use crate::policy::paths::{PathContext, real_path};
+use crate::policy::paths::{PathContext, is_within, real_path};
 
 const HOST_SERVICES: &str = include_str!("host-services.sb");
 
@@ -72,18 +73,34 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     allowed.extend(DEVICES.iter().map(|d| d.to_string()));
     line(format!("(allow file-write*\n  {})", allowed.join("\n  ")));
 
-    line("\n;; ---- Reads: everything but the sensitive paths (ADR 0015)".into());
+    line(format!("(allow file-read* {})", subpath(&home)?));
+
+    line(
+        "\n;; ---- Sensitive paths: neither read nor written, whatever a grant covers (ADR 0015)"
+            .into(),
+    );
     if !read_deny.is_empty() {
         let denied = read_deny
             .iter()
-            .map(|p| subpath(p))
+            .map(|p| {
+                // An entry holding the home leaves the home out: later rules
+                // win, and the sandbox must keep its home.
+                if is_within(&home, p) {
+                    Ok(format!(
+                        "(require-all {} (require-not {}))",
+                        subpath(p)?,
+                        subpath(&home)?
+                    ))
+                } else {
+                    subpath(p)
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
         line(format!(
-            "(deny file-read* (with message \"{tag}\")\n  {})",
+            "(deny file-read* file-write* (with message \"{tag}\")\n  {})",
             denied.join("\n  ")
         ));
     }
-    line(format!("(allow file-read* {})", subpath(&home)?));
 
     line(
         "\n;; ---- Network: only the sandbox's proxy, and Unix sockets in its home (ADR 0007)"
@@ -114,13 +131,16 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
             subpath(&home)?
         ));
     }
-    let data = real_path(&ctx.data);
+    let mut hidden = Vec::new();
+    for file in &ctx.hidden_files {
+        hidden.push(prefix_regex(&real_path(file))?);
+    }
+    for dir in &ctx.hidden_dirs {
+        hidden.push(subpath(&real_path(dir))?);
+    }
     line(format!(
-        "(deny file-read* (with message \"{tag}\")\n  {}\n  {}\n  {}\n  {})",
-        prefix_regex(&data.join("state."))?,
-        prefix_regex(&data.join("audit.jsonl"))?,
-        literal(&real_path(&ctx.config_file))?,
-        subpath(&data.join("run"))?,
+        "(deny file-read* (with message \"{tag}\")\n  {})",
+        hidden.join("\n  ")
     ));
     // Other sandboxes' folders, not the folder holding them: walking up from
     // the home (`mkdir -p`) must still see that it exists.
@@ -166,8 +186,8 @@ fn literal(path: &Path) -> Result<String, CompileError> {
     Ok(format!("(literal {})", quoted(path)?))
 }
 
-/// Every path that starts with `path`, as a regex: `state.` covers state.db,
-/// its journal and the lock; `audit.jsonl` covers its moved-aside files.
+/// Every path that starts with `path`, as a regex: `state.db` covers its
+/// journal; `audit.jsonl` covers its moved-aside files.
 fn prefix_regex(path: &Path) -> Result<String, CompileError> {
     quoted(path)?;
     let text = path.to_str().unwrap_or_default();
@@ -184,20 +204,11 @@ fn prefix_regex(path: &Path) -> Result<String, CompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
 
     fn ctx(base: &Path) -> SandboxContext {
-        let data = base.join("alice/.enclos");
-        SandboxContext {
-            name: "home".parse().unwrap(),
-            dir: data.join("sandboxes/home"),
-            home: data.join("sandboxes/home/home"),
-            user_home: base.join("alice"),
-            protected: vec![data.clone()],
-            sandboxes: data.join("sandboxes"),
-            data: data.clone(),
-            config_file: data.join("config.toml"),
-            proxy_port: 41001,
-        }
+        let layout = Layout::at(base.join("alice/.enclos"));
+        SandboxContext::new(&layout, &"home".parse().unwrap(), 41001)
     }
 
     fn policy() -> Policy {
@@ -224,13 +235,50 @@ mod tests {
         // The protected paths come after every allow, so nothing overrides them.
         let protected = at(";; ---- enclos's own files");
         assert!(text.rfind("(allow ").unwrap() < protected);
+        for hidden in [
+            "state\\.db",
+            "state\\.lock",
+            "audit\\.jsonl",
+            "config\\.toml",
+        ] {
+            assert!(
+                text[protected..].contains(&format!(
+                    "(regex #\"^/nonexistent-enclos-test/alice/\\.enclos/{hidden}\")"
+                )),
+                "{hidden}: {text}"
+            );
+        }
         assert!(
-            text.contains("(regex #\"^/nonexistent-enclos-test/alice/\\.enclos/state\\.\")"),
-            "{text}"
+            text[protected..].contains("(subpath \"/nonexistent-enclos-test/alice/.enclos/run\")")
         );
         assert!(text.contains(
             "(require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home\"))"
         ));
+    }
+
+    #[test]
+    fn hidden_paths_come_after_every_grant_and_spare_the_home() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.fs.read_deny.push("{home}/private".into());
+        p.fs.read_deny.push("~".into());
+        let text = compile(&p, &ctx(base)).unwrap().text;
+        let hidden = text
+            .find("(deny file-read* file-write*")
+            .unwrap_or_else(|| panic!("no hidden paths:\n{text}"));
+        // Later rules win: no allow for files may follow the hidden paths.
+        let last_allow = ["(allow file-write*", "(allow file-read*"]
+            .iter()
+            .filter_map(|a| text.rfind(a))
+            .max()
+            .unwrap();
+        assert!(last_allow < hidden, "{text}");
+        assert!(text[hidden..].contains(
+            "(subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home/private\")"
+        ));
+        assert!(text[hidden..].contains(
+            "(require-all (subpath \"/nonexistent-enclos-test/alice\") (require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))"
+        ), "{text}");
     }
 
     #[test]

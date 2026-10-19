@@ -41,17 +41,7 @@ impl Engine {
 
     /// What the backend needs to know about the sandbox.
     pub(crate) fn sandbox_context(&self, name: &SandboxName, proxy_port: u16) -> SandboxContext {
-        SandboxContext {
-            name: name.clone(),
-            dir: self.layout.sandbox_dir(name.as_str()),
-            home: self.layout.sandbox_home(name.as_str()),
-            user_home: self.layout.user_home().to_owned(),
-            protected: self.layout.protected(),
-            sandboxes: self.layout.data().join("sandboxes"),
-            data: self.layout.data().to_owned(),
-            config_file: self.layout.config_file(),
-            proxy_port,
-        }
+        SandboxContext::new(&self.layout, name, proxy_port)
     }
 
     /// Compiles the sandbox's active policy for its backend, with the proxy

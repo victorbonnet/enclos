@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
 
@@ -55,12 +56,30 @@ pub struct SandboxContext {
     pub protected: Vec<PathBuf>,
     /// The folder holding every sandbox's folder.
     pub sandboxes: PathBuf,
-    /// The enclos data folder, where state.db and audit.jsonl live.
-    pub data: PathBuf,
-    /// `config.toml`.
-    pub config_file: PathBuf,
+    /// Files the sandbox may not read, each with every file whose name
+    /// starts with it.
+    pub hidden_files: Vec<PathBuf>,
+    /// Folders the sandbox may not read.
+    pub hidden_dirs: Vec<PathBuf>,
     /// The sandbox's proxy port on localhost: its only way out.
     pub proxy_port: u16,
+}
+
+impl SandboxContext {
+    /// The sandbox `name` in `layout`, the one source of its paths.
+    pub fn new(layout: &Layout, name: &SandboxName, proxy_port: u16) -> SandboxContext {
+        SandboxContext {
+            name: name.clone(),
+            dir: layout.sandbox_dir(name.as_str()),
+            home: layout.sandbox_home(name.as_str()),
+            user_home: layout.user_home().to_owned(),
+            protected: layout.protected(),
+            sandboxes: layout.sandboxes_dir(),
+            hidden_files: layout.hidden_files(),
+            hidden_dirs: layout.hidden_dirs(),
+            proxy_port,
+        }
+    }
 }
 
 /// A policy compiled for one backend, as the backend reads it.
