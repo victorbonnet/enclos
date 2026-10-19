@@ -585,7 +585,7 @@ mod runtime {
         assert_eq!(check.untracked, ["scout".parse::<AgentName>().unwrap()]);
         assert_eq!(check.unnamed, ["my_bot"]);
         let err = engine
-            .connect(&alice(), &name, Some("scout"), Vec::new())
+            .remove_agent(&alice(), &name, &"scout".parse().unwrap())
             .unwrap_err();
         assert!(
             err.to_string()
@@ -598,14 +598,12 @@ mod runtime {
             .add_agent(&alice(), &name, "scout".parse().unwrap())
             .unwrap();
         assert!(added.adopted);
-        let base = engine.show_sandbox(&name).unwrap().record.port_base;
-        assert_eq!(added.record.port, base + 1);
         assert!(engine.check_agents(&name).unwrap().untracked.is_empty());
         let entries = engine.audit(None).unwrap();
         let last = entries.last().unwrap();
         assert_eq!(last.intent.command, "agent add");
         let message = &last.finished.as_ref().unwrap().outcome.message;
-        assert_eq!(message, &format!("port {}, adopted", base + 1));
+        assert_eq!(message, "adopted");
     }
 
     #[test]
@@ -625,7 +623,6 @@ mod runtime {
     fn the_check_compares_names_both_ways() {
         let tracked = |n: &str| AgentRecord {
             name: n.parse().unwrap(),
-            port: 41001,
             created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         };
         let found = ["main", "scout", "a"].map(String::from).to_vec();
