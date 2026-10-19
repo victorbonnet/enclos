@@ -224,10 +224,14 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
     ));
 
     if i.host_services {
+        // `open <folder>` asks LaunchServices to open it, and reports the
+        // refusal. Not `open -R`: inside the sandbox it exits 0 although Finder
+        // reveals nothing (shown in CI on macOS 14, 15 and 26 by checking
+        // Finder's front window from outside), so its exit code says nothing.
         list.push(probe(
             "launchservices",
-            "open a folder in Finder",
-            "/usr/bin/open -g -R /System",
+            "open a folder through LaunchServices",
+            "/usr/bin/open -g /System",
             Expect::Fails,
         ));
         list.push(probe(
