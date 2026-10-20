@@ -5,7 +5,6 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
-use std::ffi::OsString;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -162,10 +161,16 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
-    fn delete_agent(&self, name: &AgentName) -> Option<Vec<OsString>> {
+    fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
         // Hermes's own delete: the profile folder, its wrapper, and its
         // records, which a plain `rm` would leave behind.
-        Some(args(&[HERMES, "profile", "delete", name.as_str(), "--yes"]))
+        Some(SandboxCommand::from_words(&[
+            HERMES,
+            "profile",
+            "delete",
+            name.as_str(),
+            "--yes",
+        ]))
     }
 
     fn disk_parts(&self) -> Vec<(DiskPart, PathBuf)> {
@@ -513,7 +518,9 @@ mod tests {
         assert_eq!(Hermes.agent_files(&main), "~/.hermes/profiles/main");
         assert_eq!(
             Hermes.delete_agent(&main),
-            Some(args(&["hermes", "profile", "delete", "main", "--yes"]))
+            Some(SandboxCommand::from_words(&[
+                "hermes", "profile", "delete", "main", "--yes"
+            ]))
         );
         let default: AgentName = "default".parse().unwrap();
         assert_eq!(Hermes.builtin_agent(), Some("default"));

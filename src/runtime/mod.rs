@@ -160,7 +160,7 @@ pub trait RuntimeAdapter {
     }
     /// The runtime's own command that deletes an agent and its data, run in
     /// the sandbox by `enclos agent rm`. `None`: the files stay.
-    fn delete_agent(&self, _name: &AgentName) -> Option<Vec<OsString>> {
+    fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
 

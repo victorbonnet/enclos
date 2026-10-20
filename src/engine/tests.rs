@@ -1187,23 +1187,25 @@ echo \"installed $*\" > \"$HOME/installed\"
         // Removing keeps the files and says where they are.
         let Planned::DryRun(plan) = lab
             .engine
-            .remove_agent(&alice(), &lab.name, &main, Confirm::DryRun)
+            .remove_agent(&alice(), &lab.name, &main, false, Confirm::DryRun)
             .unwrap()
         else {
             panic!("a dry run removed");
         };
         assert!(plan.changes[0].contains("its files stay"), "{plan:?}");
         assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        // The stub made no profile folder: nothing for Hermes to delete.
         let removed = done(
             lab.engine
-                .remove_agent(&alice(), &lab.name, &main, Confirm::Yes)
+                .remove_agent(&alice(), &lab.name, &main, false, Confirm::Yes)
                 .unwrap(),
         );
         assert_eq!(removed.files, "~/.hermes/profiles/main");
+        assert!(!removed.deleted);
         assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
         let err = lab
             .engine
-            .remove_agent(&alice(), &lab.name, &main, Confirm::Yes)
+            .remove_agent(&alice(), &lab.name, &main, false, Confirm::Yes)
             .unwrap_err();
         assert!(err.to_string().contains("has no agent `main`"), "{err}");
     }
@@ -2138,7 +2140,6 @@ mod services {
 }
 
 mod status {
-    use std::ffi::OsString;
     use std::path::Path;
 
     use super::policy::with_sandbox_on;
@@ -2146,7 +2147,7 @@ mod status {
     use crate::engine::status::suggest;
     use crate::model::agent::AgentName;
     use crate::model::runtime::RuntimeKind;
-    use crate::runtime::{HomeFile, Installer, RuntimeAdapter};
+    use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand};
 
     /// A runtime adapter that implements none of the `status` methods.
     struct Bare;
@@ -2163,9 +2164,9 @@ mod status {
         }
         fn installer(&self) -> Installer {
             Installer {
-                url: "",
-                sha256: "",
-                args: &[],
+                url: String::new(),
+                sha256: String::new(),
+                args: Vec::new(),
             }
         }
         fn home_files(&self) -> Vec<HomeFile> {
@@ -2174,13 +2175,16 @@ mod status {
         fn login(&self) -> String {
             String::new()
         }
-        fn create_agent(&self, _: &AgentName) -> Vec<OsString> {
-            Vec::new()
+        fn create_agent(&self, _: &AgentName) -> SandboxCommand {
+            SandboxCommand::from_words(&[])
+        }
+        fn agent_files(&self, _: &AgentName) -> String {
+            String::new()
         }
         fn talk(&self, _: &AgentName) -> String {
             String::new()
         }
-        fn service(&self) -> Option<Vec<OsString>> {
+        fn service(&self) -> Option<SandboxCommand> {
             None
         }
         fn agents_in(&self, _: &Path) -> Option<Vec<String>> {
@@ -2302,7 +2306,7 @@ mod status {
         // enclos neither adds nor removes the built-in agent.
         let default: AgentName = "default".parse().unwrap();
         let err = engine
-            .add_agent(&alice(), &name, default.clone())
+            .add_agent(&alice(), &name, default.clone(), Confirm::Yes)
             .unwrap_err();
         assert!(err.to_string().contains("built-in agent"), "{err}");
         let err = engine
