@@ -292,3 +292,58 @@ fn appends_continue_the_chain_across_long_lines() {
     assert!(log.verify().unwrap().intact());
     assert_eq!(log.entries(&AuditFilter::default()).unwrap().len(), 2);
 }
+
+/// Recovers a torn line with `existing` already in the folder, as a crash
+/// during an earlier recovery leaves them, and checks that every existing
+/// file keeps its bytes, the torn bytes end up in `saved_to`, and the chain
+/// verifies.
+fn recover_after_crash(existing: &[(&str, &[u8])], saved_to: &str) {
+    let (dir, log) = log();
+    run(&log, 1);
+    tear(&log, TORN);
+    for (name, bytes) in existing {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    run(&log, 1);
+
+    for (name, bytes) in existing {
+        assert_eq!(
+            &std::fs::read(dir.path().join(name)).unwrap(),
+            bytes,
+            "{name}"
+        );
+    }
+    assert_eq!(std::fs::read(dir.path().join(saved_to)).unwrap(), TORN);
+    let report = log.verify().unwrap();
+    assert!(report.intact(), "{:?}", report.broken);
+    assert_eq!(report.torn_tail, None);
+    assert_eq!((report.lines, report.entries), (5, 2));
+    let recovery = &report.recoveries[0];
+    assert_eq!(recovery.line, 3);
+    assert_eq!(recovery.saved_to, saved_to);
+    assert!(lines(&log)[2].contains(&record::sha256_hex(TORN)));
+}
+
+const TORN: &[u8] = b"{\"schema_version\":1,\"seq\":3";
+
+#[test]
+fn recovery_reuses_a_copy_saved_before_a_crash() {
+    recover_after_crash(&[("audit.jsonl.torn-3", TORN)], "audit.jsonl.torn-3");
+}
+
+#[test]
+fn recovery_keeps_a_copy_cut_short_by_a_crash() {
+    let partial = &TORN[..TORN.len() - 5];
+    recover_after_crash(&[("audit.jsonl.torn-3", partial)], "audit.jsonl.torn-3.1");
+}
+
+#[test]
+fn recovery_keeps_files_holding_other_bytes() {
+    recover_after_crash(
+        &[
+            ("audit.jsonl.torn-3", b"something else"),
+            ("audit.jsonl.torn-3.1", b""),
+        ],
+        "audit.jsonl.torn-3.2",
+    );
+}

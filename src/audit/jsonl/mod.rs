@@ -9,7 +9,7 @@ mod verify;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use record::{Body, GENESIS, Record, SCHEMA_VERSION, decode, encode, sha256_hex};
 use verify::{Entries, split_lines};
@@ -92,11 +92,12 @@ impl JsonlAuditLog {
     }
 
     /// If a crash left an incomplete last line, moves it to
-    /// `audit.jsonl.torn-<seq>` and records that in the log. Only that damage
+    /// `audit.jsonl.torn-<line>` and records that in the log. Only that damage
     /// is recovered, and this checks only the line just before it, so call it
     /// only after [`Self::check_chain`] has refused any other damage. Called
     /// under the state lock, so the incomplete line cannot be a write still
-    /// in progress.
+    /// in progress. A crash before the line is cut off leaves it in place, so
+    /// the next write runs the recovery again; see [`Self::save_torn`].
     fn recover_torn_tail(&self) -> Result<()> {
         let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
             Ok(file) => file,
@@ -112,18 +113,8 @@ impl JsonlAuditLog {
         }
         let keep = end - last.len() as u64;
         let (seq, _) = self.tail_before(&mut file, keep)?;
-        let saved_to = format!("{}.torn-{}", self.file_name(), seq + 1);
-        let saved_path = self.path.with_file_name(&saved_to);
-        let mut saved = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&saved_path)
-            .map_err(|e| self.io_err(e))?;
-        saved
-            .write_all(&last)
-            .and_then(|()| saved.sync_all())
-            .and_then(|()| file.set_len(keep))
+        let saved_to = self.save_torn(seq + 1, &last)?;
+        file.set_len(keep)
             .and_then(|()| file.sync_all())
             .map_err(|e| self.io_err(e))?;
         self.write_record(Body::Recovered {
@@ -132,6 +123,48 @@ impl JsonlAuditLog {
             saved_to,
         })?;
         Ok(())
+    }
+
+    /// Saves the incomplete line `torn`, which would have been line `line`,
+    /// next to the log, and returns the file's name: `audit.jsonl.torn-<line>`,
+    /// or `audit.jsonl.torn-<line>.<n>` with the first free `n` if that name is
+    /// taken. A crash during an earlier recovery can leave that file behind:
+    /// if it holds exactly `torn`, it is reused; if it holds anything else,
+    /// such as part of `torn` cut short by the crash, it is left as it is.
+    fn save_torn(&self, line: u64, torn: &[u8]) -> Result<String> {
+        let first = format!("{}.torn-{line}", self.file_name());
+        for n in 0u64.. {
+            let name = match n {
+                0 => first.clone(),
+                n => format!("{first}.{n}"),
+            };
+            let path = self.path.with_file_name(&name);
+            let io_err = |source| AuditError::Io {
+                path: path.clone(),
+                source,
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut saved) => {
+                    saved
+                        .write_all(torn)
+                        .and_then(|()| saved.sync_all())
+                        .map_err(io_err)?;
+                    return Ok(name);
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    if holds_exactly(&path, torn).map_err(io_err)? {
+                        return Ok(name);
+                    }
+                }
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        unreachable!("every name from audit.jsonl.torn-<line>.1 up is taken")
     }
 
     fn file_name(&self) -> String {
@@ -189,6 +222,24 @@ impl JsonlAuditLog {
             .map_err(|e| self.io_err(e))?;
         Ok(record.seq)
     }
+}
+
+/// Whether `path` is a regular file holding exactly `bytes`, flushed to disk
+/// before saying so, since a crash may have come before the flush. A
+/// symlink or a folder never matches.
+fn holds_exactly(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    let mut content = Vec::with_capacity(bytes.len());
+    file.read_to_end(&mut content)?;
+    if content != bytes {
+        return Ok(false);
+    }
+    file.sync_all()?;
+    Ok(true)
 }
 
 /// Reads the last line of `file` that ends at or before byte `end`, with its
