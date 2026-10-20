@@ -1,0 +1,6 @@
+;; Login items and background items (ServiceManagement / BTM).
+(deny mach-lookup (with message (param "SANDBOX_TAG"))
+  (global-name "com.apple.backgroundtaskmanagementagent")
+  (global-name "com.apple.backgroundtaskmanagement.agent")
+  (global-name "com.apple.xpc.loginitemregisterd")
+  (global-name "com.apple.xpc.smd"))

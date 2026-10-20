@@ -1,0 +1,6 @@
+;; launchd: submitting or bootstrapping jobs (launchctl submit, bootstrap, load).
+;; These go to launchd through the bootstrap port, not a named service; launchd
+;; asks the caller's sandbox about `job-creation`. Shown: `(allow default)` alone
+;; already refuses all three; an explicit `(allow job-creation)` opens them.
+;; The explicit deny keeps the route closed whatever else the policy allows.
+(deny job-creation (with message (param "SANDBOX_TAG")))

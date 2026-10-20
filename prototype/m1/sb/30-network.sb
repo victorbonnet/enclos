@@ -1,0 +1,5 @@
+;; Network: outbound only to the proxy port on localhost. `network*` covers
+;; Unix-domain sockets too, so this also closes the SSH agent, the Docker
+;; socket and /var/run/mDNSResponder.
+(deny network* (with message (param "SANDBOX_TAG")))
+(allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT"))))

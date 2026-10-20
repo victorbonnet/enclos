@@ -33,3 +33,4 @@ rustc-ice-*.txt
 
 # Git worktrees that Claude Code agents work in
 .claude/worktrees/
+__pycache__/

@@ -1,0 +1,5 @@
+;; LaunchServices: `open`, opening apps, documents and URLs.
+;; Shown: `lsopen` alone makes `open -g <url>` fail with -54; denying the
+;; mach-lookup of com.apple.CoreServices.coreservicesd and
+;; com.apple.coreservices.launchservicesd alone did not stop it.
+(deny lsopen (with message (param "SANDBOX_TAG")))

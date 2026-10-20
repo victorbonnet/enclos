@@ -1,0 +1,9 @@
+;; Writes only to the sandbox home and the device files a runtime needs.
+;; `at` and `crontab` are closed regardless: shown that any Seatbelt policy,
+;; even plain (allow default), refuses to exec setuid binaries (EPERM).
+(deny file-write* (with message (param "SANDBOX_TAG")))
+(allow file-write*
+  (subpath (param "SANDBOX_HOME"))
+  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom")
+  (literal "/dev/tty") (literal "/dev/ptmx") (literal "/dev/dtracehelper")
+  (regex #"^/dev/ttys[0-9]+$") (regex #"^/dev/fd/[0-9]+$"))
