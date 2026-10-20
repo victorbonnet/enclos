@@ -47,7 +47,7 @@ impl ServiceLabel {
 
 impl fmt::Display for ServiceLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 

@@ -68,7 +68,7 @@ impl NetMode {
 
 impl fmt::Display for NetMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -129,7 +129,7 @@ impl From<TemplateName> for String {
 
 impl fmt::Display for TemplateName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -146,7 +146,7 @@ impl SnapshotId {
 
 impl fmt::Display for SnapshotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 

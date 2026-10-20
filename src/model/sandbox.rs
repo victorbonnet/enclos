@@ -58,7 +58,7 @@ impl FromStr for SandboxName {
 
 impl fmt::Display for SandboxName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -107,7 +107,7 @@ impl FromStr for BackendKind {
 
 impl fmt::Display for BackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -173,5 +173,12 @@ mod tests {
             assert_eq!(kind.as_str().parse::<BackendKind>(), Ok(kind));
         }
         assert!("docker".parse::<BackendKind>().is_err());
+    }
+
+    #[test]
+    fn names_and_backends_honor_a_table_width() {
+        let name: SandboxName = "home".parse().unwrap();
+        assert_eq!(format!("{name:<6}|"), "home  |");
+        assert_eq!(format!("{:<10}|", BackendKind::Seatbelt), "seatbelt  |");
     }
 }

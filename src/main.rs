@@ -33,7 +33,7 @@ enum Command {
     Init,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),
-    /// Create, list, show, stop or remove sandboxes.
+    /// Create, list, show, start, stop, restart or remove sandboxes.
     Sandbox(cli::sandbox::SandboxArgs),
     /// Open a shell, or run a command, inside a sandbox.
     Connect(cli::connect::ConnectArgs),
@@ -41,7 +41,7 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
-    /// Show or change a sandbox's policy.
+    /// Show, change or test a sandbox's policy.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
     Net(cli::net::NetArgs),
@@ -268,4 +268,42 @@ fn print_verify(report: &VerifyReport) -> u8 {
         );
     }
     exit::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    /// The words a command group's one-line description uses for a verb
+    /// whose name it does not spell out.
+    fn said_as(verb: &str) -> &str {
+        match verb {
+            "rm" => "remove",
+            "allow" => "change",
+            "log" => "network log",
+            "denied" => "refused",
+            verb => verb,
+        }
+    }
+
+    #[test]
+    fn each_command_group_description_names_every_verb() {
+        let cli = Cli::command();
+        for group in cli.get_subcommands().filter(|c| !c.is_hide_set()) {
+            let about = group
+                .get_about()
+                .map(|a| a.to_string().to_lowercase())
+                .unwrap_or_default();
+            for verb in group.get_subcommands().filter(|c| !c.is_hide_set()) {
+                let word = said_as(verb.get_name());
+                assert!(
+                    about.contains(word),
+                    "`{}`: {about:?} does not say {word:?}",
+                    group.get_name()
+                );
+            }
+        }
+    }
 }

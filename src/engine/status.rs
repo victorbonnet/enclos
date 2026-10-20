@@ -65,12 +65,25 @@ pub struct StatusView {
 
 impl StatusView {
     /// The agents in every sandbox: tracked, or built into their runtime.
+    /// [`StatusView::untracked_count`] counts the others.
     pub fn agent_count(&self) -> usize {
+        self.agents()
+            .filter(|a| matches!(a.kind, AgentKind::Builtin | AgentKind::Tracked { .. }))
+            .count()
+    }
+
+    /// The agents the runtimes have and enclos does not track: untracked
+    /// agents, and those under a name enclos cannot track.
+    pub fn untracked_count(&self) -> usize {
+        self.agents()
+            .filter(|a| matches!(a.kind, AgentKind::Untracked | AgentKind::Untrackable))
+            .count()
+    }
+
+    fn agents(&self) -> impl Iterator<Item = &AgentStatus> {
         self.sandboxes
             .iter()
             .flat_map(|s| s.agents.iter().flat_map(|l| &l.agents))
-            .filter(|a| matches!(a.kind, AgentKind::Builtin | AgentKind::Tracked { .. }))
-            .count()
     }
 }
 

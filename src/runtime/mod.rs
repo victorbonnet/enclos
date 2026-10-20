@@ -156,7 +156,7 @@ impl BuiltinAgent {
 
 impl fmt::Display for BuiltinAgent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.pad(self.0)
     }
 }
 
@@ -266,7 +266,7 @@ impl From<&AgentName> for RuntimeAgentName {
 
 impl fmt::Display for RuntimeAgentName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -355,7 +355,7 @@ impl ServiceName {
 
 impl fmt::Display for ServiceName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0)
+        f.pad(self.0)
     }
 }
 

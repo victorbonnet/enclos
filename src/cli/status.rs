@@ -46,14 +46,20 @@ fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
         1 => format!("1 {one}"),
         n => format!("{n} {many}"),
     };
+    // The table also lists the agents enclos does not track; the count
+    // says how many of those there are, so the two agree.
+    let mut agents = count(view.agent_count(), "agent", "agents");
+    match view.untracked_count() {
+        0 => {}
+        n => agents.push_str(&format!(" ({n} more not tracked)")),
+    }
     println!(
-        "{}, {}, {} in {}",
+        "{}, {agents}, {} in {}",
         count(
             view.sandboxes.len() + view.unlisted.len(),
             "sandbox",
             "sandboxes"
         ),
-        count(view.agent_count(), "agent", "agents"),
         size(view.bytes, view.complete),
         tilde(&view.data, user_home)
     );

@@ -3846,7 +3846,7 @@ mod status {
                 "enclos connect home -- hermes -p default setup"
             ]
         );
-        assert_eq!(view.agent_count(), 1);
+        assert_eq!((view.agent_count(), view.untracked_count()), (1, 1));
         assert_eq!(engine.status(Some(&name)).unwrap().sandboxes.len(), 1);
         let err = engine.status(Some(&"nope".parse().unwrap())).unwrap_err();
         assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
