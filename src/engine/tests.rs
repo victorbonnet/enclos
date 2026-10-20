@@ -3394,6 +3394,27 @@ mod status {
     }
 
     #[test]
+    fn a_refusal_because_the_policy_was_unreadable_is_not_a_destination_to_review() {
+        use crate::model::net::Reason;
+        let (_dir, engine, name) = with_runtime();
+        let record = engine.state.get(&name).unwrap().unwrap();
+        let now = record.created_at.checked_add(days(1)).unwrap();
+        let mut event = net_event(&name, now, true);
+        event.reason = Some(Reason::PolicyUnreadable);
+        engine.state.record(&event).unwrap();
+        // `net denied` still lists it, with its reason.
+        let denied = engine.net_denied(&name).unwrap();
+        assert_eq!(denied[0].reason, Reason::PolicyUnreadable);
+        let status = engine.sandbox_status(record, Some(&Bare), now).unwrap();
+        assert_eq!(status.refused_recently, 0);
+        let s = suggest(std::slice::from_ref(&status), now);
+        assert!(
+            !commands(&s).contains(&"enclos net denied home".into()),
+            "{s:?}"
+        );
+    }
+
+    #[test]
     fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
         let (_dir, engine, name) = with_runtime();
         let record = engine.state.get(&name).unwrap().unwrap();

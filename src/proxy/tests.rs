@@ -20,6 +20,15 @@ impl PolicySource for FixedPolicy {
     }
 }
 
+/// A state database the proxy cannot read.
+struct UnreadablePolicy;
+
+impl PolicySource for UnreadablePolicy {
+    fn policy(&self) -> Result<Policy, String> {
+        Err("database is locked".into())
+    }
+}
+
 /// Every name resolves to the address it was given.
 struct FakeResolver(IpAddr);
 
@@ -207,6 +216,31 @@ fn an_unlisted_destination_is_denied_at_once_and_logged() {
         (Verdict::Denied, Some(Reason::NotAllowed))
     );
     assert_eq!(events[0].host, "evil.example.com");
+}
+
+#[test]
+fn an_unreadable_policy_denies_even_an_allowed_destination_and_is_nothing_to_allow() {
+    let (port, _received) = upstream(b"");
+    let proxy = start_with(
+        &[format!("allowed.example.com:{port}")],
+        Box::new(FakeResolver(LOCAL)),
+        loopback_is_global,
+        |p| p.policy = Box::new(UnreadablePolicy),
+    );
+    let mut conn = TcpStream::connect(proxy.addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(conn, "CONNECT allowed.example.com:{port} HTTP/1.1\r\n\r\n").unwrap();
+    let mut reply = String::new();
+    let _ = conn.read_to_string(&mut reply);
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    assert!(!reply.contains("policy allow"), "{reply}");
+    assert!(reply.contains("enclos logs home"), "{reply}");
+    let events = proxy.log.wait_for(1);
+    assert_eq!(
+        (events[0].verdict, events[0].reason),
+        (Verdict::Denied, Some(Reason::PolicyUnreadable))
+    );
+    assert_eq!(events[0].address, None);
 }
 
 #[test]

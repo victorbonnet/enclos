@@ -31,6 +31,9 @@ pub enum Reason {
     ConnectFailed,
     /// The client did not send a request the proxy understands.
     BadRequest,
+    /// The proxy could not read the sandbox's active policy, so it refused
+    /// the connection whatever its destination: nothing to allow.
+    PolicyUnreadable,
     /// Allowed, then closed by the proxy: no byte moved either way, or a
     /// peer read nothing, for the idle limit (design §6).
     Idle,
@@ -45,17 +48,19 @@ impl Reason {
             Reason::ResolveFailed => "resolve-failed",
             Reason::ConnectFailed => "connect-failed",
             Reason::BadRequest => "bad-request",
+            Reason::PolicyUnreadable => "policy-unreadable",
             Reason::Idle => "idle",
         }
     }
 
-    const ALL: [Reason; 7] = [
+    const ALL: [Reason; 8] = [
         Reason::NotAllowed,
         Reason::BlockedAddress,
         Reason::PrivateAddress,
         Reason::ResolveFailed,
         Reason::ConnectFailed,
         Reason::BadRequest,
+        Reason::PolicyUnreadable,
         Reason::Idle,
     ];
 }

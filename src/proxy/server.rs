@@ -1,6 +1,8 @@
 //! Serving connections: one thread per client connection, two while a
 //! tunnel relays bytes, and one for each name lookup. Every connection the
 //! proxy decides on gets one network log record, written at the decision.
+//! If that write fails, the proxy says so on its standard error and serves
+//! the connection anyway (ADR 0027 proposes refusing it instead).
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -151,7 +153,7 @@ impl Proxy {
 
         let policy = self.policy.policy().map_err(|e| {
             eprintln!("enclos proxy: cannot read the active policy, denying: {e}");
-            Reason::NotAllowed
+            Reason::PolicyUnreadable
         })?;
         if !allowed(&policy, &dest) {
             return Err(Reason::NotAllowed);
@@ -571,6 +573,13 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
         (_, Reason::BadRequest) => (
             "400 Bad Request",
             "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL.\n".to_owned(),
+        ),
+        (_, Reason::PolicyUnreadable) => (
+            "403 Forbidden",
+            format!(
+                "enclos: the proxy cannot read this sandbox's policy, so it refuses every destination for now, {dest} included. There is nothing to allow: see why from the host with `enclos logs {}`.\n",
+                event.sandbox
+            ),
         ),
         _ => (
             "403 Forbidden",

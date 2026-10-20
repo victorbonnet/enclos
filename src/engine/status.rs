@@ -24,6 +24,7 @@ use super::sandbox::needs_restart;
 use crate::error::{Error, Result};
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
+use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -127,7 +128,8 @@ pub struct SandboxStatus {
     /// The latest of: its creation, a `connect` or service session starting
     /// or ending, and a connection tried. The proxy alone does not count.
     pub last_used: Timestamp,
-    /// Destinations refused in the last 7 days.
+    /// Destinations refused in the last 7 days, leaving out refusals
+    /// because the proxy could not read the policy.
     pub refused_recently: usize,
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
@@ -488,7 +490,9 @@ impl Engine {
             .state
             .denied(&name)?
             .iter()
-            .filter(|d| d.last >= since)
+            // A refusal because the proxy could not read the policy names
+            // no destination to allow.
+            .filter(|d| d.last >= since && d.reason != Reason::PolicyUnreadable)
             .count();
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(

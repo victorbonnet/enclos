@@ -82,25 +82,89 @@ fn verdict(verdict: Verdict, reason: Option<Reason>) -> String {
 }
 
 fn print_denied(sandbox: &SandboxName, denied: &[DeniedDestination]) {
+    print!("{}", denied_text(sandbox, denied));
+}
+
+fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
     if denied.is_empty() {
-        println!("Sandbox {sandbox} has not been refused anything.");
-        return;
+        return format!("Sandbox {sandbox} has not been refused anything.\n");
     }
-    println!("Refused destinations of sandbox {sandbox}, most recent first:");
+    let mut out = format!("Refused destinations of sandbox {sandbox}, most recent first:\n");
     for d in denied {
         let times = if d.count == 1 {
             "once".to_owned()
         } else {
             format!("{} times", d.count)
         };
-        println!(
-            "  {}  {}  {times}, last {}",
+        out += &format!(
+            "  {}  {}  {times}, last {}\n",
             destination(&d.host, d.port),
             d.reason,
             d.last.strftime("%Y-%m-%d %H:%M:%S UTC")
         );
     }
-    println!("Allow what you trust with `enclos policy allow {sandbox} <destination>`.");
+    let unreadable = |d: &DeniedDestination| d.reason == Reason::PolicyUnreadable;
+    if !denied.iter().all(unreadable) {
+        out +=
+            &format!("Allow what you trust with `enclos policy allow {sandbox} <destination>`.\n");
+    }
+    if denied.iter().any(unreadable) {
+        out += &format!(
+            "{}: the proxy could not read the sandbox's policy, so it refused every destination; there is nothing to allow. See why with `enclos logs {sandbox}`.\n",
+            Reason::PolicyUnreadable
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(host: &str, reason: Reason) -> DeniedDestination {
+        let at = "2026-10-20T12:00:00Z".parse().unwrap();
+        DeniedDestination {
+            host: host.into(),
+            port: 443,
+            reason,
+            count: 1,
+            first: at,
+            last: at,
+        }
+    }
+
+    #[test]
+    fn a_refusal_because_the_policy_was_unreadable_is_not_offered_to_allow() {
+        let lab: SandboxName = "lab".parse().unwrap();
+        let text = denied_text(
+            &lab,
+            &[refused("api.example.com", Reason::PolicyUnreadable)],
+        );
+        assert!(
+            text.contains("api.example.com:443  policy-unreadable"),
+            "{text}"
+        );
+        assert!(!text.contains("policy allow"), "{text}");
+        assert!(text.contains("nothing to allow"), "{text}");
+        assert!(text.contains("`enclos logs lab`"), "{text}");
+
+        let both = denied_text(
+            &lab,
+            &[
+                refused("api.example.com", Reason::PolicyUnreadable),
+                refused("evil.example.com", Reason::NotAllowed),
+            ],
+        );
+        assert!(
+            both.contains("enclos policy allow lab <destination>"),
+            "{both}"
+        );
+        assert!(both.contains("nothing to allow"), "{both}");
+
+        let plain = denied_text(&lab, &[refused("evil.example.com", Reason::NotAllowed)]);
+        assert!(plain.contains("enclos policy allow lab"), "{plain}");
+        assert!(!plain.contains("nothing to allow"), "{plain}");
+    }
 }
 
 #[cfg(test)]
