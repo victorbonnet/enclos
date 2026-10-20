@@ -13,7 +13,7 @@ use super::Engine;
 use super::session::SessionEnd;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_members, group_of, is_same, reference};
+use crate::lifecycle::process::{group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -204,8 +204,8 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
-        let (session, mut child, pgid) =
+        let summary = |(session, _): &(SessionRecord, _)| format!("session {}", session.id);
+        let (session, mut child) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
                 let compiled = self.compile_policy(name, record.proxy_port)?;
                 let (version, snapshot) =
@@ -233,7 +233,7 @@ impl Engine {
                 let root = reference(child.id()).ok_or_else(|| Error::Session {
                     what: "the service exited at once".into(),
                 })?;
-                let session = SessionRecord {
+                let mut session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
                     kind: SessionKind::Service,
@@ -242,19 +242,17 @@ impl Engine {
                     compiled: Some(compiled.display().to_string()),
                     pgid: group_of(child.id()).unwrap_or(child.id()),
                     root,
+                    tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,
                 };
-                let id = self.state.put_session(lock, &session)?;
-                Ok((id, child, session.pgid))
+                session.id = self.state.put_session(lock, &session)?;
+                Ok((session, child))
             })?;
-        let status = child.wait().map_err(|e| Error::Session {
-            what: format!("lost the service: {e}"),
-        })?;
+        // As for `connect`: the members the service starts are recorded,
+        // and what it leaves running keeps its session open.
+        let (status, left) = self.wait_session(&session, &mut child)?;
         let exit = status.code().unwrap_or(1);
-        // As for `connect`: what the service left in its group keeps its
-        // session open.
-        let left = group_members(pgid);
         let summary = |_: &()| match left.len() {
             0 => format!("exit {exit}"),
             n => format!("exit {exit}, {n} processes still running"),
@@ -262,19 +260,14 @@ impl Engine {
         self.write(
             by,
             "service end",
-            Some(format!("{name} session {session}")),
+            Some(format!("{name} session {}", session.id)),
             summary,
-            |lock| {
-                if left.is_empty() {
-                    self.state.end_session(lock, session)?;
-                }
-                Ok(())
-            },
+            |lock| self.end_or_track(lock, &session, &left),
         )?;
         Ok(SessionEnd {
-            session,
+            session: session.id,
             exit,
-            left,
+            left: left.into_iter().map(|f| f.member).collect(),
         })
     }
 
@@ -304,6 +297,7 @@ impl Engine {
                         what: "cannot read this process's start time".into(),
                     })?,
                     pgid: group_of(me).unwrap_or(me),
+                    tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,
                 };

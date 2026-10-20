@@ -217,6 +217,12 @@ impl Engine {
                     )
                 })
                 .collect();
+            changes.splice(
+                0..0,
+                self.service_status(name)
+                    .into_iter()
+                    .map(|(label, _)| format!("stop service {label}")),
+            );
             changes.push(format!("mark sandbox {name} stopped"));
             return Ok(Planned::DryRun(Plan {
                 changes,

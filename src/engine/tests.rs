@@ -1295,7 +1295,19 @@ mod services {
         );
         assert_eq!(engine.service_status(&name).len(), 2);
 
-        engine.stop_sandbox(&alice(), &name).unwrap();
+        let Planned::DryRun(plan) = engine
+            .stop_sandbox(&alice(), &name, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run stopped the sandbox");
+        };
+        assert!(
+            plan.changes
+                .contains(&format!("stop service {gateway_label}")),
+            "{plan:?}"
+        );
+        assert_eq!(fake.started.borrow().len(), 2);
+        done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
         assert!(fake.started.borrow().is_empty());
         assert!(fake.stopped.borrow().contains(&gateway_label));
         assert!(fake.stopped.borrow().contains(&proxy_label));
