@@ -1,0 +1,72 @@
+;; ---- Host services (design §5, ADR 0016)
+;; Each rule closes a route by which a sandboxed process could ask a host
+;; service to act for it outside the sandbox. What each was shown to do on
+;; macOS 26 is noted beside it (prototype #5); escape probes (#13) check them.
+
+;; LaunchServices: `open`, opening apps, documents and URLs. Shown: `open -g
+;; <url>` fails with -54 under this rule; denying the coreservicesd lookups
+;; alone did not stop it.
+(deny lsopen (with message "{tag}"))
+
+;; Apple Events (osascript, scripting Terminal or any app). Shown: either rule
+;; alone makes an event to Finder fail with -600.
+(deny appleevent-send (with message "{tag}"))
+(deny mach-lookup (with message "{tag}")
+  (global-name "com.apple.coreservices.appleevents"))
+
+;; launchd job submission (launchctl submit, bootstrap, load) goes through the
+;; bootstrap port; launchd asks the caller's sandbox about `job-creation`.
+;; Shown: refused under (allow default); the explicit deny keeps it closed.
+(deny job-creation (with message "{tag}"))
+
+;; cfprefsd writes ~/Library/Preferences for the caller, which the write rules
+;; never see. Shown: without this rule `defaults write` reached the user's own
+;; preferences although HOME pointed elsewhere. Reads stay allowed.
+(deny user-preference-write (with message "{tag}"))
+
+;; Synthetic keyboard and mouse events and the pasteboard. Shown: the lookups
+;; are refused and `pbpaste` fails. Not shown: that posting an event is
+;; stopped (no probe posts one). hid-control also refuses TIOCSTI (below);
+;; the HID client rule is an extra layer whose effect was not observed.
+(deny hid-control (with message "{tag}"))
+(deny mach-lookup (with message "{tag}")
+  (global-name "com.apple.windowserver.active")
+  (global-name "com.apple.pasteboard.1"))
+(deny iokit-open (with message "{tag}")
+  (iokit-user-client-class "IOHIDParamUserClient"))
+
+;; Login items and background items. Shown: the lookups are refused.
+(deny mach-lookup (with message "{tag}")
+  (global-name "com.apple.backgroundtaskmanagementagent")
+  (global-name "com.apple.backgroundtaskmanagement.agent")
+  (global-name "com.apple.xpc.loginitemregisterd")
+  (global-name "com.apple.xpc.smd"))
+
+;; The Keychain (securityd and secd); the keychain files are also unreadable.
+;; Shown: reading the login keychain's info is refused.
+(deny mach-lookup (with message "{tag}")
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.securityd.general")
+  (global-name "com.apple.secd")
+  (global-name "com.apple.security.agent")
+  (global-name "com.apple.security.authhost"))
+
+;; Name lookups: the network rules close /var/run/mDNSResponder and port 53;
+;; this closes the DNS-SD Mach service too. The proxy resolves names instead.
+(deny mach-lookup (with message "{tag}")
+  (global-name "com.apple.dnssd.service"))
+
+;; Typing into the terminal: TIOCSTI pushes bytes into the input of the
+;; terminal a session runs in, which the user's shell reads and runs after
+;; the session ends. Shown on macOS 26: allowed under (allow default); the
+;; hid-control rule above refuses it, and so does this rule alone, while
+;; termios and window-size calls still work. Two rules, so either may change.
+(deny file-ioctl (with message "{tag}")
+  (ioctl-command TIOCSTI))
+
+;; Signals stay inside the sandbox. Under (allow default) a sandboxed process
+;; may signal every process of the user: shown, Hermes in the sandbox found
+;; the host's own Hermes gateway by PID and could have stopped it.
+(deny signal (with message "{tag}"))
+(allow signal (target same-sandbox))

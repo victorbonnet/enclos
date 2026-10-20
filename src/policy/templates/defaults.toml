@@ -1,0 +1,63 @@
+# Built-in defaults, applied under every template (design §5, ADR 0015).
+# Reads are broad except these sensitive paths; writes go only to the
+# sandbox home. enclos's own files are protected by the compiler on top of
+# this, whatever any layer says (ADR 0010).
+
+[filesystem]
+write = ["{home}"]
+read_deny = [
+    # Credentials and keys
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.azure",
+    "~/.config/gcloud",
+    "~/.kube",
+    "~/.docker",
+    "~/.netrc",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.git-credentials",
+    "~/.config/gh",
+    "~/Library/Keychains",
+    # Shell and REPL history
+    "~/.zsh_history",
+    "~/.zsh_sessions",
+    "~/.bash_history",
+    "~/.bash_sessions",
+    "~/.local/share/fish",
+    "~/.python_history",
+    "~/.node_repl_history",
+    "~/.psql_history",
+    "~/.mysql_history",
+    # Browser data
+    "~/Library/Application Support/Google/Chrome",
+    "~/Library/Application Support/Chromium",
+    "~/Library/Application Support/BraveSoftware",
+    "~/Library/Application Support/Microsoft Edge",
+    "~/Library/Application Support/Arc",
+    "~/Library/Application Support/Firefox",
+    "~/Library/Safari",
+    "~/Library/Cookies",
+    # Mail and messages
+    "~/Library/Mail",
+    "~/Library/Messages",
+    # Password managers
+    "~/Library/Application Support/1Password",
+    "~/Library/Group Containers/2BUA8C4S2C.com.1password",
+    "~/Library/Application Support/Bitwarden",
+    "~/Library/Application Support/Proton Pass",
+    # Launch agents: Hermes finds the real home through the user database, not
+    # $HOME, and read the host's own gateway job here (prototype, issue #5).
+    "~/Library/LaunchAgents",
+    # The host's own agent configuration
+    "~/.claude",
+    "~/.claude.json",
+    "~/.codex",
+    "~/.hermes",
+]
+
+[network]
+allow = []
+private = []
+log = "metadata"

@@ -1,0 +1,11 @@
+# Personal agents, on runtimes such as Hermes (design §7). The sandbox writes only to its
+# own home, where the agent may install skills, packages and tools that then
+# run under this same policy. The runtime adapter adds the endpoints its runtime
+# needs (model provider, login, install sources); add the APIs you trust with
+# `enclos policy allow`.
+
+[filesystem]
+write = ["{home}"]
+
+[network]
+allow = []

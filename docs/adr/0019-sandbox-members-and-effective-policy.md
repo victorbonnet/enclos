@@ -10,7 +10,6 @@ A process keeps the restrictions it was started with. Network rules are enforced
 
 ## Consequences
 
-- On Linux, members are the processes in the sandbox's cgroup. On macOS there is no equivalent without privileged APIs. The milestone 1 prototype showed that a process group misses a child that calls `setsid`, and that a per-sandbox marker checked with `sandbox_check` on another process cannot recognize members. The mechanism is decided by experiments in a disposable macOS VM.
-- Stopping signals only processes enclos has shown to be members. A search that has not been shown to find only members (a refuted marker, a name match) never chooses what to signal.
+- On Linux, members are the processes in the sandbox's cgroup. On macOS there is no equivalent without privileged APIs; the mechanism (process groups set up by `enclos launch`, a per-sandbox marker checked through the sandbox API, a scan by parent chain, or a combination) is decided by the milestone 1 prototype.
 - A process that escapes tracking but stays inside Seatbelt keeps its sandbox restrictions, so a tracking gap is a lifecycle bug (it may keep an older snapshot's rules), not a way out of the sandbox. `enclos state check` looks for such processes.
 - An interactive session cannot be restarted for the user. A restart ends it and tells the user to reconnect.
