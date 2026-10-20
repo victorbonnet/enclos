@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use clap::Args;
 
 use enclos::engine::Engine;
-use enclos::engine::Left;
+use enclos::engine::{Left, SessionEnd};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -28,7 +28,14 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
         }
         Planned::Done(end) => end,
     };
-    let shown = format!("sandbox {}", args.sandbox);
+    report_end(&args.sandbox, &end);
+    Ok(u8::try_from(end.exit).unwrap_or(1))
+}
+
+/// Tells the user what a session's end left behind: notes, the signal that
+/// ended the command, and processes still running.
+pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
+    let shown = format!("sandbox {sandbox}");
     for note in &end.notes {
         eprintln!("enclos: session {} in {shown}: {note}", end.session);
     }
@@ -37,7 +44,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
     }
     let stays_open = format!(
         "Session {} stays open until `enclos sandbox stop {}` finds them gone",
-        end.session, args.sandbox
+        end.session, sandbox
     );
     match &end.left {
         Left::Nothing => {}
@@ -50,7 +57,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
                 "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",
                 left.len(),
                 pids.join(", "),
-                args.sandbox
+                sandbox
             );
         }
         Left::Unknown(why) => {
@@ -59,5 +66,4 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
             );
         }
     }
-    Ok(u8::try_from(end.exit).unwrap_or(1))
 }

@@ -37,6 +37,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         return Ok(exit::OK);
     }
     let end = engine.install_runtime(by, &sandbox, runtime)?;
+    super::connect::report_end(&sandbox, &end);
     if end.exit == 0 {
         println!(
             "{} is installed in sandbox {sandbox}. Log it in and set it up with its own command: `enclos connect {sandbox} -- {}`.",
