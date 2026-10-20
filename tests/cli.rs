@@ -1326,6 +1326,22 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
     assert_eq!(agents[1]["in_runtime"], "gone");
     assert_eq!(agents[2]["kind"], "untracked");
 
+    // A model name the sandbox wrote shows with every character that does
+    // not show as itself escaped, and the rest as it is.
+    std::fs::write(
+        profiles.join("scout/config.yaml"),
+        "model:\n  default: a\u{115F}\u{FE0F}\u{1D173}\u{600}\u{2028}b café 👨\u{200D}👩\u{200D}👧\n",
+    )
+    .unwrap();
+    let out = home.run(&["status", "home", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    let agents = json["sandboxes"][0]["agents"]["agents"].as_array().unwrap();
+    let scout = agents.iter().find(|a| a["name"] == "scout").unwrap();
+    assert_eq!(
+        scout["model"]["known"],
+        "a\\u{115f}\\u{fe0f}\\u{1d173}\\u{600}\\u{2028}b café 👨\u{200D}👩\u{200D}👧"
+    );
+
     // `agent rm` of the agent Hermes no longer has says so.
     let rm = home.run(&["agent", "rm", "home/gone"]);
     assert_eq!(
