@@ -18,8 +18,8 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference, reference_of_child};
-use crate::lifecycle::stop::{GRACE, stop};
+use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::stop::{GRACE, Stopped, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -189,6 +189,18 @@ impl Engine {
             })?;
 
         let waited = self.wait_session(&session, &mut child)?;
+        self.finish_session(by, "session end", &session, waited)
+    }
+
+    /// Records how a session's program ended (design §8 step 6), as
+    /// `audit_name`: the session ends, or stays open while it left members.
+    pub(super) fn finish_session(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        waited: Waited,
+    ) -> Result<SessionEnd> {
         let signal = waited.status.signal();
         let exit = waited
             .status
@@ -205,10 +217,10 @@ impl Engine {
         loop {
             match self.write(
                 by,
-                "session end",
-                Some(format!("{target} session {}", session.id)),
+                audit_name,
+                Some(format!("{} session {}", session.sandbox, session.id)),
                 summary,
-                |lock| self.end_or_track(lock, &session, &waited),
+                |lock| self.end_or_track(lock, session, &waited),
             ) {
                 Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
                 done => break done?,
@@ -314,8 +326,18 @@ impl Engine {
             .into_iter()
             .filter(|s| s.kind == SessionKind::Proxy)
         {
-            stop(&session, GRACE);
-            self.state.end_session(lock, session.id)?;
+            match stop(&session, GRACE)? {
+                Stopped::Clean => self.state.end_session(lock, session.id)?,
+                Stopped::Survivors(left) => {
+                    let pids: Vec<String> = left.iter().map(|s| s.member.pid.to_string()).collect();
+                    return Err(Error::Session {
+                        what: format!(
+                            "the proxy of sandbox {name} did not stop (pid {}); run `enclos sandbox stop {name}`",
+                            pids.join(", ")
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -484,7 +506,7 @@ impl Engine {
 
 /// Ends `child`, which this command started but could not record, so that
 /// it does not run where no `stop` finds it; `error` stays the reason.
-fn abandon(mut child: Child, error: Error, what: &str) -> Error {
+pub(super) fn abandon(mut child: Child, error: Error, what: &str) -> Error {
     match child.kill().and_then(|()| child.wait()) {
         Ok(_) => error,
         Err(e) => Error::CleanupFailed {

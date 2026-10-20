@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use super::Engine;
-use super::session::SessionEnd;
+use super::session::{SessionEnd, abandon};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_of, is_same, reference};
+use crate::lifecycle::process::{group_of, reference, reference_of_child};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -188,12 +188,7 @@ impl Engine {
         // records itself only once it holds the port, so a recorded proxy
         // session whose process still runs is the proof (`proxy run --record`).
         let start = Instant::now();
-        while !self
-            .state
-            .sessions(name, true)?
-            .iter()
-            .any(|s| s.kind == SessionKind::Proxy && is_same(&s.root))
-        {
+        while !self.proxy_runs(name)? {
             if start.elapsed() > PROXY_WAIT {
                 return Err(Error::Session {
                     what: format!(
@@ -230,45 +225,33 @@ impl Engine {
                     .map_err(|e| Error::Session {
                         what: format!("could not start the {kind} service: {e}"),
                     })?;
-                let root = reference(child.id()).ok_or_else(|| Error::Session {
-                    what: "the service exited at once".into(),
-                })?;
-                let mut session = SessionRecord {
-                    id: SessionId(0),
-                    sandbox: name.clone(),
-                    kind: SessionKind::Service,
-                    version: version.version,
-                    snapshot: snapshot.id,
-                    compiled: Some(compiled.display().to_string()),
-                    pgid: group_of(child.id()).unwrap_or(child.id()),
-                    root,
-                    tracked: Vec::new(),
-                    started_at: now(),
-                    ended_at: None,
-                };
-                session.id = self.state.put_session(lock, &session)?;
-                Ok((session, child))
+                let recorded = (|| -> Result<SessionRecord> {
+                    let mut session = SessionRecord {
+                        id: SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Service,
+                        version: version.version,
+                        snapshot: snapshot.id,
+                        compiled: Some(compiled.display().to_string()),
+                        // In a group made for it, which it leads.
+                        pgid: Some(child.id()),
+                        root: reference_of_child(&child)?,
+                        tracked: Vec::new(),
+                        started_at: now(),
+                        ended_at: None,
+                    };
+                    session.id = self.state.put_session(lock, &session)?;
+                    Ok(session)
+                })();
+                match recorded {
+                    Ok(session) => Ok((session, child)),
+                    Err(e) => Err(abandon(child, e, "the service")),
+                }
             })?;
         // As for `connect`: the members the service starts are recorded,
         // and what it leaves running keeps its session open.
-        let (status, left) = self.wait_session(&session, &mut child)?;
-        let exit = status.code().unwrap_or(1);
-        let summary = |_: &()| match left.len() {
-            0 => format!("exit {exit}"),
-            n => format!("exit {exit}, {n} processes still running"),
-        };
-        self.write(
-            by,
-            "service end",
-            Some(format!("{name} session {}", session.id)),
-            summary,
-            |lock| self.end_or_track(lock, &session, &left),
-        )?;
-        Ok(SessionEnd {
-            session: session.id,
-            exit,
-            left: left.into_iter().map(|f| f.member).collect(),
-        })
+        let waited = self.wait_session(&session, &mut child)?;
+        self.finish_session(by, "service end", &session, waited)
     }
 
     /// Records a proxy that a service started, so `connect` knows it runs.
@@ -293,10 +276,12 @@ impl Engine {
                     version: version.version,
                     snapshot: snapshot.id,
                     compiled: None,
-                    root: reference(me).ok_or_else(|| Error::Session {
+                    root: reference(me)?.ok_or_else(|| Error::Session {
                         what: "cannot read this process's start time".into(),
                     })?,
-                    pgid: group_of(me).unwrap_or(me),
+                    // Its group only when it leads it, as under launchd:
+                    // otherwise the group is its caller's.
+                    pgid: (group_of(me)? == Some(me)).then_some(me),
                     tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,
