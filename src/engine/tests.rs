@@ -910,6 +910,9 @@ mod runtime {
         fn services(&self) -> Vec<crate::runtime::RuntimeService> {
             Hermes.services()
         }
+        fn agents_in(&self, home: &Path) -> Option<Vec<String>> {
+            Hermes.agents_in(home)
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1131,7 +1134,8 @@ echo \"installed $*\" > \"$HOME/installed\"
                 .unwrap(),
         );
         assert_eq!(added.agent.name, main);
-        assert_eq!(added.end.exit, 0);
+        assert_eq!(added.end.as_ref().unwrap().exit, 0);
+        assert!(!added.adopted);
         assert_eq!(
             std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
             "profile create main\n"
@@ -1224,6 +1228,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         let end = done(lab.install(INSTALLS, Confirm::Yes).unwrap());
         assert!(end.installed);
         assert!(lab.allows("example.com") && lab.allows("chatgpt.com"));
+    }
 
     /// A sandbox with Hermes recorded as its runtime, and a way to make a
     /// Hermes profile in its home as `hermes profile create` would.
@@ -1260,7 +1265,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(check.untracked, ["scout".parse::<AgentName>().unwrap()]);
         assert_eq!(check.unnamed, ["my_bot"]);
         let err = engine
-            .remove_agent(&alice(), &name, &"scout".parse().unwrap())
+            .remove_agent(&alice(), &name, &"scout".parse().unwrap(), Confirm::Yes)
             .unwrap_err();
         assert!(
             err.to_string()
@@ -1269,10 +1274,17 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
 
         // Adopting runs nothing in the sandbox: the fake backend would fail.
-        let added = engine
-            .add_agent(&alice(), &name, "scout".parse().unwrap())
-            .unwrap();
-        assert!(added.adopted);
+        // The alias Hermes made for it is on the sandbox's PATH, which does
+        // not count as a command the agent would shadow.
+        let bin = engine.sandbox_home(&name).join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("scout"), "#!/bin/sh\n").unwrap();
+        let added = done(
+            engine
+                .add_agent(&alice(), &name, "scout".parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(added.adopted && added.end.is_none());
         assert!(engine.check_agents(&name).unwrap().untracked.is_empty());
         let entries = engine.audit(None).unwrap();
         let last = entries.last().unwrap();
@@ -1285,9 +1297,11 @@ echo \"installed $*\" > \"$HOME/installed\"
     fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
         let (_dir, engine, name, make) = with_hermes();
         make("scout");
-        engine
-            .add_agent(&alice(), &name, "scout".parse().unwrap())
-            .unwrap();
+        done(
+            engine
+                .add_agent(&alice(), &name, "scout".parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        );
         std::fs::remove_dir_all(engine.sandbox_home(&name).join(".hermes/profiles/scout")).unwrap();
         let check = engine.check_agents(&name).unwrap();
         assert_eq!(check.missing, ["scout".parse::<AgentName>().unwrap()]);
