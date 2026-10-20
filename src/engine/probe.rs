@@ -40,6 +40,15 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
+    /// Closed probes whose route Seatbelt itself closes, under any profile:
+    /// they show no rule enclos adds.
+    pub fn closed_by_platform(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Closed && r.closed_by_platform.is_some())
+            .count()
+    }
+
     pub fn open(&self) -> usize {
         self.count(|o| matches!(o, Outcome::Open(_)))
     }
@@ -172,21 +181,26 @@ impl Engine {
         };
         // Every stored policy was validated, so each entry expands; one that
         // does not is an error, never a path silently left out.
-        let read_deny = policy
-            .fs
-            .read_deny
-            .iter()
-            .map(|e| paths.expand(e).map(|p| real_path(&p)))
-            .collect::<std::result::Result<Vec<_>, String>>()
-            .map_err(|reason| Error::Session {
-                what: format!(
-                    "the policy of sandbox {name} has a path enclos cannot expand: {reason}"
-                ),
-            })?;
+        let expand = |entries: &[String]| {
+            entries
+                .iter()
+                .map(|e| paths.expand(e).map(|p| real_path(&p)))
+                .collect::<std::result::Result<Vec<_>, String>>()
+                .map_err(|reason| Error::Session {
+                    what: format!(
+                        "the policy of sandbox {name} has a path enclos cannot expand: {reason}"
+                    ),
+                })
+        };
+        let read_deny = expand(&policy.fs.read_deny)?;
+        let mut writes = expand(&policy.fs.write)?;
+        writes.push(real_path(&ctx.home));
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
+            sandbox_dir: self.layout.sandbox_dir(name.as_str()),
+            writes,
             other_sandboxes: self
                 .state
                 .list()?
@@ -431,6 +445,7 @@ mod tests {
                     route: "r",
                     name: "n".into(),
                     outcome,
+                    closed_by_platform: None,
                 })
                 .collect(),
             host_services: false,
@@ -468,7 +483,9 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: Vec::new(),
+            writes: Vec::new(),
             read_deny: Vec::new(),
             host_sockets: Vec::new(),
             target: Some(target),

@@ -16,6 +16,12 @@
 //! that never ran it (`sandbox-exec` refusing the compiled policy) is not
 //! taken for a refusal.
 //!
+//! A few routes are closed by Seatbelt itself, under any profile: it refuses
+//! to run setuid programs such as `crontab` and `at`, even under a bare
+//! `(allow default)`. Those probes carry a note saying so, which the report
+//! repeats, so that their being closed is not read as proof of a rule enclos
+//! adds.
+//!
 //! The probes of [`probes`] are harmless even when a rule does not hold. The
 //! ones of [`host_service_probes`] could act on the host if they succeeded
 //! (opening a folder in Finder, an Apple Event, a launchd job, a preferences
@@ -25,6 +31,8 @@
 //! check, so they count as closed only with the refusal the rule gives.
 
 use std::path::{Path, PathBuf};
+
+use crate::policy::paths::is_within;
 
 /// How a probe's own result is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +98,16 @@ pub struct Probe {
     pub script: String,
     pub proof: Proof,
     pub host: Option<HostCheck>,
+    /// What closes the route when no rule enclos adds does: Seatbelt itself,
+    /// whatever the profile says.
+    pub closed_by_platform: Option<&'static str>,
 }
+
+/// Seatbelt refuses to run a setuid program under any profile: shown on
+/// macOS 26.5.2 with `sandbox-exec -p '(version 1)(allow default)'`, where
+/// `crontab -l` and `atq` fail with `Operation not permitted`.
+pub const SETUID_REFUSED: &str =
+    "Seatbelt itself refuses to run setuid programs, under any profile; no enclos rule is tested";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -112,6 +129,8 @@ pub struct ProbeResult {
     pub route: &'static str,
     pub name: String,
     pub outcome: Outcome,
+    /// The probe's [`Probe::closed_by_platform`].
+    pub closed_by_platform: Option<&'static str>,
 }
 
 impl ProbeResult {
@@ -120,6 +139,7 @@ impl ProbeResult {
             route: probe.route,
             name: probe.name,
             outcome,
+            closed_by_platform: probe.closed_by_platform,
         }
     }
 }
@@ -128,14 +148,17 @@ impl ProbeResult {
 pub const HOST_SERVICE_ROUTES: &[&str] =
     &["launchservices", "apple events", "launchd", "preferences"];
 
-/// Routes of design §5 that no probe tries yet. `policy test` names them, so
-/// that a test that passed is not read as covering them.
+/// Routes of design §5 and ADR 0016 that no probe tries yet. `policy test`
+/// names them, so that a test that passed is not read as covering them.
 pub const NOT_PROBED: &[&str] = &[
-    "posting synthetic input events",
-    "`at` jobs",
+    "bootstrapping or loading a launchd job",
     "installing a crontab",
+    "submitting an `at` job",
     "registering a login item",
+    "posting synthetic input events",
+    "writing the pasteboard",
     "typing into the terminal (TIOCSTI)",
+    "reading a keychain item",
 ];
 
 /// What the probes are built from.
@@ -145,8 +168,13 @@ pub struct ProbeInputs {
     /// The enclos data folder and `config.toml`.
     pub data: PathBuf,
     pub config_file: PathBuf,
+    /// The sandbox's own folder, which holds its `policy.toml` and
+    /// `compiled/`, and its home.
+    pub sandbox_dir: PathBuf,
     /// Other sandboxes' folders.
     pub other_sandboxes: Vec<PathBuf>,
+    /// The policy's write grants, the sandbox home included, expanded.
+    pub writes: Vec<PathBuf>,
     /// The policy's read deny list, expanded.
     pub read_deny: Vec<PathBuf>,
     /// Unix sockets of host services that exist here (SSH agent, Docker).
@@ -179,6 +207,7 @@ fn probe(
             control: HostScript::new(control),
         },
         host: None,
+        closed_by_platform: None,
     }
 }
 
@@ -213,6 +242,56 @@ fn write_probe(route: &'static str, name: &str, file: PathBuf) -> Probe {
     write
 }
 
+/// A probe that opens an existing `file` for writing and writes nothing, so
+/// that it changes nothing even if the rule does not hold: for files that
+/// matter, such as the sandbox's `policy.toml`. Opening for writing is what
+/// Seatbelt's write rules refuse (`file-write-data`); a read deny alone does
+/// not. Controlled by whether the file is writable on the host. Built only
+/// for a file that exists, as `>>` would create one that does not.
+fn open_for_writing_probe(route: &'static str, name: &str, file: &Path) -> Probe {
+    probe(
+        route,
+        name,
+        format!("true >> {}", sh_quote(file)),
+        Expect::Fails,
+        format!("test -w {}", sh_quote(file)),
+    )
+}
+
+/// A write of `path`, a deny-list entry under one of the policy's write
+/// grants, which the deny list must still refuse (ADR 0015): a new file in
+/// it when it is a folder, the file itself, unchanged, when it is a file.
+fn denied_under_grant_probe(path: &Path, tag: u32) -> Probe {
+    let name = format!("write {}, under a write grant", path.display());
+    match path.is_dir() {
+        true => write_probe(
+            "sensitive files",
+            &name,
+            path.join(format!("enclos-probe-{tag}")),
+        ),
+        false => open_for_writing_probe("sensitive files", &name, path),
+    }
+}
+
+/// A program Seatbelt refuses to run under any profile, setuid: closed by
+/// the platform, which the report says.
+fn setuid_probe(route: &'static str, name: &str, script: &str) -> Probe {
+    let mut setuid = probe(
+        route,
+        name,
+        script,
+        Expect::FailsWith("Operation not permitted"),
+        script,
+    );
+    setuid.closed_by_platform = Some(SETUID_REFUSED);
+    setuid
+}
+
+/// The user's LaunchAgents folder, which launchd loads at login.
+fn launch_agents(i: &ProbeInputs) -> PathBuf {
+    i.user_home.join("Library/LaunchAgents")
+}
+
 /// A request through the sandbox's proxy, which must answer 403. Even with
 /// `NO_PROXY` set in the sandbox, curl is told to use the proxy.
 fn proxy_probe(name: &str, url: &str) -> Probe {
@@ -224,6 +303,7 @@ fn proxy_probe(name: &str, url: &str) -> Probe {
         ),
         proof: Proof::ProxyRefuses,
         host: None,
+        closed_by_platform: None,
     }
 }
 
@@ -234,10 +314,19 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
     for path in i.read_deny.iter().filter(|p| p.exists()) {
         list.push(read_probe("sensitive files", path));
     }
+    // A grant never covers the deny list: writing there is refused even
+    // inside a granted workspace or the sandbox home.
+    for path in i.read_deny.iter().filter(|p| p.exists()) {
+        if i.writes.iter().any(|w| is_within(path, w)) {
+            list.push(denied_under_grant_probe(path, i.tag));
+        }
+    }
     for path in [
         i.data.join("state.db"),
+        i.data.join("state.lock"),
         i.data.join("audit.jsonl"),
         i.config_file.clone(),
+        i.data.join("run"),
     ] {
         if path.exists() {
             list.push(read_probe("enclos files", &path));
@@ -245,17 +334,50 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
     }
     for dir in &i.other_sandboxes {
         list.push(read_probe("other sandboxes", dir));
+        list.push(write_probe(
+            "other sandboxes",
+            &format!("write in {}", dir.join("home").display()),
+            dir.join("home").join(format!("enclos-probe-{}", i.tag)),
+        ));
     }
     list.push(write_probe(
         "enclos files",
         "write in the enclos folder",
         i.data.join(format!("enclos-probe-{}", i.tag)),
     ));
+    // The sandbox's own policy and compiled policy: writing them would widen
+    // its own policy at the next start.
+    let policy_file = i.sandbox_dir.join("policy.toml");
+    if policy_file.exists() {
+        list.push(open_for_writing_probe(
+            "enclos files",
+            "write the sandbox's own policy.toml",
+            &policy_file,
+        ));
+    }
+    list.push(write_probe(
+        "enclos files",
+        "write in the sandbox's own compiled folder",
+        i.sandbox_dir
+            .join("compiled")
+            .join(format!("enclos-probe-{}", i.tag)),
+    ));
     list.push(write_probe(
         "writes",
         "write outside the home",
         i.user_home.join(format!("enclos-probe-{}", i.tag)),
     ));
+    // launchd loads `*.plist` files from here at login. The probe's file has
+    // no `.plist` suffix and is not a property list, and it is removed at
+    // once if the rule did not hold, so it is harmless here too.
+    let agents = launch_agents(i);
+    if agents.is_dir() {
+        list.push(write_probe(
+            "launch agents",
+            "write in ~/Library/LaunchAgents",
+            agents.join(format!("enclos-probe-{}", i.tag)),
+        ));
+    }
 
     // Refused in either network mode (ADR 0025): a port public mode does not
     // open, and addresses no mode reaches, asked for by name through the proxy.
@@ -324,17 +446,23 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
-    // Reads, with the output discarded: an account without a crontab makes
-    // the crontab probe inconclusive.
+    // Reads, with the output discarded.
     list.push(same_outside(
         "pasteboard",
         "read the pasteboard",
         "/usr/bin/pbpaste >/dev/null",
     ));
-    list.push(same_outside(
+    // Setuid programs, refused by Seatbelt itself. An account without a
+    // crontab makes the crontab probe inconclusive.
+    list.push(setuid_probe(
         "crontab",
         "read the crontab",
         "/usr/bin/crontab -l >/dev/null",
+    ));
+    list.push(setuid_probe(
+        "at",
+        "list the `at` queue",
+        "/usr/bin/atq >/dev/null",
     ));
     list
 }
@@ -362,6 +490,9 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
         .exists()
     {
         absent.push("keychain (no login keychain here)".to_owned());
+    }
+    if !launch_agents(i).is_dir() {
+        absent.push("launch agents (no ~/Library/LaunchAgents here)".to_owned());
     }
     absent
 }
@@ -549,7 +680,9 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: vec![dir.join("enclos/sandboxes/lab")],
+            writes: vec![dir.join("enclos/sandboxes/home/home")],
             read_deny: vec![dir.to_owned(), dir.join("does-not-exist")],
             host_sockets: vec![dir.join("agent.sock")],
             target: Some(4242),
@@ -591,7 +724,15 @@ mod tests {
         for route in ["launchservices", "apple events", "launchd", "preferences"] {
             assert!(!routes.contains(&route), "{route}");
         }
-        for route in ["network", "signals", "writes", "pasteboard", "crontab"] {
+        for route in [
+            "network",
+            "signals",
+            "writes",
+            "other sandboxes",
+            "pasteboard",
+            "crontab",
+            "at",
+        ] {
             assert!(routes.contains(&route), "{route}");
         }
         let host: Vec<&str> = host_service_probes(&inputs(dir.path()))
@@ -663,6 +804,171 @@ mod tests {
                 Some(HostCheck::Target) => assert!(p.script.contains("4242")),
                 None => {}
             }
+        }
+    }
+
+    fn named<'a>(list: &'a [Probe], name: &str) -> Option<&'a Probe> {
+        list.iter().find(|p| p.name.contains(name))
+    }
+
+    #[test]
+    fn the_deny_list_is_probed_for_writes_under_a_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(work.join(".secrets")).unwrap();
+        std::fs::write(work.join(".env"), "TOKEN=x").unwrap();
+        std::fs::create_dir_all(dir.path().join("outside/.ssh")).unwrap();
+        let mut i = inputs(dir.path());
+        i.writes.push(work.clone());
+        i.read_deny = vec![
+            work.join(".secrets"),
+            work.join(".env"),
+            work.join("absent"),
+            dir.path().join("outside/.ssh"),
+        ];
+        let list = probes(&i);
+        let under: Vec<&Probe> = list
+            .iter()
+            .filter(|p| p.name.ends_with("under a write grant"))
+            .collect();
+        assert_eq!(under.len(), 2, "{under:?}");
+        // A folder: a new file in it, checked and removed by the host.
+        let folder = named(&list, ".secrets, under").unwrap();
+        assert_eq!(
+            folder.host,
+            Some(HostCheck::File(work.join(".secrets/enclos-probe-7")))
+        );
+        // A file: opened for writing, never changed.
+        let file = named(&list, ".env, under").unwrap();
+        assert_eq!(
+            file.script,
+            format!("true >> {}", sh_quote(&work.join(".env")))
+        );
+        assert_eq!(file.host, None);
+        assert_eq!(file.route, "sensitive files");
+        // Not under a grant, or not here: only the read is probed, if any.
+        assert!(named(&list, "outside/.ssh, under").is_none());
+        assert!(named(&list, "absent").is_none());
+    }
+
+    #[test]
+    fn the_sandbox_s_own_policy_and_compiled_folder_are_probed_for_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inputs(dir.path());
+        let list = probes(&i);
+        // No policy.toml here: `>>` would create one, so there is no probe.
+        assert!(named(&list, "policy.toml").is_none());
+        let compiled = named(&list, "compiled folder").unwrap();
+        assert_eq!(compiled.route, "enclos files");
+        assert_eq!(
+            compiled.host,
+            Some(HostCheck::File(
+                i.sandbox_dir.join("compiled/enclos-probe-7")
+            ))
+        );
+
+        std::fs::create_dir_all(&i.sandbox_dir).unwrap();
+        let policy = i.sandbox_dir.join("policy.toml");
+        std::fs::write(&policy, "extends = \"assistant\"\n").unwrap();
+        let list = probes(&i);
+        let write = named(&list, "policy.toml").unwrap();
+        assert_eq!(write.route, "enclos files");
+        let Proof::Control { control, .. } = &write.proof else {
+            panic!("the policy.toml probe has a control");
+        };
+        assert_eq!(control.as_str(), format!("test -w {}", sh_quote(&policy)));
+    }
+
+    #[test]
+    fn opening_a_file_for_writing_changes_nothing_even_where_it_is_allowed() {
+        // What the probe does if the rule does not hold, run on the host.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("policy.toml");
+        std::fs::write(&file, "extends = \"assistant\"\n").unwrap();
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let probe = open_for_writing_probe("enclos files", "write it", &file);
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &probe.script])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "extends = \"assistant\"\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn the_launch_agents_probe_writes_a_file_launchd_never_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inputs(dir.path());
+        assert!(!probes(&i).iter().any(|p| p.route == "launch agents"));
+        assert!(not_here(&i).join("; ").contains("launch agents"));
+
+        let agents = dir.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let list = probes(&i);
+        let write = find(&list, "launch agents");
+        let Some(HostCheck::File(file)) = &write.host else {
+            panic!("the launch agents probe checks its file from the host");
+        };
+        assert_eq!(file.parent(), Some(agents.as_path()));
+        // launchd loads `*.plist` property lists: this is neither.
+        assert_ne!(file.extension().and_then(|e| e.to_str()), Some("plist"));
+        assert_eq!(write.script, format!("echo x > {}", sh_quote(file)));
+        assert!(!not_here(&i).join("; ").contains("launch agents"));
+    }
+
+    #[test]
+    fn setuid_probes_say_seatbelt_itself_closes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for p in all(dir.path()) {
+            let setuid = matches!(p.route, "crontab" | "at");
+            assert_eq!(
+                p.closed_by_platform.is_some(),
+                setuid,
+                "{}: {:?}",
+                p.name,
+                p.closed_by_platform
+            );
+            if setuid {
+                let result = ProbeResult::of(p.clone(), Outcome::Closed);
+                assert_eq!(result.closed_by_platform, Some(SETUID_REFUSED));
+                // Closed only on the exec refusal; anything else ran it.
+                let refused = ran(false, "/bin/sh: /usr/bin/atq: Operation not permitted");
+                assert_eq!(proven(&p, refused), Outcome::Closed);
+                assert!(matches!(
+                    proven(&p, ran(false, "crontab: no crontab for alice")),
+                    Outcome::Inconclusive(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn the_routes_no_probe_tries_are_named() {
+        for route in [
+            "bootstrapping",
+            "installing a crontab",
+            "submitting an `at` job",
+            "login item",
+            "synthetic input",
+            "writing the pasteboard",
+            "TIOCSTI",
+            "keychain item",
+        ] {
+            assert!(
+                NOT_PROBED.iter().any(|r| r.contains(route)),
+                "{route} is missing from {NOT_PROBED:?}"
+            );
+        }
+        // These have probes now.
+        for probed in ["LaunchAgent", "`at` jobs"] {
+            assert!(!NOT_PROBED.iter().any(|r| r.contains(probed)), "{probed}");
         }
     }
 

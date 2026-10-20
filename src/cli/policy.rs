@@ -149,7 +149,10 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     println!("Escape probes in sandbox {sandbox}: each tries one way out and must fail.");
     for r in &report.results {
         let (mark, detail) = match &r.outcome {
-            Outcome::Closed => ("closed      ", String::new()),
+            Outcome::Closed => match r.closed_by_platform {
+                Some(why) => ("closed      ", format!("  ({why})")),
+                None => ("closed      ", String::new()),
+            },
             Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
             Outcome::Inconclusive(why) => ("inconclusive", format!("  ({why})")),
             Outcome::NotRun(why) => ("NOT RUN     ", format!("  <- {why}")),
@@ -198,8 +201,12 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     }
     match report.passed() {
         true => {
+            let platform = match report.closed_by_platform() {
+                0 => String::new(),
+                n => format!(", {n} of them by Seatbelt itself rather than by an enclos rule"),
+            };
             println!(
-                "{} of {} probes were shown closed.",
+                "{} of {} probes were shown closed{platform}.",
                 report.closed(),
                 report.results.len()
             );
@@ -220,6 +227,7 @@ mod tests {
                 route: "writes",
                 name: "write outside the home".into(),
                 outcome,
+                closed_by_platform: None,
             }],
             host_services: false,
             not_here: Vec::new(),
