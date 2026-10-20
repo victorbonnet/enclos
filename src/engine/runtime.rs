@@ -3,6 +3,7 @@
 //! own command, through `enclos connect` (ADR 0024); importing an agent
 //! from the host is in `import.rs`.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -522,11 +523,7 @@ impl Engine {
         ));
         let failed = |what: String| Error::Session { what };
         let status = Command::new("/usr/bin/curl")
-            .args(["-fsSL", "--max-time", "120", "--max-filesize"])
-            .arg(INSTALLER_MAX_BYTES.to_string())
-            .arg("-o")
-            .arg(&part)
-            .arg(&installer.url)
+            .args(download_args(&installer.url, &part))
             .stdin(Stdio::null())
             .status()
             .map_err(|e| failed(format!("cannot run curl: {e}")))?;
@@ -973,7 +970,67 @@ pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
     script
 }
 
+/// The arguments of the curl that downloads an installer from `url` to
+/// `out`. `-q` comes first, the only place curl reads it, so no `.curlrc`
+/// adds options; the download and every redirect must stay on HTTPS, so
+/// curl refuses any other URL. The SHA-256 check after it is what decides
+/// whether the file is run.
+fn download_args(url: &str, out: &Path) -> Vec<OsString> {
+    // This crate's own tests install from a file; a build of enclos never
+    // reads one.
+    let proto = if cfg!(test) && url.starts_with("file://") {
+        "=file"
+    } else {
+        "=https"
+    };
+    let mut args: Vec<OsString> = [
+        "-q",
+        "--proto",
+        proto,
+        "--proto-redir",
+        "=https",
+        "-fsSL",
+        "--max-time",
+        "120",
+        "--max-filesize",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    args.push(INSTALLER_MAX_BYTES.to_string().into());
+    args.extend(["-o".into(), out.into(), url.into()]);
+    args
+}
+
 /// `s` as one `sh` word.
 fn sh_word(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_installer_download_reads_no_curlrc_and_stays_on_https() {
+        for url in [
+            "https://example.com/install.sh",
+            "http://example.com/install.sh",
+        ] {
+            let args = download_args(url, Path::new("/tmp/x.part"));
+            let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+            // curl reads `-q` only as its first argument.
+            assert_eq!(args[0], "-q", "{args:?}");
+            let pair = |flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+            assert!(pair("--proto", "=https"), "{args:?}");
+            assert!(pair("--proto-redir", "=https"), "{args:?}");
+            assert!(args.contains(&"-fsSL"), "{args:?}");
+            assert!(
+                pair("--max-filesize", &INSTALLER_MAX_BYTES.to_string()),
+                "{args:?}"
+            );
+            assert!(pair("-o", "/tmp/x.part"), "{args:?}");
+            assert_eq!(args.last(), Some(&url));
+        }
+    }
 }
