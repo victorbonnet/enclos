@@ -7,7 +7,7 @@ use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
-use enclos::probes::Outcome;
+use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -145,15 +145,26 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     }
     if !report.host_services {
         println!(
-            "Host-service routes (open, Apple Events, launchd, preferences) were not probed; CI probes them with --host-services."
+            "Host-service routes ({}) were not probed; CI probes them with --host-services.",
+            HOST_SERVICE_ROUTES.join(", ")
+        );
+    }
+    if !report.not_here.is_empty() {
+        println!(
+            "Not probed, as it is not on this host: {}.",
+            report.not_here.join("; ")
         );
     }
     println!(
-        "Only the routes listed were probed: closed means each probe failed as it should while the same thing worked outside the sandbox, not that no other way out exists."
+        "No probe tries these routes yet: {}.",
+        NOT_PROBED.join(", ")
+    );
+    println!(
+        "Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the proxy probe: the proxy answered 403). It does not mean no other way out exists."
     );
     if report.inconclusive() > 0 {
         println!(
-            "{} probes were inconclusive: they fail outside the sandbox too, so they show nothing about the policy.",
+            "{} probes were inconclusive: they failed for a reason other than the policy, so they show nothing about it.",
             report.inconclusive()
         );
     }
@@ -165,19 +176,53 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     }
     if report.not_run() > 0 {
         eprintln!(
-            "error: {} probes could not run, so their routes were not tested.",
+            "error: {} probes could not run or be checked, so their routes were not tested.",
             report.not_run()
         );
+    }
+    if report.open() == 0 && report.not_run() == 0 && report.closed() == 0 {
+        eprintln!("error: no probe was shown closed, so this test showed nothing.");
     }
     match report.passed() {
         true => {
             println!(
-                "{} of {} probes failed as they should.",
+                "{} of {} probes were shown closed.",
                 report.closed(),
                 report.results.len()
             );
             exit::OK
         }
         false => exit::ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclos::probes::ProbeResult;
+
+    fn report(outcome: Outcome) -> TestReport {
+        TestReport {
+            results: vec![ProbeResult {
+                route: "writes",
+                name: "write outside the home".into(),
+                outcome,
+            }],
+            host_services: false,
+            not_here: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_exit_code_fails_on_an_open_route_a_probe_not_run_or_nothing_closed() {
+        let home: SandboxName = "home".parse().unwrap();
+        assert_eq!(print_test(&home, &report(Outcome::Closed)), exit::OK);
+        for failing in [
+            Outcome::Open("x".into()),
+            Outcome::NotRun("x".into()),
+            Outcome::Inconclusive("x".into()),
+        ] {
+            assert_eq!(print_test(&home, &report(failing)), exit::ERROR);
+        }
     }
 }

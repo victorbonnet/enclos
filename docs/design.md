@@ -17,7 +17,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 3. **Manage only what you create.** No background collector, no scanning for agents enclos did not start.
 4. **Interfaces everywhere.** Each component has one job behind one interface. A new sandbox technology, secret store or runtime is one new implementation, with no change in the core.
 5. **Typed models at every boundary.** Nothing untyped crosses a component boundary. Files on disk carry a `schema_version`.
-6. **Never claim isolation that is not enforced or tested.** If a backend cannot enforce a policy field, enclos says so and refuses unless told otherwise. `enclos policy test` checks enforcement with probes that must fail, and reports only what it probed: a probe counts as closed only when the same thing works outside the sandbox, a probe that fails outside too is reported inconclusive, and a probe that could not run fails the test.
+6. **Never claim isolation that is not enforced or tested.** If a backend cannot enforce a policy field, enclos says so and refuses unless told otherwise. `enclos policy test` checks enforcement with probes that must fail, and reports only what it probed. A probe counts as closed only with a proof that the policy refused it: its control, a harmless check run outside the sandbox, worked, or, for the proxy probe, the proxy answered 403. A probe whose failure has another cause is reported inconclusive; a probe that could not run or be checked fails the test, and so does a test where no probe was shown closed. The report names the routes no probe tries yet.
 7. **Network is enforced by enclos, not by the backend.** Each sandbox reaches the outside only through its own egress proxy, which applies a domain allowlist, connects only to validated addresses and logs every connection.
 8. **Readable code first.** Small files, explicit registration, no clever abstractions until a third implementation needs them.
 
@@ -116,7 +116,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per runn
 
 macOS privacy permissions (TCC) are not part of the sandbox: a process started from Terminal is attributed to Terminal, so it inherits whatever Full Disk Access, Accessibility or Automation grants Terminal has. The read deny list and the rules above must hold without relying on TCC.
 
-The exact rule list is **to verify**: the milestone 1 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. On the user's Mac, `enclos policy test` runs only probes that cannot act on the host even if a rule does not hold (files, enclos's files, network, DNS, host sockets, signals, Keychain, pasteboard, crontab); the ones that could (LaunchServices, Apple Events, launchd, preferences) run only with `--host-services`, which CI's macOS runners use, and whatever they create is checked from the host and removed. Each probe that runs on the user's Mac has a harmless control run outside the sandbox first (a permission check, the same read or connection with its output discarded), so a failure that happens anyway, such as `crontab -l` for an account without a crontab or a folder macOS privacy protection already hides, is not taken for the policy's. Logins therefore use a device-code flow: the runtime prints a URL and a code, and the user opens the URL on the host.
+The exact rule list is **to verify**: the milestone 1 prototype produces it with an escape probe per route, and `enclos policy test` runs those probes. On the user's Mac, `enclos policy test` runs only probes that cannot act on the host even if a rule does not hold (files, enclos's files, network, DNS, host sockets, signals, Keychain, pasteboard, reading the crontab); the ones that could (LaunchServices, Apple Events, launchd, preferences) run only with `--host-services`, which CI's macOS runners ask for by name (`ENCLOS_HOST_SERVICE_PROBES=1`). Every probe except the proxy probe has a control, run on the host first: the same read or connection with its output discarded, a check that a folder is writable, or, for a host service, a read-only check that the service is there (Finder running, the user's launchd domain, cfprefsd). A failure that happens anyway, such as reading the crontab of an account without one, or a folder macOS privacy protection (TCC) already hides, is reported inconclusive, not closed. LaunchServices and Apple Events count as closed only with the refusal the rule was shown to give (-54, -600); launchd jobs, preferences, files written outside and the signal probe's target are checked from the host before and after the probe, and what a probe left is removed, the report saying whether removing it worked. Each probe's script prints a marker first, so a sandbox that never ran it is reported as not run, not as a refusal. Logins therefore use a device-code flow: the runtime prints a URL and a code, and the user opens the URL on the host.
 
 **Linux networking.** A bubblewrap sandbox has its own, empty network namespace, and the proxy is reached through a Unix socket bound into it. Most HTTP clients (Python `httpx` and `requests`, Node, Go) need a TCP address in `HTTPS_PROXY`, so `wrap` starts a small relay inside the sandbox (enclos itself) that listens on `127.0.0.1:<port>` and forwards to the socket. Each sandbox gets one socket and one relay. The relay is the enclos binary, so bubblewrap always mounts it read-only and the program allowlist always permits it, even with `shell = false`. The agent can kill or replace its relay, which is harmless: the relay can only reach the proxy socket.
 
@@ -281,13 +281,14 @@ pub trait Backend {
     fn wrap(&self, sb: &SandboxRecord, session: &SessionRecord, cmd: &Command) -> Result<Command>;
     fn members(&self, sb: &SandboxRecord) -> Result<Vec<Member>>;
     fn signal_members(&self, sb: &SandboxRecord, signal: StopSignal) -> Result<()>;   // Term | Kill
-    fn escape_probes(&self) -> Vec<Probe>;                                            // run by `policy test`
     fn denials(&self, sb: &SandboxRecord, since: Timestamp) -> Result<Vec<Denial>>;
     fn teardown(&self, sb: &SandboxRecord, keep_data: bool) -> Result<()>;
     fn up(&self, _sb: &SandboxRecord) -> Result<()> { Ok(()) }     // a VM boots here
     fn down(&self, _sb: &SandboxRecord) -> Result<()> { Ok(()) }
 }
 ```
+
+Escape probes are not part of the backend: `probes/` builds them and the engine runs each through the backend's `wrap`. They are macOS commands today; the bubblewrap backend will bring its own set.
 
 **Egress proxy**
 
@@ -423,7 +424,8 @@ src/
   policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       sessions.rs  stop.rs
-  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, probes.rs, denials.rs}
+  probes/          mod.rs (escape probes for `policy test`, run by engine/probe.rs)
+  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, denials.rs}
   proxy/           decide.rs (pure checks)  request.rs  server.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
@@ -591,7 +593,7 @@ The design depends on these, and none has been shown to work yet. The milestone 
 
 - How Hermes creates and selects the profiles it keeps agents in (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), and whether each agent needs its own login or shares one per sandbox.
 - What Hermes runs as a background service when no messaging platform is configured, and that a `connect` session to an agent can run alongside that agent's service.
-- The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)).
+- The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). No probe tries these routes yet: posting synthetic input events, `at` jobs, installing a crontab, registering a login item, typing into the terminal (TIOCSTI); `policy test` names them.
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.
 - How `enclos state check` finds macOS processes that escaped member tracking (§8, known gaps).
 - That Hermes's documented device-code login for a ChatGPT subscription completes inside the sandbox through the proxy, which endpoints it needs (they go into the Hermes adapter), and that the refreshed credential keeps working across sessions.
