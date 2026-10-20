@@ -34,9 +34,10 @@ fail() {
   exit 1
 }
 
+# Removes what the installer created; one failure does not stop the other.
 cleanup() {
-  if [ -n "$staging_dir" ]; then rm -rf -- "$staging_dir"; fi
-  if [ -n "$temp_dir" ]; then rm -rf -- "$temp_dir"; fi
+  if [ -n "$staging_dir" ]; then rm -rf -- "$staging_dir" || true; fi
+  if [ -n "$temp_dir" ]; then rm -rf -- "$temp_dir" || true; fi
 }
 
 need() {
@@ -55,7 +56,7 @@ fetch() {
 latest_tag() {
   local url tag
   url=$(fetch --output /dev/null --write-out '%{url_effective}' "$repository/releases/latest") \
-    || fail "Could not reach $repository/releases. Check your connection."
+    || fail "Could not get the latest release from $repository/releases (see the error above)."
   case "$url" in
     "$repository/releases/tag/"*) tag=${url#"$repository/releases/tag/"} ;;
     "$repository/releases" | "$repository/releases/") \
@@ -68,7 +69,7 @@ latest_tag() {
 
 install_latest() {
   local prefix="$1"
-  local tag digest named extra actual binary version
+  local tag digest named extra actual listing binary version
 
   need curl
   need tar
@@ -83,7 +84,8 @@ install_latest() {
   fetch --output "$temp_dir/$asset.sha256" "$repository/releases/download/$tag/$asset.sha256" \
     || fail "Could not download the checksum for $tag; nothing was installed."
 
-  read -r digest named extra < "$temp_dir/$asset.sha256" \
+  # `read` fails at a missing final newline even when it read the line.
+  read -r digest named extra < "$temp_dir/$asset.sha256" || [ -n "${digest:-}" ] \
     || fail "The release checksum file is invalid; nothing was installed."
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] && [ -z "$extra" ] \
     || fail "The release checksum file is invalid; nothing was installed."
@@ -97,7 +99,9 @@ install_latest() {
 
   # Take only the expected executable, into a file created here: the archive's
   # paths, links, owners and modes never reach the host.
-  [ "$(tar -tzf "$temp_dir/$asset")" = enclos ] \
+  listing=$(tar -tzf "$temp_dir/$asset") \
+    || fail "The release archive cannot be read; nothing was installed."
+  [ "$listing" = enclos ] \
     || fail "The release archive must hold only enclos; nothing was installed."
   binary="$temp_dir/enclos"
   tar -xOzf "$temp_dir/$asset" enclos > "$binary" \
@@ -110,7 +114,8 @@ install_latest() {
     || fail "The release executable says '$version', not $tag; nothing was installed."
 
   [ ! -d "$prefix/bin/enclos" ] || fail "$prefix/bin/enclos is a folder."
-  mkdir -p -- "$prefix/bin"
+  mkdir -p -- "$prefix/bin" 2>/dev/null \
+    || fail "Cannot create $prefix/bin. Choose a folder you own with --prefix; nothing was installed."
   # Staged next to the destination, so the replacement is one atomic rename.
   staging_dir=$(mktemp -d "$prefix/bin/.enclos-install.XXXXXX")
   cp -- "$binary" "$staging_dir/enclos"
@@ -119,7 +124,7 @@ install_latest() {
 }
 
 main() {
-  local prefix="${HOME:?HOME must be set}/.local" macos
+  local prefix="${HOME:?HOME must be set}/.local" macos found
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -139,7 +144,9 @@ main() {
   [ -n "$prefix" ] || fail "Do not install into the filesystem root."
 
   [ "$(uname -s)" = Darwin ] || fail "enclos supports only macOS for now."
-  [ "$(uname -m)" = arm64 ] || fail "An Apple silicon Mac and a native arm64 terminal are required."
+  # `uname -m` says x86_64 when this shell runs under Rosetta; the Mac decides.
+  [ "$(uname -m)" = arm64 ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] \
+    || fail "enclos needs an Apple silicon Mac."
   macos=$(sw_vers -productVersion)
   case "${macos%%.*}" in '' | *[!0-9]*) fail "Cannot tell the macOS version." ;; esac
   [ "${macos%%.*}" -ge 14 ] || fail "macOS 14 or later is required (found $macos)."
@@ -156,6 +163,11 @@ main() {
     *":$prefix/bin:"*) ;;
     *) printf 'Add it to your PATH:\n  export PATH=%q:"$PATH"\n' "$prefix/bin" ;;
   esac
+  found=$(command -v enclos 2>/dev/null || true)
+  if [ -n "$found" ] && [ "$found" != "$prefix/bin/enclos" ]; then
+    printf '\nAnother enclos comes first on your PATH: %s\n' "$found"
+    printf 'Remove it (for one built with cargo: cargo uninstall enclos), or put %s first.\n' "$prefix/bin"
+  fi
   printf '\nNext:\n  enclos init\n  enclos sandbox create lab\n  enclos runtime install hermes --sandbox lab\n'
 }
 

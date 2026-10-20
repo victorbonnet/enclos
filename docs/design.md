@@ -579,8 +579,8 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - `sandbox create`, `list`, `show`, `rm`; `agent add`, `list`, `rm`; `connect`;
    - launchd agents for each sandbox's proxy and its runtime's services while the user is logged in, `sandbox start`, `stop`, `restart`, and `logs`;
    - sessions and member tracking, with stop over every member;
-   - `policy test` with the escape probes listed in the acceptance scenario.
-   - releases: a tagged build of the Apple silicon binary with its checksum and provenance, and an installer that always installs the latest release.
+   - `policy test` with the escape probes listed in the acceptance scenario;
+   - releases: a tagged build of the Apple silicon binary with its checksum and provenance, and an installer that always installs the latest release, which the acceptance scenario does not cover.
 
    Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the runtime's own login in the sandbox home.
 

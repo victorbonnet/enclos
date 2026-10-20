@@ -10,20 +10,24 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  ASSET: enclos-aarch64-apple-darwin.tar.gz
+
 jobs:
-  macos-release:
+  # Builds with read access only: `cargo build` runs every dependency's build
+  # script, so it never sees a token that can publish or sign.
+  build:
     runs-on: macos-14
     permissions:
-      contents: write # create the release and upload its assets
-      id-token: write # sign the provenance attestation
-      attestations: write
+      contents: read
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       TARGET: aarch64-apple-darwin
-      ASSET: enclos-aarch64-apple-darwin.tar.gz
     defaults:
       run:
         shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,18 +65,38 @@ jobs:
           binary="target/$TARGET/release/enclos"
           test "$(lipo -archs "$binary")" = arm64
           test "$("$binary" --version)" = "enclos $RELEASE_VERSION"
-          mkdir -p dist/package dist/check
-          install -m 755 "$binary" dist/package/enclos
-          COPYFILE_DISABLE=1 tar -czf "dist/$ASSET" -C dist/package enclos
-          (
-            cd dist
-            shasum -a 256 "$ASSET" > "$ASSET.sha256"
-            shasum -a 256 -c "$ASSET.sha256"
-          )
-          test "$(tar -tzf "dist/$ASSET")" = enclos
-          tar -xzf "dist/$ASSET" -C dist/check
-          test -x dist/check/enclos
-          test "$(dist/check/enclos --version)" = "enclos $RELEASE_VERSION"
+          scripts/package-release.sh "$binary" dist
+          mkdir -p check
+          tar -xzf "dist/$ASSET" -C check
+          test "$(check/enclos --version)" = "enclos $RELEASE_VERSION"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+
+  # Signs and publishes what `build` made, without building anything.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+      id-token: write # sign the provenance attestation
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: Check the downloaded assets
+        run: |
+          cd dist
+          shasum -a 256 -c "$ASSET.sha256"
 
       - name: Attest where the archive was built
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -84,31 +108,36 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           prerelease=false
           if [[ "$RELEASE_VERSION" == *-* ]]; then
             prerelease=true
           fi
-          if draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')"; then
-            if [[ "$draft" != true ]]; then
+          # Create the release only when GitHub says there is none; any other
+          # failure to look it up stops here.
+          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>&1)"; then
+            if [[ "$state" != true ]]; then
               echo "Release $RELEASE_TAG is already published; refusing to replace its assets." >&2
               exit 1
             fi
-          else
+          elif [[ "$state" == *"release not found"* ]]; then
             gh release create "$RELEASE_TAG" --verify-tag --draft \
               --title "$RELEASE_TAG" --generate-notes --prerelease="$prerelease"
+          else
+            echo "Could not look up release $RELEASE_TAG: $state" >&2
+            exit 1
           fi
           gh release upload "$RELEASE_TAG" "dist/$ASSET" "dist/$ASSET.sha256" --clobber
-          mkdir -p dist/download
-          gh release download "$RELEASE_TAG" --dir dist/download \
+          mkdir -p download
+          gh release download "$RELEASE_TAG" --dir download \
             --pattern "$ASSET" --pattern "$ASSET.sha256"
           (
-            cd dist/download
+            cd download
             shasum -a 256 -c "$ASSET.sha256"
           )
-          cmp "dist/$ASSET" "dist/download/$ASSET"
-          cmp "dist/$ASSET.sha256" "dist/download/$ASSET.sha256"
+          cmp "dist/$ASSET" "download/$ASSET"
+          cmp "dist/$ASSET.sha256" "download/$ASSET.sha256"
           if [[ "$prerelease" == true ]]; then
             gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
           else
