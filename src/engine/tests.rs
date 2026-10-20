@@ -764,10 +764,14 @@ mod sandbox {
 mod runtime {
     use super::policy::with_sandbox_on;
     use super::*;
+    #[cfg(target_os = "macos")]
     use crate::model::agent::AgentName;
     use crate::model::runtime::RuntimeKind;
+    #[cfg(target_os = "macos")]
     use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand, hermes::Hermes};
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -803,12 +807,16 @@ mod runtime {
         );
         // The adapter adds destinations and nothing else.
         let first = engine.state.policy_history(&name).unwrap()[0].clone();
-        let (_, v1) = engine
-            .state
-            .active_policy(&name)
-            .map(|_| (first.version, engine.policy(&name).unwrap().snapshot))
-            .unwrap();
-        let _ = v1;
+        assert_eq!(first.version, 1);
+        assert_eq!(view.snapshot.policy.fs.write, ["{home}"]);
+        assert!(
+            view.snapshot
+                .policy
+                .fs
+                .read_deny
+                .iter()
+                .any(|p| p == "~/.ssh")
+        );
     }
 
     #[test]
@@ -844,6 +852,7 @@ mod runtime {
         );
     }
 
+    #[cfg(target_os = "macos")]
     /// Hermes's adapter with an installer of the test's own, read from a
     /// file; `sha256` is its real hash unless the test says otherwise.
     struct TestRuntime {
@@ -851,6 +860,7 @@ mod runtime {
         sha256: String,
     }
 
+    #[cfg(target_os = "macos")]
     impl TestRuntime {
         fn new(dir: &Path, script: &str) -> TestRuntime {
             let installer = dir.join("install.sh");
@@ -861,6 +871,7 @@ mod runtime {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl RuntimeAdapter for TestRuntime {
         fn kind(&self) -> RuntimeKind {
             RuntimeKind::Hermes
@@ -895,6 +906,7 @@ mod runtime {
         }
     }
 
+    #[cfg(target_os = "macos")]
     /// An installer that puts a `hermes` stub on the sandbox's PATH, which
     /// records its calls in the home and fails while `hermes-fails` exists.
     const INSTALLS: &str = "#!/bin/sh
@@ -909,9 +921,11 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 echo \"installed $*\" > \"$HOME/installed\"
 ";
 
+    #[cfg(target_os = "macos")]
     /// Engine tests start real proxies on this host's ports: one at a time.
     static HOST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(target_os = "macos")]
     /// A sandbox whose proxy is a listener this test stands in (`nc`), so
     /// that sessions can run through the fake backend; stopped when dropped,
     /// so the listener never outlives the test.
@@ -922,6 +936,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         home: PathBuf,
     }
 
+    #[cfg(target_os = "macos")]
     impl Lab {
         fn new() -> Lab {
             let (dir, engine, name) =
@@ -974,6 +989,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for Lab {
         fn drop(&mut self) {
             let _ = self.engine.stop_sandbox(&alice(), &self.name, Confirm::Yes);

@@ -160,7 +160,7 @@ impl Engine {
 
     /// The program started as the sandbox's proxy, for tests that stand one
     /// in.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_exe(mut self, exe: PathBuf) -> Engine {
         self.exe = Some(exe);
         self
