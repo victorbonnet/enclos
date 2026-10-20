@@ -127,7 +127,7 @@ pub struct RuntimeStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceLine {
     pub label: String,
-    /// `proxy` or `gateway`.
+    /// `proxy`, or the runtime's name for the service.
     pub unit: String,
     /// `running`, `loaded` (not running).
     pub state: String,
@@ -220,11 +220,11 @@ impl Engine {
             .filter(|d| d.last >= since)
             .count();
         let services = self
-            .service_status(&name)
+            .service_status(&name)?
             .into_iter()
             .map(|(label, status)| ServiceLine {
-                unit: label.rsplit('.').next().unwrap_or("").to_owned(),
-                label,
+                unit: label.service().to_owned(),
+                label: label.to_string(),
                 state: match status {
                     ServiceStatus::Running { .. } => "running",
                     ServiceStatus::Loaded => "loaded",

@@ -2184,8 +2184,8 @@ mod status {
         fn talk(&self, _: &AgentName) -> String {
             String::new()
         }
-        fn service(&self) -> Option<SandboxCommand> {
-            None
+        fn services(&self) -> Vec<crate::runtime::RuntimeService> {
+            Vec::new()
         }
         fn agents_in(&self, _: &Path) -> Option<Vec<String>> {
             None
