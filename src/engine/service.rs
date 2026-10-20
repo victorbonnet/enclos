@@ -18,6 +18,7 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::process::{group_of, is_same, reference, reference_of_child};
+use crate::lifecycle::stop::{GRACE, Stopped, stop};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -349,9 +350,10 @@ impl Engine {
 
     /// A runtime service's process: runs the command the sandbox's runtime
     /// declares under `service` in the sandbox, in a process group of its
-    /// own, recorded as a session. Told to end (TERM, as the service manager
-    /// does, INT or HUP), it stops the session's members and records the
-    /// end.
+    /// own, recorded as a session of `service`, once it has stopped any
+    /// session of `service` still open. Told to end (TERM, as the service
+    /// manager does, INT or HUP), it stops the session's members and records
+    /// the end, as failed when the program outlives that.
     pub fn launch(&self, by: &Actor, name: &SandboxName, service: &str) -> Result<SessionEnd> {
         let ended = Arc::new(AtomicBool::new(false));
         let _ending = EndOn::new(&ended)?;
@@ -400,13 +402,20 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let summary = |(session, _): &(SessionRecord, _)| format!("session {}", session.id);
-        let (session, mut child) =
+        let summary = |(session, _, replaced): &(SessionRecord, _, Vec<SessionId>)| {
+            let mut summary = format!("session {}", session.id);
+            if !replaced.is_empty() {
+                let ids: Vec<String> = replaced.iter().map(ToString::to_string).collect();
+                summary.push_str(&format!(
+                    ", after stopping {service} service session {} left by an earlier launch",
+                    ids.join(", ")
+                ));
+            }
+            summary
+        };
+        let (session, mut child, _) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
-                // A service session whose `launch` was killed before it
-                // recorded its end, at logout or by the service manager's
-                // timeout: its process is gone, so it ends here.
-                self.end_dead_sessions(lock, name, SessionKind::Service)?;
+                let replaced = self.replace_service_sessions(lock, name, service)?;
                 let compiled = self.compile_policy(name, record.proxy_port)?;
                 let (version, snapshot) = self.active_policy(name)?;
                 let launch = Launch {
@@ -427,6 +436,7 @@ impl Engine {
                         id: SessionId(0),
                         sandbox: name.clone(),
                         kind: SessionKind::Service,
+                        service: Some(service.to_owned()),
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: Some(compiled.display().to_string()),
@@ -441,7 +451,7 @@ impl Engine {
                     Ok(session)
                 })();
                 match recorded {
-                    Ok(session) => Ok((session, child)),
+                    Ok(session) => Ok((session, child, replaced)),
                     Err(e) => Err(abandon(child, e, "the service")),
                 }
             })?;
@@ -449,9 +459,56 @@ impl Engine {
         // Unlike `connect`, what it leaves running is stopped: under a
         // service manager the service is its program, which the manager
         // starts again, and what the last run left would run beside it.
-        let mut waited = self.wait_session(&session, &mut child, Some(ended))?;
+        let mut waited = match self.wait_session(&session, &mut child, Some(ended)) {
+            Ok(waited) => waited,
+            Err(error) => return Err(self.record_unended(by, "service end", &session, error)),
+        };
         self.stop_left(&session, &mut waited);
         self.finish_session(by, "service end", &session, waited)
+    }
+
+    /// Stops the sandbox's open sessions of the runtime service `service`
+    /// and ends them, before `launch` starts it again, and returns those it
+    /// ended. A `launch` killed before it recorded its end (at logout, by a
+    /// crash, or by the service manager's timeout) leaves its session open,
+    /// and maybe its runtime running with nothing left to stop it; the
+    /// service manager then starts `launch` again, which would run a second
+    /// runtime beside it. They are stopped rather than refused: the service
+    /// manager starts the service again to replace the last run, and a
+    /// refusal would fail at every restart while the old runtime ran on,
+    /// unwatched. A member that survives refuses the start, and its session
+    /// stays open. Sessions of the sandbox's other services are left alone.
+    fn replace_service_sessions(
+        &self,
+        lock: &crate::state::StateLock,
+        name: &SandboxName,
+        service: &str,
+    ) -> Result<Vec<SessionId>> {
+        let mut replaced = Vec::new();
+        for session in self.state.sessions(name, true)? {
+            if session.kind != SessionKind::Service || session.service.as_deref() != Some(service) {
+                continue;
+            }
+            match stop(&session, GRACE)? {
+                Stopped::Clean => {
+                    self.state.end_session(lock, session.id)?;
+                    replaced.push(session.id);
+                }
+                Stopped::Survivors(left) => {
+                    return Err(Error::Session {
+                        what: format!(
+                            "the {service} service session {} of sandbox {name}, left by an earlier launch, did not stop ({}), so a second one was not started; run `enclos sandbox stop {name}`",
+                            session.id,
+                            left.iter()
+                                .map(|s| format!("pid {}: {}", s.member.pid, s.why.describe()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(replaced)
     }
 
     /// Ends the sandbox's sessions of `kind` whose root process is gone.
@@ -487,6 +544,7 @@ impl Engine {
                     id: SessionId(0),
                     sandbox: name.clone(),
                     kind: SessionKind::Proxy,
+                    service: None,
                     version: version.version,
                     snapshot: snapshot.id,
                     compiled: None,

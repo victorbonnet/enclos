@@ -54,6 +54,7 @@ pub const MIGRATIONS: &[&str] = &[
         id          INTEGER PRIMARY KEY,
         sandbox     TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
         kind        TEXT NOT NULL,
+        service     TEXT,
         version     INTEGER NOT NULL,
         snapshot    TEXT NOT NULL,
         compiled    TEXT,

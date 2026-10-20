@@ -69,6 +69,9 @@ pub struct SessionRecord {
     pub id: SessionId,
     pub sandbox: SandboxName,
     pub kind: SessionKind,
+    /// The runtime service a service session runs, by the name its runtime
+    /// declares (`enclos launch <sandbox> <service>`); none for other kinds.
+    pub service: Option<String>,
     /// The policy version and snapshot the session started under.
     pub version: u32,
     pub snapshot: SnapshotId,

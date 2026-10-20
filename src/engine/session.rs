@@ -159,6 +159,7 @@ impl Engine {
                         id: SessionId(0),
                         sandbox: name.clone(),
                         kind: SessionKind::Interactive,
+                        service: None,
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: Some(compiled.display().to_string()),
@@ -208,21 +209,9 @@ impl Engine {
             Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
             Err(_) => format!("exit {exit}, could not look at what it left running"),
         };
-        // The end is recorded even while another command holds the lock
-        // for long, such as a `sandbox stop` ending other sessions.
-        let waiting = Instant::now();
-        loop {
-            match self.write(
-                by,
-                audit_name,
-                Some(format!("{} session {}", session.sandbox, session.id)),
-                summary,
-                |lock| self.end_or_track(lock, session, &waited),
-            ) {
-                Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
-                done => break done?,
-            }
-        }
+        self.write_session_end(by, audit_name, session, summary, |lock| {
+            self.end_or_track(lock, session, &waited)
+        })?;
         let left = match waited.left {
             Ok(left) if left.is_empty() => Left::Nothing,
             Ok(left) => Left::Running(left.into_iter().map(|f| f.member).collect()),
@@ -235,6 +224,68 @@ impl Engine {
             left,
             notes: waited.notes,
         })
+    }
+
+    /// Records, as `audit_name`, a session whose program `wait_session` did
+    /// not see exit, such as one that survived TERM and KILL, and returns
+    /// `error`. The entry fails with `error`, which names what still runs.
+    /// The session stays open, since its program still runs, so `sandbox
+    /// show` lists it and `sandbox stop` tries again.
+    pub(super) fn record_unended(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        error: Error,
+    ) -> Error {
+        let why = format!(
+            "{error}; session {} stays open, and `enclos sandbox show {}` lists what still runs",
+            session.id, session.sandbox
+        );
+        let reached = std::cell::Cell::new(false);
+        let recorded = self.write_session_end(
+            by,
+            audit_name,
+            session,
+            |_: &()| String::new(),
+            |_| {
+                reached.set(true);
+                Err(Error::Session { what: why.clone() })
+            },
+        );
+        match recorded {
+            Err(not) if !reached.get() => Error::CleanupFailed {
+                error: Box::new(error),
+                left: format!("the session's end unrecorded ({not})"),
+            },
+            _ => error,
+        }
+    }
+
+    /// `write` for a session's end, as `audit_name`. It waits even while
+    /// another command holds the lock for long, such as a `sandbox stop`
+    /// ending other sessions one by one, up to `END_WAIT`.
+    fn write_session_end<T>(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        summary: impl Fn(&T) -> String,
+        work: impl Fn(&StateLock) -> Result<T>,
+    ) -> Result<T> {
+        let waiting = Instant::now();
+        loop {
+            match self.write(
+                by,
+                audit_name,
+                Some(format!("{} session {}", session.sandbox, session.id)),
+                &summary,
+                &work,
+            ) {
+                Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
+                done => break done,
+            }
+        }
     }
 
     /// Waits for the session's program to exit, recording the members it
@@ -265,7 +316,10 @@ impl Engine {
                 // exits: a program not reaped would still be listed.
                 let mut members = session.clone();
                 members.tracked = known.clone();
-                stopping = Some(std::thread::spawn(move || stop(&members, STOP_GRACE)));
+                let stop_members = self.stop_members;
+                stopping = Some(std::thread::spawn(move || {
+                    stop_members(&members, STOP_GRACE)
+                }));
             }
             if stopping
                 .as_ref()
@@ -570,6 +624,7 @@ impl Engine {
             id: SessionId(0),
             sandbox: record.name.clone(),
             kind: SessionKind::Proxy,
+            service: None,
             version: version.version,
             snapshot: snapshot.id,
             compiled: None,

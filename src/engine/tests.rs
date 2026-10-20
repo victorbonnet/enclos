@@ -587,6 +587,7 @@ mod sandbox {
             id: SessionId(0),
             sandbox: name.clone(),
             kind: SessionKind::Interactive,
+            service: None,
             version: 1,
             snapshot: engine.policy(&name).unwrap().snapshot.id,
             compiled: None,
@@ -895,6 +896,7 @@ mod sandbox {
             id: SessionId(0),
             sandbox: name.clone(),
             kind: SessionKind::Interactive,
+            service: None,
             version: 1,
             snapshot: engine.policy(&name).unwrap().snapshot.id,
             compiled: None,
@@ -1178,10 +1180,27 @@ echo \"installed $*\" > \"$HOME/installed\"
 
         /// A lab whose engine installs services through `services`.
         fn with_services(services: Option<Box<dyn crate::service::ServiceManager>>) -> Lab {
+            Lab::build(services, None)
+        }
+
+        /// A lab whose `launch` stops a session's members with `stop` once
+        /// told to end.
+        fn stopping_with(stop: crate::engine::StopMembers) -> Lab {
+            Lab::build(None, Some(stop))
+        }
+
+        fn build(
+            services: Option<Box<dyn crate::service::ServiceManager>>,
+            stop: Option<crate::engine::StopMembers>,
+        ) -> Lab {
             let (dir, engine, name) =
                 with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
             let engine = match services {
                 Some(services) => engine.with_services(services),
+                None => engine,
+            };
+            let engine = match stop {
+                Some(stop) => engine.with_stop_members(stop),
                 None => engine,
             };
             let proxy = dir.path().join("proxy.sh");
@@ -2409,6 +2428,24 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let root = crate::lifecycle::process::reference_of_child(&dead).unwrap();
         let mut dead = dead;
         dead.wait().unwrap();
+        record_service_session(&lab, "gateway", root, None);
+        assert_eq!(open_service_sessions(&lab).len(), 1);
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        lab.engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert!(open_service_sessions(&lab).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Records an open session of the runtime service `service` whose
+    /// program is `root`, as a `launch` would have.
+    fn record_service_session(
+        lab: &Lab,
+        service: &str,
+        root: crate::model::session::ProcessRef,
+        pgid: Option<u32>,
+    ) -> crate::model::session::SessionId {
         lab.engine
             .write(
                 &alice(),
@@ -2421,26 +2458,170 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                         id: crate::model::session::SessionId(0),
                         sandbox: lab.name.clone(),
                         kind: crate::model::session::SessionKind::Service,
+                        service: Some(service.to_owned()),
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: None,
-                        pgid: None,
+                        pgid,
                         root,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
                     };
-                    lab.engine.state.put_session(lock, &session)?;
-                    Ok(())
+                    Ok(lab.engine.state.put_session(lock, &session)?)
                 },
             )
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    /// A `sleep` this test starts in a process group of its own, standing in
+    /// for the runtime of a service whose `launch` was killed: still running,
+    /// with nothing waiting for it but this test.
+    fn orphan_runtime() -> (std::process::Child, crate::model::session::ProcessRef) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
             .unwrap();
-        assert_eq!(open_service_sessions(&lab).len(), 1);
-        let ended = std::sync::atomic::AtomicBool::new(false);
-        lab.engine
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        (child, root)
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Waits for the stub gateway to write its pids, then sets `ended`.
+    fn end_once_started(
+        pids_file: PathBuf,
+        ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<u32>> {
+        use std::time::{Duration, Instant};
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !pids_file.exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "the stub gateway did not start"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let pids = pids_in(&pids_file);
+            ended.store(true, std::sync::atomic::Ordering::Relaxed);
+            pids
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_launch_stops_a_live_session_of_its_service_before_starting_another() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+        // The gateway a killed `launch` left running, and another service's
+        // runtime, which this launch has no reason to touch.
+        let (mut prior, prior_root) = orphan_runtime();
+        let prior_id = record_service_session(&lab, "gateway", prior_root, Some(prior.id()));
+        let (mut other, other_root) = orphan_runtime();
+        let other_id = record_service_session(&lab, "mail", other_root, Some(other.id()));
+
+        let ended = Arc::new(AtomicBool::new(false));
+        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended));
+        let end = lab
+            .engine
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap();
-        assert!(open_service_sessions(&lab).is_empty());
+        let started = teller.join().unwrap();
+
+        // The prior gateway was stopped before the new one started: it was
+        // reaped here, so it is gone, not merely a zombie.
+        assert!(
+            prior.try_wait().unwrap().is_some(),
+            "the prior gateway runs"
+        );
+        assert_ne!(end.session, prior_id);
+        assert!(!started.contains(&prior.id()));
+        assert_eq!(end.left, Left::Nothing, "{end:?}");
+        assert_gone(&started);
+        // The other service's session is untouched.
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "the other service's runtime was ended"
+        );
+        let open = open_service_sessions(&lab);
+        assert_eq!(
+            open.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [other_id],
+            "{open:?}"
+        );
+        // The launch's audit entry says what it stopped.
+        let audit = lab.audit();
+        assert!(
+            audit.contains(&format!(
+                "after stopping gateway service session {prior_id} left by an earlier launch"
+            )),
+            "{audit}"
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runtime_that_outlives_being_told_to_end_is_audited_and_its_session_stays_open() {
+        use crate::lifecycle::stop::{Stopped, Survivor, Why};
+        use crate::model::audit::AuditResult;
+        use crate::model::session::Member;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        // Nothing survives KILL on demand: this stop sends no signal and
+        // reports the program as having survived both.
+        let lab = Lab::stopping_with(|session, _| {
+            Ok(Stopped::Survivors(vec![Survivor {
+                member: Member {
+                    pid: session.root.pid,
+                    started: session.root.started.clone(),
+                    command: "hermes".into(),
+                },
+                why: Why::Survived,
+            }]))
+        });
+        assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+        let ended = Arc::new(AtomicBool::new(false));
+        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended));
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err();
+        let started = teller.join().unwrap();
+        assert!(err.to_string().contains("survived TERM and KILL"), "{err}");
+
+        // The end is audited as failed, naming what still runs.
+        let entries = lab.engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "service end");
+        let outcome = &last.finished.as_ref().expect("finished").outcome;
+        assert_eq!(outcome.result, AuditResult::Failed, "{outcome:?}");
+        let open = open_service_sessions(&lab);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert!(
+            outcome
+                .message
+                .contains(&format!("pid {}", open[0].root.pid))
+                && outcome
+                    .message
+                    .contains(&format!("session {} stays open", open[0].id)),
+            "{}",
+            outcome.message
+        );
+        // The session stays open while its program runs; `sandbox stop`,
+        // with the real stop, ends it.
+        drop(lab);
+        assert_gone(&started);
     }
 
     #[cfg(target_os = "macos")]
@@ -2478,6 +2659,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                         id: crate::model::session::SessionId(0),
                         sandbox: lab.name.clone(),
                         kind: SessionKind::Interactive,
+                        service: None,
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: None,
@@ -3281,6 +3463,7 @@ mod services {
                         id: crate::model::session::SessionId(0),
                         sandbox: name.clone(),
                         kind: SessionKind::Proxy,
+                        service: None,
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: None,
@@ -3646,6 +3829,7 @@ mod status {
             id: SessionId(0),
             sandbox: name.clone(),
             kind,
+            service: None,
             version: 1,
             snapshot: engine.policy(name).unwrap().snapshot.id,
             compiled: compiled.map(str::to_owned),
@@ -3691,6 +3875,7 @@ mod status {
             id: SessionId(0),
             sandbox: "home".parse().unwrap(),
             kind,
+            service: None,
             version: 1,
             snapshot: crate::model::policy::SnapshotId("x".into()),
             compiled: None,

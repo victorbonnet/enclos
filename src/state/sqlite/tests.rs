@@ -349,7 +349,8 @@ fn sessions_keep_their_members_until_they_end() {
     let mut session = SessionRecord {
         id: SessionId(0),
         sandbox: name.clone(),
-        kind: SessionKind::Interactive,
+        kind: SessionKind::Service,
+        service: Some("gateway".into()),
         version: 1,
         snapshot: crate::model::policy::SnapshotId("x".into()),
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),

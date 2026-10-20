@@ -33,6 +33,7 @@ pub use status::{
 };
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::audit::AuditLog;
 use crate::audit::jsonl::JsonlAuditLog;
@@ -40,11 +41,14 @@ use crate::backend::{self, Backend, Probe};
 use crate::config;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
+use crate::lifecycle::process::PsError;
+use crate::lifecycle::stop::Stopped;
 use crate::model::audit::{Actor, AuditEntry, AuditFilter, Intent, Outcome, Since, VerifyReport};
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::model::session::SessionRecord;
 use crate::state::sqlite::SqliteStateStore;
 use crate::state::{Migration, StateLock, StateStore};
 
@@ -56,7 +60,15 @@ pub struct Engine {
     /// The enclos program, to start the proxy and services with.
     exe: Option<std::path::PathBuf>,
     services: Box<dyn crate::service::ServiceManager>,
+    /// How a session's members are stopped once its program is told to end
+    /// (`enclos launch`): `lifecycle::stop::stop`, unless a test stands in
+    /// one that leaves them running.
+    stop_members: StopMembers,
 }
+
+/// Stops a session's members within a grace period, as
+/// `lifecycle::stop::stop` does.
+type StopMembers = fn(&SessionRecord, Duration) -> std::result::Result<Stopped, PsError>;
 
 /// What `enclos init` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +132,7 @@ impl Engine {
             services: Box::new(crate::service::Unsupported {
                 why: "this engine has no service manager",
             }),
+            stop_members: crate::lifecycle::stop::stop,
         }
     }
 
@@ -205,6 +218,14 @@ impl Engine {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_exe(mut self, exe: PathBuf) -> Engine {
         self.exe = Some(exe);
+        self
+    }
+
+    /// The same engine stopping a session's members with `stop`, for tests
+    /// of a program that outlives being told to end.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn with_stop_members(mut self, stop: StopMembers) -> Engine {
+        self.stop_members = stop;
         self
     }
 
