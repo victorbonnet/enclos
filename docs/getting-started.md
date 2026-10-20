@@ -10,14 +10,22 @@ The words used here:
 
 ## Before you start
 
-- macOS 14 or later, with Rust installed through [rustup](https://rustup.rs).
+- An Apple silicon Mac running macOS 14 or later.
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
-Install enclos from a clone of the repository:
+## Install enclos
 
 ```bash
-cargo install --path .
+curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
+```
+
+The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
+
+**No release is published yet.** Until the first one, the installer says so and installs nothing. Build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
+
+```bash
+cargo install --locked --path .
 ```
 
 ## Create a sandbox and install Hermes
@@ -33,7 +41,7 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 
 `enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 
-The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, set `mode = "allowlist"` under `[network]` in its `policy.toml` (`enclos policy show lab` says which file); Hermes's own OpenAI hosts stay allowed.
+The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, set `mode = "allowlist"` under `[network]` in its `policy.toml` (`enclos policy show lab` says which file). The edit takes effect with your next `enclos policy allow lab <host>`, which lists it among the changes and asks first; a command that applies an edit on its own comes in milestone 2. The hosts Hermes needs to install, log in and run stay allowed, and `enclos policy show lab` lists them.
 
 ## Add agents
 

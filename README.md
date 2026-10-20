@@ -37,10 +37,10 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 
 ## Quick start
 
-On a Mac with Rust and an account with a model provider Hermes supports:
+On an Apple silicon Mac running macOS 14 or later, with an account with a model provider Hermes supports:
 
 ```bash
-cargo install --path .
+curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
@@ -48,11 +48,13 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 enclos agent add lab/main
 enclos policy test lab                         # escape probes; every one must fail
 enclos sandbox start lab                       # proxy and gateway in the background
-enclos connect lab -- main                    # talk to the agent, with Hermes's own command
-enclos net log lab                            # what it connected to
+enclos connect lab -- main                     # talk to the agent, with Hermes's own command
+enclos net log lab                             # what it connected to
 ```
 
-The [getting started guide](docs/getting-started.md) explains each step and what does not work yet.
+The installer always takes the latest release: it checks the archive's SHA-256 checksum and the binary's version, then replaces `~/.local/bin/enclos` in one step. It never uses sudo, edits your shell startup files or creates enclos state. **No release is published yet:** until the first one, build from a clone with Rust instead, `cargo install --locked --path .`.
+
+The [getting started guide](docs/getting-started.md) explains each step and what does not work yet; [releases](docs/releases.md) says how a release is built and checked.
 
 ## Commands
 
@@ -71,6 +73,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
+- [Website](https://victorbonnet.github.io/enclos/): a visual introduction, everyday examples and common questions ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.
