@@ -69,6 +69,13 @@ impl Engine {
             Some(spec.name.to_string()),
             summary,
             |lock| {
+                // Checked again under the lock: another create may have
+                // taken the name while this one waited for it.
+                if self.state.get(&spec.name)?.is_some() {
+                    return Err(Error::SandboxExists {
+                        name: spec.name.to_string(),
+                    });
+                }
                 let record = SandboxRecord {
                     name: spec.name.clone(),
                     backend: spec.backend,
@@ -77,13 +84,23 @@ impl Engine {
                     proxy_port: self.free_port()?,
                     created_at: now(),
                 };
-                // The backend must run here before anything is created (ADR 0009).
+                let dir = self.layout.sandbox_dir(spec.name.as_str());
+                let existed = dir.exists();
                 self.state.put(lock, &record)?;
-                if let Err(e) = self.backend_of(&record.name) {
+                // The backend must run here before anything is created (ADR
+                // 0009), and the template must resolve. If either fails,
+                // nothing is left but what was there before, such as a
+                // folder kept by `sandbox rm --keep-data`.
+                let made = self
+                    .backend_of(&record.name)
+                    .and_then(|_| self.create_policy(lock, by, &record.name, &record.template));
+                if let Err(e) = made {
                     self.state.remove(lock, &record.name)?;
+                    if !existed {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
                     return Err(e);
                 }
-                self.create_policy(lock, by, &record.name, &record.template)?;
                 Ok(record)
             },
         )?;
@@ -246,6 +263,14 @@ impl Engine {
             Some(name.to_string()),
             |_| what.to_owned(),
             |lock| {
+                // Checked again under the lock: a `connect` may have started
+                // while this command waited for it.
+                self.require_sandbox(name)?;
+                if !self.state.sessions(name, true)?.is_empty() {
+                    return Err(Error::SandboxRunning {
+                        name: name.to_string(),
+                    });
+                }
                 self.state.remove(lock, name)?;
                 if !keep_data && dir.exists() {
                     std::fs::remove_dir_all(&dir).map_err(|source| LayoutError::Io {

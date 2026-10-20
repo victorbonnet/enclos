@@ -443,6 +443,9 @@ mod sandbox {
     use super::policy::with_sandbox_on;
     use super::*;
     use crate::engine::SandboxSpec;
+    use crate::lifecycle::process::reference;
+    use crate::model::sandbox::{SandboxRecord, SandboxState};
+    use crate::model::session::{SessionId, SessionKind, SessionRecord};
 
     fn spec(name: &str) -> SandboxSpec {
         SandboxSpec {
@@ -489,6 +492,113 @@ mod sandbox {
         );
         assert!(!dir.exists());
         assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+
+    /// Runs `work` while another command holds the state lock: `work`
+    /// passes its checks and waits, then `meanwhile` changes the state
+    /// before the lock is released.
+    fn while_waiting<T>(
+        engine: &Engine,
+        work: impl FnOnce() -> T,
+        meanwhile: impl FnOnce(&Engine, &crate::state::StateLock) + Send,
+    ) -> T {
+        let layout = engine.layout.clone();
+        let (held, wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let other = Engine::open(layout);
+                let lock = other.state.lock().unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                meanwhile(&other, &lock);
+            });
+            wait.recv().unwrap();
+            work()
+        })
+    }
+
+    #[test]
+    fn a_create_that_waited_for_the_lock_checks_the_name_again() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let first = SandboxRecord {
+            name: "lab".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+            state: SandboxState::Created,
+            proxy_port: 1,
+            created_at: crate::model::now(),
+        };
+        let err = while_waiting(
+            &engine,
+            || engine.create_sandbox(&alice(), spec("lab"), Confirm::Yes),
+            |other, lock| other.state.put(lock, &first).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SandboxExists { .. }), "{err}");
+        let lab = engine.state.get(&first.name).unwrap().unwrap();
+        assert_eq!(lab.proxy_port, 1);
+    }
+
+    #[test]
+    fn a_remove_that_waited_for_the_lock_checks_for_sessions_again() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let session = SessionRecord {
+            id: SessionId(0),
+            sandbox: name.clone(),
+            kind: SessionKind::Interactive,
+            version: 1,
+            snapshot: engine.policy(&name).unwrap().snapshot.id,
+            compiled: None,
+            root: reference(std::process::id()).unwrap(),
+            pgid: std::process::id(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let err = while_waiting(
+            &engine,
+            || engine.remove_sandbox(&alice(), &name, false, Confirm::Yes),
+            |other, lock| {
+                other.state.put_session(lock, &session).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SandboxRunning { .. }), "{err}");
+        assert!(engine.layout.sandbox_home("home").is_dir());
+    }
+
+    #[test]
+    fn a_create_with_an_unknown_template_leaves_nothing() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let mut bad = spec("lab");
+        bad.template = "does-not-exist".parse().unwrap();
+        engine
+            .create_sandbox(&alice(), bad, Confirm::Yes)
+            .unwrap_err();
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 1);
+        done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_failed_create_keeps_a_folder_kept_by_remove() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, true, Confirm::Yes)
+                .unwrap(),
+        );
+        let home = engine.layout.sandbox_home("home");
+        std::fs::write(home.join("notes"), "kept").unwrap();
+        let mut bad = spec("home");
+        bad.template = "does-not-exist".parse().unwrap();
+        engine
+            .create_sandbox(&alice(), bad, Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(home.join("notes")).unwrap(), "kept");
     }
 
     #[test]
