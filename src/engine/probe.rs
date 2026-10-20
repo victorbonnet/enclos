@@ -437,6 +437,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_launchd_job_or_preferences_domain_nobody_made_is_absent() {
         // Read-only lookups of names no one uses.
