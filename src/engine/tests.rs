@@ -526,6 +526,7 @@ mod sandbox {
             template: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
+            runtime: None,
             created_at: crate::model::now(),
         };
         let err = while_waiting(
