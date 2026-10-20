@@ -14,6 +14,7 @@ use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
 use crate::model::session::{Member, SessionId, SessionRecord};
+use crate::service::ServiceLabel;
 use std::path::Path;
 
 /// What `enclos sandbox create` takes.
@@ -48,6 +49,8 @@ pub struct SessionView {
 /// What stopping a sandbox did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopReport {
+    /// The services removed, so they do not start again.
+    pub services: Vec<ServiceLabel>,
     pub stopped: Vec<SessionId>,
     pub survivors: Vec<(SessionId, Vec<Survivor>)>,
 }
@@ -217,6 +220,12 @@ impl Engine {
                     )
                 })
                 .collect();
+            changes.splice(
+                0..0,
+                self.service_status(name)?
+                    .into_iter()
+                    .map(|(label, _)| format!("stop service {label}")),
+            );
             changes.push(format!("mark sandbox {name} stopped"));
             return Ok(Planned::DryRun(Plan {
                 changes,
@@ -224,9 +233,21 @@ impl Engine {
             }));
         }
         let summary = |r: &StopReport| match r.survivors.is_empty() {
-            true => format!("stopped {} sessions", r.stopped.len()),
-            false => format!("{} sessions left members running", r.survivors.len()),
+            true => format!(
+                "removed {} services, stopped {} sessions",
+                r.services.len(),
+                r.stopped.len()
+            ),
+            false => format!(
+                "removed {} services; {} sessions left members running",
+                r.services.len(),
+                r.survivors.len()
+            ),
         };
+        // The services first, so the service manager does not restart what
+        // is stopped; outside the lock, which a service told to end needs to
+        // record its end.
+        let services = self.stop_services(name)?;
         self.write(
             by,
             "sandbox stop",
@@ -237,6 +258,7 @@ impl Engine {
                     name: name.to_string(),
                 })?;
                 let mut report = StopReport {
+                    services: services.clone(),
                     stopped: Vec::new(),
                     survivors: Vec::new(),
                 };
@@ -324,11 +346,19 @@ impl Engine {
         Ok(Planned::Done(()))
     }
 
-    /// Refuses a sandbox with sessions open, saying how to end them.
+    /// Refuses a sandbox with services installed or sessions open, saying
+    /// how to end them.
     fn require_stopped(&self, name: &SandboxName) -> Result<()> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
+        // Installed, a service comes back on its own, even with no session
+        // recorded: one whose proxy could not take its port has none.
+        if self.has_services(name)? {
+            return Err(Error::SandboxHasServices {
+                name: name.to_string(),
+            });
+        }
         if self.state.sessions(name, true)?.is_empty() {
             return Ok(());
         }

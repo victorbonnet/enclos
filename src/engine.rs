@@ -8,6 +8,7 @@ mod policy;
 mod probe;
 mod runtime;
 mod sandbox;
+mod service;
 mod session;
 #[cfg(test)]
 mod tests;
@@ -18,6 +19,7 @@ pub use probe::TestReport;
 pub(crate) use runtime::home_files_script;
 pub use runtime::{AgentAdded, AgentRemoved, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
+pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 
 use std::path::PathBuf;
@@ -42,6 +44,7 @@ pub struct Engine {
     backends: Vec<Box<dyn Backend>>,
     /// The enclos program, to start the proxy and services with.
     exe: Option<std::path::PathBuf>,
+    services: Box<dyn crate::service::ServiceManager>,
 }
 
 /// What `enclos init` did.
@@ -81,12 +84,14 @@ impl Engine {
     pub fn open(layout: Layout) -> Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
+        let services = crate::service::host(layout.user_home());
         Engine::new(
             layout,
             Box::new(state),
             Box::new(audit),
             backend::registered(),
         )
+        .with_services(services)
     }
 
     pub fn new(
@@ -101,7 +106,16 @@ impl Engine {
             audit,
             backends,
             exe: std::env::current_exe().ok(),
+            services: Box::new(crate::service::Unsupported {
+                why: "this engine has no service manager",
+            }),
         }
+    }
+
+    /// The same engine with another service manager.
+    pub fn with_services(mut self, services: Box<dyn crate::service::ServiceManager>) -> Engine {
+        self.services = services;
+        self
     }
 
     /// Creates the enclos folders, `config.toml`, `state.db` and

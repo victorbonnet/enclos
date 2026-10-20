@@ -52,7 +52,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Policy | What a sandbox may do. Layered on a template, stored as immutable snapshots, compiled per backend. A sandbox has one active policy and at most one pending policy. | `extends = "assistant"` plus overrides |
 | Runtime | The software installed in a sandbox to run its agents. One runtime per sandbox. | Hermes, Claude Code, Codex |
 | Agent | A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. Runtimes without several agents (Claude Code, Codex) have one agent named `default`. | agent `main` in sandbox `home` |
-| Session | One run inside a sandbox (an interactive `connect`, an `exec`, or an agent's service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
+| Session | One run inside a sandbox (an interactive `connect`, an `exec`, or a runtime service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
 | Audit entry | One record per state-changing command: time, user, host, command, state before and after, result. Append-only, hash-chained. | `enclos policy allow home api.telegram.org` |
 
 Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
@@ -61,7 +61,7 @@ Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
 
 ## 4. Architecture
 
-There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's agent services are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that the core creates. In milestone 1 the proxy is a process of its own that the first `connect` starts and records, so `sandbox stop` ends it. Interactive sessions run in the user's terminal.
+There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's services, its proxy and its runtime's, are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that `sandbox start` installs. A `connect` with no proxy running and no services installed starts one as a plain process and records it as a session, which `sandbox stop` ends. Interactive sessions run in the user's terminal.
 
 ```text
   enclos (CLI)      enclos ui      enclos mcp / scripts
@@ -74,11 +74,11 @@ There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer 
           |
    Per sandbox:
      [interactive session: enclos connect] --+
-     [agent service: enclos launch]    --------+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
+     [runtime service: enclos launch]  -----+--> [egress proxy, one per sandbox] --> validated, allowed destinations only
      (every session runs inside the sandbox's policy, under the snapshot it started with)
 ```
 
-Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per running agent, `enclos.<sandbox>.<agent>`. Every session starts through `enclos launch`, which runs outside the sandbox, records the session, reads the secrets granted to that agent, and then runs the agent's wrapped command. An agent unit runs `enclos launch <sandbox>/<agent>`; `enclos connect` and `enclos exec` call the same code in the foreground. Secrets never sit in a plist or unit file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
+Each sandbox has a proxy service, `enclos.<install>.<sandbox>.proxy`, and one service per background process its runtime declares, `enclos.<install>.<sandbox>.<service>`, while the user is logged in. A runtime adapter declares zero, one or several services, each under a stable name; Hermes declares one, `gateway`, because its gateway serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). `enclos sandbox start` installs them, replacing those already installed, so they come back at each login; if one cannot start, none stays installed. `enclos sandbox stop` removes every service installed under the sandbox's prefix, and `enclos sandbox rm` refuses while any remains, even one with no session recorded. `<install>` is the first 8 hex digits of the SHA-256 of the enclos data folder with links and `.` resolved: launchd labels are shared by every enclos install of the user (`ENCLOS_HOME`), a sandbox name is unique only within one, and every spelling of the folder must name the same services. Each service runs with the variables that resolve the same folders (`ENCLOS_HOME`, or both XDG folders). The service manager is chosen per system: launchd on macOS; other systems refuse to start services until their manager is implemented. A runtime service starts the runtime only once the sandbox's own proxy holds its port: `proxy run --record` records itself after binding it, so a proxy session whose process still runs is the proof. Its service runs `enclos launch <sandbox> <service>`, which runs outside the sandbox, records the session, and runs the declared command under the compiled policy in a process group of its own. That group is not the service manager's to signal, so when `launch` is told to end (TERM, as launchd's stop sends) it stops every member of the session, TERM then KILL, before recording the end; the service's stop timeout gives the service manager's wait room for both and for recording the end. Interactive sessions (`enclos connect <sandbox>`, a shell or the command after `--`) run the same way in the user's terminal. Secrets never sit in a service manager's file. The proxy has one listener port, reserved for the sandbox when it is created, so adding an agent never changes the compiled policy, and the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 
 ## 5. Isolation backends
 
@@ -209,13 +209,13 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 1. Take the state lock; open an audit entry.
 2. Load the record and the active snapshot; compile it if no compiled policy exists for this snapshot and this enclos version (an upgrade recompiles, which is how stricter enclos-owned rules reach new sessions without asking; `enclos doctor` lists what changed); `prepare`.
-3. Start the proxy if it is not running, with the active network policy and the sandbox's listener, and record it beside the sessions (milestone 1: a process the first `connect` starts; later a launchd agent or systemd unit).
+3. Start the proxy if it is not running, with the active network policy and the sandbox's listener, and record it beside the sessions (the proxy service when the sandbox is started; otherwise a process this `connect` starts).
 4. Record the session with its snapshot and compiled-policy hashes; close the audit entry; release the lock.
-5. `enclos launch` reads the secrets granted to the agent, wraps the command (`main`, Hermes's own command for that agent; a login shell when none is given) and runs it in the terminal, tracking its members.
+5. Wrap the command (the one after `--`; a login shell when none is given) and run it in the terminal, tracking its members. `enclos launch <sandbox> <service>` does the same for a runtime service, for the service manager.
 6. When the session ends, take the lock, record the end and any surviving members, and append an audit entry.
 7. On failure at any step: stop what started, save `Failed { reason }`, and close the audit entry as failed.
 
-`enclos sandbox start <name>` does the same for the proxy and every autostart agent's service.
+`enclos sandbox start <name>` does the same for the proxy and every service the runtime declares.
 
 ## 9. Component APIs
 
@@ -366,7 +366,7 @@ pub trait RuntimeAdapter {
     fn create_agent(&self, agent: &AgentName) -> SandboxCommand;                // run inside the sandbox; a `SandboxCommand` can be started nowhere else
     fn agent_files(&self, agent: &AgentName) -> String;                         // where the runtime keeps the agent's files, for messages
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
-    fn service(&self, sb: &SandboxRecord) -> Option<Command>;                   // the background process serving every agent
+    fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
 }
 ```
 
@@ -386,7 +386,7 @@ impl Engine {
     pub fn create(&self, by: &Actor, spec: SandboxSpec, confirm: Confirm) -> Result<Planned<SandboxRecord>>;
     pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentSpec) -> Result<AgentRecord>;
     pub fn remove_agent(&self, by: &Actor, agent: &AgentRef, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
-    pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + agent services
+    pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + the runtime's services
     pub fn stop(&self, by: &Actor, name: &SandboxName) -> Result<StopReport>;       // every member; survivors reported
     pub fn remove(&self, by: &Actor, name: &SandboxName, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
     pub fn change_policy(&self, by: &Actor, name: &SandboxName, change: PolicyChange, confirm: Confirm) -> Result<Planned<PolicyApplied>>;
@@ -449,9 +449,9 @@ enclos connect <name> [-- <command...>]       a shell, or a command such as the 
 enclos exec <name> -- <cmd...>
 enclos logs <name> [-f]
 
-enclos agent add <name>/<agent> [--model ...] [--no-autostart]
+enclos agent add <name>/<agent> [--model ...]
 enclos agent list <name>
-enclos agent start | stop | restart <name>/<agent>
+# no `agent start | stop | restart`: services belong to the sandbox (ADR 0021)
 enclos agent rm <name>/<agent>               the record only: the files stay in the sandbox home (milestone 1)
 
 enclos policy show <name> [--compiled] [--pending]
@@ -496,7 +496,7 @@ enclos connect lab -- hermes setup
 
 enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
 enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused
-enclos sandbox start home lab                   # proxies + all four agents, under launchd
+enclos sandbox start home lab                   # each proxy and each Hermes gateway, under launchd
 enclos sandbox show home                        # agents, sessions, members, policy each started under
 
 enclos connect home -- main                     # Hermes's own command for the agent main
@@ -562,7 +562,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - the per-sandbox proxy, the allowlist, immediate deny, address validation, `net log` and `net denied`;
    - the Hermes adapter: an install per sandbox in its home (ADR 0020), agents, and the device-code subscription login;
    - `sandbox create`, `list`, `show`, `rm`; `agent add`, `list`, `rm`; `connect`;
-   - launchd agents for each sandbox's proxy and each agent while the user is logged in, autostart, `sandbox` and `agent` `start`, `stop`, `restart`, and `logs`;
+   - launchd agents for each sandbox's proxy and its runtime's services while the user is logged in, `sandbox start`, `stop`, `restart`, and `logs`;
    - sessions and member tracking, with stop over every member;
    - `policy test` with the escape probes listed in the acceptance scenario.
 
@@ -580,7 +580,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
 **Acceptance scenario (milestone 1).** On a Mac, with the user logged in and an existing ChatGPT subscription:
 
 1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes agents, every agent logged in through Hermes's device-code flow.
-2. `enclos sandbox start` on both sandboxes leaves each proxy and each agent running under launchd, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every agent, session and member, and the snapshot each session started under.
+2. `enclos sandbox start` on both sandboxes leaves each proxy and each Hermes gateway running under launchd, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every agent, session and member, and the snapshot each session started under.
 3. Through `enclos connect <sandbox> -- <hermes command>`, each agent is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
 4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and enclos's files and the other sandbox are unchanged.
 5. Every connection appears in `enclos net log` for the sandbox that made it. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again, without a restart. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
@@ -593,7 +593,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
 The design depends on these, and none has been shown to work yet. The milestone 1 prototype resolves each one, except the ADR 0006 evidence, which milestone 2 gathers; the result is recorded in the design or an ADR.
 
 - How Hermes creates and selects the profiles it keeps agents in (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), and whether each agent needs its own login or shares one per sandbox.
-- What Hermes runs as a background service when no messaging platform is configured, and that a `connect` session to an agent can run alongside that agent's service.
+- That a sandboxed Hermes gateway run with `--external-supervisor` exits for the service manager to restart it on an in-chat restart or update, rather than starting a replacement ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). What Hermes runs as a background service, one gateway serving every agent beside `connect` sessions, was shown by the prototype (issue #5) and is recorded there.
 - The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). No probe tries these routes yet: posting synthetic input events, `at` jobs, installing a crontab, registering a login item, typing into the terminal (TIOCSTI); `policy test` names them.
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.
 - How `enclos state check` finds macOS processes that escaped member tracking (§8, known gaps).

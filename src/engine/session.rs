@@ -8,17 +8,19 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT};
 
 use super::Engine;
+use super::service::{PROXY_WAIT, STOP_GRACE};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::stop::{GRACE, Stopped, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -72,7 +74,7 @@ const WATCH: Duration = Duration::from_millis(500);
 const EXIT_POLL: Duration = Duration::from_millis(20);
 /// How long the session's end waits for other commands holding the state
 /// lock, such as a `sandbox stop` ending other sessions one by one.
-const END_WAIT: Duration = Duration::from_secs(120);
+pub(super) const END_WAIT: Duration = Duration::from_secs(120);
 
 impl Engine {
     /// Runs `command` (a login shell by default) in the sandbox, in this
@@ -119,6 +121,7 @@ impl Engine {
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
+        self.wait_service_proxy(name)?;
         let (session, mut child, _keep_waiting) =
             self.write(by, audit_name, Some(target.clone()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
@@ -187,7 +190,19 @@ impl Engine {
                 }
             })?;
 
-        let waited = self.wait_session(&session, &mut child)?;
+        let waited = self.wait_session(&session, &mut child, None)?;
+        self.finish_session(by, "session end", &session, waited)
+    }
+
+    /// Records how a session's program ended (design §8 step 6), as
+    /// `audit_name`: the session ends, or stays open while it left members.
+    pub(super) fn finish_session(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        waited: Waited,
+    ) -> Result<SessionEnd> {
         let signal = waited.status.signal();
         let exit = waited
             .status
@@ -204,10 +219,10 @@ impl Engine {
         loop {
             match self.write(
                 by,
-                "session end",
-                Some(format!("{target} session {}", session.id)),
+                audit_name,
+                Some(format!("{} session {}", session.sandbox, session.id)),
                 summary,
-                |lock| self.end_or_track(lock, &session, &waited),
+                |lock| self.end_or_track(lock, session, &waited),
             ) {
                 Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
                 done => break done?,
@@ -229,11 +244,14 @@ impl Engine {
 
     /// Waits for the session's program to exit, recording the members it
     /// starts as they appear (design §8), and returns its exit status and
-    /// the members it left running.
+    /// the members it left running. Once `ended` is set, it stops every
+    /// member, TERM then KILL after `STOP_GRACE` each, as `sandbox stop`
+    /// does with `GRACE`; a program that survives both is an error.
     pub(super) fn wait_session(
         &self,
         session: &SessionRecord,
         child: &mut Child,
+        ended: Option<&AtomicBool>,
     ) -> Result<Waited> {
         let lost = |e: std::io::Error| Error::Session {
             what: format!("lost the session's program: {e}"),
@@ -242,9 +260,44 @@ impl Engine {
         let mut saved = known.clone();
         let mut notes = Vec::new();
         let mut looked: Option<Instant> = None;
+        let mut stopping = None;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(lost)? {
                 break status;
+            }
+            if stopping.is_none() && ended.is_some_and(|e| e.load(Ordering::Relaxed)) {
+                // On another thread, so this one reaps the program as it
+                // exits: a program not reaped would still be listed.
+                let mut members = session.clone();
+                members.tracked = known.clone();
+                stopping = Some(std::thread::spawn(move || stop(&members, STOP_GRACE)));
+            }
+            if stopping
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+            {
+                // Done signalling, and the program has not exited: it
+                // survived TERM and KILL, so waiting more would not end.
+                match stopping.take().map(std::thread::JoinHandle::join) {
+                    Some(Ok(Ok(Stopped::Clean))) => {}
+                    Some(Ok(Ok(Stopped::Survivors(left)))) => {
+                        return Err(Error::Session {
+                            what: format!(
+                                "the program of session {} survived TERM and KILL: {}",
+                                session.id,
+                                left.iter()
+                                    .map(|s| format!("pid {} ({})", s.member.pid, s.why.describe()))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                    }
+                    Some(Ok(Err(e))) => {
+                        note(&mut notes, format!("could not stop its members: {e}"));
+                    }
+                    Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
+                    None => {}
+                }
             }
             if looked.is_none_or(|at| at.elapsed() >= WATCH) {
                 looked = Some(Instant::now());
@@ -274,6 +327,13 @@ impl Engine {
             }
             std::thread::sleep(EXIT_POLL);
         };
+        // The program exited while its members were being stopped: what
+        // survived is listed below, as `left`.
+        match stopping.map(std::thread::JoinHandle::join) {
+            None | Some(Ok(Ok(_))) => {}
+            Some(Ok(Err(e))) => note(&mut notes, format!("could not stop its members: {e}")),
+            Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
+        }
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it.
         let left = processes().map(|procs| find(&procs, session, &known));
@@ -283,6 +343,25 @@ impl Engine {
             known,
             notes,
         })
+    }
+
+    /// Stops what the session's program left running, TERM then KILL, and
+    /// looks again at what is left.
+    pub(super) fn stop_left(&self, session: &SessionRecord, waited: &mut Waited) {
+        let sure: Vec<ProcessRef> = match &waited.left {
+            Ok(left) if !left.is_empty() => left.iter().filter_map(Found::sure_ref).collect(),
+            _ => return,
+        };
+        let mut members = session.clone();
+        members.tracked = waited.known.clone();
+        members.tracked.extend(sure);
+        if let Err(e) = stop(&members, STOP_GRACE) {
+            note(
+                &mut waited.notes,
+                format!("could not stop what it left running: {e}"),
+            );
+        }
+        waited.left = processes().map(|procs| find(&procs, session, &waited.known));
     }
 
     /// Ends the session, or, while it left members running or enclos could
@@ -300,6 +379,39 @@ impl Engine {
                 self.state.track(lock, session.id, &sure)?;
             }
             Err(_) => self.state.track(lock, session.id, &waited.known)?,
+        }
+        Ok(())
+    }
+
+    /// Stops the sandbox's open sessions of these kinds, so that services
+    /// can take their place: a proxy holds the port, and what a runtime
+    /// service left running would run beside the new one.
+    pub(super) fn stop_sessions(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        kinds: &[SessionKind],
+    ) -> Result<()> {
+        for session in self
+            .state
+            .sessions(name, true)?
+            .into_iter()
+            .filter(|s| kinds.contains(&s.kind))
+        {
+            match stop(&session, GRACE)? {
+                Stopped::Clean => self.state.end_session(lock, session.id)?,
+                Stopped::Survivors(left) => {
+                    let pids: Vec<String> = left.iter().map(|s| s.member.pid.to_string()).collect();
+                    return Err(Error::Session {
+                        what: format!(
+                            "the {} session {} of sandbox {name} did not stop (pid {}); run `enclos sandbox stop {name}`",
+                            session.kind.as_str(),
+                            session.id,
+                            pids.join(", ")
+                        ),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -347,11 +459,31 @@ impl Engine {
         Ok(false)
     }
 
+    /// Gives the sandbox's proxy service, when one is installed, time to
+    /// record itself: a proxy this command would start instead would take
+    /// its port, and the service would fail at every restart. Outside the
+    /// lock, which the service needs to record itself.
+    pub(super) fn wait_service_proxy(&self, name: &SandboxName) -> Result<()> {
+        if self.has_services(name)? {
+            self.proxy_started(name, PROXY_WAIT)?;
+        }
+        Ok(())
+    }
+
     /// Starts the sandbox's proxy unless it runs already, and records it as
     /// a session, so that `sandbox stop` ends it too.
     pub(super) fn ensure_proxy(&self, lock: &StateLock, record: &SandboxRecord) -> Result<()> {
         if self.proxy_runs(&record.name)? {
             return Ok(());
+        }
+        // With services installed, the proxy is the service's to start.
+        if self.has_services(&record.name)? {
+            return Err(Error::Session {
+                what: format!(
+                    "the proxy service of sandbox {} has not started; see `enclos logs {}`, or run `enclos sandbox stop {}` to run without services",
+                    record.name, record.name, record.name
+                ),
+            });
         }
         // A recorded proxy that exited, or was killed, is replaced: its
         // session ends here.
@@ -468,7 +600,7 @@ impl Engine {
 
 /// Ends `child`, which this command started but could not record, so that
 /// it does not run where no `stop` finds it; `error` stays the reason.
-fn abandon(mut child: Child, error: Error, what: &str) -> Error {
+pub(super) fn abandon(mut child: Child, error: Error, what: &str) -> Error {
     match child.kill().and_then(|()| child.wait()) {
         Ok(_) => error,
         Err(e) => Error::CleanupFailed {

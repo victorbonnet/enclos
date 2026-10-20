@@ -22,7 +22,8 @@ impl fmt::Display for SessionId {
 pub enum SessionKind {
     /// `enclos connect`, in the user's terminal.
     Interactive,
-    /// The runtime's background service, which serves every agent.
+    /// One of the runtime's background services, run by `enclos launch`
+    /// for the service manager.
     Service,
     /// The sandbox's egress proxy, outside the sandbox.
     Proxy,

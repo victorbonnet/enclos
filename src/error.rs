@@ -23,6 +23,12 @@ pub enum Error {
     SandboxExists { name: String },
     #[error("sandbox `{name}` has sessions open. End them first with `enclos sandbox stop {name}`")]
     SandboxRunning { name: String },
+    #[error(transparent)]
+    Service(#[from] crate::service::ServiceError),
+    #[error(
+        "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
+    )]
+    SandboxHasServices { name: String },
     /// A stop left members running; `rm` waits until they are gone.
     #[error(
         "sandbox `{name}` still has processes `enclos sandbox stop` could not end; `enclos sandbox show {name}` lists them. End them, then run `enclos sandbox stop {name}` again"
@@ -58,6 +64,11 @@ pub enum Error {
         addr: String,
         source: std::io::Error,
     },
+    #[error("the proxy of sandbox `{sandbox}` stopped serving: {source}")]
+    ProxyStopped {
+        sandbox: String,
+        source: std::io::Error,
+    },
     /// The policy does not allow the command; see design principle 6.
     #[error("refused by policy: {reason}")]
     Refused { reason: String },
@@ -90,12 +101,15 @@ impl Error {
             | Error::NoSuchSandbox { .. }
             | Error::NoPolicy { .. }
             | Error::ProxyListen { .. }
+            | Error::ProxyStopped { .. }
             | Error::Compile(_)
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
+            | Error::SandboxHasServices { .. }
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
+            | Error::Service(_)
             | Error::Processes(_) => exit::ERROR,
             Error::CleanupFailed { error, .. } => error.exit_code(),
             Error::BackendUnavailable { .. } => exit::REFUSED,

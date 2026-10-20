@@ -8,6 +8,7 @@ use clap::{Args, Subcommand};
 
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
+use enclos::model::audit::Actor;
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -24,6 +25,9 @@ enum ProxyVerb {
         /// Where to listen: the sandbox's port on loopback, such as 127.0.0.1:41000.
         #[arg(long, value_name = "ADDR")]
         listen: ListenArg,
+        /// Record this proxy as the sandbox's, as its service does.
+        #[arg(long)]
+        record: bool,
     },
 }
 
@@ -47,9 +51,15 @@ impl FromStr for ListenArg {
     }
 }
 
-pub fn run(engine: &Engine, args: ProxyArgs) -> Result<u8> {
+pub fn run(engine: &Engine, by: &Actor, args: ProxyArgs) -> Result<u8> {
     match args.verb {
-        ProxyVerb::Run { sandbox, listen } => engine.run_proxy(&sandbox, listen.0)?,
+        ProxyVerb::Run {
+            sandbox,
+            listen,
+            record,
+        } => {
+            engine.run_proxy(&sandbox, listen.0, record.then_some(by))?;
+        }
     }
     Ok(exit::OK)
 }

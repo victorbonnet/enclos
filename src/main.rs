@@ -45,6 +45,11 @@ enum Command {
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
     Net(cli::net::NetArgs),
+    /// Show the logs of a sandbox's background services.
+    Logs(cli::launch::LogsArgs),
+    /// Run one of a sandbox's runtime services; started by the service manager.
+    #[command(hide = true)]
+    Launch(cli::launch::LaunchArgs),
     /// Run a sandbox's egress proxy; started by enclos itself.
     #[command(hide = true)]
     Proxy(cli::proxy::ProxyArgs),
@@ -111,7 +116,9 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
-        Command::Proxy(args) => cli::proxy::run(&engine, args),
+        Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
+        Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
+        Command::Logs(args) => cli::launch::logs(&engine, args),
     }
 }
 

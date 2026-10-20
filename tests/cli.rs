@@ -1,5 +1,6 @@
-//! Runs the `enclos` binary against a temporary `ENCLOS_HOME`, so tests never
-//! touch the real home folder.
+//! Runs the `enclos` binary against a temporary `ENCLOS_HOME` and `HOME`, so
+//! tests never touch the real home folder, its `~/Library/LaunchAgents`
+//! included. No test runs `sandbox start`: it would install real services.
 
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
@@ -23,7 +24,9 @@ impl Home {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
-        cmd.args(args).env("ENCLOS_HOME", &self.root);
+        cmd.args(args)
+            .env("ENCLOS_HOME", &self.root)
+            .env("HOME", self._dir.path());
         cmd
     }
 
@@ -604,13 +607,7 @@ fn connect_refuses_a_port_another_program_listens_on() {
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
-    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
-    let port: u16 = show
-        .split("proxy port ")
-        .nth(1)
-        .and_then(|rest| rest.lines().next())
-        .and_then(|p| p.trim().parse().ok())
-        .unwrap();
+    let port = proxy_port(&home);
     // Another program takes the sandbox's proxy port first.
     let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     let out = home.run(&["connect", "home", "--", "/usr/bin/true"]);
@@ -620,6 +617,17 @@ fn connect_refuses_a_port_another_program_listens_on() {
         "{}",
         out.stderr()
     );
+}
+
+/// The proxy port `sandbox show` lists for the sandbox.
+#[cfg(target_os = "macos")]
+fn proxy_port(home: &Home) -> u16 {
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    show.split("proxy port ")
+        .nth(1)
+        .and_then(|rest| rest.lines().next())
+        .and_then(|p| p.trim().parse().ok())
+        .unwrap()
 }
 
 /// Kills the `enclos` this test started when the test ends, passed or not.
@@ -901,4 +909,60 @@ fn agent_commands_need_a_runtime_and_their_dry_runs_change_nothing() {
         );
     }
     assert_eq!(home.audit_lines().len(), before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let port = proxy_port(&home);
+    let listen = format!("127.0.0.1:{port}");
+    let args = ["proxy", "run", "home", "--record", "--listen", &listen];
+    // With the port taken, it records nothing: a recorded proxy owns its
+    // port, which a service's `launch` relies on.
+    {
+        let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let out = home.run(&args);
+        assert_eq!(out.code(), 1, "{}", out.stderr());
+        assert!(proxy_pid(&home).is_none());
+        assert!(!home.audit_lines().iter().any(|l| l.contains("proxy start")));
+    }
+    // As the service manager runs it.
+    let mut proxy = KillOnDrop(
+        home.command(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(eventually(|| proxy_pid(&home) == Some(proxy.0.id())));
+    // `connect` uses it rather than starting another.
+    home.run(&["connect", "home", "--", "/usr/bin/true"]).ok();
+    assert_eq!(proxy_pid(&home), Some(proxy.0.id()));
+    home.run(&["sandbox", "stop", "home"]).ok();
+    assert!(eventually(|| proxy.0.try_wait().unwrap().is_some()));
+    assert!(proxy_pid(&home).is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn logs_of_a_sandbox_without_services_say_how_to_start_it() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let out = home.run(&["logs", "home"]);
+    out.ok();
+    assert!(
+        out.stdout().contains("no service logs yet")
+            && out.stdout().contains("enclos sandbox start home"),
+        "{}",
+        out.stdout()
+    );
+    let out = home.run(&["logs", "nope"]);
+    assert_eq!(out.code(), 1);
 }

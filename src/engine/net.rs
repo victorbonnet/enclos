@@ -1,11 +1,13 @@
 //! The engine's network calls: the network log, denied destinations, and
 //! running a sandbox's egress proxy (design §6).
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
 
 use super::Engine;
 use crate::error::{Error, Result};
 use crate::model::Timestamp;
+use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::SandboxName;
 use crate::proxy::{ActivePolicy, Proxy};
@@ -25,9 +27,16 @@ impl Engine {
     }
 
     /// Runs the sandbox's egress proxy on `addr` until the process ends.
+    /// With `record`, it records itself as the sandbox's proxy once it holds
+    /// the port, never before: a recorded proxy owns its port.
     /// It reads the active policy for each new connection, so policy
     /// changes apply without a restart.
-    pub fn run_proxy(&self, name: &SandboxName, addr: SocketAddr) -> Result<()> {
+    pub fn run_proxy(
+        &self,
+        name: &SandboxName,
+        addr: SocketAddr,
+        record: Option<&Actor>,
+    ) -> Result<()> {
         self.require_sandbox(name)?;
         self.policy(name)?;
         let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
@@ -36,10 +45,23 @@ impl Engine {
             sandbox: name.clone(),
         };
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(store()));
-        proxy.run(addr).map_err(|source| Error::ProxyListen {
+        let socket = TcpListener::bind(addr).map_err(|source| Error::ProxyListen {
             sandbox: name.to_string(),
             addr: addr.to_string(),
             source,
-        })
+        })?;
+        if let Some(by) = record {
+            self.record_proxy(by, name)?;
+        }
+        let stopped = |source| Error::ProxyStopped {
+            sandbox: name.to_string(),
+            source,
+        };
+        let _ = Arc::new(proxy).serve(socket).map_err(stopped)?.join();
+        // Serving ends only if the accept loop died: an error, so the
+        // service manager starts the proxy again.
+        Err(stopped(std::io::Error::other(
+            "it stopped accepting connections",
+        )))
     }
 }

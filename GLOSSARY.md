@@ -45,8 +45,12 @@ A named identity of the sandbox's runtime, with its own configuration, memory, s
 _Avoid_: profile (Hermes's word for it), instance, persona, bot
 
 **Session**:
-A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or an agent's service, with every process it starts. A session records the policy snapshot it started under.
+A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance
+
+**Service**:
+A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
+_Avoid_: daemon, job, unit (the service manager's words), agent service
 
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.

@@ -28,11 +28,21 @@ impl SandboxName {
 /// The naming rule sandboxes and agents share: a lowercase letter, then 1
 /// to 40 lowercase letters, digits or hyphens. Safe in a path, as one shell
 /// word, and never read as a flag.
-pub fn is_short_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    first_ok && rest_ok && (2..=41).contains(&s.len())
+pub const fn is_short_name(s: &str) -> bool {
+    // Const, so a name written in code is checked when it compiles.
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 41 || !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 impl FromStr for SandboxName {
