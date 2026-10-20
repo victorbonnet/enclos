@@ -29,6 +29,13 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
         Planned::Done(end) => end,
     };
     report_end(&args.sandbox, &end);
+    // Agents made or deleted in the session with the runtime's own commands.
+    // On stderr, so a command's output stays clean; the session's exit code
+    // stays the command's.
+    match super::agent::check_notes(engine, &args.sandbox, false) {
+        Ok(notes) => notes.iter().for_each(|note| eprintln!("enclos: {note}")),
+        Err(e) => eprintln!("enclos: could not check the sandbox's agents: {e}"),
+    }
     Ok(u8::try_from(end.exit).unwrap_or(1))
 }
 

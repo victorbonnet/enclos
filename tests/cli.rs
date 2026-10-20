@@ -966,3 +966,127 @@ fn logs_of_a_sandbox_without_services_say_how_to_start_it() {
     let out = home.run(&["logs", "nope"]);
     assert_eq!(out.code(), 1);
 }
+
+/// Records Hermes as the runtime of sandbox `name` without installing it,
+/// and gives back a way to make a Hermes profile in the sandbox home as
+/// `hermes profile create` would, so the agent commands have something to
+/// report without a Hermes install.
+#[cfg(target_os = "macos")]
+fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
+    use enclos::state::StateStore;
+    let layout = enclos::layout::Layout::at(&home.root);
+    let state =
+        enclos::state::sqlite::SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let lock = state.lock().unwrap();
+    let mut record = state.get(&name.parse().unwrap()).unwrap().unwrap();
+    record.runtime = Some(enclos::model::runtime::RuntimeKind::Hermes);
+    state.put(&lock, &record).unwrap();
+    let profiles = layout.sandbox_home(name).join(".hermes/profiles");
+    move |agent: &str| {
+        std::fs::create_dir_all(profiles.join(agent)).unwrap();
+        std::fs::write(profiles.join(agent).join("config.yaml"), "").unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let make = record_hermes(&home, "home");
+    make("scout");
+    make("my_bot");
+
+    let untracked = "home/scout: Hermes has this agent; enclos does not track it. Track it with `enclos agent add home/scout`.";
+    let untrackable = "Hermes has an agent enclos cannot track: `my_bot` is not a valid agent name";
+    let list = home.run(&["agent", "list", "home"]);
+    let out = list.ok().stdout();
+    assert!(!out.contains("no agents yet"), "{out}");
+    assert_eq!(out.lines().next(), Some(untracked), "{out}");
+    assert!(out.contains(untrackable), "{out}");
+    let show = home.run(&["sandbox", "show", "home"]);
+    let out = show.ok().stdout();
+    assert!(out.contains("\n  agents: none\n"), "{out}");
+    assert!(out.contains(&format!("\n  {untracked}\n")), "{out}");
+
+    // Adopting records it without running Hermes (there is none to run),
+    // and says so instead of the next steps after a creation.
+    let before = home.audit_lines().len();
+    let add = home.run(&["agent", "add", "home/scout"]);
+    let out = add.ok().stdout();
+    assert_eq!(
+        out.trim(),
+        "Tracked agent home/scout, which Hermes already had. Talk to it with `enclos connect home -- hermes -p scout`."
+    );
+    // One entry, opened and closed: no session ran.
+    assert_eq!(home.audit_lines().len(), before + 2);
+    let list = home.run(&["agent", "list", "home"]);
+    let out = list.ok().stdout();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "{out}");
+    assert_eq!(lines[..2], ["home/scout", ""], "{out}");
+    assert!(lines[2].starts_with(untrackable), "{out}");
+    let show = home.run(&["sandbox", "show", "home"]);
+    assert!(
+        show.ok().stdout().contains("\n  agents: scout\n"),
+        "{}",
+        show.stdout()
+    );
+
+    // Removing the record keeps the files, so Hermes still has the agent.
+    let rm = home.run(&["agent", "rm", "home/scout"]);
+    assert!(
+        rm.ok()
+            .stdout()
+            .contains("enclos reports it as one it does not track"),
+        "{}",
+        rm.stdout()
+    );
+    let list = home.run(&["agent", "list", "home"]);
+    assert_eq!(list.ok().stdout().lines().next(), Some(untracked));
+
+    // A home enclos cannot read safely is said, not shown as clean.
+    let hermes = home.root.join("sandboxes/home/home/.hermes");
+    let kept = home.root.join("sandboxes/home/home/hermes-kept");
+    std::fs::rename(&hermes, &kept).unwrap();
+    std::os::unix::fs::symlink(&kept, &hermes).unwrap();
+    let list = home.run(&["agent", "list", "home"]);
+    let out = list.ok().stdout();
+    assert_eq!(
+        out.trim(),
+        "enclos cannot read Hermes's agents in sandbox home: ~/.hermes is a link. Agents made inside the sandbox are not reported."
+    );
+    let add = home.run(&["agent", "add", "home/scout"]);
+    assert_eq!(add.code(), 1);
+    assert!(
+        add.stderr().contains("~/.hermes is a link"),
+        "{}",
+        add.stderr()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_reports_untracked_agents_on_stderr_without_the_untrackable_names() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let _make = record_hermes(&home, "home");
+
+    // Made in the session, as Hermes's own commands would.
+    let script = "mkdir -p ~/.hermes/profiles/scout ~/.hermes/profiles/my_bot && touch ~/.hermes/profiles/scout/config.yaml ~/.hermes/profiles/my_bot/SOUL.md && echo made; exit 4";
+    let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
+    assert_eq!(out.code(), 4, "stderr: {}", out.stderr());
+    assert_eq!(out.stdout(), "made\n");
+    assert!(
+        out.stderr().contains(
+            "enclos: home/scout: Hermes has this agent; enclos does not track it. Track it with `enclos agent add home/scout`."
+        ),
+        "{}",
+        out.stderr()
+    );
+    assert!(!out.stderr().contains("my_bot"), "{}", out.stderr());
+}

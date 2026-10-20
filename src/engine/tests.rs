@@ -768,11 +768,13 @@ mod sandbox {
 mod runtime {
     use super::policy::with_sandbox_on;
     use super::*;
-    #[cfg(target_os = "macos")]
-    use crate::model::agent::AgentName;
+    use crate::model::agent::{AgentName, AgentRecord};
     use crate::model::runtime::RuntimeKind;
+    use crate::runtime::RuntimeAgentName;
     #[cfg(target_os = "macos")]
-    use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand, hermes::Hermes};
+    use crate::runtime::{
+        HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable, hermes::Hermes,
+    };
     #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "macos")]
@@ -910,6 +912,9 @@ mod runtime {
         }
         fn services(&self) -> Vec<crate::runtime::RuntimeService> {
             Hermes.services()
+        }
+        fn agents_in(&self, home: &Path) -> std::result::Result<Vec<RuntimeAgentName>, Unreadable> {
+            Hermes.agents_in(home)
         }
     }
 
@@ -1132,7 +1137,10 @@ echo \"installed $*\" > \"$HOME/installed\"
                 .unwrap(),
         );
         assert_eq!(added.agent.name, main);
-        assert_eq!(added.end.exit, 0);
+        let Added::Created(end) = &added.how else {
+            panic!("adopted: {added:?}");
+        };
+        assert_eq!(end.exit, 0);
         assert_eq!(
             std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
             "profile create main\n"
@@ -1225,6 +1233,191 @@ echo \"installed $*\" > \"$HOME/installed\"
         let end = done(lab.install(INSTALLS, Confirm::Yes).unwrap());
         assert!(end.installed);
         assert!(lab.allows("example.com") && lab.allows("chatgpt.com"));
+    }
+
+    /// A sandbox with Hermes recorded as its runtime, and a way to make a
+    /// Hermes profile in its home as `hermes profile create` would.
+    fn with_hermes() -> (TempDir, Engine, SandboxName, impl Fn(&str)) {
+        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let profiles = engine.sandbox_home(&name).join(".hermes/profiles");
+        let make = move |agent: &str| {
+            std::fs::create_dir_all(profiles.join(agent)).unwrap();
+            std::fs::write(profiles.join(agent).join("config.yaml"), "").unwrap();
+        };
+        (dir, engine, name, make)
+    }
+
+    fn compared(check: AgentCheck) -> AgentDiff {
+        match check {
+            AgentCheck::Compared(diff) => diff,
+            AgentCheck::Unreadable(why) => panic!("unreadable: {why}"),
+        }
+    }
+
+    fn agent(name: &str) -> AgentName {
+        name.parse().unwrap()
+    }
+
+    #[test]
+    fn an_agent_made_inside_the_sandbox_is_reported_then_adopted() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        make("my_bot");
+        let diff = compared(engine.check_agents(&name).unwrap());
+        assert_eq!(diff.untracked, [agent("scout")]);
+        assert_eq!(diff.untrackable, [RuntimeAgentName::new("my_bot").unwrap()]);
+        assert!(diff.missing.is_empty());
+        let err = engine
+            .remove_agent(&alice(), &name, &agent("scout"), Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("enclos does not track agent `scout`, which Hermes has"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("or remove it with Hermes's own"),
+            "{err}"
+        );
+
+        // The alias Hermes made for it is on the sandbox's PATH, which does
+        // not count as a command the agent would shadow.
+        let bin = engine.sandbox_home(&name).join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("scout"), "#!/bin/sh\n").unwrap();
+        let audited = engine.audit(None).unwrap().len();
+        let Planned::DryRun(plan) = engine
+            .add_agent(&alice(), &name, agent("scout"), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run adopted");
+        };
+        assert_eq!(
+            plan.changes,
+            ["record agent home/scout, which Hermes already has in the sandbox"]
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        assert_eq!(engine.audit(None).unwrap().len(), audited);
+
+        let added = done(
+            engine
+                .add_agent(&alice(), &name, agent("scout"), Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(added.how, Added::Adopted);
+        assert_eq!(added.agent.name, agent("scout"));
+        assert!(
+            compared(engine.check_agents(&name).unwrap())
+                .untracked
+                .is_empty()
+        );
+        // Adopting runs nothing in the sandbox: one audit entry, the record's,
+        // and no session (the fake backend could not have run one anyway).
+        let entries = engine.audit(None).unwrap();
+        assert_eq!(entries.len(), audited + 1);
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "agent add");
+        assert_eq!(last.intent.target.as_deref(), Some("home/scout"));
+        let outcome = &last.finished.as_ref().unwrap().outcome;
+        assert_eq!(outcome.result, AuditResult::Ok);
+        assert_eq!(outcome.message, "adopted");
+        assert!(engine.show_sandbox(&name).unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        make("ranger");
+        for a in ["scout", "ranger"] {
+            done(
+                engine
+                    .add_agent(&alice(), &name, agent(a), Confirm::Yes)
+                    .unwrap(),
+            );
+        }
+        let profiles = engine.sandbox_home(&name).join(".hermes/profiles");
+        // As `hermes profile delete` does: a tombstone, the folder kept.
+        std::fs::create_dir_all(profiles.join(".deleted/scout")).unwrap();
+        std::fs::remove_dir_all(profiles.join("ranger")).unwrap();
+        let diff = compared(engine.check_agents(&name).unwrap());
+        assert_eq!(diff.missing, [agent("ranger"), agent("scout")]);
+        assert!(diff.untracked.is_empty());
+    }
+
+    #[test]
+    fn a_linked_hermes_folder_is_reported_unreadable_and_agent_add_refuses_to_guess() {
+        let (_dir, engine, name, make) = with_hermes();
+        make("scout");
+        done(
+            engine
+                .add_agent(&alice(), &name, agent("scout"), Confirm::Yes)
+                .unwrap(),
+        );
+        let hermes = engine.sandbox_home(&name).join(".hermes");
+        let kept = engine.sandbox_home(&name).join("hermes-kept");
+        std::fs::rename(&hermes, &kept).unwrap();
+        std::os::unix::fs::symlink(&kept, &hermes).unwrap();
+        let AgentCheck::Unreadable(why) = engine.check_agents(&name).unwrap() else {
+            panic!("compared through a link");
+        };
+        assert_eq!(why.to_string(), "~/.hermes is a link");
+        let audited = engine.audit(None).unwrap().len();
+        let err = engine
+            .add_agent(&alice(), &name, agent("ranger"), Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot read Hermes's agents in sandbox home (~/.hermes is a link)"),
+            "{err}"
+        );
+        assert_eq!(engine.audit(None).unwrap().len(), audited);
+        let err = engine
+            .remove_agent(&alice(), &name, &agent("ranger"), Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has no agent `ranger`, and enclos cannot read"),
+            "{err}"
+        );
+        // A tracked agent can still be removed: its record is enclos's.
+        done(
+            engine
+                .remove_agent(&alice(), &name, &agent("scout"), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn the_check_compares_names_both_ways() {
+        let tracked = |n: &str| AgentRecord {
+            name: n.parse().unwrap(),
+            created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
+        };
+        let found: Vec<RuntimeAgentName> = ["main", "scout", "a"]
+            .iter()
+            .map(|n| RuntimeAgentName::new(n).unwrap())
+            .collect();
+        let diff = AgentDiff::compare(&found, &[tracked("main"), tracked("gone")]);
+        assert_eq!(diff.untracked, [agent("scout")]);
+        assert_eq!(diff.untrackable, [RuntimeAgentName::new("a").unwrap()]);
+        assert_eq!(diff.missing, [agent("gone")]);
+        assert!(!diff.is_clean());
+        assert!(AgentDiff::compare(&found[..1], &[tracked("main")]).is_clean());
     }
 
     #[cfg(target_os = "macos")]

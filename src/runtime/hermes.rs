@@ -5,7 +5,16 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
-use super::{HomeFile, Installer, RuntimeAdapter, RuntimeService, SandboxCommand, ServiceName};
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
+
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::io::Errno;
+
+use super::{
+    HomeFile, Installer, NotRead, RuntimeAdapter, RuntimeAgentName, RuntimeService, SandboxCommand,
+    ServiceName, Unreadable,
+};
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 
@@ -22,6 +31,83 @@ pub const INSTALLER_SHA256: &str =
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
 const GATEWAY: ServiceName = ServiceName::new("gateway");
+
+/// The files that make a folder under `~/.hermes/profiles/` a profile, as
+/// Hermes decides it: `_PROFILE_IDENTITY_MARKERS` in `hermes_constants.py`,
+/// read in Hermes 0.22.2. A Hermes change here needs the adapter updated
+/// (design §14).
+const PROFILE_MARKERS: [&str; 6] = [
+    "config.yaml",
+    ".env",
+    "SOUL.md",
+    "profile.yaml",
+    "auth.json",
+    "state.db",
+];
+
+/// At most this many entries of `~/.hermes/profiles/` are read; more means
+/// "cannot tell", never a partial list.
+const MAX_ENTRIES: usize = 512;
+
+const PROFILES: &str = "~/.hermes/profiles";
+const DELETED: &str = "~/.hermes/profiles/.deleted";
+
+/// Hermes's profile id rule, `PROFILE_ID_RE` in `hermes_cli/profiles.py`
+/// (Hermes 0.22.2): `^[a-z0-9][a-z0-9_-]{0,63}$`.
+fn hermes_id(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && name.len() <= 64
+}
+
+fn unreadable(path: &str, why: NotRead) -> Unreadable {
+    Unreadable {
+        path: path.to_owned(),
+        why,
+    }
+}
+
+fn io(path: &str, e: Errno) -> Unreadable {
+    unreadable(path, NotRead::Io(e.to_string()))
+}
+
+/// Opens the folder `name` inside the open folder `dir`, through its
+/// descriptor and without following a link in its place, so what the
+/// sandbox puts there, before or during the read, leads nowhere. `Ok(None)`
+/// when there is no such entry; a link or a non-folder is `Unreadable`.
+fn open_folder(dir: impl AsFd, name: &str, shown: &str) -> Result<Option<OwnedFd>, Unreadable> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOENT) => Ok(None),
+        // A link is refused as a loop (Linux) or as not a folder (macOS).
+        Err(Errno::LOOP | Errno::NOTDIR) => {
+            let link = entry_type(&dir, name, shown)?.is_some_and(FileType::is_symlink);
+            Err(unreadable(
+                shown,
+                if link {
+                    NotRead::Link
+                } else {
+                    NotRead::NotAFolder
+                },
+            ))
+        }
+        Err(e) => Err(io(shown, e)),
+    }
+}
+
+/// What `name` is inside the open folder `dir`, without following a link
+/// at its end: `None` when there is no such entry.
+fn entry_type(dir: impl AsFd, name: &str, shown: &str) -> Result<Option<FileType>, Unreadable> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(io(shown, e)),
+    }
+}
 
 impl RuntimeAdapter for Hermes {
     fn kind(&self) -> RuntimeKind {
@@ -98,6 +184,93 @@ impl RuntimeAdapter for Hermes {
             ]),
         }]
     }
+
+    fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable> {
+        // Hermes lists a named profile when its folder under
+        // `~/.hermes/profiles/` has a valid id, is not `default` (the Hermes
+        // home itself), has one of its identity files, and has no marker
+        // under `profiles/.deleted/`. Where Hermes follows links (a marker
+        // that `is_file` or `is_symlink`, a tombstone that `exists`), enclos
+        // looks without following: a link or a folder in a marker's place
+        // counts as Hermes would count a link, and a dangling link counts as
+        // a tombstone where Hermes would not. Every folder is opened by its
+        // descriptor, so a link the sandbox plants, before or during the
+        // read, is never followed: `.hermes`, `profiles` or `.deleted` as a
+        // link means "cannot tell", and a linked profile folder is not
+        // listed.
+        let home = rustix::fs::open(
+            home,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| match e {
+            Errno::NOENT => unreadable("~", NotRead::Missing),
+            Errno::NOTDIR => unreadable("~", NotRead::NotAFolder),
+            e => io("~", e),
+        })?;
+        let Some(hermes) = open_folder(&home, ".hermes", "~/.hermes")? else {
+            return Ok(Vec::new());
+        };
+        let Some(profiles) = open_folder(&hermes, "profiles", PROFILES)? else {
+            return Ok(Vec::new());
+        };
+        let deleted = open_folder(&profiles, ".deleted", DELETED)?;
+        let mut entries = Vec::new();
+        for entry in Dir::read_from(&profiles).map_err(|e| io(PROFILES, e))? {
+            let entry = entry.map_err(|e| io(PROFILES, e))?;
+            // A name that is not text is not a Hermes id either.
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if name == "." || name == ".." {
+                continue;
+            }
+            if entries.len() == MAX_ENTRIES {
+                return Err(unreadable(PROFILES, NotRead::TooManyEntries(MAX_ENTRIES)));
+            }
+            entries.push(name.to_owned());
+        }
+        let mut names = Vec::new();
+        for name in entries {
+            if name == "default" || !hermes_id(&name) {
+                continue;
+            }
+            // Every Hermes id is a runtime agent name.
+            let Some(agent) = RuntimeAgentName::new(&name) else {
+                continue;
+            };
+            let shown = format!("{PROFILES}/{name}");
+            let profile = match open_folder(&profiles, &name, &shown) {
+                Ok(Some(fd)) => fd,
+                Ok(None) => continue,
+                Err(Unreadable {
+                    why: NotRead::Link | NotRead::NotAFolder,
+                    ..
+                }) => continue,
+                Err(e) => return Err(e),
+            };
+            let mut identity = false;
+            for marker in PROFILE_MARKERS {
+                if entry_type(&profile, marker, &shown)?
+                    .is_some_and(|t| t.is_file() || t.is_symlink())
+                {
+                    identity = true;
+                    break;
+                }
+            }
+            if !identity {
+                continue;
+            }
+            if let Some(deleted) = &deleted
+                && entry_type(deleted, &name, DELETED)?.is_some()
+            {
+                continue;
+            }
+            names.push(agent);
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +308,140 @@ mod tests {
             crate::net::host::AllowEntry::parse(entry).unwrap();
             assert!(!entry.starts_with('*'), "no wildcard: {entry}");
         }
+    }
+
+    fn names(names: &[&str]) -> Vec<RuntimeAgentName> {
+        names
+            .iter()
+            .map(|n| RuntimeAgentName::new(n).unwrap())
+            .collect()
+    }
+
+    /// A home with a `.hermes/profiles` folder, and a way to make a profile
+    /// in it with one identity marker.
+    fn hermes_home() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        impl Fn(&str, Option<&str>),
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let profiles = home.path().join(".hermes/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        let at = profiles.clone();
+        let profile = move |name: &str, marker: Option<&str>| {
+            std::fs::create_dir_all(at.join(name)).unwrap();
+            if let Some(m) = marker {
+                std::fs::write(at.join(name).join(m), "").unwrap();
+            }
+        };
+        (home, profiles, profile)
+    }
+
+    #[test]
+    fn agents_are_listed_as_hermes_lists_its_named_profiles() {
+        let (home, profiles, profile) = hermes_home();
+        profile("main", Some("config.yaml"));
+        profile("my_bot", Some("SOUL.md")); // a Hermes name enclos cannot use
+        profile("default", Some("config.yaml")); // the Hermes home itself
+        profile("ghost", None); // no identity file: not a profile
+        profile("gone", Some(".env"));
+        std::fs::create_dir_all(profiles.join(".deleted/gone")).unwrap();
+        profile("Upper", Some(".env")); // not a Hermes id
+        std::fs::write(profiles.join("file"), "").unwrap();
+        // A marker that is a folder does not count; a link does, as for
+        // Hermes, even a dangling one.
+        profile("boxed", None);
+        std::fs::create_dir(profiles.join("boxed/config.yaml")).unwrap();
+        profile("linked-marker", None);
+        std::os::unix::fs::symlink("/nonexistent", profiles.join("linked-marker/auth.json"))
+            .unwrap();
+        // A tombstone that is a dangling link counts (Hermes would not).
+        profile("buried", Some("config.yaml"));
+        std::os::unix::fs::symlink("/nonexistent", profiles.join(".deleted/buried")).unwrap();
+        // A linked profile folder is not listed.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("config.yaml"), "").unwrap();
+        std::os::unix::fs::symlink(outside.path(), profiles.join("linked")).unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Ok(names(&["linked-marker", "main", "my_bot"]))
+        );
+    }
+
+    #[test]
+    fn a_missing_hermes_or_profiles_folder_means_no_agents() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(Hermes.agents_in(home.path()), Ok(vec![]));
+        std::fs::create_dir(home.path().join(".hermes")).unwrap();
+        assert_eq!(Hermes.agents_in(home.path()), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_link_or_a_file_in_a_folders_place_cannot_be_read_and_says_which() {
+        let at = |path: &str, why| Unreadable {
+            path: path.to_owned(),
+            why,
+        };
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("profiles/main")).unwrap();
+        std::fs::write(outside.path().join("profiles/main/config.yaml"), "").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".hermes")).unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Err(at("~/.hermes", NotRead::Link))
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".hermes"), "").unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Err(at("~/.hermes", NotRead::NotAFolder))
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".hermes")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("profiles"),
+            home.path().join(".hermes/profiles"),
+        )
+        .unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Err(at("~/.hermes/profiles", NotRead::Link))
+        );
+
+        let (home, profiles, profile) = hermes_home();
+        profile("main", Some("config.yaml"));
+        std::os::unix::fs::symlink(outside.path(), profiles.join(".deleted")).unwrap();
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Err(at("~/.hermes/profiles/.deleted", NotRead::Link))
+        );
+
+        let gone = tempfile::tempdir().unwrap();
+        let path = gone.path().to_owned();
+        drop(gone);
+        assert_eq!(Hermes.agents_in(&path), Err(at("~", NotRead::Missing)));
+    }
+
+    #[test]
+    fn more_entries_than_the_cap_cannot_be_read() {
+        let (home, profiles, profile) = hermes_home();
+        for i in 0..MAX_ENTRIES {
+            std::fs::write(profiles.join(format!("f{i}")), "").unwrap();
+        }
+        profile("main", Some("config.yaml"));
+        assert_eq!(
+            Hermes.agents_in(home.path()),
+            Err(Unreadable {
+                path: "~/.hermes/profiles".to_owned(),
+                why: NotRead::TooManyEntries(MAX_ENTRIES),
+            })
+        );
+        std::fs::remove_file(profiles.join("f0")).unwrap();
+        assert_eq!(Hermes.agents_in(home.path()), Ok(names(&["main"])));
     }
 
     #[test]
