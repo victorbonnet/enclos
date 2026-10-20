@@ -9,6 +9,7 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod layout;
+pub mod lifecycle;
 pub mod model;
 pub mod net;
 pub mod policy;

@@ -4,6 +4,7 @@
 mod netlog;
 mod policy;
 mod schema;
+mod sessions;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +23,7 @@ use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
+use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 /// How long `lock` waits for another enclos command to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -126,10 +128,15 @@ impl SqliteStateStore {
         };
         let text = |i: usize| row.get::<_, String>(i).map_err(self.sqlite_err());
         let (name, backend, state, created_at) = (text(0)?, text(1)?, text(2)?, text(4)?);
+        let template = text(5)?;
         let reason: Option<String> = row.get(3).map_err(self.sqlite_err())?;
+        let proxy_port: i64 = row.get(6).map_err(self.sqlite_err())?;
         Ok(SandboxRecord {
             name: name.parse().map_err(|e| corrupt(format!("{e}")))?,
             backend: backend.parse().map_err(|e| corrupt(format!("{e}")))?,
+            template: template.parse().map_err(|e| corrupt(format!("{e}")))?,
+            proxy_port: u16::try_from(proxy_port)
+                .map_err(|_| corrupt(format!("proxy_port {proxy_port}")))?,
             state: match (state.as_str(), reason) {
                 ("created", _) => SandboxState::Created,
                 ("running", _) => SandboxState::Running,
@@ -178,6 +185,21 @@ fn io_err(path: &Path) -> impl Fn(std::io::Error) -> StateError + '_ {
 
 impl StateStore for SqliteStateStore {
     fn lock(&self) -> Result<StateLock> {
+        let started = Instant::now();
+        loop {
+            match self.try_lock()? {
+                Some(lock) => return Ok(lock),
+                None if started.elapsed() < LOCK_WAIT => std::thread::sleep(LOCK_POLL),
+                None => {
+                    return Err(StateError::Locked {
+                        path: self.lock_file.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn try_lock(&self) -> Result<Option<StateLock>> {
         let file: File = OpenOptions::new()
             .read(true)
             .write(true)
@@ -191,20 +213,10 @@ impl StateStore for SqliteStateStore {
                 },
                 _ => io_err(&self.lock_file)(source),
             })?;
-        let started = Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(StateLock::held(file)),
-                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
-                    std::thread::sleep(LOCK_POLL);
-                }
-                Err(TryLockError::WouldBlock) => {
-                    return Err(StateError::Locked {
-                        path: self.lock_file.clone(),
-                    });
-                }
-                Err(TryLockError::Error(source)) => return Err(io_err(&self.lock_file)(source)),
-            }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StateLock::held(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(source)) => Err(io_err(&self.lock_file)(source)),
         }
     }
 
@@ -239,7 +251,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
                  FROM sandboxes WHERE name = ?1",
             )
             .map_err(self.sqlite_err())?;
@@ -254,7 +266,7 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, backend, state, failed_reason, created_at
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port
                  FROM sandboxes ORDER BY name",
             )
             .map_err(self.sqlite_err())?;
@@ -270,17 +282,20 @@ impl StateStore for SqliteStateStore {
         let conn = self.open()?;
         let (state, reason) = state_columns(&rec.state);
         conn.execute(
-            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
                  state = excluded.state, failed_reason = excluded.failed_reason,
-                 created_at = excluded.created_at",
+                 created_at = excluded.created_at, template = excluded.template,
+                 proxy_port = excluded.proxy_port",
             params![
                 rec.name.as_str(),
                 rec.backend.as_str(),
                 state,
                 reason,
-                rec.created_at.to_string()
+                rec.created_at.to_string(),
+                rec.template.as_str(),
+                rec.proxy_port
             ],
         )
         .map_err(self.sqlite_err())?;
@@ -317,6 +332,26 @@ impl StateStore for SqliteStateStore {
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>> {
         let conn = self.open()?;
         policy::history(&conn, name).map_err(|e| self.read_err(e))
+    }
+
+    fn put_session(&self, _lock: &StateLock, session: &SessionRecord) -> Result<SessionId> {
+        let conn = self.open()?;
+        sessions::insert(&conn, session).map_err(self.sqlite_err())
+    }
+
+    fn track(&self, _lock: &StateLock, id: SessionId, tracked: &[ProcessRef]) -> Result<()> {
+        let conn = self.open()?;
+        sessions::track(&conn, id, tracked).map_err(self.sqlite_err())
+    }
+
+    fn end_session(&self, _lock: &StateLock, id: SessionId) -> Result<()> {
+        let conn = self.open()?;
+        sessions::end(&conn, id, now()).map_err(self.sqlite_err())
+    }
+
+    fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>> {
+        let conn = self.open()?;
+        sessions::list(&conn, name, running_only).map_err(|e| self.read_err(e))
     }
 }
 

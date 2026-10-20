@@ -5,6 +5,7 @@ pub mod net;
 pub mod plan;
 pub mod policy;
 pub mod sandbox;
+pub mod session;
 
 /// A point in time, stored and printed in RFC 3339 (UTC).
 pub type Timestamp = jiff::Timestamp;

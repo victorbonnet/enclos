@@ -15,6 +15,8 @@ fn record(name: &str) -> SandboxRecord {
     SandboxRecord {
         name: name.parse().unwrap(),
         backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+        proxy_port: 41000,
         state: SandboxState::Created,
         created_at: "2026-01-02T03:04:05.678Z".parse().unwrap(),
     }
@@ -258,4 +260,71 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         ("evil.example.com", 2)
     );
     assert_eq!(denied[0].first, "2026-01-01T10:00:05.500Z".parse().unwrap());
+}
+
+#[test]
+fn sessions_keep_their_members_until_they_end() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let at = |pid: u32| ProcessRef {
+        pid,
+        started: format!("Thu Oct 8 09:31:{pid} 2026"),
+    };
+    let mut session = SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind: SessionKind::Interactive,
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
+        root: at(10),
+        pgid: None,
+        tracked: vec![at(11)],
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    session.id = store.put_session(&lock, &session).unwrap();
+    assert_eq!(store.sessions(&name, true).unwrap(), [session.clone()]);
+
+    // Tracking replaces what was recorded.
+    store.track(&lock, session.id, &[at(12), at(13)]).unwrap();
+    session.tracked = vec![at(12), at(13)];
+    assert_eq!(store.sessions(&name, true).unwrap(), [session.clone()]);
+
+    // Once ended, it is no longer running, and tracking no longer changes it.
+    store.end_session(&lock, session.id).unwrap();
+    assert!(store.sessions(&name, true).unwrap().is_empty());
+    store.track(&lock, session.id, &[]).unwrap();
+    let ended = store.sessions(&name, false).unwrap();
+    assert_eq!(ended[0].tracked, session.tracked);
+    assert!(ended[0].ended_at.is_some());
+
+    // Removing the sandbox removes its sessions.
+    store.remove(&lock, &name).unwrap();
+    assert!(store.sessions(&name, false).unwrap().is_empty());
+}
+
+#[test]
+fn reports_corrupt_session_members() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (sandbox, kind, version, snapshot, root_pid, root_start, tracked,
+             started_at)
+         VALUES ('home', 'interactive', 1, 'x', 10, 't', '[[1]]', '2026-10-08T09:31:10Z')",
+        [],
+    )
+    .unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    assert!(matches!(
+        store.sessions(&name, true),
+        Err(StateError::Corrupt { .. })
+    ));
 }

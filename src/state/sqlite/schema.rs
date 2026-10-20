@@ -47,6 +47,24 @@ pub const MIGRATIONS: &[&str] = &[
         duration_ms INTEGER NOT NULL
     ) STRICT;
     CREATE INDEX net_events_by_sandbox ON net_events (sandbox, at);",
+    // 4: each sandbox's template and proxy port, and sessions
+    "ALTER TABLE sandboxes ADD COLUMN template TEXT NOT NULL DEFAULT 'assistant';
+    ALTER TABLE sandboxes ADD COLUMN proxy_port INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE sessions (
+        id          INTEGER PRIMARY KEY,
+        sandbox     TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        kind        TEXT NOT NULL,
+        version     INTEGER NOT NULL,
+        snapshot    TEXT NOT NULL,
+        compiled    TEXT,
+        root_pid    INTEGER NOT NULL,
+        root_start  TEXT NOT NULL,
+        pgid        INTEGER,
+        tracked     TEXT NOT NULL DEFAULT '[]',
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT
+    ) STRICT;
+    CREATE INDEX sessions_running ON sessions (sandbox, ended_at);",
 ];
 
 /// The schema version this enclos reads and writes.

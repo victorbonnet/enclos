@@ -33,6 +33,10 @@ enum Command {
     Init,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),
+    /// Create, list, show, stop or remove sandboxes.
+    Sandbox(cli::sandbox::SandboxArgs),
+    /// Open a shell, or run a command, inside a sandbox.
+    Connect(cli::connect::ConnectArgs),
     /// Show or change a sandbox's policy.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
@@ -97,6 +101,8 @@ fn run(cli: Cli) -> Result<u8> {
             verb: Some(AuditVerb::Verify),
             ..
         }) => Ok(print_verify(&engine.verify_audit()?)),
+        Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
+        Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, args),

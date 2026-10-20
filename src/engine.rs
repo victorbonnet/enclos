@@ -5,10 +5,14 @@
 mod compile;
 mod net;
 mod policy;
+mod sandbox;
+mod session;
 #[cfg(test)]
 mod tests;
 
 pub use policy::{PolicyApplied, PolicyView};
+pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
+pub use session::{Left, SessionEnd};
 
 use std::path::PathBuf;
 
@@ -30,6 +34,8 @@ pub struct Engine {
     state: Box<dyn StateStore>,
     audit: Box<dyn AuditLog>,
     backends: Vec<Box<dyn Backend>>,
+    /// The enclos program, to start the proxy and services with.
+    exe: Option<std::path::PathBuf>,
 }
 
 /// What `enclos init` did.
@@ -88,6 +94,7 @@ impl Engine {
             state,
             audit,
             backends,
+            exe: std::env::current_exe().ok(),
         }
     }
 

@@ -136,38 +136,23 @@ fn audit_since_keeps_recent_entries() {
 
 mod policy {
     use super::*;
-    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
+    use crate::model::sandbox::SandboxName;
 
-    /// An initialized engine with sandbox `home` and its first policy, made
-    /// the way `sandbox create` will make it.
+    /// An initialized engine with sandbox `home`, created as the CLI does.
     fn with_sandbox() -> (TempDir, Engine, SandboxName) {
-        with_sandbox_on(Vec::new())
+        with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt))
     }
 
-    fn with_sandbox_on(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine, SandboxName) {
-        let (dir, engine) = engine_with(backends);
+    pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
+        let (dir, engine) = engine_with(vec![Box::new(backend)]);
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "home".parse().unwrap();
-        engine
-            .write(
-                &alice(),
-                "sandbox create",
-                Some("home".into()),
-                |_| String::new(),
-                |lock| {
-                    engine.state.put(
-                        lock,
-                        &SandboxRecord {
-                            name: name.clone(),
-                            backend: BackendKind::Seatbelt,
-                            state: SandboxState::Created,
-                            created_at: now(),
-                        },
-                    )?;
-                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
-                },
-            )
-            .unwrap();
+        let spec = crate::engine::SandboxSpec {
+            name: name.clone(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
         (dir, engine, name)
     }
 
@@ -387,39 +372,12 @@ mod policy {
 }
 
 mod compile {
+    use super::policy::with_sandbox_on;
     use super::*;
-    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-
-    fn sandbox_on(backend: FakeBackend) -> (TempDir, Engine, SandboxName) {
-        let (dir, engine) = engine_with(vec![Box::new(backend)]);
-        done(engine.init(&alice(), Confirm::Yes).unwrap());
-        let name: SandboxName = "home".parse().unwrap();
-        engine
-            .write(
-                &alice(),
-                "sandbox create",
-                None,
-                |_| String::new(),
-                |lock| {
-                    engine.state.put(
-                        lock,
-                        &SandboxRecord {
-                            name: name.clone(),
-                            backend: BackendKind::Seatbelt,
-                            state: SandboxState::Created,
-                            created_at: now(),
-                        },
-                    )?;
-                    engine.create_policy(lock, &alice(), &name, &"assistant".parse().unwrap())
-                },
-            )
-            .unwrap();
-        (dir, engine, name)
-    }
 
     #[test]
     fn the_active_policy_compiles_once_into_the_sandbox_folder() {
-        let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let file = engine.compile_policy(&name, 41001).unwrap();
         assert!(file.starts_with(engine.layout.sandbox_dir("home").join("compiled")));
         assert!(
@@ -439,7 +397,7 @@ mod compile {
 
     #[test]
     fn a_cut_off_compiled_policy_is_never_reused() {
-        let (_dir, engine, name) = sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let file = engine.compile_policy(&name, 41001).unwrap();
         let full = std::fs::read_to_string(&file).unwrap();
 
@@ -463,11 +421,341 @@ mod compile {
     }
 
     #[test]
-    fn a_backend_this_host_cannot_run_is_refused() {
-        let (_dir, engine, name) =
-            sandbox_on(FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS"));
-        let err = engine.compile_policy(&name, 41001).unwrap_err();
+    fn a_backend_this_host_cannot_run_is_refused_and_nothing_is_left() {
+        let backend = FakeBackend::unavailable(BackendKind::Seatbelt, "not macOS");
+        let (_dir, engine) = engine_with(vec![Box::new(backend)]);
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let spec = crate::engine::SandboxSpec {
+            name: "home".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        let err = engine
+            .create_sandbox(&alice(), spec, Confirm::Yes)
+            .unwrap_err();
         assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
         assert_eq!(err.exit_code(), 2);
+        assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+}
+
+mod sandbox {
+    use super::policy::with_sandbox_on;
+    use super::*;
+    use crate::engine::SandboxSpec;
+    use crate::lifecycle::process::reference;
+    use crate::model::sandbox::{SandboxRecord, SandboxState};
+    use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
+
+    fn spec(name: &str) -> SandboxSpec {
+        SandboxSpec {
+            name: name.parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn each_sandbox_gets_its_own_port_and_names_are_unique() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let lab = done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+        let home = engine
+            .show_sandbox(&"home".parse().unwrap())
+            .unwrap()
+            .record;
+        // A port another program listens on is skipped, so only the order is fixed.
+        assert!(home.proxy_port >= 41000 && lab.proxy_port > home.proxy_port);
+        let err = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SandboxExists { .. }), "{err}");
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn removing_asks_first_and_deletes_the_folder() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let dir = engine.layout.sandbox_dir("home");
+        assert!(dir.join("policy.toml").exists());
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Ask)
+            .unwrap_err();
+        assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(!dir.exists());
+        assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+
+    /// Runs `work` while another command holds the state lock: `work`
+    /// passes its checks and waits, then `meanwhile` changes the state
+    /// before the lock is released.
+    fn while_waiting<T>(
+        engine: &Engine,
+        work: impl FnOnce() -> T,
+        meanwhile: impl FnOnce(&Engine, &crate::state::StateLock) + Send,
+    ) -> T {
+        let layout = engine.layout.clone();
+        let (held, wait) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let other = Engine::open(layout);
+                let lock = other.state.lock().unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                meanwhile(&other, &lock);
+            });
+            wait.recv().unwrap();
+            work()
+        })
+    }
+
+    #[test]
+    fn a_create_that_waited_for_the_lock_checks_the_name_again() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let first = SandboxRecord {
+            name: "lab".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+            state: SandboxState::Created,
+            proxy_port: 1,
+            created_at: crate::model::now(),
+        };
+        let err = while_waiting(
+            &engine,
+            || engine.create_sandbox(&alice(), spec("lab"), Confirm::Yes),
+            |other, lock| other.state.put(lock, &first).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SandboxExists { .. }), "{err}");
+        let lab = engine.state.get(&first.name).unwrap().unwrap();
+        assert_eq!(lab.proxy_port, 1);
+    }
+
+    #[test]
+    fn a_remove_that_waited_for_the_lock_checks_for_sessions_again() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let session = SessionRecord {
+            id: SessionId(0),
+            sandbox: name.clone(),
+            kind: SessionKind::Interactive,
+            version: 1,
+            snapshot: engine.policy(&name).unwrap().snapshot.id,
+            compiled: None,
+            // Matches no process: this test never stops it.
+            root: ProcessRef {
+                pid: u32::MAX,
+                started: "never".into(),
+            },
+            pgid: None,
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let err = while_waiting(
+            &engine,
+            || engine.remove_sandbox(&alice(), &name, false, Confirm::Yes),
+            |other, lock| {
+                other.state.put_session(lock, &session).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::SandboxRunning { .. }), "{err}");
+        assert!(engine.layout.sandbox_home("home").is_dir());
+    }
+
+    #[test]
+    fn a_create_with_an_unknown_template_leaves_nothing() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let mut bad = spec("lab");
+        bad.template = "does-not-exist".parse().unwrap();
+        engine
+            .create_sandbox(&alice(), bad, Confirm::Yes)
+            .unwrap_err();
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 1);
+        done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_failed_create_keeps_a_folder_kept_by_remove() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, true, Confirm::Yes)
+                .unwrap(),
+        );
+        let home = engine.layout.sandbox_home("home");
+        std::fs::write(home.join("notes"), "kept").unwrap();
+        let mut bad = spec("home");
+        bad.template = "does-not-exist".parse().unwrap();
+        engine
+            .create_sandbox(&alice(), bad, Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(home.join("notes")).unwrap(), "kept");
+    }
+
+    #[test]
+    fn dry_runs_of_stop_and_connect_change_nothing() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let entries = engine.audit(None).unwrap().len();
+        let Planned::DryRun(plan) = engine
+            .stop_sandbox(&alice(), &name, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run stopped the sandbox");
+        };
+        assert_eq!(plan.changes, ["mark sandbox home stopped"]);
+        let Planned::DryRun(plan) = engine
+            .connect(&alice(), &name, Vec::new(), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run connected");
+        };
+        assert!(
+            plan.changes
+                .last()
+                .is_some_and(|c| c.starts_with("run `/bin/zsh -l` in sandbox home")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            crate::model::sandbox::SandboxState::Created
+        );
+        assert!(engine.state.sessions(&name, false).unwrap().is_empty());
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    #[test]
+    fn dry_runs_of_create_and_rm_change_nothing() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let entries = engine.audit(None).unwrap().len();
+        let Planned::DryRun(_) = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run created a sandbox");
+        };
+        let Planned::DryRun(_) = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run removed a sandbox");
+        };
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        assert!(engine.layout.sandbox_home("home").is_dir());
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 1);
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    #[test]
+    fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        // A program in a group made for it, which leaves a sleep there and
+        // exits once its input closes: the sleep is only counted.
+        let mut program = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let session = SessionRecord {
+            id: SessionId(0),
+            sandbox: name.clone(),
+            kind: SessionKind::Interactive,
+            version: 1,
+            snapshot: engine.policy(&name).unwrap().snapshot.id,
+            compiled: None,
+            root: reference(program.id()).unwrap().unwrap(),
+            pgid: Some(program.id()),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let lock = engine.state.lock().unwrap();
+        let id = engine.state.put_session(&lock, &session).unwrap();
+        drop(lock);
+        let start = std::time::Instant::now();
+        let sleep = loop {
+            let view = engine.show_sandbox(&name).unwrap();
+            if let Some(m) = view.sessions[0]
+                .members
+                .iter()
+                .find(|m| m.pid != program.id())
+            {
+                break m.clone();
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        program.stdin.take().unwrap().write_all(b"\n").unwrap();
+        program.wait().unwrap();
+
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert!(report.stopped.is_empty());
+        let survivors = &report.survivors;
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].0, id);
+        assert_eq!(survivors[0].1[0].member, sleep);
+        assert_eq!(
+            survivors[0].1[0].why,
+            crate::lifecycle::stop::Why::NotSignalled
+        );
+        assert!(matches!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            SandboxState::Failed { .. }
+        ));
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SandboxNotStopped { .. }), "{err}");
+
+        // Once the user ends it, stop finds the session empty and ends it.
+        let sleep = ProcessRef {
+            pid: sleep.pid,
+            started: sleep.started,
+        };
+        crate::lifecycle::process::signal_process(&sleep, crate::lifecycle::process::Signal::Kill)
+            .unwrap();
+        let start = std::time::Instant::now();
+        while crate::lifecycle::process::is_same(&sleep).unwrap() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert_eq!(report.stopped, [id]);
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            SandboxState::Stopped
+        );
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn stopping_a_sandbox_with_nothing_running_marks_it_stopped() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert!(report.stopped.is_empty() && report.survivors.is_empty());
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            crate::model::sandbox::SandboxState::Stopped
+        );
     }
 }
