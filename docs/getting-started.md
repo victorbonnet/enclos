@@ -62,13 +62,13 @@ Hermes prints its own next steps after creating an agent, such as `main setup` a
 
 ### Agents made inside the sandbox
 
-You can also create an agent with Hermes's own commands, from a shell in the sandbox (`enclos connect lab`, then `hermes profile create scout`). It works right away (`enclos connect lab -- scout`), but enclos has no record of it yet, so `enclos agent list lab` would not show it. enclos tells you when it sees one, at the end of the `connect` session, in `enclos agent list lab` and in `enclos sandbox show lab`:
+You can also create an agent with Hermes's own commands, from a shell in the sandbox (`enclos connect lab`, then `hermes profile create scout`). It works right away (`enclos connect lab -- scout`), but enclos has no record of it yet, so `enclos agent list lab` would not show it. enclos tells you when it sees one, at the end of the `connect` session (on stderr, prefixed with `enclos:`), in `enclos agent list lab` and in `enclos sandbox show lab`:
 
 ```text
-lab/scout: made inside the sandbox, not tracked by enclos. Track it with `enclos agent add lab/scout`.
+lab/scout: Hermes has this agent; enclos does not track it. Track it with `enclos agent add lab/scout`.
 ```
 
-`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record. Agent names in enclos are a lowercase letter followed by lowercase letters, digits or hyphens; a Hermes agent named otherwise (`my_bot`) is reported but cannot be tracked.
+`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
 
 ## Check the sandbox
 

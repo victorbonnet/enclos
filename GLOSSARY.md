@@ -45,7 +45,7 @@ A named identity of the sandbox's runtime, with its own configuration, memory, s
 _Avoid_: profile (Hermes's word for it), instance, persona, bot
 
 **Untracked agent**:
-An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. enclos reports it and tracks it once it is added.
+An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. It becomes a tracked agent when added.
 _Avoid_: orphan, rogue agent, unknown agent
 
 **Session**:

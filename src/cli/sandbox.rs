@@ -82,7 +82,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 };
                 println!("  service {label}: {state}");
             }
-            if let Ok(agents) = engine.agents(&name) {
+            // Agents are the runtime's: nothing to list without one.
+            if engine.runtime(&name)?.is_some() {
+                let agents = engine.agents(&name)?;
                 let list: Vec<String> = agents.iter().map(|a| a.name.to_string()).collect();
                 println!(
                     "  agents: {}",
@@ -92,9 +94,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                         list.join(", ")
                     }
                 );
-            }
-            for note in super::agent::check_notes(engine, &name, true) {
-                println!("  {note}");
+                for note in super::agent::check_notes(engine, &name, true)? {
+                    println!("  {note}");
+                }
             }
         }
         SandboxVerb::Start { name } if confirm == Confirm::DryRun => {

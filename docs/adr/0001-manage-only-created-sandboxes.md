@@ -9,3 +9,7 @@ enclos creates named, persistent sandboxes, installs an agent in each, and gover
 ## Considered options
 
 - **Wrap any command (`enclos run -- <cmd>`):** simpler, but it gives enclos nothing persistent to hold a policy, a state or a network log against. `enclos exec <sandbox> -- <cmd>` covers one-off commands inside an existing sandbox.
+
+## Consequences
+
+- Inside a sandbox enclos created, agents made with the runtime's own commands are reported and adopted on request ([0023](0023-agents-made-inside-a-sandbox.md)); that is a read of the sandbox's own home, not discovery on the host.

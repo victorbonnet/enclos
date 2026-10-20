@@ -359,13 +359,13 @@ pub trait RuntimeAdapter {
     fn agent_files(&self, agent: &AgentName) -> String;                         // where the runtime keeps the agent's files, for messages
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
     fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
-    fn agents_in(&self, home: &Path) -> Option<Vec<String>>;                     // read on the host; None: cannot tell
+    fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;   // read on the host; Err: cannot tell, and why
 }
 ```
 
 For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
 
-**Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so `agent list` and `sandbox show` miss them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/` with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link, reads a bounded number of entries, and answers `None` (cannot tell) rather than guess. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session and when a name is not found, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. `enclos agent add` adopts an agent the runtime already has: it records it without creating it again. enclos never adopts or removes an agent on its own.
+**Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so `agent list` and `sandbox show` miss them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/`, other than `default`, with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link (each folder is opened by its descriptor, so a link planted before or during the read leads nowhere), reads a bounded number of entries, and answers `Unreadable`, with the path and the reason, rather than guess. A name it returns is a `RuntimeAgentName`: one printable word, wider than an agent name, safe in a message. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session (there without the names it cannot use, which only a rename inside the sandbox changes) and when `agent rm` names an agent it does not track, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. When the list cannot be read, each of these says so instead, and `agent add` refuses to act. `enclos agent add` adopts an agent the runtime already has: it records it without creating it again, re-checking under the lock. enclos never adopts or removes an agent on its own. After `agent rm`, whose files stay, the runtime still has the agent and enclos reports it as one it does not track.
 
 **Engine** — the API every client calls. Reads are not audited. Every write takes the lock, opens an audit entry, does the work, saves state and closes the entry, also on failure. `Confirm::DryRun` returns the plan without changing anything.
 
@@ -379,8 +379,8 @@ impl Engine {
     pub fn denials(&self, name: &SandboxName, since: Timestamp) -> Result<Vec<Denial>>;
 
     pub fn create(&self, by: &Actor, spec: SandboxSpec, confirm: Confirm) -> Result<Planned<SandboxRecord>>;
-    pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentSpec) -> Result<AddedAgent>;   // or adopts one made inside
-    pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck>;   // the runtime's agents vs the records
+    pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentName, confirm: Confirm) -> Result<Planned<AgentAdded>>;   // created, or adopted when made inside
+    pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck>;   // Compared(the differences) or Unreadable(why)
     pub fn remove_agent(&self, by: &Actor, agent: &AgentRef, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
     pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + the runtime's services
     pub fn stop(&self, by: &Actor, name: &SandboxName) -> Result<StopReport>;       // every member; survivors reported
@@ -446,7 +446,7 @@ enclos exec <name> -- <cmd...>
 enclos logs <name> [-f]
 
 enclos agent add <name>/<agent> [--model ...]   also adopts an agent made inside the sandbox
-enclos agent list <name>                      with the agents made inside that enclos does not track
+enclos agent list <name>                      with what differs from the runtime's own list: agents made inside, names enclos cannot use, agents gone
 # no `agent start | stop | restart`: services belong to the sandbox (ADR 0021)
 enclos agent rm <name>/<agent>               the record only: the files stay in the sandbox home (milestone 1)
 
@@ -590,6 +590,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
 The design depends on these, and none has been shown to work yet. The milestone 1 prototype resolves each one, except the ADR 0006 evidence and the secrets items (per-agent channel secrets, keychain items, the Keychain from a service), which milestone 2 gathers; the result is recorded in the design or an ADR.
 
 - How Hermes creates and selects the profiles it keeps agents in (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), (agents share one login per sandbox, shown by the prototype and recorded in §12).
+- That the Hermes adapter's `agents_in` lists what `hermes profile list` lists (the id rule, the identity files, `.deleted/` markers, `default` left out) for the Hermes version the installer serves ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)): the rules were read in Hermes 0.22.2's source, not compared against a run.
 - That a sandboxed Hermes gateway run with `--external-supervisor` exits for the service manager to restart it on an in-chat restart or update, rather than starting a replacement ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). What Hermes runs as a background service, one gateway serving every agent beside `connect` sessions, was shown by the prototype (issue #5) and is recorded there.
 - The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). No probe tries these routes yet: posting synthetic input events, `at` jobs, installing a crontab, registering a login item, typing into the terminal (TIOCSTI); `policy test` names them.
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.

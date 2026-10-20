@@ -106,11 +106,86 @@ pub trait RuntimeAdapter {
     /// has one gateway serving every agent (ADR 0021).
     fn services(&self) -> Vec<RuntimeService>;
     /// The names of the agents the runtime has in this sandbox home, as it
-    /// would list them, read on the host without running anything. `None`
-    /// when the runtime has no named agents, or when its listing cannot be
-    /// read safely. The sandbox writes its home, so implementations never
-    /// follow a link and read a bounded number of entries (ADR 0023).
-    fn agents_in(&self, home: &Path) -> Option<Vec<String>>;
+    /// would list them, sorted, read on the host without running anything.
+    /// The sandbox writes its home, so implementations never follow a link,
+    /// read a bounded number of entries, and answer [`Unreadable`], with
+    /// the reason, rather than guess (ADR 0023).
+    fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+}
+
+/// A name a runtime gives one of its agents, as the runtime writes it.
+/// Wider than [`AgentName`] (Hermes allows `_` and a leading digit), but
+/// still one printable ASCII word of at most 64 bytes, so it is safe in a
+/// message. Adapters apply their runtime's own rule first; this one is the
+/// trait's promise to whoever prints the name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RuntimeAgentName(String);
+
+impl RuntimeAgentName {
+    /// `[a-z0-9][a-z0-9_.-]{0,63}`; `None` otherwise.
+    pub fn new(name: &str) -> Option<RuntimeAgentName> {
+        let mut chars = name.chars();
+        let ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | '-')
+            })
+            && name.len() <= 64;
+        ok.then(|| RuntimeAgentName(name.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Every agent name is a runtime agent name: the short-name rule is the
+/// narrower one.
+impl From<&AgentName> for RuntimeAgentName {
+    fn from(name: &AgentName) -> RuntimeAgentName {
+        RuntimeAgentName(name.as_str().to_owned())
+    }
+}
+
+impl fmt::Display for RuntimeAgentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why an adapter could not read its runtime's agents in a sandbox home
+/// (ADR 0023): what the sandbox wrote cannot be read safely, or at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// The path, as the sandbox sees it: `~/.hermes/profiles`.
+    pub path: String,
+    pub why: NotRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRead {
+    /// A link, which the sandbox may have pointed anywhere.
+    Link,
+    NotAFolder,
+    Missing,
+    /// More entries than an adapter reads.
+    TooManyEntries(usize),
+    /// A read failed; the OS's words.
+    Io(String),
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = &self.path;
+        match &self.why {
+            NotRead::Link => write!(f, "{path} is a link"),
+            NotRead::NotAFolder => write!(f, "{path} is not a folder"),
+            NotRead::Missing => write!(f, "{path} is missing"),
+            NotRead::TooManyEntries(max) => write!(f, "{path} has more than {max} entries"),
+            NotRead::Io(e) => write!(f, "{path}: {e}"),
+        }
+    }
 }
 
 /// One background process of a runtime, run by the host's service manager
@@ -203,6 +278,45 @@ mod tests {
         for bad in ["", "/etc/x", "../x", "bin/../../x", "bin//x", "./x"] {
             assert!(!file(bad).path_is_inside_home(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_runtime_agent_name_is_one_printable_word_and_wider_than_an_agent_name() {
+        for good in ["main", "my_bot", "0day", "a.b-c_d", &"x".repeat(64)] {
+            assert_eq!(RuntimeAgentName::new(good).unwrap().as_str(), good);
+        }
+        for bad in [
+            "",
+            "Main",
+            "-x",
+            "_x",
+            "a b",
+            "a/b",
+            "a\u{1b}[0m",
+            "é",
+            &"x".repeat(65),
+        ] {
+            assert!(RuntimeAgentName::new(bad).is_none(), "{bad:?}");
+        }
+        let main: AgentName = "main".parse().unwrap();
+        assert_eq!(RuntimeAgentName::from(&main).as_str(), "main");
+    }
+
+    #[test]
+    fn unreadable_says_the_path_and_the_reason() {
+        let at = |why| Unreadable {
+            path: "~/.hermes".to_owned(),
+            why,
+        };
+        assert_eq!(at(NotRead::Link).to_string(), "~/.hermes is a link");
+        assert_eq!(
+            at(NotRead::TooManyEntries(512)).to_string(),
+            "~/.hermes has more than 512 entries"
+        );
+        assert_eq!(
+            at(NotRead::Io("permission denied".into())).to_string(),
+            "~/.hermes: permission denied"
+        );
     }
 
     #[test]
