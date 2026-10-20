@@ -111,6 +111,7 @@ impl Engine {
                 r.not_run()
             )
         };
+        self.wait_service_proxy(name)?;
         self.write(by, "policy test", Some(name.to_string()), summary, |lock| {
             let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),

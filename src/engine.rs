@@ -19,6 +19,7 @@ pub use probe::TestReport;
 pub(crate) use runtime::home_files_script;
 pub use runtime::{AgentAdded, AgentRemoved, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
+pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 
 use std::path::PathBuf;

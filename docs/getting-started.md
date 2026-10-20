@@ -56,6 +56,8 @@ enclos connect lab                        # a shell in the sandbox, for anything
 
 enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
 
+Until you run the sandbox (below), only what you run in `connect` runs: the Hermes gateway, which serves scheduled jobs and messaging for every agent, is not running yet.
+
 Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
 
 ## Check the sandbox

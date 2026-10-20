@@ -14,6 +14,7 @@ use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
 use crate::model::session::{Member, SessionId, SessionRecord};
+use crate::service::ServiceLabel;
 use std::path::Path;
 
 /// What `enclos sandbox create` takes.
@@ -48,6 +49,8 @@ pub struct SessionView {
 /// What stopping a sandbox did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopReport {
+    /// The services removed, so they do not start again.
+    pub services: Vec<ServiceLabel>,
     pub stopped: Vec<SessionId>,
     pub survivors: Vec<(SessionId, Vec<Survivor>)>,
 }
@@ -230,11 +233,21 @@ impl Engine {
             }));
         }
         let summary = |r: &StopReport| match r.survivors.is_empty() {
-            true => format!("stopped {} sessions", r.stopped.len()),
-            false => format!("{} sessions left members running", r.survivors.len()),
+            true => format!(
+                "removed {} services, stopped {} sessions",
+                r.services.len(),
+                r.stopped.len()
+            ),
+            false => format!(
+                "removed {} services; {} sessions left members running",
+                r.services.len(),
+                r.survivors.len()
+            ),
         };
-        // The services first, so launchd does not restart what is stopped.
-        self.stop_services(name)?;
+        // The services first, so the service manager does not restart what
+        // is stopped; outside the lock, which a service told to end needs to
+        // record its end.
+        let services = self.stop_services(name)?;
         self.write(
             by,
             "sandbox stop",
@@ -245,6 +258,7 @@ impl Engine {
                     name: name.to_string(),
                 })?;
                 let mut report = StopReport {
+                    services: services.clone(),
                     stopped: Vec::new(),
                     survivors: Vec::new(),
                 };

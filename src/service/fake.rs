@@ -3,20 +3,40 @@
 
 use std::cell::RefCell;
 
-use super::{ServiceError, ServiceManager, ServiceStatus, ServiceUnit};
+use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
 
 #[derive(Default)]
 pub struct FakeServices {
     pub started: RefCell<Vec<ServiceUnit>>,
-    pub stopped: RefCell<Vec<String>>,
+    pub stopped: RefCell<Vec<ServiceLabel>>,
     /// Starts of labels ending with this fail.
     pub refuse: RefCell<Option<String>>,
+    /// Stops of labels ending with this fail.
+    pub refuse_stop: RefCell<Option<String>>,
+}
+
+impl FakeServices {
+    /// As if a unit were installed, by an earlier enclos or by hand.
+    pub fn seed(&self, label: &str) {
+        self.started.borrow_mut().push(ServiceUnit {
+            label: ServiceLabel::parse(label).unwrap(),
+            program: "/usr/local/bin/enclos".into(),
+            args: Vec::new(),
+            log: "/dev/null".into(),
+            env: Vec::new(),
+            stop_timeout: std::time::Duration::ZERO,
+        });
+    }
 }
 
 impl ServiceManager for FakeServices {
+    fn available(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
         if let Some(end) = self.refuse.borrow().as_deref()
-            && unit.label.ends_with(end)
+            && unit.label.as_str().ends_with(end)
         {
             return Err(ServiceError {
                 what: format!("refused {}", unit.label),
@@ -28,46 +48,57 @@ impl ServiceManager for FakeServices {
         Ok(())
     }
 
-    fn stop(&self, label: &str) -> Result<(), ServiceError> {
-        self.started.borrow_mut().retain(|u| u.label != label);
-        self.stopped.borrow_mut().push(label.to_owned());
+    fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+        if let Some(end) = self.refuse_stop.borrow().as_deref()
+            && label.as_str().ends_with(end)
+        {
+            return Err(ServiceError {
+                what: format!("would not stop {label}"),
+            });
+        }
+        self.started.borrow_mut().retain(|u| u.label != *label);
+        self.stopped.borrow_mut().push(label.clone());
         Ok(())
     }
 
-    fn status(&self, label: &str) -> ServiceStatus {
-        if self.started.borrow().iter().any(|u| u.label == label) {
+    fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus, ServiceError> {
+        Ok(if self.started.borrow().iter().any(|u| u.label == *label) {
             ServiceStatus::Loaded
         } else {
             ServiceStatus::NotLoaded
-        }
+        })
     }
 
-    fn installed(&self, prefix: &str) -> Result<Vec<String>, ServiceError> {
+    fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         Ok(self
             .started
             .borrow()
             .iter()
             .map(|u| u.label.clone())
-            .filter(|l| l.starts_with(prefix))
+            .filter(|l| l.as_str().starts_with(prefix))
             .collect())
     }
 }
 
 /// Shared, so a test keeps a handle on what the engine asked.
 impl ServiceManager for std::rc::Rc<FakeServices> {
+    fn available(&self) -> Result<(), ServiceError> {
+        self.as_ref().available()
+    }
+
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
         self.as_ref().start(unit)
     }
 
-    fn stop(&self, label: &str) -> Result<(), ServiceError> {
+    fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
         self.as_ref().stop(label)
     }
 
-    fn status(&self, label: &str) -> ServiceStatus {
+    fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus, ServiceError> {
         self.as_ref().status(label)
     }
 
-    fn installed(&self, prefix: &str) -> Result<Vec<String>, ServiceError> {
+    fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         self.as_ref().installed(prefix)
     }
 }

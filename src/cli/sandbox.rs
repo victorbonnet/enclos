@@ -2,14 +2,14 @@
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Engine, SandboxSpec, SandboxView, StopReport};
+use enclos::engine::{Engine, PROXY_WAIT, SandboxSpec, SandboxView, StopReport};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use enclos::model::session::SessionKind;
-use enclos::service::ServiceStatus;
+use enclos::service::{ServiceLabel, ServiceStatus};
 
 #[derive(Args)]
 pub struct SandboxArgs {
@@ -33,7 +33,7 @@ enum SandboxVerb {
     List,
     /// Show a sandbox: its state, policy version, sessions and their processes.
     Show { name: SandboxName },
-    /// Run the sandbox's proxy and its runtime's gateway in the background, now and at each login.
+    /// Run the sandbox's proxy and its runtime's services in the background, now and at each login.
     Start { name: SandboxName },
     /// Stop every service, session and process of a sandbox.
     Stop { name: SandboxName },
@@ -86,7 +86,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::Start { name } if confirm == Confirm::DryRun => {
             print_would_start(&name, &engine.service_labels(&name)?)
         }
-        SandboxVerb::Start { name } => print_started(&name, &engine.start_sandbox(by, &name)?),
+        SandboxVerb::Start { name } => {
+            return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
+        }
         SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
             Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
             Planned::Done(report) => return Ok(print_stop(&name, &report)),
@@ -101,7 +103,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 if code != exit::OK {
                     return Ok(code);
                 }
-                print_started(&name, &engine.start_sandbox(by, &name)?);
+                return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
             }
         },
         SandboxVerb::Rm { name, keep_data } => {
@@ -199,7 +201,8 @@ fn print_show(v: &SandboxView) {
 fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
     if report.survivors.is_empty() {
         println!(
-            "Stopped sandbox {name}: {} sessions ended.",
+            "Stopped sandbox {name}: {} services removed, {} sessions ended.",
+            report.services.len(),
             report.stopped.len()
         );
         return exit::OK;
@@ -221,18 +224,31 @@ fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
     exit::ERROR
 }
 
-fn print_would_start(name: &SandboxName, labels: &[String]) {
+fn print_would_start(name: &SandboxName, labels: &[ServiceLabel]) {
     for label in labels {
-        println!("Would install and load the launchd job {label} for sandbox {name}.");
+        println!("Would install and start the service {label} of sandbox {name}.");
     }
 }
 
-fn print_started(name: &SandboxName, labels: &[String]) {
-    println!(
-        "Started sandbox {name} in the background: {}.",
-        labels.join(", ")
+/// Reports the services installed, once the proxy runs: the services start
+/// on their own, and a proxy whose port is taken never does.
+fn print_started(engine: &Engine, name: &SandboxName, labels: &[ServiceLabel]) -> Result<u8> {
+    let labels = labels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if engine.proxy_started(name, PROXY_WAIT)? {
+        println!("Started sandbox {name} in the background: {labels}.");
+        println!(
+            "It starts again at each login until `enclos sandbox stop {name}`. Logs: `enclos logs {name}`."
+        );
+        return Ok(exit::OK);
+    }
+    println!("Installed the services of sandbox {name}: {labels}.");
+    eprintln!(
+        "error: the proxy of sandbox {name} has not started after {} seconds. See `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`.",
+        PROXY_WAIT.as_secs()
     );
-    println!(
-        "It starts again at each login until `enclos sandbox stop {name}`. Logs: `enclos logs {name}`."
-    );
+    Ok(exit::ERROR)
 }

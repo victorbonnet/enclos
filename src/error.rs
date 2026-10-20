@@ -23,6 +23,8 @@ pub enum Error {
     SandboxExists { name: String },
     #[error("sandbox `{name}` has sessions open. End them first with `enclos sandbox stop {name}`")]
     SandboxRunning { name: String },
+    #[error(transparent)]
+    Service(#[from] crate::service::ServiceError),
     #[error(
         "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
     )]
@@ -107,6 +109,7 @@ impl Error {
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
+            | Error::Service(_)
             | Error::Processes(_) => exit::ERROR,
             Error::CleanupFailed { error, .. } => error.exit_code(),
             Error::BackendUnavailable { .. } => exit::REFUSED,

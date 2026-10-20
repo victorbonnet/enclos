@@ -1,5 +1,5 @@
-//! `enclos launch` and `enclos logs`: a sandbox's background service, as
-//! launchd runs it, and its logs.
+//! `enclos launch` and `enclos logs`: one of a sandbox's runtime services,
+//! as the host's service manager runs it, and the services' logs.
 
 use std::process::Command;
 
@@ -42,7 +42,7 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
         );
         return Ok(0);
     }
-    let mut tail = Command::new("/usr/bin/tail");
+    let mut tail = Command::new("tail");
     tail.args(["-n", "40"]);
     if args.follow {
         tail.arg("-F");

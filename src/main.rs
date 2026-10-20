@@ -47,7 +47,7 @@ enum Command {
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
-    /// Run a sandbox's runtime service; started by launchd.
+    /// Run one of a sandbox's runtime services; started by the service manager.
     #[command(hide = true)]
     Launch(cli::launch::LaunchArgs),
     /// Run a sandbox's egress proxy; started by enclos itself.

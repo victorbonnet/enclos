@@ -130,7 +130,8 @@ impl Layout {
         if self.data == self.config {
             return vec![var(HOME_VAR, &self.data)];
         }
-        // Two folders only come from the XDG variables, each `<var>/enclos`.
+        // Two folders come only from `resolve`'s Linux branch, each `<XDG
+        // folder, set or defaulted>/enclos`: the parent is the value to pass.
         let parent = |path: &Path| path.parent().unwrap_or(path).to_owned();
         vec![
             var("XDG_DATA_HOME", &parent(&self.data)),

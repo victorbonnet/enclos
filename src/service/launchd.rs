@@ -1,33 +1,72 @@
 //! launchd user agents (macOS): one job file per unit in
 //! `~/Library/LaunchAgents`, loaded into the user's login session.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::{ServiceError, ServiceManager, ServiceStatus, ServiceUnit};
+use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
 
 pub struct Launchd {
     /// The folder job files go in: `~/Library/LaunchAgents`.
-    pub agents_dir: PathBuf,
+    agents_dir: PathBuf,
 }
 
+/// `launchctl print` of a service the domain does not have.
+const NOT_FOUND: i32 = 113;
+
 impl Launchd {
-    fn plist_path(&self, label: &str) -> PathBuf {
+    pub fn for_user(user_home: &Path) -> Launchd {
+        Launchd {
+            agents_dir: user_home.join("Library/LaunchAgents"),
+        }
+    }
+
+    fn plist_path(&self, label: &ServiceLabel) -> PathBuf {
         self.agents_dir.join(format!("{label}.plist"))
     }
 
-    fn domain() -> String {
-        format!("gui/{}", user_id())
+    /// The user's login session, `gui/<uid>`, as launchd names it.
+    fn domain() -> Result<String, ServiceError> {
+        let out = Command::new("/usr/bin/id")
+            .arg("-u")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| ServiceError {
+                what: format!("cannot run id to find your user id for launchd: {e}"),
+            })?;
+        let uid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if !out.status.success() || uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ServiceError {
+                what: format!(
+                    "cannot find your user id for launchd: id -u said `{uid}` ({})",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        Ok(format!("gui/{uid}"))
     }
-}
 
-/// The user's numeric id, as launchd's domains name it.
-fn user_id() -> String {
-    Command::new("/usr/bin/id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default()
+    fn target(label: &ServiceLabel) -> Result<String, ServiceError> {
+        Ok(format!("{}/{label}", Self::domain()?))
+    }
+
+    /// Unloads the job, which ends its process; nothing to do when launchd
+    /// has no such job.
+    fn bootout(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+        if self.status(label)? == ServiceStatus::NotLoaded {
+            return Ok(());
+        }
+        let out = launchctl(&["bootout", &Self::target(label)?])?;
+        if !out.status.success() && self.status(label)? != ServiceStatus::NotLoaded {
+            return Err(ServiceError {
+                what: format!(
+                    "launchd did not stop {label}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn escape(text: &str) -> String {
@@ -36,13 +75,9 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// How long launchd waits after TERM before it kills a service: enough for
-/// `enclos launch` to stop the runtime it runs (TERM, `STOP_GRACE`, KILL,
-/// another `STOP_GRACE`) and record its end.
-const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(80);
-
 /// The job file: started at load and at login, restarted if it crashes
-/// (not when it exits cleanly), with its output in the unit's log.
+/// (not when it exits cleanly), with its output in the unit's log, and
+/// given the unit's stop timeout before launchd kills it.
 pub fn plist(unit: &ServiceUnit) -> String {
     let mut args = vec![unit.program.display().to_string()];
     args.extend(unit.args.iter().map(|a| a.to_string_lossy().into_owned()));
@@ -85,19 +120,47 @@ pub fn plist(unit: &ServiceUnit) -> String {
 </dict>
 </plist>
 "#,
-        label = escape(&unit.label),
-        exit_timeout = EXIT_TIMEOUT.as_secs(),
+        label = escape(unit.label.as_str()),
+        exit_timeout = unit.stop_timeout.as_secs(),
     )
 }
 
-fn launchctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+fn launchctl(args: &[&str]) -> Result<std::process::Output, ServiceError> {
     Command::new("/bin/launchctl")
         .args(args)
         .stdin(Stdio::null())
         .output()
+        .map_err(|e| ServiceError {
+            what: format!("cannot run launchctl: {e}"),
+        })
+}
+
+/// What `launchctl print <domain>/<label>` says of a loaded job.
+fn parse_status(text: &str) -> ServiceStatus {
+    text.lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pid = ")
+                .and_then(|p| p.trim().parse().ok())
+        })
+        .map_or(ServiceStatus::Loaded, |pid| ServiceStatus::Running { pid })
 }
 
 impl ServiceManager for Launchd {
+    fn available(&self) -> Result<(), ServiceError> {
+        let domain = Self::domain()?;
+        let out = launchctl(&["print", &domain])?;
+        if !out.status.success() {
+            return Err(ServiceError {
+                what: format!(
+                    "launchd has no login session {domain} to run services in (are you logged in on this Mac?): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
         let failed = |what: String| ServiceError { what };
         std::fs::create_dir_all(&self.agents_dir)
@@ -106,11 +169,8 @@ impl ServiceManager for Launchd {
         std::fs::write(&path, plist(unit))
             .map_err(|e| failed(format!("cannot write {}: {e}", path.display())))?;
         // Replace a previous load of the same unit.
-        if self.status(&unit.label) != ServiceStatus::NotLoaded {
-            let _ = launchctl(&["bootout", &format!("{}/{}", Self::domain(), unit.label)]);
-        }
-        let out = launchctl(&["bootstrap", &Self::domain(), &path.display().to_string()])
-            .map_err(|e| failed(format!("cannot run launchctl: {e}")))?;
+        self.bootout(&unit.label)?;
+        let out = launchctl(&["bootstrap", &Self::domain()?, &path.display().to_string()])?;
         if !out.status.success() {
             return Err(failed(format!(
                 "launchd refused {}: {}",
@@ -121,23 +181,8 @@ impl ServiceManager for Launchd {
         Ok(())
     }
 
-    fn stop(&self, label: &str) -> Result<(), ServiceError> {
-        if self.status(label) != ServiceStatus::NotLoaded {
-            let out =
-                launchctl(&["bootout", &format!("{}/{label}", Self::domain())]).map_err(|e| {
-                    ServiceError {
-                        what: format!("cannot run launchctl: {e}"),
-                    }
-                })?;
-            if !out.status.success() && self.status(label) != ServiceStatus::NotLoaded {
-                return Err(ServiceError {
-                    what: format!(
-                        "launchd did not stop {label}: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                });
-            }
-        }
+    fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+        self.bootout(label)?;
         let path = self.plist_path(label);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| ServiceError {
@@ -147,26 +192,29 @@ impl ServiceManager for Launchd {
         Ok(())
     }
 
-    fn status(&self, label: &str) -> ServiceStatus {
-        let Ok(out) = launchctl(&["print", &format!("{}/{label}", Self::domain())]) else {
-            return ServiceStatus::NotLoaded;
-        };
-        if !out.status.success() {
-            return ServiceStatus::NotLoaded;
+    fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus, ServiceError> {
+        let out = launchctl(&["print", &Self::target(label)?])?;
+        if out.status.success() {
+            return Ok(parse_status(&String::from_utf8_lossy(&out.stdout)));
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        text.lines()
-            .find_map(|l| {
-                l.trim()
-                    .strip_prefix("pid = ")
-                    .and_then(|p| p.trim().parse().ok())
-            })
-            .map_or(ServiceStatus::Loaded, |pid| ServiceStatus::Running { pid })
+        // Only "no such service" means not loaded; anything else (no such
+        // domain, a refusal) is not knowing, which `stop` must not read as
+        // nothing to stop.
+        if out.status.code() == Some(NOT_FOUND) {
+            return Ok(ServiceStatus::NotLoaded);
+        }
+        Err(ServiceError {
+            what: format!(
+                "launchctl cannot say whether {label} runs (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        })
     }
 
     /// From the job files: `start` writes one before loading it, and `stop`
     /// removes it only once the job is unloaded.
-    fn installed(&self, prefix: &str) -> Result<Vec<String>, ServiceError> {
+    fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         let entries = match std::fs::read_dir(&self.agents_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -185,8 +233,9 @@ impl ServiceManager for Launchd {
             let label = file
                 .to_str()
                 .and_then(|f| f.strip_suffix(".plist"))
-                .filter(|l| l.starts_with(prefix));
-            labels.extend(label.map(str::to_owned));
+                .filter(|l| l.starts_with(prefix))
+                .and_then(ServiceLabel::parse);
+            labels.extend(label);
         }
         labels.sort();
         Ok(labels)
@@ -195,12 +244,18 @@ impl ServiceManager for Launchd {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
+    fn label(text: &str) -> ServiceLabel {
+        ServiceLabel::parse(text).unwrap()
+    }
+
     #[test]
-    fn the_job_file_runs_the_unit_restarts_crashes_and_logs() {
+    fn the_job_file_runs_the_unit_restarts_crashes_logs_and_waits_for_its_stop() {
         let unit = ServiceUnit {
-            label: "enclos.home.proxy".into(),
+            label: label("enclos.12345678.home.proxy"),
             program: "/usr/local/bin/enclos".into(),
             args: vec![
                 "proxy".into(),
@@ -211,26 +266,34 @@ mod tests {
             ],
             log: "/Users/alice/.enclos/sandboxes/home/logs/proxy.log".into(),
             env: vec![("ENCLOS_HOME".into(), "/Users/alice/.enclos".into())],
+            stop_timeout: Duration::from_secs(95),
         };
         let text = plist(&unit);
-        assert!(text.contains("<key>Label</key><string>enclos.home.proxy</string>"));
+        assert!(text.contains("<key>Label</key><string>enclos.12345678.home.proxy</string>"));
         assert!(
             text.contains("<string>/usr/local/bin/enclos</string>\n    <string>proxy</string>")
         );
         assert!(text.contains("<key>SuccessfulExit</key><false/>"));
-        assert!(text.contains("<key>ExitTimeOut</key><integer>80</integer>"));
+        assert!(text.contains("<key>ExitTimeOut</key><integer>95</integer>"));
         assert!(text.contains("<key>StandardErrorPath</key><string>/Users/alice/.enclos/sandboxes/home/logs/proxy.log</string>"));
         assert!(text.contains("<key>ENCLOS_HOME</key><string>/Users/alice/.enclos</string>"));
     }
 
     #[test]
+    fn a_loaded_job_runs_when_launchctl_prints_its_pid() {
+        let running = "enclos.12345678.home.proxy = {\n\tactive count = 1\n\tpath = /Users/alice/Library/LaunchAgents/enclos.12345678.home.proxy.plist\n\tstate = running\n\n\tprogram = /usr/local/bin/enclos\n\tpid = 4242\n\truns = 1\n}\n";
+        assert_eq!(parse_status(running), ServiceStatus::Running { pid: 4242 });
+        let waiting = "enclos.12345678.home.proxy = {\n\tactive count = 0\n\tstate = not running\n\truns = 3\n\tlast exit code = 1\n}\n";
+        assert_eq!(parse_status(waiting), ServiceStatus::Loaded);
+        assert_eq!(parse_status("\tpid = many\n"), ServiceStatus::Loaded);
+    }
+
+    #[test]
     fn installed_labels_are_the_job_files_with_the_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let launchd = Launchd {
-            agents_dir: dir.path().join("LaunchAgents"),
-        };
+        let launchd = Launchd::for_user(dir.path());
         assert!(launchd.installed("enclos.").unwrap().is_empty());
-        std::fs::create_dir(&launchd.agents_dir).unwrap();
+        std::fs::create_dir_all(&launchd.agents_dir).unwrap();
         for file in [
             "enclos.12345678.home.proxy.plist",
             "enclos.12345678.home.gateway.plist",
@@ -242,7 +305,10 @@ mod tests {
         }
         assert_eq!(
             launchd.installed("enclos.12345678.home.").unwrap(),
-            ["enclos.12345678.home.gateway", "enclos.12345678.home.proxy"]
+            [
+                label("enclos.12345678.home.gateway"),
+                label("enclos.12345678.home.proxy")
+            ]
         );
     }
 

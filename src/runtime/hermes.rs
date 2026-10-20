@@ -5,7 +5,7 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
-use super::{HomeFile, Installer, RuntimeAdapter, RuntimeService, SandboxCommand};
+use super::{HomeFile, Installer, RuntimeAdapter, RuntimeService, SandboxCommand, ServiceName};
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 
@@ -21,6 +21,7 @@ pub const INSTALLER_SHA256: &str =
 
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
+const GATEWAY: ServiceName = ServiceName::new("gateway");
 
 impl RuntimeAdapter for Hermes {
     fn kind(&self) -> RuntimeKind {
@@ -80,13 +81,15 @@ impl RuntimeAdapter for Hermes {
 
     fn services(&self) -> Vec<RuntimeService> {
         // One gateway per Hermes home serves every agent: cron, housekeeping
-        // and, later, messaging (prototype, issue #5). The sandbox clears
-        // the markers Hermes reads to find launchd, so the flag says that a
-        // supervisor restarts it: on an in-chat restart or update it exits
-        // (75) for launchd to restart it, rather than starting a detached
+        // and, later, messaging (prototype, issue #5). The backend starts
+        // programs from an empty environment, which clears the markers
+        // Hermes reads to find its supervisor (`XPC_SERVICE_NAME` for
+        // launchd, `INVOCATION_ID` for systemd), so the flag says that one
+        // restarts it: on an in-chat restart or update it exits (75) for the
+        // service manager to start it again, rather than starting a detached
         // replacement that no session would hold.
         vec![RuntimeService {
-            name: "gateway",
+            name: GATEWAY,
             command: SandboxCommand::from_words(&[
                 HERMES,
                 "gateway",
@@ -157,7 +160,7 @@ mod tests {
     fn one_gateway_serves_the_sandbox_and_says_launchd_restarts_it() {
         let services = Hermes.services();
         assert_eq!(services.len(), 1);
-        assert_eq!(services[0].name, "gateway");
+        assert_eq!(services[0].name.as_str(), "gateway");
         assert_eq!(
             services[0].command,
             SandboxCommand::from_words(&["hermes", "gateway", "run", "--external-supervisor"])

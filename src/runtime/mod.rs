@@ -7,6 +7,7 @@
 pub mod hermes;
 
 use std::ffi::OsString;
+use std::fmt;
 
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -109,10 +110,46 @@ pub trait RuntimeAdapter {
 /// through `enclos launch <sandbox> <name>`.
 #[derive(Debug, Clone)]
 pub struct RuntimeService {
-    /// Stable across versions, as it names the service's label and log:
-    /// the short-name rule, and never `proxy`, the sandbox's own service.
-    pub name: &'static str,
+    pub name: ServiceName,
     pub command: SandboxCommand,
+}
+
+/// A runtime's name for one of its services, stable across versions, as it
+/// names the service's label and log: the short-name rule, and never
+/// `proxy`, the sandbox's own service. Made in code, as a constant, so a
+/// name that breaks the rule does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ServiceName(&'static str);
+
+impl ServiceName {
+    pub const fn new(name: &'static str) -> ServiceName {
+        assert!(
+            crate::model::sandbox::is_short_name(name),
+            "a service name is a short name: a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
+        );
+        // `const` has no string comparison; the bytes of "proxy".
+        let b = name.as_bytes();
+        assert!(
+            !(b.len() == 5
+                && b[0] == b'p'
+                && b[1] == b'r'
+                && b[2] == b'o'
+                && b[3] == b'x'
+                && b[4] == b'y'),
+            "`proxy` is the sandbox's own service, not a runtime's"
+        );
+        ServiceName(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+impl fmt::Display for ServiceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {
@@ -126,18 +163,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn service_names_are_distinct_short_names_and_never_the_proxy() {
+    fn a_runtime_names_each_of_its_services_once() {
         for kind in crate::model::runtime::RuntimeKind::ALL {
-            let names: Vec<&str> = adapter(kind).services().iter().map(|s| s.name).collect();
-            for name in &names {
-                assert!(crate::model::sandbox::is_short_name(name), "{kind}: {name}");
-                assert_ne!(*name, "proxy", "{kind}");
-            }
+            let names: Vec<ServiceName> = adapter(kind).services().iter().map(|s| s.name).collect();
             let mut unique = names.clone();
             unique.sort_unstable();
             unique.dedup();
             assert_eq!(unique.len(), names.len(), "{kind}: {names:?}");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "short name")]
+    fn a_service_name_that_is_not_a_short_name_is_refused() {
+        ServiceName::new("Gateway");
+    }
+
+    #[test]
+    #[should_panic(expected = "sandbox's own service")]
+    fn a_service_named_proxy_is_refused() {
+        ServiceName::new("proxy");
     }
 
     #[test]
