@@ -112,7 +112,8 @@ impl fmt::Display for BackendKind {
 }
 
 /// Where a sandbox is in its lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum SandboxState {
     Created,
     Running,

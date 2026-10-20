@@ -1003,7 +1003,11 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     assert!(!out.contains("no agents yet"), "{out}");
-    assert_eq!(out.lines().next(), Some(untracked), "{out}");
+    assert_eq!(
+        out.lines().take(2).collect::<Vec<_>>(),
+        ["home/default  built in", untracked],
+        "{out}"
+    );
     assert!(out.contains(untrackable), "{out}");
     let show = home.run(&["sandbox", "show", "home"]);
     let out = show.ok().stdout();
@@ -1024,9 +1028,13 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 3, "{out}");
-    assert_eq!(lines[..2], ["home/scout", ""], "{out}");
-    assert!(lines[2].starts_with(untrackable), "{out}");
+    assert_eq!(lines.len(), 4, "{out}");
+    assert_eq!(
+        lines[..3],
+        ["home/default  built in", "home/scout", ""],
+        "{out}"
+    );
+    assert!(lines[3].starts_with(untrackable), "{out}");
     let show = home.run(&["sandbox", "show", "home"]);
     assert!(
         show.ok().stdout().contains("\n  agents: scout\n"),
@@ -1034,8 +1042,8 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
         show.stdout()
     );
 
-    // Removing the record keeps the files, so Hermes still has the agent.
-    let rm = home.run(&["agent", "rm", "home/scout"]);
+    // Removing the record alone keeps the files, so Hermes still has the agent.
+    let rm = home.run(&["agent", "rm", "home/scout", "--keep-data"]);
     assert!(
         rm.ok()
             .stdout()
@@ -1044,7 +1052,7 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
         rm.stdout()
     );
     let list = home.run(&["agent", "list", "home"]);
-    assert_eq!(list.ok().stdout().lines().next(), Some(untracked));
+    assert_eq!(list.ok().stdout().lines().nth(1), Some(untracked));
 
     // A home enclos cannot read safely is said, not shown as clean.
     let hermes = home.root.join("sandboxes/home/home/.hermes");
@@ -1054,8 +1062,11 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     assert_eq!(
-        out.trim(),
-        "enclos cannot read Hermes's agents in sandbox home: ~/.hermes is a link. Agents made inside the sandbox are not reported."
+        out.lines().nth(1),
+        Some(
+            "enclos cannot read Hermes's agents in sandbox home: ~/.hermes is a link. Agents made inside the sandbox are not reported."
+        ),
+        "{out}"
     );
     let add = home.run(&["agent", "add", "home/scout"]);
     assert_eq!(add.code(), 1);
@@ -1089,4 +1100,95 @@ fn connect_reports_untracked_agents_on_stderr_without_the_untrackable_names() {
         out.stderr()
     );
     assert!(!out.stderr().contains("my_bot"), "{}", out.stderr());
+}
+
+#[test]
+fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["status"]);
+    assert_eq!(
+        out.ok().stdout(),
+        "No sandboxes yet. Create one with `enclos sandbox create lab`.\n"
+    );
+    let out = home.run(&["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(json["sandboxes"], serde_json::json!([]));
+    assert_eq!(json["unlisted"], serde_json::json!([]));
+    assert_eq!(json["suggestions"], serde_json::json!([]));
+    assert_eq!(
+        (&json["bytes"], &json["complete"], &json["idle_days"]),
+        (
+            &serde_json::json!(0),
+            &serde_json::json!(true),
+            &serde_json::json!(30)
+        )
+    );
+    assert_eq!(json["data"], home.root.display().to_string());
+    let out = home.run(&["status", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn status_shows_each_sandbox_its_agents_and_what_to_do() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "spare"]).ok();
+    let make = record_hermes(&home, "home");
+    make("scout");
+    make("gone");
+    home.run(&["agent", "add", "home/gone"]).ok();
+    let profiles = home.root.join("sandboxes/home/home/.hermes/profiles");
+    std::fs::remove_dir_all(profiles.join("gone")).unwrap();
+    // Without Hermes's own files, status says to install it again.
+    let text = home.run(&["status", "home"]).ok().stdout();
+    assert!(text.contains("Hermes, files missing"), "{text}");
+    assert!(
+        text.contains("enclos runtime install hermes --sandbox home"),
+        "{text}"
+    );
+    std::fs::create_dir_all(home.root.join("sandboxes/home/home/.hermes/hermes-agent")).unwrap();
+
+    let out = home.run(&["status"]);
+    let text = out.ok().stdout();
+    // The built-in agent and the tracked one.
+    assert!(text.starts_with("2 sandboxes, 2 agents, "), "{text}");
+    for line in [
+        "home   created   Hermes, not logged in",
+        "spare  created   no runtime",
+        "  AGENT    LAST ACTIVE        SIZE  MODEL",
+        "  default  never",
+        "built in",
+        "scout",
+        "made inside the sandbox, not tracked",
+        "the runtime no longer has it",
+        "What you could do",
+        "enclos agent add home/scout",
+        "enclos agent rm home/gone",
+        "enclos connect home -- hermes -p default setup",
+        "enclos runtime install <runtime> --sandbox spare",
+    ] {
+        assert!(text.contains(line), "{line:?} in\n{text}");
+    }
+    let out = home.run(&["status", "home", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    let agents = &json["sandboxes"][0]["agents"]["agents"];
+    assert_eq!(agents[0]["kind"], "builtin");
+    assert_eq!(agents[1]["name"], "gone");
+    assert_eq!(agents[1]["in_runtime"], "gone");
+    assert_eq!(agents[2]["kind"], "untracked");
+
+    // `agent rm` of the agent Hermes no longer has says so.
+    let rm = home.run(&["agent", "rm", "home/gone"]);
+    assert_eq!(
+        rm.ok().stdout(),
+        "Removed the record of agent home/gone, which Hermes no longer had.\n"
+    );
 }

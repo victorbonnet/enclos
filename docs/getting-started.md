@@ -23,35 +23,40 @@ cargo install --path .
 ## Create a sandbox and install Hermes
 
 ```bash
-enclos init                                  # the ~/.enclos folder, state database and audit log
-enclos sandbox create lab                    # Seatbelt backend, `assistant` template
-enclos runtime install hermes --sandbox lab  # Hermes's own installer, run inside the sandbox; takes a few minutes
-enclos connect lab -- hermes setup           # Hermes's own setup: your provider and its login, then a model
+enclos init                                    # the ~/.enclos folder, state database and audit log
+enclos sandbox create lab                      # Seatbelt backend, `assistant` template
+enclos runtime install hermes --sandbox lab    # Hermes's own installer, run inside the sandbox; takes a few minutes
+enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider and its login, then a model
 ```
 
 `enclos runtime install` downloads Hermes's installer on your Mac and runs it only if it is the version enclos was reviewed against. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
-`enclos connect lab -- hermes setup` runs Hermes's own setup wizard inside the sandbox, in your terminal: pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes model`.
+`enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 
 The sandbox reaches only the hosts its policy allows, and Hermes's adapter allows only the OpenAI hosts its first login used so far (`chatgpt.com`, `auth.openai.com`). For another provider, allow its API host before you log in, for example `enclos policy allow lab api.example.com`; `enclos net denied lab` shows what the login was refused.
 
 ## Add agents
 
+Hermes already has one agent once it is installed: its built-in `default`, the root of its home, which `hermes` uses when you name no agent, unless `hermes profile use` picked another. `enclos agent add` adds more:
+
 ```bash
 enclos agent add lab/main
 enclos agent add lab/scout
-enclos agent list lab
+enclos agent list lab        # lab/default  built in, then lab/main and lab/scout
 ```
+
+enclos lists `default` but neither adds nor removes it: it exists as long as Hermes is installed in the sandbox.
 
 ## Reach an agent
 
 You reach the sandbox with `enclos connect lab`: a shell, or the command you put after `--`. To talk to an agent or change it, run Hermes's own commands that way:
 
 ```bash
-enclos connect lab -- main                # talk to the agent main (Hermes's wrapper for `hermes -p main`)
-enclos connect lab -- scout model         # change the model of the agent scout
-enclos connect lab -- hermes -p scout     # the same agent, without the wrapper
-enclos connect lab                        # a shell in the sandbox, for anything else
+enclos connect lab -- hermes -p default  # talk to the built-in agent default
+enclos connect lab -- main               # talk to the agent main (Hermes's wrapper for `hermes -p main`)
+enclos connect lab -- scout model        # change the model of the agent scout
+enclos connect lab -- hermes -p scout    # the same agent, without the wrapper
+enclos connect lab                       # a shell in the sandbox, for anything else
 ```
 
 enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
@@ -68,7 +73,9 @@ You can also create an agent with Hermes's own commands, from a shell in the san
 lab/scout: Hermes has this agent; enclos does not track it. Track it with `enclos agent add lab/scout`.
 ```
 
-`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
+`enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record.
+
+`enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`); `--keep-data` removes only enclos's record and leaves the files, so Hermes still has the agent and enclos reports it as one it does not track. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
 
 ## Check the sandbox
 
@@ -103,6 +110,7 @@ The agent cannot allow anything itself.
 ## Look around
 
 ```bash
+enclos status                # every sandbox and agent, what it costs on disk, what you could do
 enclos sandbox show lab      # state, policy version, sessions and their processes
 enclos logs lab -f           # the background services' logs
 enclos policy show lab       # what the sandbox may do

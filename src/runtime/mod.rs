@@ -5,6 +5,7 @@
 //! `login` and `talk` are text enclos shows, never runs (ADR 0024).
 
 pub mod hermes;
+pub mod home;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -12,6 +13,7 @@ use std::path::Path;
 
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
+pub use home::HomePath;
 
 /// An installer enclos downloads on the host and runs only if its content
 /// is the one reviewed.
@@ -81,6 +83,83 @@ impl SandboxCommand {
     }
 }
 
+/// A part of a sandbox home that `enclos status` counts on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiskPart {
+    /// The runtime's own install: what reinstalling would put back.
+    Runtime,
+    /// Caches the runtime or its tools rebuild on their own.
+    Cache,
+}
+
+/// A value in a YAML file of the sandbox home: the file, and the dotted
+/// keys to try in order (`model.default`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueAt {
+    pub file: HomePath,
+    pub keys: &'static [&'static str],
+}
+
+/// Where a runtime keeps the facts `enclos status` shows about it. Paths
+/// only, inside the sandbox home: the engine does every read, under ADR
+/// 0023's rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeFacts {
+    /// Its version, when it writes one to a file.
+    pub version: Option<ValueAt>,
+    /// A file that exists once the runtime is logged in. Only its presence
+    /// is read, never its content.
+    pub login: Option<HomePath>,
+    /// A path that exists while the runtime is installed in the home: gone,
+    /// the runtime needs installing again.
+    pub install: Option<HomePath>,
+}
+
+/// Where a runtime keeps one agent's data and the facts `status` shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentFacts {
+    /// The folder holding the agent's own data.
+    pub folder: Option<HomePath>,
+    pub model: Option<ValueAt>,
+    /// Files that change when the agent is used: the newest gives its last
+    /// activity.
+    pub activity: Vec<HomePath>,
+}
+
+/// The agent a runtime always has once installed, such as Hermes's
+/// `default`. Made in code, as a constant, so a name that is not a valid
+/// agent name does not compile: enclos shows it, and names it in commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BuiltinAgent(&'static str);
+
+impl BuiltinAgent {
+    pub const fn new(name: &'static str) -> BuiltinAgent {
+        assert!(
+            crate::model::sandbox::is_short_name(name),
+            "a built-in agent's name is an agent name: a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
+        );
+        BuiltinAgent(name)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    pub fn agent_name(self) -> AgentName {
+        self.0.parse().expect("checked when made")
+    }
+
+    pub fn runtime_name(self) -> RuntimeAgentName {
+        RuntimeAgentName::from(&self.agent_name())
+    }
+}
+
+impl fmt::Display for BuiltinAgent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
 pub trait RuntimeAdapter {
     fn kind(&self) -> RuntimeKind;
     /// The adapter's version, recorded in policy snapshots (ADR 0018).
@@ -111,6 +190,33 @@ pub trait RuntimeAdapter {
     /// read a bounded number of entries, and answer [`Unreadable`], with
     /// the reason, rather than guess (ADR 0023).
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;
+    /// The name of the agent the runtime always has once installed, such as
+    /// Hermes's `default`: it exists as long as the runtime, so enclos lists
+    /// it without a record and neither adds nor removes it. `None`: every
+    /// agent is one enclos adds.
+    fn builtin_agent(&self) -> Option<BuiltinAgent> {
+        None
+    }
+    /// The runtime's own command that deletes an agent and its data, run in
+    /// the sandbox by `enclos agent rm`. `None`: the runtime has none, so
+    /// `agent rm` removes only the record and says the files stay.
+    fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
+
+    // What `enclos status` shows (issue #29). Each answer may be "cannot
+    // tell", and a runtime that names nothing still gets sizes.
+
+    /// Parts of the home counted on their own.
+    fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> {
+        Vec::new()
+    }
+    fn runtime_facts(&self) -> RuntimeFacts {
+        RuntimeFacts::default()
+    }
+    fn agent_facts(&self, _agent: &RuntimeAgentName) -> AgentFacts {
+        AgentFacts::default()
+    }
 }
 
 /// A name a runtime gives one of its agents, as the runtime writes it.
@@ -171,6 +277,12 @@ pub enum NotRead {
     Missing,
     /// More entries than an adapter reads.
     TooManyEntries(usize),
+    /// Something other than a plain file where a file was expected.
+    NotAFile,
+    /// A file larger than enclos reads.
+    TooLarge(u64),
+    /// A file that is not UTF-8 text.
+    NotText,
     /// A read failed; the OS's words.
     Io(String),
 }
@@ -183,6 +295,9 @@ impl fmt::Display for Unreadable {
             NotRead::NotAFolder => write!(f, "{path} is not a folder"),
             NotRead::Missing => write!(f, "{path} is missing"),
             NotRead::TooManyEntries(max) => write!(f, "{path} has more than {max} entries"),
+            NotRead::NotAFile => write!(f, "{path} is not a plain file"),
+            NotRead::TooLarge(max) => write!(f, "{path} is larger than {max} bytes"),
+            NotRead::NotText => write!(f, "{path} is not text"),
             NotRead::Io(e) => write!(f, "{path}: {e}"),
         }
     }

@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Added, AgentCheck, Engine};
+use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -25,8 +25,13 @@ enum AgentVerb {
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
     List { sandbox: SandboxName },
-    /// Remove an agent's record; its files stay in the sandbox home.
-    Rm { agent: AgentTarget },
+    /// Remove an agent and its files, with the runtime's own command; `--keep-data` keeps the files.
+    Rm {
+        agent: AgentTarget,
+        /// Keep the agent's files in the sandbox home; remove only the record.
+        #[arg(long)]
+        keep_data: bool,
+    },
 }
 
 /// An agent of a sandbox, as the agent commands name it: `lab/main`.
@@ -102,7 +107,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
         AgentVerb::List { sandbox } => {
             let agents = engine.agents(&sandbox)?;
             let notes = check_notes(engine, &sandbox, true)?;
-            if agents.is_empty() && notes.is_empty() {
+            let builtin = engine.builtin_agent(&sandbox)?;
+            if let Some(b) = builtin {
+                println!("{sandbox}/{b}  built in");
+            }
+            if builtin.is_none() && agents.is_empty() && notes.is_empty() {
                 println!(
                     "Sandbox {sandbox} has no agents yet. Add one with `enclos agent add {sandbox}/main`."
                 );
@@ -115,18 +124,32 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             }
             notes.iter().for_each(|n| println!("{n}"));
         }
-        AgentVerb::Rm { agent } => {
+        AgentVerb::Rm { agent, keep_data } => {
             let AgentTarget { sandbox, agent } = agent;
-            match engine.remove_agent(by, &sandbox, &agent, confirm)? {
+            let removed = match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
                 Planned::DryRun(plan) => {
                     plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    return Ok(exit::OK);
                 }
-                Planned::Done(removed) => {
-                    let runtime = removed.kind.display_name();
-                    println!(
-                        "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({}), so {runtime} still has the agent and enclos reports it as one it does not track; remove it with {runtime}'s own commands in `enclos connect {sandbox}`.",
-                        removed.files
-                    );
+                Planned::Done(removed) => removed,
+            };
+            match removed {
+                AgentRemoved::Deleted { .. } => {
+                    println!("Removed agent {sandbox}/{agent} and its files.")
+                }
+                AgentRemoved::RecordOnly { kind, files, why } => {
+                    let runtime = kind.display_name();
+                    match why {
+                        FilesKept::Asked => println!(
+                            "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
+                        ),
+                        FilesKept::RuntimeLacksIt => println!(
+                            "Removed the record of agent {sandbox}/{agent}, which {runtime} no longer had."
+                        ),
+                        FilesKept::NoDeleteCommand => println!(
+                            "Removed the record of agent {sandbox}/{agent}. {runtime} has no command enclos can run to delete an agent, so its files stay in the sandbox home ({files}); remove them with {runtime}'s own commands in `enclos connect {sandbox}`."
+                        ),
+                    }
                 }
             }
         }

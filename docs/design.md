@@ -51,7 +51,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Sandbox | A named, persistent isolated environment created by enclos: backend, policy, home folder, mounts, lifecycle state. | `home` (Seatbelt), `pi-bot` (bubblewrap) |
 | Policy | What a sandbox may do. Layered on a template, stored as immutable snapshots, compiled per backend. A sandbox has one active policy and at most one pending policy. | `extends = "assistant"` plus overrides |
 | Runtime | The software installed in a sandbox to run its agents. One runtime per sandbox. | Hermes, Claude Code, Codex |
-| Agent | A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. Runtimes without several agents (Claude Code, Codex) have one agent named `default`. | agent `main` in sandbox `home` |
+| Agent | A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime may have a built-in agent, which exists as long as the runtime is installed and which enclos neither adds nor removes (Hermes's `default`); a runtime without several agents (Claude Code, Codex) has only that one. | agent `main` in sandbox `home` |
 | Session | One run inside a sandbox (an interactive `connect`, an `exec`, or a runtime service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
 | Audit entry | One record per state-changing command: time, user, host, command, state before and after, result. Append-only, hash-chained. | `enclos policy allow home api.telegram.org` |
 
@@ -360,12 +360,21 @@ pub trait RuntimeAdapter {
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
     fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable>;   // read on the host; Err: cannot tell, and why
+    fn builtin_agent(&self) -> Option<BuiltinAgent> { None }                     // the agent it always has: Hermes's `default`, a valid agent name
+    fn delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // the runtime's own delete, run in the sandbox; None: files stay
+
+    // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.
+    fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> { Vec::new() }             // Runtime | Cache
+    fn runtime_facts(&self) -> RuntimeFacts { RuntimeFacts::default() }          // version, login file, install path
+    fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts { AgentFacts::default() }   // folder, model, activity files
 }
 ```
 
-For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
+For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own `default` profile, the root of its home, is its built-in agent `default`. Without `-p`, `hermes` uses the profile `hermes profile use` last saved, which may be another, so enclos names it with `-p default`, in `talk` and in the login, which every agent shares: enclos lists it without a record, refuses to add or remove it, never reports it as untracked, and points at it with `enclos connect <sandbox> -- hermes -p default`. Another runtime names its own built-in agent, or none. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
 
-**Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so `agent list` and `sandbox show` miss them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/`, other than `default`, with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link (each folder is opened by its descriptor, so a link planted before or during the read leads nowhere), reads a bounded number of entries, and answers `Unreadable`, with the path and the reason, rather than guess. A name it returns is a `RuntimeAgentName`: one printable word, wider than an agent name, safe in a message. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session (there without the names it cannot use, which only a rename inside the sandbox changes) and when `agent rm` names an agent it does not track, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. When the list cannot be read, each of these says so instead, and `agent add` refuses to act. `enclos agent add` adopts an agent the runtime already has: it records it without creating it again, re-checking under the lock. enclos never adopts or removes an agent on its own. After `agent rm`, whose files stay, the runtime still has the agent and enclos reports it as one it does not track.
+**Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so `agent list` and `sandbox show` miss them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/`, other than `default`, with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link (each folder is opened by its descriptor, so a link planted before or during the read leads nowhere), reads a bounded number of entries, and answers `Unreadable`, with the path and the reason, rather than guess. A name it returns is a `RuntimeAgentName`: one printable word, wider than an agent name, safe in a message. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session (there without the names it cannot use, which only a rename inside the sandbox changes) and when `agent rm` names an agent it does not track, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. When the list cannot be read, each of these says so instead, and `agent add` refuses to act. `enclos agent add` adopts an agent the runtime already has: it records it without creating it again, re-checking under the lock. enclos never adopts or removes an agent on its own. After `agent rm --keep-data`, whose files stay, the runtime still has the agent and enclos reports it as one it does not track. `agent rm` without it runs the runtime's own delete only when the runtime's list has the agent, checks the list again afterwards, and refuses when the list cannot be read.
+
+**Status** (issue #29). `enclos status [<sandbox>]` shows what is on the host, what it costs on disk and what the user could do. It is a read: no lock, no audit entry, and nothing runs in a sandbox, so it works on stopped ones. From enclos's records (trusted) it takes each sandbox's state, policy version, running sessions and whether one runs under a compiled policy the active one replaced (the proxy applies network rules live and never counts), the last `connect`, the last connection tried and the destinations refused in the last 7 days; from the service manager, the state of its services. A sandbox enclos cannot look at is listed with why, and the others still show. From the sandbox home it takes sizes and the runtime's facts, under ADR 0023's rules: adapters only name `HomePath`s, plain components inside the home; the engine opens every folder and file through its parent's descriptor without following a link, checks a file with `fstat` and reads at most 256 KB of it (a link, a FIFO or a growing file put in place before or during the read leads nowhere), escapes control and invisible characters in what it shows and cuts it to 120 characters, and answers "cannot tell", with why, rather than guess. Each fact is known, absent, "cannot tell" or not provided by the adapter, in the text and in `--json`. One walker measures the sandbox folder by descriptor: each entry `lstat`ed, allocated blocks, each hard link once, at most a million entries counted as they are read. A read that fails, or the budget running out, makes every size a lower bound (`≥`) and says why; hard-linked files with links outside the folder are counted apart, since removing it does not free them (APFS clones are not told apart). Agents are the runtime's built-in agent, enclos's records and `agents_in`: each is built in, tracked (present, gone, or unknown when the list cannot be read), untracked, or untrackable, the same findings as `check_agents`, worded for a table; when the list cannot be read, status says why. Suggestions are fixed rules, each naming an existing command; "unused" means nothing runs now and, for 30 days, no `connect` or service session started or ended and no connection was tried, by enclos's own records. A runtime whose adapter names nothing still gets sizes and every suggestion that does not need its facts, including "no agents" for a runtime that lists none. For Hermes: runtime `.hermes/{hermes-agent,tools,installs}`, and installed while `.hermes/hermes-agent` exists; caches `.hermes/cache`, `.npm`, `.cache`, `tmp`; logged in when `.hermes/auth.json` exists (never read); each agent's model from `model.default` (or `model.model`) in its `config.yaml`, and its last activity from its `.hermes_history`, `state.db` and `state.db-wal`. The built-in `default` agent's folder is the root `.hermes`: the runtime install, caches and other agents' folders under it are counted on their own, so its size is its own data (shown with a clone of a real Hermes home: about 5 MB of 2.5 GB).
 
 **Engine** — the API every client calls. Reads are not audited. Every write takes the lock, opens an audit entry, does the work, saves state and closes the entry, also on failure. `Confirm::DryRun` returns the plan without changing anything.
 
@@ -381,7 +390,8 @@ impl Engine {
     pub fn create(&self, by: &Actor, spec: SandboxSpec, confirm: Confirm) -> Result<Planned<SandboxRecord>>;
     pub fn add_agent(&self, by: &Actor, sandbox: &SandboxName, agent: AgentName, confirm: Confirm) -> Result<Planned<AgentAdded>>;   // created, or adopted when made inside
     pub fn check_agents(&self, name: &SandboxName) -> Result<AgentCheck>;   // Compared(the differences) or Unreadable(why)
-    pub fn remove_agent(&self, by: &Actor, agent: &AgentRef, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
+    pub fn status(&self, only: Option<&SandboxName>) -> Result<StatusView>;  // a read: records, sizes, suggestions
+    pub fn remove_agent(&self, by: &Actor, sandbox: &SandboxName, agent: &AgentName, keep_data: bool, confirm: Confirm) -> Result<Planned<AgentRemoved>>;   // Deleted, or RecordOnly with why
     pub fn start(&self, by: &Actor, name: &SandboxName) -> Result<SandboxRecord>;   // proxy + the runtime's services
     pub fn stop(&self, by: &Actor, name: &SandboxName) -> Result<StopReport>;       // every member; survivors reported
     pub fn remove(&self, by: &Actor, name: &SandboxName, keep_data: bool, confirm: Confirm) -> Result<Planned<()>>;
@@ -448,7 +458,7 @@ enclos logs <name> [-f]
 enclos agent add <name>/<agent> [--model ...]   also adopts an agent made inside the sandbox
 enclos agent list <name>                      with what differs from the runtime's own list: agents made inside, names enclos cannot use, agents gone
 # no `agent start | stop | restart`: services belong to the sandbox (ADR 0021)
-enclos agent rm <name>/<agent>               the record only: the files stay in the sandbox home (milestone 1)
+enclos agent rm <name>/<agent> [--keep-data]   deletes its files with the runtime's own command unless --keep-data
 
 enclos policy show <name> [--compiled] [--pending]
 enclos policy edit <name>
@@ -466,7 +476,8 @@ enclos secret set | list | rm <ref>
 enclos net log <name> [-f] | net denied <name>
 enclos denials <name>
 
-enclos state show | check | repair <name>
+enclos status [<name>] [--json]              what is here, what it costs on disk, what you could do
+enclos state check | repair <name>
 enclos audit [<name>] [--since 7d] | audit verify
 
 enclos apply -f stack.toml
@@ -482,13 +493,13 @@ enclos sandbox create home --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox home
 enclos agent add home/main
 enclos agent add home/research
-enclos connect home -- hermes setup             # Hermes's own setup: provider, login (a URL to open on the host), model
+enclos connect home -- hermes -p default setup  # Hermes's own setup: provider, login (a URL to open on the host), model
 
 enclos sandbox create lab --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox lab
 enclos agent add lab/scout
 enclos agent add lab/writer
-enclos connect lab -- hermes setup
+enclos connect lab -- hermes -p default setup
 
 enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
 enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused
@@ -599,6 +610,9 @@ The design depends on these, and none has been shown to work yet. The milestone 
 - That Hermes's setup wizard, `hermes setup`, completes inside the sandbox through the proxy: the prototype logged in with `hermes model`, which covers only provider, login and model. A wizard section that acts on the host (installing a launchd job, for example) would be refused.
 - That Hermes, its model calls, its installers (Python and Node package managers, skill downloads) and any headless browser it starts work through `HTTPS_PROXY` with writes limited to the home, and which install sources the Hermes adapter must allow.
 - Whether a browser started inside Seatbelt needs its own sandbox disabled to run, which would leave only enclos's.
+- Where Hermes records its version on disk: `hermes-agent/pyproject.toml` says `0.0.0`, so `enclos status` shows no version yet.
+- Which files reliably change when a Hermes agent is used: `sessions/` stayed empty after an agent was used, while `.hermes_history` and `state.db` changed; `status` uses those two and `state.db`'s write-ahead log, `state.db-wal`.
+- What `hermes profile delete <name> --yes`, which `enclos agent rm` runs, removes beside the profile folder (its wrapper on the sandbox PATH, Hermes's own records): `agent rm` checks only that Hermes no longer lists the agent afterwards.
 - Whether runtimes need writes to system temp or cache folders beyond `TMPDIR`.
 - That denying mDNSResponder removes DNS from the sandbox without breaking clients that use the proxy.
 - That the proxy environment variables reach every client Hermes and its installers use, including curl and Node's `fetch`.

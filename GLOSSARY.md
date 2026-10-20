@@ -41,8 +41,12 @@ The software installed in a sandbox to run its agents, such as Hermes, Claude Co
 _Avoid_: agent (for the software), platform, program
 
 **Agent**:
-A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime without several agents has one agent named `default`.
+A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime may have a built-in agent; a runtime without several agents has only its built-in one.
 _Avoid_: profile (Hermes's word for it), instance, persona, bot
+
+**Built-in agent**:
+The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
+_Avoid_: main agent, root profile, default profile
 
 **Untracked agent**:
 An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. It becomes a tracked agent when added.

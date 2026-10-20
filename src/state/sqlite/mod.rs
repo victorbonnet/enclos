@@ -407,4 +407,9 @@ impl NetLogStore for SqliteStateStore {
         let conn = self.open()?;
         netlog::denied(&conn, sandbox).map_err(|e| self.read_err(e))
     }
+
+    fn last_event(&self, sandbox: &SandboxName) -> Result<Option<Timestamp>> {
+        let conn = self.open()?;
+        netlog::last(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
 }
