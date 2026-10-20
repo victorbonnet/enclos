@@ -7,7 +7,7 @@ const scenarios = {
     destination: "sandbox home",
     blocked: false,
     title: ["The tool gets a home.", "Your Mac keeps its boundaries."],
-    description: "Tools, dependencies, and skills can live inside the sandbox’s own home and run under the same policy. Downloads still need an allowed destination.",
+    description: "Tools, dependencies, and skills can live inside the sandbox’s own home and run under the same policy. Downloads go through its proxy and are logged.",
     commandLabel: "Inspect what this sandbox may do",
     command: "enclos policy show lab",
   },
@@ -64,6 +64,12 @@ for (const button of scenarioButtons) {
     document.getElementById("result-description").textContent = scenario.description;
     document.getElementById("result-command-label").textContent = scenario.commandLabel;
     document.getElementById("result-command").textContent = scenario.command;
+
+    // Below the choices on narrow screens: bring the outcome into view.
+    if (window.matchMedia("(max-width: 999px)").matches) {
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      result.scrollIntoView({ block: "nearest", behavior: reduced ? "auto" : "smooth" });
+    }
   });
 }
 
@@ -92,8 +98,12 @@ fetch("https://api.github.com/repos/victorbonnet/enclos/releases/latest", {
     const state = document.getElementById("release-state");
     if (response.status === 404) {
       state.textContent = "First release coming soon";
-      document.getElementById("release-note").textContent =
-        "No release is published yet: the command says so and installs nothing. Until the first one, build from a clone with Rust: cargo install --locked --path .";
+      const command = document.createElement("code");
+      command.textContent = "cargo install --locked --path .";
+      document.getElementById("release-note").replaceChildren(
+        "No release is published yet: the command says so and installs nothing. Until the first one, build from a clone with Rust: ",
+        command,
+      );
       return;
     }
     if (!response.ok) return;
