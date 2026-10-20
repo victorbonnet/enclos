@@ -908,6 +908,9 @@ mod runtime {
         fn talk(&self, agent: &AgentName) -> String {
             Hermes.talk(agent)
         }
+        fn service(&self) -> Option<SandboxCommand> {
+            Hermes.service()
+        }
     }
 
     #[cfg(target_os = "macos")]

@@ -44,8 +44,9 @@ impl HomeFile {
 }
 
 /// A command that runs inside a sandbox, under its policy. Anyone can make
-/// one; only the engine's session code can take its words out to start it,
-/// so an adapter's command cannot be started on the host by mistake.
+/// one; only the engine's code that starts programs in a sandbox can take
+/// its words out, so an adapter's command cannot be started on the host by
+/// mistake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommand(Vec<OsString>);
 
@@ -71,7 +72,8 @@ impl SandboxCommand {
             .join(" ")
     }
 
-    /// The words to start it with: the engine's session code only.
+    /// The words to start it with: only the engine's code that starts a
+    /// program in a sandbox (sessions, and the service runner).
     pub(crate) fn into_words(self) -> Vec<OsString> {
         self.0
     }
@@ -99,7 +101,7 @@ pub trait RuntimeAdapter {
     fn talk(&self, agent: &AgentName) -> String;
     /// The one background process serving every agent of the sandbox,
     /// if the runtime has one (ADR 0021).
-    fn service(&self) -> Option<Vec<OsString>>;
+    fn service(&self) -> Option<SandboxCommand>;
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {

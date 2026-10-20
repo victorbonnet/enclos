@@ -178,9 +178,12 @@ impl Engine {
     /// in the sandbox, in a process group of its own, recorded as a session.
     pub fn launch(&self, by: &Actor, name: &SandboxName) -> Result<SessionEnd> {
         let kind = self.runtime_of(name)?;
-        let command = adapter(kind).service().ok_or_else(|| Error::Session {
-            what: format!("{kind} has no background service"),
-        })?;
+        let command = adapter(kind)
+            .service()
+            .ok_or_else(|| Error::Session {
+                what: format!("{kind} has no background service"),
+            })?
+            .into_words();
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;

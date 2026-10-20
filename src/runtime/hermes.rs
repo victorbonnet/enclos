@@ -78,10 +78,10 @@ impl RuntimeAdapter for Hermes {
         format!("{HERMES} -p {agent}")
     }
 
-    fn service(&self) -> Option<Vec<OsString>> {
+    fn service(&self) -> Option<SandboxCommand> {
         // One gateway per Hermes home serves every agent: cron, housekeeping
         // and, later, messaging (prototype, issue #5).
-        Some(args(&[HERMES, "gateway", "run"]))
+        Some(SandboxCommand::from_words(&[HERMES, "gateway", "run"]))
     }
 }
 
