@@ -467,8 +467,12 @@ mod sandbox {
             .show_sandbox(&"home".parse().unwrap())
             .unwrap()
             .record;
-        // A port another program listens on is skipped, so only the order is fixed.
-        assert!(home.proxy_port >= 41000 && lab.proxy_port > home.proxy_port);
+        // A port another program listens on is skipped (other tests run
+        // proxies in the same range), so which port each gets is not fixed:
+        // only that each has its own, in the range.
+        let range = crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST;
+        assert!(range.contains(&home.proxy_port) && range.contains(&lab.proxy_port));
+        assert_ne!(home.proxy_port, lab.proxy_port);
         let err = engine
             .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
             .unwrap_err();
