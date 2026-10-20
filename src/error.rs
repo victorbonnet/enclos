@@ -54,7 +54,11 @@ pub enum Error {
     /// A failed command whose cleanup failed too.
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
-    #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
+    /// A record without an active policy, which `sandbox create` never
+    /// leaves: it records both in one transaction.
+    #[error(
+        "sandbox `{sandbox}` has no active policy, so its record is incomplete. Remove the record with `enclos sandbox rm {sandbox} --keep-data`, then run `enclos sandbox create {sandbox}` again: its home is kept"
+    )]
     NoPolicy { sandbox: String },
     /// A backend this host cannot run; never overridden (ADR 0009).
     #[error("sandbox `{sandbox}` uses the {backend} backend, which this host cannot run: {reason}")]

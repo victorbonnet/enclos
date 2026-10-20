@@ -183,6 +183,53 @@ fn policy_versions_append_and_identical_snapshots_are_stored_once() {
 }
 
 #[test]
+fn a_new_sandbox_and_its_first_policy_are_recorded_together_or_not_at_all() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+
+    // The policy version is written after the record: failing it must take
+    // the record back too.
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_policy BEFORE INSERT ON policy_versions
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .unwrap();
+    let err = store
+        .create_sandbox(&lock, &record("home"), &snap, &by)
+        .unwrap_err();
+    assert!(err.to_string().contains("injected failure"), "{err}");
+    assert_eq!(store.get(&name).unwrap(), None);
+    assert!(store.policy_history(&name).unwrap().is_empty());
+
+    conn.execute_batch("DROP TRIGGER fail_policy").unwrap();
+    let v1 = store
+        .create_sandbox(&lock, &record("home"), &snap, &by)
+        .unwrap();
+    assert_eq!(v1.version, 1);
+    assert_eq!(store.get(&name).unwrap(), Some(record("home")));
+    assert_eq!(
+        store.active_policy(&name).unwrap().unwrap(),
+        (v1.clone(), snap.clone())
+    );
+
+    // A name already recorded is an error, and changes nothing.
+    let mut other = record("home");
+    other.proxy_port = 41001;
+    store.create_sandbox(&lock, &other, &snap, &by).unwrap_err();
+    assert_eq!(store.get(&name).unwrap(), Some(record("home")));
+    assert_eq!(store.policy_history(&name).unwrap(), [v1]);
+}
+
+#[test]
 fn the_network_log_filters_by_time_and_groups_denials() {
     use crate::model::net::{NetEvent, Reason, Verdict};
     use crate::state::NetLogStore;
