@@ -106,4 +106,4 @@ sequenceDiagram
   CLI->>Data: record the session's end, audited
 ```
 
-`enclos sandbox stop lab` ends every member of every recorded session, services included: the program each session started, what it started, and the jobs of an interactive shell. It signals a process, or a group through its leader, only while that process is still the same one (same pid and start time), so it never signals a process that merely reused a pid.
+`enclos sandbox stop lab` ends every member of every recorded session, services included: the program each session started, what it started, and the shell jobs of an interactive shell. It signals a process, or a group through its leader, only after checking right before the signal that the process is still the same one (same pid and start time), so a pid already reused is not signalled. A member it cannot end is reported with why (only counted, never signalled; still running after KILL; or a signal that could not be sent), and the sandbox stays `failed` until a later stop finds none left.
