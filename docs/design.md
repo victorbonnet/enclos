@@ -175,7 +175,7 @@ log = "metadata"                         # per tunnel: host, port, address, byte
 memory = "2G"
 cpu = 2.0
 
-[secrets.main]                           # per agent: only `main` receives these
+[secrets]                                # every session in the sandbox receives these
 env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 ```
 
@@ -190,7 +190,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 **Snapshots** ([ADR 0018](adr/0018-immutable-policy-snapshots.md)). A snapshot is the fully resolved policy together with its inputs (enclos version and built-in defaults, template name and content hash, adapter version and contributed endpoints, and the overrides), identified by the SHA-256 of both. Snapshots are insert-only, and identical content reuses the existing snapshot. A sandbox's history is an append-only list of numbered policy versions, each pointing to a snapshot and recording who made it, when, and which version it restores if it is a rollback. Audit entries and session records reference both the version number and the snapshot hash.
 
-- **Active and pending.** New sessions use the active snapshot. A file, program or resource change applies at once if no session is running; if sessions are running, it needs a restart and asks first; if the user declines, it becomes the pending snapshot, the active one stays, and `enclos policy show` and `enclos sandbox show` display both. `enclos policy apply` restarts and makes the pending snapshot active; `enclos policy discard` drops it. A change mixing restart-requiring and network parts is pending as a whole. A network-only change takes effect at once as a new active snapshot, and if a change is pending, it is re-resolved into a new pending snapshot that includes the network change.
+- **Active and pending.** New sessions use the active snapshot. A file, program, resource or secret change applies at once if no session is running; if sessions are running, it needs a restart and asks first; if the user declines, it becomes the pending snapshot, the active one stays, and `enclos policy show` and `enclos sandbox show` display both. `enclos policy apply` restarts and makes the pending snapshot active; `enclos policy discard` drops it. A change mixing restart-requiring and network parts is pending as a whole. A network-only change takes effect at once as a new active snapshot, and if a change is pending, it is re-resolved into a new pending snapshot that includes the network change.
 - **Updates.** A new enclos version or template never silently changes grants: launch uses the active snapshot as stored. `enclos policy refresh` resolves again against the current template and adapter and turns any difference into a change for the user to accept. Until refresh and pending changes arrive (milestone 2), `enclos policy allow` resolves the whole `policy.toml` against the current template and adapter; when the result changes more than the entry asked for (edits not applied yet, or a newer template or built-in defaults), it lists each extra change and asks first.
 - **Rollback.** `enclos policy rollback --to <version>` makes that snapshot's effective policy the target again, as a new version recording what it restores, and restores its overrides so later edits start from it. It follows the restart rules above. A rollback or refresh made while a change is pending replaces that pending change, after showing it and asking.
 
@@ -203,7 +203,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 **Stop and restart.** `stop` ends every member: a signal, a grace period, then a forced kill, then a check that no member remains. Survivors are reported, and the sandbox is marked `Failed` instead of `Stopped`. `restart` stops every member and starts the sandbox's services again under the active snapshot; an interactive session ends and the CLI tells the user to reconnect.
 
-**Effective policy.** Network rules follow the active snapshot live; file, program and resource rules are fixed when a session starts. `enclos sandbox show` lists each session with both, for example `network: v7 (live)  files, programs, resources: v5 (at launch)`, and flags a session as needing a restart only when its file, program or resource rules differ from the active snapshot's, not merely because the version number moved; in milestone 1, when the compiled policy it runs under differs from the one the active snapshot compiles to. A pending snapshot never applies to anything running.
+**Effective policy.** Network rules follow the active snapshot live; file, program and resource rules, and secrets (milestone 2), are fixed when a session starts. `enclos sandbox show` lists each session with both, for example `network: v7 (live)  files, programs, resources: v5 (at launch)`, and flags a session as needing a restart only when its file, program or resource rules differ from the active snapshot's, not merely because the version number moved; in milestone 1, when the compiled policy it runs under differs from the one the active snapshot compiles to. A pending snapshot never applies to anything running.
 
 **Starting a session: `enclos connect home -- main`, step by step**
 
@@ -211,7 +211,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 2. Load the record and the active snapshot; compile it if no compiled policy exists for this snapshot and this enclos version (an upgrade recompiles, which is how stricter enclos-owned rules reach new sessions without asking; `enclos doctor` lists what changed); `prepare`.
 3. Start the proxy if it is not running, with the active network policy and the sandbox's listener, and record it beside the sessions (the proxy service when the sandbox is started; otherwise a process this `connect` starts).
 4. Record the session with its snapshot and compiled-policy hashes; close the audit entry; release the lock.
-5. Wrap the command (the one after `--`; a login shell when none is given) and run it in the terminal, tracking its members. `enclos launch <sandbox> <service>` does the same for a runtime service, for the service manager.
+5. Read the secrets the session's snapshot grants (milestone 2), wrap the command (the one after `--`; a login shell when none is given) and run it in the terminal, tracking its members. `enclos launch <sandbox> <service>` does the same for a runtime service, for the service manager.
 6. When the session ends, take the lock, record the end and any surviving members, and append an audit entry.
 7. On failure at any step: stop what started, save `Failed { reason }`, and close the audit entry as failed.
 
@@ -464,7 +464,7 @@ enclos policy test <name>                     enforcement and escape probes
 enclos template list | show <template>
 
 enclos runtime install <type> --sandbox <name> [--version x]
-enclos runtime configure <name>[/<agent>] [--model ...] [--mcp-add name=https://...] [--channel ...]
+enclos runtime configure <name>[/<agent>] [--model ...] [--mcp-add name=https://...] [--channel ... [--token-env VAR]]
 
 enclos secret set | list | rm <ref>
 enclos net log <name> [-f] | net denied <name>
@@ -506,11 +506,12 @@ enclos net denied home                          # what was refused; allow what y
 enclos sandbox stop home lab                    # every member, services and sessions alike
 ```
 
-**Later** (milestones 2 and 3): agents that answer on Telegram with secrets granted per agent, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
+**Later** (milestones 2 and 3): agents that answer on Telegram with the sandbox's secrets, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
 
 ```bash
 enclos secret set home/telegram-main
-enclos runtime configure home/main --channel telegram --secret home/telegram-main
+enclos policy edit home   # [secrets] env = { TELEGRAM_BOT_TOKEN_MAIN = "secret:home/telegram-main" }
+enclos runtime configure home/main --channel telegram --token-env TELEGRAM_BOT_TOKEN_MAIN   # the agent's bot; routing is to verify (§14)
 
 enclos sandbox create dev --backend seatbelt --template coding --workspace ~/dev/app
 enclos runtime install claude-code --sandbox dev
@@ -546,8 +547,8 @@ On Linux: `config.toml` and `templates/` in `$XDG_CONFIG_HOME/enclos`, everythin
 
 ## 12. Secrets and subscriptions
 
-- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, through `enclos launch` ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)). The sandbox itself is meant to have no Keychain access (planned, to verify with the host-service probes).
-- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, enclos supports only device-code logins: Hermes prints a URL and a short code, and the user opens the URL on the host. enclos makes no network exception for logins (no localhost callback port), and does not copy tokens in from a login made on the host. Hermes documents this login (its OpenAI Codex provider, "ChatGPT OAuth") as a device-code flow, and stores the credential in its own home (`~/.hermes/auth.json` inside the sandbox). Hermes can also import a host Codex CLI login from `~/.codex/auth.json`; inside the sandbox that path is on the read deny list, so the import is unavailable by design. That the login completes inside the sandbox is to verify (§14). Once logged in, every agent in the sandbox can read the runtime's refresh token; enclos flags it.
+- Secrets live in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`, and reach a sandbox only as environment variables, set up on the host when a session starts ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md); milestone 2, not implemented yet). They are granted per sandbox: every session, whichever agent it runs, and the runtime's services receive the same variables, and agents that must not share a secret go in different sandboxes. enclos never writes their values to a service manager's file or the sandbox home; a runtime that receives one may still save it in its home. The sandbox itself is meant to have no Keychain access (Seatbelt denies the security daemons and the keychain files, and the `keychain` probe shows reading the login keychain's settings is refused; that no item can be read is to verify, §14).
+- **Subscriptions, v1 (host backends):** the runtime's own login runs inside the sandbox and stays in its home. The first is Hermes with an existing ChatGPT subscription, through Hermes's supported login flow; its login endpoints come from the Hermes adapter. Because the sandbox cannot open a browser on the host, enclos supports only device-code logins: Hermes prints a URL and a short code, and the user opens the URL on the host. enclos makes no network exception for logins (no localhost callback port), and does not copy tokens in from a login made on the host. Hermes documents this login (its OpenAI Codex provider, "ChatGPT OAuth") as a device-code flow, and stores the credential in its own home (`~/.hermes/auth.json` inside the sandbox). Hermes can also import a host Codex CLI login from `~/.codex/auth.json`; inside the sandbox that path is on the read deny list, so the import is unavailable by design. That the login completes inside the sandbox is to verify (§14). Once logged in, every agent in the sandbox shares the login (shown by the prototype: agents with no `auth.json` of their own used the sandbox's) and can read the runtime's refresh token; enclos will flag it.
 - **Subscriptions, v2:** one refresh owner on the host keeps the renewable credential; sandboxes get only short-lived access tokens.
 
 ## 13. Milestones
@@ -569,7 +570,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the runtime's own login in the sandbox home.
 
    Done when the acceptance scenario below passes.
-2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per agent, stored in the Keychain and passed through `enclos launch`; Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
+2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per sandbox, stored in the Keychain and set up on the host when a session starts (`connect`, `exec` and `enclos launch`); Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
 3. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
    2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
@@ -590,9 +591,9 @@ Each milestone holds only what its goal needs; everything else waits for a later
 
 ## 14. Awaiting prototype verification
 
-The design depends on these, and none has been shown to work yet. The milestone 1 prototype resolves each one, except the ADR 0006 evidence, which milestone 2 gathers; the result is recorded in the design or an ADR.
+The design depends on these, and none has been shown to work yet. The milestone 1 prototype resolves each one, except the ADR 0006 evidence and the secrets items (per-agent channel secrets, keychain items, the Keychain from a service), which milestone 2 gathers; the result is recorded in the design or an ADR.
 
-- How Hermes creates and selects the profiles it keeps agents in (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), and whether each agent needs its own login or shares one per sandbox.
+- How Hermes creates and selects the profiles it keeps agents in (`HERMES_HOME`, `~/.hermes/profiles/<name>/`), (agents share one login per sandbox, shown by the prototype and recorded in §12).
 - That a sandboxed Hermes gateway run with `--external-supervisor` exits for the service manager to restart it on an in-chat restart or update, rather than starting a replacement ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). What Hermes runs as a background service, one gateway serving every agent beside `connect` sessions, was shown by the prototype (issue #5) and is recorded there.
 - The Seatbelt rules that block host-service delegation, with one escape probe per route in §5 ([ADR 0016](adr/0016-seatbelt-blocks-host-service-delegation.md)). No probe tries these routes yet: posting synthetic input events, `at` jobs, installing a crontab, registering a login item, typing into the terminal (TIOCSTI); `policy test` names them.
 - The evidence ADR 0006 needs to decide between `(allow default)` and `(deny default)`.
@@ -604,11 +605,14 @@ The design depends on these, and none has been shown to work yet. The milestone 
 - Whether runtimes need writes to system temp or cache folders beyond `TMPDIR`.
 - That denying mDNSResponder removes DNS from the sandbox without breaking clients that use the proxy.
 - That the proxy environment variables reach every client Hermes and its installers use, including curl and Node's `fetch`.
+- Whether Hermes's single gateway can take each agent's channel secret (such as one Telegram bot token per agent) from environment variables, since secrets reach a sandbox only that way ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)). Milestone 2.
+- That no keychain item can be read from inside a sandbox: the `keychain` probe shows only that reading the login keychain's settings is refused. Milestone 2.
+- That `enclos launch`, run by the service manager, can read a sandbox's secrets from the Keychain without a prompt, including after an enclos upgrade changes its code signature: a service has nobody to answer one. Milestone 2.
 - The unified-log predicate for Seatbelt denials, how lines are attributed to a sandbox, and whether streaming needs admin rights.
 
 ## 15. Open decisions
 
-Decided since the first draft: Rust as the language; a domain-level CONNECT proxy without TLS interception ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md)); one runtime per sandbox ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)); launchd and systemd user units ([ADR 0002](adr/0002-no-daemon.md)); the threat model ([ADR 0014](adr/0014-threat-model-accidental-damage.md)); unknown destinations denied without asking; stricter enclos-owned rules apply on upgrade without asking ([ADR 0018](adr/0018-immutable-policy-snapshots.md)); device-code logins only (§12); a server name check on TLS tunnels (§6); secrets granted per agent ([ADR 0011](adr/0011-secrets-only-as-env-at-launch.md)); each host managed locally, with no `--host` option for now.
+Decided since the first draft: Rust as the language; a domain-level CONNECT proxy without TLS interception ([ADR 0007](adr/0007-network-through-a-proxy-per-sandbox.md)); one runtime per sandbox ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)); launchd and systemd user units ([ADR 0002](adr/0002-no-daemon.md)); the threat model ([ADR 0014](adr/0014-threat-model-accidental-damage.md)); unknown destinations denied without asking; stricter enclos-owned rules apply on upgrade without asking ([ADR 0018](adr/0018-immutable-policy-snapshots.md)); device-code logins only (§12); a server name check on TLS tunnels (§6); secrets granted per sandbox ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)); each host managed locally, with no `--host` option for now.
 
 | Decision | Recommendation |
 | --- | --- |
