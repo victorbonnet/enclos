@@ -158,6 +158,24 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
 .intro-strip p strong { font-weight: 500; color: var(--text); }
 .intro-strip .wrap > span { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; color: var(--text-faint); }
 
+/* Room to work */
+.room-section { display: grid; gap: 28px; }
+.room-columns { display: grid; gap: 12px; }
+.room-card { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--line-strong); padding: 20px; }
+.room-free { border-top-color: var(--allowed); }
+.room-blocked { border-top-color: var(--refused); }
+.room-yours { border-top-color: var(--accent-soft); }
+.room-card h3 { display: flex; align-items: center; gap: 10px; font-size: 19px; }
+.room-card h3 span { font-family: var(--mono); font-weight: 700; width: 18px; text-align: center; }
+.room-free h3 span { color: var(--allowed); }
+.room-blocked h3 span { color: var(--refused); }
+.room-yours h3 span { color: var(--accent); }
+.room-card ul { margin: 12px 0 0; padding: 0; list-style: none; }
+.room-card li { font-size: 15px; line-height: 1.55; color: var(--text-muted); padding-block: 9px; border-top: 1px solid var(--line); }
+.room-card li:first-child { border-top: 0; padding-top: 0; }
+.room-note { font-size: 15px; line-height: 1.7; color: var(--text-muted); max-width: 720px; border-left: 2px solid var(--refused); padding-left: 14px; }
+.room-note strong { color: var(--text); font-weight: 600; }
+
 /* Why */
 .why-section { display: grid; gap: 32px; }
 .section-intro h2 { margin-top: 16px; }
@@ -310,6 +328,7 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
   .sandbox-illustration { padding: 20px; }
   .intro-strip > .wrap { flex-direction: row; justify-content: space-between; align-items: center; }
   .benefit-tag { display: block; }
+  .room-columns { grid-template-columns: repeat(3, 1fr); }
   .scenario-options { grid-template-columns: 1fr 1fr; }
   .install-card { padding: 28px 32px; }
   .install-platform { flex-direction: row; align-items: center; justify-content: space-between; }
@@ -324,6 +343,10 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
 @media (min-width: 1000px) {
   .hero { grid-template-columns: 1fr 1fr; align-items: center; gap: 64px; padding-block: 72px 80px; }
   .why-section { grid-template-columns: 1fr 1.1fr; gap: 88px; }
+  .room-section { gap: 40px; }
+  .room-section .section-intro { display: grid; grid-template-columns: 1fr 1.1fr; gap: 0 88px; align-items: end; }
+  .room-section .section-intro > .eyebrow { grid-column: 1 / -1; }
+  .room-section .section-intro > p:last-child { margin-top: 0; }
   .section-heading-row { flex-direction: row; align-items: flex-end; justify-content: space-between; gap: 30px; }
   .section-heading-row > p br { display: inline; }
   .boundary-explorer { grid-template-columns: 0.95fr 1.3fr; gap: 36px; margin-top: 40px; }

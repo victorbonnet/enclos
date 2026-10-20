@@ -5,16 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f5f5ed" media="(prefers-color-scheme: light)">
     <meta name="theme-color" content="#0e1f19" media="(prefers-color-scheme: dark)">
-    <meta name="description" content="One place to manage your local AI agents and see what is running. enclos runs Hermes agents in sandboxes on your Mac, with a central overview and clear file and network limits.">
+    <meta name="description" content="Let your agents work without handing them your Mac. enclos runs Hermes agents in sandboxes on your Mac: free to install tools, run code and browse the web, with your files, keys and local network out of reach.">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src https://api.github.com; img-src 'self' data:; base-uri 'none'; form-action 'none'">
     <meta name="color-scheme" content="light dark">
     <link rel="canonical" href="https://victorbonnet.github.io/enclos/">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://victorbonnet.github.io/enclos/">
-    <meta property="og:title" content="enclos — Your agents. One place. Clear limits.">
-    <meta property="og:description" content="One place to manage your local AI agents and see what is running. enclos runs Hermes agents in sandboxes on your Mac, with a central overview and clear file and network limits.">
+    <meta property="og:title" content="enclos — Let your agents work. Keep your Mac yours.">
+    <meta property="og:description" content="Let your agents work without handing them your Mac. enclos runs Hermes agents in sandboxes on your Mac: free to install tools, run code and browse the web, with your files, keys and local network out of reach.">
     <meta name="twitter:card" content="summary">
-    <title>enclos — Your agents. One place. Clear limits.</title>
+    <title>enclos — Let your agents work. Keep your Mac yours.</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./styles.css">
     <script src="./script.js" defer></script>
@@ -25,7 +25,7 @@
       <div class="wrap header-inner">
       <a class="wordmark" href="#" aria-label="enclos, back to top"><svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M12 4H4v8m16-8h8v8M4 20v8h8m16-8v8h-8" stroke="currentColor" stroke-width="3"/><path d="M12 12h8v8h-8z" fill="currentColor"/></svg>enclos<span class="wordmark-dot">.</span></a>
       <nav aria-label="Main navigation">
-        <a href="#why">Why</a>
+        <a href="#room">Why</a>
         <a href="#boundaries">How<span class="nav-long"> it works</span></a>
         <a href="#start">Install</a>
         <a href="#questions">FAQ</a>
@@ -37,9 +37,9 @@
     <main id="main">
       <section class="hero wrap" aria-labelledby="hero-heading">
         <div class="hero-copy">
-          <p class="eyebrow status"><span class="status-dot" aria-hidden="true"></span> Local agents. One clear overview.</p>
-          <h1 id="hero-heading">Your agents.<br>One place.<br><span class="serif-word">Clear limits.</span></h1>
-          <p class="hero-description">Create, run, and keep track of the agents in your enclos sandboxes from one local CLI. See what’s running, manage their sandboxes, and set limits on what they can access.</p>
+          <p class="eyebrow status"><span class="status-dot" aria-hidden="true"></span> Local agents. Room to work.</p>
+          <h1 id="hero-heading">Let your agents work.<br><span class="serif-word">Keep your Mac yours.</span></h1>
+          <p class="hero-description">Each runtime gets a sandbox of its own. Inside, your agents install tools, run code, and browse the web without asking at every step. Your files, keys, and local network stay out of reach, and one CLI shows what runs where.</p>
           <div class="hero-actions">
             <a class="button button-primary" href="#start">Install enclos <span aria-hidden="true">↗</span></a>
             <a class="text-link" href="#boundaries">See what it controls <span aria-hidden="true">↓</span></a>
@@ -68,8 +68,18 @@
 
       <div class="intro-strip"><div class="wrap"><p>One place to manage your agents.<br><strong>Clear boundaries for every sandbox.</strong></p><span>OPEN SOURCE / LOCAL FIRST / MIT LICENSE</span></div></div>
 
+      <section class="room-section wrap section-space" id="room" aria-labelledby="room-heading">
+        <div class="section-intro"><p class="eyebrow">01 / Room to work</p><h2 id="room-heading">Fewer questions.<br>The same walls.</h2><p>An agent that asks before every step is slow. One with your whole Mac is a risk. In a sandbox, it gets on with the work, inside limits you can read.</p></div>
+        <div class="room-columns">
+          <article class="room-card room-free"><h3><span aria-hidden="true">✓</span>Free to do</h3><ul><li>Install tools, packages, and skills</li><li>Run code and write files in its own home</li><li>Browse and call the public web, every connection logged</li><li>Keep working in the background</li></ul></article>
+          <article class="room-card room-blocked"><h3><span aria-hidden="true">×</span>Out of reach</h3><ul><li>Writing to your files</li><li>Reading SSH keys, credentials, browser data, and mail</li><li>Your local network, your Mac’s own services, and cloud metadata</li><li>Opening apps, sending Apple Events, or signaling other processes</li></ul></article>
+          <article class="room-card room-yours"><h3><span aria-hidden="true">→</span>Your call</h3><ul><li>Other ports and private addresses, when you allow them</li><li>Allowlist mode: only the sites you list</li><li>What to allow after a refusal, without a restart</li></ul></article>
+        </div>
+        <p class="room-note"><strong>Worth knowing:</strong> the agent can still send what it can read to a public website. For sensitive work, put its sandbox in allowlist mode.</p>
+      </section>
+
       <section class="why-section wrap section-space" id="why" aria-labelledby="why-heading">
-        <div class="section-intro"><p class="eyebrow">01 / Why enclos</p><h2 id="why-heading">More agents.<br>Less to keep track of.</h2><p>As you add agents, it gets harder to remember where they live, what’s running, and what they can access. enclos brings the agents in its sandboxes into one local workflow, with a central overview and a policy around each sandbox.</p></div>
+        <div class="section-intro"><p class="eyebrow">02 / One place</p><h2 id="why-heading">More agents.<br>Less to keep track of.</h2><p>As you add agents, it gets harder to remember where they live, what’s running, and what they can access. enclos brings the agents in its sandboxes into one local workflow, with a central overview and a policy around each sandbox.</p></div>
         <div class="benefit-list">
           <article class="benefit"><span class="benefit-number">01</span><div><h3>Your agents, in one place</h3><p>Run <code>enclos status</code> to see your sandboxes and agents, service state, disk usage, and useful next steps. Add or remove agents and start or stop sandboxes through the same CLI.</p></div><span class="benefit-tag">MANAGEMENT</span></article>
           <article class="benefit"><span class="benefit-number">02</span><div><h3>A home of its own</h3><p>The agent can install tools and write files in its sandbox home. By default, it cannot write to your other files, and sensitive paths such as SSH keys, browser data, and cloud credentials are blocked from reads.</p></div><span class="benefit-tag">FILES</span></article>
@@ -80,7 +90,7 @@
 
       <section class="boundaries-section" id="boundaries" aria-labelledby="boundaries-heading">
         <div class="wrap section-space">
-          <div class="section-heading-row"><div><p class="eyebrow">02 / Boundaries, made concrete</p><h2 id="boundaries-heading">What happens when<br>your agent tries to…</h2></div><p>Explore a few everyday actions.<br> These are illustrations, not live activity.</p></div>
+          <div class="section-heading-row"><div><p class="eyebrow">03 / Boundaries, made concrete</p><h2 id="boundaries-heading">What happens when<br>your agent tries to…</h2></div><p>Explore a few everyday actions.<br> These are illustrations, not live activity.</p></div>
           <noscript><p class="boundary-footnote">The tool-install example is shown below. Enable JavaScript to explore the other examples.</p></noscript>
           <div class="boundary-explorer">
             <div class="scenario-options" role="group" aria-label="Choose an example action">
@@ -102,7 +112,7 @@
       </section>
 
       <section class="workflow-section wrap section-space" aria-labelledby="workflow-heading">
-        <div class="workflow-copy"><p class="eyebrow">03 / Fits the way you work</p><h2 id="workflow-heading">From first setup<br>to everyday<br>management.</h2><p>enclos brings sandbox creation, agent management, service controls, and status into one CLI. Hermes still handles the conversation, models, memory, and skills. You keep the runtime’s own commands, with a policy around them.</p><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/architecture.md">Explore the architecture <span aria-hidden="true">↗</span></a><div class="use-case"><span class="eyebrow">A GOOD FIT FOR</span><p>Developers and early adopters running local Hermes agents who want one overview, a consistent way to manage them, and explicit limits on their access.</p></div></div>
+        <div class="workflow-copy"><p class="eyebrow">04 / Fits the way you work</p><h2 id="workflow-heading">From first setup<br>to everyday<br>management.</h2><p>enclos brings sandbox creation, agent management, service controls, and status into one CLI. Hermes still handles the conversation, models, memory, and skills. You keep the runtime’s own commands, with a policy around them.</p><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/architecture.md">Explore the architecture <span aria-hidden="true">↗</span></a><div class="use-case"><span class="eyebrow">A GOOD FIT FOR</span><p>Developers and early adopters running local Hermes agents who want one overview, a consistent way to manage them, and explicit limits on their access.</p></div></div>
         <div class="workflow-steps">
           <article><span class="step-index">1</span><div><h3>Make space for the work</h3><p>Create a named sandbox. It gets its own home, policy, and proxy.</p><code>enclos sandbox create lab</code></div></article>
           <article><span class="step-index">2</span><div><h3>Bring in the runtime</h3><p>Install Hermes inside it and sign in with your model provider.</p><code>enclos runtime install hermes --sandbox lab</code></div></article>
@@ -122,13 +132,13 @@
           </div>
         </div>
         <div class="wrap start-grid">
-          <div class="start-copy"><p class="eyebrow">04 / Take it for a spin</p><h2 id="start-heading">Install once.<br>Meet your sandbox.</h2><p>The installer downloads the latest release and checks it before replacing anything. Then four commands give you a sandbox with Hermes in it, logged in and ready for its first agent.</p><ul class="prerequisites"><li>An Apple silicon Mac running macOS 14 or later</li><li>No Rust compiler needed</li><li>An account with a model provider Hermes supports</li><li>About 2.5 GB of free space per Hermes sandbox</li></ul><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md">Read the full getting started guide <span aria-hidden="true">↗</span></a><p class="provider-note">Run these commands one at a time: the login and the conversation are interactive. When the login shows a URL, open it in your Mac’s browser.</p></div>
+          <div class="start-copy"><p class="eyebrow">05 / Take it for a spin</p><h2 id="start-heading">Install once.<br>Meet your sandbox.</h2><p>The installer downloads the latest release and checks it before replacing anything. Then four commands give you a sandbox with Hermes in it, logged in and ready for its first agent.</p><ul class="prerequisites"><li>An Apple silicon Mac running macOS 14 or later</li><li>No Rust compiler needed</li><li>An account with a model provider Hermes supports</li><li>About 2.5 GB of free space per Hermes sandbox</li></ul><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md">Read the full getting started guide <span aria-hidden="true">↗</span></a><p class="provider-note">Run these commands one at a time: the login and the conversation are interactive. When the login shows a URL, open it in your Mac’s browser.</p></div>
           <div class="terminal"><div class="terminal-top"><span><i></i><i></i><i></i></span><span class="mono">AFTER INSTALLATION</span></div><pre><code id="quickstart-code"><span class="line"><span class="code-comment"># Create enclos state</span></span><span class="line">enclos init</span><span class="line"> </span><span class="line"><span class="code-comment"># A sandbox, then a runtime</span></span><span class="line">enclos sandbox create lab</span><span class="line">enclos runtime install hermes --sandbox lab</span><span class="line">enclos connect lab -- hermes -p default setup</span><span class="line"> </span><span class="line"><span class="code-comment"># Add an agent and check known escape routes</span></span><span class="line">enclos agent add lab/main</span><span class="line">enclos policy test lab</span><span class="line"> </span><span class="line"><span class="code-comment"># Start services and talk to your agent</span></span><span class="line">enclos sandbox start lab</span><span class="line">enclos connect lab -- hermes -p main</span><span class="line"> </span><span class="line"><span class="code-comment"># After the conversation, inspect connections</span></span><span class="line">enclos net log lab</span><span class="line">enclos status</span></code></pre><div class="terminal-footer"><span class="status-dot" aria-hidden="true"></span> Run each command separately. Stop if a probe reports OPEN.</div></div>
         </div>
       </section>
 
       <section class="questions-section wrap section-space" id="questions" aria-labelledby="questions-heading">
-        <div class="questions-heading"><p class="eyebrow">05 / A few useful answers</p><h2 id="questions-heading">Know what<br>you’re getting.</h2><p>Clear boundaries also mean being clear about the limits.</p><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/adr/0014-threat-model-accidental-damage.md">Read the threat model <span aria-hidden="true">↗</span></a></div>
+        <div class="questions-heading"><p class="eyebrow">06 / A few useful answers</p><h2 id="questions-heading">Know what<br>you’re getting.</h2><p>Clear boundaries also mean being clear about the limits.</p><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/adr/0014-threat-model-accidental-damage.md">Read the threat model <span aria-hidden="true">↗</span></a></div>
         <div class="faq-list">
           <details open><summary>Is enclos an AI agent?<span aria-hidden="true">+</span></summary><p>enclos creates and manages sandboxes for agent runtimes. Hermes is the runtime supported today; it provides the agents, conversations, and tools. You use your own supported model-provider account.</p></details>
           <details><summary>Can I manage all my agents in one place?<span aria-hidden="true">+</span></summary><p>enclos gives you one CLI to manage and see the agents in the sandboxes it creates on your Mac. Run <code>enclos status</code> for an overview, then use the agent and sandbox commands to add or remove agents, start or stop services, and clean up unused sandboxes. Hermes is supported today; agents installed elsewhere and other machines are outside this overview.</p></details>
