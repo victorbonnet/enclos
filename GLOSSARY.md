@@ -18,7 +18,11 @@ _Avoid_: driver, provider, engine
 
 **Policy**:
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
-_Avoid_: rules, permissions, config. A backend's file generated from a policy (such as a Seatbelt `.sb` file) is a compiled policy, never a "profile".
+_Avoid_: rules, permissions, config
+
+**Compiled policy**:
+A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
+_Avoid_: profile, sandbox profile, rules file
 
 **Policy snapshot**:
 One immutable, fully resolved version of a sandbox's policy, identified by its content hash and recording the inputs it was resolved from.
