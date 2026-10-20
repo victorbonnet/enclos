@@ -78,6 +78,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.
 - [Decisions](docs/adr/): one short record per architecture decision.
+- [An organization of three sandboxes](examples/organization/README.md): a manager, a developer and a community manager, each in its own sandbox, set up and checked from scripts.
 - [Glossary](GLOSSARY.md): the words enclos uses.
 - [Security policy](SECURITY.md): how to report a vulnerability.
 
