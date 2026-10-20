@@ -15,7 +15,7 @@ A release is a GitHub Release with two assets, built for Apple silicon Macs runn
 The tag runs [`release.yml`](../.github/workflows/release.yml) in two jobs. **build**, with read access only, so dependency build scripts never see a token that can publish:
 
 - refuses a tag that does not match the version in `Cargo.toml`;
-- builds with the lockfile and the toolchain pinned in `rust-toolchain.toml`, on macOS 14 with deployment target 14.0, and checks that the binary is arm64 and prints `enclos <version>`;
+- builds with the lockfile and the toolchain pinned in `rust-toolchain.toml`, on a macOS 26 runner with deployment target 14.0 (so the binary runs on macOS 14 and later), and checks that the binary is arm64 and prints `enclos <version>`;
 - packs it with [`scripts/package-release.sh`](../scripts/package-release.sh), the same script the installer tests use, then unpacks and runs the result.
 
 **publish**, which builds nothing:

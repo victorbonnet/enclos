@@ -17,7 +17,9 @@ jobs:
   # Builds with read access only: `cargo build` runs every dependency's build
   # script, so it never sees a token that can publish or sign.
   build:
-    runs-on: macos-14
+    # A current arm64 image (macos-14 is being retired); the deployment
+    # target keeps the binary running on macOS 14 and later.
+    runs-on: macos-26
     permissions:
       contents: read
     env:
