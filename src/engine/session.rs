@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::lifecycle::process::{group_members, group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
+use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{Member, SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
@@ -41,7 +42,11 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         command: Vec<OsString>,
-    ) -> Result<SessionEnd> {
+        confirm: Confirm,
+    ) -> Result<Planned<SessionEnd>> {
+        if confirm == Confirm::DryRun {
+            return self.plan_connect(name, &command).map(Planned::DryRun);
+        }
         let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
         // Which process group is the session's (design §8). In a terminal
         // where this command leads its job, the job's group: the program
@@ -145,22 +150,62 @@ impl Engine {
                 Ok(())
             },
         )?;
-        Ok(SessionEnd {
+        Ok(Planned::Done(SessionEnd {
             session,
             exit,
             left,
+        }))
+    }
+
+    /// What `connect` would start, without starting anything.
+    fn plan_connect(&self, name: &SandboxName, command: &[OsString]) -> Result<Plan> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let (version, _) = self
+            .state
+            .active_policy(name)?
+            .ok_or_else(|| Error::NoPolicy {
+                sandbox: name.to_string(),
+            })?;
+        let mut changes = Vec::new();
+        if !self.proxy_runs(name)? {
+            changes.push(format!(
+                "start the proxy of sandbox {name} on port {}",
+                record.proxy_port
+            ));
+        }
+        let shown = match command {
+            [] => "/bin/zsh -l".to_owned(),
+            words => words
+                .iter()
+                .map(|w| w.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        changes.push(format!(
+            "run `{shown}` in sandbox {name} under policy v{}",
+            version.version
+        ));
+        Ok(Plan {
+            changes,
+            ..Plan::default()
         })
+    }
+
+    /// Whether the sandbox's recorded proxy still runs.
+    fn proxy_runs(&self, name: &SandboxName) -> Result<bool> {
+        Ok(self
+            .state
+            .sessions(name, true)?
+            .into_iter()
+            .any(|s| s.kind == SessionKind::Proxy && is_same(&s.root)))
     }
 
     /// Starts the sandbox's proxy unless it runs already, and records it as
     /// a session, so that `sandbox stop` ends it too.
     fn ensure_proxy(&self, lock: &StateLock, record: &SandboxRecord) -> Result<()> {
-        let running = self
-            .state
-            .sessions(&record.name, true)?
-            .into_iter()
-            .any(|s| s.kind == SessionKind::Proxy && is_same(&s.root));
-        if running {
+        if self.proxy_runs(&record.name)? {
             return Ok(());
         }
         let failed = |what: String| Error::Session { what };

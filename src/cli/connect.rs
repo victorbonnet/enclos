@@ -5,8 +5,9 @@ use std::ffi::OsString;
 use clap::Args;
 
 use enclos::engine::Engine;
-use enclos::error::Result;
+use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
+use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -18,8 +19,14 @@ pub struct ConnectArgs {
     command: Vec<OsString>,
 }
 
-pub fn run(engine: &Engine, by: &Actor, args: ConnectArgs) -> Result<u8> {
-    let end = engine.connect(by, &args.sandbox, args.command)?;
+pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> Result<u8> {
+    let end = match engine.connect(by, &args.sandbox, args.command, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            return Ok(exit::OK);
+        }
+        Planned::Done(end) => end,
+    };
     if !end.left.is_empty() {
         let pids: Vec<String> = end
             .left

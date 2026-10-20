@@ -67,9 +67,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         }
         SandboxVerb::List => print_list(&engine.list_sandboxes()?),
         SandboxVerb::Show { name } => print_show(&engine.show_sandbox(&name)?),
-        SandboxVerb::Stop { name } => {
-            return Ok(print_stop(&name, &engine.stop_sandbox(by, &name)?));
-        }
+        SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
+            Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
+            Planned::Done(report) => return Ok(print_stop(&name, &report)),
+        },
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),

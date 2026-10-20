@@ -102,7 +102,7 @@ fn run(cli: Cli) -> Result<u8> {
             ..
         }) => Ok(print_verify(&engine.verify_audit()?)),
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
-        Command::Connect(args) => cli::connect::run(&engine, &current_actor(), args),
+        Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, args),

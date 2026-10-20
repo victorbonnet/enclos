@@ -139,7 +139,32 @@ impl Engine {
 
     /// Stops every session of the sandbox. Members that survive are
     /// reported, and the sandbox is marked failed rather than stopped.
-    pub fn stop_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<StopReport> {
+    pub fn stop_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+    ) -> Result<Planned<StopReport>> {
+        if confirm == Confirm::DryRun {
+            let view = self.show_sandbox(name)?;
+            let mut changes: Vec<String> = view
+                .sessions
+                .iter()
+                .map(|(s, members)| {
+                    format!(
+                        "stop session {} ({}, {} processes)",
+                        s.id,
+                        s.kind.as_str(),
+                        members.len()
+                    )
+                })
+                .collect();
+            changes.push(format!("mark sandbox {name} stopped"));
+            return Ok(Planned::DryRun(Plan {
+                changes,
+                ..Plan::default()
+            }));
+        }
         let summary = |r: &StopReport| match r.survivors.is_empty() {
             true => format!("stopped {} sessions", r.stopped.len()),
             false => format!("{} sessions left members running", r.survivors.len()),
@@ -177,6 +202,7 @@ impl Engine {
                 Ok(report)
             },
         )
+        .map(Planned::Done)
     }
 
     /// Removes a stopped sandbox: its record and history, and its folder

@@ -492,9 +492,40 @@ mod sandbox {
     }
 
     #[test]
+    fn dry_runs_of_stop_and_connect_change_nothing() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let entries = engine.audit(None).unwrap().len();
+        let Planned::DryRun(plan) = engine
+            .stop_sandbox(&alice(), &name, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run stopped the sandbox");
+        };
+        assert_eq!(plan.changes, ["mark sandbox home stopped"]);
+        let Planned::DryRun(plan) = engine
+            .connect(&alice(), &name, Vec::new(), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run connected");
+        };
+        assert!(
+            plan.changes
+                .last()
+                .is_some_and(|c| c.starts_with("run `/bin/zsh -l` in sandbox home")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            crate::model::sandbox::SandboxState::Created
+        );
+        assert!(engine.state.sessions(&name, false).unwrap().is_empty());
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    #[test]
     fn stopping_a_sandbox_with_nothing_running_marks_it_stopped() {
         let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
-        let report = engine.stop_sandbox(&alice(), &name).unwrap();
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
         assert!(report.stopped.is_empty() && report.survivors.is_empty());
         assert_eq!(
             engine.show_sandbox(&name).unwrap().record.state,
