@@ -322,7 +322,7 @@ impl Engine {
     }
 
     /// Whether the sandbox's recorded proxy still runs.
-    fn proxy_runs(&self, name: &SandboxName) -> Result<bool> {
+    pub(super) fn proxy_runs(&self, name: &SandboxName) -> Result<bool> {
         for s in self.state.sessions(name, true)? {
             if s.kind == SessionKind::Proxy && is_same(&s.root)? {
                 return Ok(true);

@@ -6,6 +6,14 @@
 //! Event, a launchd job, a preferences write) run only with
 //! `--host-services`, which CI's macOS runners use; whatever they manage to
 //! create is checked from the host and removed.
+//!
+//! A probe that only has to fail proves something only if the same thing
+//! works outside the sandbox: `crontab -l` fails anyway for an account
+//! without a crontab, and a connection fails anyway on a host that is
+//! offline. Each such probe has a control, a harmless check run on the host
+//! first; when the control fails too, the probe is inconclusive, not closed.
+//! The host-service probes have none, since running them outside would act
+//! on this Mac; what they leave is checked from the host instead.
 
 use std::path::{Path, PathBuf};
 
@@ -45,14 +53,29 @@ pub struct Probe {
     pub script: String,
     pub expect: Expect,
     pub host: HostCheck,
+    /// A harmless `/bin/sh -c` script run on the host, outside the sandbox,
+    /// that succeeds when the route works there.
+    pub control: Option<String>,
+}
+
+impl Probe {
+    fn control(mut self, script: impl Into<String>) -> Probe {
+        self.control = Some(script.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// The probe failed in the sandbox, and its control worked outside it.
     Closed,
     /// The route is open: what showed it.
     Open(String),
-    Skipped(String),
+    /// The probe failed, but so did its control outside the sandbox: the
+    /// failure shows nothing about the policy.
+    Inconclusive(String),
+    /// The probe could not be run, with why: the route was not tested.
+    NotRun(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +122,7 @@ fn probe(
         script: script.into(),
         expect,
         host: HostCheck::None,
+        control: None,
     }
 }
 
@@ -111,15 +135,29 @@ fn read(path: &Path) -> String {
     }
 }
 
+/// Whether this user may read `path`, without reading it.
+fn readable(path: &Path) -> String {
+    match path.is_dir() {
+        true => format!("test -r {0} -a -x {0}", sh_quote(path)),
+        false => format!("test -r {}", sh_quote(path)),
+    }
+}
+
+/// A probe that reads `path`, controlled by whether the user may.
+fn read_probe(route: &'static str, path: &Path) -> Probe {
+    probe(
+        route,
+        format!("read {}", path.display()),
+        read(path),
+        Expect::Fails,
+    )
+    .control(readable(path))
+}
+
 pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
     let mut list = Vec::new();
     for path in i.read_deny.iter().filter(|p| p.exists()) {
-        list.push(probe(
-            "sensitive files",
-            format!("read {}", path.display()),
-            read(path),
-            Expect::Fails,
-        ));
+        list.push(read_probe("sensitive files", path));
     }
     for path in [
         i.data.join("state.db"),
@@ -127,21 +165,11 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         i.config_file.clone(),
     ] {
         if path.exists() {
-            list.push(probe(
-                "enclos files",
-                format!("read {}", path.display()),
-                read(&path),
-                Expect::Fails,
-            ));
+            list.push(read_probe("enclos files", &path));
         }
     }
     for dir in &i.other_sandboxes {
-        list.push(probe(
-            "other sandboxes",
-            format!("read {}", dir.display()),
-            read(dir),
-            Expect::Fails,
-        ));
+        list.push(read_probe("other sandboxes", dir));
     }
     let in_enclos = i.data.join(format!("enclos-probe-{}", i.tag));
     let mut write = probe(
@@ -149,7 +177,8 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "write in the enclos folder",
         format!("echo x > {}", sh_quote(&in_enclos)),
         Expect::Fails,
-    );
+    )
+    .control(format!("test -w {}", sh_quote(&i.data)));
     write.host = HostCheck::File(in_enclos);
     list.push(write);
     let outside = i.user_home.join(format!("enclos-probe-{}", i.tag));
@@ -158,7 +187,8 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "write outside the home",
         format!("echo x > {}", sh_quote(&outside)),
         Expect::Fails,
-    );
+    )
+    .control(format!("test -w {}", sh_quote(&i.user_home)));
     write.host = HostCheck::File(outside);
     list.push(write);
 
@@ -168,64 +198,82 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "/usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 https://probe.enclos.invalid/",
         Expect::ProxyRefuses,
     ));
-    list.push(probe(
-        "network",
-        "a direct connection, around the proxy",
-        "/usr/bin/nc -z -w 3 1.1.1.1 443",
-        Expect::Fails,
-    ));
-    list.push(probe(
-        "dns",
-        "DNS on port 53",
-        "/usr/bin/nc -z -w 3 1.1.1.1 53",
-        Expect::Fails,
-    ));
-    list.push(probe(
-        "dns",
-        "a name lookup through mDNSResponder",
-        "/usr/bin/dscacheutil -q host -a name example.com",
-        Expect::OutputLacks("address"),
-    ));
-    for socket in &i.host_sockets {
-        list.push(probe(
-            "host sockets",
-            format!("connect to {}", socket.display()),
-            format!("/usr/bin/nc -U -w 2 {} </dev/null", sh_quote(socket)),
+    // The same connections outside the sandbox: they only open and close
+    // a connection, and fail on a host that is offline.
+    let direct = "/usr/bin/nc -z -w 3 1.1.1.1 443";
+    list.push(
+        probe(
+            "network",
+            "a direct connection, around the proxy",
+            direct,
             Expect::Fails,
-        ));
+        )
+        .control(direct),
+    );
+    let dns = "/usr/bin/nc -z -w 3 1.1.1.1 53";
+    list.push(probe("dns", "DNS on port 53", dns, Expect::Fails).control(dns));
+    list.push(
+        probe(
+            "dns",
+            "a name lookup through mDNSResponder",
+            "/usr/bin/dscacheutil -q host -a name example.com",
+            Expect::OutputLacks("address"),
+        )
+        .control("/usr/bin/dscacheutil -q host -a name example.com | /usr/bin/grep -q address"),
+    );
+    for socket in &i.host_sockets {
+        list.push(
+            probe(
+                "host sockets",
+                format!("connect to {}", socket.display()),
+                format!("/usr/bin/nc -U -w 2 {} </dev/null", sh_quote(socket)),
+                Expect::Fails,
+            )
+            .control(format!("test -S {0} -a -w {0}", sh_quote(socket))),
+        );
     }
     let mut signal = probe(
         "signals",
         "signal a process outside the sandbox",
         format!("kill -TERM {}", i.outside_pid),
         Expect::Fails,
-    );
+    )
+    // Signal 0 only checks that a signal could be sent.
+    .control(format!("kill -0 {}", i.outside_pid));
     signal.host = HostCheck::Process(i.outside_pid);
     list.push(signal);
     let keychain = i.user_home.join("Library/Keychains/login.keychain-db");
     if keychain.exists() {
-        list.push(probe(
-            "keychain",
-            "read the login keychain's settings",
-            format!(
-                "/usr/bin/security show-keychain-info {}",
-                sh_quote(&keychain)
-            ),
-            Expect::Fails,
-        ));
+        // Its settings (lock timeout), not its items.
+        let info = format!(
+            "/usr/bin/security show-keychain-info {}",
+            sh_quote(&keychain)
+        );
+        list.push(
+            probe(
+                "keychain",
+                "read the login keychain's settings",
+                info.clone(),
+                Expect::Fails,
+            )
+            .control(format!("{info} >/dev/null 2>&1")),
+        );
     }
-    list.push(probe(
-        "synthetic input",
-        "read the pasteboard",
-        "/usr/bin/pbpaste >/dev/null",
-        Expect::Fails,
-    ));
-    list.push(probe(
-        "at and crontab",
-        "list crontab",
-        "/usr/bin/crontab -l >/dev/null",
-        Expect::Fails,
-    ));
+    // The controls read the pasteboard and the crontab outside the sandbox,
+    // and discard them; an account without a crontab makes this probe
+    // inconclusive.
+    let paste = "/usr/bin/pbpaste >/dev/null";
+    list.push(
+        probe(
+            "synthetic input",
+            "read the pasteboard",
+            paste,
+            Expect::Fails,
+        )
+        .control(paste),
+    );
+    let cron = "/usr/bin/crontab -l >/dev/null";
+    list.push(probe("at and crontab", "list crontab", cron, Expect::Fails).control(cron));
 
     if i.host_services {
         // `open <folder>` asks LaunchServices to open it, and reports the
@@ -288,6 +336,21 @@ pub fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
         ),
         Expect::AppleEventBlocked => Outcome::Closed,
+    }
+}
+
+/// The final outcome once the control is known: a probe that failed is
+/// closed only if the control, run outside the sandbox, succeeded.
+/// `control` is the control's success and output, when the probe has one.
+pub fn conclude(outcome: Outcome, control: Option<(bool, &str)>) -> Outcome {
+    match (outcome, control) {
+        (Outcome::Closed, Some((false, output))) => {
+            Outcome::Inconclusive(match last_line(output) {
+                line if line.is_empty() => "it fails outside the sandbox too".to_owned(),
+                line => format!("it fails outside the sandbox too: {line}"),
+            })
+        }
+        (outcome, _) => outcome,
     }
 }
 
@@ -359,6 +422,37 @@ mod tests {
         assert!(matches!(judge(ae, false, timeout), Outcome::Open(_)));
         let blocked = "execution error: An error of type -10004 has occurred. (-10004)";
         assert_eq!(judge(ae, false, blocked), Outcome::Closed);
+    }
+
+    #[test]
+    fn a_probe_that_fails_outside_the_sandbox_too_proves_nothing() {
+        let list = probes(&inputs(false));
+        let cron = list.iter().find(|p| p.route == "at and crontab").unwrap();
+        let failed = judge(cron, false, "crontab: Operation not permitted");
+        assert_eq!(failed, Outcome::Closed);
+        let no_crontab = "crontab: no crontab for alice";
+        assert!(matches!(
+            conclude(failed.clone(), Some((false, no_crontab))),
+            Outcome::Inconclusive(why) if why.contains("no crontab")
+        ));
+        assert_eq!(conclude(failed, Some((true, ""))), Outcome::Closed);
+        // An open route stays open, whatever the control says.
+        let open = judge(cron, true, "");
+        assert_eq!(conclude(open.clone(), Some((false, ""))), open);
+    }
+
+    #[test]
+    fn every_probe_that_runs_here_has_a_control_and_host_services_have_none() {
+        for p in probes(&inputs(false)) {
+            let needs = p.expect != Expect::ProxyRefuses;
+            assert_eq!(p.control.is_some(), needs, "{}", p.name);
+        }
+        let safe: Vec<String> = probes(&inputs(false)).into_iter().map(|p| p.name).collect();
+        for p in probes(&inputs(true)) {
+            if !safe.contains(&p.name) {
+                assert!(p.control.is_none(), "{} would act on the host", p.name);
+            }
+        }
     }
 
     #[test]

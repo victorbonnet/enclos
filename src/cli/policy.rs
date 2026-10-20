@@ -40,8 +40,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
             sandbox,
             host_services,
         } => {
-            let report = engine.policy_test(by, &sandbox, host_services)?;
-            return Ok(print_test(&sandbox, &report));
+            return Ok(
+                match engine.policy_test(by, &sandbox, host_services, confirm)? {
+                    Planned::DryRun(plan) => {
+                        plan.changes.iter().for_each(|c| println!("Would {c}."));
+                        exit::OK
+                    }
+                    Planned::Done(report) => print_test(&sandbox, &report),
+                },
+            );
         }
         PolicyVerb::Show { sandbox } => print_policy(&engine.policy(&sandbox)?),
         PolicyVerb::Allow {
@@ -129,9 +136,10 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     println!("Escape probes in sandbox {sandbox}: each tries one way out and must fail.");
     for r in &report.results {
         let (mark, detail) = match &r.outcome {
-            Outcome::Closed => ("closed ", String::new()),
-            Outcome::Open(why) => ("OPEN   ", format!("  <- {why}")),
-            Outcome::Skipped(why) => ("skipped", format!("  ({why})")),
+            Outcome::Closed => ("closed      ", String::new()),
+            Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
+            Outcome::Inconclusive(why) => ("inconclusive", format!("  ({why})")),
+            Outcome::NotRun(why) => ("NOT RUN     ", format!("  <- {why}")),
         };
         println!("  {mark}  {:<16} {}{detail}", r.route, r.name);
     }
@@ -141,18 +149,35 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
         );
     }
     println!(
-        "Only the routes listed were probed: closed means each probe failed as it should, not that no other way out exists."
+        "Only the routes listed were probed: closed means each probe failed as it should while the same thing worked outside the sandbox, not that no other way out exists."
     );
-    match report.open() {
-        0 => {
-            println!("All {} probes failed as they should.", report.results.len());
+    if report.inconclusive() > 0 {
+        println!(
+            "{} probes were inconclusive: they fail outside the sandbox too, so they show nothing about the policy.",
+            report.inconclusive()
+        );
+    }
+    if report.open() > 0 {
+        eprintln!(
+            "error: {} probes got through. Do not use this sandbox until this is fixed.",
+            report.open()
+        );
+    }
+    if report.not_run() > 0 {
+        eprintln!(
+            "error: {} probes could not run, so their routes were not tested.",
+            report.not_run()
+        );
+    }
+    match report.passed() {
+        true => {
+            println!(
+                "{} of {} probes failed as they should.",
+                report.closed(),
+                report.results.len()
+            );
             exit::OK
         }
-        n => {
-            eprintln!(
-                "error: {n} probes got through. Do not use this sandbox until this is fixed."
-            );
-            exit::ERROR
-        }
+        false => exit::ERROR,
     }
 }

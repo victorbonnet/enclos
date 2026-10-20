@@ -454,6 +454,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     );
     let report = out.stdout();
     assert!(!report.contains("OPEN"), "{report}");
+    assert!(!report.contains("NOT RUN"), "{report}");
     for route in [
         "enclos files",
         "other sandboxes",
@@ -463,15 +464,54 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "signals",
         "synthetic input",
     ] {
-        assert!(
-            report.contains(&format!("closed   {route}")),
-            "no closed {route} probe:\n{report}"
-        );
+        let closed = report
+            .lines()
+            .any(|l| l.trim_start().starts_with("closed ") && l.contains(&format!(" {route} ")));
+        assert!(closed, "no closed {route} probe:\n{report}");
     }
+    assert!(report.contains("probes failed as they should"), "{report}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn policy_test_fails_when_its_probes_cannot_run() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // A home no probe can run in.
+    let sandbox_home = home.root.join("sandboxes/home/home");
+    std::fs::remove_dir_all(&sandbox_home).unwrap();
+    std::fs::write(&sandbox_home, "not a folder").unwrap();
+    let out = home.run(&["policy", "test", "home"]);
+    assert_ne!(out.code(), 0, "{}", out.stdout());
     assert!(
-        report.contains("All ") && report.contains("probes failed as they should"),
-        "{report}"
+        !out.stdout().contains("failed as they should"),
+        "{}",
+        out.stdout()
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_policy_test_dry_run_starts_and_records_nothing() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let before = home.audit_lines().len();
+    let out = home.run(&["policy", "test", "home", "--host-services", "--dry-run"]);
+    let plan = out.ok().stdout();
+    assert!(
+        plan.contains("Would start the proxy of sandbox home"),
+        "{plan}"
+    );
+    assert!(plan.contains("escape probes in sandbox home"), "{plan}");
+    assert!(!plan.contains("closed"), "{plan}");
+    assert_eq!(home.audit_lines().len(), before);
+    assert!(!home.root.join("sandboxes/home/compiled").exists());
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains("no sessions running"), "{show}");
 }
 
 #[cfg(target_os = "macos")]
