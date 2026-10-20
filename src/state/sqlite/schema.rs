@@ -60,6 +60,7 @@ pub const MIGRATIONS: &[&str] = &[
         root_pid    INTEGER NOT NULL,
         root_start  TEXT NOT NULL,
         pgid        INTEGER NOT NULL,
+        tracked     TEXT NOT NULL DEFAULT '[]',
         started_at  TEXT NOT NULL,
         ended_at    TEXT
     ) STRICT;

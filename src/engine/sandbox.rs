@@ -4,7 +4,7 @@
 use super::Engine;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::process::group_members;
+use crate::lifecycle::members::members;
 use crate::lifecycle::stop::{GRACE, Stopped, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -143,8 +143,8 @@ impl Engine {
             .sessions(&record.name, true)?
             .into_iter()
             .map(|s| {
-                let members = group_members(s.pgid);
-                (s, members)
+                let found = members(&s);
+                (s, found)
             })
             .collect();
         Ok(SandboxView {

@@ -71,15 +71,20 @@ pub struct SessionRecord {
     pub snapshot: SnapshotId,
     /// The compiled policy file it runs under (none for the proxy).
     pub compiled: Option<String>,
-    /// The first process of the session.
+    /// The program the session started.
     pub root: ProcessRef,
-    /// The process group its members share.
+    /// The process group the program started in: one made for it, or the
+    /// terminal's job, which the `enclos` holding the terminal leads; 0
+    /// when neither (design §8).
     pub pgid: u32,
+    /// Members recorded while the session ran, so that one whose parent
+    /// exited is still found.
+    pub tracked: Vec<ProcessRef>,
     pub started_at: Timestamp,
     pub ended_at: Option<Timestamp>,
 }
 
-/// A process found running in a session's process group.
+/// A process found running as a member of a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub pid: u32,

@@ -13,7 +13,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
-use crate::model::session::{SessionId, SessionRecord};
+use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
 ///
@@ -83,6 +83,8 @@ pub trait StateStore: NetLogStore {
 
     /// Records a session that started; its `id` is ignored and assigned.
     fn put_session(&self, lock: &StateLock, session: &SessionRecord) -> Result<SessionId>;
+    /// Replaces the members recorded for a running session.
+    fn track(&self, lock: &StateLock, id: SessionId, tracked: &[ProcessRef]) -> Result<()>;
     /// Records that a session ended.
     fn end_session(&self, lock: &StateLock, id: SessionId) -> Result<()>;
     /// The sandbox's sessions, oldest first; only those not ended yet when

@@ -1,17 +1,15 @@
-//! Stopping a session: every member of its process group (design §8).
+//! Stopping a session: every member (design §8).
 //!
-//! TERM to the group, a grace period, KILL to what is left, then a check.
-//! The group is signalled only while its recorded leader is still the same
-//! process (see `process`). If the leader is already gone, nothing is
-//! signalled and whatever still runs in its group is reported as surviving.
-//!
-//! Known gap (milestone 1): a member that leaves the group (`setsid`) is
-//! not seen. It keeps its Seatbelt restrictions, so this is a lifecycle bug,
-//! not a way out of the sandbox (ADR 0019).
+//! TERM to the members, a grace period, KILL to what is left, then a check.
+//! A group is signalled through its leader when the leader is a sure
+//! member, any other sure member alone; members that are only counted are
+//! never signalled, and are reported if they remain (see `members`).
 
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use super::process::{Signal, group_members, is_same, signal_group};
+use super::members::{Found, find};
+use super::process::{Signal, processes, signal_group, signal_process};
 use crate::model::session::{Member, SessionRecord};
 
 pub const GRACE: Duration = Duration::from_secs(5);
@@ -27,34 +25,52 @@ pub enum Stopped {
 }
 
 pub fn stop(session: &SessionRecord, grace: Duration) -> Stopped {
-    if !is_same(&session.root) {
-        // The leader is gone: its group may still hold members, but without
-        // the leader there is no proof they are this session's.
-        let left = group_members(session.pgid);
-        return if left.is_empty() {
-            Stopped::Clean
-        } else {
-            Stopped::Survivors(left)
+    let first = find(&processes(), session, &session.tracked);
+    if !first.iter().any(|f| f.sure) {
+        // Nothing enclos may signal: what is only counted is reported.
+        return match first.is_empty() {
+            true => Stopped::Clean,
+            false => Stopped::Survivors(first.into_iter().map(|f| f.member).collect()),
         };
     }
-    signal_group(&session.root, session.pgid, Signal::Term);
-    if wait_empty(session.pgid, grace) {
+    // What was found stays known while the signals end parents: a member
+    // whose parent exits first is still the session's.
+    let mut known = session.tracked.clone();
+    known.extend(first.iter().filter(|f| f.sure).map(Found::process));
+    let now = || find(&processes(), session, &known);
+    signal(&first, Signal::Term);
+    if wait_empty(&now, grace) {
         return Stopped::Clean;
     }
-    // KILL needs the leader too; a leader that already exited leaves its
-    // members to be reported.
-    signal_group(&session.root, session.pgid, Signal::Kill);
-    if wait_empty(session.pgid, grace) {
+    signal(&now(), Signal::Kill);
+    if wait_empty(&now, grace) {
         Stopped::Clean
     } else {
-        Stopped::Survivors(group_members(session.pgid))
+        Stopped::Survivors(now().into_iter().map(|f| f.member).collect())
     }
 }
 
-fn wait_empty(pgid: u32, within: Duration) -> bool {
+fn signal(found: &[Found], signal: Signal) {
+    let sure: Vec<&Found> = found.iter().filter(|f| f.sure).collect();
+    let leaders: BTreeSet<u32> = sure
+        .iter()
+        .filter(|f| f.member.pid == f.pgid)
+        .map(|f| f.pgid)
+        .collect();
+    for f in sure {
+        let process = f.process();
+        if leaders.contains(&f.member.pid) {
+            signal_group(&process, f.pgid, signal);
+        } else if !leaders.contains(&f.pgid) {
+            signal_process(&process, signal);
+        }
+    }
+}
+
+fn wait_empty(now: &impl Fn() -> Vec<Found>, within: Duration) -> bool {
     let start = Instant::now();
     loop {
-        if group_members(pgid).is_empty() {
+        if now().is_empty() {
             return true;
         }
         if start.elapsed() >= within {
@@ -67,9 +83,10 @@ fn wait_empty(pgid: u32, within: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::members::members;
     use crate::lifecycle::process::reference;
     use crate::model::now;
-    use crate::model::session::{SessionId, SessionKind};
+    use crate::model::session::{ProcessRef, SessionId, SessionKind};
     use std::os::unix::process::CommandExt;
     use std::process::Command;
 
@@ -83,6 +100,7 @@ mod tests {
             compiled: None,
             root: reference(child.id()).unwrap(),
             pgid: child.id(),
+            tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
         }
@@ -98,12 +116,41 @@ mod tests {
             .unwrap();
         let session = session_of(&child);
         let start = Instant::now();
-        while group_members(session.pgid).len() < 2 && start.elapsed() < Duration::from_secs(5) {
+        while members(&session).len() < 2 && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(POLL);
         }
-        assert_eq!(group_members(session.pgid).len(), 2);
+        assert_eq!(members(&session).len(), 2);
         assert_eq!(stop(&session, Duration::from_secs(5)), Stopped::Clean);
         let _ = child.wait();
+    }
+
+    #[test]
+    fn stop_ends_a_job_in_a_group_of_its_own() {
+        // A child that moves to a group of its own, as an interactive
+        // shell's jobs do.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "/usr/bin/perl -e 'setpgrp; sleep 30' & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let session = session_of(&child);
+        let start = Instant::now();
+        let job = loop {
+            let found = members(&session);
+            if let Some(job) = found.iter().find(|m| {
+                crate::lifecycle::process::group_of(m.pid) == Some(m.pid) && m.pid != child.id()
+            }) {
+                break job.clone();
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{found:?}");
+            std::thread::sleep(POLL);
+        };
+        assert_eq!(stop(&session, Duration::from_secs(5)), Stopped::Clean);
+        let _ = child.wait();
+        assert!(!crate::lifecycle::process::is_same(&ProcessRef {
+            pid: job.pid,
+            started: job.started,
+        }));
     }
 
     #[test]

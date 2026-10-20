@@ -6,18 +6,19 @@ use std::io::IsTerminal;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use super::Engine;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_members, group_of, is_same, reference};
+use crate::lifecycle::members::{Found, find};
+use crate::lifecycle::process::{group_of, is_same, processes, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::session::{Member, SessionId, SessionKind, SessionRecord};
+use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
 /// How a session ended.
@@ -33,6 +34,11 @@ pub struct SessionEnd {
 
 /// How long the proxy has to start listening.
 const PROXY_START: Duration = Duration::from_secs(5);
+/// How often a running session's processes are looked at, to record the
+/// members it starts.
+const WATCH: Duration = Duration::from_millis(500);
+/// How often the wait for a session's program checks that it exited.
+const EXIT_POLL: Duration = Duration::from_millis(20);
 
 impl Engine {
     /// Runs `command` (a login shell by default) in the sandbox, in this
@@ -47,18 +53,19 @@ impl Engine {
         if confirm == Confirm::DryRun {
             return self.plan_connect(name, &command).map(Planned::DryRun);
         }
-        let summary = |(id, _, _): &(SessionId, _, _)| format!("session {id}");
-        // Which process group is the session's (design §8). In a terminal
-        // where this command leads its job, the job's group: the program
-        // keeps the terminal. Run by something else without a terminal (a
-        // script, CI), a new group for the program, so the session's group
-        // holds only its processes. Otherwise (a terminal, but not a job of
-        // its own) the group is the caller's, which is not the session's to
-        // signal or count.
+        let summary = |(session, _): &(SessionRecord, _)| format!("session {}", session.id);
+        // Which process group the program starts in (design §8). In a
+        // terminal where this command leads its job, the job's group: the
+        // program keeps the terminal, and this process, which leads the
+        // group, is not a member. Run by something else without a terminal
+        // (a script, CI), a group made for the program. Otherwise (a
+        // terminal, but not a job of its own) the caller's group, which is
+        // not the session's: the session then has no group, only the
+        // processes the program starts.
         let me = std::process::id();
         let leads_group = group_of(me) == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
-        let (session, mut child, pgid) =
+        let (session, mut child) =
             self.write(by, "connect", Some(name.to_string()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
@@ -94,46 +101,33 @@ impl Engine {
                         launch.program.to_string_lossy()
                     ),
                 })?;
-                let leader = if own_group { child.id() } else { me };
-                let session = SessionRecord {
+                let mut session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),
                     kind: SessionKind::Interactive,
                     version: version.version,
                     snapshot: snapshot.id,
                     compiled: Some(compiled.display().to_string()),
-                    root: reference(leader).ok_or_else(|| Error::Session {
+                    root: reference(child.id()).ok_or_else(|| Error::Session {
                         what: "cannot read the session's start time".into(),
                     })?,
-                    pgid: if own_group {
-                        leader
-                    } else {
-                        group_of(me).unwrap_or(me)
+                    pgid: match (own_group, leads_group) {
+                        (true, _) => child.id(),
+                        (false, true) => me,
+                        (false, false) => 0,
                     },
+                    tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,
                 };
-                let id = self.state.put_session(lock, &session)?;
+                session.id = self.state.put_session(lock, &session)?;
                 record.state = SandboxState::Running;
                 self.state.put(lock, &record)?;
-                Ok((id, child, session.pgid))
+                Ok((session, child))
             })?;
 
-        let status = child.wait().map_err(|e| Error::Session {
-            what: format!("lost the session's program: {e}"),
-        })?;
+        let (status, left) = self.wait_session(&session, &mut child)?;
         let exit = status.code().unwrap_or(1);
-        // The program's exit is not the session's end: what it left running
-        // in the session's group keeps the session open, so `show`, `stop`
-        // and `rm` still see it. This process is not a member.
-        let left: Vec<Member> = if leads_group || own_group {
-            group_members(pgid)
-                .into_iter()
-                .filter(|m| m.pid != me)
-                .collect()
-        } else {
-            Vec::new()
-        };
         let summary = |_: &()| match left.len() {
             0 => format!("exit {exit}"),
             n => format!("exit {exit}, {n} processes still running"),
@@ -141,20 +135,73 @@ impl Engine {
         self.write(
             by,
             "session end",
-            Some(format!("{name} session {session}")),
+            Some(format!("{name} session {}", session.id)),
             summary,
-            |lock| {
-                if left.is_empty() {
-                    self.state.end_session(lock, session)?;
-                }
-                Ok(())
-            },
+            |lock| self.end_or_track(lock, &session, &left),
         )?;
         Ok(Planned::Done(SessionEnd {
-            session,
+            session: session.id,
             exit,
-            left,
+            left: left.into_iter().map(|f| f.member).collect(),
         }))
+    }
+
+    /// Waits for the session's program to exit, recording the members it
+    /// starts as they appear (design §8), and returns its exit status and
+    /// the members it left running.
+    pub(super) fn wait_session(
+        &self,
+        session: &SessionRecord,
+        child: &mut Child,
+    ) -> Result<(ExitStatus, Vec<Found>)> {
+        let lost = |e: std::io::Error| Error::Session {
+            what: format!("lost the session's program: {e}"),
+        };
+        let mut known = session.tracked.clone();
+        let mut saved = known.clone();
+        let mut looked: Option<Instant> = None;
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(lost)? {
+                break status;
+            }
+            if looked.is_none_or(|at| at.elapsed() >= WATCH) {
+                looked = Some(Instant::now());
+                known = find(&processes(), session, &known)
+                    .iter()
+                    .filter(|f| f.sure)
+                    .map(Found::process)
+                    .collect();
+                // Recorded for `show`, `stop` and `rm`; a busy lock only
+                // delays it to a later look.
+                if known != saved
+                    && let Ok(lock) = self.state.lock()
+                    && self.state.track(&lock, session.id, &known).is_ok()
+                {
+                    saved = known.clone();
+                }
+            }
+            std::thread::sleep(EXIT_POLL);
+        };
+        // The program's exit is not the session's end: what it left running
+        // keeps the session open, so `show`, `stop` and `rm` still see it.
+        Ok((status, find(&processes(), session, &known)))
+    }
+
+    /// Ends the session, or, while it left members running, records them.
+    pub(super) fn end_or_track(
+        &self,
+        lock: &StateLock,
+        session: &SessionRecord,
+        left: &[Found],
+    ) -> Result<()> {
+        if left.is_empty() {
+            self.state.end_session(lock, session.id)?;
+        } else {
+            let sure: Vec<ProcessRef> =
+                left.iter().filter(|f| f.sure).map(Found::process).collect();
+            self.state.track(lock, session.id, &sure)?;
+        }
+        Ok(())
     }
 
     /// What `connect` would start, without starting anything.
@@ -293,6 +340,7 @@ impl Engine {
             compiled: None,
             root: reference(pid).ok_or_else(|| failed("the proxy exited at once".into()))?,
             pgid: pid,
+            tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
         };

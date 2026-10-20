@@ -579,3 +579,81 @@ fn a_proxy_that_died_is_replaced_and_stop_works_from_another_time_zone() {
     );
     assert!(eventually(|| long.0.try_wait().unwrap().is_some()));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_ends_an_interactive_shell_and_its_jobs() {
+    use std::io::Write;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // An empty .zshrc, so zsh does not ask a new user to set it up.
+    std::fs::write(home.root.join("sandboxes/home/home/.zshrc"), "").unwrap();
+
+    // `script` gives connect a terminal: the default shell is interactive
+    // and puts itself, and each job, in a group of its own.
+    let mut terminal = KillOnDrop(
+        Command::new("/usr/bin/script")
+            .args([
+                "-q",
+                "/dev/null",
+                env!("CARGO_BIN_EXE_enclos"),
+                "connect",
+                "home",
+            ])
+            .env("ENCLOS_HOME", &home.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = terminal.0.stdin.take().unwrap();
+    input.write_all(b"/bin/sleep 45\n").unwrap();
+    input.flush().unwrap();
+
+    let mut show = String::new();
+    assert!(
+        eventually(|| {
+            show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+            show.contains("sleep")
+        }),
+        "{show}"
+    );
+    let interactive: String = show
+        .lines()
+        .skip_while(|l| !l.contains(" interactive:"))
+        .skip(1)
+        .take_while(|l| l.trim_start().starts_with("pid "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(interactive.contains("zsh"), "{show}");
+    assert!(!interactive.contains("enclos"), "{show}");
+    let sleep: u32 = interactive
+        .lines()
+        .find(|l| l.contains("sleep"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|pid| pid.parse().ok())
+        .unwrap();
+
+    let stop = home.run(&["sandbox", "stop", "home"]);
+    assert!(
+        stop.ok().stdout().contains("Stopped sandbox home"),
+        "{}",
+        stop.stdout()
+    );
+    let gone = |pid: u32| {
+        !Command::new("/bin/ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(eventually(|| gone(sleep)));
+    assert!(eventually(|| terminal.0.try_wait().unwrap().is_some()));
+    drop(input);
+}

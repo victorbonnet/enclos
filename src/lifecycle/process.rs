@@ -1,15 +1,16 @@
 //! Looking at and signalling processes, through `ps` and `kill`, with no
 //! `unsafe` code (ADR 0012).
 //!
-//! Signalling is narrow on purpose. enclos signals only process groups it
-//! created and recorded, and only after checking that the group's recorded
-//! leader is still the same process: same pid and same start time, so a pid
-//! reused by an unrelated process is never signalled.
+//! Signalling is narrow on purpose. enclos signals only a session's sure
+//! members (see `members`): processes it recorded, and what they started.
+//! A group is signalled only through its leader. Right before each signal,
+//! it checks that the target is still the same process: same pid and same
+//! start time, so a pid reused by an unrelated process is never signalled.
 
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
-use crate::model::session::{Member, ProcessRef};
+use crate::model::session::ProcessRef;
 
 /// `ps`, reading dates in UTC and the C locale, so that a start time is
 /// the same text whoever asks: start times are compared as text.
@@ -53,14 +54,22 @@ pub fn group_of(pid: u32) -> Option<u32> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-/// Every running process in process group `pgid`. Read-only. A process
-/// that exited but was not yet reaped by its parent (a zombie) runs nothing
-/// and is not counted.
-pub fn group_members(pgid: u32) -> Vec<Member> {
-    // In a group of its own, so `ps` never lists itself as a member of the
-    // group of the process asking.
+/// A process as one listing shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub started: String,
+    pub command: String,
+}
+
+/// Every running process. Read-only. Zombies run nothing and are left out.
+pub fn processes() -> Vec<Proc> {
+    // In a group of its own, so `ps` is never in the group of the process
+    // asking.
     let Ok(out) = ps()
-        .args(["-A", "-o", "pid=,pgid=,stat=,lstart=,comm="])
+        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=,comm="])
         .process_group(0)
         .output()
     else {
@@ -71,13 +80,16 @@ pub fn group_members(pgid: u32) -> Vec<Member> {
         .filter_map(|line| {
             let mut words = line.split_whitespace();
             let pid: u32 = words.next()?.parse().ok()?;
-            let group: u32 = words.next()?.parse().ok()?;
+            let ppid: u32 = words.next()?.parse().ok()?;
+            let pgid: u32 = words.next()?.parse().ok()?;
             let zombie = words.next()?.starts_with('Z');
             // lstart is five words: "Sun Oct 18 15:03:21 2026".
             let started = words.by_ref().take(5).collect::<Vec<_>>().join(" ");
             let command = words.collect::<Vec<_>>().join(" ");
-            (group == pgid && !zombie).then_some(Member {
+            (!zombie).then_some(Proc {
                 pid,
+                ppid,
+                pgid,
                 started,
                 command,
             })
@@ -98,12 +110,22 @@ pub fn signal_group(leader: &ProcessRef, pgid: u32, signal: Signal) -> bool {
     if leader.pid != pgid || !is_same(leader) || group_of(leader.pid) != Some(pgid) {
         return false;
     }
+    kill(signal, &format!("-{pgid}"))
+}
+
+/// Sends `signal` to `process` alone, only if it is still the recorded
+/// process. Returns whether it was sent.
+pub fn signal_process(process: &ProcessRef, signal: Signal) -> bool {
+    is_same(process) && kill(signal, &process.pid.to_string())
+}
+
+fn kill(signal: Signal, target: &str) -> bool {
     let name = match signal {
         Signal::Term => "TERM",
         Signal::Kill => "KILL",
     };
     Command::new("/bin/kill")
-        .args(["-s", name, "--", &format!("-{pgid}")])
+        .args(["-s", name, "--", target])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -144,9 +166,9 @@ mod tests {
         assert!(is_same(&leader));
         assert_eq!(group_of(child.id()), Some(child.id()));
         assert!(
-            group_members(child.id())
-                .iter()
-                .any(|m| m.pid == child.id())
+            processes().iter().any(|p| p.pid == child.id()
+                && p.pgid == child.id()
+                && p.started == leader.started)
         );
         assert!(signal_group(&leader, child.id(), Signal::Term));
         assert!(wait_gone(&mut child));
@@ -181,6 +203,20 @@ mod tests {
         assert!(off < 60, "{started} is {off}s away from now in UTC");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn a_process_is_signalled_alone_only_while_it_is_the_recorded_one() {
+        let mut child = own_group();
+        let recorded = reference(child.id()).unwrap();
+        let stale = ProcessRef {
+            pid: child.id(),
+            started: "Thu Jan  1 00:00:00 1970".into(),
+        };
+        assert!(!signal_process(&stale, Signal::Term));
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(signal_process(&recorded, Signal::Term));
+        assert!(wait_gone(&mut child));
     }
 
     #[test]

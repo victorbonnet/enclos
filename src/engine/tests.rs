@@ -551,6 +551,7 @@ mod sandbox {
             compiled: None,
             root: reference(std::process::id()).unwrap(),
             pgid: std::process::id(),
+            tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
         };

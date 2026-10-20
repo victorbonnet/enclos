@@ -23,7 +23,7 @@ use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::session::{SessionId, SessionRecord};
+use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 /// How long `lock` waits for another enclos command to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -332,6 +332,11 @@ impl StateStore for SqliteStateStore {
     fn put_session(&self, _lock: &StateLock, session: &SessionRecord) -> Result<SessionId> {
         let conn = self.open()?;
         sessions::insert(&conn, session).map_err(self.sqlite_err())
+    }
+
+    fn track(&self, _lock: &StateLock, id: SessionId, tracked: &[ProcessRef]) -> Result<()> {
+        let conn = self.open()?;
+        sessions::track(&conn, id, tracked).map_err(self.sqlite_err())
     }
 
     fn end_session(&self, _lock: &StateLock, id: SessionId) -> Result<()> {
