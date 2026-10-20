@@ -222,6 +222,14 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
 .result-command { margin-top: auto; padding-top: 20px; }
 .result-command > span { display: block; font-size: 12px; color: var(--panel-muted); margin-bottom: 6px; }
 .result-command code { font-size: 13px; color: var(--lime); overflow-wrap: anywhere; }
+.policy-block { display: grid; gap: 20px; margin-top: 40px; padding-top: 32px; border-top: 1px solid var(--panel-line); }
+.policy-copy h3 { font-size: 22px; }
+.policy-copy p { font-size: 15px; line-height: 1.7; color: var(--panel-muted); margin-top: 12px; max-width: 480px; }
+.policy-copy code { font-size: 13px; color: var(--lime); white-space: nowrap; }
+.policy-file { background: var(--panel-deep); border: 1px solid var(--panel-line); min-width: 0; }
+.policy-file pre { font-size: 12px; line-height: 1.8; padding: 16px 14px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--panel-text); }
+.policy-file pre code { font-size: inherit; }
+.policy-file pre .line { display: block; padding-left: 2ch; text-indent: -2ch; }
 .boundary-footnote { font-size: 14px; line-height: 1.7; color: var(--panel-muted); max-width: 650px; margin-top: 20px; }
 
 /* Workflow */
@@ -335,6 +343,7 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
   .install-one-liner { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 24px; padding: 22px 18px; }
   .copy-button { justify-self: end; }
   .terminal pre { font-size: 13px; padding: 24px; }
+  .policy-file pre { font-size: 13px; padding: 22px 24px; }
   .closing-mark { display: block; }
   .closing .button { margin-left: auto; }
   .site-footer { flex-direction: row; align-items: center; justify-content: space-between; }
@@ -356,6 +365,7 @@ h1 { font-size: clamp(44px, 12vw, 70px); line-height: 1.05; letter-spacing: -0.0
   .scenario-button[aria-pressed="true"] { border-color: var(--lime); }
   .scenario-arrow { display: block; }
   .scenario-result { padding: 26px 30px; min-height: 360px; }
+  .policy-block { grid-template-columns: 0.95fr 1.3fr; gap: 36px; align-items: center; margin-top: 56px; padding-top: 48px; }
   .workflow-section { grid-template-columns: 1fr 1.05fr; gap: 110px; }
   .start-section { padding-block: 86px; }
   .install-block { margin-bottom: 64px; }

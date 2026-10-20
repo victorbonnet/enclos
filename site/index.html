@@ -107,6 +107,10 @@
               <div class="result-command"><span id="result-command-label">Inspect what this sandbox may do</span><code id="result-command">enclos policy show lab</code></div>
             </div>
           </div>
+          <div class="policy-block">
+            <div class="policy-copy"><h3>One policy per sandbox</h3><p>Each sandbox reads its limits from one small file. Give an agent a folder to write, hide more of your files, or keep it to the sites you list. <code>enclos policy show lab</code> shows what is in force.</p><p>Every change becomes a new version, recorded in the audit log. Whatever the file says, your keys and credentials, other sandboxes, and your computer’s own services stay out of reach.</p></div>
+            <div class="policy-file"><div class="terminal-top"><span><i></i><i></i><i></i></span><span class="mono">POLICY.TOML</span></div><pre><code><span class="line"><span class="code-comment"># ~/.enclos/sandboxes/lab/policy.toml</span></span><span class="line"> </span><span class="line">[filesystem]</span><span class="line"><span class="code-comment"># a folder it may write</span></span><span class="line">write_add = [&quot;~/Documents/notes&quot;]</span><span class="line"><span class="code-comment"># more of your files to hide</span></span><span class="line">read_deny_add = [&quot;~/work&quot;]</span><span class="line"> </span><span class="line">[network]</span><span class="line"><span class="code-comment"># only the sites listed here</span></span><span class="line">mode = &quot;allowlist&quot;</span><span class="line">allow_add = [&quot;api.telegram.org&quot;]</span></code></pre></div>
+          </div>
           <p class="boundary-footnote">The sandbox is the boundary. Agents inside it share the runtime, policy, proxy, and login. Use separate sandboxes when those need to differ.</p>
         </div>
       </section>
