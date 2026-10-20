@@ -203,12 +203,47 @@ mod policy {
     #[test]
     fn unsafe_destinations_are_refused_and_change_nothing() {
         let (_dir, engine, name) = with_sandbox();
-        for bad in ["*.com", "localhost", "169.254.169.254"] {
+        for bad in [
+            "*.com",
+            "localhost",
+            "127.0.0.1",
+            "169.254.169.254",
+            "192.168.1.5",
+        ] {
             let err = engine
                 .policy_allow(&alice(), &name, bad, Confirm::Ask)
                 .unwrap_err();
             assert!(matches!(err, Error::Policy(_)), "{bad}: {err}");
+            assert_eq!(err.exit_code(), 2, "{bad}: {err}");
         }
+        for malformed in ["exa mple.com", "example.com:0", "intranet"] {
+            let err = engine
+                .policy_allow(&alice(), &name, malformed, Confirm::Ask)
+                .unwrap_err();
+            assert_eq!(err.exit_code(), 1, "{malformed}: {err}");
+        }
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+    }
+
+    #[test]
+    fn a_hand_edit_the_policy_refuses_exits_2_and_one_that_does_not_parse_exits_1() {
+        let (_dir, engine, name) = with_sandbox();
+        let file = engine.layout.policy_file("home");
+        let original = std::fs::read_to_string(&file).unwrap();
+        // Replacing the read-deny list drops what enclos always hides.
+        let dropped = original.replace("read_deny_add = []", "read_deny = []");
+        std::fs::write(&file, &dropped).unwrap();
+        let err = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(err.to_string().contains("read_deny_add instead"), "{err}");
+
+        std::fs::write(&file, original + "[network\n").unwrap();
+        let err = engine
+            .policy_allow(&alice(), &name, "api.example.com", Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 1, "{err}");
         assert_eq!(engine.policy(&name).unwrap().version.version, 1);
     }
 

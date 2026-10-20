@@ -23,6 +23,24 @@ pub enum HostPattern {
     Ip(IpAddr),
 }
 
+/// Why an entry is not accepted. The two kinds exit differently (design
+/// §10): a refusal with 2, an entry that does not parse with 1.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EntryError {
+    /// It is not written as a destination: fix how it is written.
+    #[error("{0}")]
+    Malformed(String),
+    /// It is a destination a sandbox may never reach.
+    #[error("{0}")]
+    Refused(String),
+}
+
+impl EntryError {
+    pub fn is_refused(&self) -> bool {
+        matches!(self, EntryError::Refused(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AllowEntry {
     pub host: HostPattern,
@@ -31,12 +49,14 @@ pub struct AllowEntry {
 
 impl AllowEntry {
     /// Parses and checks one entry; the error says what is wrong with it.
-    pub fn parse(entry: &str) -> Result<AllowEntry, String> {
+    pub fn parse(entry: &str) -> Result<AllowEntry, EntryError> {
         let entry = entry.trim();
-        let (host, port) = split_port(entry)?;
+        let (host, port) = split_port(entry).map_err(EntryError::Malformed)?;
         if let Ok(ip) = host.parse::<IpAddr>() {
             if let AddrClass::Blocked(why) = classify(ip) {
-                return Err(format!("{ip} is a {why} address, which is never reachable"));
+                return Err(EntryError::Refused(format!(
+                    "{ip} is a {why} address, which is never reachable"
+                )));
             }
             return Ok(AllowEntry {
                 host: HostPattern::Ip(ip),
@@ -51,9 +71,9 @@ impl AllowEntry {
                 .unwrap_or(domain)
                 .to_ascii_lowercase();
             if psl::domain_str(&lowered).is_none() {
-                return Err(format!(
+                return Err(EntryError::Refused(format!(
                     "*.{lowered} would allow a whole public suffix; name a domain someone owns, such as *.example.com"
-                ));
+                )));
             }
             let domain = normalize_host(domain)?;
             return Ok(AllowEntry {
@@ -62,7 +82,9 @@ impl AllowEntry {
             });
         }
         if host.contains('*') {
-            return Err("a wildcard may only cover subdomains, written *.example.com".to_owned());
+            return Err(EntryError::Malformed(
+                "a wildcard may only cover subdomains, written *.example.com".to_owned(),
+            ));
         }
         let host = normalize_host(host)?;
         Ok(AllowEntry {
@@ -138,7 +160,7 @@ fn split_port(entry: &str) -> Result<(&str, u16), String> {
 
 /// A `network.private` entry in the form the allowlist and the proxy compare
 /// against: an IP address as Rust prints it, or a normalized host name.
-pub fn canonical_private(entry: &str) -> Result<String, String> {
+pub fn canonical_private(entry: &str) -> Result<String, EntryError> {
     match entry.parse::<IpAddr>() {
         Ok(ip) => Ok(ip.to_string()),
         Err(_) => normalize_host(entry),
@@ -147,18 +169,19 @@ pub fn canonical_private(entry: &str) -> Result<String, String> {
 
 /// Lowercases a host name, drops a trailing dot, and checks it is a domain
 /// name: dot-separated labels of letters, digits and hyphens.
-pub fn normalize_host(host: &str) -> Result<String, String> {
+pub fn normalize_host(host: &str) -> Result<String, EntryError> {
+    let malformed = |why: String| Err(EntryError::Malformed(why));
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     if host.is_empty() {
-        return Err("the host is empty".to_owned());
+        return malformed("the host is empty".to_owned());
     }
     if !host.is_ascii() {
-        return Err(format!(
+        return malformed(format!(
             "`{host}` is not ASCII: write an international name in its xn-- form"
         ));
     }
     if host.len() > 253 {
-        return Err("the host is longer than 253 characters".to_owned());
+        return malformed("the host is longer than 253 characters".to_owned());
     }
     let label_ok = |l: &str| {
         (1..=63).contains(&l.len())
@@ -167,10 +190,15 @@ pub fn normalize_host(host: &str) -> Result<String, String> {
             && !l.ends_with('-')
     };
     if !host.split('.').all(label_ok) {
-        return Err(format!("`{host}` is not a host name"));
+        return malformed(format!("`{host}` is not a host name"));
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(EntryError::Refused(
+            "localhost is never reachable from a sandbox".to_owned(),
+        ));
     }
     if !host.contains('.') {
-        return Err(format!(
+        return malformed(format!(
             "`{host}` is not a full domain name, such as api.example.com"
         ));
     }
@@ -182,12 +210,9 @@ pub fn normalize_host(host: &str) -> Result<String, String> {
     if last.bytes().all(|b| b.is_ascii_digit())
         || (last.starts_with("0x") && hex.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        return Err(format!(
+        return malformed(format!(
             "`{host}` reads as an IP address: write an IPv4 address as four decimal numbers, such as 192.0.2.10"
         ));
-    }
-    if host == "localhost" || host.ends_with(".localhost") {
-        return Err("localhost is never reachable from a sandbox".to_owned());
     }
     Ok(host)
 }
@@ -217,19 +242,29 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_or_malformed_entries_are_refused() {
+    fn destinations_a_sandbox_may_never_reach_are_refused() {
         for bad in [
             // githubusercontent.com is on the Public Suffix List: each subdomain is someone else's.
-            "*",
             "*.com",
             "*.co.uk",
             "*.githubusercontent.com",
-            "a*.example.com",
             "localhost",
-            "intranet",
+            "api.localhost",
             "127.0.0.1",
             "[::1]:443",
             "169.254.169.254",
+        ] {
+            let err = AllowEntry::parse(bad).unwrap_err();
+            assert!(err.is_refused(), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn entries_that_are_not_destinations_are_malformed() {
+        for bad in [
+            "*",
+            "a*.example.com",
+            "intranet",
             "example.com:0",
             "example.com:99999",
             "exa mple.com",
@@ -242,10 +277,12 @@ mod tests {
             "192.168.1",
             "169.254.43518",
             "a.0x7f",
-            "*.127.1",
         ] {
-            assert!(AllowEntry::parse(bad).is_err(), "{bad}");
+            let err = AllowEntry::parse(bad).unwrap_err();
+            assert!(!err.is_refused(), "{bad}: {err}");
         }
+        // Not a domain someone owns, whichever way it is read.
+        assert!(AllowEntry::parse("*.127.1").is_err());
     }
 
     #[test]

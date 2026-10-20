@@ -452,7 +452,7 @@ src/
 
 ## 10. CLI
 
-Every operation is `enclos <noun> <verb>`. Readable output in a terminal, JSON when piped or with `--json`. Exit codes: 0 ok, 1 error, 2 refused by policy, 3 needs confirmation. Changes print a diff and ask; `--yes` skips, `--dry-run` only shows. Commands act on the local host only.
+Every operation is `enclos <noun> <verb>`. Readable output in a terminal, JSON when piped or with `--json`. Exit codes: 0 ok, 1 error, 2 refused by policy, 3 needs confirmation. Refused by policy covers a policy enclos never accepts for what it grants or reaches (loopback, link-local or a private address without its opt-in, a wildcard over a public suffix, writes to enclos's own files, a dropped built-in read-deny entry) or for what the backend cannot enforce, and a backend the host cannot run ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)). Input that is not written right, such as a TOML syntax error, an unknown field or a destination that does not parse, is an error, also when it comes with a refusal. Changes print a diff and ask; `--yes` skips, `--dry-run` only shows. Commands act on the local host only.
 
 ```text
 enclos init | doctor
