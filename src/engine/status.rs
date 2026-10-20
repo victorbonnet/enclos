@@ -319,7 +319,7 @@ impl Engine {
     }
 
     /// The agents of a sandbox, tracked or only in the runtime. `None` when
-    /// the runtime has no named agents and enclos tracks none.
+    /// the runtime lists none and enclos tracks none.
     fn agent_statuses(
         &self,
         name: &SandboxName,
@@ -331,7 +331,7 @@ impl Engine {
         // unknown for every agent but the built-in one.
         let found = runtime.agents_in(home).ok();
         let builtin = runtime.builtin_agent();
-        if found.is_none() && tracked.is_empty() && builtin.is_none() {
+        if found.as_ref().is_none_or(Vec::is_empty) && tracked.is_empty() && builtin.is_none() {
             return Ok(None);
         }
         let mut names: Vec<String> = builtin.into_iter().map(str::to_owned).collect();
@@ -351,7 +351,9 @@ impl Engine {
                     tracked: tracked.iter().any(|t| t.name.as_str() == agent),
                     in_runtime: match is_builtin {
                         true => Some(true),
-                        false => found.as_ref().map(|f| f.iter().any(|n| n.as_str() == agent)),
+                        false => found
+                            .as_ref()
+                            .map(|f| f.iter().any(|n| n.as_str() == agent)),
                     },
                     trackable: agent.parse::<crate::model::agent::AgentName>().is_ok(),
                     last_active: facts

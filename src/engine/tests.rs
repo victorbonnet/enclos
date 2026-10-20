@@ -1451,7 +1451,8 @@ echo \"installed $*\" > \"$HOME/installed\"
             .remove_agent(&alice(), &name, &agent("scout"), false, Confirm::Yes)
             .unwrap_err();
         assert!(
-            err.to_string().contains("cannot read Hermes's agents") && err.to_string().contains("--keep-data"),
+            err.to_string().contains("cannot read Hermes's agents")
+                && err.to_string().contains("--keep-data"),
             "{err}"
         );
         done(
@@ -1469,7 +1470,10 @@ echo \"installed $*\" > \"$HOME/installed\"
             created_at: "2026-01-02T03:04:05Z".parse().unwrap(),
         };
         let names = |names: &[&str]| -> Vec<RuntimeAgentName> {
-            names.iter().map(|n| RuntimeAgentName::new(n).unwrap()).collect()
+            names
+                .iter()
+                .map(|n| RuntimeAgentName::new(n).unwrap())
+                .collect()
         };
         let found = names(&["main", "scout", "a"]);
         let diff = AgentDiff::compare(&found, &[tracked("main"), tracked("gone")], None);
@@ -2147,7 +2151,9 @@ mod status {
     use crate::engine::status::suggest;
     use crate::model::agent::AgentName;
     use crate::model::runtime::RuntimeKind;
-    use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand};
+    use crate::runtime::{
+        HomeFile, Installer, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable,
+    };
 
     /// A runtime adapter that implements none of the `status` methods.
     struct Bare;
@@ -2187,8 +2193,8 @@ mod status {
         fn services(&self) -> Vec<crate::runtime::RuntimeService> {
             Vec::new()
         }
-        fn agents_in(&self, _: &Path) -> Option<Vec<String>> {
-            None
+        fn agents_in(&self, _: &Path) -> std::result::Result<Vec<RuntimeAgentName>, Unreadable> {
+            Ok(Vec::new())
         }
     }
 

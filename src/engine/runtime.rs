@@ -216,9 +216,11 @@ impl Engine {
         let tracked = self.state.agents(name)?;
         let runtime = adapter(kind);
         Ok(match runtime.agents_in(&self.sandbox_home(name)) {
-            Ok(found) => {
-                AgentCheck::Compared(AgentDiff::compare(&found, &tracked, runtime.builtin_agent()))
-            }
+            Ok(found) => AgentCheck::Compared(AgentDiff::compare(
+                &found,
+                &tracked,
+                runtime.builtin_agent(),
+            )),
             Err(why) => AgentCheck::Unreadable(why),
         })
     }

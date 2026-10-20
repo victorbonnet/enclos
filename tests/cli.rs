@@ -1003,7 +1003,11 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     assert!(!out.contains("no agents yet"), "{out}");
-    assert_eq!(out.lines().next(), Some(untracked), "{out}");
+    assert_eq!(
+        out.lines().take(2).collect::<Vec<_>>(),
+        ["home/default  built in", untracked],
+        "{out}"
+    );
     assert!(out.contains(untrackable), "{out}");
     let show = home.run(&["sandbox", "show", "home"]);
     let out = show.ok().stdout();
@@ -1024,9 +1028,13 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 3, "{out}");
-    assert_eq!(lines[..2], ["home/scout", ""], "{out}");
-    assert!(lines[2].starts_with(untrackable), "{out}");
+    assert_eq!(lines.len(), 4, "{out}");
+    assert_eq!(
+        lines[..3],
+        ["home/default  built in", "home/scout", ""],
+        "{out}"
+    );
+    assert!(lines[3].starts_with(untrackable), "{out}");
     let show = home.run(&["sandbox", "show", "home"]);
     assert!(
         show.ok().stdout().contains("\n  agents: scout\n"),
@@ -1034,8 +1042,8 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
         show.stdout()
     );
 
-    // Removing the record keeps the files, so Hermes still has the agent.
-    let rm = home.run(&["agent", "rm", "home/scout"]);
+    // Removing the record alone keeps the files, so Hermes still has the agent.
+    let rm = home.run(&["agent", "rm", "home/scout", "--keep-data"]);
     assert!(
         rm.ok()
             .stdout()
@@ -1044,7 +1052,7 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
         rm.stdout()
     );
     let list = home.run(&["agent", "list", "home"]);
-    assert_eq!(list.ok().stdout().lines().next(), Some(untracked));
+    assert_eq!(list.ok().stdout().lines().nth(1), Some(untracked));
 
     // A home enclos cannot read safely is said, not shown as clean.
     let hermes = home.root.join("sandboxes/home/home/.hermes");
@@ -1054,8 +1062,11 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let list = home.run(&["agent", "list", "home"]);
     let out = list.ok().stdout();
     assert_eq!(
-        out.trim(),
-        "enclos cannot read Hermes's agents in sandbox home: ~/.hermes is a link. Agents made inside the sandbox are not reported."
+        out.lines().nth(1),
+        Some(
+            "enclos cannot read Hermes's agents in sandbox home: ~/.hermes is a link. Agents made inside the sandbox are not reported."
+        ),
+        "{out}"
     );
     let add = home.run(&["agent", "add", "home/scout"]);
     assert_eq!(add.code(), 1);
