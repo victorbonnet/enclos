@@ -34,7 +34,7 @@ const scenarios = {
     destination: "a second agent",
     blocked: false,
     title: ["Another agent.", "The same sandbox boundary."],
-    description: "Create an agent with Hermes inside the sandbox and enclos reports it. Add it to track the existing agent without recreating it. It shares this sandbox’s policy, proxy, runtime, and login.",
+    description: "Create an agent with the runtime’s own commands inside the sandbox and enclos reports it. Add it to track the existing agent without recreating it. It shares this sandbox’s policy, proxy, runtime, and login.",
     commandLabel: "Track an existing agent named scout",
     command: "enclos agent add lab/scout",
   },
