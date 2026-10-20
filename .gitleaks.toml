@@ -1,0 +1,25 @@
+# gitleaks reads this file from the repository root (the CI `secrets` job
+# and a local `gitleaks git`). It keeps every default rule and adds one for
+# personal data: a home folder path names its owner, and test output or a
+# pasted log can carry the developer's.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "home-folder-path"
+description = "An absolute home folder path, which names a person: write /Users/alice or ~ instead"
+# A path that starts at the root, not `sandboxes/home/...`. The user name
+# is what the allowlist below is checked against.
+regex = '''(?:^|[^A-Za-z0-9._~/-])/(?:Users|home)/([A-Za-z0-9][A-Za-z0-9._-]*)'''
+secretGroup = 1
+keywords = ["/users/", "/home/"]
+
+[[rules.allowlists]]
+description = "Placeholder names in tests and docs, and folders that belong to no person"
+regexes = [
+  # Placeholders; `x` is in an older version of docs/design.md.
+  '''^(?:alice|alicex|x)$''',
+  # macOS's shared folder, and the GitHub Actions runner's user.
+  '''^(?:Shared|runner)$''',
+]
