@@ -2,13 +2,15 @@
 status: accepted
 ---
 
-# Secrets are granted per sandbox, as environment variables through `enclos launch`
+# Secrets are granted per sandbox, as environment variables at session start
 
 Supersedes [0011](0011-secrets-only-as-env-at-launch.md), which granted secrets per agent.
 
-Secrets are stored in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`. A sandbox's policy grants secrets to the sandbox as a whole. Every session starts through `enclos launch`, which runs outside the sandbox, reads the sandbox's secrets, and starts the session with them as environment variables: an interactive `connect` to any agent, an `exec`, and the runtime's gateway alike. Secrets are never written to a plist, a unit file or the sandbox home. The sandbox itself is meant to have no Keychain access; that is part of the host-service blocks in [0016](0016-seatbelt-blocks-host-service-delegation.md) and is still to verify.
+This is the design planned for milestone 2: secret storage, grants and injection are not implemented yet, and a policy holds only filesystem and network rules today.
 
-Per-agent grants would protect nothing. The sandbox is the permission boundary and its agents share a home ([0003](0003-sandbox-is-the-permission-boundary.md)), so any agent can read what another saved. One gateway serves every agent of a sandbox ([0021](0021-one-runtime-service-per-sandbox.md)), so it would need every agent's secrets anyway, and messaging, the first use of secrets, runs in that gateway. Agents also already share the runtime's login.
+Secrets are stored in the macOS Keychain, libsecret, or a `0600` file on a headless machine, referenced as `secret:<sandbox>/<name>`. A sandbox's policy will grant secrets to the sandbox as a whole. Host-side session setup, which runs outside the sandbox, will read the sandbox's secrets and start each session with them as environment variables: an interactive `connect` to any agent, an `exec`, and the runtime services started through `enclos launch <sandbox> <service>` alike. enclos never writes secret values to a plist, a unit file or the sandbox home; once a runtime has a value in its environment, it may save or log it in its own home, which enclos cannot prevent. The sandbox itself is meant to have no Keychain access; that is part of the host-service blocks in [0016](0016-seatbelt-blocks-host-service-delegation.md) and is still to verify.
+
+Per-agent grants would not provide isolation. The sandbox is the permission boundary and its agents share a home ([0003](0003-sandbox-is-the-permission-boundary.md)), so any agent can read what another saved. One gateway serves every agent of a sandbox ([0021](0021-one-runtime-service-per-sandbox.md)), so it would need every agent's secrets anyway, and messaging, the first use of secrets, runs in that gateway. Agents also already share the runtime's login.
 
 ## Consequences
 
