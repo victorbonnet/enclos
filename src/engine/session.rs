@@ -8,12 +8,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT};
 
 use super::Engine;
+use super::service::STOP_GRACE;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
@@ -188,7 +189,7 @@ impl Engine {
                 }
             })?;
 
-        let waited = self.wait_session(&session, &mut child)?;
+        let waited = self.wait_session(&session, &mut child, None)?;
         self.finish_session(by, "session end", &session, waited)
     }
 
@@ -242,11 +243,13 @@ impl Engine {
 
     /// Waits for the session's program to exit, recording the members it
     /// starts as they appear (design §8), and returns its exit status and
-    /// the members it left running.
+    /// the members it left running. Once `ended` is set, it stops every
+    /// member, the program first, as `sandbox stop` would.
     pub(super) fn wait_session(
         &self,
         session: &SessionRecord,
         child: &mut Child,
+        ended: Option<&AtomicBool>,
     ) -> Result<Waited> {
         let lost = |e: std::io::Error| Error::Session {
             what: format!("lost the session's program: {e}"),
@@ -255,9 +258,17 @@ impl Engine {
         let mut saved = known.clone();
         let mut notes = Vec::new();
         let mut looked: Option<Instant> = None;
+        let mut stopping = None;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(lost)? {
                 break status;
+            }
+            if stopping.is_none() && ended.is_some_and(|e| e.load(Ordering::Relaxed)) {
+                // On another thread, so this one reaps the program as it
+                // exits: a program not reaped would still be listed.
+                let mut members = session.clone();
+                members.tracked = known.clone();
+                stopping = Some(std::thread::spawn(move || stop(&members, STOP_GRACE)));
             }
             if looked.is_none_or(|at| at.elapsed() >= WATCH) {
                 looked = Some(Instant::now());
@@ -287,6 +298,12 @@ impl Engine {
             }
             std::thread::sleep(EXIT_POLL);
         };
+        // What survived is listed below, as `left`.
+        match stopping.map(std::thread::JoinHandle::join) {
+            None | Some(Ok(Ok(_))) => {}
+            Some(Ok(Err(e))) => note(&mut notes, format!("could not stop its members: {e}")),
+            Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
+        }
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it.
         let left = processes().map(|procs| find(&procs, session, &known));
@@ -317,14 +334,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Stops the sandbox's proxy session, so that a service can take its
-    /// port.
-    pub(super) fn stop_proxy(&self, lock: &StateLock, name: &SandboxName) -> Result<()> {
+    /// Stops the sandbox's open sessions of these kinds, so that services
+    /// can take their place: a proxy holds the port, and what a runtime
+    /// service left running would run beside the new one.
+    pub(super) fn stop_sessions(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        kinds: &[SessionKind],
+    ) -> Result<()> {
         for session in self
             .state
             .sessions(name, true)?
             .into_iter()
-            .filter(|s| s.kind == SessionKind::Proxy)
+            .filter(|s| kinds.contains(&s.kind))
         {
             match stop(&session, GRACE)? {
                 Stopped::Clean => self.state.end_session(lock, session.id)?,
@@ -332,7 +355,9 @@ impl Engine {
                     let pids: Vec<String> = left.iter().map(|s| s.member.pid.to_string()).collect();
                     return Err(Error::Session {
                         what: format!(
-                            "the proxy of sandbox {name} did not stop (pid {}); run `enclos sandbox stop {name}`",
+                            "the {} session {} of sandbox {name} did not stop (pid {}); run `enclos sandbox stop {name}`",
+                            session.kind.as_str(),
+                            session.id,
                             pids.join(", ")
                         ),
                     });

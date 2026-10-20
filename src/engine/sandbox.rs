@@ -219,7 +219,7 @@ impl Engine {
                 .collect();
             changes.splice(
                 0..0,
-                self.service_status(name)
+                self.service_status(name)?
                     .into_iter()
                     .map(|(label, _)| format!("stop service {label}")),
             );
@@ -332,11 +332,19 @@ impl Engine {
         Ok(Planned::Done(()))
     }
 
-    /// Refuses a sandbox with sessions open, saying how to end them.
+    /// Refuses a sandbox with services installed or sessions open, saying
+    /// how to end them.
     fn require_stopped(&self, name: &SandboxName) -> Result<()> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
+        // Installed, a service comes back on its own, even with no session
+        // recorded: one whose proxy could not take its port has none.
+        if self.has_services(name)? {
+            return Err(Error::SandboxHasServices {
+                name: name.to_string(),
+            });
+        }
         if self.state.sessions(name, true)?.is_empty() {
             return Ok(());
         }

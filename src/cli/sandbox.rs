@@ -74,7 +74,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::List => print_list(&engine.list_sandboxes()?),
         SandboxVerb::Show { name } => {
             print_show(&engine.show_sandbox(&name)?);
-            for (label, status) in engine.service_status(&name) {
+            for (label, status) in engine.service_status(&name)? {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
                     ServiceStatus::Loaded => "loaded, not running".to_owned(),

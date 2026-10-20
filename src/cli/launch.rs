@@ -13,11 +13,13 @@ use enclos::model::sandbox::SandboxName;
 #[derive(Args)]
 pub struct LaunchArgs {
     sandbox: SandboxName,
+    /// The runtime's name for the service, such as `gateway`.
+    service: String,
 }
 
-/// Runs the runtime's gateway in the sandbox until it exits.
+/// Runs one of the runtime's services in the sandbox until it exits.
 pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
-    let end = engine.launch(by, &args.sandbox)?;
+    let end = engine.launch(by, &args.sandbox, &args.service)?;
     // Into the service's log, which `enclos logs` shows.
     super::connect::report_end(&args.sandbox, &end);
     Ok(u8::try_from(end.exit).unwrap_or(1))

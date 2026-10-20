@@ -122,6 +122,22 @@ impl Layout {
         &self.user_home
     }
 
+    /// The variables with which another enclos process, such as a service
+    /// started with only `HOME`, resolves this same layout: `ENCLOS_HOME`
+    /// when everything is in one folder, else both XDG folders.
+    pub fn env(&self) -> Vec<(String, String)> {
+        let var = |name: &str, path: &Path| (name.to_owned(), path.display().to_string());
+        if self.data == self.config {
+            return vec![var(HOME_VAR, &self.data)];
+        }
+        // Two folders only come from the XDG variables, each `<var>/enclos`.
+        let parent = |path: &Path| path.parent().unwrap_or(path).to_owned();
+        vec![
+            var("XDG_DATA_HOME", &parent(&self.data)),
+            var("XDG_CONFIG_HOME", &parent(&self.config)),
+        ]
+    }
+
     /// The enclos data and config folders: what sandboxes may never write
     /// outside their own home (ADR 0010).
     pub fn protected(&self) -> Vec<PathBuf> {
@@ -328,6 +344,42 @@ mod tests {
     fn macos_uses_dot_enclos_in_home() {
         let layout = Layout::resolve(Os::MacOs, env(&[("HOME", "/Users/alice")])).unwrap();
         assert_eq!(layout, Layout::at("/Users/alice/.enclos"));
+    }
+
+    #[test]
+    fn a_process_given_the_layout_env_resolves_the_same_layout() {
+        let cases: [(Os, &[(&str, &str)]); 4] = [
+            (Os::MacOs, &[("HOME", "/Users/alice")]),
+            (Os::Linux, &[("HOME", "/home/alice")]),
+            (
+                Os::Linux,
+                &[
+                    ("HOME", "/home/alice"),
+                    ("XDG_DATA_HOME", "/data"),
+                    ("XDG_CONFIG_HOME", "/cfg"),
+                ],
+            ),
+            (
+                Os::Linux,
+                &[("HOME", "/home/alice"), ("ENCLOS_HOME", "/srv/enclos")],
+            ),
+        ];
+        for (os, vars) in cases {
+            let layout = Layout::resolve(os, env(vars)).unwrap();
+            let given = layout.env();
+            // A service starts with the user's HOME and nothing else.
+            let home = vars.iter().find(|(k, _)| *k == "HOME").unwrap().1;
+            let mut child: Vec<(&str, &str)> = given
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            child.push(("HOME", home));
+            assert_eq!(
+                Layout::resolve(os, env(&child)).unwrap(),
+                layout,
+                "{vars:?}"
+            );
+        }
     }
 
     #[test]

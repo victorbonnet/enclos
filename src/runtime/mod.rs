@@ -99,9 +99,20 @@ pub trait RuntimeAdapter {
     /// What a person runs in the sandbox to talk to an agent, for enclos's
     /// messages: `enclos connect <sandbox> -- <this>` (ADR 0024).
     fn talk(&self, agent: &AgentName) -> String;
-    /// The one background process serving every agent of the sandbox,
-    /// if the runtime has one (ADR 0021).
-    fn service(&self) -> Option<SandboxCommand>;
+    /// The background processes the runtime runs while its sandbox is
+    /// started: none, one or several, each with a name of its own. Hermes
+    /// has one gateway serving every agent (ADR 0021).
+    fn services(&self) -> Vec<RuntimeService>;
+}
+
+/// One background process of a runtime, run by the host's service manager
+/// through `enclos launch <sandbox> <name>`.
+#[derive(Debug, Clone)]
+pub struct RuntimeService {
+    /// Stable across versions, as it names the service's label and log:
+    /// the short-name rule, and never `proxy`, the sandbox's own service.
+    pub name: &'static str,
+    pub command: SandboxCommand,
 }
 
 pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {
@@ -113,6 +124,21 @@ pub fn adapter(kind: RuntimeKind) -> Box<dyn RuntimeAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_names_are_distinct_short_names_and_never_the_proxy() {
+        for kind in crate::model::runtime::RuntimeKind::ALL {
+            let names: Vec<&str> = adapter(kind).services().iter().map(|s| s.name).collect();
+            for name in &names {
+                assert!(crate::model::sandbox::is_short_name(name), "{kind}: {name}");
+                assert_ne!(*name, "proxy", "{kind}");
+            }
+            let mut unique = names.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), names.len(), "{kind}: {names:?}");
+        }
+    }
 
     #[test]
     fn a_home_file_stays_inside_the_home() {

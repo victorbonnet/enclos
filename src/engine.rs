@@ -83,14 +83,14 @@ impl Engine {
     pub fn open(layout: Layout) -> Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
-        let agents_dir = layout.user_home().join("Library/LaunchAgents");
+        let services = crate::service::host(layout.user_home());
         Engine::new(
             layout,
             Box::new(state),
             Box::new(audit),
             backend::registered(),
         )
-        .with_services(Box::new(crate::service::launchd::Launchd { agents_dir }))
+        .with_services(services)
     }
 
     pub fn new(
@@ -105,7 +105,9 @@ impl Engine {
             audit,
             backends,
             exe: std::env::current_exe().ok(),
-            services: Box::new(NoServices),
+            services: Box::new(crate::service::Unsupported {
+                why: "this engine has no service manager",
+            }),
         }
     }
 
@@ -217,28 +219,5 @@ impl Engine {
                 Err(error)
             }
         }
-    }
-}
-
-/// The service manager of an engine built without one: refuses every start,
-/// so tests never reach the host's real service manager.
-struct NoServices;
-
-impl crate::service::ServiceManager for NoServices {
-    fn start(
-        &self,
-        unit: &crate::service::ServiceUnit,
-    ) -> std::result::Result<(), crate::service::ServiceError> {
-        Err(crate::service::ServiceError {
-            what: format!("this engine has no service manager to start {}", unit.label),
-        })
-    }
-
-    fn stop(&self, _label: &str) -> std::result::Result<(), crate::service::ServiceError> {
-        Ok(())
-    }
-
-    fn status(&self, _label: &str) -> crate::service::ServiceStatus {
-        crate::service::ServiceStatus::NotLoaded
     }
 }

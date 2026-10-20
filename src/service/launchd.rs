@@ -36,6 +36,11 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// How long launchd waits after TERM before it kills a service: enough for
+/// `enclos launch` to stop the runtime it runs (TERM, `STOP_GRACE`, KILL,
+/// another `STOP_GRACE`) and record its end.
+const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(80);
+
 /// The job file: started at load and at login, restarted if it crashes
 /// (not when it exits cleanly), with its output in the unit's log.
 pub fn plist(unit: &ServiceUnit) -> String {
@@ -74,12 +79,14 @@ pub fn plist(unit: &ServiceUnit) -> String {
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>{exit_timeout}</integer>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 "#,
         label = escape(&unit.label),
+        exit_timeout = EXIT_TIMEOUT.as_secs(),
     )
 }
 
@@ -156,6 +163,34 @@ impl ServiceManager for Launchd {
             })
             .map_or(ServiceStatus::Loaded, |pid| ServiceStatus::Running { pid })
     }
+
+    /// From the job files: `start` writes one before loading it, and `stop`
+    /// removes it only once the job is unloaded.
+    fn installed(&self, prefix: &str) -> Result<Vec<String>, ServiceError> {
+        let entries = match std::fs::read_dir(&self.agents_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ServiceError {
+                    what: format!("cannot read {}: {e}", self.agents_dir.display()),
+                });
+            }
+        };
+        let mut labels = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| ServiceError {
+                what: format!("cannot read {}: {e}", self.agents_dir.display()),
+            })?;
+            let file = entry.file_name();
+            let label = file
+                .to_str()
+                .and_then(|f| f.strip_suffix(".plist"))
+                .filter(|l| l.starts_with(prefix));
+            labels.extend(label.map(str::to_owned));
+        }
+        labels.sort();
+        Ok(labels)
+    }
 }
 
 #[cfg(test)]
@@ -183,8 +218,32 @@ mod tests {
             text.contains("<string>/usr/local/bin/enclos</string>\n    <string>proxy</string>")
         );
         assert!(text.contains("<key>SuccessfulExit</key><false/>"));
+        assert!(text.contains("<key>ExitTimeOut</key><integer>80</integer>"));
         assert!(text.contains("<key>StandardErrorPath</key><string>/Users/alice/.enclos/sandboxes/home/logs/proxy.log</string>"));
         assert!(text.contains("<key>ENCLOS_HOME</key><string>/Users/alice/.enclos</string>"));
+    }
+
+    #[test]
+    fn installed_labels_are_the_job_files_with_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let launchd = Launchd {
+            agents_dir: dir.path().join("LaunchAgents"),
+        };
+        assert!(launchd.installed("enclos.").unwrap().is_empty());
+        std::fs::create_dir(&launchd.agents_dir).unwrap();
+        for file in [
+            "enclos.12345678.home.proxy.plist",
+            "enclos.12345678.home.gateway.plist",
+            "enclos.12345678.homework.proxy.plist",
+            "com.example.other.plist",
+            "enclos.12345678.home.notes",
+        ] {
+            std::fs::write(launchd.agents_dir.join(file), "").unwrap();
+        }
+        assert_eq!(
+            launchd.installed("enclos.12345678.home.").unwrap(),
+            ["enclos.12345678.home.gateway", "enclos.12345678.home.proxy"]
+        );
     }
 
     #[test]

@@ -4,10 +4,11 @@
 
 #[cfg(test)]
 pub mod fake;
+#[cfg(target_os = "macos")]
 pub mod launchd;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One service, as enclos defines it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,4 +46,52 @@ pub trait ServiceManager {
     /// Stops the unit and removes it, so it does not start at login.
     fn stop(&self, label: &str) -> Result<(), ServiceError>;
     fn status(&self, label: &str) -> ServiceStatus;
+    /// The labels installed and not removed yet that start with `prefix`,
+    /// whether or not they run.
+    fn installed(&self, prefix: &str) -> Result<Vec<String>, ServiceError>;
+}
+
+/// This host's service manager: launchd on macOS. Other systems have none
+/// yet, and refuse to start services.
+#[cfg(target_os = "macos")]
+pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
+    Box::new(launchd::Launchd {
+        agents_dir: user_home.join("Library/LaunchAgents"),
+    })
+}
+
+/// This host's service manager: launchd on macOS. Other systems have none
+/// yet, and refuse to start services.
+#[cfg(not(target_os = "macos"))]
+pub fn host(_user_home: &Path) -> Box<dyn ServiceManager> {
+    Box::new(Unsupported {
+        why: "enclos runs background services only on macOS for now",
+    })
+}
+
+/// A service manager that refuses every start and has nothing installed:
+/// on a system enclos has none for, and in an engine built without one, so
+/// tests never reach the host's.
+pub struct Unsupported {
+    pub why: &'static str,
+}
+
+impl ServiceManager for Unsupported {
+    fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
+        Err(ServiceError {
+            what: format!("cannot start {}: {}", unit.label, self.why),
+        })
+    }
+
+    fn stop(&self, _label: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    fn status(&self, _label: &str) -> ServiceStatus {
+        ServiceStatus::NotLoaded
+    }
+
+    fn installed(&self, _prefix: &str) -> Result<Vec<String>, ServiceError> {
+        Ok(Vec::new())
+    }
 }

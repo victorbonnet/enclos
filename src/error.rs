@@ -23,6 +23,10 @@ pub enum Error {
     SandboxExists { name: String },
     #[error("sandbox `{name}` has sessions open. End them first with `enclos sandbox stop {name}`")]
     SandboxRunning { name: String },
+    #[error(
+        "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
+    )]
+    SandboxHasServices { name: String },
     /// A stop left members running; `rm` waits until they are gone.
     #[error(
         "sandbox `{name}` still has processes `enclos sandbox stop` could not end; `enclos sandbox show {name}` lists them. End them, then run `enclos sandbox stop {name}` again"
@@ -99,6 +103,7 @@ impl Error {
             | Error::Compile(_)
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
+            | Error::SandboxHasServices { .. }
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
