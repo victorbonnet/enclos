@@ -39,7 +39,7 @@ flowchart LR
   you --> cli
   cli -->|"connect lab -- main"| main
   cli -->|"sandbox start"| launchd
-  launchd -->|"enclos launch lab"| gateway
+  launchd -->|"enclos launch lab gateway"| gateway
   launchd -->|"enclos proxy run"| proxy
   cli --> state
   cli --> audit
@@ -53,7 +53,7 @@ flowchart LR
 - **The sandbox** is the permission boundary ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)). Every process in it runs under `sandbox-exec` with the sandbox's compiled policy: it writes only to its home and to devices, cannot read the sensitive deny list (`~/.ssh`, keychains, browser data, other agents' configuration, other sandboxes, enclos's files), connects only to its proxy's ports, and cannot reach host services such as LaunchServices, Apple Events, launchd, preferences or the pasteboard, or signal processes outside it.
 - **The runtime** (Hermes) is installed inside the sandbox's home by its own installer, run in the sandbox ([ADR 0020](adr/0020-runtimes-installed-per-sandbox.md)). Its **agents** share it, the policy, the proxy, the login and the secrets; each has its own configuration, memory, skills and sessions.
 - **The egress proxy** runs on the host, outside the sandbox. It allows only destinations on the policy's allowlist, resolves names itself, connects only to addresses it has validated ([ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)), and logs every connection. It reads the active policy for each new connection, so `enclos policy allow` applies without a restart. Each sandbox has one proxy port, so the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
-- **Services**: `enclos sandbox start` installs two launchd jobs per sandbox, its proxy and its runtime's gateway, which serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). There is no enclos daemon ([ADR 0002](adr/0002-no-daemon.md)). Interactive sessions run in your terminal and use the same proxy.
+- **Services**: `enclos sandbox start` installs a sandbox's services with the host's service manager (launchd on macOS): its proxy, and each background service its runtime declares. Hermes declares one, its gateway, which serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). There is no enclos daemon ([ADR 0002](adr/0002-no-daemon.md)). Interactive sessions run in your terminal and use the same proxy.
 - **State and audit**: `state.db` (SQLite) holds the sandboxes, every policy snapshot, sessions and the network log; `audit.jsonl` holds one hash-chained entry per state-changing command ([ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md)).
 
 ## The code
@@ -65,7 +65,7 @@ flowchart TB
   engine --> policy["policy/<br/>layers, snapshots, validation"]
   engine --> backend["backend/seatbelt/<br/>compile a policy, wrap a command"]
   engine --> runtime["runtime/<br/>adapters: Hermes"]
-  engine --> service["service/<br/>launchd jobs"]
+  engine --> service["service/<br/>service manager: launchd"]
   engine --> lifecycle["lifecycle/<br/>session members, safe stop"]
   engine --> probes["probes/<br/>escape probes for policy test"]
   engine --> proxy["proxy/<br/>the egress proxy"]
