@@ -94,11 +94,16 @@ pub trait StateStore: NetLogStore {
     /// `running_only`.
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>>;
 
-    fn put_agent(&self, lock: &StateLock, sandbox: &SandboxName, agent: &AgentRecord)
-    -> Result<()>;
+    /// Records a new agent; a second with the same name is an error.
+    fn insert_agent(
+        &self,
+        lock: &StateLock,
+        sandbox: &SandboxName,
+        agent: &AgentRecord,
+    ) -> Result<()>;
     fn remove_agent(&self, lock: &StateLock, sandbox: &SandboxName, name: &AgentName)
     -> Result<()>;
-    /// The sandbox's agents, in port order.
+    /// The sandbox's agents, by name.
     fn agents(&self, sandbox: &SandboxName) -> Result<Vec<AgentRecord>>;
 }
 

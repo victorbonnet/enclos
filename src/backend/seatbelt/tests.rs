@@ -3,6 +3,7 @@
 //! policy denies. Only processes these tests start are ever signalled.
 
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -79,6 +80,25 @@ impl World {
         let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().unwrap().success()
+    }
+
+    /// Runs a shell command in the sandbox: whether it exited 0, and what
+    /// it printed.
+    fn out(&self, script: &str) -> (bool, String) {
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+        };
+        let out = Seatbelt
+            .wrap(&self.compiled, &self.ctx, &launch)
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        )
     }
 
     fn path(&self, rel: &str) -> String {
@@ -179,16 +199,7 @@ fn the_sandbox_cannot_type_into_its_terminal() {
     assert!(!out.contains("INJECTED"), "{out}");
 }
 
-#[test]
-fn home_files_are_copied_from_inside_so_a_planted_link_reaches_nothing_outside() {
-    use crate::engine::home_files_script;
-    use crate::runtime::HomeFile;
-    let w = world();
-    // The sandbox planted a link where enclos puts its mktemp wrapper.
-    let sentinel = w.base.join("alice/sentinel");
-    std::fs::write(&sentinel, "host file").unwrap();
-    std::fs::create_dir_all(w.ctx.home.join("bin")).unwrap();
-    std::os::unix::fs::symlink(&sentinel, w.ctx.home.join("bin/mktemp")).unwrap();
+fn staged_wrapper(w: &World) -> (PathBuf, HomeFile) {
     let staged = w.ctx.dir.join("installers/home-0");
     std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
     std::fs::write(&staged, "wrapper").unwrap();
@@ -197,14 +208,97 @@ fn home_files_are_copied_from_inside_so_a_planted_link_reaches_nothing_outside()
         contents: "wrapper",
         executable: true,
     };
-    assert!(!w.sh(&home_files_script(&[(staged.clone(), &file)])));
-    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "host file");
+    (staged, file)
+}
 
-    // Without the link, the same lines put the file in place.
-    std::fs::remove_file(w.ctx.home.join("bin/mktemp")).unwrap();
+use crate::engine::home_files_script;
+use crate::runtime::HomeFile;
+
+#[test]
+fn home_files_are_copied_from_inside_so_a_planted_link_reaches_nothing_outside() {
+    let w = world();
+    // The sandbox planted a link where enclos puts its mktemp wrapper. The
+    // link goes, the wrapper takes its place, and the host file is untouched.
+    let sentinel = w.base.join("alice/sentinel");
+    std::fs::write(&sentinel, "host file").unwrap();
+    std::fs::create_dir_all(w.ctx.home.join("bin")).unwrap();
+    std::os::unix::fs::symlink(&sentinel, w.ctx.home.join("bin/mktemp")).unwrap();
+    let (staged, file) = staged_wrapper(&w);
+    assert!(w.sh(&home_files_script(&[(staged.clone(), &file)])));
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "host file");
+    let target = w.ctx.home.join("bin/mktemp");
+    assert!(target.symlink_metadata().unwrap().is_file());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "wrapper");
+
+    // A folder planted there goes the same way.
+    std::fs::remove_file(&target).unwrap();
+    std::fs::create_dir_all(target.join("inside")).unwrap();
     assert!(w.sh(&home_files_script(&[(staged, &file)])));
-    assert_eq!(
-        std::fs::read_to_string(w.ctx.home.join("bin/mktemp")).unwrap(),
-        "wrapper"
+    assert!(target.is_file());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "wrapper");
+}
+
+#[test]
+fn a_home_folder_that_is_a_link_outside_gets_nothing() {
+    let w = world();
+    // `~/bin` itself leads outside the home: the copy is refused and the
+    // host folder stays empty.
+    let outside = w.base.join("alice/outside-bin");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, w.ctx.home.join("bin")).unwrap();
+    let (staged, file) = staged_wrapper(&w);
+    assert!(!w.sh(&home_files_script(&[(staged, &file)])));
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+}
+
+#[test]
+fn a_hard_link_to_a_host_file_cannot_be_made_in_the_home() {
+    let w = world();
+    let readable = w.path("alice/readable.txt");
+    assert!(!w.sh(&format!("/bin/ln '{readable}' \"$HOME/bin-link\"")));
+    assert!(!w.ctx.home.join("bin-link").exists());
+}
+
+#[test]
+fn the_mktemp_wrapper_puts_temp_files_under_the_sandbox_tmp() {
+    let w = world();
+    let bin = w.ctx.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("mktemp");
+    std::fs::write(&shim, include_str!("../../runtime/hermes/mktemp")).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tmp = w.ctx.home.join("tmp").display().to_string();
+    for (call, prefix) in [
+        ("mktemp", "tmp."),
+        ("mktemp -d", "tmp."),
+        ("mktemp -t pfx", "pfx."),
+        ("mktemp -d -t pfx", "pfx."),
+        ("mktemp -q -t pfx", "pfx."),
+    ] {
+        let (ok, made) = w.out(call);
+        assert!(ok, "{call}");
+        let expected = format!("{tmp}/{prefix}");
+        assert!(
+            made.starts_with(&expected),
+            "{call}: {made} not under {expected}"
+        );
+        assert!(Path::new(&made).exists(), "{call}: {made}");
+    }
+    // A template, or a long option, passes through unchanged.
+    let (ok, made) = w.out("mktemp \"$HOME/tmp/mine.XXXXXX\"");
+    assert!(ok && made.starts_with(&format!("{tmp}/mine.")), "{made}");
+    assert!(!w.sh("mktemp --tmpdir=/nonexistent x.XXXX"));
+    // -p counts only when TMPDIR is unset; TMPDIR wins otherwise.
+    let alt = w.ctx.home.join("tmp/alt");
+    std::fs::create_dir_all(&alt).unwrap();
+    let (ok, made) = w.out(&format!("mktemp -p '{}' -t pfx", alt.display()));
+    assert!(ok && made.starts_with(&format!("{tmp}/pfx.")), "{made}");
+    let (ok, made) = w.out(&format!(
+        "env -u TMPDIR mktemp -p '{}' -t pfx",
+        alt.display()
+    ));
+    assert!(
+        ok && made.starts_with(&format!("{}/pfx.", alt.display())),
+        "{made}"
     );
 }

@@ -16,6 +16,7 @@ pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use runtime::home_files_script;
+pub use runtime::{AgentAdded, AgentRemoved, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use session::{Left, SessionEnd};
 
@@ -155,6 +156,14 @@ impl Engine {
                 name: name.to_string(),
             }),
         }
+    }
+
+    /// The program started as the sandbox's proxy, for tests that stand one
+    /// in.
+    #[cfg(test)]
+    pub(crate) fn with_exe(mut self, exe: PathBuf) -> Engine {
+        self.exe = Some(exe);
+        self
     }
 
     /// The first registered backend that works on this host.

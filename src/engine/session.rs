@@ -24,6 +24,7 @@ use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::runtime::SandboxCommand;
 use crate::state::{StateError, StateLock};
 
 /// How a session ended.
@@ -91,7 +92,7 @@ impl Engine {
         if confirm == Confirm::DryRun {
             return self.plan_connect(name, &command).map(Planned::DryRun);
         }
-        self.run_in_sandbox(by, name, command, "connect")
+        self.run_in_sandbox(by, name, SandboxCommand::new(command), "connect")
             .map(Planned::Done)
     }
 
@@ -101,9 +102,10 @@ impl Engine {
         &self,
         by: &Actor,
         name: &SandboxName,
-        command: Vec<OsString>,
+        command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
+        let command = command.into_words();
         let target = name.to_string();
         let summary = |(session, ..): &(SessionRecord, _, _)| format!("session {}", session.id);
         // Which process group the program starts in (design §8). When this

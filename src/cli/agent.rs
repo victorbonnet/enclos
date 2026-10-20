@@ -8,6 +8,7 @@ use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
+use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -47,31 +48,43 @@ impl FromStr for AgentTarget {
     }
 }
 
-pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
+pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
         AgentVerb::Add { agent } => {
             let AgentTarget { sandbox, agent } = agent;
-            let added = engine.add_agent(by, &sandbox, agent)?;
-            let name = &added.name;
-            let kind = engine.show_sandbox(&sandbox)?.record.runtime;
-            let runtime = kind.map_or("The runtime", |r| r.display_name());
-            let talk = kind.map_or(String::new(), |k| enclos::runtime::adapter(k).talk(name));
+            let added = match engine.add_agent(by, &sandbox, agent, confirm)? {
+                Planned::DryRun(plan) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    return Ok(exit::OK);
+                }
+                Planned::Done(added) => added,
+            };
+            super::connect::report_end(&sandbox, &added.end);
+            let name = &added.agent.name;
+            let runtime = enclos::runtime::adapter(added.kind);
             let shell = format!("enclos connect {sandbox}");
-            let talk = format!("{shell} -- {talk}");
+            let talk = format!("{shell} -- {}", runtime.talk(name));
             let w = talk.len() + 3;
             // The runtime's own output above suggests commands and `~` paths
             // that only work inside the sandbox.
             println!("\nAdded agent {sandbox}/{name}.\n");
-            println!("{runtime}'s next steps above are commands to run inside the sandbox:");
+            println!(
+                "{}'s next steps above are commands to run inside the sandbox:",
+                added.kind.display_name()
+            );
             println!("  {talk:<w$}talk to the agent");
-            println!("  {shell:<w$}a shell in the sandbox, for commands such as `{name} model`");
+            println!(
+                "  {shell:<w$}a shell in the sandbox, for {}'s own commands",
+                added.kind.display_name()
+            );
             println!(
                 "There, ~ is the sandbox's home: {}",
                 engine.sandbox_home(&sandbox).display()
             );
             println!(
-                "`{name} setup` is optional: the agent already uses the sandbox's login (`enclos connect {sandbox} -- {}`).",
-                kind.map_or(String::new(), |k| enclos::runtime::adapter(k).login())
+                "The agent shares the sandbox's {} login, made with `enclos connect {sandbox} -- {}`; it needs no login of its own.",
+                added.kind.display_name(),
+                runtime.login()
             );
         }
         AgentVerb::List { sandbox } => {
@@ -86,9 +99,47 @@ pub fn run(engine: &Engine, by: &Actor, args: AgentArgs) -> Result<u8> {
             }
         }
         AgentVerb::Rm { agent } => {
-            engine.remove_agent(by, &agent.sandbox, &agent.agent)?;
-            println!("Removed agent {}/{}.", agent.sandbox, agent.agent);
+            let AgentTarget { sandbox, agent } = agent;
+            match engine.remove_agent(by, &sandbox, &agent, confirm)? {
+                Planned::DryRun(plan) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                }
+                Planned::Done(removed) => {
+                    println!(
+                        "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({}); remove them with {}'s own commands in `enclos connect {sandbox}`.",
+                        removed.files,
+                        removed.kind.display_name()
+                    );
+                }
+            }
         }
     }
     Ok(exit::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_agent_is_named_sandbox_slash_agent_and_both_parts_follow_the_rule() {
+        let target: AgentTarget = "lab/main".parse().unwrap();
+        assert_eq!(
+            (target.sandbox.as_str(), target.agent.as_str()),
+            ("lab", "main")
+        );
+        for bad in [
+            "main",
+            "lab/",
+            "/main",
+            "lab/main/extra",
+            "lab/../x",
+            "lab/a;b",
+            "lab/$(x)",
+            "Lab/main",
+            "lab/-x",
+        ] {
+            assert!(bad.parse::<AgentTarget>().is_err(), "{bad}");
+        }
+    }
 }

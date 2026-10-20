@@ -361,14 +361,14 @@ impl StateStore for SqliteStateStore {
         sessions::list(&conn, name, running_only).map_err(|e| self.read_err(e))
     }
 
-    fn put_agent(
+    fn insert_agent(
         &self,
         _lock: &StateLock,
         sandbox: &SandboxName,
         agent: &AgentRecord,
     ) -> Result<()> {
         let conn = self.open()?;
-        agents::put(&conn, sandbox, agent).map_err(self.sqlite_err())
+        agents::insert(&conn, sandbox, agent).map_err(self.sqlite_err())
     }
 
     fn remove_agent(

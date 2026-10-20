@@ -108,7 +108,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
-        Command::Agent(args) => cli::agent::run(&engine, &current_actor(), args),
+        Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, args),

@@ -848,18 +848,57 @@ fn a_runtime_install_dry_run_starts_nothing() {
         "home",
         "--dry-run",
     ]);
+    let plan = out.ok().stdout();
     assert!(
-        out.ok()
-            .stdout()
-            .contains("Would download the Hermes installer"),
-        "{}",
-        out.stdout()
+        plan.contains("Would allow the 13 destinations hermes needs"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("Would download the hermes installer from https://"),
+        "{plan}"
+    );
+    assert!(plan.contains("Would start the proxy"), "{plan}");
+    assert!(
+        plan.contains("record hermes as its runtime if the installer exits 0"),
+        "{plan}"
     );
     assert_eq!(home.audit_lines().len(), before);
-    assert!(
-        home.run(&["sandbox", "show", "home"])
-            .ok()
-            .stdout()
-            .contains("no sessions running")
-    );
+    assert!(!home.root.join("sandboxes/home/installers").exists());
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains("no sessions running"), "{show}");
+    assert!(show.contains("active policy v1"), "{show}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn agent_commands_need_a_runtime_and_their_dry_runs_change_nothing() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let before = home.audit_lines().len();
+    // Without a runtime, nothing to add to: said before anything runs.
+    let out = home.run(&["agent", "add", "home/main", "--dry-run"]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("no runtime yet"), "{}", out.stderr());
+    let out = home.run(&["agent", "rm", "home/main", "--dry-run"]);
+    assert_eq!(out.code(), 1);
+    assert_eq!(home.audit_lines().len(), before);
+    // Names are checked before anything else.
+    for bad in [
+        "main",
+        "home/",
+        "home/../x",
+        "home/a;b",
+        "home/$(x)",
+        "home/-x",
+    ] {
+        let out = home.run(&["agent", "add", bad]);
+        assert_ne!(out.code(), 0, "{bad}");
+        assert!(
+            out.stderr().contains("<sandbox>/<agent>") || out.stderr().contains("not a valid"),
+            "{bad}: {}",
+            out.stderr()
+        );
+    }
+    assert_eq!(home.audit_lines().len(), before);
 }

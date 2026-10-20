@@ -32,6 +32,11 @@ pub enum PolicyError {
     UnknownTemplate(String),
     #[error("a template cannot extend another; `{0}` names `extends`")]
     NestedTemplate(String),
+    #[error(
+        "the {runtime} adapter's layer may only add network destinations (`[network] allow_add`); it sets {}",
+        sets.join(", ")
+    )]
+    AdapterLayer { runtime: String, sets: Vec<String> },
     #[error("the policy is not valid:\n  - {}", problems.join("\n  - "))]
     Invalid { problems: Vec<String> },
 }
@@ -95,8 +100,14 @@ pub fn resolve(
     template_layer.apply(&mut policy);
     if let Some(adapter) = adapter {
         let layer = PolicyFile::parse(&format!("{} adapter", adapter.runtime), &adapter.text)?;
-        if layer.extends.is_some() {
-            return Err(PolicyError::NestedTemplate(adapter.runtime.clone()));
+        // An adapter adds the destinations its runtime needs, nothing else:
+        // it never widens writes, narrows the deny list or replaces a list.
+        let beyond = layer.beyond_destinations();
+        if !beyond.is_empty() {
+            return Err(PolicyError::AdapterLayer {
+                runtime: adapter.runtime.clone(),
+                sets: beyond.iter().map(|s| s.to_string()).collect(),
+            });
         }
         layer.apply(&mut policy);
     }

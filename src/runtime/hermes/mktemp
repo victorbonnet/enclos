@@ -8,16 +8,19 @@ set -u
 for a in "$@"; do
     case "$a" in --*) exec /usr/bin/mktemp "$@" ;; esac
 done
-flags=() prefix=tmp
+flags=() prefix=tmp pdir=
 OPTIND=1
 while getopts ":dqup:t:" opt; do
     case "$opt" in
         d|q|u) flags+=("-$opt") ;;
         t) prefix="$OPTARG" ;;
-        p) ;;                      # TMPDIR wins over -p, as the man page says
+        # The man page says TMPDIR wins over -p; /usr/bin/mktemp lets -p win.
+        # Here TMPDIR wins, as documented: the sandbox's folder is the one
+        # that is writable. -p counts only when TMPDIR is unset.
+        p) pdir="$OPTARG" ;;
         *) exec /usr/bin/mktemp "$@" ;;
     esac
 done
 [ $# -ge "$OPTIND" ] && exec /usr/bin/mktemp "$@"
-dir="${TMPDIR:-/tmp}"
+dir="${TMPDIR:-${pdir:-/tmp}}"
 exec /usr/bin/mktemp ${flags[@]+"${flags[@]}"} "${dir%/}/$prefix.XXXXXXXXXX"

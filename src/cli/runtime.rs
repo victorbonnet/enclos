@@ -6,7 +6,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
-use enclos::model::plan::Confirm;
+use enclos::model::plan::{Confirm, Planned};
 use enclos::model::runtime::RuntimeKind;
 use enclos::model::sandbox::SandboxName;
 
@@ -28,22 +28,26 @@ enum RuntimeVerb {
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
     let RuntimeVerb::Install { runtime, sandbox } = args.verb;
-    if confirm == Confirm::DryRun {
-        engine.show_sandbox(&sandbox)?;
-        println!(
-            "Would download the {} installer and run it in sandbox {sandbox}, under its policy.",
-            runtime.display_name()
+    let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            return Ok(exit::OK);
+        }
+        Planned::Done(end) => end,
+    };
+    super::connect::report_end(&sandbox, &end.end);
+    let shown = runtime.display_name();
+    if !end.installed {
+        eprintln!(
+            "enclos: the {shown} installer exited with {} in sandbox {sandbox}; its output above says why. Nothing is recorded as installed, and the policy is back to v{} without {shown}'s destinations. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again.",
+            end.end.exit, end.policy
         );
-        return Ok(exit::OK);
+        return Ok(exit::ERROR);
     }
-    let end = engine.install_runtime(by, &sandbox, runtime)?;
-    super::connect::report_end(&sandbox, &end);
-    if end.exit == 0 {
-        println!(
-            "{} is installed in sandbox {sandbox}. Log it in and set it up with its own command: `enclos connect {sandbox} -- {}`.",
-            runtime.display_name(),
-            enclos::runtime::adapter(runtime).login()
-        );
-    }
-    Ok(if end.exit == 0 { exit::OK } else { exit::ERROR })
+    println!(
+        "{shown} is installed in sandbox {sandbox} (policy v{}). Log it in and set it up with its own command: `enclos connect {sandbox} -- {}`.",
+        end.policy,
+        enclos::runtime::adapter(runtime).login()
+    );
+    Ok(exit::OK)
 }

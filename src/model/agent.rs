@@ -8,9 +8,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::Timestamp;
+use super::sandbox::is_short_name;
 
-/// An agent name: the sandbox naming rule, so it is safe in paths and
-/// commands.
+/// An agent name: the sandbox naming rule (`is_short_name`), so it is safe
+/// in paths and commands.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AgentName(String);
 
@@ -30,13 +31,9 @@ impl FromStr for AgentName {
     type Err = InvalidAgentName;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut chars = s.chars();
-        let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-        let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if first_ok && rest_ok && (2..=41).contains(&s.len()) {
-            Ok(AgentName(s.to_owned()))
-        } else {
-            Err(InvalidAgentName(s.to_owned()))
+        match is_short_name(s) {
+            true => Ok(AgentName(s.to_owned())),
+            false => Err(InvalidAgentName(s.to_owned())),
         }
     }
 }
@@ -59,8 +56,23 @@ mod tests {
 
     #[test]
     fn names_parse() {
-        assert!("main".parse::<AgentName>().is_ok());
-        for bad in ["", "m", "Main", "a/b", "../x"] {
+        for ok in ["main", "ab", "a-1", &"a".repeat(41)] {
+            assert!(ok.parse::<AgentName>().is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "m",
+            "Main",
+            "a/b",
+            "../x",
+            "a;b",
+            "a b",
+            "$(x)",
+            "-a",
+            "a_b",
+            "a.b",
+            &"a".repeat(42),
+        ] {
             assert!(bad.parse::<AgentName>().is_err(), "{bad}");
         }
     }

@@ -41,6 +41,28 @@ pub struct NetLayer {
 }
 
 impl PolicyFile {
+    /// What this layer sets besides adding network destinations: a runtime
+    /// adapter's layer may do nothing else (design §7).
+    pub fn beyond_destinations(&self) -> Vec<&'static str> {
+        let mut found = Vec::new();
+        if self.extends.is_some() {
+            found.push("extends");
+        }
+        if self.filesystem != FsLayer::default() {
+            found.push("filesystem");
+        }
+        if self.network.allow.is_some() {
+            found.push("network.allow");
+        }
+        if self.network.private.is_some() || !self.network.private_add.is_empty() {
+            found.push("network.private");
+        }
+        if self.network.log.is_some() {
+            found.push("network.log");
+        }
+        found
+    }
+
     /// Parses one layer; `name` says which in errors, such as `policy.toml`.
     pub fn parse(name: &str, text: &str) -> Result<PolicyFile, PolicyError> {
         toml::from_str(text).map_err(|e| PolicyError::Parse {

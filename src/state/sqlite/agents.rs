@@ -6,7 +6,7 @@ use super::policy::ReadError;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::sandbox::SandboxName;
 
-pub fn put(conn: &Connection, sandbox: &SandboxName, p: &AgentRecord) -> rusqlite::Result<()> {
+pub fn insert(conn: &Connection, sandbox: &SandboxName, p: &AgentRecord) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO agents (sandbox, name, created_at) VALUES (?1, ?2, ?3)",
         params![sandbox.as_str(), p.name.as_str(), p.created_at.to_string()],

@@ -34,8 +34,16 @@ impl fmt::Display for RuntimeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown runtime `{0}`: this enclos knows hermes")]
+#[error("unknown runtime `{0}`: this enclos knows {known}", known = known())]
 pub struct UnknownRuntime(pub String);
+
+fn known() -> String {
+    RuntimeKind::ALL
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 impl FromStr for RuntimeKind {
     type Err = UnknownRuntime;
@@ -55,6 +63,10 @@ mod tests {
     #[test]
     fn kinds_parse() {
         assert_eq!("hermes".parse::<RuntimeKind>(), Ok(RuntimeKind::Hermes));
-        assert!("claude".parse::<RuntimeKind>().is_err());
+        let err = "claude".parse::<RuntimeKind>().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown runtime `claude`: this enclos knows hermes"
+        );
     }
 }
