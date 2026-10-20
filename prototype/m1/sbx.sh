@@ -10,7 +10,11 @@ set -u
 source "$(dirname "$0")/env.sh"
 [ "${1:-}" = "--" ] && shift
 
-compiled="$WORK/compiled.sb"
+# A new file for each launch, made read-only once written: a concurrent launch
+# can never truncate or rewrite the policy this one hands to sandbox-exec.
+# They stay in .work/policies (exec leaves nothing to clean them up).
+mkdir -p "$WORK/policies"
+compiled="$(mktemp "$WORK/policies/compiled.XXXXXX")" || exit 1
 if [ "${SBX_POLICY:-}" = none ]; then
     printf '(version 1)\n(allow default)\n' >"$compiled"
 else
@@ -24,6 +28,7 @@ else
 fi
 # Extra SBPL appended last, for experiments: SBX_EXTRA_RULES='(deny appleevent-send)'
 printf '%s\n' "${SBX_EXTRA_RULES:-}" >>"$compiled"
+chmod 0444 "$compiled"
 
 mkdir -p "$SBX_HOME"/{tmp,.cache,.config,.local/share,.local/bin,bin}
 proxy="http://127.0.0.1:$PROXY_PORT"

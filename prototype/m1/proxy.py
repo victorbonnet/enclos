@@ -66,13 +66,44 @@ def normalize(host):
         return host
 
 
+NAT64 = ipaddress.ip_network("64:ff9b::/96")
+NAT64_LOCAL = ipaddress.ip_network("64:ff9b:1::/48")
+SIX_TO_FOUR = ipaddress.ip_network("2002::/16")
+TEREDO = ipaddress.ip_network("2001::/32")
+
+
+def carried_v4(ip):
+    """The IPv4 addresses an IPv6 address carries (ADR 0017, as src/net/addr.rs):
+    mapped, NAT64 /96 and /48, 6to4, and Teredo's server and client."""
+    if ip.ipv4_mapped:
+        return [ip.ipv4_mapped]
+    b = ip.packed
+    v4 = lambda *o: ipaddress.IPv4Address(bytes(o))  # noqa: E731
+    if ip in NAT64:
+        return [v4(*b[12:16])]
+    if ip in NAT64_LOCAL:
+        return [v4(b[6], b[7], b[9], b[10])]
+    if ip in SIX_TO_FOUR:
+        return [v4(*b[2:6])]
+    if ip in TEREDO:
+        return [v4(*b[4:8]), v4(*(x ^ 0xFF for x in b[12:16]))]
+    return []
+
+
+def is_public(ip):
+    """Global, and so is every IPv4 address it carries."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        carried = carried_v4(ip)
+        if carried:
+            return all(c.is_global for c in carried)
+    return ip.is_global
+
+
 def public_addresses(host, port):
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     good = []
     for family, _, _, _, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        carried = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
-        if (carried or ip).is_global and (family, sockaddr) not in good:
+        if is_public(ipaddress.ip_address(sockaddr[0])) and (family, sockaddr) not in good:
             good.append((family, sockaddr))
     return good
 
@@ -130,6 +161,48 @@ def pump(a, b, event):
     return up, down
 
 
+HOP_BY_HOP = {"connection", "proxy-connection", "keep-alive", "proxy-authorization"}
+
+
+def forward_one_request(conn, upstream, head, method, path, version, event):
+    """Forwards exactly one plain-HTTP request, then only the answer, and the
+    connection closes after it. A client that reuses the connection for
+    another request, maybe to another origin, never has it sent here: it
+    must connect again, and that request is checked and logged on its own."""
+    lines, _, early = head.partition(b"\r\n\r\n")
+    headers, length = [], 0
+    for raw in lines.split(b"\r\n")[1:]:
+        name = raw.split(b":", 1)[0].strip().lower().decode("latin-1")
+        if name == "transfer-encoding":
+            conn.sendall(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            event.update(verdict="deny", reason="chunked-request-body")
+            return
+        if name == "content-length":
+            length = int(raw.split(b":", 1)[1])
+        if name not in HOP_BY_HOP:
+            headers.append(raw)
+    body = early[:length]
+    while len(body) < length:
+        chunk = conn.recv(min(65536, length - len(body)))
+        if not chunk:
+            break
+        body += chunk
+    request = f"{method} {path} {version}\r\n".encode("latin-1")
+    request += b"".join(h + b"\r\n" for h in headers) + b"Connection: close\r\n\r\n" + body
+    upstream.sendall(request)
+    up, down = len(request), 0
+    try:
+        while True:
+            data = upstream.recv(65536)
+            if not data:
+                break
+            conn.sendall(data)
+            down += len(data)
+    except OSError:
+        pass
+    event.update(bytes_up=up, bytes_down=down)
+
+
 def read_head(conn):
     data = b""
     while b"\r\n\r\n" not in data:
@@ -179,9 +252,7 @@ def handle(conn, peer):
             if url.query:
                 path += "?" + url.query
             event["path"] = path
-            first, rest = head.split(b"\r\n", 1)
-            upstream.sendall(f"{method} {path} {parts[2]}\r\n".encode("latin-1") + rest)
-            pump(conn, upstream, event)
+            forward_one_request(conn, upstream, head, method, path, parts[2], event)
     except Exception as e:  # noqa: BLE001 - a prototype logs and moves on
         event.setdefault("verdict", "error")
         event["error"] = repr(e)

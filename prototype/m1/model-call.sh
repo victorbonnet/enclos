@@ -10,7 +10,10 @@ M1="$(cd "$(dirname "$0")" && pwd -P)"
 source "$M1/env.sh"
 label="$1"; profile="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ))
 prompt="${*:-Reply with exactly one word: ok}"
-model="${HERMES_MODEL:-gpt-5.4-mini}"
+# Hermes's built-in defaults (gpt-5.4-mini, gpt-5.5) were refused with HTTP 400
+# for the prototype's ChatGPT account; gpt-5.6-luna worked. For another
+# account, list its models with probes/codex-models.py and set HERMES_MODEL.
+model="${HERMES_MODEL:-gpt-5.6-luna}"
 secs="${CAP_SECS:-180}"
 pflag=(); [ -n "$profile" ] && [ "$profile" != default ] && pflag=(-p "$profile")
 redact() { perl -pe 's/\e\[[0-9;]*m//g; s/eyJ[A-Za-z0-9_-]{10,}(\.[A-Za-z0-9_-]+)*/<redacted-jwt>/g; s/\b(sk|rt|sess)-[A-Za-z0-9_-]{16,}/<redacted-token>/g'; }

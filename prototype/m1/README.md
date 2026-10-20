@@ -11,7 +11,7 @@ Everything the prototype creates lives in `.work/` (gitignored): the sandbox hom
 | `sb/*.sb` | Fragments of the compiled policy, concatenated in order by `sbx.sh`. Each says what was shown about it. |
 | `sbx.sh` | Runs a command in the sandbox: compiled policy, environment pointed at the sandbox home, proxy variables. `SBX_WITHOUT="41 44"` leaves fragments out, `SBX_EXTRA_RULES` appends rules, `SBX_POLICY=none` uses plain `(allow default)`. |
 | `shims/mktemp` | On the sandbox `PATH`: makes `mktemp` honour `TMPDIR` (see "System temp"). |
-| `run-capped.sh` | Runs a sandboxed command with a time cap in its own process group, and signals only that group, from a leader that is still alive. Nothing found by searching is ever signalled. |
+| `run-capped.sh` | Runs a sandboxed command with a time cap in its own process group: SIGTERM at the cap, SIGKILL after a grace period (`GRACE_SECS`, default 3). It signals only that group, by the id of a leader that is still alive. Nothing found by searching is ever signalled. |
 | `proxy.py`, `proxy.sh`, `allow.txt` | The CONNECT proxy: allowlist, or `--learn` to allow any public destination and log it. |
 | `hermes-install.sh` | Runs the Hermes installer (read first, pinned by SHA-256) in the sandbox. |
 | `gateway-test.sh` | Runs the gateway, capped, and a model call for a profile alongside it. |
