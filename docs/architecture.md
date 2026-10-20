@@ -97,7 +97,7 @@ sequenceDiagram
   CLI->>Data: take the lock, open an audit entry, read the active snapshot
   CLI->>CLI: compile the policy (reused if unchanged)
   CLI->>Proxy: start it if it is not running (its own recorded session)
-  CLI->>SB: sandbox-exec main, with an empty environment plus the proxy variables
+  CLI->>SB: sandbox-exec main, with an emptied environment: terminal and locale variables, the sandbox's own and the proxy variables
   CLI->>Data: record the session, close the audit entry
   SB->>Proxy: CONNECT chatgpt.com:443
   Proxy->>Data: read the active policy, log the connection
