@@ -30,12 +30,46 @@ pub struct FsPolicy {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetPolicy {
+    /// Which destinations are reachable at all (ADR 0025).
+    pub mode: NetMode,
     /// Destinations the proxy lets through: `host`, `host:port` or
     /// `*.domain`. Without a port, 443.
     pub allow: Vec<String>,
     /// Allowed hosts that may resolve to private addresses (ADR 0017).
     pub private: Vec<String>,
     pub log: NetLog,
+}
+
+/// Which destinations a sandbox may reach (ADR 0025). Either way, every
+/// connection goes through the proxy, is logged, and reaches only addresses
+/// it validated (ADR 0017).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetMode {
+    /// Only the destinations listed in `allow`.
+    #[default]
+    Allowlist,
+    /// Any public address on the web ports, 80 and 443, as well as what
+    /// `allow` lists.
+    Public,
+}
+
+impl NetMode {
+    /// The ports public mode opens to any public address.
+    pub const PUBLIC_PORTS: [u16; 2] = [80, 443];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NetMode::Allowlist => "allowlist",
+            NetMode::Public => "public",
+        }
+    }
+}
+
+impl fmt::Display for NetMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// What the network log keeps.

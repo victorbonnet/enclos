@@ -1,11 +1,18 @@
 # Personal agents, on runtimes such as Hermes (design §7). The sandbox writes only to its
 # own home, where the agent may install skills, packages and tools that then
-# run under this same policy. The runtime adapter adds the endpoints its runtime
-# needs (model provider, login, install sources); add the APIs you trust with
-# `enclos policy allow`.
+# run under this same policy.
+#
+# The agent may browse, research and call public APIs: any public address on
+# ports 80 and 443, through the sandbox's proxy, which logs every connection
+# and never connects to loopback, link-local, metadata or private addresses
+# (ADR 0025). Other ports and hosts on your network need `enclos policy allow`.
+# For a sandbox that reaches only what you list, set mode = "allowlist" in its
+# policy.toml; the runtime adapter's endpoints (model provider, login, install
+# sources) are listed for that case.
 
 [filesystem]
 write = ["{home}"]
 
 [network]
+mode = "public"
 allow = []

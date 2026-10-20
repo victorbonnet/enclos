@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 
 use crate::model::net::Reason;
-use crate::model::policy::Policy;
+use crate::model::policy::{NetMode, Policy};
 use crate::net::addr::AddrClass;
 use crate::net::host::{AllowEntry, normalize_host};
 
@@ -37,14 +37,18 @@ impl Destination {
     }
 }
 
-/// Whether the allowlist lets the sandbox reach `dest`.
+/// Whether the policy lets the sandbox reach `dest`: in public mode any
+/// destination on a web port, and in either mode what the allowlist lists.
+/// Its addresses are checked after this, the same way in both modes.
 pub fn allowed(policy: &Policy, dest: &Destination) -> bool {
-    policy
-        .net
-        .allow
-        .iter()
-        .filter_map(|entry| AllowEntry::parse(entry).ok())
-        .any(|entry| entry.matches(&dest.host, dest.port))
+    let public = policy.net.mode == NetMode::Public && NetMode::PUBLIC_PORTS.contains(&dest.port);
+    public
+        || policy
+            .net
+            .allow
+            .iter()
+            .filter_map(|entry| AllowEntry::parse(entry).ok())
+            .any(|entry| entry.matches(&dest.host, dest.port))
 }
 
 /// The addresses the proxy may connect to, in the order given: global ones,
@@ -110,6 +114,29 @@ mod tests {
         assert!(!allowed(&p, &dest("api.example.com", 80)));
         assert!(!allowed(&p, &dest("evil.example.com", 443)));
         assert!(!allowed(&p, &dest("cdn.example.net", 443)));
+    }
+
+    #[test]
+    fn public_mode_opens_the_web_ports_to_any_destination_and_no_more() {
+        let mut p = policy(&["files.example.org:8443"], &[]);
+        p.net.mode = NetMode::Public;
+        let dest = |h: &str, port| Destination::parse(h, port).unwrap();
+        assert!(allowed(&p, &dest("weather.example.com", 443)));
+        assert!(allowed(&p, &dest("weather.example.com", 80)));
+        assert!(allowed(&p, &dest("93.184.216.34", 443)));
+        assert!(!allowed(&p, &dest("weather.example.com", 22)));
+        assert!(allowed(&p, &dest("files.example.org", 8443)));
+        // Its addresses are still checked: never loopback or metadata, and
+        // private ones only with the opt-in, which needs the allowlist.
+        let any = dest("rebind.example.com", 443);
+        assert_eq!(
+            validated(&p, &any, &ips(&["127.0.0.1", "169.254.169.254"]), classify),
+            Err(Reason::BlockedAddress)
+        );
+        assert_eq!(
+            validated(&p, &any, &ips(&["192.168.1.20"]), classify),
+            Err(Reason::PrivateAddress)
+        );
     }
 
     #[test]

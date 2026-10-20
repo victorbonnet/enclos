@@ -24,6 +24,10 @@ _Avoid_: rules, permissions, config. A backend's file generated from a policy (s
 One immutable, fully resolved version of a sandbox's policy, identified by its content hash and recording the inputs it was resolved from.
 _Avoid_: revision, policy file
 
+**Network mode**:
+Which destinations a sandbox may reach: `public`, any public address on the web ports as well as what its policy lists, or `allowlist`, only what its policy lists.
+_Avoid_: open mode, internet access
+
 **Active policy**:
 The policy snapshot every new session in a sandbox starts under.
 _Avoid_: current policy, live policy

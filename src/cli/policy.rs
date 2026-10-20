@@ -6,6 +6,7 @@ use enclos::engine::{Engine, PolicyApplied, PolicyView, TestReport};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
+use enclos::model::policy::NetMode;
 use enclos::model::sandbox::SandboxName;
 use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
 
@@ -85,9 +86,21 @@ fn print_policy(view: &PolicyView) {
     for path in &policy.fs.read_deny {
         println!("    {path}");
     }
-    println!("\nNetwork (every other destination is denied and logged)");
+    match policy.net.mode {
+        NetMode::Public => {
+            println!("\nNetwork: public web (every connection is logged)");
+            println!("  mode:    public: any public address on ports 80 and 443");
+            println!(
+                "           never loopback, link-local or metadata addresses, nor private ones unless listed below"
+            );
+        }
+        NetMode::Allowlist => {
+            println!("\nNetwork: allowlist (every other destination is denied and logged)");
+            println!("  mode:    allowlist: only the destinations below");
+        }
+    }
     if policy.net.allow.is_empty() {
-        println!("  allowed: nothing yet");
+        println!("  allowed: nothing listed");
     } else {
         println!("  allowed: {}", policy.net.allow.join(", "));
     }
@@ -160,7 +173,7 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
         NOT_PROBED.join(", ")
     );
     println!(
-        "Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the proxy probe: the proxy answered 403). It does not mean no other way out exists."
+        "Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists."
     );
     if report.inconclusive() > 0 {
         println!(

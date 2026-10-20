@@ -7,7 +7,7 @@
 use serde::Deserialize;
 
 use super::PolicyError;
-use crate::model::policy::{NetLog, Policy, TemplateName};
+use crate::model::policy::{NetLog, NetMode, Policy, TemplateName};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +33,7 @@ pub struct FsLayer {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct NetLayer {
+    pub mode: Option<NetMode>,
     pub allow: Option<Vec<String>>,
     pub allow_add: Vec<String>,
     pub private: Option<Vec<String>>,
@@ -94,6 +95,9 @@ impl PolicyFile {
             &self.network.private,
             &self.network.private_add,
         );
+        if let Some(mode) = self.network.mode {
+            policy.net.mode = mode;
+        }
         if let Some(log) = self.network.log {
             policy.net.log = log;
         }
@@ -125,6 +129,25 @@ mod tests {
             .unwrap()
             .apply(&mut policy);
         assert_eq!(policy.net.allow, ["d.com"]);
+    }
+
+    #[test]
+    fn the_last_layer_naming_a_mode_sets_it() {
+        let mut policy = Policy::default();
+        assert_eq!(policy.net.mode, NetMode::Allowlist);
+        PolicyFile::parse("a", "[network]\nmode = \"public\"")
+            .unwrap()
+            .apply(&mut policy);
+        PolicyFile::parse("b", "[network]\nallow_add = [\"c.com\"]")
+            .unwrap()
+            .apply(&mut policy);
+        assert_eq!(policy.net.mode, NetMode::Public);
+        PolicyFile::parse("c", "[network]\nmode = \"allowlist\"")
+            .unwrap()
+            .apply(&mut policy);
+        assert_eq!(policy.net.mode, NetMode::Allowlist);
+        let err = PolicyFile::parse("d", "[network]\nmode = \"open\"").unwrap_err();
+        assert!(err.to_string().contains("open"), "{err}");
     }
 
     #[test]

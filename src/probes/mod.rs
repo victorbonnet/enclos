@@ -9,7 +9,8 @@
 //! that the service is there). When the control fails too, the probe is
 //! inconclusive, not closed: `crontab -l` fails anyway for an account
 //! without a crontab, and a connection fails anyway on a host that is
-//! offline. The proxy probe is its own proof: the proxy answers 403.
+//! offline. The probes through the proxy are their own proof: the proxy answers
+//! 403.
 //!
 //! Each probe's script prints a marker before anything else, so a sandbox
 //! that never ran it (`sandbox-exec` refusing the compiled policy) is not
@@ -212,6 +213,20 @@ fn write_probe(route: &'static str, name: &str, file: PathBuf) -> Probe {
     write
 }
 
+/// A request through the sandbox's proxy, which must answer 403. Even with
+/// `NO_PROXY` set in the sandbox, curl is told to use the proxy.
+fn proxy_probe(name: &str, url: &str) -> Probe {
+    Probe {
+        route: "network",
+        name: name.into(),
+        script: format!(
+            "/usr/bin/curl -s -o /dev/null -w '%{{http_connect}}' --max-time 15 --noproxy '' {url}"
+        ),
+        proof: Proof::ProxyRefuses,
+        host: None,
+    }
+}
+
 /// The probes that are harmless even if a rule does not hold: run wherever
 /// `policy test` runs, the user's Mac included.
 pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
@@ -242,13 +257,22 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         i.user_home.join(format!("enclos-probe-{}", i.tag)),
     ));
 
-    list.push(Probe {
-        route: "network",
-        name: "an unlisted destination through the proxy".into(),
-        script: "/usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 https://probe.enclos.invalid/".into(),
-        proof: Proof::ProxyRefuses,
-        host: None,
-    });
+    // Refused in either network mode (ADR 0025): a port public mode does not
+    // open, and addresses no mode reaches, asked for by name through the proxy.
+    list.push(proxy_probe(
+        "an unlisted port through the proxy",
+        "https://probe.enclos.invalid:8443/",
+    ));
+    for (what, address) in [
+        ("loopback", "127.0.0.1"),
+        ("the cloud metadata address", "169.254.169.254"),
+        ("a private address", "10.0.0.1"),
+    ] {
+        list.push(proxy_probe(
+            &format!("{what} through the proxy"),
+            &format!("https://{address}/"),
+        ));
+    }
     // The same connections outside the sandbox only open and close a
     // connection; they fail on a host that is offline.
     list.push(same_outside(

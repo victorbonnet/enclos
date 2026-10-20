@@ -33,7 +33,7 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 
 `enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 
-The sandbox reaches only the hosts its policy allows, and Hermes's adapter allows only the OpenAI hosts its first login used so far (`chatgpt.com`, `auth.openai.com`). For another provider, allow its API host before you log in, for example `enclos policy allow lab api.example.com`; `enclos net denied lab` shows what the login was refused.
+The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, set `mode = "allowlist"` under `[network]` in its `policy.toml` (`enclos policy show lab` says which file); Hermes's own OpenAI hosts stay allowed.
 
 ## Add agents
 
@@ -99,10 +99,10 @@ enclos net log lab           # every connection the sandbox made
 enclos net denied lab        # what the sandbox was refused
 ```
 
-An answer alone does not show where it came from: Hermes may answer from the model, or through the model provider's own web search, in which case the log shows only the provider. If a site you trust was refused, allow it from your Mac; it applies at once, without a restart:
+An answer alone does not show where it came from: Hermes may answer from the model, or through the model provider's own web search, in which case the log shows only the provider. The public web needs no grant; another port, or any host in allowlist mode, does. If something you trust was refused, allow it from your Mac; it applies at once, without a restart:
 
 ```bash
-enclos policy allow lab api.open-meteo.com
+enclos policy allow lab api.example.com:8443
 ```
 
 The agent cannot allow anything itself.
