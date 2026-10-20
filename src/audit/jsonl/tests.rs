@@ -224,6 +224,24 @@ fn damage_before_an_incomplete_last_line_still_blocks_writes() {
 }
 
 #[test]
+fn damage_in_the_middle_blocks_writes() {
+    let (_dir, log) = log();
+    run(&log, 2);
+    let mut edited = lines(&log);
+    edited[1] = edited[1].replace("did 0", "did X");
+    write_lines(&log, &edited);
+    let before = std::fs::read(&log.path).unwrap();
+
+    let lock = StateLock::for_tests();
+    let err = log.begin(&lock, intent("next")).unwrap_err();
+    assert!(matches!(err, AuditError::Damaged { .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("line 2 was changed"), "{message}");
+    assert!(message.contains("enclos audit verify"), "{message}");
+    assert_eq!(std::fs::read(&log.path).unwrap(), before);
+}
+
+#[test]
 fn appends_continue_the_chain_across_long_lines() {
     let (_dir, log) = log();
     let lock = StateLock::for_tests();

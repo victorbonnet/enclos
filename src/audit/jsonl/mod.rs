@@ -93,9 +93,10 @@ impl JsonlAuditLog {
 
     /// If a crash left an incomplete last line, moves it to
     /// `audit.jsonl.torn-<seq>` and records that in the log. Only that damage
-    /// is recovered: if the line before it is not intact either, nothing is
-    /// moved and the log stays `Damaged`. Called under the state lock, so the
-    /// incomplete line cannot be a write still in progress.
+    /// is recovered: [`Self::append`] checks the lines before it first, so
+    /// any other damage moves nothing and the log stays `Damaged`. Called
+    /// under the state lock, so the incomplete line cannot be a write still
+    /// in progress.
     fn recover_torn_tail(&self) -> Result<()> {
         let mut file = match OpenOptions::new().read(true).write(true).open(&self.path) {
             Ok(file) => file,
@@ -140,10 +141,27 @@ impl JsonlAuditLog {
         )
     }
 
-    /// Appends one record, first recovering an incomplete last line.
+    /// Appends one record, first recovering an incomplete last line. Any
+    /// other damage, on any line, stops the write before the file changes.
     fn append(&self, body: Body) -> Result<u64> {
+        self.check_chain()?;
         self.recover_torn_tail()?;
         self.write_record(body)
+    }
+
+    /// Verifies every line, as `enclos audit verify` does, and fails on the
+    /// first break. An incomplete last line and unfinished entries are not
+    /// breaks. A missing file starts a new chain.
+    fn check_chain(&self) -> Result<()> {
+        let (content, torn) = match self.read_all() {
+            Ok(read) => read,
+            Err(AuditError::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match verify::verify(&split_lines(&content), torn).broken {
+            Some(broken) => Err(self.damaged(broken.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// Writes one record after the current last line, and flushes it to disk.
