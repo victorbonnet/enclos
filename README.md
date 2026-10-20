@@ -8,7 +8,7 @@
 
 Agents such as Hermes install tools, run code and reach the network on their own. enclos gives each runtime a sandbox of its own, so a misled agent cannot read your SSH keys, delete your files or talk to hosts you did not allow:
 
-- **Files:** it writes only to its own home. It reads broadly, except a deny list of sensitive paths: `~/.ssh`, cloud credentials, keychains, browser data, mail, shell history, other agents' configuration, other sandboxes and enclos's own files.
+- **Files:** it writes only to its own home. It reads broadly, except a deny list of sensitive paths: `~/.ssh`, cloud credentials, keychains, browser data, mail, shell history, your own agents' configuration on the host (`~/.hermes`, `~/.claude`, `~/.codex`), other sandboxes and enclos's own files. Agents in the same sandbox share its home and can read each other's files.
 - **Network:** its only way out is its own proxy, which allows listed domains, checks every address they resolve to, and logs every connection. You review what was refused and allow what you trust, without a restart.
 - **The rest of your Mac:** opening apps, Apple Events, launchd jobs, preferences, the pasteboard and signals to other processes are blocked.
 - **A record:** every command that changes something is written to a hash-chained audit log.
