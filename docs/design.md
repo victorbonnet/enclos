@@ -370,7 +370,7 @@ pub trait RuntimeAdapter {
 }
 ```
 
-For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own `default` profile, the root of its home that `hermes` uses without `-p`, is its built-in agent `default`: enclos lists it without a record, refuses to add or remove it, never reports it as untracked, and points at it with `enclos connect <sandbox> -- hermes`. Another runtime names its own built-in agent, or none. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
+For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own `default` profile, the root of its home, is its built-in agent `default`. Without `-p`, `hermes` uses the profile `hermes profile use` last saved, which may be another, so enclos names it with `-p default`, in `talk` and in the login, which every agent shares: enclos lists it without a record, refuses to add or remove it, never reports it as untracked, and points at it with `enclos connect <sandbox> -- hermes -p default`. Another runtime names its own built-in agent, or none. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
 
 **Agents made inside a sandbox** ([ADR 0023](adr/0023-agents-made-inside-a-sandbox.md)). Anything run in the sandbox can create or delete agents with the runtime's own commands, such as `hermes profile create` in an `enclos connect` shell. They work, under the same policy, but enclos has no record of them, so `agent list` and `sandbox show` miss them. `agents_in` lists the agents the runtime has, the way the runtime itself does (for Hermes: a folder under `~/.hermes/profiles/`, other than `default`, with a valid id, one of its identity files, and no marker under `.deleted/`), read on the host. What it reads is written by the sandbox: it never follows a link (each folder is opened by its descriptor, so a link planted before or during the read leads nowhere), reads a bounded number of entries, and answers `Unreadable`, with the path and the reason, rather than guess. A name it returns is a `RuntimeAgentName`: one printable word, wider than an agent name, safe in a message. enclos compares the list with its records in `agent list`, `sandbox show`, after each `connect` session (there without the names it cannot use, which only a rename inside the sandbox changes) and when `agent rm` names an agent it does not track, and reports agents it does not track, names that are not valid agent names, and tracked agents the runtime no longer has, each with the command that fixes it. When the list cannot be read, each of these says so instead, and `agent add` refuses to act. `enclos agent add` adopts an agent the runtime already has: it records it without creating it again, re-checking under the lock. enclos never adopts or removes an agent on its own. After `agent rm --keep-data`, whose files stay, the runtime still has the agent and enclos reports it as one it does not track. `agent rm` without it runs the runtime's own delete only when the runtime's list has the agent, checks the list again afterwards, and refuses when the list cannot be read.
 
@@ -493,13 +493,13 @@ enclos sandbox create home --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox home
 enclos agent add home/main
 enclos agent add home/research
-enclos connect home -- hermes setup             # Hermes's own setup: provider, login (a URL to open on the host), model
+enclos connect home -- hermes -p default setup  # Hermes's own setup: provider, login (a URL to open on the host), model
 
 enclos sandbox create lab --backend seatbelt --template assistant
 enclos runtime install hermes --sandbox lab
 enclos agent add lab/scout
 enclos agent add lab/writer
-enclos connect lab -- hermes setup
+enclos connect lab -- hermes -p default setup
 
 enclos policy test home                         # probes: ~/.ssh and the other sandbox unreadable, writes outside home refused,
 enclos policy test lab                          # `open` and osascript refused, unlisted destinations and private addresses refused

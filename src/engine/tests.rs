@@ -2455,7 +2455,7 @@ mod status {
             commands(&view.suggestions),
             [
                 "enclos agent add home/scout",
-                "enclos connect home -- hermes setup"
+                "enclos connect home -- hermes -p default setup"
             ]
         );
         assert_eq!(view.agent_count(), 1);
@@ -2483,7 +2483,9 @@ mod status {
             .unwrap_err();
         assert!(
             err.to_string().contains("is Hermes's built-in agent")
-                && err.to_string().contains("enclos connect home -- hermes`"),
+                && err
+                    .to_string()
+                    .contains("enclos connect home -- hermes -p default`"),
             "{err}"
         );
         let err = engine
@@ -2695,6 +2697,37 @@ mod status {
     }
 
     #[test]
+    fn a_sandbox_that_cannot_be_read_is_listed_with_why_and_the_total_is_a_lower_bound() {
+        let (_dir, engine, name) = with_runtime();
+        let spec = crate::engine::SandboxSpec {
+            name: "spare".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+        assert!(engine.status(None).unwrap().complete);
+        put_session(
+            &engine,
+            &name,
+            SessionKind::Interactive,
+            None,
+            crate::model::now(),
+            None,
+        );
+        let db = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+        db.execute("UPDATE sessions SET started_at = 'not a time'", [])
+            .unwrap();
+        let view = engine.status(None).unwrap();
+        let listed: Vec<&str> = view.sandboxes.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(listed, ["spare"]);
+        assert_eq!(view.unlisted.len(), 1);
+        assert_eq!(view.unlisted[0].name, name);
+        assert!(!view.unlisted[0].error.is_empty());
+        // Its folder is not in `bytes`, so the total is a lower bound.
+        assert!(!view.complete);
+    }
+
+    #[test]
     fn refused_destinations_count_for_seven_days_exactly() {
         let (_dir, engine, name) = with_runtime();
         let record = engine.state.get(&name).unwrap().unwrap();
@@ -2845,7 +2878,7 @@ mod status {
                 "kind": "log_in",
                 "target": "home",
                 "reason": "Hermes is not logged in",
-                "command": "enclos connect home -- hermes setup"
+                "command": "enclos connect home -- hermes -p default setup"
             })
         );
     }

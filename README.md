@@ -43,11 +43,11 @@ On a Mac with Rust and an account with a model provider Hermes supports:
 cargo install --path .
 enclos init
 enclos sandbox create lab
-enclos runtime install hermes --sandbox lab   # Hermes's own installer, inside the sandbox
-enclos connect lab -- hermes setup            # Hermes's own setup: your provider, its login, a model
+enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
+enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider, its login, a model
 enclos agent add lab/main
-enclos policy test lab                        # escape probes; every one must fail
-enclos sandbox start lab                      # proxy and gateway in the background
+enclos policy test lab                         # escape probes; every one must fail
+enclos sandbox start lab                       # proxy and gateway in the background
 enclos connect lab -- main                    # talk to the agent, with Hermes's own command
 enclos net log lab                            # what it connected to
 ```

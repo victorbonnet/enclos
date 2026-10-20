@@ -114,7 +114,10 @@ impl RuntimeAdapter for Hermes {
         // Hermes's setup wizard: the provider and its login, the model, and
         // optional sections. `hermes model` covers only provider, login and
         // model, which the prototype used (`setup` in the sandbox: to verify).
-        format!("{HERMES} setup")
+        // For the root profile, whose login every agent shares: without `-p`,
+        // Hermes uses the profile `hermes profile use` last saved in
+        // `~/.hermes/active_profile` (`hermes_cli/main.py`, Hermes 0.22.2).
+        format!("{HERMES} -p {DEFAULT_PROFILE} setup")
     }
 
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
@@ -185,12 +188,10 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn talk(&self, agent: &AgentName) -> String {
-        if *agent == DEFAULT_PROFILE.agent_name() {
-            return HERMES.to_owned();
-        }
         // Hermes also writes a wrapper named after the agent on the sandbox
         // PATH (`main` runs `hermes -p main`); enclos's messages use the
-        // form that does not depend on it.
+        // form that does not depend on it. The built-in agent is named too:
+        // bare `hermes` follows the saved active profile, not always it.
         format!("{HERMES} -p {agent}")
     }
 
@@ -472,7 +473,7 @@ mod tests {
     fn commands_name_the_agent_and_the_home_file_stays_inside_the_home() {
         let main: AgentName = "main".parse().unwrap();
         assert_eq!(Hermes.talk(&main), "hermes -p main");
-        assert_eq!(Hermes.login(), "hermes setup");
+        assert_eq!(Hermes.login(), "hermes -p default setup");
         assert_eq!(Hermes.agent_files(&main), "~/.hermes/profiles/main");
         assert_eq!(
             Hermes.delete_agent(&main),
@@ -482,7 +483,7 @@ mod tests {
         );
         let default: AgentName = "default".parse().unwrap();
         assert_eq!(Hermes.builtin_agent(), Some(DEFAULT_PROFILE));
-        assert_eq!(Hermes.talk(&default), "hermes");
+        assert_eq!(Hermes.talk(&default), "hermes -p default");
         let facts = |n: &str| Hermes.agent_facts(&RuntimeAgentName::new(n).unwrap());
         assert_eq!(facts("default").folder, Some(at(".hermes")));
         let main_facts = facts("main");

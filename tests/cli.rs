@@ -1172,7 +1172,7 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
         "What you could do",
         "enclos agent add home/scout",
         "enclos agent rm home/gone",
-        "enclos connect home -- hermes setup",
+        "enclos connect home -- hermes -p default setup",
         "enclos runtime install <runtime> --sandbox spare",
     ] {
         assert!(text.contains(line), "{line:?} in\n{text}");

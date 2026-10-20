@@ -55,8 +55,8 @@ pub struct StatusView {
     pub suggestions: Vec<Suggestion>,
     /// Every sandbox folder together, in bytes.
     pub bytes: u64,
-    /// `false`: some sandbox's walk did not see everything, so `bytes` is a
-    /// lower bound.
+    /// `false`: some sandbox's walk did not see everything, or a sandbox is
+    /// unlisted, so `bytes` is a lower bound.
     pub complete: bool,
     /// Days without use after which a sandbox is suggested for removal.
     pub idle_days: i64,
@@ -452,7 +452,8 @@ impl Engine {
         Ok(StatusView {
             data: self.layout.data().to_owned(),
             bytes: sandboxes.iter().map(|s| s.disk.total).sum(),
-            complete: sandboxes.iter().all(|s| s.disk.incomplete.is_none()),
+            // A sandbox left out is left out of `bytes` too.
+            complete: unlisted.is_empty() && sandboxes.iter().all(|s| s.disk.incomplete.is_none()),
             idle_days: IDLE_DAYS,
             sandboxes,
             unlisted,
@@ -1060,10 +1061,18 @@ fn walk(root: &Path, parts: &[(PathBuf, Slot)], budget: usize) -> Usage {
         by_slot: HashMap::new(),
     };
     let mut linked: HashMap<(i128, i128), Linked> = HashMap::new();
+    // `rel` holds names the sandbox chose: escaped before it is shown.
     let fail = |usage: &mut Usage, rel: &Path, e: Errno| {
         usage
             .incomplete
-            .get_or_insert_with(|| format!("{}: {e}", root.join(rel).display()));
+            .get_or_insert_with(|| match rel.as_os_str().is_empty() {
+                true => format!("{}: {e}", root.display()),
+                false => format!(
+                    "{}/{}: {e}",
+                    root.display(),
+                    printable(&rel.to_string_lossy())
+                ),
+            });
     };
     let root_fd = match rustix::fs::open(
         root,
@@ -1261,6 +1270,15 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         let why = usage.incomplete.unwrap();
         assert!(why.contains("locked"), "{why}");
+        // A name the sandbox chose is escaped before it is shown.
+        let forged = root.path().join("\u{1b}[2J\u{1b}[HFORGED\nline");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let usage = walk(root.path(), &[], 1000);
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let why = usage.incomplete.unwrap();
+        assert!(!why.contains('\u{1b}') && !why.contains('\n'), "{why:?}");
+        assert!(why.contains("\\u{1b}[2J\\u{1b}[HFORGED\\nline"), "{why}");
         // A missing folder is not a failure: it frees nothing.
         let gone = walk(&root.path().join("gone"), &[], 1000);
         assert_eq!((gone.total, gone.incomplete), (0, None));

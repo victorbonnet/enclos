@@ -23,21 +23,21 @@ cargo install --path .
 ## Create a sandbox and install Hermes
 
 ```bash
-enclos init                                  # the ~/.enclos folder, state database and audit log
-enclos sandbox create lab                    # Seatbelt backend, `assistant` template
-enclos runtime install hermes --sandbox lab  # Hermes's own installer, run inside the sandbox; takes a few minutes
-enclos connect lab -- hermes setup           # Hermes's own setup: your provider and its login, then a model
+enclos init                                    # the ~/.enclos folder, state database and audit log
+enclos sandbox create lab                      # Seatbelt backend, `assistant` template
+enclos runtime install hermes --sandbox lab    # Hermes's own installer, run inside the sandbox; takes a few minutes
+enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider and its login, then a model
 ```
 
 `enclos runtime install` downloads Hermes's installer on your Mac and runs it only if it is the version enclos was reviewed against. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
-`enclos connect lab -- hermes setup` runs Hermes's own setup wizard inside the sandbox, in your terminal: pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes model`.
+`enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 
 The sandbox reaches only the hosts its policy allows, and Hermes's adapter allows only the OpenAI hosts its first login used so far (`chatgpt.com`, `auth.openai.com`). For another provider, allow its API host before you log in, for example `enclos policy allow lab api.example.com`; `enclos net denied lab` shows what the login was refused.
 
 ## Add agents
 
-Hermes already has one agent once it is installed: its built-in `default`, which `hermes` uses when you name no agent. `enclos agent add` adds more:
+Hermes already has one agent once it is installed: its built-in `default`, the root of its home, which `hermes` uses when you name no agent, unless `hermes profile use` picked another. `enclos agent add` adds more:
 
 ```bash
 enclos agent add lab/main
@@ -52,11 +52,11 @@ enclos lists `default` but neither adds nor removes it: it exists as long as Her
 You reach the sandbox with `enclos connect lab`: a shell, or the command you put after `--`. To talk to an agent or change it, run Hermes's own commands that way:
 
 ```bash
-enclos connect lab -- hermes              # talk to the built-in agent default
-enclos connect lab -- main                # talk to the agent main (Hermes's wrapper for `hermes -p main`)
-enclos connect lab -- scout model         # change the model of the agent scout
-enclos connect lab -- hermes -p scout     # the same agent, without the wrapper
-enclos connect lab                        # a shell in the sandbox, for anything else
+enclos connect lab -- hermes -p default  # talk to the built-in agent default
+enclos connect lab -- main               # talk to the agent main (Hermes's wrapper for `hermes -p main`)
+enclos connect lab -- scout model        # change the model of the agent scout
+enclos connect lab -- hermes -p scout    # the same agent, without the wrapper
+enclos connect lab                       # a shell in the sandbox, for anything else
 ```
 
 enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
