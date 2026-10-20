@@ -66,7 +66,7 @@ flowchart TB
   engine --> backend["backend/seatbelt/<br/>compile a policy, wrap a command"]
   engine --> runtime["runtime/<br/>adapters: Hermes"]
   engine --> service["service/<br/>launchd jobs"]
-  engine --> lifecycle["lifecycle/<br/>process groups, safe stop"]
+  engine --> lifecycle["lifecycle/<br/>session members, safe stop"]
   engine --> probes["probes/<br/>escape probes for policy test"]
   engine --> proxy["proxy/<br/>the egress proxy"]
   engine --> state["state/<br/>state.db"]
@@ -106,4 +106,4 @@ sequenceDiagram
   CLI->>Data: record the session's end, audited
 ```
 
-`enclos sandbox stop lab` ends every recorded session's process group, services included. It signals a group only while its recorded leader is still the same process (same pid and start time), so it never signals a process that merely reused a pid.
+`enclos sandbox stop lab` ends every member of every recorded session, services included: the program each session started, what it started, and the jobs of an interactive shell. It signals a process, or a group through its leader, only while that process is still the same one (same pid and start time), so it never signals a process that merely reused a pid.
