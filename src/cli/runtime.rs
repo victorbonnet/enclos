@@ -6,6 +6,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
+use enclos::model::plan::Confirm;
 use enclos::model::runtime::RuntimeKind;
 use enclos::model::sandbox::SandboxName;
 
@@ -25,8 +26,16 @@ enum RuntimeVerb {
     },
 }
 
-pub fn run(engine: &Engine, by: &Actor, args: RuntimeArgs) -> Result<u8> {
+pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> Result<u8> {
     let RuntimeVerb::Install { runtime, sandbox } = args.verb;
+    if confirm == Confirm::DryRun {
+        engine.show_sandbox(&sandbox)?;
+        println!(
+            "Would download the {} installer and run it in sandbox {sandbox}, under its policy.",
+            runtime.display_name()
+        );
+        return Ok(exit::OK);
+    }
     let end = engine.install_runtime(by, &sandbox, runtime)?;
     if end.exit == 0 {
         println!(

@@ -832,3 +832,34 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     assert_eq!(status.unwrap().code(), Some(3));
     assert!(audit().contains("ok: exit 3"), "{}", audit());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_runtime_install_dry_run_starts_nothing() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let before = home.audit_lines().len();
+    let out = home.run(&[
+        "runtime",
+        "install",
+        "hermes",
+        "--sandbox",
+        "home",
+        "--dry-run",
+    ]);
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("Would download the Hermes installer"),
+        "{}",
+        out.stdout()
+    );
+    assert_eq!(home.audit_lines().len(), before);
+    assert!(
+        home.run(&["sandbox", "show", "home"])
+            .ok()
+            .stdout()
+            .contains("no sessions running")
+    );
+}
