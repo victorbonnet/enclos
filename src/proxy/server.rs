@@ -1,11 +1,11 @@
 //! Serving connections: one thread per client connection, two while a
-//! tunnel relays bytes. Every connection the proxy decides on gets one
-//! network log record, written at the decision.
+//! tunnel relays bytes, and one for each name lookup. Every connection the
+//! proxy decides on gets one network log record, written at the decision.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -81,7 +81,14 @@ impl Proxy {
             Ok((upstream, request, early)) => {
                 // Logged as it opens, so a long tunnel shows while it lasts.
                 let row = self.record(&event);
-                forward(&client, &upstream, request, &early, &mut event);
+                forward(
+                    &client,
+                    &upstream,
+                    request,
+                    &early,
+                    self.idle_timeout,
+                    &mut event,
+                );
                 event.duration_ms = started.elapsed().as_millis() as u64;
                 if let Some(row) = row
                     && let Err(e) = self.log.finish(row, &event)
@@ -152,32 +159,56 @@ impl Proxy {
         // From here on the policy allows the destination: a failure to reach
         // it is not a refusal.
         event.verdict = Verdict::Allowed;
+        // Resolving and connecting share one deadline.
+        let deadline = Instant::now() + self.connect_timeout;
         let resolved = match dest.ip {
             Some(ip) => vec![ip],
             None => self
-                .resolver
-                .resolve(&dest.host, dest.port)
+                .resolve(&dest.host, dest.port, deadline)
                 .map_err(|_| Reason::ResolveFailed)?,
         };
         let addrs = validated(&policy, &dest, &resolved, self.classify).inspect_err(|_| {
             event.verdict = Verdict::Denied;
         })?;
-        let upstream = self.connect(&addrs, dest.port, event)?;
+        let upstream = self.connect(&addrs, dest.port, deadline, event)?;
         event.reason = None;
         Ok((upstream, request, early))
     }
 
+    /// Resolves the name on a thread of its own and stops waiting at
+    /// `deadline`, since the resolver has no deadline of its own. A lookup
+    /// given up on keeps its place among the lookups until it returns, so
+    /// names that never resolve cannot pile up threads: past
+    /// `max_connections` lookups at once, the next one fails at once.
+    fn resolve(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Vec<IpAddr>> {
+        let lookup = Slot::take(&self.lookups, self.max_connections)
+            .ok_or_else(|| io::Error::other("too many lookups still running"))?;
+        let (tx, rx) = mpsc::channel();
+        let resolver = Arc::clone(&self.resolver);
+        let host = host.to_owned();
+        thread::Builder::new()
+            .name("enclos-proxy-resolve".into())
+            .spawn(move || {
+                let _lookup = lookup;
+                let _ = tx.send(resolver.resolve(&host, port));
+            })?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        rx.recv_timeout(left)
+            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+    }
+
     /// Connects to the first validated address that answers, by address, so
     /// nothing resolves the name again behind the check (ADR 0017). The two
-    /// address families take turns and all tries share `connect_timeout`, so
-    /// dead addresses of one family cannot hold up a working one for long.
+    /// address families take turns and all tries share what is left until
+    /// `deadline`, so dead addresses of one family cannot hold up a working
+    /// one for long.
     fn connect(
         &self,
         addrs: &[IpAddr],
         port: u16,
+        deadline: Instant,
         event: &mut NetEvent,
     ) -> Result<TcpStream, Reason> {
-        let deadline = Instant::now() + self.connect_timeout;
         let order = interleaved(addrs);
         for (i, ip) in order.iter().enumerate() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -196,8 +227,8 @@ impl Proxy {
     }
 }
 
-/// One of the connections the proxy serves at once; the place frees when
-/// the connection ends.
+/// A place among the connections, or the lookups, the proxy runs at once;
+/// it frees when dropped, as the connection or lookup ends.
 struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
@@ -251,14 +282,24 @@ pub(super) fn interleaved(addrs: &[IpAddr]) -> Vec<IpAddr> {
 }
 
 /// Sends upstream what the client asked for, then relays both ways until
-/// the connection ends. Adds the bytes moved to `event`.
+/// the connection ends, or until no byte moved either way for `idle`. Adds
+/// the bytes moved to `event`, and the reason `idle` when it was closed for
+/// that.
 fn forward(
     client: &TcpStream,
     upstream: &TcpStream,
     request: Request,
     early: &[u8],
+    idle: Duration,
     event: &mut NetEvent,
 ) {
+    // A peer that stops reading holds up a write no longer than it may stay
+    // quiet.
+    for stream in [client, upstream] {
+        if stream.set_write_timeout(Some(idle)).is_err() {
+            return;
+        }
+    }
     let mut first = match request {
         Request::Connect { .. } => {
             let mut client = client;
@@ -284,51 +325,125 @@ fn forward(
         return;
     }
     event.bytes_up += first.len() as u64;
-    let (up, down) = relay(client, upstream);
-    event.bytes_up += up;
-    event.bytes_down += down;
+    let relayed = relay(client, upstream, idle);
+    event.bytes_up += relayed.up;
+    event.bytes_down += relayed.down;
+    if relayed.idle {
+        event.reason = Some(Reason::Idle);
+    }
 }
 
-/// Copies bytes both ways; returns (up, down). When the client is done, the
-/// server is told so and may still answer; when the server is done, the
-/// connection ends.
-fn relay(client: &TcpStream, upstream: &TcpStream) -> (u64, u64) {
-    let _ = client.set_read_timeout(None);
+/// What a relay moved, and whether it ended because nothing moved for the
+/// idle limit.
+struct Relayed {
+    up: u64,
+    down: u64,
+    idle: bool,
+}
+
+/// When bytes last moved through a connection, either way, as both copies
+/// of a relay see it.
+struct Activity {
+    start: Instant,
+    /// Milliseconds from `start` to the last move.
+    last: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Activity {
+        Activity {
+            start: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn moved(&self) {
+        let at = self.start.elapsed().as_millis() as u64;
+        self.last.fetch_max(at, Ordering::Relaxed);
+    }
+
+    /// How long nothing has moved.
+    fn quiet(&self) -> Duration {
+        let last = Duration::from_millis(self.last.load(Ordering::Relaxed));
+        self.start.elapsed().saturating_sub(last)
+    }
+}
+
+/// Copies bytes both ways. When the client is done, the server is told so
+/// and may still answer; when the server is done, the connection ends; when
+/// nothing moved either way for `idle`, both sides are closed.
+fn relay(client: &TcpStream, upstream: &TcpStream, idle: Duration) -> Relayed {
+    let activity = Activity::new();
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            let n = copy(client, upstream);
-            let _ = upstream.shutdown(Shutdown::Write);
-            n
+            let (n, quiet) = copy(client, upstream, &activity, idle);
+            let _ = upstream.shutdown(if quiet {
+                Shutdown::Both
+            } else {
+                Shutdown::Write
+            });
+            (n, quiet)
         });
-        let down = match up {
-            Ok(_) => copy(upstream, client),
-            Err(_) => 0,
+        let (down, quiet_down) = match up {
+            Ok(_) => copy(upstream, client, &activity, idle),
+            Err(_) => (0, false),
         };
         // Ends the client side too, which also ends the copy reading it.
         let _ = client.shutdown(Shutdown::Both);
-        let up = up.map_or(0, |up| up.join().unwrap_or(0));
-        (up, down)
+        let (up, quiet_up) = up.map_or((0, false), |up| up.join().unwrap_or((0, false)));
+        Relayed {
+            up,
+            down,
+            idle: quiet_up || quiet_down,
+        }
     })
 }
 
-/// Copies until the reader ends or either side fails, and returns the bytes
-/// it moved, also when an error, such as a reset, ended it.
-fn copy(mut from: &TcpStream, mut to: &TcpStream) -> u64 {
+/// Copies until the reader ends, either side fails, or nothing moved either
+/// way for `idle`. Returns the bytes it moved, also when an error, such as
+/// a reset, ended it, and whether it stopped for being idle.
+fn copy(
+    mut from: &TcpStream,
+    mut to: &TcpStream,
+    activity: &Activity,
+    idle: Duration,
+) -> (u64, bool) {
     let mut buf = [0u8; 16 * 1024];
     let mut moved = 0;
     loop {
+        let quiet = activity.quiet();
+        if quiet >= idle {
+            return (moved, true);
+        }
+        // Wakes when the connection would turn idle, unless the other copy
+        // moved bytes in the meantime.
+        if from.set_read_timeout(Some(idle - quiet)).is_err() {
+            return (moved, false);
+        }
         match from.read(&mut buf) {
-            Ok(0) => return moved,
+            Ok(0) => return (moved, false),
             Ok(n) => {
-                if to.write_all(&buf[..n]).is_err() {
-                    return moved;
+                activity.moved();
+                if let Err(e) = to.write_all(&buf[..n]) {
+                    // A peer that stopped reading for the idle limit.
+                    return (moved, timed_out(&e) && activity.quiet() >= idle);
                 }
+                activity.moved();
                 moved += n as u64;
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return moved,
+            Err(e) if timed_out(&e) => {}
+            Err(_) => return (moved, false),
         }
     }
+}
+
+/// Whether a read or write failed only because its timeout passed.
+fn timed_out(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Result<()> {

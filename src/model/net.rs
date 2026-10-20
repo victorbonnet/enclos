@@ -15,7 +15,8 @@ pub enum Verdict {
     Denied,
 }
 
-/// Why a connection was denied or failed.
+/// Why a connection was denied or failed, or why the proxy closed one it
+/// allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// The destination is not on the allowlist.
@@ -30,6 +31,9 @@ pub enum Reason {
     ConnectFailed,
     /// The client did not send a request the proxy understands.
     BadRequest,
+    /// Allowed, then closed by the proxy: no byte moved either way for the
+    /// idle limit (design §6).
+    Idle,
 }
 
 impl Reason {
@@ -41,16 +45,18 @@ impl Reason {
             Reason::ResolveFailed => "resolve-failed",
             Reason::ConnectFailed => "connect-failed",
             Reason::BadRequest => "bad-request",
+            Reason::Idle => "idle",
         }
     }
 
-    const ALL: [Reason; 6] = [
+    const ALL: [Reason; 7] = [
         Reason::NotAllowed,
         Reason::BlockedAddress,
         Reason::PrivateAddress,
         Reason::ResolveFailed,
         Reason::ConnectFailed,
         Reason::BadRequest,
+        Reason::Idle,
     ];
 }
 

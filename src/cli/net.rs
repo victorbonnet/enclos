@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Since;
-use enclos::model::net::{DeniedDestination, NetEvent, Verdict, destination};
+use enclos::model::net::{DeniedDestination, NetEvent, Reason, Verdict, destination};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
 
@@ -59,6 +59,7 @@ fn print_log(events: &[NetEvent]) {
     for e in events {
         let verdict = match (e.verdict, e.reason) {
             (Verdict::Allowed, None) => "allowed".to_owned(),
+            (Verdict::Allowed, Some(Reason::Idle)) => "closed: idle".to_owned(),
             (Verdict::Allowed, Some(r)) => format!("failed: {r}"),
             (Verdict::Denied, Some(r)) => format!("denied: {r}"),
             (Verdict::Denied, None) => "denied".to_owned(),

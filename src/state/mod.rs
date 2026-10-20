@@ -112,7 +112,8 @@ pub trait StateStore: NetLogStore {
 pub trait NetLogStore {
     /// Records a connection; returns its row, for `finish`.
     fn record(&self, event: &NetEvent) -> Result<i64>;
-    /// Sets a recorded connection's bytes and duration, once it closed.
+    /// Sets a recorded connection's bytes, duration and reason, once it
+    /// closed.
     fn finish(&self, row: i64, event: &NetEvent) -> Result<()>;
     /// The sandbox's connections, oldest first, from `since` on.
     fn events(&self, sandbox: &SandboxName, since: Option<Timestamp>) -> Result<Vec<NetEvent>>;
