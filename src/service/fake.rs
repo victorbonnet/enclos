@@ -13,7 +13,13 @@ pub struct FakeServices {
     pub refuse: RefCell<Option<String>>,
     /// Stops of labels ending with this fail.
     pub refuse_stop: RefCell<Option<String>>,
+    /// Called after each stop that worked, as if something else happened
+    /// meanwhile.
+    pub on_stop: RefCell<Option<Meanwhile>>,
 }
+
+/// What a test has happen meanwhile, given the label just stopped.
+pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
 
 impl FakeServices {
     /// As if a unit were installed, by an earlier enclos or by hand.
@@ -58,6 +64,9 @@ impl ServiceManager for FakeServices {
         }
         self.started.borrow_mut().retain(|u| u.label != *label);
         self.stopped.borrow_mut().push(label.clone());
+        if let Some(meanwhile) = self.on_stop.borrow().as_ref() {
+            meanwhile(label);
+        }
         Ok(())
     }
 

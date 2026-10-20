@@ -312,10 +312,10 @@ impl Engine {
         };
         // The services first, so the service manager does not restart what
         // is stopped; outside the lock, which a service told to end needs to
-        // record its end. A damaged audit log would refuse the audited stop
-        // after the removal, so it is checked before.
+        // record its end, and audited on its own. A damaged audit log would
+        // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
-        let services = self.stop_services(name)?;
+        let services = self.remove_services(by, name, "for sandbox stop")?;
         self.write(
             by,
             "sandbox stop",

@@ -18,7 +18,7 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::process::{group_of, is_same, reference, reference_of_child};
-use crate::model::audit::Actor;
+use crate::model::audit::{Actor, Outcome};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
@@ -155,15 +155,16 @@ impl Engine {
         self.audit.check()?;
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
-        self.stop_services(name)?;
-        self.install_services(by, name)
-            .map_err(|error| match self.stop_services(name) {
+        self.remove_services(by, name, "before sandbox start")?;
+        self.install_services(by, name).map_err(|error| {
+            match self.remove_services(by, name, "after a failed sandbox start") {
                 Ok(_) => error,
                 Err(left) => Error::CleanupFailed {
                     error: Box::new(error),
                     left: left.to_string(),
                 },
-            })
+            }
+        })
     }
 
     fn install_services(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
@@ -238,13 +239,54 @@ impl Engine {
     }
 
     /// Removes every service of the sandbox installed now, the proxy last,
-    /// and returns what it removed; `stop_sandbox` calls this first.
-    pub(super) fn stop_services(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// and returns what it removed; `stop_sandbox` calls this first, and
+    /// `start_sandbox` before it installs and after a failed install, as
+    /// `why` says.
+    ///
+    /// Outside the lock, which a runtime service told to end needs to
+    /// record its end, so two audit entries surround the removal: one
+    /// naming what is about to be removed, closed before the first removal,
+    /// then one saying what was removed and what is left. If the second
+    /// cannot be written, the first still shows the removal began.
+    pub(super) fn remove_services(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        why: &str,
+    ) -> Result<Vec<ServiceLabel>> {
         let labels = self.installed_labels(name)?;
-        for label in &labels {
-            self.services.stop(label)?;
+        if labels.is_empty() {
+            return Ok(labels);
         }
-        Ok(labels)
+        let target = Some(name.to_string());
+        let message = format!("removing {} {why}", joined(&labels));
+        self.note(by, "services remove", target.clone(), Outcome::ok(message))?;
+        let mut removed = 0;
+        let failed = labels
+            .iter()
+            .find_map(|label| match self.services.stop(label) {
+                Ok(()) => {
+                    removed += 1;
+                    None
+                }
+                Err(e) => Some(e),
+            });
+        let (done, left) = labels.split_at(removed);
+        let outcome = match &failed {
+            None => Outcome::ok(format!("removed {}", joined(done))),
+            Some(e) => Outcome::failed(format!(
+                "removed {}; could not remove {}: {e}; still installed: {}",
+                joined(done),
+                left[0],
+                joined(left)
+            )),
+        };
+        let recorded = self.note(by, "services removed", target, outcome);
+        match failed {
+            // The removal's error matters more than the entry's.
+            Some(e) => Err(e.into()),
+            None => recorded.map(|()| labels),
+        }
     }
 
     /// Whether the sandbox has services installed, running or not.
@@ -463,6 +505,18 @@ impl Engine {
         files.sort_by_key(|p| (*p != proxy, p.clone()));
         Ok(files)
     }
+}
+
+/// Labels as an audit message lists them: `a, b`, or `none`.
+fn joined(labels: &[ServiceLabel]) -> String {
+    if labels.is_empty() {
+        return "none".to_owned();
+    }
+    labels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Sets `ended` on TERM, INT and HUP while it lives, instead of ending this

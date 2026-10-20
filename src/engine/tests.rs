@@ -2664,6 +2664,141 @@ mod services {
         assert!(left.contains("would not stop"), "{left}");
     }
 
+    /// The command, result and message of each audit entry after the first
+    /// `from`.
+    fn entries_after(engine: &Engine, from: usize) -> Vec<(String, AuditResult, String)> {
+        engine.audit(None).unwrap()[from..]
+            .iter()
+            .map(|e| {
+                let outcome = &e.finished.as_ref().expect("a closed entry").outcome;
+                (
+                    e.intent.command.clone(),
+                    outcome.result,
+                    outcome.message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_whose_removal_fails_part_way_records_what_was_removed_and_what_is_left() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let [proxy, gateway] =
+            [Unit::Proxy, Unit::Runtime(GATEWAY)].map(|u| engine.label(&name, u).unwrap());
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let from = engine.audit(None).unwrap().len();
+
+        *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
+        let err = engine
+            .stop_sandbox(&alice(), &name, Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("would not stop"), "{err}");
+        assert_eq!(
+            entries_after(&engine, from),
+            [
+                (
+                    "services remove".to_owned(),
+                    AuditResult::Ok,
+                    format!("removing {gateway}, {proxy} for sandbox stop")
+                ),
+                (
+                    "services removed".to_owned(),
+                    AuditResult::Failed,
+                    format!(
+                        "removed {gateway}; could not remove {proxy}: would not stop {proxy}; still installed: {proxy}"
+                    )
+                ),
+            ]
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
+    #[test]
+    fn a_failed_start_records_the_removal_that_undoes_it() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let proxy = engine.label(&name, Unit::Proxy).unwrap();
+        let from = engine.audit(None).unwrap().len();
+
+        // The proxy is installed, then the gateway is refused.
+        *fake.refuse.borrow_mut() = Some(".gateway".to_owned());
+        engine.start_sandbox(&alice(), &name).unwrap_err();
+        let entries = entries_after(&engine, from);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].0, "sandbox start");
+        assert_eq!(entries[0].1, AuditResult::Failed);
+        assert_eq!(
+            entries[1..],
+            [
+                (
+                    "services remove".to_owned(),
+                    AuditResult::Ok,
+                    format!("removing {proxy} after a failed sandbox start")
+                ),
+                (
+                    "services removed".to_owned(),
+                    AuditResult::Ok,
+                    format!("removed {proxy}")
+                ),
+            ]
+        );
+
+        // An undo that fails is recorded too.
+        let from = engine.audit(None).unwrap().len();
+        *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
+        engine.start_sandbox(&alice(), &name).unwrap_err();
+        let last = entries_after(&engine, from).pop().unwrap();
+        assert_eq!(
+            last,
+            (
+                "services removed".to_owned(),
+                AuditResult::Failed,
+                format!(
+                    "removed none; could not remove {proxy}: would not stop {proxy}; still installed: {proxy}"
+                )
+            )
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
+    #[test]
+    fn a_removal_whose_lock_then_times_out_leaves_the_entry_naming_it() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let [proxy, gateway] =
+            [Unit::Proxy, Unit::Runtime(GATEWAY)].map(|u| engine.label(&name, u).unwrap());
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let from = engine.audit(None).unwrap().len();
+
+        // Another command takes the lock while the services are removed,
+        // and keeps it past the wait.
+        let other = SqliteStateStore::new(engine.layout.state_db(), engine.layout.state_lock());
+        let held = Rc::new(std::cell::RefCell::new(None));
+        let holder = Rc::clone(&held);
+        *fake.on_stop.borrow_mut() = Some(Box::new(move |_: &ServiceLabel| {
+            if holder.borrow().is_none() {
+                *holder.borrow_mut() = Some(other.lock().unwrap());
+            }
+        }));
+        let err = engine
+            .stop_sandbox(&alice(), &name, Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::State(crate::state::StateError::Locked { .. })),
+            "{err:?}"
+        );
+        assert!(fake.started.borrow().is_empty());
+        held.borrow_mut().take();
+
+        assert_eq!(
+            entries_after(&engine, from),
+            [(
+                "services remove".to_owned(),
+                AuditResult::Ok,
+                format!("removing {gateway}, {proxy} for sandbox stop")
+            )]
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
     #[test]
     fn a_start_needs_the_service_manager_before_it_stops_anything() {
         let (_dir, engine, name) =
