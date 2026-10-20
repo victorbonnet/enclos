@@ -488,3 +488,94 @@ fn connect_refuses_a_port_another_program_listens_on() {
         out.stderr()
     );
 }
+
+/// Kills the `enclos` this test started when the test ends, passed or not.
+#[cfg(target_os = "macos")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(target_os = "macos")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Polls `check` for up to ten seconds.
+#[cfg(target_os = "macos")]
+fn eventually(mut check: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// The pid `sandbox show` lists under the sandbox's running proxy session.
+#[cfg(target_os = "macos")]
+fn proxy_pid(home: &Home) -> Option<u32> {
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    let mut lines = show.lines().skip_while(|l| !l.contains(" proxy:"));
+    lines.next()?;
+    let line = lines.next()?.trim();
+    line.strip_prefix("pid ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_proxy_that_died_is_replaced_and_stop_works_from_another_time_zone() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    // A long command: its connect, the parent of the proxy it started,
+    // stays, so a proxy that dies stays an unreaped zombie.
+    let mut long = KillOnDrop(
+        home.command(&["connect", "home", "--", "/bin/sleep", "30"])
+            .env("TZ", "UTC0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut first = None;
+    assert!(eventually(|| {
+        first = proxy_pid(&home);
+        first.is_some()
+    }));
+    let first = first.unwrap();
+    // The proxy this test's enclos started, as `sandbox show` names it.
+    Command::new("/bin/kill")
+        .args(["-TERM", &first.to_string()])
+        .status()
+        .unwrap();
+    assert!(eventually(|| proxy_pid(&home).is_none()));
+
+    // The next connect starts a new proxy.
+    home.run(&["connect", "home", "--", "/usr/bin/true"]).ok();
+    let second = proxy_pid(&home);
+    assert!(second.is_some_and(|p| p != first), "{second:?}");
+
+    // Stop, from another time zone, still recognizes what connect recorded.
+    let stop = Run(home
+        .command(&["sandbox", "stop", "home"])
+        .env("TZ", "America/Bogota")
+        .output()
+        .unwrap());
+    assert!(
+        stop.ok().stdout().contains("Stopped sandbox home"),
+        "{}",
+        stop.stdout()
+    );
+    assert!(eventually(|| long.0.try_wait().unwrap().is_some()));
+}

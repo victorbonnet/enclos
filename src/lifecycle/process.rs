@@ -11,16 +11,27 @@ use std::process::{Command, Stdio};
 
 use crate::model::session::{Member, ProcessRef};
 
-/// The start time `ps` reports for `pid`, or `None` when no such process
-/// exists. Compared as text with what was recorded.
+/// `ps`, reading dates in UTC and the C locale, so that a start time is
+/// the same text whoever asks: start times are compared as text.
+fn ps() -> Command {
+    let mut ps = Command::new("/bin/ps");
+    ps.env("TZ", "UTC0")
+        .env("LC_ALL", "C")
+        .stderr(Stdio::null());
+    ps
+}
+
+/// The start time of `pid`, or `None` when no such process runs. A process
+/// that exited but was not yet reaped by its parent (a zombie) runs
+/// nothing and holds nothing, so it does not count as running.
 pub fn start_time(pid: u32) -> Option<String> {
-    let out = Command::new("/bin/ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .stderr(Stdio::null())
+    let out = ps()
+        .args(["-o", "stat=,lstart=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (out.status.success() && !text.is_empty()).then_some(text)
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (stat, started) = text.trim().split_once(char::is_whitespace)?;
+    (out.status.success() && !stat.starts_with('Z')).then(|| started.trim().to_owned())
 }
 
 /// A reference to a process that is running now.
@@ -35,9 +46,8 @@ pub fn is_same(process: &ProcessRef) -> bool {
 
 /// The process group of `pid`.
 pub fn group_of(pid: u32) -> Option<u32> {
-    let out = Command::new("/bin/ps")
+    let out = ps()
         .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .stderr(Stdio::null())
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
@@ -49,10 +59,9 @@ pub fn group_of(pid: u32) -> Option<u32> {
 pub fn group_members(pgid: u32) -> Vec<Member> {
     // In a group of its own, so `ps` never lists itself as a member of the
     // group of the process asking.
-    let Ok(out) = Command::new("/bin/ps")
+    let Ok(out) = ps()
         .args(["-A", "-o", "pid=,pgid=,stat=,lstart=,comm="])
         .process_group(0)
-        .stderr(Stdio::null())
         .output()
     else {
         return Vec::new();
@@ -142,6 +151,36 @@ mod tests {
         assert!(signal_group(&leader, child.id(), Signal::Term));
         assert!(wait_gone(&mut child));
         assert!(!is_same(&leader));
+    }
+
+    #[test]
+    fn a_process_that_exited_is_not_the_same_even_unreaped() {
+        let mut child = own_group();
+        let recorded = reference(child.id()).unwrap();
+        child.kill().unwrap();
+        // Not waited for: the process stays a zombie, with its pid and
+        // start time, until `wait` below.
+        let start = Instant::now();
+        while is_same(&recorded) && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_same(&recorded));
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn start_times_read_in_utc_whatever_the_callers_time_zone() {
+        let mut child = own_group();
+        let started = start_time(child.id()).unwrap();
+        let read = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", &started)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp();
+        let off = (jiff::Timestamp::now() - read).get_seconds().abs();
+        assert!(off < 60, "{started} is {off}s away from now in UTC");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

@@ -208,6 +208,16 @@ impl Engine {
         if self.proxy_runs(&record.name)? {
             return Ok(());
         }
+        // A recorded proxy that exited, or was killed, is replaced: its
+        // session ends here.
+        for dead in self
+            .state
+            .sessions(&record.name, true)?
+            .into_iter()
+            .filter(|s| s.kind == SessionKind::Proxy)
+        {
+            self.state.end_session(lock, dead.id)?;
+        }
         let failed = |what: String| Error::Session { what };
         let exe = self
             .exe
