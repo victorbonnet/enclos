@@ -5,12 +5,14 @@
 mod compile;
 mod net;
 mod policy;
+mod probe;
 mod sandbox;
 mod session;
 #[cfg(test)]
 mod tests;
 
 pub use policy::{PolicyApplied, PolicyView};
+pub use probe::TestReport;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use session::{Left, SessionEnd};
 

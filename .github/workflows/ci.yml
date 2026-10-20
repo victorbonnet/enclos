@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        os: [macos-14, macos-26, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,8 +32,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest, ubuntu-24.04-arm]
+        # macOS 26 too: Seatbelt rules such as hid-control behave differently
+        # there (design §5).
+        os: [macos-14, macos-26, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
+    env:
+      # The escape probes that would act on the host if a rule did not hold
+      # (LaunchServices, Apple Events, launchd, preferences) run only on
+      # these throwaway runners, never on a developer's Mac.
+      ENCLOS_HOST_SERVICE_PROBES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Installs the toolchain and components pinned in rust-toolchain.toml

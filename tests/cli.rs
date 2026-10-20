@@ -432,6 +432,133 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn every_escape_probe_fails_in_a_new_sandbox() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // The host-service probes act on the host if a rule fails: only where
+    // CI asks for them by name, never because some tool set `CI`.
+    let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    let mut args = vec!["policy", "test", "home"];
+    if host_services {
+        args.push("--host-services");
+    }
+    let out = home.run(&args);
+    assert_eq!(
+        out.code(),
+        0,
+        "stdout: {}\nstderr: {}",
+        out.stdout(),
+        out.stderr()
+    );
+    let report = out.stdout();
+    assert!(!report.contains("OPEN"), "{report}");
+    assert!(!report.contains("NOT RUN"), "{report}");
+    let mut routes = vec![
+        "enclos files",
+        "other sandboxes",
+        "writes",
+        "network",
+        "dns",
+        "signals",
+        "pasteboard",
+    ];
+    if host_services {
+        routes.extend(["launchservices", "apple events", "launchd", "preferences"]);
+    }
+    for route in routes {
+        let closed = report
+            .lines()
+            .any(|l| l.trim_start().starts_with("closed ") && l.contains(&format!(" {route} ")));
+        assert!(closed, "no closed {route} probe:\n{report}");
+    }
+    assert!(report.contains("probes were shown closed"), "{report}");
+    let audit = home.run(&["audit"]).ok().stdout();
+    assert!(
+        audit.contains("policy test") && audit.contains(" 0 open,") && audit.contains(" 0 not run"),
+        "{audit}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_route_that_gets_through_fails_the_policy_test() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // Allowing the destination the proxy probe asks for opens that route:
+    // the proxy lets the request through and answers 502, as the name does
+    // not resolve. Nothing leaves this host.
+    home.run(&["policy", "allow", "home", "probe.enclos.invalid", "--yes"])
+        .ok();
+    let out = home.run(&["policy", "test", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    let open = out
+        .stdout()
+        .lines()
+        .any(|l| l.trim_start().starts_with("OPEN") && l.contains(" network "));
+    assert!(open, "{}", out.stdout());
+    assert!(
+        out.stderr().contains("probes got through"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!out.stdout().contains("shown closed"), "{}", out.stdout());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn policy_test_fails_when_the_sandbox_home_is_unusable() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // A home no probe can run in.
+    let sandbox_home = home.root.join("sandboxes/home/home");
+    std::fs::remove_dir_all(&sandbox_home).unwrap();
+    std::fs::write(&sandbox_home, "not a folder").unwrap();
+    let out = home.run(&["policy", "test", "home"]);
+    assert_ne!(out.code(), 0, "{}", out.stdout());
+    assert!(out.stderr().contains("home/tmp"), "{}", out.stderr());
+    assert!(!out.stdout().contains("shown closed"), "{}", out.stdout());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_policy_test_dry_run_starts_and_records_nothing() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let before = home.audit_lines().len();
+    let out = home.run(&["policy", "test", "home", "--host-services", "--dry-run"]);
+    let plan = out.ok().stdout();
+    assert!(
+        plan.contains("Would start the proxy of sandbox home"),
+        "{plan}"
+    );
+    assert!(plan.contains("escape probes in sandbox home"), "{plan}");
+    assert!(plan.contains("host-service routes included"), "{plan}");
+    let plain = home
+        .run(&["policy", "test", "home", "--dry-run"])
+        .ok()
+        .stdout();
+    assert!(plain.contains("escape probes in sandbox home"), "{plain}");
+    assert!(!plain.contains("host-service"), "{plain}");
+    assert!(!plan.contains("closed"), "{plan}");
+    assert_eq!(home.audit_lines().len(), before);
+    assert!(!home.root.join("sandboxes/home/compiled").exists());
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains("no sessions running"), "{show}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn a_session_stays_open_while_its_command_left_processes_running() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
