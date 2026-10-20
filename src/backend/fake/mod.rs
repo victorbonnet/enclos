@@ -69,10 +69,20 @@ impl Backend for FakeBackend {
         })
     }
 
-    /// Runs the program as it is, outside any sandbox.
-    fn wrap(&self, _compiled: &Path, _ctx: &SandboxContext, launch: &Launch) -> Command {
+    /// Runs the program as it is, outside any sandbox, but with the
+    /// sandbox's environment (its home, PATH and TMPDIR), so that a test's
+    /// program never touches the developer's own home.
+    fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
+        command.env_clear();
+        for (name, value) in super::seatbelt::environment(ctx) {
+            command.env(name, value);
+        }
+        for (name, value) in &launch.env {
+            command.env(name, value);
+        }
+        command.current_dir(&ctx.home);
         command
     }
 }

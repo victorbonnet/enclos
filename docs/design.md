@@ -97,7 +97,7 @@ Each sandbox has one proxy unit, `enclos.<sandbox>.proxy`, and one unit per runn
 
 **Security level, honestly stated.** Seatbelt and bubblewrap share the host kernel and user: they are designed to stop a misled agent from reading `~/.ssh` or deleting repos, not deliberately malicious code exploiting a kernel bug. That fits the threat model. Agents that read untrusted outside content with a shell, or run untrusted code, belong in a container or microVM backend. Most real risk is an agent misusing permissions it was given (exfiltration through an allowed destination, deleting its workspace), which only a narrow policy and logging address, on every backend.
 
-**Filesystem defaults** ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are broad, except a sensitive-path deny list. Writes go only to the sandbox home and to workspaces the user grants. The initial deny list on macOS covers `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.config/gh`, shell history files, `~/Library/Keychains`, browser data folders, `~/Library/Mail`, `~/Library/Messages`, `~/Library/Cookies`, password-manager folders, the host's own agent configuration (`~/.claude`, `~/.codex`, `~/.hermes`), other sandboxes and enclos's protected paths. Paths on the deny list cannot be written either, even inside a granted workspace or the sandbox home: the compiler puts these denials after every write and read allow, so no grant covers them. Policies can add entries; removing a default entry is an explicit, audited change. Milestone 1 has no such change, so a policy that leaves out a default entry is refused. The agent installs skills, dependencies and tools into its home: `HOME`, `TMPDIR`, caches, Python and Node environments and a `bin/` on `PATH` all point inside it, and programs installed there may run. The shared runtime under `runtimes/` stays read-only. Writes to device files the runtime needs (`/dev/null`, `/dev/tty` and similar) are part of every backend's baseline.
+**Filesystem defaults** ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are broad, except a sensitive-path deny list. Writes go only to the sandbox home and to workspaces the user grants. The initial deny list on macOS covers `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.config/gh`, shell history files, `~/Library/Keychains`, browser data folders, `~/Library/Mail`, `~/Library/Messages`, `~/Library/Cookies`, password-manager folders, the host's own agent configuration (`~/.claude`, `~/.codex`, `~/.hermes`), other sandboxes and enclos's protected paths. Paths on the deny list cannot be written either, even inside a granted workspace or the sandbox home: the compiler puts these denials after every write and read allow, so no grant covers them. Policies can add entries; removing a default entry is an explicit, audited change. Milestone 1 has no such change, so a policy that leaves out a default entry is refused. The agent installs skills, dependencies and tools into its home: `HOME`, `TMPDIR`, caches, Python and Node environments and a `bin/` on `PATH` all point inside it, and programs installed there may run. The shared runtime under `runtimes/` stays read-only (milestone 1 installs each runtime in its sandbox's home instead, [ADR 0020](adr/0020-runtimes-installed-per-sandbox.md)). Writes to device files the runtime needs (`/dev/null`, `/dev/tty` and similar) are part of every backend's baseline.
 
 **Protected paths.** Whatever the policy says, every backend denies the sandbox write access anywhere in the enclos data and config folders (`~/.enclos` on macOS; `$XDG_DATA_HOME/enclos` and `$XDG_CONFIG_HOME/enclos` on Linux) except its own `home/`, and read access to `state.db`, `audit.jsonl` and its `audit.jsonl.torn-*` files, `config.toml`, the file secret store, the proxies' control sockets and other sandboxes' folders. The compiler adds these rules itself, and `validate` rejects a policy that tries to grant them, including through a broad path such as `~` or a workspace that contains them. `validate` compares paths after resolving symlinks and `..`, so a workspace symlinked into these folders is rejected too. It also rejects a write or deny-list path holding a double quote or a backslash, which the Seatbelt compiler refuses rather than escape, so such a policy never becomes active. This is also why the agent cannot widen its own policy. See [ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md).
 
@@ -358,19 +358,19 @@ pub trait AuditLog {
 pub trait RuntimeAdapter {
     fn kind(&self) -> RuntimeKind;
     fn supports_multiple_agents(&self) -> bool;                                 // Hermes: yes; Claude Code, Codex: no
-    fn requirements(&self) -> PolicyFragment;                                   // versioned; recorded in snapshot inputs
-    fn install(&self, runtimes: &Path, version: &Version) -> Result<Runtime>;   // shared, read-only
-    fn init_home(&self, sb: &SandboxRecord, runtime: &Runtime) -> Result<()>;   // writable environments, bin, caches, skills
-    fn login(&self) -> Command;                                                 // the runtime's own login and setup, shown as `connect <sandbox> -- <this>`
+    fn endpoints(&self) -> &str;  fn version(&self) -> &str;                    // the destinations it needs, as a layer that adds nothing else; versioned, recorded in snapshot inputs
+    fn installer(&self) -> Installer;                                           // downloaded on the host, pinned by SHA-256, run inside the sandbox (milestone 1, ADR 0020)
+    fn home_files(&self) -> Vec<HomeFile>;                                      // files enclos stages beside the home; copied in from inside the sandbox
+    fn login(&self) -> String;                                                  // the runtime's own login and setup, shown as `connect <sandbox> -- <this>`, never run by enclos
 
-    fn add_agent(&self, sb: &SandboxRecord, agent: &AgentSpec) -> Result<()>;          // model, skills, channels
-    fn remove_agent(&self, sb: &SandboxRecord, agent: &AgentName, keep_data: bool) -> Result<()>;
+    fn create_agent(&self, agent: &AgentName) -> SandboxCommand;                // run inside the sandbox; a `SandboxCommand` can be started nowhere else
+    fn agent_files(&self, agent: &AgentName) -> String;                         // where the runtime keeps the agent's files, for messages
     fn configure(&self, sb: &SandboxRecord, agent: &AgentName, cfg: &AgentConfig) -> Result<ConfigDiff>;
     fn service(&self, sb: &SandboxRecord) -> Option<Command>;                   // the background process serving every agent
 }
 ```
 
-For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the same shared Hermes install, and `command` selects the profile. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
+For Hermes, each agent is a Hermes profile of the same name (Hermes's word for it): all live under the sandbox's Hermes home and run the sandbox's own Hermes install (ADR 0020), and `command` selects the profile. Hermes's own installs of skills, packages and tools are configured to land in the sandbox home, never in the shared runtime.
 
 **Engine** — the API every client calls. Reads are not audited. Every write takes the lock, opens an audit entry, does the work, saves state and closes the entry, also on failure. `Confirm::DryRun` returns the plan without changing anything.
 
@@ -452,7 +452,7 @@ enclos logs <name> [-f]
 enclos agent add <name>/<agent> [--model ...] [--no-autostart]
 enclos agent list <name>
 enclos agent start | stop | restart <name>/<agent>
-enclos agent rm <name>/<agent> [--keep-data]
+enclos agent rm <name>/<agent>               the record only: the files stay in the sandbox home (milestone 1)
 
 enclos policy show <name> [--compiled] [--pending]
 enclos policy edit <name>
@@ -530,13 +530,14 @@ enclos policy allow community mcp.example.org
   state.db                     SQLite: sandbox records, policy snapshots, sessions and members, network log, denials
   state.lock                   held while a command changes state
   audit.jsonl                  append-only and hash-chained: one line when a state-changing command starts, one when it ends
-  runtimes/<runtime>/<version>/  shared, read-only to every sandbox
+  runtimes/<runtime>/<version>/  shared, read-only to every sandbox (planned; milestone 1 installs each runtime in its sandbox's home instead, ADR 0020)
   templates/                   user templates
   run/<sandbox>/               proxy control sockets
   sandboxes/<name>/
-    sandbox.toml               backend, runtime, agents (autostart), created_at
+    (the record in state.db)   backend, template, runtime, agents, created_at (ADR 0010; no sandbox.toml)
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
     compiled/<snapshot>-<enclos version>/   what the backend received (.sb, bwrap argv)
+    installers/                the runtime's installer and files for the home, checked on the host; the sandbox reads, never writes them
     home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/
     logs/                      its services' output
 ```
@@ -559,7 +560,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - the `assistant` template, policy resolution into immutable snapshots (§7), `policy show` and `policy allow`;
    - the Seatbelt backend: write rules, the sensitive deny list, protected paths, host-service blocks and proxy-only network, on the `(allow default)` baseline;
    - the per-sandbox proxy, the allowlist, immediate deny, address validation, `net log` and `net denied`;
-   - the Hermes adapter: the shared runtime, writable install space in the home, agents, and the device-code subscription login;
+   - the Hermes adapter: an install per sandbox in its home (ADR 0020), agents, and the device-code subscription login;
    - `sandbox create`, `list`, `show`, `rm`; `agent add`, `list`, `rm`; `connect`;
    - launchd agents for each sandbox's proxy and each agent while the user is logged in, autostart, `sandbox` and `agent` `start`, `stop`, `restart`, and `logs`;
    - sessions and member tracking, with stop over every member;
@@ -581,7 +582,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
 1. The steps in §10's first working flow run without manual edits to files: two sandboxes, each with two Hermes agents, every agent logged in through Hermes's device-code flow.
 2. `enclos sandbox start` on both sandboxes leaves each proxy and each agent running under launchd, and they keep running after the terminal that started them closes. `enclos sandbox show` lists every agent, session and member, and the snapshot each session started under.
 3. Through `enclos connect <sandbox> -- <hermes command>`, each agent is asked for the current weather in several locations and answers with conditions for each. Hermes picks its own tools, browser or skills; the scenario neither names a weather provider nor uses MCP, and no template or adapter allows a weather service in advance.
-4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and the shared runtime, enclos's files and the other sandbox are unchanged.
+4. Anything Hermes installs on the way (skills, packages, tools, a browser) lands in that sandbox's home, and enclos's files and the other sandbox are unchanged.
 5. Every connection appears in `enclos net log` for the sandbox that made it. If Hermes is refused a destination, it shows in `enclos net denied`; the user may allow it from the host with `enclos policy allow` and ask again, without a restart. Hermes cannot allow anything itself. If Hermes gets the weather through a remote service, such as the model provider's own web search, the log shows only that service, and that is reported as a granted capability, not as isolation.
 6. `enclos policy test` on each sandbox runs at least these probes, all of which must fail to do what they try: every host-service route in §5 (including DNS), reads of each default sensitive path and protected path, reads and writes of the other sandbox's folder, a write outside the home, a connection to an unlisted destination, and connections to loopback, link-local and private addresses through an allowed name. The report lists every probe run.
 7. `enclos sandbox stop` ends every member, including services, interactive sessions and any browser or installer Hermes started, and `enclos sandbox show` reports none left.

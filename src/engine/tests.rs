@@ -467,8 +467,12 @@ mod sandbox {
             .show_sandbox(&"home".parse().unwrap())
             .unwrap()
             .record;
-        // A port another program listens on is skipped, so only the order is fixed.
-        assert!(home.proxy_port >= 41000 && lab.proxy_port > home.proxy_port);
+        // A port another program listens on is skipped (other tests run
+        // proxies in the same range), so which port each gets is not fixed:
+        // only that each has its own, in the range.
+        let range = crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST;
+        assert!(range.contains(&home.proxy_port) && range.contains(&lab.proxy_port));
+        assert_ne!(home.proxy_port, lab.proxy_port);
         let err = engine
             .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
             .unwrap_err();
@@ -526,6 +530,7 @@ mod sandbox {
             template: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
+            runtime: None,
             created_at: crate::model::now(),
         };
         let err = while_waiting(
@@ -757,5 +762,456 @@ mod sandbox {
             engine.show_sandbox(&name).unwrap().record.state,
             crate::model::sandbox::SandboxState::Stopped
         );
+    }
+}
+
+mod runtime {
+    use super::policy::with_sandbox_on;
+    use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::model::agent::AgentName;
+    use crate::model::runtime::RuntimeKind;
+    #[cfg(target_os = "macos")]
+    use crate::runtime::{HomeFile, Installer, RuntimeAdapter, SandboxCommand, hermes::Hermes};
+    #[cfg(target_os = "macos")]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "macos")]
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn an_installed_runtime_adds_its_endpoints_as_a_new_policy_version() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    let overrides = engine.layout.read_policy("home")?;
+                    engine.save_policy(lock, &alice(), &name, &overrides)
+                },
+            )
+            .unwrap();
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 2);
+        assert!(
+            view.snapshot
+                .policy
+                .net
+                .allow
+                .contains(&"chatgpt.com".to_owned())
+        );
+        assert_eq!(
+            view.snapshot.inputs.adapter.as_ref().unwrap().runtime,
+            "hermes"
+        );
+        // The adapter adds destinations and nothing else.
+        let first = engine.state.policy_history(&name).unwrap()[0].clone();
+        assert_eq!(first.version, 1);
+        assert_eq!(view.snapshot.policy.fs.write, ["{home}"]);
+        assert!(
+            view.snapshot
+                .policy
+                .fs
+                .read_deny
+                .iter()
+                .any(|p| p == "~/.ssh")
+        );
+    }
+
+    #[test]
+    fn saving_the_active_policy_again_adds_no_version() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        for _ in 0..2 {
+            engine
+                .write(
+                    &alice(),
+                    "test",
+                    None,
+                    |_| String::new(),
+                    |lock| {
+                        let overrides = engine.layout.read_policy("home")?;
+                        engine.save_policy(lock, &alice(), &name, &overrides)
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+        assert_eq!(engine.state.policy_history(&name).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agents_need_a_runtime_first() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let err = engine.agents(&name).unwrap_err();
+        assert!(err.to_string().contains("no runtime yet"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("enclos runtime install hermes --sandbox home"),
+            "{err}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    /// Hermes's adapter with an installer of the test's own, read from a
+    /// file; `sha256` is its real hash unless the test says otherwise.
+    struct TestRuntime {
+        installer: PathBuf,
+        sha256: String,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TestRuntime {
+        fn new(dir: &Path, script: &str) -> TestRuntime {
+            let installer = dir.join("install.sh");
+            std::fs::write(&installer, script).unwrap();
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(script.as_bytes());
+            let sha256 = digest.iter().map(|b| format!("{b:02x}")).collect();
+            TestRuntime { installer, sha256 }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl RuntimeAdapter for TestRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Hermes
+        }
+        fn version(&self) -> &'static str {
+            Hermes.version()
+        }
+        fn endpoints(&self) -> &'static str {
+            Hermes.endpoints()
+        }
+        fn installer(&self) -> Installer {
+            Installer {
+                url: format!("file://{}", self.installer.display()),
+                sha256: self.sha256.clone(),
+                args: vec!["--non-interactive".into()],
+            }
+        }
+        fn home_files(&self) -> Vec<HomeFile> {
+            Hermes.home_files()
+        }
+        fn login(&self) -> String {
+            Hermes.login()
+        }
+        fn create_agent(&self, name: &AgentName) -> SandboxCommand {
+            Hermes.create_agent(name)
+        }
+        fn agent_files(&self, name: &AgentName) -> String {
+            Hermes.agent_files(name)
+        }
+        fn talk(&self, agent: &AgentName) -> String {
+            Hermes.talk(agent)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    /// An installer that puts a `hermes` stub on the sandbox's PATH, which
+    /// records its calls in the home and fails while `hermes-fails` exists.
+    const INSTALLS: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
+[ -f \"$HOME/hermes-fails\" ] && exit 3
+exit 0
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+echo \"installed $*\" > \"$HOME/installed\"
+";
+
+    #[cfg(target_os = "macos")]
+    /// Engine tests start real proxies on this host's ports: one at a time.
+    static HOST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "macos")]
+    /// A sandbox whose proxy is a listener this test stands in (`nc`), so
+    /// that sessions can run through the fake backend; stopped when dropped,
+    /// so the listener never outlives the test.
+    struct Lab {
+        _dir: TempDir,
+        engine: Engine,
+        name: SandboxName,
+        home: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Lab {
+        fn new() -> Lab {
+            let (dir, engine, name) =
+                with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+            let proxy = dir.path().join("proxy.sh");
+            std::fs::write(
+                &proxy,
+                "#!/bin/sh\nexec /usr/bin/nc -lk 127.0.0.1 \"${5#*:}\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let home = engine.layout.sandbox_home("home");
+            Lab {
+                _dir: dir,
+                engine: engine.with_exe(proxy),
+                name,
+                home,
+            }
+        }
+
+        fn install(&self, script: &str, confirm: Confirm) -> Result<Planned<InstallEnd>> {
+            let runtime = TestRuntime::new(self._dir.path(), script);
+            self.engine
+                .install_runtime_with(&alice(), &self.name, &runtime, confirm)
+        }
+
+        fn runtime(&self) -> Option<RuntimeKind> {
+            self.engine.state.get(&self.name).unwrap().unwrap().runtime
+        }
+
+        fn allows(&self, host: &str) -> bool {
+            self.engine
+                .policy(&self.name)
+                .unwrap()
+                .snapshot
+                .policy
+                .net
+                .allow
+                .contains(&host.to_owned())
+        }
+
+        fn audit(&self) -> String {
+            self.engine
+                .audit(None)
+                .unwrap()
+                .iter()
+                .map(|e| format!("{} {:?}", e.intent.command, e.finished))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Lab {
+        fn drop(&mut self) {
+            let _ = self.engine.stop_sandbox(&alice(), &self.name, Confirm::Yes);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let entries = lab.engine.audit(None).unwrap().len();
+        let Planned::DryRun(plan) = lab.install(INSTALLS, Confirm::DryRun).unwrap() else {
+            panic!("a dry run installed");
+        };
+        let plan = plan.changes.join("\n");
+        assert!(
+            plan.contains("allow the 13 destinations hermes needs"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("download the hermes installer from file://"),
+            "{plan}"
+        );
+        assert!(plan.contains("start the proxy"), "{plan}");
+        assert_eq!(lab.engine.audit(None).unwrap().len(), entries);
+        assert_eq!(lab.runtime(), None);
+        assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
+        assert!(!lab.home.join("bin/mktemp").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_changed_installer_is_refused_before_anything_changes() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+        runtime.sha256 = "0".repeat(64);
+        let err = lab
+            .engine
+            .install_runtime_with(&alice(), &lab.name, &runtime, Confirm::Yes)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("changed") && text.contains(&"0".repeat(64)),
+            "{text}"
+        );
+        assert_eq!(lab.runtime(), None);
+        assert!(!lab.allows("chatgpt.com"));
+        assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
+        let installers = lab.engine.layout.sandbox_dir("home").join("installers");
+        assert!(!installers.join("hermes-install.sh").exists());
+        assert!(
+            std::fs::read_dir(&installers)
+                .unwrap()
+                .all(|e| { !e.unwrap().file_name().to_string_lossy().ends_with(".part") })
+        );
+        assert!(!lab.audit().contains("runtime install"), "{}", lab.audit());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_installer_that_fails_leaves_the_sandbox_as_before() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let end = done(lab.install("#!/bin/sh\nexit 3\n", Confirm::Yes).unwrap());
+        assert!(!end.installed);
+        assert_eq!(end.end.exit, 3);
+        assert_eq!(lab.runtime(), None);
+        assert!(!lab.allows("chatgpt.com"));
+        // The destinations came and went: two versions, back to the first's content.
+        let history = lab.engine.state.policy_history(&lab.name).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(end.policy, 3);
+        let audit = lab.audit();
+        assert!(audit.contains("runtime install failed"), "{audit}");
+        assert!(!audit.contains("runtime installed"), "{audit}");
+        // The home file was put in place from inside the sandbox before.
+        assert!(lab.home.join("bin/mktemp").is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_install_records_the_runtime_once_its_installer_exits_0_and_agents_follow() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let end = done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+        assert!(end.installed);
+        assert_eq!(end.policy, 2);
+        assert_eq!(lab.runtime(), Some(RuntimeKind::Hermes));
+        assert!(lab.allows("chatgpt.com") && lab.allows("github.com"));
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("installed")).unwrap(),
+            "installed --non-interactive\n"
+        );
+        let mode = std::fs::metadata(lab.home.join("bin/mktemp"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(lab.audit().contains("runtime installed"), "{}", lab.audit());
+
+        // A second install of the same runtime is allowed, another refused.
+        let main: AgentName = "main".parse().unwrap();
+        let Planned::DryRun(plan) = lab
+            .engine
+            .add_agent(&alice(), &lab.name, main.clone(), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run added");
+        };
+        assert_eq!(
+            plan.changes,
+            [
+                "run `hermes profile create main` in sandbox home under policy v2",
+                "record agent home/main"
+            ]
+        );
+        assert!(!lab.home.join("hermes-calls").exists());
+
+        let added = done(
+            lab.engine
+                .add_agent(&alice(), &lab.name, main.clone(), Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(added.agent.name, main);
+        assert_eq!(added.end.exit, 0);
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
+            "profile create main\n"
+        );
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        // Twice is refused before the runtime runs again.
+        let err = lab
+            .engine
+            .add_agent(&alice(), &lab.name, main.clone(), Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("already has agent main"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
+            "profile create main\n"
+        );
+        // A name that is a command on the sandbox's PATH is refused.
+        let err = lab
+            .engine
+            .add_agent(&alice(), &lab.name, "curl".parse().unwrap(), Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("command on the sandbox's PATH"),
+            "{err}"
+        );
+        let err = lab
+            .engine
+            .add_agent(&alice(), &lab.name, "hermes".parse().unwrap(), Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains(".local/bin/hermes"), "{err}");
+
+        // The runtime failing leaves no record, and says how to recover.
+        std::fs::write(lab.home.join("hermes-fails"), "").unwrap();
+        let err = lab
+            .engine
+            .add_agent(&alice(), &lab.name, "other".parse().unwrap(), Confirm::Yes)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exit 3") && text.contains("~/.hermes/profiles/other"),
+            "{text}"
+        );
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+
+        // Removing keeps the files and says where they are.
+        let Planned::DryRun(plan) = lab
+            .engine
+            .remove_agent(&alice(), &lab.name, &main, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run removed");
+        };
+        assert!(plan.changes[0].contains("its files stay"), "{plan:?}");
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        let removed = done(
+            lab.engine
+                .remove_agent(&alice(), &lab.name, &main, Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(removed.files, "~/.hermes/profiles/main");
+        assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+        let err = lab
+            .engine
+            .remove_agent(&alice(), &lab.name, &main, Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("has no agent `main`"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_install_with_unapplied_policy_edits_asks_first() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let file = lab.engine.layout.policy_file("home");
+        let edited = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("allow_add = []", "allow_add = [\"example.com\"]");
+        std::fs::write(&file, edited).unwrap();
+        let err = lab.install(INSTALLS, Confirm::Ask).unwrap_err();
+        assert!(matches!(err, Error::NeedsConfirmation { .. }), "{err}");
+        assert!(err.to_string().contains("allow example.com"), "{err}");
+        assert_eq!(lab.runtime(), None);
+        let Planned::DryRun(plan) = lab.install(INSTALLS, Confirm::DryRun).unwrap() else {
+            panic!("a dry run installed");
+        };
+        assert!(
+            plan.changes.iter().any(|c| c == "also allow example.com"),
+            "{plan:?}"
+        );
+        // Said yes: both apply.
+        let end = done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+        assert!(end.installed);
+        assert!(lab.allows("example.com") && lab.allows("chatgpt.com"));
     }
 }

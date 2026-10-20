@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use super::Timestamp;
 use super::policy::TemplateName;
+use super::runtime::RuntimeKind;
 
 /// A sandbox name: a lowercase letter, then 1 to 40 lowercase letters, digits
 /// or hyphens.
@@ -24,17 +25,23 @@ impl SandboxName {
     }
 }
 
+/// The naming rule sandboxes and agents share: a lowercase letter, then 1
+/// to 40 lowercase letters, digits or hyphens. Safe in a path, as one shell
+/// word, and never read as a flag.
+pub fn is_short_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    first_ok && rest_ok && (2..=41).contains(&s.len())
+}
+
 impl FromStr for SandboxName {
     type Err = InvalidName;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut chars = s.chars();
-        let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
-        let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if first_ok && rest_ok && (2..=41).contains(&s.len()) {
-            Ok(SandboxName(s.to_owned()))
-        } else {
-            Err(InvalidName(s.to_owned()))
+        match is_short_name(s) {
+            true => Ok(SandboxName(s.to_owned())),
+            false => Err(InvalidName(s.to_owned())),
         }
     }
 }
@@ -113,6 +120,8 @@ pub struct SandboxRecord {
     /// The sandbox's proxy port on localhost (design §4), reserved when it
     /// is created.
     pub proxy_port: u16,
+    /// The runtime installed in it, if any (at most one, ADR 0003).
+    pub runtime: Option<RuntimeKind>,
     pub created_at: Timestamp,
 }
 

@@ -17,6 +17,7 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 
 pub use compile::tag;
+pub use wrap::environment;
 
 pub struct Seatbelt;
 

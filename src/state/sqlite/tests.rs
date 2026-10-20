@@ -17,6 +17,7 @@ fn record(name: &str) -> SandboxRecord {
         backend: BackendKind::Seatbelt,
         template: "assistant".parse().unwrap(),
         proxy_port: 41000,
+        runtime: None,
         state: SandboxState::Created,
         created_at: "2026-01-02T03:04:05.678Z".parse().unwrap(),
     }
@@ -327,4 +328,71 @@ fn reports_corrupt_session_members() {
         store.sessions(&name, true),
         Err(StateError::Corrupt { .. })
     ));
+}
+
+#[test]
+fn agents_are_recorded_once_each_and_go_with_their_sandbox() {
+    use crate::model::agent::AgentRecord;
+    use crate::model::runtime::RuntimeKind;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let mut sandbox = record("home");
+    sandbox.runtime = Some(RuntimeKind::Hermes);
+    store.put(&lock, &sandbox).unwrap();
+    assert_eq!(
+        store.get(&name).unwrap().unwrap().runtime,
+        Some(RuntimeKind::Hermes)
+    );
+    let agent = |n: &str| AgentRecord {
+        name: n.parse().unwrap(),
+        created_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+    };
+    store.insert_agent(&lock, &name, &agent("zed")).unwrap();
+    store.insert_agent(&lock, &name, &agent("main")).unwrap();
+    let names: Vec<String> = store
+        .agents(&name)
+        .unwrap()
+        .iter()
+        .map(|a| a.name.to_string())
+        .collect();
+    assert_eq!(names, ["main", "zed"]);
+    // A second record of the same agent is an error, not a duplicate.
+    assert!(store.insert_agent(&lock, &name, &agent("main")).is_err());
+    assert_eq!(store.agents(&name).unwrap().len(), 2);
+    store
+        .remove_agent(&lock, &name, &"zed".parse().unwrap())
+        .unwrap();
+    assert_eq!(store.agents(&name).unwrap().len(), 1);
+    // Removing the sandbox removes its agents.
+    store.remove(&lock, &name).unwrap();
+    assert!(store.agents(&name).unwrap().is_empty());
+    store.put(&lock, &record("home")).unwrap();
+    assert!(store.agents(&name).unwrap().is_empty());
+}
+
+#[test]
+fn reports_a_corrupt_agent_or_runtime() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    conn.execute(
+        "INSERT INTO agents (sandbox, name, created_at) VALUES ('home', 'Bad Name', 'x')",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        store.agents(&name),
+        Err(StateError::Corrupt { .. })
+    ));
+    conn.execute(
+        "UPDATE sandboxes SET runtime = 'claude' WHERE name = 'home'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(store.get(&name), Err(StateError::Corrupt { .. })));
 }

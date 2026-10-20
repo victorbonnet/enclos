@@ -10,6 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{Policy, PolicySnapshot, PolicyVersion, TemplateName};
+use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
@@ -159,7 +160,7 @@ impl Engine {
         let current = self.layout.read_policy(name.as_str())?;
         let overrides = with_allowed(&current, entry)?.unwrap_or(current);
         let snapshot = self.checked_policy(name, &overrides)?;
-        let also = differences(&active.snapshot.policy, &snapshot.policy, entry);
+        let also = differences(&active.snapshot.policy, &snapshot.policy, &[entry]);
         Ok(AllowPlan {
             active,
             change: Some((overrides, snapshot)),
@@ -184,7 +185,7 @@ impl Engine {
 
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
     /// records the snapshot as the active version.
-    fn save_policy(
+    pub(super) fn save_policy(
         &self,
         lock: &StateLock,
         by: &Actor,
@@ -195,9 +196,37 @@ impl Engine {
         self.store_policy(lock, by, name, overrides, &snapshot)
     }
 
+    /// As `save_policy`, with `runtime`'s endpoints instead of the installed
+    /// runtime's: while a runtime installs, before it is recorded, and when
+    /// its install failed, to take them out again.
+    pub(super) fn save_policy_for_runtime(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        overrides: &str,
+        runtime: Option<RuntimeKind>,
+    ) -> Result<PolicyVersion> {
+        let snapshot = self.checked_policy_with(name, overrides, runtime.map(adapter_layer))?;
+        self.store_policy(lock, by, name, overrides, &snapshot)
+    }
+
     /// `overrides` resolved and validated for this sandbox.
-    fn checked_policy(&self, name: &SandboxName, overrides: &str) -> Result<PolicySnapshot> {
-        let snapshot = policy::resolve(overrides, self.adapter_layer(name).as_ref())?;
+    pub(super) fn checked_policy(
+        &self,
+        name: &SandboxName,
+        overrides: &str,
+    ) -> Result<PolicySnapshot> {
+        self.checked_policy_with(name, overrides, self.adapter_layer(name)?)
+    }
+
+    pub(super) fn checked_policy_with(
+        &self,
+        name: &SandboxName,
+        overrides: &str,
+        adapter: Option<AdapterLayer>,
+    ) -> Result<PolicySnapshot> {
+        let snapshot = policy::resolve(overrides, adapter.as_ref())?;
         validate(&snapshot.policy, &self.validation_context(name))?;
         Ok(snapshot)
     }
@@ -215,6 +244,12 @@ impl Engine {
     ) -> Result<PolicyVersion> {
         let previous = self.layout.read_policy(name.as_str()).ok();
         self.layout.write_policy(name.as_str(), overrides)?;
+        // The same policy as the active one is not a new version.
+        if let Some((active, current)) = self.state.active_policy(name)?
+            && current.id == snapshot.id
+        {
+            return Ok(active);
+        }
         match self.state.save_policy(lock, name, snapshot, by, None) {
             Ok(version) => Ok(version),
             Err(e) => {
@@ -236,9 +271,24 @@ impl Engine {
         }
     }
 
-    /// The installed runtime's endpoints. Agents arrive with the adapter issue.
-    fn adapter_layer(&self, _name: &SandboxName) -> Option<AdapterLayer> {
-        None
+    /// The installed runtime's endpoints, as a policy layer (design §7). A
+    /// state that cannot be read is an error: resolving without the layer
+    /// would record a policy that lacks them.
+    fn adapter_layer(&self, name: &SandboxName) -> Result<Option<AdapterLayer>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(record.runtime.map(adapter_layer))
+    }
+}
+
+/// `kind`'s endpoints as a policy layer.
+pub(super) fn adapter_layer(kind: RuntimeKind) -> AdapterLayer {
+    let runtime = crate::runtime::adapter(kind);
+    AdapterLayer {
+        runtime: kind.to_string(),
+        version: runtime.version().to_owned(),
+        text: runtime.endpoints().to_owned(),
     }
 }
 
@@ -252,13 +302,13 @@ fn needs_confirmation(entry: &str, also: &[String]) -> Error {
     }
 }
 
-/// What `new` grants differently from `old`, besides allowing `entry`.
-fn differences(old: &Policy, new: &Policy, entry: &str) -> Vec<String> {
+/// What `new` grants differently from `old`, besides allowing `expected`.
+pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
     let mut compare = |old: &[String], new: &[String], added: &str, removed: &str| {
         for e in new
             .iter()
-            .filter(|e| !old.contains(e) && e.as_str() != entry)
+            .filter(|e| !old.contains(e) && !expected.contains(&e.as_str()))
         {
             found.push(added.replace("{}", e));
         }
@@ -379,13 +429,13 @@ mod tests {
         new.fs.write = vec!["~/work".into()];
         new.fs.read_deny.pop();
         assert_eq!(
-            differences(&old, &new, "a.example.com"),
+            differences(&old, &new, &["a.example.com"]),
             [
                 "let it write ~/work (sessions started from now on)",
                 "let it read ~/dev/work (sessions started from now on)",
                 "allow b.example.com",
             ]
         );
-        assert!(differences(&old, &old, "a.example.com").is_empty());
+        assert!(differences(&old, &old, &["a.example.com"]).is_empty());
     }
 }

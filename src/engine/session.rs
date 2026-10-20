@@ -24,6 +24,7 @@ use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::runtime::SandboxCommand;
 use crate::state::{StateError, StateLock};
 
 /// How a session ended.
@@ -83,9 +84,29 @@ impl Engine {
         command: Vec<OsString>,
         confirm: Confirm,
     ) -> Result<Planned<SessionEnd>> {
+        let command = if command.is_empty() {
+            vec![OsString::from("/bin/zsh"), OsString::from("-l")]
+        } else {
+            command
+        };
         if confirm == Confirm::DryRun {
             return self.plan_connect(name, &command).map(Planned::DryRun);
         }
+        self.run_in_sandbox(by, name, SandboxCommand::new(command), "connect")
+            .map(Planned::Done)
+    }
+
+    /// Runs `command` in the sandbox, in this terminal, as a recorded
+    /// session (design §8 steps 1-6), and returns when it exits.
+    pub(super) fn run_in_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+    ) -> Result<SessionEnd> {
+        let command = command.into_words();
+        let target = name.to_string();
         let summary = |(session, ..): &(SessionRecord, _, _)| format!("session {}", session.id);
         // Which process group the program starts in (design §8). When this
         // command leads its group, as a terminal's job does, that group:
@@ -99,7 +120,7 @@ impl Engine {
         let leads_group = group_of(me)? == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
         let (session, mut child, _keep_waiting) =
-            self.write(by, "connect", Some(name.to_string()), summary, |lock| {
+            self.write(by, audit_name, Some(target.clone()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
@@ -111,14 +132,12 @@ impl Engine {
                         .ok_or_else(|| Error::NoPolicy {
                             sandbox: name.to_string(),
                         })?;
-
-                let (program, args) = match command.split_first() {
-                    Some((program, args)) => (program.clone(), args.to_vec()),
-                    None => (OsString::from("/bin/zsh"), vec![OsString::from("-l")]),
-                };
+                let (program, args) = command.split_first().ok_or_else(|| Error::Session {
+                    what: "no command to run".into(),
+                })?;
                 let launch = Launch {
-                    program,
-                    args,
+                    program: program.clone(),
+                    args: args.to_vec(),
                     env: Vec::new(),
                 };
                 let ctx = self.sandbox_context(name, record.proxy_port);
@@ -133,7 +152,7 @@ impl Engine {
                 }
                 let child = wrapped.spawn().map_err(|e| Error::Session {
                     what: format!(
-                        "could not start {} in sandbox {name}: {e}",
+                        "could not start {} in {target}: {e}",
                         launch.program.to_string_lossy()
                     ),
                 })?;
@@ -186,7 +205,7 @@ impl Engine {
             match self.write(
                 by,
                 "session end",
-                Some(format!("{name} session {}", session.id)),
+                Some(format!("{target} session {}", session.id)),
                 summary,
                 |lock| self.end_or_track(lock, &session, &waited),
             ) {
@@ -199,13 +218,13 @@ impl Engine {
             Ok(left) => Left::Running(left.into_iter().map(|f| f.member).collect()),
             Err(e) => Left::Unknown(e.to_string()),
         };
-        Ok(Planned::Done(SessionEnd {
+        Ok(SessionEnd {
             session: session.id,
             exit,
             signal,
             left,
             notes: waited.notes,
-        }))
+        })
     }
 
     /// Waits for the session's program to exit, recording the members it
@@ -303,14 +322,11 @@ impl Engine {
                 record.proxy_port
             ));
         }
-        let shown = match command {
-            [] => "/bin/zsh -l".to_owned(),
-            words => words
-                .iter()
-                .map(|w| w.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
+        let shown = command
+            .iter()
+            .map(|w| w.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         changes.push(format!(
             "run `{shown}` in sandbox {name} under policy v{}",
             version.version
