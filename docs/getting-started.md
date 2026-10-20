@@ -14,29 +14,19 @@ The words used here:
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
-## Install the latest release
-
-From a checkout containing `install.sh`, its default behavior is:
+## Install enclos
 
 ```bash
-bash install.sh
+curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
 ```
 
-This downloads the latest published release binary for Apple silicon, verifies its SHA-256 checksum and executable version, and installs it into `~/.local/bin`. Rust and Xcode Command Line Tools are not required for this path. If that directory is not on your PATH, run the export command the installer prints before continuing.
+The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash -s -- --prefix /opt/enclos`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
 
-**The first binary release is not published yet.** Until then, use the explicit source build below. The installer reports an error if a release cannot be found or verified; it never silently builds `main` or the local checkout.
-
-Use `bash install.sh --version <tag>` to select a specific release, or `--prefix /absolute/path` to change the install directory. `bash install.sh --help` lists the options. The public `curl … | bash` command becomes available once the script is on `main` and a binary release has been published. The installer does not use sudo, edit shell startup files, or create sandboxes.
-
-### Build this checkout during development
-
-Source builds require Xcode Command Line Tools (`xcode-select --install`) and the pinned Rust toolchain, through [rustup](https://rustup.rs) or matching local Cargo and rustc binaries:
+**No release is published yet.** Until the first one, the installer says so and installs nothing. Build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
 
 ```bash
-bash install.sh --source .
+cargo install --locked --path .
 ```
-
-This builds the specified checkout using `Cargo.lock`. Missing prerequisites are reported with instructions rather than installed automatically. `bash install.sh --ref <branch-tag-or-commit>` explicitly downloads and builds a source ref. Direct Cargo installation remains available with `cargo install --locked --path .`.
 
 ## Create a sandbox and install Hermes
 

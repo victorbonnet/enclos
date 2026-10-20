@@ -37,10 +37,10 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 
 ## Quick start
 
-On an Apple silicon Mac running macOS 14 or later, with an account with a model provider Hermes supports. The installer defaults to the latest published release binary and does not require Rust. No releases have been published yet; to try this checkout today, use `bash install.sh --source .` with Xcode Command Line Tools and the pinned Rust toolchain.
+On an Apple silicon Mac running macOS 14 or later, with an account with a model provider Hermes supports:
 
 ```bash
-bash install.sh                              # latest published release into ~/.local/bin
+curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
@@ -48,13 +48,13 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 enclos agent add lab/main
 enclos policy test lab                         # escape probes; every one must fail
 enclos sandbox start lab                       # proxy and gateway in the background
-enclos connect lab -- main                    # talk to the agent, with Hermes's own command
-enclos net log lab                            # what it connected to
+enclos connect lab -- main                     # talk to the agent, with Hermes's own command
+enclos net log lab                             # what it connected to
 ```
 
-The installer resolves the latest release tag, downloads its binary and SHA-256 checksum, verifies the archive and executable version, then replaces the installed binary. It prints a PATH command if needed and does not use sudo, edit shell startup files, or create Enclos state. `--version <tag>` selects a specific release; `--source <path>` and `--ref <ref>` explicitly select source builds. A missing release is an error, with no automatic source fallback. The public `curl … | bash` command needs `install.sh` on `main` and a published binary release; it is not live yet.
+The installer always takes the latest release: it checks the archive's SHA-256 checksum and the binary's version, then replaces `~/.local/bin/enclos` in one step. It never uses sudo, edits your shell startup files or creates enclos state. **No release is published yet:** until the first one, build from a clone with Rust instead, `cargo install --locked --path .`.
 
-The [getting started guide](docs/getting-started.md) explains each step and what does not work yet. Developers can build with `bash install.sh --source .` or directly with `cargo install --locked --path .`. See [Publishing releases](docs/releases.md) for the release workflow and artifact format.
+The [getting started guide](docs/getting-started.md) explains each step and what does not work yet; [releases](docs/releases.md) says how a release is built and checked.
 
 ## Commands
 
@@ -73,7 +73,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
-- [Why enclos](docs/marketing/index.html): a visual introduction, everyday examples and common questions ([preview instructions](docs/marketing/README.md)).
+- [Website](https://victorbonnet.github.io/enclos/): a visual introduction, everyday examples and common questions ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.

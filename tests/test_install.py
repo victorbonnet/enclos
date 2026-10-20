@@ -1,6 +1,6 @@
-"""Exercise release and source installation without network or host changes.
+"""Exercise install.sh without network access or changes to the host.
 
-Run with: python3 -m unittest discover -s tests -p 'test_install.py'
+Run with: python3 tests/test_install.py
 """
 
 import hashlib
@@ -33,56 +33,12 @@ with open(os.environ["INSTALL_TEST_LOG"], "a", encoding="utf-8") as log:
 def value(key, default):
     return os.environ.get("INSTALL_TEST_" + key, default)
 
-def install_binary(install_args):
-    if value("BUILD_FAIL", "0") == "1":
-        sys.exit(42)
-    prefix = Path(install_args[install_args.index("--root") + 1])
-    binary = prefix / "bin" / "enclos"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    binary.write_text(
-        "#!" + sys.executable + "\n"
-        "import json, os, sys\n"
-        "with open(os.environ['INSTALL_TEST_LOG'], 'a') as log:\n"
-        "    log.write(json.dumps({'command': 'enclos', 'args': sys.argv[1:]}) + '\\n')\n"
-        "print('enclos 0.1.0')\n",
-        encoding="utf-8",
-    )
-    binary.chmod(0o755)
-
 if name == "uname":
     print(value("ARCH", "arm64") if "-m" in args else value("OS", "Darwin"))
 elif name == "id":
     print(value("UID", "501"))
 elif name == "sw_vers":
     print(value("MACOS_VERSION", "14.7"))
-elif name == "xcode-select":
-    if value("CLT_FAIL", "0") == "1":
-        sys.exit(2)
-    print("/Library/Developer/CommandLineTools")
-elif name == "rustup":
-    if value("TOOLCHAIN_FAIL", "0") == "1":
-        sys.exit(1)
-    if args == ["toolchain", "list"]:
-        print("1.99.1-aarch64-apple-darwin (default)")
-    elif args[:4] == ["run", "1.99.1", "cargo", "--version"]:
-        print("cargo 1.99.1 (test)")
-    elif args[:4] == ["run", "1.99.1", "cargo", "install"]:
-        install_binary(args)
-    else:
-        print("Unexpected rustup invocation: " + repr(args), file=sys.stderr)
-        sys.exit(97)
-elif name == "cargo":
-    if args == ["--version"]:
-        print("cargo " + value("CARGO_VERSION", "1.99.1") + " (test)")
-    elif args and args[0] == "install":
-        install_binary(args)
-    else:
-        sys.exit(97)
-elif name == "rustc":
-    if args == ["--version"]:
-        print("rustc " + value("RUSTC_VERSION", "1.99.1") + " (test)")
-    else:
-        sys.exit(97)
 elif name == "curl":
     if value("DOWNLOAD_FAIL", "0") == "1":
         sys.exit(22)
@@ -112,8 +68,6 @@ elif name == "curl":
             data = Path(os.environ["INSTALL_TEST_RELEASE_ARCHIVE"]).read_bytes()
         else:
             sys.exit(95)
-    elif url.startswith("https://codeload.github.com/victorbonnet/enclos/tar.gz/"):
-        data = Path(os.environ["INSTALL_TEST_SOURCE_ARCHIVE"]).read_bytes()
     else:
         sys.exit(95)
     if output:
@@ -141,17 +95,12 @@ class InstallerTests(unittest.TestCase):
         self.bin = self.root / "command stubs"
         self.bin.mkdir()
         self.log = self.root / "commands.jsonl"
-        for command in ("uname", "id", "sw_vers", "xcode-select", "rustup", "curl", "tar"):
+        for command in ("uname", "id", "sw_vers", "curl", "tar"):
             self.make_stub(command)
-        self.source = self.root / "source checkout"
-        self.make_source(self.source)
-        self.installer = self.source / "install.sh"
+        self.installer = self.root / "install.sh"
         shutil.copyfile(INSTALLER, self.installer)
         self.release_archive = self.root / "release.tar.gz"
         self.make_release_archive(self.release_archive)
-        self.source_archive = self.root / "source.tar.gz"
-        with tarfile.open(self.source_archive, "w:gz") as archive:
-            archive.add(self.source, arcname="enclos-test")
         self.startup_files = {}
         for name in (".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile"):
             path = self.home / name
@@ -182,6 +131,10 @@ class InstallerTests(unittest.TestCase):
     def installed_binary(self, prefix=None):
         return (prefix or self.home / ".local") / "bin" / "enclos"
 
+    def installed_release_bytes(self):
+        with tarfile.open(self.release_archive, "r:gz") as archive:
+            return archive.extractfile("enclos").read()
+
     def seed_existing_binary(self, prefix=None):
         binary = self.installed_binary(prefix)
         binary.parent.mkdir(parents=True, exist_ok=True)
@@ -189,32 +142,14 @@ class InstallerTests(unittest.TestCase):
         binary.chmod(0o755)
         return binary
 
-    def use_direct_toolchain(self):
-        (self.bin / "rustup").unlink()
-        self.make_stub("cargo")
-        self.make_stub("rustc")
-
-    @staticmethod
-    def make_source(path):
-        path.mkdir(parents=True)
-        (path / "Cargo.toml").write_text('[package]\nname = "enclos"\nversion = "0.1.0"\n')
-        (path / "Cargo.lock").write_text("version = 4\n")
-        (path / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.99.1"\n')
-        (path / "src").mkdir()
-        (path / "src" / "main.rs").write_text("fn main() {}\n")
-
-    def run_installer(self, *args, settings=None, standalone=False, piped=False):
-        installer = self.installer
-        if standalone:
-            installer = self.root / "standalone install.sh"
-            shutil.copyfile(INSTALLER, installer)
+    def run_installer(self, *args, settings=None, piped=False):
         settings = dict(settings or {})
         archive = Path(settings.pop("RELEASE_ARCHIVE", self.release_archive))
         checksum = self.root / "release.tar.gz.sha256"
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         if settings.pop("CHECKSUM_MISMATCH", "0") == "1":
             digest = "0" * 64
-        checksum.write_text(digest + "  enclos-aarch64-apple-darwin.tar.gz\n")
+        checksum.write_text(digest + "  " + settings.pop("CHECKSUM_NAME", "enclos-aarch64-apple-darwin.tar.gz") + "\n")
         env = {
             "HOME": str(self.home),
             "TMPDIR": str(self.temp),
@@ -223,11 +158,10 @@ class InstallerTests(unittest.TestCase):
             "INSTALL_TEST_LOG": str(self.log),
             "INSTALL_TEST_RELEASE_ARCHIVE": str(archive),
             "INSTALL_TEST_CHECKSUM": str(checksum),
-            "INSTALL_TEST_SOURCE_ARCHIVE": str(self.source_archive),
         }
         for key, value in settings.items():
             env["INSTALL_TEST_" + key] = value
-        command = ["/bin/bash", "-s", "--"] if piped else ["/bin/bash", str(installer)]
+        command = ["/bin/bash", "-s", "--"] if piped else ["/bin/bash", str(self.installer)]
         result = subprocess.run(
             [*command, *map(str, args)],
             cwd=self.root,
@@ -245,215 +179,78 @@ class InstallerTests(unittest.TestCase):
     def assert_untouched_home(self):
         for path, contents in self.startup_files.items():
             self.assertEqual(path.read_text(encoding="utf-8"), contents)
-        self.assertFalse((self.home / ".enclos").exists(), "installer initialized Enclos state")
+        self.assertFalse((self.home / ".enclos").exists(), "installer initialized enclos state")
 
     def commands(self, name=None):
         events = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return [event for event in events if name is None or event["command"] == name]
 
-    def assert_no_build(self):
-        self.assertFalse(any("install" in event["args"] for event in self.commands("rustup")))
-        self.assertFalse(any("install" in event["args"] for event in self.commands("cargo")))
-        self.assertFalse((self.home / ".local" / "bin" / "enclos").exists())
+    def urls(self):
+        return [arg for event in self.commands("curl") for arg in event["args"] if arg.startswith("https://")]
 
-    def test_explicit_checkout_builds_locked_with_pinned_toolchain(self):
-        result = self.run_installer("--source", self.source)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        installs = [event["args"] for event in self.commands("rustup") if "install" in event["args"]]
-        self.assertEqual(len(installs), 1)
-        args = installs[0]
-        self.assertEqual(args[:4], ["run", "1.99.1", "cargo", "install"])
-        self.assertIn("--locked", args)
-        self.assertEqual(Path(args[args.index("--path") + 1]).resolve(), self.source.resolve())
-        self.assertEqual(Path(args[args.index("--root") + 1]), self.home / ".local")
-        self.assertEqual(self.commands("enclos"), [{"command": "enclos", "args": ["--version"]}])
-        self.assertEqual(self.commands("curl"), [])
-        self.assertIn(str(self.home / ".local" / "bin"), result.stdout + result.stderr)
-
-    def test_explicit_source_and_prefix_preserve_spaces(self):
-        source = self.root / "another source checkout"
-        self.make_source(source)
-        prefix = self.root / "custom install prefix"
-        result = self.run_installer("--source", source, "--prefix", prefix, standalone=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        installs = [event["args"] for event in self.commands("rustup") if "install" in event["args"]]
-        args = installs[0]
-        self.assertEqual(Path(args[args.index("--path") + 1]).resolve(), source.resolve())
-        self.assertEqual(Path(args[args.index("--root") + 1]), prefix)
-        self.assertTrue((prefix / "bin" / "enclos").exists())
-        self.assertEqual(self.commands("curl"), [])
-
-    def test_matching_direct_toolchain_builds_without_rustup(self):
-        self.use_direct_toolchain()
-        result = self.run_installer("--source", self.source)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.commands("rustup"), [])
-        self.assertEqual(self.commands("rustc"), [{"command": "rustc", "args": ["--version"]}])
-        installs = [event["args"] for event in self.commands("cargo") if "install" in event["args"]]
-        self.assertEqual(len(installs), 1)
-        args = installs[0]
-        self.assertEqual(args[0], "install")
-        self.assertIn("--locked", args)
-        self.assertEqual(Path(args[args.index("--path") + 1]).resolve(), self.source.resolve())
-        self.assertEqual(Path(args[args.index("--root") + 1]), self.home / ".local")
-        self.assertEqual(self.commands("enclos"), [{"command": "enclos", "args": ["--version"]}])
-
-    def test_mismatched_direct_cargo_or_rustc_stops_before_build(self):
-        self.use_direct_toolchain()
-        for settings in (
-            {"CARGO_VERSION": "1.98.0"},
-            {"RUSTC_VERSION": "1.98.0"},
-            {"CARGO_VERSION": "1.99.1-nightly"},
-            {"RUSTC_VERSION": "1.99.1-nightly"},
-        ):
-            with self.subTest(settings=settings):
-                self.log.unlink(missing_ok=True)
-                result = self.run_installer("--source", self.source, settings=settings)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
-                self.assertEqual(self.commands("enclos"), [])
-
-    def test_direct_toolchain_requires_rustc_too(self):
-        self.use_direct_toolchain()
-        (self.bin / "rustc").unlink()
-        result = self.run_installer("--source", self.source)
+    def assert_failed(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
+        self.assertNotIn("Installed enclos", result.stdout + result.stderr)
 
-    def test_rustup_takes_precedence_over_direct_toolchain(self):
-        self.make_stub("cargo")
-        self.make_stub("rustc")
-        result = self.run_installer("--source", self.source, settings={"CARGO_VERSION": "1.98.0", "RUSTC_VERSION": "1.98.0"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.commands("cargo"), [])
-        self.assertEqual(self.commands("rustc"), [])
-        self.assertTrue(any("install" in event["args"] for event in self.commands("rustup")))
-
-    def test_direct_toolchain_build_failure_does_not_run_binary(self):
-        self.use_direct_toolchain()
-        result = self.run_installer("--source", self.source, settings={"BUILD_FAIL": "1"})
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.commands("enclos"), [])
-        self.assertFalse((self.home / ".local" / "bin" / "enclos").exists())
-
-    def test_explicit_ref_downloads_instead_of_using_adjacent_checkout(self):
-        result = self.run_installer("--ref", "v0.1.0-test")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        downloads = self.commands("curl")
-        self.assertEqual(len(downloads), 1)
-        self.assertTrue(any("v0.1.0-test" in arg for arg in downloads[0]["args"]))
-        self.assertEqual(len(self.commands("tar")), 1)
-        args = next(event["args"] for event in self.commands("rustup") if "install" in event["args"])
-        self.assertNotEqual(Path(args[args.index("--path") + 1]).resolve(), self.source.resolve())
-
-    def test_unsupported_hosts_and_root_stop_before_build(self):
-        for settings in ({"OS": "Linux"}, {"ARCH": "x86_64"}, {"MACOS_VERSION": "13.6"}, {"UID": "0"}):
-            with self.subTest(settings=settings):
-                self.log.unlink(missing_ok=True)
-                result = self.run_installer(settings=settings)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
-                self.assertEqual(self.commands("curl"), [])
-
-    def test_missing_prerequisites_do_not_install_them(self):
-        for settings in ({"CLT_FAIL": "1"}, {"TOOLCHAIN_FAIL": "1"}):
-            with self.subTest(settings=settings):
-                self.log.unlink(missing_ok=True)
-                result = self.run_installer("--source", self.source, settings=settings)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
-                self.assertFalse(any("toolchain" in event["args"] and "install" in event["args"] for event in self.commands("rustup")))
-        (self.bin / "rustup").unlink()
-        self.log.unlink(missing_ok=True)
-        result = self.run_installer("--source", self.source)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
-        self.assertIn("rustup", (result.stdout + result.stderr).lower())
-
-    def test_download_failure_never_builds_or_reports_success(self):
-        result = self.run_installer("--ref", "v0.1.0-test", settings={"DOWNLOAD_FAIL": "1"})
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
-        self.assertEqual(self.commands("tar"), [])
-        self.assertEqual(self.commands("enclos"), [])
-
-    def test_extraction_failure_cleans_up_without_building(self):
-        result = self.run_installer("--ref", "v0.1.0-test", settings={"EXTRACT_FAIL": "1"})
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
-        self.assertEqual(len(self.commands("tar")), 1)
-        self.assertEqual(self.commands("enclos"), [])
-
-    def assert_release_downloads(self, tag, *, latest=True):
-        downloads = self.commands("curl")
-        urls = [arg for event in downloads for arg in event["args"] if arg.startswith("https://")]
-        base = "https://github.com/victorbonnet/enclos"
-        asset = "enclos-aarch64-apple-darwin.tar.gz"
-        expected = [base + "/releases/latest"] if latest else []
-        expected += [base + "/releases/download/" + tag + "/" + asset,
-                     base + "/releases/download/" + tag + "/" + asset + ".sha256"]
-        self.assertCountEqual(urls, expected)
-        if latest:
-            latest_args = next(event["args"] for event in downloads if base + "/releases/latest" in event["args"])
-            self.assertIn("%{url_effective}", latest_args)
-            self.assertIn("/dev/null", latest_args)
-        self.assertFalse(self.commands("rustup"))
-        self.assertFalse(self.commands("cargo"))
-        self.assertFalse(self.commands("rustc"))
-        self.assertFalse(self.commands("xcode-select"))
-
-    def test_default_installs_latest_release_even_next_to_checkout(self):
-        result = self.run_installer(settings={"CLT_FAIL": "1", "TOOLCHAIN_FAIL": "1"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_release_downloads("v0.2.0")
-        self.assertTrue(self.installed_binary().is_file())
-        self.assertEqual(self.commands("enclos"), [{"command": "enclos", "args": ["--version"]}])
-
-    def test_standalone_and_piped_scripts_default_to_latest_release(self):
+    def test_installs_the_latest_release(self):
         for piped in (False, True):
             with self.subTest(piped=piped):
                 self.log.unlink(missing_ok=True)
                 self.installed_binary().unlink(missing_ok=True)
-                result = self.run_installer(standalone=True, piped=piped)
+                result = self.run_installer(piped=piped)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_release_downloads("v0.2.0")
-                self.assertTrue(self.installed_binary().is_file())
+                base = "https://github.com/victorbonnet/enclos/releases"
+                asset = "enclos-aarch64-apple-darwin.tar.gz"
+                self.assertEqual(self.urls(), [
+                    base + "/latest",
+                    base + "/download/v0.2.0/" + asset,
+                    base + "/download/v0.2.0/" + asset + ".sha256",
+                ])
+                latest = self.commands("curl")[0]["args"]
+                self.assertIn("%{url_effective}", latest)
+                self.assertIn("/dev/null", latest)
+                self.assertEqual(self.installed_binary().read_bytes(), self.installed_release_bytes())
+                self.assertEqual(self.installed_binary().stat().st_mode & 0o777, 0o755)
+                self.assertEqual(self.commands("enclos"), [{"command": "enclos", "args": ["--version"]}])
+                self.assertIn("enclos 0.2.0", result.stdout)
+                self.assertIn("export PATH=", result.stdout)
 
-    def test_explicit_version_skips_latest_resolution(self):
-        self.make_release_archive(self.release_archive, version="0.1.7")
-        result = self.run_installer("--version", "v0.1.7")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_release_downloads("v0.1.7", latest=False)
-
-    def test_release_prefix_preserves_spaces_and_replaces_existing_binary(self):
+    def test_a_prefix_with_spaces_replaces_the_existing_binary(self):
         prefix = self.root / "custom release prefix"
         binary = self.seed_existing_binary(prefix)
-        result = self.run_installer("--prefix", prefix)
+        result = self.run_installer("--prefix", str(prefix) + "//")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotEqual(binary.read_bytes(), b"existing installation\n")
         self.assertEqual(binary.read_bytes(), self.installed_release_bytes())
-        self.assert_release_downloads("v0.2.0")
+        self.assertEqual(list(binary.parent.iterdir()), [binary])
 
-    def installed_release_bytes(self):
-        with tarfile.open(self.release_archive, "r:gz") as archive:
-            return archive.extractfile("enclos").read()
-
-    def test_missing_or_invalid_latest_release_never_falls_back_to_source(self):
-        for settings in (
-            {"LATEST_FAIL": "1"},
-            {"LATEST_URL": "https://github.com/victorbonnet/enclos/releases/latest"},
-            {"LATEST_URL": "https://github.com/other/repository/releases/tag/v0.2.0"},
+    def test_no_release_yet_is_said_and_nothing_is_downloaded(self):
+        for url in (
+            "https://github.com/victorbonnet/enclos/releases",
+            "https://github.com/victorbonnet/enclos/releases/",
         ):
-            with self.subTest(settings=settings):
+            with self.subTest(url=url):
                 self.log.unlink(missing_ok=True)
-                result = self.run_installer(settings=settings)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
-                self.assertEqual(len(self.commands("curl")), 1)
-                self.assertEqual(self.commands("enclos"), [])
+                result = self.run_installer(settings={"LATEST_URL": url})
+                self.assert_failed(result)
+                self.assertIn("no published release yet", result.stderr)
+                self.assertEqual(len(self.urls()), 1)
+                self.assertFalse(self.installed_binary().exists())
+
+    def test_an_unexpected_latest_answer_downloads_nothing(self):
+        for url in (
+            "https://github.com/victorbonnet/enclos/releases/latest",
+            "https://github.com/other/repository/releases/tag/v0.2.0",
+            "https://github.com/victorbonnet/enclos/releases/tag/v0.2.0-rc.1",
+            "https://github.com/victorbonnet/enclos/releases/tag/v0.2.0/../../x",
+        ):
+            with self.subTest(url=url):
+                self.log.unlink(missing_ok=True)
+                result = self.run_installer(settings={"LATEST_URL": url})
+                self.assert_failed(result)
+                self.assertEqual(len(self.urls()), 1)
                 self.assertEqual(self.commands("tar"), [])
 
-    def test_release_failures_preserve_existing_binary(self):
+    def test_release_failures_keep_the_existing_binary(self):
         bad_archive = self.root / "bad archive.tar.gz"
         bad_archive.write_bytes(b"not a gzip archive")
         missing_binary = self.root / "missing binary.tar.gz"
@@ -467,6 +264,7 @@ class InstallerTests(unittest.TestCase):
             {"ASSET_DOWNLOAD_FAIL": "1"},
             {"CHECKSUM_DOWNLOAD_FAIL": "1"},
             {"CHECKSUM_MISMATCH": "1"},
+            {"CHECKSUM_NAME": "other.tar.gz"},
             {"EXTRACT_FAIL": "1"},
             {"RELEASE_ARCHIVE": str(bad_archive)},
             {"RELEASE_ARCHIVE": str(missing_binary)},
@@ -476,77 +274,43 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(settings=settings):
                 self.log.unlink(missing_ok=True)
                 binary = self.seed_existing_binary()
-                result = self.run_installer(settings=settings)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_failed(self.run_installer(settings=settings))
                 self.assertEqual(binary.read_bytes(), b"existing installation\n")
                 self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
                 self.assertEqual(list(binary.parent.iterdir()), [binary])
-                self.assertFalse(any("install" in event["args"] for event in self.commands("rustup")))
-                self.assertFalse(any("install" in event["args"] for event in self.commands("cargo")))
-                self.assertFalse(any("codeload.github.com" in arg for event in self.commands("curl") for arg in event["args"]))
-                self.assertNotIn("Installed enclos", result.stdout + result.stderr)
 
-    def test_bad_checksum_stops_before_extraction_or_execution(self):
-        result = self.run_installer(settings={"CHECKSUM_MISMATCH": "1"})
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
+    def test_a_bad_checksum_stops_before_unpacking_or_running(self):
+        self.assert_failed(self.run_installer(settings={"CHECKSUM_MISMATCH": "1"}))
         self.assertEqual(self.commands("tar"), [])
         self.assertEqual(self.commands("enclos"), [])
 
-    def test_source_requires_lockfile_and_numeric_toolchain(self):
-        (self.source / "Cargo.lock").unlink()
-        result = self.run_installer("--source", self.source)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assert_no_build()
-        (self.source / "Cargo.lock").write_text("version = 4\n")
-        for channel in ("stable", "nightly", "1.99.1\n1.99.0"):
-            with self.subTest(channel=channel):
+    def test_unsupported_hosts_and_root_stop_before_any_download(self):
+        for settings in ({"OS": "Linux"}, {"ARCH": "x86_64"}, {"MACOS_VERSION": "13.6"}, {"UID": "0"}):
+            with self.subTest(settings=settings):
                 self.log.unlink(missing_ok=True)
-                (self.source / "rust-toolchain.toml").write_text(
-                    '[toolchain]\nchannel = "' + channel + '"\n'
-                )
-                result = self.run_installer("--source", self.source)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
+                self.assert_failed(self.run_installer(settings=settings))
+                self.assertEqual(self.commands("curl"), [])
 
-    def test_build_failure_does_not_run_binary(self):
-        result = self.run_installer("--source", self.source, settings={"BUILD_FAIL": "1"})
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.commands("enclos"), [])
-        self.assertFalse((self.home / ".local" / "bin" / "enclos").exists())
-
-    def test_help_does_not_install(self):
+    def test_help_installs_nothing(self):
         result = self.run_installer("--help")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("--version", result.stdout + result.stderr)
-        self.assertIn("--source", result.stdout + result.stderr)
-        self.assertIn("--ref", result.stdout + result.stderr)
-        self.assertIn("--prefix", result.stdout + result.stderr)
-        self.assert_no_build()
+        self.assertIn("--prefix", result.stdout)
         self.assertEqual(self.commands("curl"), [])
 
-    def test_invalid_arguments_stop_before_build(self):
+    def test_invalid_arguments_stop_before_any_download(self):
         for args in (
             ("--unknown",),
+            ("--version", "v0.1.0"),
+            ("--source", "."),
             ("--prefix",),
-            ("--version",),
-            ("--version", ""),
-            ("--version", "../v0.1.0"),
-            ("--version", "v0.1.0?query"),
-            ("--version", "v0.1.0", "--ref", "main"),
-            ("--source", self.source, "--version", "v0.1.0"),
+            ("--prefix", ""),
             ("--prefix", "relative/path"),
             ("--prefix", "/"),
-            ("--prefix", "//"),
             ("--prefix", "////"),
-            ("--source", self.root / "missing"),
-            ("--source", self.source, "--ref", "main"),
         ):
             with self.subTest(args=args):
                 self.log.unlink(missing_ok=True)
-                result = self.run_installer(*args)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assert_no_build()
+                self.assert_failed(self.run_installer(*args))
                 self.assertEqual(self.commands("curl"), [])
 
 

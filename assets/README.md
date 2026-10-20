@@ -1,4 +1,4 @@
-# Enclos brand assets
+# enclos brand assets
 
 The **Home base** icon uses four open corners around a central square. The horizontal wordmark adds lowercase **enclos** to its right. All SVGs have transparent backgrounds; each light/dark pair has identical geometry.
 

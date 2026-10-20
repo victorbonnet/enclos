@@ -4,8 +4,7 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,6 +13,10 @@ concurrency:
 jobs:
   macos-release:
     runs-on: macos-14
+    permissions:
+      contents: write # create the release and upload its assets
+      id-token: write # sign the provenance attestation
+      attestations: write
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       TARGET: aarch64-apple-darwin
@@ -70,6 +73,11 @@ jobs:
           tar -xzf "dist/$ASSET" -C dist/check
           test -x dist/check/enclos
           test "$(dist/check/enclos --version)" = "enclos $RELEASE_VERSION"
+
+      - name: Attest where the archive was built
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ASSET }}
 
       - name: Upload, verify, then publish the release
         env:
