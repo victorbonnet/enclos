@@ -9,7 +9,7 @@ use super::Engine;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{Policy, PolicySnapshot, PolicyVersion, TemplateName};
+use crate::model::policy::{NetMode, Policy, PolicySnapshot, PolicyVersion, TemplateName};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
@@ -340,6 +340,14 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
         "let {} reach private addresses",
         "stop {} reaching private addresses",
     );
+    if old.net.mode != new.net.mode {
+        found.push(match new.net.mode {
+            NetMode::Public => {
+                "open the public web to it: any public address on ports 80 and 443".to_owned()
+            }
+            NetMode::Allowlist => "limit its network to the allowlist".to_owned(),
+        });
+    }
     found
 }
 
@@ -437,5 +445,15 @@ mod tests {
             ]
         );
         assert!(differences(&old, &old, &["a.example.com"]).is_empty());
+        let mut public = old.clone();
+        public.net.mode = NetMode::Public;
+        assert_eq!(
+            differences(&old, &public, &["a.example.com"]),
+            ["open the public web to it: any public address on ports 80 and 443"]
+        );
+        assert_eq!(
+            differences(&public, &old, &["a.example.com"]),
+            ["limit its network to the allowlist"]
+        );
     }
 }

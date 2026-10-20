@@ -389,6 +389,14 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
     );
     let _stop = StopOnDrop(&home, "home");
 
+    // The assistant template reaches the public web, and says so (ADR 0025).
+    let show = home.run(&["policy", "show", "home"]);
+    assert!(
+        show.ok().stdout().contains("Network: public web"),
+        "{}",
+        show.stdout()
+    );
+
     // The command's exit code comes back; it wrote only in its home.
     let script = "echo hi > \"$HOME/hello\"; echo no > \"$HOME/../escaped\" 2>/dev/null; exit 3";
     let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
@@ -397,8 +405,9 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
     assert!(sandbox.join("home/hello").exists());
     assert!(!sandbox.join("escaped").exists());
 
-    // Through the proxy, a destination not on the allowlist is refused and logged.
-    let curl = "/usr/bin/curl -s -o /dev/null -w '%{http_code}' https://example.com/ || true";
+    // Through the proxy, a destination the policy does not open is refused
+    // and logged: the public web is ports 80 and 443 only.
+    let curl = "/usr/bin/curl -s -o /dev/null -w '%{http_code}' https://example.com:8443/ || true";
     home.run(&["connect", "home", "--", "/bin/sh", "-c", curl])
         .ok();
     let denied = home.run(&["net", "denied", "home"]);
@@ -406,7 +415,7 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
         denied
             .ok()
             .stdout()
-            .contains("example.com:443  not-allowed"),
+            .contains("example.com:8443  not-allowed"),
         "{}",
         denied.stdout()
     );
@@ -494,11 +503,17 @@ fn a_route_that_gets_through_fails_the_policy_test() {
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
-    // Allowing the destination the proxy probe asks for opens that route:
-    // the proxy lets the request through and answers 502, as the name does
-    // not resolve. Nothing leaves this host.
-    home.run(&["policy", "allow", "home", "probe.enclos.invalid", "--yes"])
-        .ok();
+    // Allowing the destination and port a proxy probe asks for opens that
+    // route: the proxy lets the request through and answers 502, as the name
+    // does not resolve. Nothing leaves this host.
+    home.run(&[
+        "policy",
+        "allow",
+        "home",
+        "probe.enclos.invalid:8443",
+        "--yes",
+    ])
+    .ok();
     let out = home.run(&["policy", "test", "home"]);
     assert_eq!(out.code(), 1, "{}", out.stdout());
     let open = out

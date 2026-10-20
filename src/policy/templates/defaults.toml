@@ -58,6 +58,9 @@ read_deny = [
 ]
 
 [network]
+# Only the destinations listed in allow; a template may open the public web
+# with mode = "public" (ADR 0025).
+mode = "allowlist"
 allow = []
 private = []
 log = "metadata"
