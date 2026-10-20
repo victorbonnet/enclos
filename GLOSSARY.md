@@ -48,6 +48,10 @@ _Avoid_: profile (Hermes's word for it), instance, persona, bot
 A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance
 
+**Secret**:
+A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
+_Avoid_: credential (for a secret), key
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
