@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Added, AgentCheck, Engine};
+use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -126,16 +126,31 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
         }
         AgentVerb::Rm { agent, keep_data } => {
             let AgentTarget { sandbox, agent } = agent;
-            match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
-                Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-                Planned::Done(removed) if removed.deleted => {
+            let removed = match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
+                Planned::DryRun(plan) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    return Ok(exit::OK);
+                }
+                Planned::Done(removed) => removed,
+            };
+            match removed {
+                AgentRemoved::Deleted { .. } => {
                     println!("Removed agent {sandbox}/{agent} and its files.")
                 }
-                Planned::Done(removed) => println!(
-                    "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({}), so {} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again.",
-                    removed.files,
-                    removed.kind.display_name()
-                ),
+                AgentRemoved::RecordOnly { kind, files, why } => {
+                    let runtime = kind.display_name();
+                    match why {
+                        FilesKept::Asked => println!(
+                            "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
+                        ),
+                        FilesKept::RuntimeLacksIt => println!(
+                            "Removed the record of agent {sandbox}/{agent}, which {runtime} no longer had."
+                        ),
+                        FilesKept::NoDeleteCommand => println!(
+                            "Removed the record of agent {sandbox}/{agent}. {runtime} has no command enclos can run to delete an agent, so its files stay in the sandbox home ({files}); remove them with {runtime}'s own commands in `enclos connect {sandbox}`."
+                        ),
+                    }
+                }
             }
         }
     }

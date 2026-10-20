@@ -42,7 +42,7 @@ Hermes already has one agent once it is installed: its built-in `default`, which
 ```bash
 enclos agent add lab/main
 enclos agent add lab/scout
-enclos agent list lab        # lab/default (built in), lab/main, lab/scout
+enclos agent list lab        # lab/default  built in, then lab/main and lab/scout
 ```
 
 enclos lists `default` but neither adds nor removes it: it exists as long as Hermes is installed in the sandbox.

@@ -111,7 +111,7 @@ pub fn events(
     Ok(events)
 }
 
-/// When the sandbox last made a connection.
+/// When the sandbox last tried a connection, allowed or refused.
 pub fn last(conn: &Connection, sandbox: &SandboxName) -> Result<Option<Timestamp>, ReadError> {
     let at: Option<String> = conn.query_row(
         "SELECT max(at) FROM net_events WHERE sandbox = ?1",

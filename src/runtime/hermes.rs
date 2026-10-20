@@ -5,15 +5,15 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
-use std::os::fd::{AsFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
-use rustix::io::Errno;
+use rustix::fs::{Dir, FileType};
 
+use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, DiskPart, HomeFile, Installer, NotRead, RuntimeAdapter, RuntimeAgentName,
-    RuntimeFacts, RuntimeService, SandboxCommand, ServiceName, Unreadable, ValueAt,
+    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
+    RuntimeAgentName, RuntimeFacts, RuntimeService, SandboxCommand, ServiceName, Unreadable,
+    ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -33,7 +33,7 @@ const HERMES: &str = "hermes";
 const GATEWAY: ServiceName = ServiceName::new("gateway");
 
 /// Hermes's built-in profile, the root of its home.
-const DEFAULT_PROFILE: &str = "default";
+const DEFAULT_PROFILE: BuiltinAgent = BuiltinAgent::new("default");
 
 /// The files that make a folder under `~/.hermes/profiles/` a profile, as
 /// Hermes decides it: `_PROFILE_IDENTITY_MARKERS` in `hermes_constants.py`,
@@ -66,50 +66,17 @@ fn hermes_id(name: &str) -> bool {
         && name.len() <= 64
 }
 
-fn unreadable(path: &str, why: NotRead) -> Unreadable {
-    Unreadable {
-        path: path.to_owned(),
-        why,
-    }
+/// A path of the home Hermes writes; every one here is a literal.
+fn at(path: &str) -> HomePath {
+    HomePath::new(path).expect("a plain path inside the home")
 }
 
-fn io(path: &str, e: Errno) -> Unreadable {
-    unreadable(path, NotRead::Io(e.to_string()))
-}
-
-/// Opens the folder `name` inside the open folder `dir`, through its
-/// descriptor and without following a link in its place, so what the
-/// sandbox puts there, before or during the read, leads nowhere. `Ok(None)`
-/// when there is no such entry; a link or a non-folder is `Unreadable`.
-fn open_folder(dir: impl AsFd, name: &str, shown: &str) -> Result<Option<OwnedFd>, Unreadable> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(Errno::NOENT) => Ok(None),
-        // A link is refused as a loop (Linux) or as not a folder (macOS).
-        Err(Errno::LOOP | Errno::NOTDIR) => {
-            let link = entry_type(&dir, name, shown)?.is_some_and(FileType::is_symlink);
-            Err(unreadable(
-                shown,
-                if link {
-                    NotRead::Link
-                } else {
-                    NotRead::NotAFolder
-                },
-            ))
-        }
-        Err(e) => Err(io(shown, e)),
-    }
-}
-
-/// What `name` is inside the open folder `dir`, without following a link
-/// at its end: `None` when there is no such entry.
-fn entry_type(dir: impl AsFd, name: &str, shown: &str) -> Result<Option<FileType>, Unreadable> {
-    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
-        Err(Errno::NOENT) => Ok(None),
-        Err(e) => Err(io(shown, e)),
-    }
+/// Whether the entry is a link or a plain file, without following it.
+fn file_or_link(dir: &rustix::fd::OwnedFd, name: &str, shown: &str) -> Result<bool, Unreadable> {
+    Ok(entry_stat(dir, name, shown)?.is_some_and(|s| {
+        let t = FileType::from_raw_mode(s.st_mode);
+        t.is_file() || t.is_symlink()
+    }))
 }
 
 impl RuntimeAdapter for Hermes {
@@ -162,8 +129,8 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
-        // Hermes's own delete: the profile folder, its wrapper, and its
-        // records, which a plain `rm` would leave behind.
+        // Hermes's own delete, so whatever it keeps beside the profile
+        // folder goes with it (what that is: to verify, design §14).
         Some(SandboxCommand::from_words(&[
             HERMES,
             "profile",
@@ -173,11 +140,10 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
-    fn disk_parts(&self) -> Vec<(DiskPart, PathBuf)> {
-        let runtime = ["hermes-agent", "tools", "installs"]
-            .map(|p| (DiskPart::Runtime, Path::new(".hermes").join(p)));
-        let caches =
-            [".hermes/cache", ".npm", ".cache", "tmp"].map(|p| (DiskPart::Cache, p.into()));
+    fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> {
+        let runtime = [".hermes/hermes-agent", ".hermes/tools", ".hermes/installs"]
+            .map(|p| (DiskPart::Runtime, at(p)));
+        let caches = [".hermes/cache", ".npm", ".cache", "tmp"].map(|p| (DiskPart::Cache, at(p)));
         runtime.into_iter().chain(caches).collect()
     }
 
@@ -187,36 +153,39 @@ impl RuntimeAdapter for Hermes {
             // 0.0.0 (to verify, design §14).
             version: None,
             // Agents share the root login (prototype, issue #5).
-            login: Some(".hermes/auth.json".into()),
+            login: Some(at(".hermes/auth.json")),
+            // Where the installer puts Hermes itself.
+            install: Some(at(".hermes/hermes-agent")),
         }
     }
 
-    fn agent_facts(&self, agent: &str) -> AgentFacts {
+    fn agent_facts(&self, agent: &RuntimeAgentName) -> AgentFacts {
         // The built-in agent's folder is the whole home of Hermes: the parts
         // counted on their own (runtime, caches, other profiles) leave it its
         // own data.
-        let folder = if agent == DEFAULT_PROFILE {
-            PathBuf::from(".hermes")
+        let folder = if agent.as_str() == DEFAULT_PROFILE.as_str() {
+            at(".hermes")
         } else {
-            Path::new(".hermes/profiles").join(agent)
+            at(".hermes/profiles").join(agent)
         };
+        let file = |name: &str| folder.child(name).expect("a plain file name");
         AgentFacts {
             model: Some(ValueAt {
-                file: folder.join("config.yaml"),
+                file: file("config.yaml"),
                 // Hermes reads either key.
-                keys: vec!["model.default", "model.model"],
+                keys: &["model.default", "model.model"],
             }),
             // What changed when an agent was used; `sessions/` did not (to
             // verify, design §14).
             activity: [".hermes_history", "state.db", "state.db-wal"]
-                .map(|f| folder.join(f))
+                .map(file)
                 .to_vec(),
             folder: Some(folder),
         }
     }
 
     fn talk(&self, agent: &AgentName) -> String {
-        if Some(agent.as_str()) == self.builtin_agent() {
+        if *agent == DEFAULT_PROFILE.agent_name() {
             return HERMES.to_owned();
         }
         // Hermes also writes a wrapper named after the agent on the sandbox
@@ -225,7 +194,7 @@ impl RuntimeAdapter for Hermes {
         format!("{HERMES} -p {agent}")
     }
 
-    fn builtin_agent(&self) -> Option<&'static str> {
+    fn builtin_agent(&self) -> Option<BuiltinAgent> {
         // Hermes's own `default` profile: the root of its home, which
         // `hermes` uses when no `-p` is given.
         Some(DEFAULT_PROFILE)
@@ -264,16 +233,7 @@ impl RuntimeAdapter for Hermes {
         // read, is never followed: `.hermes`, `profiles` or `.deleted` as a
         // link means "cannot tell", and a linked profile folder is not
         // listed.
-        let home = rustix::fs::open(
-            home,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| match e {
-            Errno::NOENT => unreadable("~", NotRead::Missing),
-            Errno::NOTDIR => unreadable("~", NotRead::NotAFolder),
-            e => io("~", e),
-        })?;
+        let home = open_home(home)?;
         let Some(hermes) = open_folder(&home, ".hermes", "~/.hermes")? else {
             return Ok(Vec::new());
         };
@@ -298,7 +258,7 @@ impl RuntimeAdapter for Hermes {
         }
         let mut names = Vec::new();
         for name in entries {
-            if name == "default" || !hermes_id(&name) {
+            if name == DEFAULT_PROFILE.as_str() || !hermes_id(&name) {
                 continue;
             }
             // Every Hermes id is a runtime agent name.
@@ -306,7 +266,7 @@ impl RuntimeAdapter for Hermes {
                 continue;
             };
             let shown = format!("{PROFILES}/{name}");
-            let profile = match open_folder(&profiles, &name, &shown) {
+            let profile = match open_folder(&profiles, name.as_str(), &shown) {
                 Ok(Some(fd)) => fd,
                 Ok(None) => continue,
                 Err(Unreadable {
@@ -317,9 +277,7 @@ impl RuntimeAdapter for Hermes {
             };
             let mut identity = false;
             for marker in PROFILE_MARKERS {
-                if entry_type(&profile, marker, &shown)?
-                    .is_some_and(|t| t.is_file() || t.is_symlink())
-                {
+                if file_or_link(&profile, marker, &shown)? {
                     identity = true;
                     break;
                 }
@@ -328,7 +286,7 @@ impl RuntimeAdapter for Hermes {
                 continue;
             }
             if let Some(deleted) = &deleted
-                && entry_type(deleted, &name, DELETED)?.is_some()
+                && entry_stat(deleted, name.as_str(), DELETED)?.is_some()
             {
                 continue;
             }
@@ -523,22 +481,51 @@ mod tests {
             ]))
         );
         let default: AgentName = "default".parse().unwrap();
-        assert_eq!(Hermes.builtin_agent(), Some("default"));
+        assert_eq!(Hermes.builtin_agent(), Some(DEFAULT_PROFILE));
         assert_eq!(Hermes.talk(&default), "hermes");
+        let facts = |n: &str| Hermes.agent_facts(&RuntimeAgentName::new(n).unwrap());
+        assert_eq!(facts("default").folder, Some(at(".hermes")));
+        let main_facts = facts("main");
+        assert_eq!(main_facts.folder, Some(at(".hermes/profiles/main")));
         assert_eq!(
-            Hermes.agent_facts("default").folder.as_deref(),
-            Some(Path::new(".hermes"))
+            main_facts.model,
+            Some(ValueAt {
+                file: at(".hermes/profiles/main/config.yaml"),
+                keys: &["model.default", "model.model"],
+            })
         );
-        let facts = Hermes.agent_facts("main");
         assert_eq!(
-            facts.folder.as_deref(),
-            Some(Path::new(".hermes/profiles/main"))
+            main_facts.activity,
+            [".hermes_history", "state.db", "state.db-wal"]
+                .map(|f| at(&format!(".hermes/profiles/main/{f}")))
         );
-        assert!(
-            facts
-                .activity
-                .iter()
-                .all(|f| f.starts_with(".hermes/profiles/main"))
+        // What `status` counts on its own; a rename here changes what it shows.
+        let parts: Vec<(DiskPart, String)> = Hermes
+            .disk_parts()
+            .into_iter()
+            .map(|(p, path)| (p, path.to_string()))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                (DiskPart::Runtime, "~/.hermes/hermes-agent"),
+                (DiskPart::Runtime, "~/.hermes/tools"),
+                (DiskPart::Runtime, "~/.hermes/installs"),
+                (DiskPart::Cache, "~/.hermes/cache"),
+                (DiskPart::Cache, "~/.npm"),
+                (DiskPart::Cache, "~/.cache"),
+                (DiskPart::Cache, "~/tmp"),
+            ]
+            .map(|(p, s)| (p, s.to_owned()))
+        );
+        let rt = Hermes.runtime_facts();
+        assert_eq!(
+            (rt.version, rt.login, rt.install),
+            (
+                None,
+                Some(at(".hermes/auth.json")),
+                Some(at(".hermes/hermes-agent"))
+            )
         );
         assert_eq!(
             Hermes.create_agent(&main),

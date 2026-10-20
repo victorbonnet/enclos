@@ -21,7 +21,7 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::policy::file::PolicyFile;
 use crate::runtime::{
-    HomeFile, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter,
+    BuiltinAgent, HomeFile, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter,
 };
 
 /// How `runtime install` ended.
@@ -56,15 +56,30 @@ pub enum Added {
     Adopted,
 }
 
-/// What `agent rm` did: the record is gone, and the files with it unless
-/// they were kept.
+/// What `agent rm` did. The record is gone either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRemoved {
-    pub kind: RuntimeKind,
-    /// Where the agent's files are, relative to the sandbox home.
-    pub files: String,
-    /// Whether the runtime's own command deleted them.
-    pub deleted: bool,
+pub enum AgentRemoved {
+    /// The runtime's own command deleted the agent and its files.
+    Deleted { kind: RuntimeKind },
+    /// Only the record went.
+    RecordOnly {
+        kind: RuntimeKind,
+        /// Where the agent's files are, relative to the sandbox home.
+        files: String,
+        why: FilesKept,
+    },
+}
+
+/// Why `agent rm` removed only the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesKept {
+    /// `--keep-data`: the runtime still has the agent.
+    Asked,
+    /// The runtime no longer listed the agent: nothing was left to delete.
+    RuntimeLacksIt,
+    /// The runtime has no command enclos can run to delete an agent: its
+    /// files stay.
+    NoDeleteCommand,
 }
 
 /// What an install would change, worked out without changing anything.
@@ -112,10 +127,11 @@ impl AgentDiff {
     pub(crate) fn compare(
         found: &[RuntimeAgentName],
         tracked: &[AgentRecord],
-        builtin: Option<&str>,
+        builtin: Option<BuiltinAgent>,
     ) -> AgentDiff {
         let mut diff = AgentDiff::default();
-        for name in found.iter().filter(|n| Some(n.as_str()) != builtin) {
+        let builtin = builtin.map(BuiltinAgent::runtime_name);
+        for name in found.iter().filter(|n| Some(*n) != builtin.as_ref()) {
             match name.as_str().parse::<AgentName>() {
                 Ok(agent) if tracked.iter().any(|t| t.name == agent) => {}
                 Ok(agent) => diff.untracked.push(agent),
@@ -183,11 +199,15 @@ impl Engine {
     /// The runtime's built-in agent comes and goes with the runtime: enclos
     /// neither adds nor removes it.
     fn refuse_builtin(&self, name: &SandboxName, kind: RuntimeKind, agent: &str) -> Result<()> {
-        if adapter(kind).builtin_agent() == Some(agent) {
+        let runtime = adapter(kind);
+        if let Some(builtin) = runtime.builtin_agent()
+            && builtin.as_str() == agent
+        {
             return Err(Error::Session {
                 what: format!(
-                    "agent `{agent}` is {}'s built-in agent: it exists as long as the runtime is installed in sandbox {name}, so enclos neither adds nor removes it",
-                    kind.display_name()
+                    "agent `{agent}` is {}'s built-in agent: it exists as long as the runtime is installed in sandbox {name}, so enclos neither adds nor removes it. Talk to it with `enclos connect {name} -- {}`",
+                    kind.display_name(),
+                    runtime.talk(&builtin.agent_name())
                 ),
             });
         }
@@ -195,7 +215,7 @@ impl Engine {
     }
 
     /// The runtime's built-in agent in this sandbox, if it has one.
-    pub fn builtin_agent(&self, name: &SandboxName) -> Result<Option<&'static str>> {
+    pub fn builtin_agent(&self, name: &SandboxName) -> Result<Option<BuiltinAgent>> {
         Ok(self
             .runtime(name)?
             .and_then(|kind| adapter(kind).builtin_agent()))
@@ -666,9 +686,12 @@ impl Engine {
     }
 
     /// Removes an agent: its files, with the runtime's own command run in
-    /// the sandbox (design §10), then its record. With `keep_data`, or when
-    /// the runtime has no such command or no longer has the agent, only the
-    /// record goes. Deleting files asks for confirmation first.
+    /// the sandbox (design §10), then its record. Only the record goes with
+    /// `keep_data`, when the runtime no longer lists the agent, or when it
+    /// has no command to delete one. Refuses the runtime's built-in agent,
+    /// and refuses when the runtime's list cannot be read (ADR 0023), since
+    /// enclos cannot tell whether files are left, unless `keep_data` asks
+    /// for the record alone. Deleting files asks for confirmation first.
     pub fn remove_agent(
         &self,
         by: &Actor,
@@ -679,74 +702,116 @@ impl Engine {
     ) -> Result<Planned<AgentRemoved>> {
         self.agent_of(name, agent.as_str())?;
         let kind = self.runtime_of(name)?;
+        let shown = kind.display_name();
         let runtime = adapter(kind);
-        // Whether the runtime still has the files to delete: not when the
-        // list says it does not, and not known when it cannot be read, in
-        // which case only the record can go (ADR 0023).
-        let delete = match (keep_data, runtime.agents_in(&self.sandbox_home(name))) {
-            (true, _) => None,
-            (false, Ok(found)) if found.contains(&RuntimeAgentName::from(agent)) => {
-                runtime.delete_agent(agent)
-            }
-            (false, Ok(_)) => None,
-            (false, Err(why)) => {
-                return Err(Error::Session {
-                    what: format!(
-                        "enclos cannot read {}'s agents in sandbox {name} ({why}), so it cannot tell whether agent {agent} still has files to delete. `--keep-data` removes only the record",
-                        kind.display_name()
-                    ),
-                });
-            }
+        let home = self.sandbox_home(name);
+        let listed = |found: &[RuntimeAgentName]| found.contains(&RuntimeAgentName::from(agent));
+        let unreadable = |why: &Unreadable| Error::Session {
+            what: format!(
+                "enclos cannot read {shown}'s agents in sandbox {name} ({why}), so it cannot tell whether agent {agent} still has files to delete. `--keep-data` removes only the record"
+            ),
         };
+        let delete = match (keep_data, runtime.agents_in(&home)) {
+            (true, _) => Err(FilesKept::Asked),
+            (false, Ok(found)) if listed(&found) => runtime
+                .delete_agent(agent)
+                .ok_or(FilesKept::NoDeleteCommand),
+            (false, Ok(_)) => Err(FilesKept::RuntimeLacksIt),
+            (false, Err(why)) => return Err(unreadable(&why)),
+        };
+        let files = runtime.agent_files(agent);
         match confirm {
             Confirm::DryRun => {
                 let what = match &delete {
-                    Some(_) => format!(
-                        "delete agent {name}/{agent} and its files, with {kind}'s own command"
+                    Ok(_) => format!(
+                        "delete agent {name}/{agent} and its files, with {shown}'s own command"
                     ),
-                    None => format!("remove the record of agent {name}/{agent}; its files stay"),
+                    Err(FilesKept::Asked) => {
+                        format!(
+                            "remove the record of agent {name}/{agent}; its files stay ({files})"
+                        )
+                    }
+                    Err(FilesKept::RuntimeLacksIt) => format!(
+                        "remove the record of agent {name}/{agent}, which {shown} no longer has"
+                    ),
+                    Err(FilesKept::NoDeleteCommand) => format!(
+                        "remove the record of agent {name}/{agent}; {shown} has no command enclos can run to delete it, so its files stay ({files})"
+                    ),
                 };
                 return Ok(Planned::DryRun(Plan {
                     changes: vec![what],
                     ..Plan::default()
                 }));
             }
-            Confirm::Ask if delete.is_some() => {
+            Confirm::Ask if delete.is_ok() => {
                 return Err(Error::NeedsConfirmation {
                     what: format!("deleting agent {name}/{agent} and its files"),
                 });
             }
             _ => {}
         }
-        let files = runtime.agent_files(agent);
-        let deleted = delete.is_some();
-        if let Some(command) = delete {
-            let end = self.run_in_sandbox(by, name, command, "agent rm run")?;
-            if end.exit != 0 {
-                return Err(Error::Session {
-                    what: format!(
-                        "{kind} could not delete agent {agent} (exit {}); its record stays. `--keep-data` removes only the record",
-                        end.exit
-                    ),
-                });
+        let deleted = match delete {
+            Ok(command) => {
+                // The runtime's command runs as its own session, which takes
+                // the lock itself; the record goes after it, below.
+                let end = self.run_in_sandbox(by, name, command, "agent rm run")?;
+                if end.exit != 0 {
+                    let how = match end.signal {
+                        Some(signal) => format!("was ended by signal {signal}"),
+                        None => format!("exited with {}", end.exit),
+                    };
+                    return Err(Error::Session {
+                        what: format!(
+                            "{shown}'s command to delete agent {agent} {how}; its record stays. Look at what is left with {shown}'s own commands in `enclos connect {name}`; `--keep-data` removes only the record"
+                        ),
+                    });
+                }
+                match runtime.agents_in(&home) {
+                    Ok(found) if listed(&found) => {
+                        return Err(Error::Session {
+                            what: format!(
+                                "{shown}'s command to delete agent {agent} exited 0, but {shown} still lists it; its record stays"
+                            ),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(why) => return Err(unreadable(&why)),
+                }
+                Ok(())
             }
-        }
+            Err(why) => Err(why),
+        };
         self.write(
             by,
             "agent rm",
             Some(format!("{name}/{agent}")),
-            |_| "removed".to_owned(),
+            |_| {
+                match deleted {
+                    Ok(()) => "deleted",
+                    Err(_) => "removed the record",
+                }
+                .to_owned()
+            },
             |lock| {
                 self.agent_of(name, agent.as_str())?;
                 self.state
                     .remove_agent(lock, name, agent)
                     .map_err(Into::into)
             },
-        )?;
-        Ok(Planned::Done(AgentRemoved {
-            kind,
-            files,
-            deleted,
+        )
+        .map_err(|e| match deleted {
+            // The files are gone already: say so, so a second try is not
+            // read as a runtime that never had the agent.
+            Ok(()) => Error::Session {
+                what: format!(
+                    "{shown} deleted agent {agent} and its files, but enclos could not remove its record: {e}. Run `enclos agent rm {name}/{agent}` again: it removes the record"
+                ),
+            },
+            Err(_) => e,
+        })?;
+        Ok(Planned::Done(match deleted {
+            Ok(()) => AgentRemoved::Deleted { kind },
+            Err(why) => AgentRemoved::RecordOnly { kind, files, why },
         }))
     }
 }

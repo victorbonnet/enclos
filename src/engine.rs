@@ -18,13 +18,13 @@ pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use runtime::home_files_script;
-pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, InstallEnd};
+pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 pub use status::{
-    AgentStatus, Disk, IDLE_DAYS, RuntimeStatus, SandboxStatus, ServiceLine, Size, StatusView,
-    Suggestion, human_bytes,
+    AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, Presence, RuntimeStatus,
+    SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted, human_bytes,
 };
 
 use std::path::PathBuf;

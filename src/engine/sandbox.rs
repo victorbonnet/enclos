@@ -15,7 +15,7 @@ use crate::model::sandbox::{
 };
 use crate::model::session::{Member, SessionId, SessionRecord};
 use crate::service::ServiceLabel;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What `enclos sandbox create` takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,25 +165,26 @@ impl Engine {
         self.view(record)
     }
 
+    /// The file the active policy compiles to: a session started under
+    /// another one runs file and program rules the active policy no longer
+    /// has. A sandbox this host cannot compile for runs nothing. Compiled in
+    /// memory only: nothing is written.
+    pub(super) fn active_compiled(&self, record: &SandboxRecord) -> Option<PathBuf> {
+        self.compiled_file(&record.name, record.proxy_port)
+            .ok()
+            .map(|(file, _)| file)
+    }
+
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
-        // The file the active policy compiles to: a session started under
-        // another one runs file and program rules the active policy no
-        // longer has. A sandbox this host cannot compile for runs nothing.
-        let active = self
-            .compiled_file(&record.name, record.proxy_port)
-            .ok()
-            .map(|(file, _)| file);
+        let active = self.active_compiled(&record);
         let sessions = self
             .state
             .sessions(&record.name, true)?
             .into_iter()
             .map(|session| {
                 let members = members(&session)?;
-                let needs_restart = match (&session.compiled, &active) {
-                    (Some(at_launch), Some(active)) => Path::new(at_launch) != active,
-                    _ => false,
-                };
+                let needs_restart = needs_restart(&session, active.as_deref());
                 Ok(SessionView {
                     session,
                     members,
@@ -367,5 +368,15 @@ impl Engine {
             SandboxState::Failed { .. } => Error::SandboxNotStopped { name },
             _ => Error::SandboxRunning { name },
         })
+    }
+}
+
+/// Whether a running session needs a restart to run under the active
+/// policy: it started under another compiled file. The proxy has none and
+/// applies network rules live, so it never does.
+pub(super) fn needs_restart(session: &SessionRecord, active: Option<&Path>) -> bool {
+    match (&session.compiled, active) {
+        (Some(at_launch), Some(active)) => Path::new(at_launch) != active,
+        _ => false,
     }
 }

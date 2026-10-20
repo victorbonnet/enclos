@@ -255,6 +255,25 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         store.last_event(&name).unwrap(),
         Some("2026-01-01T10:00:06Z".parse().unwrap())
     );
+    // Another sandbox's later events are its own; one without any has none.
+    store.put(&lock, &record("other")).unwrap();
+    let other: SandboxName = "other".parse().unwrap();
+    assert_eq!(store.last_event(&other).unwrap(), None);
+    store
+        .record(&NetEvent {
+            sandbox: other.clone(),
+            ..event(
+                "2026-01-02T00:00:00Z",
+                "x.example.com",
+                Verdict::Allowed,
+                None,
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store.last_event(&name).unwrap(),
+        Some("2026-01-01T10:00:06Z".parse().unwrap())
+    );
     let since = "2026-01-01T10:00:05.200Z".parse().unwrap();
     assert_eq!(store.events(&name, Some(since)).unwrap().len(), 2);
 
