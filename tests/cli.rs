@@ -457,7 +457,13 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     assert_ne!(rm.code(), 0, "{}", rm.stdout());
 
     // Once the sleep ends, stop finds the group empty and ends the session.
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert!(eventually(|| {
+        !home
+            .run(&["sandbox", "show", "home"])
+            .ok()
+            .stdout()
+            .contains("sleep")
+    }));
     home.run(&["sandbox", "stop", "home"]).ok();
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
     assert!(show.contains("no sessions running"), "{show}");
@@ -514,11 +520,11 @@ fn eventually(mut check: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// The pid `sandbox show` lists under the sandbox's running proxy session.
+/// The pid `sandbox show` lists under the sandbox's running proxy.
 #[cfg(target_os = "macos")]
 fn proxy_pid(home: &Home) -> Option<u32> {
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
-    let mut lines = show.lines().skip_while(|l| !l.contains(" proxy:"));
+    let mut lines = show.lines().skip_while(|l| !l.contains("  proxy, session"));
     lines.next()?;
     let line = lines.next()?.trim();
     line.strip_prefix("pid ")?
@@ -656,4 +662,46 @@ fn stop_ends_an_interactive_shell_and_its_jobs() {
     assert!(eventually(|| gone(sleep)));
     assert!(eventually(|| terminal.0.try_wait().unwrap().is_some()));
     drop(input);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_outlives_ctrl_c_and_records_the_programs_end() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    // Without a terminal the program runs in a group of its own: the INT
+    // sent below reaches this enclos alone, as a terminal's Ctrl-C reaches
+    // it beside a program that handles it and goes on.
+    let script = "/bin/sleep 2; exit 3";
+    let mut connect = KillOnDrop(
+        home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let audit = || home.run(&["audit"]).ok().stdout();
+    // The connect entry closes once the session is recorded.
+    assert!(
+        eventually(|| audit().contains("ok: session 2")),
+        "{}",
+        audit()
+    );
+    // The enclos this test started.
+    Command::new("/bin/kill")
+        .args(["-INT", &connect.0.id().to_string()])
+        .status()
+        .unwrap();
+    let mut status = None;
+    assert!(eventually(|| {
+        status = connect.0.try_wait().unwrap();
+        status.is_some()
+    }));
+    assert_eq!(status.unwrap().code(), Some(3));
+    assert!(audit().contains("ok: exit 3"), "{}", audit());
 }

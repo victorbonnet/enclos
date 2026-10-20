@@ -37,10 +37,10 @@ pub fn end(conn: &Connection, id: SessionId, at: Timestamp) -> rusqlite::Result<
     Ok(())
 }
 
-/// Replaces the members recorded for a session.
+/// Replaces the members recorded for a session that has not ended.
 pub fn track(conn: &Connection, id: SessionId, tracked: &[ProcessRef]) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE sessions SET tracked = ?2 WHERE id = ?1",
+        "UPDATE sessions SET tracked = ?2 WHERE id = ?1 AND ended_at IS NULL",
         params![id.0, encode(tracked)],
     )?;
     Ok(())

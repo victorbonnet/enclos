@@ -445,7 +445,7 @@ mod sandbox {
     use crate::engine::SandboxSpec;
     use crate::lifecycle::process::reference;
     use crate::model::sandbox::{SandboxRecord, SandboxState};
-    use crate::model::session::{SessionId, SessionKind, SessionRecord};
+    use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
     fn spec(name: &str) -> SandboxSpec {
         SandboxSpec {
@@ -549,8 +549,12 @@ mod sandbox {
             version: 1,
             snapshot: engine.policy(&name).unwrap().snapshot.id,
             compiled: None,
-            root: reference(std::process::id()).unwrap(),
-            pgid: std::process::id(),
+            // Matches no process: this test never stops it.
+            root: ProcessRef {
+                pid: u32::MAX,
+                started: "never".into(),
+            },
+            pgid: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -631,6 +635,117 @@ mod sandbox {
         );
         assert!(engine.state.sessions(&name, false).unwrap().is_empty());
         assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    #[test]
+    fn dry_runs_of_create_and_rm_change_nothing() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let entries = engine.audit(None).unwrap().len();
+        let Planned::DryRun(_) = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run created a sandbox");
+        };
+        let Planned::DryRun(_) = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run removed a sandbox");
+        };
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        assert!(engine.layout.sandbox_home("home").is_dir());
+        assert_eq!(engine.list_sandboxes().unwrap().len(), 1);
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    #[test]
+    fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        // A program in a group made for it, which leaves a sleep there and
+        // exits once its input closes: the sleep is only counted.
+        let mut program = std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let session = SessionRecord {
+            id: SessionId(0),
+            sandbox: name.clone(),
+            kind: SessionKind::Interactive,
+            version: 1,
+            snapshot: engine.policy(&name).unwrap().snapshot.id,
+            compiled: None,
+            root: reference(program.id()).unwrap().unwrap(),
+            pgid: Some(program.id()),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let lock = engine.state.lock().unwrap();
+        let id = engine.state.put_session(&lock, &session).unwrap();
+        drop(lock);
+        let start = std::time::Instant::now();
+        let sleep = loop {
+            let view = engine.show_sandbox(&name).unwrap();
+            if let Some(m) = view.sessions[0]
+                .members
+                .iter()
+                .find(|m| m.pid != program.id())
+            {
+                break m.clone();
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        program.stdin.take().unwrap().write_all(b"\n").unwrap();
+        program.wait().unwrap();
+
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert!(report.stopped.is_empty());
+        let survivors = &report.survivors;
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].0, id);
+        assert_eq!(survivors[0].1[0].member, sleep);
+        assert_eq!(
+            survivors[0].1[0].why,
+            crate::lifecycle::stop::Why::NotSignalled
+        );
+        assert!(matches!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            SandboxState::Failed { .. }
+        ));
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SandboxNotStopped { .. }), "{err}");
+
+        // Once the user ends it, stop finds the session empty and ends it.
+        let sleep = ProcessRef {
+            pid: sleep.pid,
+            started: sleep.started,
+        };
+        crate::lifecycle::process::signal_process(&sleep, crate::lifecycle::process::Signal::Kill)
+            .unwrap();
+        let start = std::time::Instant::now();
+        while crate::lifecycle::process::is_same(&sleep).unwrap() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert_eq!(report.stopped, [id]);
+        assert_eq!(
+            engine.show_sandbox(&name).unwrap().record.state,
+            SandboxState::Stopped
+        );
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+                .unwrap(),
+        );
     }
 
     #[test]

@@ -4,54 +4,109 @@
 //! Signalling is narrow on purpose. enclos signals only a session's sure
 //! members (see `members`): processes it recorded, and what they started.
 //! A group is signalled only through its leader. Right before each signal,
-//! it checks that the target is still the same process: same pid and same
-//! start time, so a pid reused by an unrelated process is never signalled.
+//! it checks that the target is still the same process, same pid and same
+//! start time, so a pid already reused by an unrelated process is not
+//! signalled. The check narrows the window to the moment between it and the
+//! signal; it cannot close it.
+//!
+//! A `ps` that fails is an error, never an empty answer: "no process" from a
+//! listing that did not run would end sessions whose members still run.
 
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use crate::model::session::ProcessRef;
 
-/// `ps`, reading dates in UTC and the C locale, so that a start time is
-/// the same text whoever asks: start times are compared as text.
-fn ps() -> Command {
-    let mut ps = Command::new("/bin/ps");
-    ps.env("TZ", "UTC0")
+/// `ps` could not answer.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot look at processes with /bin/ps: {0}")]
+pub struct PsError(String);
+
+/// Runs `ps`, reading dates in UTC and the C locale, so that a start time
+/// reads the same whoever asks.
+fn ps(args: &[&str]) -> Result<Output, PsError> {
+    Command::new("/bin/ps")
+        .env("TZ", "UTC0")
         .env("LC_ALL", "C")
-        .stderr(Stdio::null());
-    ps
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PsError(e.to_string()))
+}
+
+/// The five words of `lstart`, one space apart. `ps` pads a day before the
+/// 10th with a second space; start times are compared as text, so both
+/// readers below must spell them alike.
+fn lstart<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<String> {
+    let words: Vec<&str> = words.take(5).collect();
+    (words.len() == 5).then(|| words.join(" "))
+}
+
+/// The state and start time in one line of `ps -o stat=,lstart=`.
+fn parse_start(line: &str) -> Option<(String, String)> {
+    let mut words = line.split_whitespace();
+    let stat = words.next()?.to_owned();
+    Some((stat, lstart(&mut words)?))
+}
+
+/// The state and start time of `pid`, or `None` when no such process exists.
+fn stat_and_start(pid: u32) -> Result<Option<(String, String)>, PsError> {
+    let out = ps(&["-o", "stat=,lstart=", "-p", &pid.to_string()])?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        // For a pid that does not exist, `ps` prints nothing and fails; any
+        // other failure says why on stderr.
+        let why = String::from_utf8_lossy(&out.stderr);
+        return match why.trim() {
+            "" => Ok(None),
+            why => Err(PsError(why.to_owned())),
+        };
+    }
+    parse_start(&text)
+        .map(Some)
+        .ok_or_else(|| PsError(format!("unexpected output `{}`", text.trim())))
 }
 
 /// The start time of `pid`, or `None` when no such process runs. A process
 /// that exited but was not yet reaped by its parent (a zombie) runs
 /// nothing and holds nothing, so it does not count as running.
-pub fn start_time(pid: u32) -> Option<String> {
-    let out = ps()
-        .args(["-o", "stat=,lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (stat, started) = text.trim().split_once(char::is_whitespace)?;
-    (out.status.success() && !stat.starts_with('Z')).then(|| started.trim().to_owned())
+pub fn start_time(pid: u32) -> Result<Option<String>, PsError> {
+    Ok(
+        stat_and_start(pid)?
+            .and_then(|(stat, started)| (!stat.starts_with('Z')).then_some(started)),
+    )
 }
 
 /// A reference to a process that is running now.
-pub fn reference(pid: u32) -> Option<ProcessRef> {
-    start_time(pid).map(|started| ProcessRef { pid, started })
+pub fn reference(pid: u32) -> Result<Option<ProcessRef>, PsError> {
+    Ok(start_time(pid)?.map(|started| ProcessRef { pid, started }))
+}
+
+/// A reference to `child`, which this process started and has not waited
+/// for. Until it is waited for, its pid cannot be reused, so it is read even
+/// when the program already exited.
+pub fn reference_of_child(child: &Child) -> Result<ProcessRef, PsError> {
+    let pid = child.id();
+    let (_, started) = stat_and_start(pid)?
+        .ok_or_else(|| PsError(format!("pid {pid}, just started, is not listed")))?;
+    Ok(ProcessRef { pid, started })
 }
 
 /// Whether `process` is still the very process that was recorded.
-pub fn is_same(process: &ProcessRef) -> bool {
-    start_time(process.pid).is_some_and(|now| now == process.started)
+pub fn is_same(process: &ProcessRef) -> Result<bool, PsError> {
+    Ok(start_time(process.pid)?.is_some_and(|now| now == process.started))
 }
 
-/// The process group of `pid`.
-pub fn group_of(pid: u32) -> Option<u32> {
-    let out = ps()
-        .args(["-o", "pgid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+/// The process group of `pid`, or `None` when no such process exists.
+pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
+    let out = ps(&["-o", "pgid=", "-p", &pid.to_string()])?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    match text.trim() {
+        "" => Ok(None),
+        pgid => pgid
+            .parse()
+            .map(Some)
+            .map_err(|_| PsError(format!("unexpected group `{pgid}`"))),
+    }
 }
 
 /// A process as one listing shows it.
@@ -64,37 +119,50 @@ pub struct Proc {
     pub command: String,
 }
 
-/// Every running process. Read-only. Zombies run nothing and are left out.
-pub fn processes() -> Vec<Proc> {
-    // In a group of its own, so `ps` is never in the group of the process
-    // asking.
-    let Ok(out) = ps()
-        .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=,comm="])
-        .process_group(0)
-        .output()
-    else {
-        return Vec::new();
+/// One line of `ps -o pid=,ppid=,pgid=,stat=,lstart=,comm=`, and whether
+/// the process is a zombie.
+fn parse_listing(line: &str) -> Option<(Proc, bool)> {
+    let mut words = line.split_whitespace();
+    let pid: u32 = words.next()?.parse().ok()?;
+    let ppid: u32 = words.next()?.parse().ok()?;
+    let pgid: u32 = words.next()?.parse().ok()?;
+    let zombie = words.next()?.starts_with('Z');
+    let started = lstart(&mut words)?;
+    let command = words.collect::<Vec<_>>().join(" ");
+    let proc = Proc {
+        pid,
+        ppid,
+        pgid,
+        started,
+        command,
     };
-    String::from_utf8_lossy(&out.stdout)
+    Some((proc, zombie))
+}
+
+/// Every running process. Read-only. Zombies run nothing and are left out.
+pub fn processes() -> Result<Vec<Proc>, PsError> {
+    let out = ps(&["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=,comm="])?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        return Err(PsError(format!("{} {}", out.status, why.trim())));
+    }
+    let listed: Vec<(Proc, bool)> = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            let pid: u32 = words.next()?.parse().ok()?;
-            let ppid: u32 = words.next()?.parse().ok()?;
-            let pgid: u32 = words.next()?.parse().ok()?;
-            let zombie = words.next()?.starts_with('Z');
-            // lstart is five words: "Sun Oct 18 15:03:21 2026".
-            let started = words.by_ref().take(5).collect::<Vec<_>>().join(" ");
-            let command = words.collect::<Vec<_>>().join(" ");
-            (!zombie).then_some(Proc {
-                pid,
-                ppid,
-                pgid,
-                started,
-                command,
-            })
-        })
-        .collect()
+        .filter_map(parse_listing)
+        .collect();
+    // A listing that misses the process asking cannot be read, or is not
+    // the whole listing.
+    let me = std::process::id();
+    if !listed.iter().any(|(p, _)| p.pid == me) {
+        return Err(PsError(format!(
+            "the listing does not show pid {me}, the caller"
+        )));
+    }
+    Ok(listed
+        .into_iter()
+        .filter(|(_, zombie)| !zombie)
+        .map(|(p, _)| p)
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,33 +171,69 @@ pub enum Signal {
     Kill,
 }
 
+/// What became of a signal enclos meant to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signalled {
+    Sent,
+    /// The target is no longer the recorded process: it exited, or its pid
+    /// was reused. Nothing was sent.
+    Gone,
+    /// The leader no longer leads the group. Nothing was sent.
+    NotLeader,
+    /// `kill` refused or failed, with why.
+    Failed(String),
+}
+
 /// Sends `signal` to the process group whose leader is `leader`, only if
 /// that leader is still the recorded process and leads its own group.
-/// Returns whether it was sent.
-pub fn signal_group(leader: &ProcessRef, pgid: u32, signal: Signal) -> bool {
-    if leader.pid != pgid || !is_same(leader) || group_of(leader.pid) != Some(pgid) {
-        return false;
+pub fn signal_group(leader: &ProcessRef, pgid: u32, signal: Signal) -> Result<Signalled, PsError> {
+    if leader.pid != pgid {
+        return Ok(Signalled::NotLeader);
     }
-    kill(signal, &format!("-{pgid}"))
+    if !is_same(leader)? {
+        return Ok(Signalled::Gone);
+    }
+    if group_of(leader.pid)? != Some(pgid) {
+        return Ok(Signalled::NotLeader);
+    }
+    Ok(kill(signal, -i64::from(pgid)))
 }
 
 /// Sends `signal` to `process` alone, only if it is still the recorded
-/// process. Returns whether it was sent.
-pub fn signal_process(process: &ProcessRef, signal: Signal) -> bool {
-    is_same(process) && kill(signal, &process.pid.to_string())
+/// process.
+pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
+    if !is_same(process)? {
+        return Ok(Signalled::Gone);
+    }
+    Ok(kill(signal, i64::from(process.pid)))
 }
 
-fn kill(signal: Signal, target: &str) -> bool {
+/// Targets `kill` reads as more than one process of a session: 0 is the
+/// caller's own group and -1 every process the user owns; 1 is launchd.
+fn never_signalled(target: i64) -> bool {
+    target.abs() <= 1
+}
+
+fn kill(signal: Signal, target: i64) -> Signalled {
+    if never_signalled(target) {
+        return Signalled::Failed(format!("enclos never signals {target}"));
+    }
     let name = match signal {
         Signal::Term => "TERM",
         Signal::Kill => "KILL",
     };
-    Command::new("/bin/kill")
-        .args(["-s", name, "--", target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    match Command::new("/bin/kill")
+        .args(["-s", name, "--", &target.to_string()])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => Signalled::Sent,
+        Ok(out) => Signalled::Failed(match String::from_utf8_lossy(&out.stderr).trim() {
+            "" => out.status.to_string(),
+            why => why.to_owned(),
+        }),
+        Err(e) => Signalled::Failed(format!("cannot run /bin/kill: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +244,7 @@ mod tests {
 
     /// A `sleep` this test starts in a group of its own: the only kind of
     /// process these tests signal.
-    fn own_group() -> std::process::Child {
+    fn own_group() -> Child {
         Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -148,7 +252,7 @@ mod tests {
             .unwrap()
     }
 
-    fn wait_gone(child: &mut std::process::Child) -> bool {
+    fn wait_gone(child: &mut Child) -> bool {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             if child.try_wait().unwrap().is_some() {
@@ -159,41 +263,78 @@ mod tests {
         false
     }
 
+    fn now(pid: u32) -> ProcessRef {
+        reference(pid).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_day_before_the_10th_reads_the_same_in_both_readers() {
+        // `ps` pads the day: the 8th prints as "Oct  8".
+        let (stat, alone) = parse_start("Ss   Thu Oct  8 09:31:55 2026   ").unwrap();
+        let (listed, zombie) =
+            parse_listing(" 3701     1  3701 Ss   Thu Oct  8 09:31:55 2026     /usr/libexec/x y")
+                .unwrap();
+        assert_eq!(stat, "Ss");
+        assert!(!zombie);
+        assert_eq!(alone, "Thu Oct 8 09:31:55 2026");
+        assert_eq!(listed.started, alone);
+        assert_eq!((listed.pid, listed.ppid, listed.pgid), (3701, 1, 3701));
+        assert_eq!(listed.command, "/usr/libexec/x y");
+    }
+
     #[test]
     fn a_recorded_group_is_found_and_stopped() {
         let mut child = own_group();
-        let leader = reference(child.id()).unwrap();
-        assert!(is_same(&leader));
-        assert_eq!(group_of(child.id()), Some(child.id()));
+        let leader = now(child.id());
+        assert!(is_same(&leader).unwrap());
+        assert_eq!(group_of(child.id()).unwrap(), Some(child.id()));
         assert!(
-            processes().iter().any(|p| p.pid == child.id()
+            processes().unwrap().iter().any(|p| p.pid == child.id()
                 && p.pgid == child.id()
                 && p.started == leader.started)
         );
-        assert!(signal_group(&leader, child.id(), Signal::Term));
+        assert_eq!(
+            signal_group(&leader, child.id(), Signal::Term).unwrap(),
+            Signalled::Sent
+        );
         assert!(wait_gone(&mut child));
-        assert!(!is_same(&leader));
+        assert!(!is_same(&leader).unwrap());
     }
 
     #[test]
     fn a_process_that_exited_is_not_the_same_even_unreaped() {
         let mut child = own_group();
-        let recorded = reference(child.id()).unwrap();
+        let recorded = now(child.id());
         child.kill().unwrap();
         // Not waited for: the process stays a zombie, with its pid and
         // start time, until `wait` below.
         let start = Instant::now();
-        while is_same(&recorded) && start.elapsed() < Duration::from_secs(5) {
+        while is_same(&recorded).unwrap() && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!is_same(&recorded));
+        assert!(!is_same(&recorded).unwrap());
+        assert!(!processes().unwrap().iter().any(|p| p.pid == child.id()));
         let _ = child.wait();
+    }
+
+    #[test]
+    fn a_child_that_exited_at_once_still_has_a_reference_until_waited_for() {
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let start = Instant::now();
+        while start_time(child.id()).unwrap().is_some() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let recorded = reference_of_child(&child).unwrap();
+        assert_eq!(recorded.pid, child.id());
+        let _ = child.wait();
+        assert_eq!(start_time(recorded.pid).unwrap(), None);
     }
 
     #[test]
     fn start_times_read_in_utc_whatever_the_callers_time_zone() {
         let mut child = own_group();
-        let started = start_time(child.id()).unwrap();
+        let started = start_time(child.id()).unwrap().unwrap();
         let read = jiff::civil::DateTime::strptime("%a %b %e %H:%M:%S %Y", &started)
             .unwrap()
             .to_zoned(jiff::tz::TimeZone::UTC)
@@ -208,14 +349,20 @@ mod tests {
     #[test]
     fn a_process_is_signalled_alone_only_while_it_is_the_recorded_one() {
         let mut child = own_group();
-        let recorded = reference(child.id()).unwrap();
+        let recorded = now(child.id());
         let stale = ProcessRef {
             pid: child.id(),
-            started: "Thu Jan  1 00:00:00 1970".into(),
+            started: "Thu Jan 1 00:00:00 1970".into(),
         };
-        assert!(!signal_process(&stale, Signal::Term));
+        assert_eq!(
+            signal_process(&stale, Signal::Term).unwrap(),
+            Signalled::Gone
+        );
         assert!(child.try_wait().unwrap().is_none());
-        assert!(signal_process(&recorded, Signal::Term));
+        assert_eq!(
+            signal_process(&recorded, Signal::Term).unwrap(),
+            Signalled::Sent
+        );
         assert!(wait_gone(&mut child));
     }
 
@@ -225,9 +372,12 @@ mod tests {
         // The same pid, recorded at another time: as after pid reuse.
         let stale = ProcessRef {
             pid: child.id(),
-            started: "Thu Jan  1 00:00:00 1970".into(),
+            started: "Thu Jan 1 00:00:00 1970".into(),
         };
-        assert!(!signal_group(&stale, child.id(), Signal::Term));
+        assert_eq!(
+            signal_group(&stale, child.id(), Signal::Term).unwrap(),
+            Signalled::Gone
+        );
         assert!(child.try_wait().unwrap().is_none());
         let _ = child.kill();
         let _ = child.wait();
@@ -236,10 +386,24 @@ mod tests {
     #[test]
     fn a_process_that_does_not_lead_the_group_is_never_used_to_signal_it() {
         let mut child = own_group();
-        let leader = reference(child.id()).unwrap();
+        let leader = now(child.id());
         // Our own pid is not the group's leader.
-        assert!(!signal_group(&leader, std::process::id(), Signal::Term));
+        assert_eq!(
+            signal_group(&leader, std::process::id(), Signal::Term).unwrap(),
+            Signalled::NotLeader
+        );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn targets_meaning_more_than_one_process_are_never_signalled() {
+        // Checked on the rule alone: a test that sent them would signal the
+        // test runner's group, or every process of the user.
+        for target in [0, -1, 1] {
+            assert!(never_signalled(target), "{target}");
+        }
+        assert!(!never_signalled(-4242));
+        assert!(!never_signalled(4242));
     }
 }

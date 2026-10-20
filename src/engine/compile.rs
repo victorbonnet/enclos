@@ -50,18 +50,32 @@ impl Engine {
     /// a cut-off Seatbelt profile can still be valid and leave out every
     /// restriction after the cut.
     pub fn compile_policy(&self, name: &SandboxName, proxy_port: u16) -> Result<PathBuf> {
+        let (file, text) = self.compiled_file(name, proxy_port)?;
+        if std::fs::read(&file).ok().as_deref() != Some(text.as_bytes()) {
+            let dir = file.parent().unwrap_or(&file);
+            std::fs::create_dir_all(dir).map_err(io(dir))?;
+            publish(&file, text.as_bytes())?;
+        }
+        Ok(file)
+    }
+
+    /// The file the active policy compiles to, and its text, without
+    /// writing it.
+    pub(crate) fn compiled_file(
+        &self,
+        name: &SandboxName,
+        proxy_port: u16,
+    ) -> Result<(PathBuf, String)> {
         let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
         let ctx = self.sandbox_context(name, proxy_port);
         let compiled = backend.compile(&policy, &ctx)?;
         let digest = sha256_hex(compiled.text.as_bytes());
-        let dir = ctx.dir.join("compiled");
-        let file = dir.join(format!("{}.{}", &digest[..16], compiled.extension));
-        if std::fs::read(&file).ok().as_deref() != Some(compiled.text.as_bytes()) {
-            std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-            publish(&file, compiled.text.as_bytes())?;
-        }
-        Ok(file)
+        let file =
+            ctx.dir
+                .join("compiled")
+                .join(format!("{}.{}", &digest[..16], compiled.extension));
+        Ok((file, compiled.text))
     }
 }
 

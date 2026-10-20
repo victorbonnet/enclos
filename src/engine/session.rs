@@ -5,31 +5,61 @@ use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
+
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT};
 
 use super::Engine;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
+use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{group_of, is_same, processes, reference};
+use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
-use crate::state::StateLock;
+use crate::state::{StateError, StateLock};
 
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
     pub session: SessionId,
-    /// The program's exit status; 1 when a signal ended it.
+    /// The program's exit status, or, as a shell reports it, 128 plus the
+    /// signal that ended it.
     pub exit: i32,
-    /// Processes the program left running in the session's group. While
-    /// there are any, the session stays open.
-    pub left: Vec<Member>,
+    /// The signal that ended the program, if one did.
+    pub signal: Option<i32>,
+    pub left: Left,
+    /// Problems met while recording the session's members, each said once.
+    pub notes: Vec<String>,
+}
+
+/// What the program left running when it exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Left {
+    /// Nothing: the session ended.
+    Nothing,
+    /// Members that still run. The session stays open, so `show` lists them
+    /// and `rm` refuses, until `enclos sandbox stop` finds them gone.
+    Running(Vec<Member>),
+    /// enclos could not look, with why. The session stays open, as above.
+    Unknown(String),
+}
+
+/// A session's program, waited for.
+pub(super) struct Waited {
+    pub status: ExitStatus,
+    /// The members it left running, or why they could not be listed.
+    pub left: std::result::Result<Vec<Found>, PsError>,
+    /// The sure members last seen, recorded when `left` could not be listed.
+    pub known: Vec<ProcessRef>,
+    pub notes: Vec<String>,
 }
 
 /// How long the proxy has to start listening.
@@ -39,6 +69,9 @@ const PROXY_START: Duration = Duration::from_secs(5);
 const WATCH: Duration = Duration::from_millis(500);
 /// How often the wait for a session's program checks that it exited.
 const EXIT_POLL: Duration = Duration::from_millis(20);
+/// How long the session's end waits for other commands holding the state
+/// lock, such as a `sandbox stop` ending other sessions one by one.
+const END_WAIT: Duration = Duration::from_secs(120);
 
 impl Engine {
     /// Runs `command` (a login shell by default) in the sandbox, in this
@@ -53,19 +86,19 @@ impl Engine {
         if confirm == Confirm::DryRun {
             return self.plan_connect(name, &command).map(Planned::DryRun);
         }
-        let summary = |(session, _): &(SessionRecord, _)| format!("session {}", session.id);
-        // Which process group the program starts in (design §8). In a
-        // terminal where this command leads its job, the job's group: the
-        // program keeps the terminal, and this process, which leads the
+        let summary = |(session, ..): &(SessionRecord, _, _)| format!("session {}", session.id);
+        // Which process group the program starts in (design §8). When this
+        // command leads its group, as a terminal's job does, that group:
+        // the program keeps the terminal, and this process, which leads the
         // group, is not a member. Run by something else without a terminal
         // (a script, CI), a group made for the program. Otherwise (a
         // terminal, but not a job of its own) the caller's group, which is
         // not the session's: the session then has no group, only the
         // processes the program starts.
         let me = std::process::id();
-        let leads_group = group_of(me) == Some(me);
+        let leads_group = group_of(me)? == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
-        let (session, mut child) =
+        let (session, mut child, _keep_waiting) =
             self.write(by, "connect", Some(name.to_string()), summary, |lock| {
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
@@ -89,7 +122,10 @@ impl Engine {
                     env: Vec::new(),
                 };
                 let ctx = self.sandbox_context(name, record.proxy_port);
-                std::fs::create_dir_all(ctx.home.join("tmp")).ok();
+                // TMPDIR inside the sandbox (the policy denies /tmp).
+                let tmp = ctx.home.join("tmp");
+                std::fs::create_dir_all(&tmp)
+                    .map_err(|source| LayoutError::Io { path: tmp, source })?;
                 let backend = self.backend_of(name)?;
                 let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
                 if own_group {
@@ -101,48 +137,74 @@ impl Engine {
                         launch.program.to_string_lossy()
                     ),
                 })?;
-                let mut session = SessionRecord {
-                    id: SessionId(0),
-                    sandbox: name.clone(),
-                    kind: SessionKind::Interactive,
-                    version: version.version,
-                    snapshot: snapshot.id,
-                    compiled: Some(compiled.display().to_string()),
-                    root: reference(child.id()).ok_or_else(|| Error::Session {
-                        what: "cannot read the session's start time".into(),
-                    })?,
-                    pgid: match (own_group, leads_group) {
-                        (true, _) => child.id(),
-                        (false, true) => me,
-                        (false, false) => 0,
-                    },
-                    tracked: Vec::new(),
-                    started_at: now(),
-                    ended_at: None,
-                };
-                session.id = self.state.put_session(lock, &session)?;
-                record.state = SandboxState::Running;
-                self.state.put(lock, &record)?;
-                Ok((session, child))
+                let recorded = (|| -> Result<(SessionRecord, KeepWaiting)> {
+                    let mut session = SessionRecord {
+                        id: SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Interactive,
+                        version: version.version,
+                        snapshot: snapshot.id,
+                        compiled: Some(compiled.display().to_string()),
+                        // Read even if the program already exited: it is
+                        // still a session, with an exit status to report.
+                        root: reference_of_child(&child)?,
+                        pgid: match (own_group, leads_group) {
+                            (true, _) => Some(child.id()),
+                            (false, true) => Some(me),
+                            (false, false) => None,
+                        },
+                        tracked: Vec::new(),
+                        started_at: now(),
+                        ended_at: None,
+                    };
+                    session.id = self.state.put_session(lock, &session)?;
+                    record.state = SandboxState::Running;
+                    self.state.put(lock, &record)?;
+                    Ok((session, KeepWaiting::new()?))
+                })();
+                match recorded {
+                    Ok((session, keep_waiting)) => Ok((session, child, keep_waiting)),
+                    Err(e) => Err(abandon(child, e, "the program")),
+                }
             })?;
 
-        let (status, left) = self.wait_session(&session, &mut child)?;
-        let exit = status.code().unwrap_or(1);
-        let summary = |_: &()| match left.len() {
-            0 => format!("exit {exit}"),
-            n => format!("exit {exit}, {n} processes still running"),
+        let waited = self.wait_session(&session, &mut child)?;
+        let signal = waited.status.signal();
+        let exit = waited
+            .status
+            .code()
+            .unwrap_or_else(|| 128 + signal.unwrap_or(0));
+        let summary = |_: &()| match &waited.left {
+            Ok(left) if left.is_empty() => format!("exit {exit}"),
+            Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
+            Err(_) => format!("exit {exit}, could not look at what it left running"),
         };
-        self.write(
-            by,
-            "session end",
-            Some(format!("{name} session {}", session.id)),
-            summary,
-            |lock| self.end_or_track(lock, &session, &left),
-        )?;
+        // The end is recorded even while another command holds the lock
+        // for long, such as a `sandbox stop` ending other sessions.
+        let waiting = Instant::now();
+        loop {
+            match self.write(
+                by,
+                "session end",
+                Some(format!("{name} session {}", session.id)),
+                summary,
+                |lock| self.end_or_track(lock, &session, &waited),
+            ) {
+                Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
+                done => break done?,
+            }
+        }
+        let left = match waited.left {
+            Ok(left) if left.is_empty() => Left::Nothing,
+            Ok(left) => Left::Running(left.into_iter().map(|f| f.member).collect()),
+            Err(e) => Left::Unknown(e.to_string()),
+        };
         Ok(Planned::Done(SessionEnd {
             session: session.id,
             exit,
-            left: left.into_iter().map(|f| f.member).collect(),
+            signal,
+            left,
+            notes: waited.notes,
         }))
     }
 
@@ -153,12 +215,13 @@ impl Engine {
         &self,
         session: &SessionRecord,
         child: &mut Child,
-    ) -> Result<(ExitStatus, Vec<Found>)> {
+    ) -> Result<Waited> {
         let lost = |e: std::io::Error| Error::Session {
             what: format!("lost the session's program: {e}"),
         };
         let mut known = session.tracked.clone();
         let mut saved = known.clone();
+        let mut notes = Vec::new();
         let mut looked: Option<Instant> = None;
         let status = loop {
             if let Some(status) = child.try_wait().map_err(lost)? {
@@ -166,40 +229,58 @@ impl Engine {
             }
             if looked.is_none_or(|at| at.elapsed() >= WATCH) {
                 looked = Some(Instant::now());
-                known = find(&processes(), session, &known)
-                    .iter()
-                    .filter(|f| f.sure)
-                    .map(Found::process)
-                    .collect();
-                // Recorded for `show`, `stop` and `rm`; a busy lock only
-                // delays it to a later look.
-                if known != saved
-                    && let Ok(lock) = self.state.lock()
-                    && self.state.track(&lock, session.id, &known).is_ok()
-                {
-                    saved = known.clone();
+                match processes() {
+                    Ok(procs) => {
+                        known = find(&procs, session, &known)
+                            .iter()
+                            .filter_map(Found::sure_ref)
+                            .collect();
+                    }
+                    Err(e) => note(&mut notes, format!("could not look at its processes: {e}")),
+                }
+                // Recorded for `show`, `stop` and `rm`. This never waits for
+                // the lock: while another command holds it, a later look
+                // records them, and the program's exit is still seen at once.
+                if known != saved {
+                    let tracked = self.state.try_lock().and_then(|lock| match lock {
+                        Some(lock) => self.state.track(&lock, session.id, &known).map(Some),
+                        None => Ok(None),
+                    });
+                    match tracked {
+                        Ok(Some(())) => saved = known.clone(),
+                        Ok(None) => {}
+                        Err(e) => note(&mut notes, format!("could not record its members: {e}")),
+                    }
                 }
             }
             std::thread::sleep(EXIT_POLL);
         };
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it.
-        Ok((status, find(&processes(), session, &known)))
+        let left = processes().map(|procs| find(&procs, session, &known));
+        Ok(Waited {
+            status,
+            left,
+            known,
+            notes,
+        })
     }
 
-    /// Ends the session, or, while it left members running, records them.
+    /// Ends the session, or, while it left members running or enclos could
+    /// not look, records the members last seen.
     pub(super) fn end_or_track(
         &self,
         lock: &StateLock,
         session: &SessionRecord,
-        left: &[Found],
+        waited: &Waited,
     ) -> Result<()> {
-        if left.is_empty() {
-            self.state.end_session(lock, session.id)?;
-        } else {
-            let sure: Vec<ProcessRef> =
-                left.iter().filter(|f| f.sure).map(Found::process).collect();
-            self.state.track(lock, session.id, &sure)?;
+        match &waited.left {
+            Ok(left) if left.is_empty() => self.state.end_session(lock, session.id)?,
+            Ok(left) => {
+                let sure: Vec<ProcessRef> = left.iter().filter_map(Found::sure_ref).collect();
+                self.state.track(lock, session.id, &sure)?;
+            }
+            Err(_) => self.state.track(lock, session.id, &waited.known)?,
         }
         Ok(())
     }
@@ -242,11 +323,12 @@ impl Engine {
 
     /// Whether the sandbox's recorded proxy still runs.
     fn proxy_runs(&self, name: &SandboxName) -> Result<bool> {
-        Ok(self
-            .state
-            .sessions(name, true)?
-            .into_iter()
-            .any(|s| s.kind == SessionKind::Proxy && is_same(&s.root)))
+        for s in self.state.sessions(name, true)? {
+            if s.kind == SessionKind::Proxy && is_same(&s.root)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Starts the sandbox's proxy unless it runs already, and records it as
@@ -288,7 +370,7 @@ impl Engine {
                 record.proxy_port, record.name
             )));
         }
-        let mut child = Command::new(exe)
+        let child = Command::new(exe)
             .args([
                 "proxy",
                 "run",
@@ -302,11 +384,30 @@ impl Engine {
             .stderr(log)
             .spawn()
             .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
-        let pid = child.id();
+        let mut child = child;
+        match self.record_started_proxy(lock, record, &mut child, addr, &log_path) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(abandon(child, e, "the proxy")),
+        }
+    }
+
+    /// Waits for the proxy this command started to listen, and records it.
+    fn record_started_proxy(
+        &self,
+        lock: &StateLock,
+        record: &SandboxRecord,
+        child: &mut Child,
+        addr: SocketAddr,
+        log_path: &std::path::Path,
+    ) -> Result<()> {
+        let failed = |what: String| Error::Session { what };
         let start = Instant::now();
         loop {
             // Listening is not enough: it must be this proxy, still running.
-            if let Ok(Some(status)) = child.try_wait() {
+            let exited = child
+                .try_wait()
+                .map_err(|e| failed(format!("lost the proxy of sandbox {}: {e}", record.name)))?;
+            if let Some(status) = exited {
                 return Err(failed(format!(
                     "the proxy of sandbox {} exited ({status}); see {}",
                     record.name,
@@ -338,13 +439,60 @@ impl Engine {
             version: version.version,
             snapshot: snapshot.id,
             compiled: None,
-            root: reference(pid).ok_or_else(|| failed("the proxy exited at once".into()))?,
-            pgid: pid,
+            root: reference_of_child(child)?,
+            pgid: Some(child.id()),
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
         };
         self.state.put_session(lock, &session)?;
         Ok(())
+    }
+}
+
+/// Ends `child`, which this command started but could not record, so that
+/// it does not run where no `stop` finds it; `error` stays the reason.
+fn abandon(mut child: Child, error: Error, what: &str) -> Error {
+    match child.kill().and_then(|()| child.wait()) {
+        Ok(_) => error,
+        Err(e) => Error::CleanupFailed {
+            error: Box::new(error),
+            left: format!("{what} running as pid {} ({e})", child.id()),
+        },
+    }
+}
+
+fn note(notes: &mut Vec<String>, note: String) {
+    if !notes.contains(&note) {
+        notes.push(note);
+    }
+}
+
+/// Keeps this process waiting for the program through Ctrl-C, Ctrl-\ and a
+/// hangup, as `system(3)` does. In a terminal they reach this process along
+/// with the program, which may handle them and go on; this process must
+/// outlive it to record the session's end. The program itself was started
+/// before, with the default handling, and keeps it.
+struct KeepWaiting(Vec<signal_hook::SigId>);
+
+impl KeepWaiting {
+    fn new() -> Result<Self> {
+        let mut ids = Vec::new();
+        for signal in [SIGINT, SIGQUIT, SIGHUP] {
+            let id = signal_hook::flag::register(signal, Arc::new(AtomicBool::new(false)))
+                .map_err(|e| Error::Session {
+                    what: format!("cannot keep waiting through signal {signal}: {e}"),
+                })?;
+            ids.push(id);
+        }
+        Ok(KeepWaiting(ids))
+    }
+}
+
+impl Drop for KeepWaiting {
+    fn drop(&mut self) {
+        for id in self.0.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
     }
 }

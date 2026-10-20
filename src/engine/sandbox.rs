@@ -5,7 +5,7 @@ use super::Engine;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::members;
-use crate::lifecycle::stop::{GRACE, Stopped, stop};
+use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -14,6 +14,7 @@ use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
 use crate::model::session::{Member, SessionId, SessionRecord};
+use std::path::Path;
 
 /// What `enclos sandbox create` takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,15 +29,27 @@ pub struct SandboxSpec {
 pub struct SandboxView {
     pub record: SandboxRecord,
     pub policy: Option<PolicyVersion>,
-    /// Running sessions, each with the members found in its group now.
-    pub sessions: Vec<(SessionRecord, Vec<Member>)>,
+    /// Sessions not ended yet, and the sandbox's proxy, which is recorded
+    /// beside them.
+    pub sessions: Vec<SessionView>,
+}
+
+/// A session not ended yet, as `show` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub session: SessionRecord,
+    /// The members found now.
+    pub members: Vec<Member>,
+    /// Whether its file and program rules differ from the active
+    /// snapshot's, so that only a restart applies them (design §8).
+    pub needs_restart: bool,
 }
 
 /// What stopping a sandbox did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopReport {
     pub stopped: Vec<SessionId>,
-    pub survivors: Vec<(SessionId, Vec<Member>)>,
+    pub survivors: Vec<(SessionId, Vec<Survivor>)>,
 }
 
 impl Engine {
@@ -87,19 +100,31 @@ impl Engine {
                 let dir = self.layout.sandbox_dir(spec.name.as_str());
                 let existed = dir.exists();
                 self.state.put(lock, &record)?;
-                // The backend must run here before anything is created (ADR
-                // 0009), and the template must resolve. If either fails,
-                // nothing is left but what was there before, such as a
-                // folder kept by `sandbox rm --keep-data`.
+                // The backend must run here (ADR 0009), and the template
+                // must resolve. If either fails, nothing is left but what was
+                // there before, such as a folder kept by `sandbox rm
+                // --keep-data`.
                 let made = self
                     .backend_of(&record.name)
                     .and_then(|_| self.create_policy(lock, by, &record.name, &record.template));
-                if let Err(e) = made {
-                    self.state.remove(lock, &record.name)?;
-                    if !existed {
-                        let _ = std::fs::remove_dir_all(&dir);
+                if let Err(error) = made {
+                    let mut left = Vec::new();
+                    if let Err(e) = self.state.remove(lock, &record.name) {
+                        left.push(format!("the record of sandbox {} ({e})", record.name));
                     }
-                    return Err(e);
+                    if !existed
+                        && let Err(e) = std::fs::remove_dir_all(&dir)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        left.push(format!("{} ({e})", dir.display()));
+                    }
+                    return Err(match left.is_empty() {
+                        true => error,
+                        false => Error::CleanupFailed {
+                            error: Box::new(error),
+                            left: left.join(" and "),
+                        },
+                    });
                 }
                 Ok(record)
             },
@@ -138,15 +163,30 @@ impl Engine {
 
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
+        // The file the active policy compiles to: a session started under
+        // another one runs file and program rules the active policy no
+        // longer has. A sandbox this host cannot compile for runs nothing.
+        let active = self
+            .compiled_file(&record.name, record.proxy_port)
+            .ok()
+            .map(|(file, _)| file);
         let sessions = self
             .state
             .sessions(&record.name, true)?
             .into_iter()
-            .map(|s| {
-                let found = members(&s);
-                (s, found)
+            .map(|session| {
+                let members = members(&session)?;
+                let needs_restart = match (&session.compiled, &active) {
+                    (Some(at_launch), Some(active)) => Path::new(at_launch) != active,
+                    _ => false,
+                };
+                Ok(SessionView {
+                    session,
+                    members,
+                    needs_restart,
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         Ok(SandboxView {
             record,
             policy,
@@ -167,12 +207,12 @@ impl Engine {
             let mut changes: Vec<String> = view
                 .sessions
                 .iter()
-                .map(|(s, members)| {
+                .map(|v| {
                     format!(
                         "stop session {} ({}, {} processes)",
-                        s.id,
-                        s.kind.as_str(),
-                        members.len()
+                        v.session.id,
+                        v.session.kind.as_str(),
+                        v.members.len()
                     )
                 })
                 .collect();
@@ -201,11 +241,20 @@ impl Engine {
                 };
                 for session in self.state.sessions(name, true)? {
                     match stop(&session, GRACE) {
-                        Stopped::Clean => {
+                        Ok(Stopped::Clean) => {
                             self.state.end_session(lock, session.id)?;
                             report.stopped.push(session.id);
                         }
-                        Stopped::Survivors(left) => report.survivors.push((session.id, left)),
+                        Ok(Stopped::Survivors(left)) => report.survivors.push((session.id, left)),
+                        // Without a listing, nothing shows the members are
+                        // gone: the session stays open.
+                        Err(e) => {
+                            record.state = SandboxState::Failed {
+                                reason: format!("stop could not look at processes: {e}"),
+                            };
+                            self.state.put(lock, &record)?;
+                            return Err(e.into());
+                        }
                     }
                 }
                 record.state = if report.survivors.is_empty() {
@@ -231,12 +280,7 @@ impl Engine {
         keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<()>> {
-        self.require_sandbox(name)?;
-        if !self.state.sessions(name, true)?.is_empty() {
-            return Err(Error::SandboxRunning {
-                name: name.to_string(),
-            });
-        }
+        self.require_stopped(name)?;
         let dir = self.layout.sandbox_dir(name.as_str());
         let what = if keep_data {
             "remove its record"
@@ -265,12 +309,7 @@ impl Engine {
             |lock| {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
-                self.require_sandbox(name)?;
-                if !self.state.sessions(name, true)?.is_empty() {
-                    return Err(Error::SandboxRunning {
-                        name: name.to_string(),
-                    });
-                }
+                self.require_stopped(name)?;
                 self.state.remove(lock, name)?;
                 if !keep_data && dir.exists() {
                     std::fs::remove_dir_all(&dir).map_err(|source| LayoutError::Io {
@@ -282,5 +321,20 @@ impl Engine {
             },
         )?;
         Ok(Planned::Done(()))
+    }
+
+    /// Refuses a sandbox with sessions open, saying how to end them.
+    fn require_stopped(&self, name: &SandboxName) -> Result<()> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        if self.state.sessions(name, true)?.is_empty() {
+            return Ok(());
+        }
+        let name = name.to_string();
+        Err(match record.state {
+            SandboxState::Failed { .. } => Error::SandboxNotStopped { name },
+            _ => Error::SandboxRunning { name },
+        })
     }
 }

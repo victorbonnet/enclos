@@ -21,14 +21,26 @@ pub enum Error {
         "a sandbox named `{name}` already exists. Pick another name, or remove it with `enclos sandbox rm {name}`"
     )]
     SandboxExists { name: String },
-    #[error("sandbox `{name}` is running. Stop it first with `enclos sandbox stop {name}`")]
+    #[error("sandbox `{name}` has sessions open. End them first with `enclos sandbox stop {name}`")]
     SandboxRunning { name: String },
+    /// A stop left members running; `rm` waits until they are gone.
     #[error(
-        "no free proxy port is left between 41000 and 48999. Remove a sandbox you no longer use"
+        "sandbox `{name}` still has processes `enclos sandbox stop` could not end; `enclos sandbox show {name}` lists them. End them, then run `enclos sandbox stop {name}` again"
+    )]
+    SandboxNotStopped { name: String },
+    #[error(
+        "no free proxy port is left between {} and {}. Remove a sandbox you no longer use",
+        crate::model::sandbox::PORT_FIRST,
+        crate::model::sandbox::PORT_LAST
     )]
     NoFreePorts,
     #[error("{what}")]
     Session { what: String },
+    #[error(transparent)]
+    Processes(#[from] crate::lifecycle::process::PsError),
+    /// A failed command whose cleanup failed too.
+    #[error("{error}; cleaning up after it failed too, and left {left}")]
+    CleanupFailed { error: Box<Error>, left: String },
     #[error("sandbox `{sandbox}` has no policy yet. Run `enclos state check {sandbox}`")]
     NoPolicy { sandbox: String },
     /// A backend this host cannot run; never overridden (ADR 0009).
@@ -81,8 +93,11 @@ impl Error {
             | Error::Compile(_)
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
+            | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
-            | Error::Session { .. } => exit::ERROR,
+            | Error::Session { .. }
+            | Error::Processes(_) => exit::ERROR,
+            Error::CleanupFailed { error, .. } => error.exit_code(),
             Error::BackendUnavailable { .. } => exit::REFUSED,
         }
     }

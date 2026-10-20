@@ -11,8 +11,8 @@ mod session;
 mod tests;
 
 pub use policy::{PolicyApplied, PolicyView};
-pub use sandbox::{SandboxSpec, SandboxView, StopReport};
-pub use session::SessionEnd;
+pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
+pub use session::{Left, SessionEnd};
 
 use std::path::PathBuf;
 

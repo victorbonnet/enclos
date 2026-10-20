@@ -8,6 +8,7 @@ use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
+use enclos::model::session::SessionKind;
 
 #[derive(Args)]
 pub struct SandboxArgs {
@@ -136,20 +137,28 @@ fn print_show(v: &SandboxView) {
     if v.sessions.is_empty() {
         println!("  no sessions running");
     }
-    for (s, members) in &v.sessions {
-        let active = v.policy.as_ref().map_or(0, |p| p.version);
-        let stale = if s.version != active {
-            "  (files: restart to apply the active policy)"
+    let active = v.policy.as_ref().map_or(0, |p| p.version);
+    for view in &v.sessions {
+        let s = &view.session;
+        if s.kind == SessionKind::Proxy {
+            // Outside the sandbox, with the network policy, which is live.
+            println!(
+                "  proxy, session {}: port {}, network v{active} (live)",
+                s.id, r.proxy_port
+            );
         } else {
-            ""
-        };
-        println!(
-            "  session {} {}: network v{active} (live), files v{} (at launch){stale}",
-            s.id,
-            s.kind.as_str(),
-            s.version
-        );
-        for m in members {
+            let restart = match view.needs_restart {
+                true => "  (restart to apply the active policy's file and program rules)",
+                false => "",
+            };
+            println!(
+                "  session {} {}: network v{active} (live)  files, programs, resources v{} (at launch){restart}",
+                s.id,
+                s.kind.as_str(),
+                s.version
+            );
+        }
+        for m in &view.members {
             println!("    pid {:<7} {}", m.pid, m.command);
         }
     }
@@ -164,10 +173,18 @@ fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
         return exit::OK;
     }
     eprintln!("error: sandbox {name} is marked failed: some processes survived stop:");
-    for (session, members) in &report.survivors {
-        for m in members {
-            eprintln!("  session {session}: pid {} {}", m.pid, m.command);
+    for (session, survivors) in &report.survivors {
+        for s in survivors {
+            eprintln!(
+                "  session {session}: pid {} {}: {}",
+                s.member.pid,
+                s.member.command,
+                s.why.describe()
+            );
         }
     }
+    eprintln!(
+        "End them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses."
+    );
     exit::ERROR
 }

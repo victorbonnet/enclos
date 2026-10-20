@@ -1,5 +1,6 @@
-//! Sessions and their members (design §8, ADR 0019): one run inside a
-//! sandbox, with every process it started, and the policy it started under.
+//! Sessions and their members (design §8, ADR 0019): a single use of a
+//! sandbox from start to end, with every process it started, and the policy
+//! it started under.
 
 use std::fmt;
 use std::str::FromStr;
@@ -57,7 +58,8 @@ impl FromStr for SessionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessRef {
     pub pid: u32,
-    /// The start time `ps` reports for it, compared as text.
+    /// The start time `ps` reports for it, in UTC, its five words one space
+    /// apart. Compared as text.
     pub started: String,
 }
 
@@ -74,9 +76,9 @@ pub struct SessionRecord {
     /// The program the session started.
     pub root: ProcessRef,
     /// The process group the program started in: one made for it, or the
-    /// terminal's job, which the `enclos` holding the terminal leads; 0
+    /// terminal's job, which the `enclos` holding the terminal leads; none
     /// when neither (design §8).
-    pub pgid: u32,
+    pub pgid: Option<u32>,
     /// Members recorded while the session ran, so that one whose parent
     /// exited is still found.
     pub tracked: Vec<ProcessRef>,

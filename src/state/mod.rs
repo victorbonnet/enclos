@@ -58,6 +58,8 @@ pub trait StateStore: NetLogStore {
     /// Takes the exclusive state lock, waiting a few seconds for another
     /// enclos command to finish.
     fn lock(&self) -> Result<StateLock>;
+    /// Takes the state lock if no other command holds it, without waiting.
+    fn try_lock(&self) -> Result<Option<StateLock>>;
     /// Creates the database if needed and applies pending schema migrations.
     fn migrate(&self, lock: &StateLock) -> Result<Migration>;
     fn get(&self, name: &SandboxName) -> Result<Option<SandboxRecord>>;

@@ -185,6 +185,21 @@ fn io_err(path: &Path) -> impl Fn(std::io::Error) -> StateError + '_ {
 
 impl StateStore for SqliteStateStore {
     fn lock(&self) -> Result<StateLock> {
+        let started = Instant::now();
+        loop {
+            match self.try_lock()? {
+                Some(lock) => return Ok(lock),
+                None if started.elapsed() < LOCK_WAIT => std::thread::sleep(LOCK_POLL),
+                None => {
+                    return Err(StateError::Locked {
+                        path: self.lock_file.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn try_lock(&self) -> Result<Option<StateLock>> {
         let file: File = OpenOptions::new()
             .read(true)
             .write(true)
@@ -198,20 +213,10 @@ impl StateStore for SqliteStateStore {
                 },
                 _ => io_err(&self.lock_file)(source),
             })?;
-        let started = Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(StateLock::held(file)),
-                Err(TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
-                    std::thread::sleep(LOCK_POLL);
-                }
-                Err(TryLockError::WouldBlock) => {
-                    return Err(StateError::Locked {
-                        path: self.lock_file.clone(),
-                    });
-                }
-                Err(TryLockError::Error(source)) => return Err(io_err(&self.lock_file)(source)),
-            }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(StateLock::held(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(source)) => Err(io_err(&self.lock_file)(source)),
         }
     }
 

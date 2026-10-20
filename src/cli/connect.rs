@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use clap::Args;
 
 use enclos::engine::Engine;
+use enclos::engine::Left;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -27,20 +28,36 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
         }
         Planned::Done(end) => end,
     };
-    if !end.left.is_empty() {
-        let pids: Vec<String> = end
-            .left
-            .iter()
-            .map(|m| format!("{} ({})", m.pid, m.command))
-            .collect();
-        eprintln!(
-            "enclos: the command exited, but it left {} processes running in sandbox {}: {}. Session {} stays open until they end; `enclos sandbox show {}` lists them.",
-            end.left.len(),
-            args.sandbox,
-            pids.join(", "),
-            end.session,
-            args.sandbox
-        );
+    let shown = format!("sandbox {}", args.sandbox);
+    for note in &end.notes {
+        eprintln!("enclos: session {} in {shown}: {note}", end.session);
+    }
+    if let Some(signal) = end.signal {
+        eprintln!("enclos: the command was ended by signal {signal}");
+    }
+    let stays_open = format!(
+        "Session {} stays open until `enclos sandbox stop {}` finds them gone",
+        end.session, args.sandbox
+    );
+    match &end.left {
+        Left::Nothing => {}
+        Left::Running(left) => {
+            let pids: Vec<String> = left
+                .iter()
+                .map(|m| format!("{} ({})", m.pid, m.command))
+                .collect();
+            eprintln!(
+                "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",
+                left.len(),
+                pids.join(", "),
+                args.sandbox
+            );
+        }
+        Left::Unknown(why) => {
+            eprintln!(
+                "enclos: the command exited, but enclos could not look at what it left running in {shown}: {why}. {stays_open}."
+            );
+        }
     }
     Ok(u8::try_from(end.exit).unwrap_or(1))
 }
