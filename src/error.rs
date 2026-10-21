@@ -54,6 +54,10 @@ pub enum Error {
     /// A failed command whose cleanup failed too.
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
+    /// A failed command that had already changed something, which `done`
+    /// names, so that its audit entry records it too.
+    #[error("{error} (after {done})")]
+    FailedAfter { error: Box<Error>, done: String },
     /// A failed command whose cleanup worked but could not be recorded in
     /// the audit log.
     #[error(
@@ -149,7 +153,8 @@ impl Error {
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }
-            | Error::WithContext { error, .. } => error.exit_code(),
+            | Error::WithContext { error, .. }
+            | Error::FailedAfter { error, .. } => error.exit_code(),
         }
     }
 }
@@ -204,6 +209,11 @@ mod tests {
         assert_eq!(backend.exit_code(), 2);
         assert_eq!(confirm.exit_code(), 3);
         assert_eq!(error.exit_code(), 1);
+        let after = Error::FailedAfter {
+            error: Box::new(invalid(vec![Problem::Refused("x".into())])),
+            done: "y".into(),
+        };
+        assert_eq!(after.exit_code(), 2);
     }
 
     #[test]

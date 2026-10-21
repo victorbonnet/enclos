@@ -349,7 +349,8 @@ fn sessions_keep_their_members_until_they_end() {
     let mut session = SessionRecord {
         id: SessionId(0),
         sandbox: name.clone(),
-        kind: SessionKind::Interactive,
+        kind: SessionKind::Service,
+        service: Some("gateway".into()),
         version: 1,
         snapshot: crate::model::policy::SnapshotId("x".into()),
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
@@ -378,6 +379,46 @@ fn sessions_keep_their_members_until_they_end() {
     // Removing the sandbox removes its sessions.
     store.remove(&lock, &name).unwrap();
     assert!(store.sessions(&name, false).unwrap().is_empty());
+}
+
+#[test]
+fn only_a_service_session_names_a_service() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let session = |kind, service: Option<&str>| SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind,
+        service: service.map(str::to_owned),
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: None,
+        root: ProcessRef {
+            pid: 10,
+            started: "Thu Oct 8 09:31:10 2026".into(),
+        },
+        pgid: None,
+        tracked: Vec::new(),
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    let mut interactive = session(SessionKind::Interactive, None);
+    interactive.id = store.put_session(&lock, &interactive).unwrap();
+    assert_eq!(store.sessions(&name, true).unwrap(), [interactive]);
+    for (kind, service) in [
+        (SessionKind::Service, None),
+        (SessionKind::Interactive, Some("gateway")),
+        (SessionKind::Proxy, Some("gateway")),
+    ] {
+        assert!(
+            store.put_session(&lock, &session(kind, service)).is_err(),
+            "{kind:?} with {service:?} was recorded"
+        );
+    }
 }
 
 #[test]

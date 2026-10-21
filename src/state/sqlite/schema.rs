@@ -62,7 +62,8 @@ pub const MIGRATIONS: &[&str] = &[
         pgid        INTEGER,
         tracked     TEXT NOT NULL DEFAULT '[]',
         started_at  TEXT NOT NULL,
-        ended_at    TEXT
+        ended_at    TEXT,
+        service     TEXT CHECK ((kind = 'service') = (service IS NOT NULL))
     ) STRICT;
     CREATE INDEX sessions_running ON sessions (sandbox, ended_at);",
     // 5: the runtime installed in each sandbox, and its agents

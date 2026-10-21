@@ -6,6 +6,7 @@
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -206,7 +207,15 @@ impl Engine {
                     // A proxy `connect` started would hold the port the
                     // service needs, and what a runtime service left running
                     // would run beside the new one.
-                    self.stop_sessions(lock, name, &[SessionKind::Proxy, SessionKind::Service])?;
+                    self.stop_sessions(
+                        lock,
+                        name,
+                        |s| matches!(s.kind, SessionKind::Proxy | SessionKind::Service),
+                        &format!(
+                            "`enclos sandbox start` stopped there. End what still runs, then run `enclos sandbox start {name}` again"
+                        ),
+                        &mut Vec::new(),
+                    )?;
                     let units = Self::units(&record)
                         .into_iter()
                         .map(|unit| {
@@ -349,9 +358,10 @@ impl Engine {
 
     /// A runtime service's process: runs the command the sandbox's runtime
     /// declares under `service` in the sandbox, in a process group of its
-    /// own, recorded as a session. Told to end (TERM, as the service manager
-    /// does, INT or HUP), it stops the session's members and records the
-    /// end.
+    /// own, recorded as a session of `service`, once it has stopped any
+    /// session of `service` still open. Told to end (TERM, as the service
+    /// manager does, INT or HUP), it stops the session's members and records
+    /// the end, as failed when the program outlives that.
     pub fn launch(&self, by: &Actor, name: &SandboxName, service: &str) -> Result<SessionEnd> {
         let ended = Arc::new(AtomicBool::new(false));
         let _ending = EndOn::new(&ended)?;
@@ -400,56 +410,91 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let summary = |(session, _): &(SessionRecord, _)| format!("session {}", session.id);
-        let (session, mut child) =
+        let summary = |(session, _, replaced): &(SessionRecord, _, Vec<SessionId>)| {
+            let earlier = replaced_earlier(service, replaced);
+            match earlier {
+                Some(earlier) => format!("session {}, after {earlier}", session.id),
+                None => format!("session {}", session.id),
+            }
+        };
+        let (session, mut child, _) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
-                // A service session whose `launch` was killed before it
-                // recorded its end, at logout or by the service manager's
-                // timeout: its process is gone, so it ends here.
-                self.end_dead_sessions(lock, name, SessionKind::Service)?;
-                let compiled = self.compile_policy(name, record.proxy_port)?;
-                let (version, snapshot) = self.active_policy(name)?;
-                let launch = Launch {
-                    program: program.clone(),
-                    args: args.to_vec(),
-                    env: Vec::new(),
-                };
-                let ctx = self.sandbox_context(name, record.proxy_port);
-                let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
-                let child = wrapped
-                    .process_group(0)
-                    .spawn()
-                    .map_err(|e| Error::Session {
-                        what: format!("could not start the {kind} {service} service: {e}"),
-                    })?;
-                let recorded = (|| -> Result<SessionRecord> {
-                    let mut session = SessionRecord {
-                        id: SessionId(0),
-                        sandbox: name.clone(),
-                        kind: SessionKind::Service,
-                        version: version.version,
-                        snapshot: snapshot.id,
-                        compiled: Some(compiled.display().to_string()),
-                        // In a group made for it, which it leads.
-                        pgid: Some(child.id()),
-                        root: reference_of_child(&child)?,
-                        tracked: Vec::new(),
-                        started_at: now(),
-                        ended_at: None,
+                // Sessions stopped and ended before a failure are named in
+                // the failed entry too.
+                let mut replaced = Vec::new();
+                let started = (|| -> Result<(SessionRecord, Child)> {
+                    // A `launch` killed before it recorded its end leaves its
+                    // session open, and maybe its runtime running (design §4).
+                    self.stop_sessions(
+                        lock,
+                        name,
+                        |s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service),
+                        &format!(
+                            "a second {service} was not started. End what still runs, and the service manager starts the service again on its own; `enclos sandbox stop {name}` removes the service instead"
+                        ),
+                        &mut replaced,
+                    )?;
+                    if ended.load(Ordering::Relaxed) {
+                        return Err(Error::Session {
+                            what: format!("told to end before the {service} service of {name} started"),
+                        });
+                    }
+                    let compiled = self.compile_policy(name, record.proxy_port)?;
+                    let (version, snapshot) = self.active_policy(name)?;
+                    let launch = Launch {
+                        program: program.clone(),
+                        args: args.to_vec(),
+                        env: Vec::new(),
                     };
-                    session.id = self.state.put_session(lock, &session)?;
-                    Ok(session)
+                    let ctx = self.sandbox_context(name, record.proxy_port);
+                    let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
+                    let child = wrapped
+                        .process_group(0)
+                        .spawn()
+                        .map_err(|e| Error::Session {
+                            what: format!("could not start the {kind} {service} service: {e}"),
+                        })?;
+                    let recorded = (|| -> Result<SessionRecord> {
+                        let mut session = SessionRecord {
+                            id: SessionId(0),
+                            sandbox: name.clone(),
+                            kind: SessionKind::Service,
+                            service: Some(service.to_owned()),
+                            version: version.version,
+                            snapshot: snapshot.id,
+                            compiled: Some(compiled.display().to_string()),
+                            // In a group made for it, which it leads.
+                            pgid: Some(child.id()),
+                            root: reference_of_child(&child)?,
+                            tracked: Vec::new(),
+                            started_at: now(),
+                            ended_at: None,
+                        };
+                        session.id = self.state.put_session(lock, &session)?;
+                        Ok(session)
+                    })();
+                    match recorded {
+                        Ok(session) => Ok((session, child)),
+                        Err(e) => Err(abandon(child, e, "the service")),
+                    }
                 })();
-                match recorded {
-                    Ok(session) => Ok((session, child)),
-                    Err(e) => Err(abandon(child, e, "the service")),
+                match (started, replaced_earlier(service, &replaced)) {
+                    (Ok((session, child)), _) => Ok((session, child, replaced)),
+                    (Err(error), None) => Err(error),
+                    (Err(error), Some(done)) => Err(Error::FailedAfter {
+                        error: Box::new(error),
+                        done,
+                    }),
                 }
             })?;
         // As for `connect`, the members the service starts are recorded.
         // Unlike `connect`, what it leaves running is stopped: under a
         // service manager the service is its program, which the manager
-        // starts again, and what the last run left would run beside it.
-        let mut waited = self.wait_session(&session, &mut child, Some(ended))?;
+        // starts again, and what it last left would run beside it.
+        let mut waited = match self.wait_session(&session, &mut child, Some(ended)) {
+            Ok(waited) => waited,
+            Err(error) => return Err(self.record_unended(by, "service end", &session, error)),
+        };
         self.stop_left(&session, &mut waited);
         self.finish_session(by, "service end", &session, waited)
     }
@@ -487,6 +532,7 @@ impl Engine {
                     id: SessionId(0),
                     sandbox: name.clone(),
                     kind: SessionKind::Proxy,
+                    service: None,
                     version: version.version,
                     snapshot: snapshot.id,
                     compiled: None,
@@ -580,6 +626,25 @@ fn joined(labels: &[ServiceLabel]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// What `launch` did before starting `service`, for its audit entry: the
+/// sessions of `service` it stopped and ended, if any.
+fn replaced_earlier(service: &str, ids: &[SessionId]) -> Option<String> {
+    let list = ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ids {
+        [] => None,
+        [_] => Some(format!(
+            "stopping and ending {service} service session {list}, left by an earlier launch"
+        )),
+        _ => Some(format!(
+            "stopping and ending {service} service sessions {list}, left by earlier launches"
+        )),
+    }
 }
 
 /// Sets `ended` on TERM, INT and HUP while it lives, instead of ending this

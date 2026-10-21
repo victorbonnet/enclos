@@ -159,6 +159,7 @@ mod tests {
             id: SessionId(1),
             sandbox: "home".parse().unwrap(),
             kind: SessionKind::Interactive,
+            service: None,
             version: 1,
             snapshot: crate::model::policy::SnapshotId("x".into()),
             compiled: None,

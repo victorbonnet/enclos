@@ -55,6 +55,21 @@ impl Why {
     }
 }
 
+/// Each survivor as `pid N command: why`, as `sandbox stop` lists them.
+pub fn describe_survivors(left: &[Survivor]) -> String {
+    left.iter()
+        .map(|s| {
+            format!(
+                "pid {} {}: {}",
+                s.member.pid,
+                s.member.command,
+                s.why.describe()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn stop(session: &SessionRecord, grace: Duration) -> Result<Stopped, PsError> {
     let first = find(&processes()?, session, &session.tracked);
     if !first.iter().any(|f| f.sure) {
@@ -183,6 +198,7 @@ mod tests {
             id: SessionId(1),
             sandbox: "home".parse().unwrap(),
             kind: SessionKind::Service,
+            service: Some("gateway".into()),
             version: 1,
             snapshot: crate::model::policy::SnapshotId("x".into()),
             compiled: None,

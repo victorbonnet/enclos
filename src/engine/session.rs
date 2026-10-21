@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
-use crate::lifecycle::stop::{GRACE, Stopped, stop};
+use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -159,6 +159,7 @@ impl Engine {
                         id: SessionId(0),
                         sandbox: name.clone(),
                         kind: SessionKind::Interactive,
+                        service: None,
                         version: version.version,
                         snapshot: snapshot.id,
                         compiled: Some(compiled.display().to_string()),
@@ -208,21 +209,9 @@ impl Engine {
             Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
             Err(_) => format!("exit {exit}, could not look at what it left running"),
         };
-        // The end is recorded even while another command holds the lock
-        // for long, such as a `sandbox stop` ending other sessions.
-        let waiting = Instant::now();
-        loop {
-            match self.write(
-                by,
-                audit_name,
-                Some(format!("{} session {}", session.sandbox, session.id)),
-                summary,
-                |lock| self.end_or_track(lock, session, &waited),
-            ) {
-                Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
-                done => break done?,
-            }
-        }
+        self.write_session_end(by, audit_name, session, summary, |lock| {
+            self.end_or_track(lock, session, &waited)
+        })?;
         let left = match waited.left {
             Ok(left) if left.is_empty() => Left::Nothing,
             Ok(left) => Left::Running(left.into_iter().map(|f| f.member).collect()),
@@ -235,6 +224,70 @@ impl Engine {
             left,
             notes: waited.notes,
         })
+    }
+
+    /// Records, as `audit_name`, a failed end for a session whose program
+    /// `wait_session` did not see exit: one that survived TERM and KILL, or
+    /// one enclos could not stop, as `error` says. The session stays open,
+    /// so `sandbox show` lists it, and `sandbox stop` or the service's next
+    /// `launch` tries again. Returns the entry's error, or `CleanupFailed`
+    /// around `error` when the entry could not be written.
+    pub(super) fn record_unended(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        error: Error,
+    ) -> Error {
+        let why = format!(
+            "{error}; session {} stays open, and `enclos sandbox show {}` lists what still runs",
+            session.id, session.sandbox
+        );
+        let opened = std::cell::Cell::new(false);
+        let recorded = self.write_session_end(
+            by,
+            audit_name,
+            session,
+            // Never called: the work always fails.
+            |_: &()| String::new(),
+            |_| {
+                opened.set(true);
+                Err(Error::Session { what: why.clone() })
+            },
+        );
+        match recorded {
+            Err(unrecorded) if !opened.get() => Error::CleanupFailed {
+                error: Box::new(error),
+                left: format!("the session's end unrecorded ({unrecorded})"),
+            },
+            _ => Error::Session { what: why },
+        }
+    }
+
+    /// `write` for a session's end, as `audit_name`. It waits even while
+    /// another command holds the lock for long, such as a `sandbox stop`
+    /// ending other sessions one by one, up to `END_WAIT`.
+    fn write_session_end<T>(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        summary: impl Fn(&T) -> String,
+        work: impl Fn(&StateLock) -> Result<T>,
+    ) -> Result<T> {
+        let waiting = Instant::now();
+        loop {
+            match self.write(
+                by,
+                audit_name,
+                Some(format!("{} session {}", session.sandbox, session.id)),
+                &summary,
+                &work,
+            ) {
+                Err(Error::State(StateError::Locked { .. })) if waiting.elapsed() < END_WAIT => {}
+                done => break done,
+            }
+        }
     }
 
     /// Waits for the session's program to exit, recording the members it
@@ -265,33 +318,40 @@ impl Engine {
                 // exits: a program not reaped would still be listed.
                 let mut members = session.clone();
                 members.tracked = known.clone();
-                stopping = Some(std::thread::spawn(move || stop(&members, STOP_GRACE)));
+                let stop_members = self.stop_members;
+                stopping = Some(std::thread::spawn(move || {
+                    stop_members(&members, STOP_GRACE)
+                }));
             }
             if stopping
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
-                // Done signalling, and the program has not exited: it
-                // survived TERM and KILL, so waiting more would not end.
-                match stopping.take().map(std::thread::JoinHandle::join) {
-                    Some(Ok(Ok(Stopped::Clean))) => {}
-                    Some(Ok(Ok(Stopped::Survivors(left)))) => {
-                        return Err(Error::Session {
-                            what: format!(
-                                "the program of session {} survived TERM and KILL: {}",
-                                session.id,
-                                left.iter()
-                                    .map(|s| format!("pid {} ({})", s.member.pid, s.why.describe()))
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                        });
+                // Done signalling, and the program had not exited: it
+                // survived TERM and KILL, or enclos could not stop it, so
+                // waiting more would not end.
+                let failed = match stopping.take().map(std::thread::JoinHandle::join) {
+                    Some(Ok(Ok(Stopped::Clean))) | None => None,
+                    Some(Ok(Ok(Stopped::Survivors(left)))) => Some(format!(
+                        "the program of session {} survived TERM and KILL ({})",
+                        session.id,
+                        describe_survivors(&left)
+                    )),
+                    Some(Ok(Err(e))) => Some(format!(
+                        "could not stop the members of session {}: {e}",
+                        session.id
+                    )),
+                    Some(Err(_)) => Some(format!(
+                        "stopping the members of session {} failed",
+                        session.id
+                    )),
+                };
+                if let Some(what) = failed {
+                    // Unless it exited since the last look.
+                    if let Some(status) = child.try_wait().map_err(lost)? {
+                        break status;
                     }
-                    Some(Ok(Err(e))) => {
-                        note(&mut notes, format!("could not stop its members: {e}"));
-                    }
-                    Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
-                    None => {}
+                    return Err(Error::Session { what });
                 }
             }
             if looked.is_none_or(|at| at.elapsed() >= WATCH) {
@@ -378,31 +438,37 @@ impl Engine {
         Ok(())
     }
 
-    /// Stops the sandbox's open sessions of these kinds, so that services
-    /// can take their place: a proxy holds the port, and what a runtime
-    /// service left running would run beside the new one.
+    /// Stops the sandbox's open sessions that `which` selects, so that
+    /// something new can take their place, and ends each as it stops,
+    /// adding it to `ended`. A member that survives refuses: its session
+    /// stays open, and the error names each survivor, then `refused`, which
+    /// says what was not done and what to do once they are ended.
     pub(super) fn stop_sessions(
         &self,
         lock: &StateLock,
         name: &SandboxName,
-        kinds: &[SessionKind],
+        which: impl Fn(&SessionRecord) -> bool,
+        refused: &str,
+        ended: &mut Vec<SessionId>,
     ) -> Result<()> {
-        for session in self
-            .state
-            .sessions(name, true)?
-            .into_iter()
-            .filter(|s| kinds.contains(&s.kind))
-        {
-            match stop(&session, GRACE)? {
-                Stopped::Clean => self.state.end_session(lock, session.id)?,
+        for session in self.state.sessions(name, true)?.into_iter().filter(&which) {
+            let label = match &session.service {
+                Some(service) => format!("the {service} service session {}", session.id),
+                None => format!("the {} session {}", session.kind.as_str(), session.id),
+            };
+            let stopped = (self.stop_members)(&session, GRACE).map_err(|e| Error::Session {
+                what: format!("could not stop {label} of sandbox {name}: {e}"),
+            })?;
+            match stopped {
+                Stopped::Clean => {
+                    self.state.end_session(lock, session.id)?;
+                    ended.push(session.id);
+                }
                 Stopped::Survivors(left) => {
-                    let pids: Vec<String> = left.iter().map(|s| s.member.pid.to_string()).collect();
                     return Err(Error::Session {
                         what: format!(
-                            "the {} session {} of sandbox {name} did not stop (pid {}); run `enclos sandbox stop {name}`",
-                            session.kind.as_str(),
-                            session.id,
-                            pids.join(", ")
+                            "{label} of sandbox {name} did not stop ({}), so {refused}",
+                            describe_survivors(&left)
                         ),
                     });
                 }
@@ -570,6 +636,7 @@ impl Engine {
             id: SessionId(0),
             sandbox: record.name.clone(),
             kind: SessionKind::Proxy,
+            service: None,
             version: version.version,
             snapshot: snapshot.id,
             compiled: None,
