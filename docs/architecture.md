@@ -51,7 +51,7 @@ flowchart LR
 ```
 
 - **The sandbox** is the permission boundary ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)). Every process in it runs under `sandbox-exec` with the sandbox's compiled policy: it writes only to its home and to devices, cannot read the sensitive deny list (`~/.ssh`, keychains, browser data, the host's own agent configuration such as `~/.hermes`, `~/.claude` and `~/.codex`, other sandboxes, enclos's files), connects only to its proxy's ports, and cannot reach host services such as LaunchServices, Apple Events, launchd, preferences or the pasteboard, or signal processes outside it. Agents of the same sandbox share its home, so each can read the others' files: the sandbox is the boundary, not the agent.
-- **The runtime** (Hermes) is installed inside the sandbox's home by its own installer, run in the sandbox ([ADR 0020](adr/0020-runtimes-installed-per-sandbox.md)). Its **agents** share it, the policy, the proxy, the login and the secrets; each has its own configuration, memory, skills and sessions.
+- **The runtime** (Hermes) is installed inside the sandbox's home by its own installer, run in the sandbox ([ADR 0020](adr/0020-runtimes-installed-per-sandbox.md)). Its **agents** share it, the policy, the proxy, the login and, from milestone 2, the secrets; each has its own configuration, memory, skills and sessions.
 - **The egress proxy** runs on the host, outside the sandbox. It allows what the policy's network mode allows (the public web on ports 80 and 443, or only the allowlist; [ADR 0025](adr/0025-public-web-by-default-for-assistants.md)), resolves names itself, connects only to addresses it has validated ([ADR 0017](adr/0017-proxy-connects-only-to-validated-addresses.md)), and logs every connection. It reads the active policy for each new connection, so `enclos policy allow` applies without a restart. Each sandbox has one proxy port, so the network log is per sandbox ([ADR 0024](adr/0024-agents-reached-through-the-runtime.md)).
 - **Services**: `enclos sandbox start` installs a sandbox's services with the host's service manager (launchd on macOS): its proxy, and each background service its runtime declares. Hermes declares one, its gateway, which serves every agent ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)). There is no enclos daemon ([ADR 0002](adr/0002-no-daemon.md)). Interactive sessions run in your terminal and use the same proxy.
 - **State and audit**: `state.db` (SQLite) holds the sandboxes, every policy snapshot, sessions and the network log; `audit.jsonl` holds one hash-chained entry per state-changing command ([ADR 0010](adr/0010-sqlite-state-and-jsonl-audit.md)).
@@ -97,7 +97,7 @@ sequenceDiagram
   CLI->>Data: take the lock, open an audit entry, read the active snapshot
   CLI->>CLI: compile the policy (reused if unchanged)
   CLI->>Proxy: start it if it is not running (its own recorded session)
-  CLI->>SB: sandbox-exec main, with an empty environment plus the proxy variables
+  CLI->>SB: sandbox-exec main, with an emptied environment: terminal, locale, time zone and user name variables, the sandbox's own and the proxy variables
   CLI->>Data: record the session, close the audit entry
   SB->>Proxy: CONNECT chatgpt.com:443
   Proxy->>Data: read the active policy, log the connection
