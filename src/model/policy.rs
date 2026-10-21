@@ -200,6 +200,8 @@ mod tests {
     fn template_names_follow_the_naming_rule() {
         assert!("assistant".parse::<TemplateName>().is_ok());
         assert!("mcp-only".parse::<TemplateName>().is_ok());
+        let name: TemplateName = "assistant".parse().unwrap();
+        assert_eq!(format!("{name:<12}|"), "assistant   |");
         for bad in ["", "A", "1x", "a b", "../x"] {
             assert!(bad.parse::<TemplateName>().is_err(), "{bad}");
         }

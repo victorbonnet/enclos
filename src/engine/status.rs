@@ -65,19 +65,14 @@ pub struct StatusView {
 
 impl StatusView {
     /// The agents in every sandbox: tracked, or built into their runtime.
-    /// [`StatusView::untracked_count`] counts the others.
     pub fn agent_count(&self) -> usize {
-        self.agents()
-            .filter(|a| matches!(a.kind, AgentKind::Builtin | AgentKind::Tracked { .. }))
-            .count()
+        self.agents().filter(|a| !a.kind.is_untracked()).count()
     }
 
     /// The agents the runtimes have and enclos does not track: untracked
     /// agents, and those under a name enclos cannot track.
     pub fn untracked_count(&self) -> usize {
-        self.agents()
-            .filter(|a| matches!(a.kind, AgentKind::Untracked | AgentKind::Untrackable))
-            .count()
+        self.agents().filter(|a| a.kind.is_untracked()).count()
     }
 
     fn agents(&self) -> impl Iterator<Item = &AgentStatus> {
@@ -233,6 +228,18 @@ pub enum AgentKind {
     Untracked,
     /// The runtime has it under a name that is not a valid agent name.
     Untrackable,
+}
+
+impl AgentKind {
+    /// Whether enclos has no record of it and it is not built in: what
+    /// [`StatusView::untracked_count`] counts, and
+    /// [`StatusView::agent_count`] leaves out.
+    fn is_untracked(self) -> bool {
+        match self {
+            AgentKind::Builtin | AgentKind::Tracked { .. } => false,
+            AgentKind::Untracked | AgentKind::Untrackable => true,
+        }
+    }
 }
 
 /// Whether the runtime still has a tracked agent.

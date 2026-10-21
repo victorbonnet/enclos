@@ -429,7 +429,7 @@ fn a_seatbelt_sandbox_is_refused_off_macos() {
 fn column_starts(line: &str) -> Vec<usize> {
     let bytes = line.as_bytes();
     (0..bytes.len())
-        .filter(|&i| bytes[i] != b' ' && (i == 0 || (i >= 2 && &bytes[i - 2..i] == b"  ")))
+        .filter(|&i| bytes[i] != b' ' && (i == 0 || bytes[..i].ends_with(b"  ")))
         .collect()
 }
 
@@ -1332,6 +1332,9 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
         text.starts_with("2 sandboxes, 2 agents (1 more not tracked), "),
         "{text}"
     );
+    // With nothing untracked, the header gives the count alone.
+    let spare = home.run(&["status", "spare"]).ok().stdout();
+    assert!(spare.starts_with("1 sandbox, 0 agents, "), "{spare}");
     for line in [
         "home   created   Hermes, not logged in",
         "spare  created   no runtime",

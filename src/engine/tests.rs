@@ -4229,6 +4229,11 @@ mod status {
             ("scout", AgentKind::Untracked),
             ("my_bot", AgentKind::Untrackable),
         ]);
+        // The two counts split every agent of every sandbox.
+        let other = with_agents(vec![("bot", AgentKind::Untracked)]);
+        let mut view = engine.status(None).unwrap();
+        view.sandboxes = vec![s.clone(), other];
+        assert_eq!((view.agent_count(), view.untracked_count()), (4, 3));
         assert_eq!(
             commands(&suggest(&[s], t0)),
             ["enclos agent rm home/gone", "enclos agent add home/scout"]

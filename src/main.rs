@@ -41,7 +41,7 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
-    /// Show, change or test a sandbox's policy.
+    /// Show, widen or test a sandbox's policy.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
     Net(cli::net::NetArgs),
@@ -276,16 +276,30 @@ mod tests {
 
     use super::Cli;
 
-    /// The words a command group's one-line description uses for a verb
+    /// The word a command group's one-line description uses for a verb
     /// whose name it does not spell out.
     fn said_as(verb: &str) -> &str {
         match verb {
             "rm" => "remove",
-            "allow" => "change",
-            "log" => "network log",
+            "allow" => "widen",
             "denied" => "refused",
             verb => verb,
         }
+    }
+
+    /// Whether `about` has `word` as a whole word, so "restart" does not
+    /// count as "start".
+    fn names(about: &str, word: &str) -> bool {
+        about
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .any(|w| w == word)
+    }
+
+    #[test]
+    fn a_verb_counts_only_as_a_whole_word() {
+        assert!(names("create, start or restart sandboxes.", "start"));
+        assert!(!names("create, stop or restart sandboxes.", "start"));
+        assert!(!names("shows a sandbox.", "show"));
     }
 
     #[test]
@@ -299,7 +313,7 @@ mod tests {
             for verb in group.get_subcommands().filter(|c| !c.is_hide_set()) {
                 let word = said_as(verb.get_name());
                 assert!(
-                    about.contains(word),
+                    names(&about, word),
                     "`{}`: {about:?} does not say {word:?}",
                     group.get_name()
                 );
