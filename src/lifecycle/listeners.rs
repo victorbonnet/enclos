@@ -15,8 +15,8 @@ use std::process::{Command, Output, Stdio};
 #[error("cannot look at listening sockets with /usr/sbin/lsof: {0}")]
 pub struct LsofError(String);
 
-/// The TCP addresses `pid` listens on. A wildcard address (`*`) is given as
-/// `0.0.0.0`.
+/// The TCP addresses `pid` listens on. A wildcard address (`*`, IPv4 or
+/// IPv6) is given as `0.0.0.0`.
 pub fn tcp_listeners(pid: u32) -> Result<Vec<SocketAddr>, LsofError> {
     Ok(tcp_listeners_of(&[pid])?
         .into_iter()
@@ -26,7 +26,7 @@ pub fn tcp_listeners(pid: u32) -> Result<Vec<SocketAddr>, LsofError> {
 
 /// The TCP addresses each of `pids` listens on, with the pid that holds it,
 /// in one look. A process that is gone holds none.
-pub fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
+fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
     if pids.is_empty() {
         return Ok(Vec::new());
     }
@@ -35,9 +35,23 @@ pub fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, LsofErro
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    lsof(&["-a", "-p", &list, "-iTCP", "-sTCP:LISTEN"])
+}
+
+/// Every process, of those `lsof` can see (the user's), that listens on TCP
+/// at 127.0.0.1 port `port`, with the address it holds. Another user's
+/// process cannot bind a port the user's holds, so the user's are the ones
+/// that matter.
+pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
+    lsof(&[&format!("-iTCP@127.0.0.1:{port}"), "-sTCP:LISTEN"])
+}
+
+fn lsof(select: &[&str]) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
     let out = Command::new("/usr/sbin/lsof")
         .env("LC_ALL", "C")
-        .args(["-nP", "-a", "-p", &list, "-iTCP", "-sTCP:LISTEN", "-Fn"])
+        .arg("-nP")
+        .args(select)
+        .arg("-Fn")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| LsofError(e.to_string()))?;
@@ -102,38 +116,45 @@ fn address(name: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-/// The ports the system picks from for a bind on port 0. `sysctl` gives
-/// them on macOS; IANA's dynamic ports, macOS's default, when it cannot.
-pub fn ephemeral_ports() -> RangeInclusive<u16> {
-    let read = |name: &str| -> Option<u16> {
+/// The ports the system picks from for a bind on port 0, as `sysctl` gives
+/// them on macOS; why not, when it cannot say.
+pub fn ephemeral_ports() -> Result<RangeInclusive<u16>, String> {
+    let read = |name: &str| -> Result<u16, String> {
         let out = Command::new("/usr/sbin/sysctl")
             .args(["-n", name])
             .stdin(Stdio::null())
             .output()
-            .ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+            .map_err(|e| format!("cannot run /usr/sbin/sysctl: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        match out.status.success() {
+            true => text
+                .trim()
+                .parse()
+                .map_err(|_| format!("sysctl gave `{}` for {name}", text.trim())),
+            false => Err(format!("sysctl could not read {name}: {}", out.status)),
+        }
     };
-    match (
-        read("net.inet.ip.portrange.first"),
-        read("net.inet.ip.portrange.last"),
-    ) {
-        (Some(first), Some(last)) if first <= last => first..=last,
-        _ => 49152..=65535,
+    let (first, last) = (
+        read("net.inet.ip.portrange.first")?,
+        read("net.inet.ip.portrange.last")?,
+    );
+    match first <= last {
+        true => Ok(first..=last),
+        false => Err(format!("the ephemeral ports run from {first} to {last}")),
     }
 }
 
 /// The service's port, out of what its process holds: the one it listens on
-/// at 127.0.0.1, or every IPv4 address, in `ephemeral`, where a bind on port
-/// 0 lands (ADR 0028). A port it binds by number, such as Hermes's API
-/// server or webhooks, is not taken for it; none or several such ports is
-/// never a guess.
+/// at 127.0.0.1 in `ephemeral`, where a bind on port 0 lands (ADR 0028), as
+/// Hermes's gateway binds `127.0.0.1:0`. A port it binds by number, such as
+/// Hermes's API server or webhooks, and one held on every address are not
+/// taken for it: on every address, another process of the user could hold
+/// 127.0.0.1 at that port, and a session would reach that one. None or
+/// several such ports is never a guess.
 pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<u16, String> {
     let mut ports: Vec<u16> = held
         .iter()
-        .filter(|a| match a.ip() {
-            IpAddr::V4(ip) => ip.is_loopback() || ip.is_unspecified(),
-            IpAddr::V6(_) => false,
-        })
+        .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
         .map(SocketAddr::port)
         .filter(|port| ephemeral.contains(port))
         .collect();
@@ -141,7 +162,7 @@ pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<
     ports.dedup();
     match ports.as_slice() {
         [] => Err(format!(
-            "it holds no TCP listener on 127.0.0.1 in the ephemeral ports, {} to {}",
+            "it holds no TCP listener at 127.0.0.1 in the ephemeral ports, {} to {}",
             ephemeral.start(),
             ephemeral.end()
         )),
@@ -165,11 +186,10 @@ mod tests {
     use std::process::ExitStatus;
 
     #[test]
-    fn the_service_port_is_the_one_ephemeral_port_on_127_0_0_1() {
+    fn the_service_port_is_the_one_ephemeral_port_at_127_0_0_1() {
         let a = |s: &str| s.parse::<SocketAddr>().unwrap();
         let ephemeral = 49152..=65535;
         assert_eq!(one_port(&[a("127.0.0.1:61374")], &ephemeral), Ok(61374));
-        assert_eq!(one_port(&[a("0.0.0.0:61374")], &ephemeral), Ok(61374));
         // Ports bound by number (Hermes's API server, webhooks) are left out.
         assert_eq!(
             one_port(
@@ -178,8 +198,12 @@ mod tests {
             ),
             Ok(61374)
         );
-        // [::1] is not where `tcp4` reaches.
-        assert!(one_port(&[a("[::1]:61374")], &ephemeral).is_err());
+        // Every address is not taken for it: another process could hold
+        // 127.0.0.1 at that port. Nor [::1], which `tcp4` does not reach,
+        // nor another loopback address.
+        for held in ["0.0.0.0:61374", "[::1]:61374", "127.0.0.2:61374"] {
+            assert!(one_port(&[a(held)], &ephemeral).is_err(), "{held}");
+        }
         assert!(one_port(&[a("127.0.0.1:8642")], &ephemeral).is_err());
         assert!(one_port(&[], &ephemeral).is_err());
         let err = one_port(&[a("127.0.0.1:50001"), a("127.0.0.1:50002")], &ephemeral).unwrap_err();
@@ -197,10 +221,11 @@ mod tests {
         }
     }
 
+    // macOS's sysctl names; Linux has its own range.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_ephemeral_ports_are_the_systems() {
-        let ports = ephemeral_ports();
-        assert!(ports.start() <= ports.end());
+        let ports = ephemeral_ports().unwrap();
         // A bind on port 0 lands in them.
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -214,7 +239,7 @@ mod tests {
     fn listeners_are_read_from_the_name_lines() {
         let got = listening(&out(
             0,
-            "p32653\nf22\nn127.0.0.1:61374\nf23\nn[::1]:61374\nf24\nn*:9000\n",
+            "p32653\nf22\nn127.0.0.1:61374\nf23\nn[::1]:61374\nf24\nn*:9000\np41\nf5\nn127.0.0.1:61374\n",
             "",
         ))
         .unwrap();
@@ -224,6 +249,7 @@ mod tests {
                 (32653, "127.0.0.1:61374".parse().unwrap()),
                 (32653, "[::1]:61374".parse().unwrap()),
                 (32653, "0.0.0.0:9000".parse().unwrap()),
+                (41, "127.0.0.1:61374".parse().unwrap()),
             ]
         );
     }
@@ -246,10 +272,18 @@ mod tests {
     // `lsof` at that path is macOS's, where sandboxes listen (ADR 0028).
     #[cfg(target_os = "macos")]
     #[test]
-    fn this_process_is_seen_listening() {
+    fn this_process_is_seen_listening_by_pid_and_by_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let found = tcp_listeners(std::process::id()).unwrap();
         assert!(found.iter().any(|a| a.port() == port), "{found:?}");
+        let holders = tcp_listeners_at(port).unwrap();
+        assert_eq!(
+            holders,
+            [(
+                std::process::id(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+            )]
+        );
     }
 }

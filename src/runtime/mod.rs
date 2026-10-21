@@ -185,8 +185,8 @@ pub trait RuntimeAdapter {
     /// has one gateway serving every agent (ADR 0021).
     fn services(&self) -> Vec<RuntimeService>;
     /// The service that listens in the sandbox, whose port the sandbox's
-    /// sessions then reach (ADR 0028). `None`: the runtime's clients need
-    /// no listener of its own.
+    /// sessions then reach (ADR 0028). `None` (the default): the runtime has
+    /// no service its sessions must reach.
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }

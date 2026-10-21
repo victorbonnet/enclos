@@ -46,8 +46,9 @@ pub const TERMINAL_PARAM: &str = "ENCLOS_TERMINAL";
 
 /// The `sandbox-exec` parameter that names, as `localhost:<port>`, the
 /// port where the sandbox's runtime service listens, set by `wrap` for a
-/// session started while it listens (ADR 0028). Unset, as for the service
-/// itself, the session reaches its proxy alone.
+/// session started while it listens (ADR 0028). Unset (for the service
+/// itself, a probe, or a session started while the service does not
+/// listen), the program reaches its proxy alone.
 pub const SERVICE_PARAM: &str = "ENCLOS_SERVICE";
 
 /// What macOS grants a process for a pseudo-terminal it opens through
@@ -202,8 +203,9 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         // that one port, which `wrap` names: the port it held when the
         // session started, so every agent's client finds it and gets its own
         // ticket, as outside enclos. `tcp4` opens it on 127.0.0.1 alone,
-        // where the service listens, not on [::1], which another sandbox that
-        // listens could hold at that port (`tcp` opens both, macOS 26.5.2).
+        // where the service listens, not on [::1], which any other program, on
+        // the host or in another sandbox, could hold at that port (`tcp` opens
+        // both, checked by hand on macOS 26.5.2).
         // A parameter, so every session runs under this one compiled policy.
         line(format!(
             "(if (param \"{SERVICE_PARAM}\")\n  (allow network-outbound (remote tcp4 (param \"{SERVICE_PARAM}\"))))"

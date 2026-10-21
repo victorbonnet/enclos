@@ -108,7 +108,7 @@ impl Engine {
         audit_name: &str,
     ) -> Result<SessionEnd> {
         let command = command.into_words();
-        let summary = |(session, ..): &(SessionRecord, _, _)| format!("session {}", session.id);
+        let summary = |(session, ..): &(SessionRecord, _, _, _)| format!("session {}", session.id);
         // Which process group the program starts in (design §8). When this
         // command leads its group, as a terminal's job does, that group:
         // the program keeps the terminal, and this process, which leads the
@@ -121,14 +121,18 @@ impl Engine {
         let leads_group = group_of(me)? == Some(me);
         let own_group = !leads_group && !std::io::stdin().is_terminal();
         self.wait_service_proxy(name)?;
-        let (session, mut child, _keep_waiting) =
+        let (session, mut child, _keep_waiting, unreachable) =
             self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
                 let started = self.start_in_sandbox(lock, name, &command, own_group, leads_group);
                 self.failed_on_error(lock, name, audit_name, started)
             })?;
 
         let waited = self.wait_session(&session, &mut child, None)?;
-        self.finish_session(by, "session end", &session, waited)
+        let mut end = self.finish_session(by, "session end", &session, waited)?;
+        // Why the session could not reach its runtime's service (ADR 0028),
+        // which explains a runtime's own "connection failed".
+        end.notes.extend(unreachable);
+        Ok(end)
     }
 
     /// Starts `command` in the sandbox and records it as a session (design
@@ -140,7 +144,7 @@ impl Engine {
         command: &[OsString],
         own_group: bool,
         leads_group: bool,
-    ) -> Result<(SessionRecord, Child, KeepWaiting)> {
+    ) -> Result<(SessionRecord, Child, KeepWaiting, Option<String>)> {
         let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
@@ -150,14 +154,18 @@ impl Engine {
         let (program, args) = command.split_first().ok_or_else(|| Error::Session {
             what: "no command to run".into(),
         })?;
+        // The runtime's clients reach its service on the port it holds now
+        // (ADR 0028), or the session says why it cannot.
+        let (service_port, unreachable) = match self.service_port(&record) {
+            Ok(port) => (port, None),
+            Err(why) => (None, Some(why)),
+        };
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
             env: Vec::new(),
             in_terminal: true,
-            // The runtime's clients reach its service on the port it holds
-            // now (ADR 0028).
-            service_port: self.service_port(&record),
+            service_port,
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         // TMPDIR inside the sandbox (the policy denies /tmp).
@@ -204,7 +212,7 @@ impl Engine {
             Ok((session, keep_waiting))
         })();
         match recorded {
-            Ok((session, keep_waiting)) => Ok((session, child, keep_waiting)),
+            Ok((session, keep_waiting)) => Ok((session, child, keep_waiting, unreachable)),
             Err(e) => Err(abandon(child, e, "the program")),
         }
     }

@@ -239,8 +239,9 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn listener(&self) -> Option<RuntimeListener> {
-        // Hermes 0.22.3's chat (CLI, TUI, stream-json) never runs on its
-        // own: it finds the gateway, gets a ticket for its own profile over
+        // Hermes 0.22.3's chat (CLI, TUI, stream-json) cannot run without the
+        // gateway: it finds it, gets a ticket for its own agent (a Hermes
+        // profile) over
         // `gateway.sock` in the home, and dials the WebSocket the gateway
         // serves on 127.0.0.1:0 (`gateway/run_api.py`,
         // `hermes_cli/gateway_client.py`).
