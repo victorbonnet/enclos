@@ -47,7 +47,7 @@ elif name == "sysctl":
 elif name == "id":
     print(value("UID", "501"))
 elif name == "sw_vers":
-    print(value("MACOS_VERSION", "14.7"))
+    print(value("MACOS_VERSION", "15.7"))
 elif name == "curl":
     urls = [arg for arg in args if arg.startswith("https://")]
     if len(urls) != 1:
@@ -357,7 +357,7 @@ class InstallerTests(unittest.TestCase):
     def test_unsupported_hosts_and_root_stop_before_any_download(self):
         for settings, message in (
             ({"OS": "Linux"}, "only macOS"),
-            ({"MACOS_VERSION": "13.6"}, "macOS 14 or later"),
+            ({"MACOS_VERSION": "14.7"}, "macOS 15 or later"),
             ({"MACOS_VERSION": "beta"}, "Cannot tell the macOS version"),
             ({"UID": "0"}, "without sudo"),
         ):

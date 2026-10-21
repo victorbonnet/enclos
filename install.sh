@@ -14,7 +14,7 @@ staging_dir=""
 
 usage() {
   cat <<'HELP'
-Install the latest enclos release on an Apple silicon Mac running macOS 14 or later.
+Install the latest enclos release on an Apple silicon Mac running macOS 15 or later.
 
 Usage: install.sh [--prefix PATH]
 
@@ -149,7 +149,7 @@ main() {
     || fail "enclos needs an Apple silicon Mac."
   macos=$(sw_vers -productVersion)
   case "${macos%%.*}" in '' | *[!0-9]*) fail "Cannot tell the macOS version." ;; esac
-  [ "${macos%%.*}" -ge 14 ] || fail "macOS 14 or later is required (found $macos)."
+  [ "${macos%%.*}" -ge 15 ] || fail "macOS 15 or later is required (found $macos)."
   [ "$(id -u)" != 0 ] || fail "Run the installer as yourself, without sudo."
 
   trap cleanup EXIT
