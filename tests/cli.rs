@@ -602,6 +602,8 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "enclos files",
         "other sandboxes",
         "writes",
+        "renames",
+        "clones",
         "network",
         "dns",
         "signals",

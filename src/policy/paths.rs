@@ -3,6 +3,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::model::policy::FsPolicy;
+
 /// What policy paths expand against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathContext {
@@ -134,6 +136,62 @@ pub fn is_within(inner: &Path, outer: &Path) -> bool {
     inner.starts_with(outer)
 }
 
+/// A policy's filesystem paths, expanded and real, as the sandbox sees
+/// them. The compiler and `policy test` both start from this, so the probes
+/// check the folders the compiled rules name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsPaths {
+    /// The sandbox home, always writable.
+    pub home: PathBuf,
+    /// The policy's write grants.
+    pub writes: Vec<PathBuf>,
+    /// The policy's read deny list.
+    pub read_deny: Vec<PathBuf>,
+}
+
+impl FsPaths {
+    /// Expands and resolves every entry; one that does not expand is an
+    /// error, never a path silently left out.
+    pub fn of(fs: &FsPolicy, ctx: &PathContext) -> Result<FsPaths, String> {
+        let expand = |entries: &[String]| -> Result<Vec<PathBuf>, String> {
+            entries
+                .iter()
+                .map(|e| ctx.expand(e).map(|p| real_path(&p)))
+                .collect()
+        };
+        Ok(FsPaths {
+            home: real_path(&ctx.sandbox_home),
+            writes: expand(&fs.write)?,
+            read_deny: expand(&fs.read_deny)?,
+        })
+    }
+
+    /// The folders the sandbox may write in but must not move (design §5):
+    /// the sandbox home, every workspace, and every folder inside them that
+    /// holds a deny-list entry. Moving one of them would carry what it holds
+    /// to a path no deny rule names. Sorted, without repeats.
+    pub fn unmovable(&self) -> Vec<PathBuf> {
+        let writable: Vec<&Path> = std::iter::once(self.home.as_path())
+            .chain(self.writes.iter().map(PathBuf::as_path))
+            .collect();
+        let inside_writable = |p: &Path| writable.iter().any(|w| is_within(p, w));
+        let holding_denied = self
+            .read_deny
+            .iter()
+            .flat_map(|entry| entry.ancestors().skip(1))
+            .filter(|a| inside_writable(a));
+        let mut folders: Vec<PathBuf> = writable
+            .iter()
+            .copied()
+            .chain(holding_denied)
+            .map(Path::to_path_buf)
+            .collect();
+        folders.sort();
+        folders.dedup();
+        folders
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +299,47 @@ mod tests {
         link("loop-b", "b/loop-a");
         link("loop-a", "b/loop-b");
         assert!(links_on_the_way(&base.join("b/loop-a")).len() <= MAX_LINKS);
+    }
+
+    #[test]
+    fn the_writable_folders_and_those_holding_a_denied_path_inside_them_cannot_move() {
+        let u = "/nonexistent-enclos-test/u";
+        let ctx = PathContext {
+            user_home: u.into(),
+            sandbox_home: format!("{u}/.enclos/sandboxes/s/home").into(),
+        };
+        let s = |v: &[&str]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        let fs = FsPolicy {
+            // The home again, a workspace twice, and one holding nothing denied.
+            write: s(&["{home}", "~/work", "~/work/", "~/plain"]),
+            read_deny: s(&[
+                "~/.ssh",
+                "~/work/a/b/private",
+                "~/work/a/key",
+                "{home}/c/private",
+                "~",
+            ]),
+        };
+        let paths = FsPaths::of(&fs, &ctx).unwrap();
+        assert_eq!(paths.home, ctx.sandbox_home);
+        let p = |s: &str| PathBuf::from(format!("{u}{s}"));
+        assert_eq!(
+            paths.unmovable(),
+            [
+                p("/.enclos/sandboxes/s/home"),
+                p("/.enclos/sandboxes/s/home/c"),
+                p("/plain"),
+                p("/work"),
+                p("/work/a"),
+                p("/work/a/b"),
+            ]
+        );
+        // An entry that does not expand is an error, not a folder left out.
+        let bad = FsPolicy {
+            write: s(&["work"]),
+            read_deny: Vec::new(),
+        };
+        assert!(FsPaths::of(&bad, &ctx).unwrap_err().contains("`work`"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::layout::LayoutError;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
-use crate::policy::paths::{PathContext, real_path};
+use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, Run, host_service_probes,
     missing_workspaces, not_here, outcome, probes, sandboxed_script,
@@ -195,27 +195,20 @@ impl Engine {
             sandbox_home: ctx.home.clone(),
         };
         // Every stored policy was validated, so each entry expands; one that
-        // does not is an error, never a path silently left out.
-        let expand = |entries: &[String]| {
-            entries
-                .iter()
-                .map(|e| paths.expand(e).map(|p| real_path(&p)))
-                .collect::<std::result::Result<Vec<_>, String>>()
-                .map_err(|reason| Error::Session {
-                    what: format!(
-                        "the policy of sandbox {name} has a path enclos cannot expand: {reason}"
-                    ),
-                })
-        };
-        let read_deny = expand(&policy.fs.read_deny)?;
-        let home = real_path(&ctx.home);
-        let mut writes = expand(&policy.fs.write)?;
+        // does not is an error, never a path silently left out. The compiler
+        // starts from the same paths, so the probes check what it denies.
+        let fs = FsPaths::of(&policy.fs, &paths).map_err(|reason| Error::Session {
+            what: format!("the policy of sandbox {name} has a path enclos cannot expand: {reason}"),
+        })?;
+        let unmovable = fs.unmovable();
+        let home = fs.home.clone();
         let mut workspaces: Vec<PathBuf> = Vec::new();
-        for path in &writes {
+        for path in &fs.writes {
             if *path != home && !workspaces.contains(path) {
                 workspaces.push(path.clone());
             }
         }
+        let mut writes = fs.writes.clone();
         writes.push(home.clone());
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
@@ -230,9 +223,10 @@ impl Engine {
                 .filter(|r| r.name != *name)
                 .map(|r| self.layout.sandbox_dir(r.name.as_str()))
                 .collect(),
-            read_deny,
+            read_deny: fs.read_deny,
             home,
             workspaces,
+            unmovable,
             host_sockets: host_sockets(&ctx.user_home),
             target,
             tag: std::process::id(),
@@ -528,6 +522,7 @@ mod tests {
             read_deny: Vec::new(),
             home: dir.join("enclos/sandboxes/home/home"),
             workspaces: Vec::new(),
+            unmovable: Vec::new(),
             host_sockets: Vec::new(),
             target: Some(target),
             tag: 7,

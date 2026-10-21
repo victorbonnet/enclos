@@ -47,6 +47,14 @@ pub enum Expect {
     FailsWith(&'static str),
     /// Closed when the output does not contain this text.
     OutputLacks(&'static str),
+    /// A folder renamed or cloned into itself, which the filesystem refuses
+    /// (`Invalid argument`; a volume that cannot clone refuses a clone with
+    /// another error), so nothing moves or is copied even when the rule does
+    /// not hold. Closed on Seatbelt's refusal (`Operation not permitted`),
+    /// which comes first; the filesystem's means the call got past Seatbelt:
+    /// open. Any other failure is inconclusive. The control is the same call
+    /// on the host, which works when the filesystem refuses it there.
+    IntoItself,
     /// An Apple Event to Finder. An answer, a refusal by TCC (-1743) or a
     /// wait on Finder (-1712) all mean the event left the sandbox: open
     /// (ADR 0016). Closed on the refusal Seatbelt gives (-600); any other
@@ -197,6 +205,9 @@ pub struct ProbeInputs {
     pub home: PathBuf,
     /// The policy's workspaces, resolved, held to the same rule.
     pub workspaces: Vec<PathBuf>,
+    /// The writable folders the sandbox must not move: the home, every
+    /// workspace, and the folders inside them that hold a denied path.
+    pub unmovable: Vec<PathBuf>,
     /// Unix sockets of host services that exist here (SSH agent, Docker).
     pub host_sockets: Vec<PathBuf>,
     /// The process the host started for the signal probe; none when nothing
@@ -402,6 +413,53 @@ pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
         .collect()
 }
 
+/// Renames `folder` into itself, with rename(2) through perl: the filesystem
+/// refuses that whatever the policy, so the folder never moves, and the
+/// same call on the host is the control.
+fn rename_probe(folder: &Path, tag: u32) -> Probe {
+    into_itself(
+        "renames",
+        "rename",
+        "rename($ARGV[0], $ARGV[1])",
+        folder,
+        tag,
+    )
+}
+
+/// Clones `folder` into itself, with clonefileat(2) (syscall 462, with
+/// `AT_FDCWD`) through perl, which has no call of its own for it: refused by
+/// the filesystem whatever the policy, so nothing is copied.
+fn clone_probe(folder: &Path, tag: u32) -> Probe {
+    into_itself(
+        "clones",
+        "clone",
+        "syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0",
+        folder,
+        tag,
+    )
+}
+
+/// A probe whose perl `call` acts on `folder` and a path inside it
+/// (`$ARGV[0]`, `$ARGV[1]`): see [`Expect::IntoItself`]. Both the probe and
+/// its control print why they failed, and say what a success may have left.
+fn into_itself(route: &'static str, verb: &str, call: &str, folder: &Path, tag: u32) -> Probe {
+    let script = |on_success: &str, on_failure: &str| {
+        format!(
+            "/usr/bin/perl -e 'if ({call}) {{ print \"it succeeded, so $ARGV[1] may now exist\\n\"; {on_success} }} {on_failure}' {} {}",
+            sh_quote(folder),
+            sh_quote(&folder.join(format!("enclos-probe-{tag}")))
+        )
+    };
+    probe(
+        route,
+        format!("{verb} {}", folder.display()),
+        script("exit 0", "die \"$!\\n\""),
+        Expect::IntoItself,
+        // The filesystem's refusal is the control working.
+        script("exit 1", "exit 0 if $!{EINVAL}; die \"$!\\n\""),
+    )
+}
+
 /// A request through the sandbox's proxy, which must answer 403. Even with
 /// `NO_PROXY` set in the sandbox, curl is told to use the proxy.
 fn proxy_probe(name: &str, url: &str) -> Probe {
@@ -432,6 +490,10 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         .filter(|p| probeable(p) && i.writes.iter().any(|w| is_within(p, w)))
     {
         list.push(denied_under_grant_probe(path, i.tag));
+    }
+    for folder in i.unmovable.iter().filter(|f| f.is_dir()) {
+        list.push(rename_probe(folder, i.tag));
+        list.push(clone_probe(folder, i.tag));
     }
     for path in [
         i.data.join("state.db"),
@@ -603,6 +665,13 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
             others.join(", ")
         ));
     }
+    let not_folders = i.unmovable.iter().filter(|f| !f.is_dir()).count();
+    if not_folders > 0 {
+        absent.push(format!(
+            "renames and clones of {not_folders} of the {} folders that cannot move (they are not folders here)",
+            i.unmovable.len()
+        ));
+    }
     if i.host_sockets.is_empty() {
         absent.push("host sockets (no SSH agent or Docker socket here)".to_owned());
     }
@@ -737,10 +806,16 @@ pub fn outcome(
         (Ok(None), Outcome::Closed) => match (&probe.proof, control) {
             (Proof::ProxyRefuses, _) => Outcome::Closed,
             (Proof::Control { .. }, Some((true, _))) => Outcome::Closed,
-            (Proof::Control { .. }, Some((false, output))) => {
+            (Proof::Control { expect, .. }, Some((false, output))) => {
+                let why = match expect {
+                    Expect::IntoItself => {
+                        "outside the sandbox, the filesystem did not refuse it with Invalid argument"
+                    }
+                    _ => "it fails outside the sandbox too",
+                };
                 Outcome::Inconclusive(match last_line(output) {
-                    line if line.is_empty() => "it fails outside the sandbox too".to_owned(),
-                    line => format!("it fails outside the sandbox too: {line}"),
+                    line if line.is_empty() => why.to_owned(),
+                    line => format!("{why}: {line}"),
                 })
             }
             (Proof::Control { .. }, None) => Outcome::NotRun("its control did not run".into()),
@@ -777,6 +852,19 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             Outcome::Open(format!("output has `{text}`"))
         }
         Expect::OutputLacks(_) => Outcome::Closed,
+        // Its script says what the call may have left.
+        Expect::IntoItself if succeeded => Outcome::Open(match last_line(output) {
+            line if line.is_empty() => "it succeeded".to_owned(),
+            line => line,
+        }),
+        Expect::IntoItself if output.contains("Operation not permitted") => Outcome::Closed,
+        Expect::IntoItself if output.contains("Invalid argument") => Outcome::Open(
+            "the filesystem refused it (Invalid argument), so Seatbelt let the call through".into(),
+        ),
+        Expect::IntoItself => Outcome::Inconclusive(format!(
+            "it failed, but not with the policy's refusal (Operation not permitted): {}",
+            last_line(output)
+        )),
         Expect::AppleEventBlocked if succeeded => {
             Outcome::Open(format!("Finder answered: {}", last_line(output)))
         }
@@ -811,6 +899,7 @@ mod tests {
     use std::process::Command;
 
     fn inputs(dir: &Path) -> ProbeInputs {
+        std::fs::create_dir_all(dir.join("it's here")).unwrap();
         ProbeInputs {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
@@ -821,6 +910,7 @@ mod tests {
             read_deny: vec![dir.to_owned(), dir.join("does-not-exist")],
             home: dir.join("enclos/sandboxes/home/home"),
             workspaces: vec![dir.join("work")],
+            unmovable: vec![dir.join("it's here"), dir.join("not-a-folder")],
             host_sockets: vec![dir.join("agent.sock")],
             target: Some(4242),
             tag: 7,
@@ -903,6 +993,10 @@ mod tests {
         let absent = not_here(&i).join("; ");
         assert!(
             absent.contains("1 of the 2 denied sensitive paths"),
+            "{absent}"
+        );
+        assert!(
+            absent.contains("renames and clones of 1 of the 2 folders that cannot move"),
             "{absent}"
         );
         assert!(absent.contains("host sockets"), "{absent}");
@@ -1420,6 +1514,90 @@ mod tests {
             proven(ae, ran(false, broken)),
             Outcome::Inconclusive(_)
         ));
+    }
+
+    #[test]
+    fn a_rename_or_clone_is_closed_only_by_seatbelt_refusing_it_before_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = all(dir.path());
+        for route in ["renames", "clones"] {
+            let found: Vec<&Probe> = list.iter().filter(|p| p.route == route).collect();
+            assert_eq!(found.len(), 1, "only folders that exist: {found:?}");
+            let p = found[0];
+            assert!(
+                p.script.contains(&sh_quote(&dir.path().join("it's here"))),
+                "{}",
+                p.script
+            );
+            let refused = "Operation not permitted";
+            assert_eq!(proven(p, ran(false, refused)), Outcome::Closed);
+            assert!(matches!(
+                proven(p, ran(false, "Invalid argument")),
+                Outcome::Open(why) if why.contains("Seatbelt let the call through")
+            ));
+            assert!(matches!(proven(p, ran(true, "")), Outcome::Open(_)));
+            let left = "it succeeded, so /x/enclos-probe-7 may now exist";
+            assert_eq!(proven(p, ran(true, left)), Outcome::Open(left.into()));
+            assert!(matches!(
+                proven(p, ran(false, "No such file or directory")),
+                Outcome::Inconclusive(_)
+            ));
+            // A control that did not get the filesystem's refusal says why,
+            // and never lets the probe count as closed.
+            for host in ["Operation not supported", left] {
+                assert_eq!(
+                    outcome(p, ran(false, refused), Ok(None), Some((false, host))),
+                    Outcome::Inconclusive(format!(
+                        "outside the sandbox, the filesystem did not refuse it with Invalid argument: {host}"
+                    ))
+                );
+            }
+        }
+    }
+
+    /// The controls themselves, run on the host on temporary folders: the
+    /// filesystem refuses a folder into itself, so they work and nothing is
+    /// made; on a folder no longer there, they fail and say why.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_rename_and_clone_controls_work_on_a_folder_and_say_why_they_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (here, gone) = (dir.path().join("here"), dir.path().join("gone"));
+        std::fs::create_dir(&here).unwrap();
+        std::fs::create_dir(&gone).unwrap();
+        let controls = |folder: &Path| -> Vec<HostScript> {
+            let mut i = inputs(dir.path());
+            i.unmovable = vec![folder.to_owned()];
+            probes(&i)
+                .into_iter()
+                .filter(|p| ["renames", "clones"].contains(&p.route))
+                .map(|p| match p.proof {
+                    Proof::Control { control, .. } => control,
+                    Proof::ProxyRefuses => panic!("{} has no control", p.name),
+                })
+                .collect()
+        };
+        let run = |control: &HostScript| {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", control.as_str()])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            (out.status.success(), text)
+        };
+        let (worked, failing) = (controls(&here), controls(&gone));
+        assert_eq!((worked.len(), failing.len()), (2, 2));
+        for control in &worked {
+            let (ok, text) = run(control);
+            assert!(ok, "{text}");
+        }
+        assert!(!here.join("enclos-probe-7").exists());
+        std::fs::remove_dir(&gone).unwrap();
+        for control in &failing {
+            let (ok, text) = run(control);
+            assert!(!ok && text.contains("No such file or directory"), "{text}");
+        }
     }
 
     #[test]
