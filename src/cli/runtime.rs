@@ -38,9 +38,20 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     super::connect::report_end(&sandbox, &end.end);
     let shown = runtime.display_name();
     if !end.installed {
+        let after = match end.recorded {
+            Some(kept) => format!(
+                "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
+                kept.display_name(),
+                end.policy
+            ),
+            None => format!(
+                "Nothing is recorded as installed, and policy v{} is without {shown}'s destinations",
+                end.policy
+            ),
+        };
         eprintln!(
-            "enclos: the {shown} installer exited with {} in sandbox {sandbox}; its output above says why. Nothing is recorded as installed, and the policy is back to v{} without {shown}'s destinations. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again.",
-            end.end.exit, end.policy
+            "enclos: the {shown} installer exited with {} in sandbox {sandbox}; its output above says why. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again.",
+            end.end.exit
         );
         return Ok(exit::ERROR);
     }

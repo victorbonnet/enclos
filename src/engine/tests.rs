@@ -1012,6 +1012,18 @@ echo \"installed $*\" > \"$HOME/installed\"
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+
+        /// The summary of the last finished audit entry for `command`.
+        fn summary(&self, command: &str) -> String {
+            self.engine
+                .audit(None)
+                .unwrap()
+                .into_iter()
+                .rfind(|e| e.intent.command == command)
+                .and_then(|e| e.finished)
+                .map(|f| f.outcome.message)
+                .unwrap_or_else(|| panic!("no finished {command} entry"))
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1082,6 +1094,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         let lab = Lab::new();
         let end = done(lab.install("#!/bin/sh\nexit 3\n", Confirm::Yes).unwrap());
         assert!(!end.installed);
+        assert_eq!(end.recorded, None);
         assert_eq!(end.end.exit, 3);
         assert_eq!(lab.runtime(), None);
         assert!(!lab.allows("chatgpt.com"));
@@ -1092,9 +1105,9 @@ echo \"installed $*\" > \"$HOME/installed\"
         let audit = lab.audit();
         assert!(audit.contains("runtime install failed"), "{audit}");
         assert!(!audit.contains("runtime installed"), "{audit}");
-        assert!(
-            audit.contains("the installer exited with 3; policy back to v3"),
-            "{audit}"
+        assert_eq!(
+            lab.summary("runtime install failed"),
+            "the installer exited with 3; policy v3 without hermes's destinations"
         );
         // The home file was put in place from inside the sandbox before.
         assert!(lab.home.join("bin/mktemp").is_file());
@@ -1111,27 +1124,21 @@ echo \"installed $*\" > \"$HOME/installed\"
 
         let end = done(lab.install("#!/bin/sh\nexit 3\n", Confirm::Yes).unwrap());
         assert!(!end.installed);
+        assert_eq!(end.recorded, Some(RuntimeKind::Hermes));
         assert_eq!(end.end.exit, 3);
         // The sandbox is as before the reinstall: the runtime still
         // recorded, and the same active policy, which allows its endpoints.
         assert_eq!(lab.runtime(), Some(RuntimeKind::Hermes));
-        assert!(lab.allows("chatgpt.com") && lab.allows("github.com"));
+        assert!(lab.allows("chatgpt.com"));
+        assert!(lab.allows("github.com"));
         let after = lab.engine.policy(&lab.name).unwrap();
-        assert_eq!(after.version.version, 2);
         assert_eq!(end.policy, 2);
+        assert_eq!(after.version.version, 2);
         assert_eq!(after.snapshot.id, before.snapshot.id);
         assert_eq!(lab.engine.state.policy_history(&lab.name).unwrap().len(), 2);
-        let failed = lab
-            .engine
-            .audit(None)
-            .unwrap()
-            .into_iter()
-            .rfind(|e| e.intent.command == "runtime install failed")
-            .expect("the failure is audited");
-        let summary = &failed.finished.as_ref().unwrap().outcome.message;
         assert_eq!(
-            summary,
-            "the installer exited with 3; hermes still installed, under policy v2"
+            lab.summary("runtime install failed"),
+            "the installer exited with 3; hermes still recorded as installed, under policy v2"
         );
     }
 

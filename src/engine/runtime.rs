@@ -32,10 +32,14 @@ pub struct InstallEnd {
     pub kind: RuntimeKind,
     /// How the installer's session ended.
     pub end: SessionEnd,
-    /// Whether the runtime is now recorded as installed: the installer
-    /// exited 0. Otherwise the sandbox is as before, without the runtime's
-    /// destinations.
+    /// Whether this install succeeded: its installer exited 0, and the
+    /// runtime is recorded because of it.
     pub installed: bool,
+    /// The runtime the sandbox records afterwards. After a failed install it
+    /// is the one it had before, and the active policy allows that runtime's
+    /// destinations only: none after a failed first install, this runtime
+    /// after a failed reinstall.
+    pub recorded: Option<RuntimeKind>,
     /// The sandbox's active policy version afterwards.
     pub policy: u32,
 }
@@ -132,9 +136,6 @@ struct InstallPlan {
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
     proxy_runs: bool,
-    /// The runtime the sandbox has before this install: none, or the same
-    /// runtime when it is installed again.
-    before: Option<RuntimeKind>,
 }
 
 /// An installer larger than this is not the script enclos reviewed.
@@ -296,7 +297,9 @@ impl Engine {
     /// policy, its installer is downloaded on the host and run only if it is
     /// the reviewed one, inside the sandbox, through the proxy, in this
     /// terminal. The runtime is recorded as installed only when the
-    /// installer exits 0; otherwise the sandbox is as before the install.
+    /// installer exits 0; otherwise the record keeps the runtime it had and
+    /// the policy is resolved again from `policy.toml` with that runtime's
+    /// destinations. Files written in the home stay either way.
     pub fn install_runtime(
         &self,
         by: &Actor,
@@ -329,36 +332,35 @@ impl Engine {
         // installer lands beside the home, where the sandbox cannot write.
         let command = self.stage_install(name, runtime)?;
         let target = format!("{name} {kind}");
-        let (version, before) = self.write(
+        let version = self.write(
             by,
             "runtime install",
             Some(target.clone()),
-            |(v, _): &(PolicyVersion, _)| format!("policy v{}", v.version),
+            |v: &PolicyVersion| format!("policy v{}", v.version),
             |lock| {
                 // Checked again under the lock: the policy may have changed.
                 let plan = self.plan_install(name, runtime)?;
                 if confirm == Confirm::Ask && !plan.also.is_empty() {
                     return Err(needs_confirmation(kind, name, &plan.also));
                 }
-                let version =
-                    self.save_policy_for_runtime(lock, by, name, &plan.overrides, Some(kind))?;
-                Ok((version, plan.before))
+                self.save_policy_for_runtime(lock, by, name, &plan.overrides, Some(kind))
             },
         )?;
         let end = match self.run_in_sandbox(by, name, command, "runtime installer") {
             Ok(end) => end,
             Err(e) => {
-                self.undo_install(by, name, kind, before, &e.to_string())?;
+                self.undo_install(by, name, kind, &e.to_string())?;
                 return Err(e);
             }
         };
         if end.exit != 0 {
             let why = format!("the installer exited with {}", end.exit);
-            let policy = self.undo_install(by, name, kind, before, &why)?;
+            let (policy, recorded) = self.undo_install(by, name, kind, &why)?;
             return Ok(Planned::Done(InstallEnd {
                 kind,
                 end,
                 installed: false,
+                recorded,
                 policy,
             }));
         }
@@ -380,6 +382,7 @@ impl Engine {
             kind,
             end,
             installed: true,
+            recorded: Some(kind),
             policy: version.version,
         }))
     }
@@ -419,42 +422,44 @@ impl Engine {
             added,
             also,
             proxy_runs: self.proxy_runs(name)?,
-            before: record.runtime,
         })
     }
 
-    /// After a failed install, the sandbox is as before it: the runtime it
-    /// had (`before`), and a policy resolved with that runtime's
-    /// destinations. A failed first install leaves no runtime and takes the
-    /// destinations out again; a failed reinstall keeps the runtime recorded
-    /// and its destinations in the active policy.
+    /// After a failed install, the policy is resolved again with the
+    /// runtime the record has: an install records its runtime only on
+    /// success, so that is the one the sandbox had before, none or the same
+    /// one, unless another install succeeded meanwhile. Returns the
+    /// active version and that runtime.
     fn undo_install(
         &self,
         by: &Actor,
         name: &SandboxName,
         kind: RuntimeKind,
-        before: Option<RuntimeKind>,
         why: &str,
-    ) -> Result<u32> {
-        let version = self.write(
+    ) -> Result<(u32, Option<RuntimeKind>)> {
+        let (version, recorded) = self.write(
             by,
             "runtime install failed",
             Some(format!("{name} {kind}")),
-            |v: &PolicyVersion| match before {
-                Some(kept) => format!("{why}; {kept} still installed, under policy v{}", v.version),
-                None => format!("{why}; policy back to v{}", v.version),
+            |(v, recorded): &(PolicyVersion, Option<RuntimeKind>)| match recorded {
+                Some(kept) => format!(
+                    "{why}; {kept} still recorded as installed, under policy v{}",
+                    v.version
+                ),
+                None => format!("{why}; policy v{} without {kind}'s destinations", v.version),
             },
             |lock| {
-                let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+                let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
-                record.runtime = before;
-                self.state.put(lock, &record)?;
                 let overrides = self.layout.read_policy(name.as_str())?;
-                self.save_policy_for_runtime(lock, by, name, &overrides, before)
+                Ok((
+                    self.save_policy(lock, by, name, &overrides)?,
+                    record.runtime,
+                ))
             },
         )?;
-        Ok(version.version)
+        Ok((version.version, recorded))
     }
 
     /// Stages what an install needs in the sandbox's `installers/` folder,

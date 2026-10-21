@@ -197,8 +197,7 @@ impl Engine {
     }
 
     /// As `save_policy`, with `runtime`'s endpoints instead of the installed
-    /// runtime's: while a runtime installs, before it is recorded, and when
-    /// its install failed, to take them out again.
+    /// runtime's: while a runtime installs, before it is recorded.
     pub(super) fn save_policy_for_runtime(
         &self,
         lock: &StateLock,
