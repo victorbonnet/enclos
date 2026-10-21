@@ -163,6 +163,22 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         "(allow network-outbound (remote unix-socket {}))",
         subpath(home)?
     ));
+    if policy.net.listen {
+        // A runtime's own listener (ADR 0028). Seatbelt refuses `localhost:0`
+        // and `localhost` does not hold a bind to loopback (a bind on 0.0.0.0
+        // passes too, macOS 26.5.2), so this opens every port on every
+        // address. Then each proxy port of the install is closed again, so no
+        // sandbox takes another's proxy port while that proxy is not running:
+        // an exact-port deny after the allow held on every address, and
+        // Seatbelt refuses before the port is found in use. Outbound is
+        // unchanged: only the proxy port.
+        line("(allow network-bind network-inbound (local tcp \"localhost:*\"))".into());
+        for port in &ctx.reserved_ports {
+            line(format!(
+                "(deny network-bind (local tcp \"*:{port}\") (with message \"{tag}\"))"
+            ));
+        }
+    }
 
     line(String::new());
     line(HOST_SERVICES.replace("{tag}", &tag).trim_end().to_owned());
@@ -300,6 +316,40 @@ mod tests {
         p.fs.write = vec!["{home}".into(), "~/work".into()];
         p.fs.read_deny = vec!["~/.ssh".into(), "~/.netrc".into()];
         p
+    }
+
+    #[test]
+    fn a_policy_that_does_not_listen_binds_only_unix_sockets_in_the_home() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let text = compile(&policy(), &ctx(base)).unwrap().text;
+        assert_eq!(text.matches("(local tcp").count(), 0, "{text}");
+        assert_eq!(text.matches("(allow network-bind").count(), 1, "{text}");
+        assert!(text.contains("(allow network-bind network-inbound (local unix-socket"));
+    }
+
+    #[test]
+    fn a_policy_that_listens_binds_tcp_but_no_proxy_port_of_the_install() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.net.listen = true;
+        let mut c = ctx(base);
+        c.reserved_ports = vec![41000, 41001, 41005];
+        let text = compile(&p, &c).unwrap().text;
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
+        };
+        let allow = at("(allow network-bind network-inbound (local tcp \"localhost:*\"))");
+        // Later rules win: each deny comes after the allow, on every address.
+        for port in [41000, 41001, 41005] {
+            let deny = at(&format!(
+                "(deny network-bind (local tcp \"*:{port}\") (with message \"enclos:home\"))"
+            ));
+            assert!(allow < deny, "{port}");
+        }
+        // Outbound is unchanged: still the proxy port alone.
+        assert_eq!(text.matches("(remote tcp").count(), 1);
+        assert!(at("(deny network*") < allow);
     }
 
     #[test]

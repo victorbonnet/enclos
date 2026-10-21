@@ -38,6 +38,12 @@ pub struct NetPolicy {
     /// Allowed hosts that may resolve to private addresses (ADR 0017).
     pub private: Vec<String>,
     pub log: NetLog,
+    /// Whether the sandbox may listen on TCP, on any port but enclos's proxy
+    /// ports (ADR 0028), for a runtime whose own clients reach its service
+    /// through the proxy. Nothing narrows a listener to loopback: what
+    /// listens here can serve the network.
+    #[serde(default)]
+    pub listen: bool,
 }
 
 /// Which destinations a sandbox may reach (ADR 0025). Either way, every

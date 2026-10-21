@@ -73,6 +73,17 @@ impl Engine {
         Ok(file)
     }
 
+    /// Every proxy port the install's sandboxes have reserved, and
+    /// `proxy_port`, sorted: a sandbox that may listen binds none of them
+    /// (ADR 0028). A port reserved later is not in a policy compiled now.
+    fn reserved_ports(&self, proxy_port: u16) -> Result<Vec<u16>> {
+        let mut ports: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
+        ports.push(proxy_port);
+        ports.sort_unstable();
+        ports.dedup();
+        Ok(ports)
+    }
+
     /// The file the active policy compiles to, and its text, without
     /// writing it.
     pub(crate) fn compiled_file(
@@ -83,7 +94,8 @@ impl Engine {
         let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
         self.check_before_compile(name, &policy)?;
-        let ctx = self.sandbox_context(name, proxy_port);
+        let mut ctx = self.sandbox_context(name, proxy_port);
+        ctx.reserved_ports = self.reserved_ports(proxy_port)?;
         let compiled = backend.compile(&policy, &ctx)?;
         let digest = sha256_hex(compiled.text.as_bytes());
         let file =

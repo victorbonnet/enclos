@@ -225,6 +225,57 @@ fn the_network_reaches_only_the_proxy_port() {
     assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 ::1 {}", port(&other6))));
 }
 
+/// Listening (ADR 0028). Without `listen`, no TCP bind at all. With it, any
+/// port the install has not reserved, on loopback and on every address, and
+/// none of the reserved ones, the one the proxy holds included; outbound
+/// still reaches only the proxy port. The `policy test` probe is closed in
+/// both cases, with its control working on the host.
+#[test]
+fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
+    let mut w = world();
+    let bind = |addr: &str, port: u16| {
+        format!(
+            "/usr/bin/perl -MSocket -e 'socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"$!\\n\"; bind($s, sockaddr_in({port}, inet_aton(\"{addr}\"))) or die \"$!\\n\"; listen($s, 1) or die \"$!\\n\"'"
+        )
+    };
+    let proxy = w.allowed.local_addr().unwrap().port();
+    let probe_closes = |w: &World, listen: bool| {
+        let probe = crate::probes::listen_probe(listen, proxy);
+        let Proof::Control { control, .. } = &probe.proof else {
+            panic!("{} has no control", probe.name);
+        };
+        let host = Command::new("/bin/sh")
+            .args(["-c", control.as_str()])
+            .status()
+            .unwrap();
+        assert!(host.success(), "the control fails on the host");
+        assert!(w.refused(&probe.script), "{}", probe.name);
+    };
+    assert!(w.refused(&bind("127.0.0.1", 0)));
+    probe_closes(&w, false);
+
+    // Another sandbox's proxy port, which nothing holds now.
+    let other_proxy = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    w.ctx.reserved_ports = vec![proxy, other_proxy];
+    let mut policy = Policy::default();
+    policy.fs.write = vec!["{home}".into()];
+    policy.net.listen = true;
+    w.enforce(&policy);
+    for addr in ["127.0.0.1", "0.0.0.0"] {
+        assert!(w.sh(&bind(addr, 0)), "{addr}:0");
+        // Seatbelt refuses before the port is found in use.
+        assert!(w.refused(&bind(addr, proxy)), "{addr}:{proxy}, held");
+        assert!(w.refused(&bind(addr, other_proxy)), "{addr}:{other_proxy}");
+    }
+    probe_closes(&w, true);
+    let other = w.other.local_addr().unwrap().port();
+    assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 127.0.0.1 {other}")));
+}
+
 /// The rule opens the proxy port to TCP only: a program holding that port
 /// for UDP would get datagrams around the proxy, which holds TCP alone.
 #[test]
@@ -438,6 +489,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         unmovable: w.fs.unmovable(),
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
+        listen: false,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -591,6 +643,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         unmovable: Vec::new(),
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
+        listen: false,
         other_terminal: None,
         target: None,
         tag: 7,

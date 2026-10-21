@@ -32,6 +32,9 @@ pub struct TestReport {
     pub host_services: bool,
     /// What was not probed because it is not on this host.
     pub not_here: Vec<String>,
+    /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
+    /// the policy, so the report says so rather than probing it closed.
+    pub listens: bool,
 }
 
 impl TestReport {
@@ -213,6 +216,7 @@ impl Engine {
                 results,
                 host_services,
                 not_here: not_here(&inputs),
+                listens: inputs.listen,
             })
         })
         .map(Planned::Done)
@@ -268,6 +272,7 @@ impl Engine {
             unmovable,
             host_sockets: host_sockets(&ctx.user_home),
             proxy_port: ctx.proxy_port,
+            listen: policy.net.listen,
             target,
             other_terminal,
             tag: std::process::id(),
@@ -511,6 +516,7 @@ mod tests {
                 .collect(),
             host_services: false,
             not_here: Vec::new(),
+            listens: false,
         }
     }
 
@@ -568,6 +574,7 @@ mod tests {
             unmovable: Vec::new(),
             host_sockets: Vec::new(),
             proxy_port: 41001,
+            listen: false,
             target: Some(target),
             other_terminal: None,
             tag: 7,

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::Engine;
 use super::import::{Archive, LeftCopy};
-use super::policy::{adapter_layer, differences};
+use super::policy::{adapter_layer, differences, listen_change};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
@@ -133,6 +133,9 @@ struct InstallPlan {
     active: u32,
     /// The runtime's destinations the active policy does not allow yet.
     added: Vec<String>,
+    /// Whether the runtime's layer lets the sandbox listen, which the active
+    /// policy does not yet (ADR 0028).
+    listens: bool,
     /// What else the new version changes: edits to `policy.toml` not
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
@@ -416,11 +419,18 @@ impl Engine {
             .filter(|d| !active.snapshot.policy.net.allow.contains(d))
             .cloned()
             .collect();
-        let also = differences(&active.snapshot.policy, &snapshot.policy, &expected);
+        let mut also = differences(&active.snapshot.policy, &snapshot.policy, &expected);
+        // Listening the adapter's layer asks for is what the runtime brings,
+        // like its destinations (ADR 0028), unless `policy.toml` overrides it.
+        let listening = snapshot.policy.net.listen;
+        if layer.network.listen == Some(listening) {
+            also.retain(|c| *c != listen_change(listening));
+        }
         Ok(InstallPlan {
             overrides,
             active: active.version.version,
             added,
+            listens: listening && !active.snapshot.policy.net.listen,
             also,
             proxy_runs: self.proxy_runs(name)?,
         })
@@ -911,14 +921,22 @@ impl InstallPlan {
         let kind = runtime.kind();
         let mut changes = Vec::new();
         match self.added.len() {
-            0 if self.also.is_empty() => changes.push(format!(
+            0 if self.also.is_empty() && !self.listens => changes.push(format!(
                 "keep the policy of sandbox {name} at v{}: it already allows what {kind} needs",
                 self.active
+            )),
+            0 => changes.push(format!(
+                "change the policy of sandbox {name} for {kind}, as a new policy version"
             )),
             n => changes.push(format!(
                 "allow the {n} destinations {kind} needs in sandbox {name}, as a new policy version: {}",
                 self.added.join(", ")
             )),
+        }
+        if self.listens {
+            changes.push(format!(
+                "let {kind}'s own service listen in sandbox {name} (ADR 0028): on TCP, any port but enclos's proxy ports, on every address, so what listens there can serve the network"
+            ));
         }
         changes.extend(self.also.iter().map(|c| format!("also {c}")));
         changes.push(format!(

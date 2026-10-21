@@ -221,6 +221,8 @@ pub struct ProbeInputs {
     pub host_sockets: Vec<PathBuf>,
     /// The sandbox's proxy port.
     pub proxy_port: u16,
+    /// Whether the policy lets the sandbox listen on TCP (ADR 0028).
+    pub listen: bool,
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
@@ -309,6 +311,40 @@ fn open_for_writing_probe(route: &'static str, name: &str, file: &Path) -> Probe
         format!("true >> {file}"),
         Expect::Fails,
         format!("test -f {file} && true >> {file}"),
+    )
+}
+
+/// A script that binds TCP `port` on 127.0.0.1 and exits at once: it never
+/// listens, so nothing can connect even if the bind is allowed. Port 0 lets
+/// the system choose one. `perl` ships with macOS and prints the error it
+/// gets, Seatbelt's `Operation not permitted` included.
+fn bind_script(port: u16) -> String {
+    format!(
+        "/usr/bin/perl -MSocket -e 'socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"socket: $!\\n\"; bind($s, sockaddr_in({port}, inet_aton(\"127.0.0.1\"))) or die \"bind: $!\\n\"'"
+    )
+}
+
+/// Listening (ADR 0028). Without `listen`, no TCP bind at all. With it, any
+/// port but the proxy ports, so the probe binds the sandbox's own: Seatbelt
+/// refuses before the port is found in use, so it is refused the same way
+/// while the proxy holds it, where the host would get `Address already in
+/// use`. Either way the control is a bind the system chooses the port for,
+/// on the host. That listening itself is open when allowed is said by the
+/// report, not shown as closed.
+pub(crate) fn listen_probe(listen: bool, proxy_port: u16) -> Probe {
+    let (name, port) = match listen {
+        false => ("listen on a TCP port".to_owned(), 0),
+        true => (
+            format!("listen on the sandbox's proxy port, {proxy_port}"),
+            proxy_port,
+        ),
+    };
+    probe(
+        "network",
+        name,
+        bind_script(port),
+        Expect::FailsWith(REFUSED),
+        bind_script(0),
     )
 }
 
@@ -612,6 +648,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "/usr/bin/nc -z -w 3 1.1.1.1 443",
     ));
     list.push(ipv6_loopback_probe(i.proxy_port));
+    list.push(listen_probe(i.listen, i.proxy_port));
     list.push(same_outside(
         "dns",
         "DNS on port 53",
@@ -998,6 +1035,7 @@ mod tests {
             unmovable: vec![dir.join("it's here"), dir.join("not-a-folder")],
             host_sockets: vec![dir.join("agent.sock")],
             proxy_port: 41001,
+            listen: false,
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,

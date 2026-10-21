@@ -3,8 +3,8 @@
 # (issue #5) on macOS, installing Hermes 0.22.2. Task-specific APIs are not
 # here: allow those with `enclos policy allow`.
 #
-# Only `[network] allow_add` is allowed in this layer; enclos refuses an
-# adapter layer that sets anything else.
+# Only `[network] allow_add` and `listen` are allowed in this layer; enclos
+# refuses an adapter layer that sets anything else.
 #
 # Some entries are broad hosts (github.com, storage.googleapis.com): allowing
 # them grants whatever those services serve, and they could carry data out.
@@ -13,6 +13,9 @@
 # allowed, so the GitHub download must succeed.
 
 [network]
+# Hermes 0.22.3's gateway binds 127.0.0.1:0 for its session WebSocket and
+# dashboard, and exits if it cannot (ADR 0028, issue #64).
+listen = true
 allow_add = [
     # Model calls and the model list (ChatGPT subscription)
     "chatgpt.com",

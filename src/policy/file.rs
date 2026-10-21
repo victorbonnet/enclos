@@ -39,11 +39,13 @@ pub struct NetLayer {
     pub private: Option<Vec<String>>,
     pub private_add: Vec<String>,
     pub log: Option<NetLog>,
+    pub listen: Option<bool>,
 }
 
 impl PolicyFile {
-    /// What this layer sets besides adding network destinations: a runtime
-    /// adapter's layer may do nothing else (design §7).
+    /// What this layer sets besides adding network destinations and
+    /// listening: a runtime adapter's layer may do nothing else (design §7,
+    /// ADR 0028).
     pub fn beyond_destinations(&self) -> Vec<&'static str> {
         let mut found = Vec::new();
         if self.extends.is_some() {
@@ -101,6 +103,9 @@ impl PolicyFile {
         if let Some(log) = self.network.log {
             policy.net.log = log;
         }
+        if let Some(listen) = self.network.listen {
+            policy.net.listen = listen;
+        }
     }
 }
 
@@ -148,6 +153,33 @@ mod tests {
         assert_eq!(policy.net.mode, NetMode::Allowlist);
         let err = PolicyFile::parse("d", "[network]\nmode = \"open\"").unwrap_err();
         assert!(err.to_string().contains("open"), "{err}");
+    }
+
+    #[test]
+    fn the_last_layer_naming_listen_sets_it() {
+        let mut policy = Policy::default();
+        assert!(!policy.net.listen);
+        PolicyFile::parse("adapter", "[network]\nlisten = true")
+            .unwrap()
+            .apply(&mut policy);
+        PolicyFile::parse("b", "[network]\nallow_add = [\"c.com\"]")
+            .unwrap()
+            .apply(&mut policy);
+        assert!(policy.net.listen);
+        PolicyFile::parse("policy.toml", "[network]\nlisten = false")
+            .unwrap()
+            .apply(&mut policy);
+        assert!(!policy.net.listen);
+    }
+
+    #[test]
+    fn listening_is_not_beyond_what_an_adapter_layer_may_set() {
+        let layer = PolicyFile::parse(
+            "adapter",
+            "[network]\nlisten = true\nallow_add = [\"a.com\"]",
+        )
+        .unwrap();
+        assert!(layer.beyond_destinations().is_empty());
     }
 
     #[test]

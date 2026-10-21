@@ -86,7 +86,8 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn version(&self) -> &'static str {
-        "1"
+        // 2: the gateway listens (ADR 0028).
+        "2"
     }
 
     fn endpoints(&self) -> &'static str {
@@ -349,6 +350,13 @@ mod tests {
             crate::net::host::AllowEntry::parse(entry).unwrap();
             assert!(!entry.starts_with('*'), "no wildcard: {entry}");
         }
+    }
+
+    #[test]
+    fn the_gateway_may_listen() {
+        // Hermes 0.22.3's gateway binds its own listener (ADR 0028).
+        let layer = PolicyFile::parse("hermes adapter", Hermes.endpoints()).unwrap();
+        assert_eq!(layer.network.listen, Some(true));
     }
 
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {

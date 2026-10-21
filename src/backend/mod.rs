@@ -63,6 +63,9 @@ pub struct SandboxContext {
     pub hidden_dirs: Vec<PathBuf>,
     /// The sandbox's proxy port, on 127.0.0.1 and [::1]: its only way out.
     pub proxy_port: u16,
+    /// Every proxy port the install has reserved, this sandbox's included:
+    /// a sandbox that may listen must bind none of them (ADR 0028).
+    pub reserved_ports: Vec<u16>,
 }
 
 impl SandboxContext {
@@ -78,6 +81,7 @@ impl SandboxContext {
             hidden_files: layout.hidden_files(),
             hidden_dirs: layout.hidden_dirs(),
             proxy_port,
+            reserved_ports: vec![proxy_port],
         }
     }
 }
