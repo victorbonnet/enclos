@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use clap::Args;
 
 use enclos::engine::Engine;
-use enclos::engine::{Left, SessionEnd};
+use enclos::engine::{Left, ServiceWait, SessionEnd};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -21,6 +21,28 @@ pub struct ConnectArgs {
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> Result<u8> {
+    // The runtime's own clients need its service, and a session reaches it
+    // only on the port it holds when the session starts (ADR 0028), so it
+    // is started first. On stderr, so a command's output stays clean.
+    if confirm != Confirm::DryRun
+        && let Some(ServiceWait {
+            service,
+            started,
+            late,
+        }) = engine.start_listener_service(by, &args.sandbox)?
+    {
+        let sandbox = &args.sandbox;
+        if started {
+            eprintln!(
+                "enclos: started the services of sandbox {sandbox}: its runtime's clients need its {service}. They start again at each login until `enclos sandbox stop {sandbox}`."
+            );
+        }
+        if let Some(why) = late {
+            eprintln!(
+                "enclos: the {service} is not listening yet ({why}); its log: `enclos logs {sandbox}`."
+            );
+        }
+    }
     let end = match engine.connect(by, &args.sandbox, args.command, confirm)? {
         Planned::DryRun(plan) => {
             plan.changes.iter().for_each(|c| println!("Would {c}."));

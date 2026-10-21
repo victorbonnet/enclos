@@ -3515,6 +3515,61 @@ mod services {
         status.iter().map(|(l, _)| l.to_string()).collect()
     }
 
+    /// A gateway whose session is open but which binds its listener only a
+    /// second later, as one still starting: a `connect` then waits for it,
+    /// and never starts the services again, which would stop it (ADR 0028).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        let mut gateway = std::process::Command::new("/usr/bin/perl")
+            .args([
+                "-MSocket",
+                "-e",
+                "sleep 1; socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; sleep 30",
+            ])
+            .spawn()
+            .unwrap();
+        let root = crate::lifecycle::process::reference_of_child(&gateway).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let record = engine.state.get(&name)?.unwrap();
+                    let session = SessionRecord {
+                        id: crate::model::session::SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Service,
+                        service: Some(GATEWAY.as_str().to_owned()),
+                        version: 1,
+                        snapshot: engine.policy(&name)?.snapshot.id,
+                        compiled: None,
+                        root,
+                        pgid: None,
+                        tracked: Vec::new(),
+                        started_at: crate::model::now(),
+                        ended_at: None,
+                    };
+                    engine.state.start_session(lock, &session, &record)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let waited = engine.start_listener_service(&alice(), &name);
+        let _ = gateway.kill();
+        let _ = gateway.wait();
+        let waited = waited.unwrap().expect("it listened only after the look");
+        assert!(!waited.started, "{waited:?}");
+        assert_eq!(waited.late, None);
+        assert!(fake.started.borrow().is_empty());
+        assert!(fake.stopped.borrow().is_empty());
+    }
+
     #[test]
     fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
         let (_dir, engine, fake, name) = sandbox_with_services(None);
@@ -5112,6 +5167,34 @@ mod listener {
     pub(super) fn end(mut child: std::process::Child) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    fn connect_starts_nothing_for_a_runtime_whose_files_are_gone() {
+        let (_dir, engine, name) = with_sandbox();
+        engine
+            .write(
+                &super::alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    Ok(engine.state.put(lock, &record)?)
+                },
+            )
+            .unwrap();
+        // Recorded, but `.hermes/hermes-agent` is not in the home: its
+        // gateway could not run, so nothing is started or waited for.
+        let started = std::time::Instant::now();
+        assert_eq!(
+            engine
+                .start_listener_service(&super::alice(), &name)
+                .unwrap(),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

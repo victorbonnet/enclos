@@ -2,13 +2,38 @@
 //! it listens, from enclos's records, so the sandbox's sessions may reach
 //! that one port.
 
+use std::time::{Duration, Instant};
+
 use super::Engine;
+use crate::error::Result;
 use crate::lifecycle::listeners::{ephemeral_ports, one_port, tcp_listeners, tcp_listeners_at};
 use crate::lifecycle::process::is_same;
+use crate::model::audit::Actor;
 use crate::model::sandbox::{PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord};
 use crate::model::session::SessionKind;
+use crate::runtime::home::stat;
 use crate::runtime::{RuntimeListener, adapter};
 use crate::state::StateStore;
+
+/// How long `connect` waits for a service it started to listen.
+const SERVICE_START: Duration = Duration::from_secs(60);
+/// How long it waits while no session of the service is open, as when the
+/// service exits at once and the service manager waits before starting it
+/// again (launchd: 10 seconds).
+const SERVICE_GONE: Duration = Duration::from_secs(15);
+/// How often it looks.
+const SERVICE_POLL: Duration = Duration::from_millis(250);
+
+/// What `connect` did about the runtime's service before it connected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceWait {
+    pub service: String,
+    /// Whether it started the sandbox's services: false when a session of
+    /// the service was open already, still starting, and was waited for.
+    pub started: bool,
+    /// Why the service was not listening when the wait ended, if it was not.
+    pub late: Option<String>,
+}
 
 /// The port `service` listens on now: the one TCP port at 127.0.0.1 in the
 /// ephemeral range that the program its open session started holds (`enclos
@@ -103,5 +128,75 @@ impl Engine {
                     record.name
                 )
             })
+    }
+
+    /// Starts the sandbox's services when its runtime's clients need its
+    /// service and no session of it is open (ADR 0028): Hermes's chat no
+    /// longer starts a gateway of its own, which could not reach it, and a
+    /// session reaches the service only on the port it held when the session
+    /// started. A session that is open but not listening yet is a service
+    /// still starting, so it is waited for, never started again, which
+    /// would stop it. Nothing for a runtime whose files are gone, since its
+    /// service could not run. Waits until the service listens, and gives up
+    /// sooner when no session of it stays open, as when it exits at once.
+    /// `None`: it listened already, or there is no such service.
+    pub fn start_listener_service(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+    ) -> Result<Option<ServiceWait>> {
+        let record = self.record(name)?;
+        let Some(kind) = record.runtime else {
+            return Ok(None);
+        };
+        let Some(listener) = Self::listener(&record) else {
+            return Ok(None);
+        };
+        let home = self.layout.sandbox_home(name.as_str());
+        if let Some(install) = adapter(kind).runtime_facts().install
+            && !matches!(stat(&home, &install), Ok(Some(_)))
+        {
+            return Ok(None);
+        }
+        let service = listener.service.as_str();
+        if service_listener(self.state.as_ref(), name, service).is_ok() {
+            return Ok(None);
+        }
+        let start = !self.service_open(name, service)?;
+        if start {
+            self.start_sandbox(by, name)?;
+        }
+        let started = Instant::now();
+        let late = loop {
+            let why = match service_listener(self.state.as_ref(), name, service) {
+                Ok(_) => break None,
+                Err(why) => why,
+            };
+            let waited = started.elapsed();
+            if waited >= SERVICE_START
+                || waited >= SERVICE_GONE && !self.service_open(name, service)?
+            {
+                break Some(why);
+            }
+            std::thread::sleep(SERVICE_POLL);
+        };
+        Ok(Some(ServiceWait {
+            service: service.to_owned(),
+            started: start,
+            late,
+        }))
+    }
+
+    /// Whether a session of `service` is open with its program running.
+    pub(super) fn service_open(&self, name: &SandboxName, service: &str) -> Result<bool> {
+        for session in self.state.sessions(name, true)? {
+            if session.kind == SessionKind::Service
+                && session.service.as_deref() == Some(service)
+                && is_same(&session.root)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
