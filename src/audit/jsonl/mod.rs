@@ -252,4 +252,8 @@ impl AuditLog for JsonlAuditLog {
         let (content, torn) = self.read_all()?;
         Ok(verify::verify(&split_lines(&content), torn))
     }
+
+    fn check(&self) -> Result<()> {
+        self.check_chain()
+    }
 }

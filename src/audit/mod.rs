@@ -42,6 +42,10 @@ pub trait AuditLog {
     fn entries(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>>;
     /// Checks the hash chain and lists entries that never finished.
     fn verify(&self) -> Result<VerifyReport>;
+    /// Fails as `begin` would on a damaged log, without writing: for a
+    /// command that must change something outside the lock before it opens
+    /// its entry.
+    fn check(&self) -> Result<()>;
 }
 
 /// Why the audit log could not be read or written.
