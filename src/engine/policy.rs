@@ -163,8 +163,7 @@ impl Engine {
     }
 
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
-    /// records the snapshot as the active version. Only tests call it.
-    #[cfg(test)]
+    /// records the snapshot as the active version.
     pub(super) fn save_policy(
         &self,
         lock: &StateLock,
