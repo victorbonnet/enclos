@@ -206,20 +206,31 @@ fn the_next_write_moves_an_incomplete_last_line_aside() {
     assert!(lines(&log)[2].contains(&record::sha256_hex(torn)));
 }
 
-#[test]
-fn damage_before_an_incomplete_last_line_still_blocks_writes() {
-    let (dir, log) = log();
-    run(&log, 1);
-    let mut edited = lines(&log);
-    edited[1] = edited[1].replace("did 0", "did X");
-    write_lines(&log, &edited);
-    tear(&log, b"{\"schema_version\":1");
+/// Expects the next write to fail as `Damaged` without changing the file,
+/// and returns the error message.
+fn assert_write_blocked(log: &JsonlAuditLog) -> String {
     let before = std::fs::read(&log.path).unwrap();
-
     let lock = StateLock::for_tests();
     let err = log.begin(&lock, intent("next")).unwrap_err();
     assert!(matches!(err, AuditError::Damaged { .. }), "{err}");
     assert_eq!(std::fs::read(&log.path).unwrap(), before);
+    err.to_string()
+}
+
+/// Replaces `from` with `to` on line `line`, counted from 1.
+fn edit_line(log: &JsonlAuditLog, line: usize, from: &str, to: &str) {
+    let mut edited = lines(log);
+    edited[line - 1] = edited[line - 1].replace(from, to);
+    write_lines(log, &edited);
+}
+
+#[test]
+fn damage_before_an_incomplete_last_line_still_blocks_writes() {
+    let (dir, log) = log();
+    run(&log, 1);
+    edit_line(&log, 2, "did 0", "did X");
+    tear(&log, b"{\"schema_version\":1");
+    assert_write_blocked(&log);
     assert!(!dir.path().join("audit.jsonl.torn-3").exists());
 }
 
@@ -227,17 +238,46 @@ fn damage_before_an_incomplete_last_line_still_blocks_writes() {
 fn damage_in_the_middle_blocks_writes() {
     let (_dir, log) = log();
     run(&log, 2);
-    let mut edited = lines(&log);
-    edited[1] = edited[1].replace("did 0", "did X");
-    write_lines(&log, &edited);
-    let before = std::fs::read(&log.path).unwrap();
-
-    let lock = StateLock::for_tests();
-    let err = log.begin(&lock, intent("next")).unwrap_err();
-    assert!(matches!(err, AuditError::Damaged { .. }), "{err}");
-    let message = err.to_string();
+    edit_line(&log, 2, "did 0", "did X");
+    let message = assert_write_blocked(&log);
     assert!(message.contains("line 2 was changed"), "{message}");
-    assert!(message.contains("enclos audit verify"), "{message}");
+    assert!(message.contains("audit.jsonl.damaged"), "{message}");
+}
+
+#[test]
+fn damage_in_the_middle_with_an_incomplete_last_line_moves_nothing() {
+    // The line just before the incomplete one is intact, so only the
+    // whole-chain check, run before recovery, can refuse this.
+    let (dir, log) = log();
+    run(&log, 2);
+    edit_line(&log, 2, "did 0", "did X");
+    tear(&log, b"{\"schema_version\":1");
+    let message = assert_write_blocked(&log);
+    assert!(message.contains("line 2 was changed"), "{message}");
+    assert!(!dir.path().join("audit.jsonl.torn-5").exists());
+}
+
+#[test]
+fn a_deleted_line_blocks_writes() {
+    let (_dir, log) = log();
+    run(&log, 3);
+    let mut edited = lines(&log);
+    edited.remove(2);
+    write_lines(&log, &edited);
+    let message = assert_write_blocked(&log);
+    assert!(message.contains("line 3 does not follow"), "{message}");
+}
+
+#[test]
+fn damage_after_begin_blocks_finish() {
+    let (_dir, log) = log();
+    run(&log, 1);
+    let lock = StateLock::for_tests();
+    let ticket = log.begin(&lock, intent("next")).unwrap();
+    edit_line(&log, 2, "did 0", "did X");
+    let before = std::fs::read(&log.path).unwrap();
+    let err = log.finish(ticket, Outcome::ok("done")).unwrap_err();
+    assert!(matches!(err, AuditError::Damaged { .. }), "{err}");
     assert_eq!(std::fs::read(&log.path).unwrap(), before);
 }
 

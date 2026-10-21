@@ -226,8 +226,14 @@ fn print_verify(report: &VerifyReport) -> u8 {
     if let Some(broken) = &report.broken {
         eprintln!("error: the audit log is broken: {broken}.");
         eprintln!(
-            "Entries from line {} on cannot be trusted. Keep a copy of audit.jsonl to investigate.",
+            "Entries from line {} on cannot be trusted, and no state-changing command runs \
+             until the log is repaired.",
             broken.line
+        );
+        eprintln!(
+            "To repair it, rename audit.jsonl and keep it to investigate: a name that starts \
+             with audit.jsonl, such as audit.jsonl.damaged, stays hidden from sandboxes. The \
+             next state-changing command then starts a new chain."
         );
         return exit::ERROR;
     }

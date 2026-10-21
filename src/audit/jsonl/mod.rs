@@ -93,8 +93,8 @@ impl JsonlAuditLog {
 
     /// If a crash left an incomplete last line, moves it to
     /// `audit.jsonl.torn-<seq>` and records that in the log. Only that damage
-    /// is recovered: [`Self::append`] checks the lines before it first, so
-    /// any other damage moves nothing and the log stays `Damaged`. Called
+    /// is recovered, and this checks only the line just before it, so call it
+    /// only after [`Self::check_chain`] has refused any other damage. Called
     /// under the state lock, so the incomplete line cannot be a write still
     /// in progress.
     fn recover_torn_tail(&self) -> Result<()> {
@@ -141,8 +141,9 @@ impl JsonlAuditLog {
         )
     }
 
-    /// Appends one record, first recovering an incomplete last line. Any
-    /// other damage, on any line, stops the write before the file changes.
+    /// Checks the whole chain, recovers an incomplete last line, then appends
+    /// one record. Any other damage, on any line, stops the write before the
+    /// file changes.
     fn append(&self, body: Body) -> Result<u64> {
         self.check_chain()?;
         self.recover_torn_tail()?;
@@ -151,14 +152,15 @@ impl JsonlAuditLog {
 
     /// Verifies every line, as `enclos audit verify` does, and fails on the
     /// first break. An incomplete last line and unfinished entries are not
-    /// breaks. A missing file starts a new chain.
+    /// breaks. A missing file starts a new chain. This reads the whole file,
+    /// so each write takes time linear in the log's size.
     fn check_chain(&self) -> Result<()> {
-        let (content, torn) = match self.read_all() {
-            Ok(read) => read,
+        let report = match self.verify() {
+            Ok(report) => report,
             Err(AuditError::NotFound { .. }) => return Ok(()),
             Err(e) => return Err(e),
         };
-        match verify::verify(&split_lines(&content), torn).broken {
+        match report.broken {
             Some(broken) => Err(self.damaged(broken.to_string())),
             None => Ok(()),
         }

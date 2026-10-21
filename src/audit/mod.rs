@@ -49,7 +49,11 @@ pub trait AuditLog {
 pub enum AuditError {
     #[error("audit log {path} not found: enclos is not initialized. Run `enclos init` first")]
     NotFound { path: PathBuf },
-    #[error("audit log {path} is damaged: {reason}. Run `enclos audit verify` for details")]
+    #[error(
+        "audit log {path} is damaged: {reason}. No state-changing command runs until it is \
+         repaired: keep the file under another name, such as `audit.jsonl.damaged`, and the \
+         next command starts a new chain"
+    )]
     Damaged { path: PathBuf, reason: String },
     #[error("cannot use audit log {path}: {source}")]
     Io {
