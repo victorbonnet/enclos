@@ -165,6 +165,9 @@ fn tear(log: &JsonlAuditLog, torn: &[u8]) {
     std::fs::write(&log.path, content).unwrap();
 }
 
+/// An incomplete line 3, as a crash while writing it leaves.
+const TORN: &[u8] = b"{\"schema_version\":1,\"seq\":3";
+
 #[test]
 fn an_incomplete_last_line_is_a_warning_not_a_break() {
     let (_dir, log) = log();
@@ -182,28 +185,10 @@ fn an_incomplete_last_line_is_a_warning_not_a_break() {
 
 #[test]
 fn the_next_write_moves_an_incomplete_last_line_aside() {
-    let (dir, log) = log();
-    run(&log, 1);
-    let torn = b"{\"schema_version\":1,\"seq\":3";
-    tear(&log, torn);
-    run(&log, 1);
-
+    let dir = recover_after_crash(&[], "audit.jsonl.torn-3");
     let saved = dir.path().join("audit.jsonl.torn-3");
-    assert_eq!(std::fs::read(&saved).unwrap(), torn);
     let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-
-    let report = log.verify().unwrap();
-    assert!(report.intact());
-    assert_eq!(report.torn_tail, None);
-    assert_eq!((report.lines, report.entries), (5, 2));
-    let recovery = &report.recoveries[0];
-    assert_eq!(
-        (recovery.line, recovery.removed_bytes),
-        (3, torn.len() as u64)
-    );
-    assert_eq!(recovery.saved_to, "audit.jsonl.torn-3");
-    assert!(lines(&log)[2].contains(&record::sha256_hex(torn)));
 }
 
 /// Expects the next write to fail as `Damaged` without changing the file,
@@ -295,9 +280,10 @@ fn appends_continue_the_chain_across_long_lines() {
 
 /// Recovers a torn line with `existing` already in the folder, as a crash
 /// during an earlier recovery leaves them, and checks that every existing
-/// file keeps its bytes, the torn bytes end up in `saved_to`, and the chain
-/// verifies.
-fn recover_after_crash(existing: &[(&str, &[u8])], saved_to: &str) {
+/// file keeps its bytes, the torn bytes end up in `saved_to`, the
+/// `recovered` line names that file with the line's number, size and hash,
+/// and the chain verifies. Returns the folder.
+fn recover_after_crash(existing: &[(&str, &[u8])], saved_to: &str) -> TempDir {
     let (dir, log) = log();
     run(&log, 1);
     tear(&log, TORN);
@@ -308,23 +294,31 @@ fn recover_after_crash(existing: &[(&str, &[u8])], saved_to: &str) {
 
     for (name, bytes) in existing {
         assert_eq!(
-            &std::fs::read(dir.path().join(name)).unwrap(),
-            bytes,
+            std::fs::read(dir.path().join(name)).unwrap(),
+            *bytes,
             "{name}"
         );
     }
+    assert_recovered(&dir, &log, saved_to);
+    dir
+}
+
+/// Checks that the one recovery saved `TORN` to `saved_to` and recorded it.
+fn assert_recovered(dir: &TempDir, log: &JsonlAuditLog, saved_to: &str) {
     assert_eq!(std::fs::read(dir.path().join(saved_to)).unwrap(), TORN);
     let report = log.verify().unwrap();
     assert!(report.intact(), "{:?}", report.broken);
     assert_eq!(report.torn_tail, None);
     assert_eq!((report.lines, report.entries), (5, 2));
+    assert_eq!(report.recoveries.len(), 1);
     let recovery = &report.recoveries[0];
-    assert_eq!(recovery.line, 3);
+    assert_eq!(
+        (recovery.line, recovery.removed_bytes),
+        (3, TORN.len() as u64)
+    );
     assert_eq!(recovery.saved_to, saved_to);
-    assert!(lines(&log)[2].contains(&record::sha256_hex(TORN)));
+    assert!(lines(log)[2].contains(&record::sha256_hex(TORN)));
 }
-
-const TORN: &[u8] = b"{\"schema_version\":1,\"seq\":3";
 
 #[test]
 fn recovery_reuses_a_copy_saved_before_a_crash() {
@@ -338,6 +332,15 @@ fn recovery_keeps_a_copy_cut_short_by_a_crash() {
 }
 
 #[test]
+fn recovery_keeps_a_file_of_the_same_size_holding_other_bytes() {
+    let same_size = vec![b'x'; TORN.len()];
+    recover_after_crash(
+        &[("audit.jsonl.torn-3", &same_size)],
+        "audit.jsonl.torn-3.1",
+    );
+}
+
+#[test]
 fn recovery_keeps_files_holding_other_bytes() {
     recover_after_crash(
         &[
@@ -346,4 +349,95 @@ fn recovery_keeps_files_holding_other_bytes() {
         ],
         "audit.jsonl.torn-3.2",
     );
+}
+
+#[test]
+fn recovery_reuses_a_numbered_copy_saved_before_a_crash() {
+    recover_after_crash(
+        &[
+            ("audit.jsonl.torn-3", b"something else"),
+            ("audit.jsonl.torn-3.1", TORN),
+        ],
+        "audit.jsonl.torn-3.1",
+    );
+}
+
+#[test]
+fn recovery_never_reuses_a_symlink() {
+    let (dir, log) = log();
+    run(&log, 1);
+    tear(&log, TORN);
+    let backup = dir.path().join("audit.jsonl.torn-3");
+    std::fs::write(dir.path().join("elsewhere"), TORN).unwrap();
+    std::os::unix::fs::symlink("elsewhere", &backup).unwrap();
+    run(&log, 1);
+
+    let kept = std::fs::symlink_metadata(&backup).unwrap();
+    assert!(kept.file_type().is_symlink());
+    assert_eq!(std::fs::read(dir.path().join("elsewhere")).unwrap(), TORN);
+    assert_recovered(&dir, &log, "audit.jsonl.torn-3.1");
+}
+
+#[test]
+fn recovery_keeps_a_copy_it_cannot_read() {
+    let (dir, log) = log();
+    run(&log, 1);
+    tear(&log, TORN);
+    let backup = dir.path().join("audit.jsonl.torn-3");
+    std::fs::write(&backup, TORN).unwrap();
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&backup).is_ok() {
+        // Run as root, which reads everything.
+        return;
+    }
+    run(&log, 1);
+
+    let mode = std::fs::symlink_metadata(&backup)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o000);
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(std::fs::read(&backup).unwrap(), TORN);
+    assert_recovered(&dir, &log, "audit.jsonl.torn-3.1");
+}
+
+#[test]
+fn a_copy_left_by_a_crash_after_the_cut_blocks_nothing() {
+    // The line was cut off but the crash came before the `recovered` line,
+    // so the copy has no record, and a later line 3 tears again.
+    let (dir, log) = log();
+    std::fs::write(dir.path().join("audit.jsonl.torn-3"), b"earlier").unwrap();
+    run(&log, 1);
+    tear(&log, TORN);
+    run(&log, 1);
+
+    assert_eq!(
+        std::fs::read(dir.path().join("audit.jsonl.torn-3")).unwrap(),
+        b"earlier"
+    );
+    assert_recovered(&dir, &log, "audit.jsonl.torn-3.1");
+}
+
+#[test]
+fn a_copy_that_cannot_be_created_blocks_the_write_and_names_it() {
+    let (dir, log) = log();
+    run(&log, 1);
+    tear(&log, TORN);
+    let before = std::fs::read(&log.path).unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let lock = StateLock::for_tests();
+    let result = log.begin(&lock, intent("next")).map(|_| ());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Err(err) = result else {
+        // Run as root, which writes everywhere.
+        return;
+    };
+    assert!(
+        matches!(&err, AuditError::SaveTorn { path, .. } if path.ends_with("audit.jsonl.torn-3")),
+        "{err}"
+    );
+    assert!(err.to_string().contains("run the command again"), "{err}");
+    assert_eq!(std::fs::read(&log.path).unwrap(), before);
 }
