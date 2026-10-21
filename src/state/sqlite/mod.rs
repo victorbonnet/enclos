@@ -182,6 +182,33 @@ fn state_columns(state: &SandboxState) -> (&'static str, Option<&str>) {
     }
 }
 
+/// Inserts the sandbox's record, followed by `on_conflict` (empty: a name
+/// already recorded is an error).
+fn insert_sandbox(
+    conn: &Connection,
+    rec: &SandboxRecord,
+    on_conflict: &str,
+) -> rusqlite::Result<()> {
+    let (state, reason) = state_columns(&rec.state);
+    conn.execute(
+        &format!(
+            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port, runtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) {on_conflict}"
+        ),
+        params![
+            rec.name.as_str(),
+            rec.backend.as_str(),
+            state,
+            reason,
+            rec.created_at.to_string(),
+            rec.template.as_str(),
+            rec.proxy_port,
+            rec.runtime.map(|a| a.as_str())
+        ],
+    )?;
+    Ok(())
+}
+
 fn io_err(path: &Path) -> impl Fn(std::io::Error) -> StateError + '_ {
     |source| StateError::Io {
         path: path.to_owned(),
@@ -286,27 +313,15 @@ impl StateStore for SqliteStateStore {
 
     fn put(&self, _lock: &StateLock, rec: &SandboxRecord) -> Result<()> {
         let conn = self.open()?;
-        let (state, reason) = state_columns(&rec.state);
-        conn.execute(
-            "INSERT INTO sandboxes (name, backend, state, failed_reason, created_at, template, proxy_port, runtime)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
+        insert_sandbox(
+            &conn,
+            rec,
+            "ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
                  state = excluded.state, failed_reason = excluded.failed_reason,
                  created_at = excluded.created_at, template = excluded.template,
                  proxy_port = excluded.proxy_port, runtime = excluded.runtime",
-            params![
-                rec.name.as_str(),
-                rec.backend.as_str(),
-                state,
-                reason,
-                rec.created_at.to_string(),
-                rec.template.as_str(),
-                rec.proxy_port,
-                rec.runtime.map(|a| a.as_str())
-            ],
         )
-        .map_err(self.sqlite_err())?;
-        Ok(())
+        .map_err(self.sqlite_err())
     }
 
     fn remove(&self, _lock: &StateLock, name: &SandboxName) -> Result<()> {
@@ -317,6 +332,24 @@ impl StateStore for SqliteStateStore {
         )
         .map_err(self.sqlite_err())?;
         Ok(())
+    }
+
+    fn create_sandbox(
+        &self,
+        _lock: &StateLock,
+        rec: &SandboxRecord,
+        snapshot: &PolicySnapshot,
+        by: &Actor,
+    ) -> Result<PolicyVersion> {
+        let mut conn = self.open()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(self.sqlite_err())?;
+        insert_sandbox(&tx, rec, "").map_err(self.sqlite_err())?;
+        let version =
+            policy::append(&tx, &rec.name, snapshot, by, now(), None).map_err(self.sqlite_err())?;
+        tx.commit().map_err(self.sqlite_err())?;
+        Ok(version)
     }
 
     fn save_policy(

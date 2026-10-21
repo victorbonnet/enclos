@@ -129,12 +129,7 @@ impl Engine {
                 })?;
                 let compiled = self.compile_policy(name, record.proxy_port)?;
                 self.ensure_proxy(lock, &record)?;
-                let (version, snapshot) =
-                    self.state
-                        .active_policy(name)?
-                        .ok_or_else(|| Error::NoPolicy {
-                            sandbox: name.to_string(),
-                        })?;
+                let (version, snapshot) = self.active_policy(name)?;
                 let (program, args) = command.split_first().ok_or_else(|| Error::Session {
                     what: "no command to run".into(),
                 })?;
@@ -421,12 +416,7 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
-        let (version, _) = self
-            .state
-            .active_policy(name)?
-            .ok_or_else(|| Error::NoPolicy {
-                sandbox: name.to_string(),
-            })?;
+        let (version, _) = self.active_policy(name)?;
         let mut changes = Vec::new();
         if !self.proxy_runs(name)? {
             changes.push(format!(
@@ -574,12 +564,7 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let (version, snapshot) =
-            self.state
-                .active_policy(&record.name)?
-                .ok_or_else(|| Error::NoPolicy {
-                    sandbox: record.name.to_string(),
-                })?;
+        let (version, snapshot) = self.active_policy(&record.name)?;
         let session = SessionRecord {
             id: SessionId(0),
             sandbox: record.name.clone(),

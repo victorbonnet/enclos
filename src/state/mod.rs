@@ -67,6 +67,16 @@ pub trait StateStore: NetLogStore {
     fn list(&self) -> Result<Vec<SandboxRecord>>;
     fn put(&self, lock: &StateLock, rec: &SandboxRecord) -> Result<()>;
     fn remove(&self, lock: &StateLock, name: &SandboxName) -> Result<()>;
+    /// Records a new sandbox with `snapshot` as its first, active policy
+    /// version, in one transaction: a crash leaves both or neither. A name
+    /// already recorded is an error.
+    fn create_sandbox(
+        &self,
+        lock: &StateLock,
+        rec: &SandboxRecord,
+        snapshot: &PolicySnapshot,
+        by: &Actor,
+    ) -> Result<PolicyVersion>;
 
     /// Stores `snapshot` unless an identical one is stored, appends a policy
     /// version pointing to it, and makes that version the sandbox's active

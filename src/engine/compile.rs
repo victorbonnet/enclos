@@ -13,7 +13,7 @@ use super::Engine;
 use crate::backend::{Backend, Probe, SandboxContext};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::policy::sha256_hex;
 
 impl Engine {
@@ -23,15 +23,27 @@ impl Engine {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
+        self.backend_for(name, record.backend)
+    }
+
+    /// The backend `kind`, refused when this host cannot run it (ADR 0009:
+    /// no override); `name` only names the sandbox in the error. `backend_of`
+    /// passes a recorded sandbox's kind, `sandbox create` the kind it is
+    /// about to record.
+    pub(crate) fn backend_for(
+        &self,
+        name: &SandboxName,
+        kind: BackendKind,
+    ) -> Result<&dyn Backend> {
         let unavailable = |reason: String| Error::BackendUnavailable {
             sandbox: name.to_string(),
-            backend: record.backend.to_string(),
+            backend: kind.to_string(),
             reason,
         };
         let backend = self
             .backends
             .iter()
-            .find(|b| b.kind() == record.backend)
+            .find(|b| b.kind() == kind)
             .ok_or_else(|| unavailable("this build of enclos does not include it".to_owned()))?;
         match backend.probe() {
             Probe::Available => Ok(backend.as_ref()),

@@ -1,7 +1,7 @@
 //! Policy snapshots and versions in `state.db` (ADR 0018). Snapshots are
 //! insert-only; versions are append-only.
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 
 use crate::model::Timestamp;
 use crate::model::audit::Actor;
@@ -34,6 +34,20 @@ pub fn save(
     restores: Option<u32>,
 ) -> rusqlite::Result<PolicyVersion> {
     let tx = conn.transaction()?;
+    let version = append(&tx, name, snapshot, by, at, restores)?;
+    tx.commit()?;
+    Ok(version)
+}
+
+/// As `save`, inside the caller's transaction.
+pub fn append(
+    tx: &Transaction<'_>,
+    name: &SandboxName,
+    snapshot: &PolicySnapshot,
+    by: &Actor,
+    at: Timestamp,
+    restores: Option<u32>,
+) -> rusqlite::Result<PolicyVersion> {
     let inputs = serde_json::to_string(&snapshot.inputs).expect("policy inputs serialize");
     let policy = serde_json::to_string(&snapshot.policy).expect("policies serialize");
     tx.execute(
@@ -63,7 +77,6 @@ pub fn save(
         "UPDATE sandboxes SET active_version = ?2 WHERE name = ?1",
         params![name.as_str(), version],
     )?;
-    tx.commit()?;
     Ok(PolicyVersion {
         version,
         snapshot: snapshot.id.clone(),

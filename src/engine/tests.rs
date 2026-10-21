@@ -648,6 +648,184 @@ mod sandbox {
     }
 
     #[test]
+    fn a_create_whose_records_fail_leaves_what_was_there_before() {
+        let (_dir, engine, home) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        done(
+            engine
+                .remove_sandbox(&alice(), &home, true, Confirm::Yes)
+                .unwrap(),
+        );
+        engine.layout.write_policy("home", "kept = true\n").unwrap();
+        // The policy version fails, and a record cannot be deleted either:
+        // only a create that writes both in one transaction leaves no
+        // record, since one that committed the record first could not take
+        // it back, as after a crash between the two.
+        let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_policy BEFORE INSERT ON policy_versions
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;
+             CREATE TRIGGER no_cleanup BEFORE DELETE ON sandboxes
+             BEGIN SELECT RAISE(ABORT, 'cleanup cannot run'); END;",
+        )
+        .unwrap();
+        let err = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err}");
+        let lab: SandboxName = "lab".parse().unwrap();
+        assert_eq!(engine.state.get(&lab).unwrap(), None);
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        // A folder kept by `rm --keep-data` keeps its `policy.toml`.
+        engine
+            .create_sandbox(&alice(), spec("home"), Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(engine.state.get(&home).unwrap(), None);
+        assert_eq!(engine.layout.read_policy("home").unwrap(), "kept = true\n");
+        conn.execute_batch("DROP TRIGGER fail_policy; DROP TRIGGER no_cleanup")
+            .unwrap();
+        done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_create_that_fails_in_a_folder_without_policy_toml_takes_back_only_that_file() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        // A folder left by a create that stopped before writing its policy.
+        engine.layout.create_sandbox_dirs("lab").unwrap();
+        let notes = engine.layout.sandbox_home("lab").join("notes");
+        std::fs::write(&notes, "kept").unwrap();
+        let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_policy BEFORE INSERT ON policy_versions
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        let err = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("injected failure"), "{err}");
+        let lab: SandboxName = "lab".parse().unwrap();
+        assert_eq!(engine.state.get(&lab).unwrap(), None);
+        assert!(!engine.layout.policy_file("lab").exists());
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "kept");
+    }
+
+    #[test]
+    fn a_kept_policy_toml_that_cannot_be_read_stops_the_create_before_it_writes() {
+        let (_dir, engine, home) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        done(
+            engine
+                .remove_sandbox(&alice(), &home, true, Confirm::Yes)
+                .unwrap(),
+        );
+        // Not UTF-8: a failed create could not put it back.
+        let file = engine.layout.policy_file("home");
+        std::fs::write(&file, b"kept = \"\xff\"\n").unwrap();
+        let err = engine
+            .create_sandbox(&alice(), spec("home"), Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::Layout(_)), "{err}");
+        assert_eq!(engine.state.get(&home).unwrap(), None);
+        assert_eq!(std::fs::read(&file).unwrap(), b"kept = \"\xff\"\n");
+    }
+
+    #[test]
+    fn a_folder_left_by_a_create_that_stopped_before_its_records_is_reused() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        // What create writes before its transaction.
+        engine.layout.create_sandbox_dirs("lab").unwrap();
+        engine
+            .layout
+            .write_policy("lab", "left = \"over\"\n")
+            .unwrap();
+        let lab: SandboxName = "lab".parse().unwrap();
+        // Not listed, and, as of today, not something `rm` knows.
+        let listed = engine.list_sandboxes().unwrap();
+        assert!(listed.iter().all(|v| v.record.name != lab));
+        assert!(matches!(
+            engine.remove_sandbox(&alice(), &lab, true, Confirm::Yes),
+            Err(Error::NoSuchSandbox { .. })
+        ));
+        done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(engine.policy(&lab).unwrap().version.version, 1);
+        let file = engine.layout.read_policy("lab").unwrap();
+        assert!(!file.contains("left"), "{file}");
+    }
+
+    #[test]
+    fn a_sandbox_without_an_active_policy_says_how_to_create_it_again() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        // A record with no policy version, which enclos never writes but an
+        // older build could leave.
+        let lab = SandboxRecord {
+            name: "lab".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+            state: SandboxState::Created,
+            proxy_port: 1,
+            runtime: None,
+            created_at: crate::model::now(),
+        };
+        engine
+            .state
+            .put(&engine.state.lock().unwrap(), &lab)
+            .unwrap();
+        engine.layout.create_sandbox_dirs("lab").unwrap();
+        let notes = engine.layout.sandbox_home("lab").join("notes");
+        std::fs::write(&notes, "kept").unwrap();
+
+        let err = engine.policy(&lab.name).unwrap_err();
+        assert!(matches!(err, Error::NoPolicy { .. }), "{err}");
+        let message = err.to_string();
+        assert!(!message.contains("state check"), "{message}");
+        assert!(
+            message.contains("`enclos sandbox rm lab --keep-data`")
+                && message.contains(
+                    "`enclos sandbox create lab --backend seatbelt --template assistant`"
+                ),
+            "{message}"
+        );
+        // It makes the sandbox again from its own backend and template, not
+        // the defaults of `sandbox create`.
+        let work = SandboxRecord {
+            name: "work".parse().unwrap(),
+            backend: BackendKind::Bubblewrap,
+            template: "coding".parse().unwrap(),
+            ..lab.clone()
+        };
+        engine
+            .state
+            .put(&engine.state.lock().unwrap(), &work)
+            .unwrap();
+        let message = engine.policy(&work.name).unwrap_err().to_string();
+        assert!(
+            message.contains("`enclos sandbox create work --backend bubblewrap --template coding`"),
+            "{message}"
+        );
+
+        // The steps it names work, without --yes, and keep the home.
+        done(
+            engine
+                .remove_sandbox(&alice(), &lab.name, true, Confirm::Ask)
+                .unwrap(),
+        );
+        done(
+            engine
+                .create_sandbox(&alice(), spec("lab"), Confirm::Ask)
+                .unwrap(),
+        );
+        assert_eq!(engine.policy(&lab.name).unwrap().version.version, 1);
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "kept");
+    }
+
+    #[test]
     fn dry_runs_of_stop_and_connect_change_nothing() {
         let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let entries = engine.audit(None).unwrap().len();

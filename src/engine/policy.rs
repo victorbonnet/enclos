@@ -1,5 +1,5 @@
-//! The engine's policy calls: show the active policy, allow a destination,
-//! and write a new sandbox's first policy (design §7, ADR 0018).
+//! The engine's policy calls: show the active policy and allow a
+//! destination (design §7, ADR 0018).
 
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use super::Engine;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{NetMode, Policy, PolicySnapshot, PolicyVersion, TemplateName};
+use crate::model::policy::{NetMode, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
@@ -53,13 +53,7 @@ struct AllowPlan {
 impl Engine {
     /// The sandbox's active policy.
     pub fn policy(&self, name: &SandboxName) -> Result<PolicyView> {
-        self.require_sandbox(name)?;
-        let (version, snapshot) =
-            self.state
-                .active_policy(name)?
-                .ok_or_else(|| Error::NoPolicy {
-                    sandbox: name.to_string(),
-                })?;
+        let (version, snapshot) = self.active_policy(name)?;
         Ok(PolicyView {
             sandbox: name.clone(),
             version,
@@ -168,21 +162,6 @@ impl Engine {
         })
     }
 
-    /// Writes a new sandbox's `policy.toml` from `template` and makes its
-    /// resolution the sandbox's first policy version. The sandbox record must
-    /// exist; the caller holds the lock and the audit entry.
-    pub fn create_policy(
-        &self,
-        lock: &StateLock,
-        by: &Actor,
-        name: &SandboxName,
-        template: &TemplateName,
-    ) -> Result<PolicyVersion> {
-        self.layout.create_sandbox_dirs(name.as_str())?;
-        let overrides = policy::initial_overrides(name.as_str(), template);
-        self.save_policy(lock, by, name, &overrides)
-    }
-
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
     /// records the snapshot as the active version.
     pub(super) fn save_policy(
@@ -196,8 +175,10 @@ impl Engine {
         self.store_policy(lock, by, name, overrides, &snapshot)
     }
 
-    /// As `save_policy`, with `runtime`'s endpoints instead of the installed
-    /// runtime's: while a runtime installs, before it is recorded.
+    /// Resolves and checks `overrides` with `runtime`'s endpoints instead of
+    /// the installed runtime's, writes them to `policy.toml`, then records
+    /// the snapshot as the active version: while a runtime installs, before
+    /// it is recorded.
     pub(super) fn save_policy_for_runtime(
         &self,
         lock: &StateLock,
