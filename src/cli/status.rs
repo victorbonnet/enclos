@@ -42,10 +42,6 @@ fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
         println!("No sandboxes yet. Create one with `enclos sandbox create lab`.");
         return;
     }
-    let count = |n: usize, one: &str, many: &str| match n {
-        1 => format!("1 {one}"),
-        n => format!("{n} {many}"),
-    };
     println!(
         "{}, {}, {} in {}",
         count(
@@ -53,7 +49,7 @@ fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
             "sandbox",
             "sandboxes"
         ),
-        count(view.agent_count(), "agent", "agents"),
+        agents(view.agent_count(), view.untracked_count()),
         size(view.bytes, view.complete),
         tilde(&view.data, user_home)
     );
@@ -278,9 +274,34 @@ fn tilde(path: &Path, user_home: Option<&str>) -> String {
     }
 }
 
+fn count(n: usize, one: &str, many: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    }
+}
+
+/// The header's agent count. The table also lists the agents enclos does
+/// not track, so the header counts them apart to match it.
+fn agents(tracked: usize, untracked: usize) -> String {
+    let agents = count(tracked, "agent", "agents");
+    match (tracked, untracked) {
+        (_, 0) => agents,
+        (0, n) => format!("{agents} ({n} not tracked)"),
+        (_, n) => format!("{agents} ({n} more not tracked)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_agent_count_says_how_many_are_not_tracked() {
+        assert_eq!(agents(1, 0), "1 agent");
+        assert_eq!(agents(2, 1), "2 agents (1 more not tracked)");
+        assert_eq!(agents(0, 2), "0 agents (2 not tracked)");
+    }
 
     #[test]
     fn times_read_as_how_long_ago() {

@@ -40,7 +40,7 @@ impl FromStr for AgentName {
 
 impl fmt::Display for AgentName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 

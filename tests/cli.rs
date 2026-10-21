@@ -424,6 +424,34 @@ fn a_seatbelt_sandbox_is_refused_off_macos() {
     );
 }
 
+/// Where each column of a table line starts: after two spaces or more.
+#[cfg(target_os = "macos")]
+fn column_starts(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    (0..bytes.len())
+        .filter(|&i| bytes[i] != b' ' && (i == 0 || bytes[..i].ends_with(b"  ")))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_list_lines_up_its_columns_for_names_of_any_length() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "ab"]).ok();
+    let long = "a-name-longer-than-twenty-letters";
+    home.run(&["sandbox", "create", long]).ok();
+    let out = home.run(&["sandbox", "list"]);
+    let text = out.ok().stdout();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    let header = column_starts(lines[0]);
+    assert_eq!(header.len(), 5, "{text}");
+    for line in &lines[1..] {
+        assert_eq!(column_starts(line), header, "{text}");
+    }
+}
+
 /// Tests that start proxies take turns: proxy ports are the host's, shared
 /// by every test's enclos folder.
 #[cfg(target_os = "macos")]
@@ -1299,8 +1327,14 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
 
     let out = home.run(&["status"]);
     let text = out.ok().stdout();
-    // The built-in agent and the tracked one.
-    assert!(text.starts_with("2 sandboxes, 2 agents, "), "{text}");
+    // The built-in agent and the tracked one, and the untracked one apart.
+    assert!(
+        text.starts_with("2 sandboxes, 2 agents (1 more not tracked), "),
+        "{text}"
+    );
+    // With nothing untracked, the header gives the count alone.
+    let spare = home.run(&["status", "spare"]).ok().stdout();
+    assert!(spare.starts_with("1 sandbox, 0 agents, "), "{spare}");
     for line in [
         "home   created   Hermes, not logged in",
         "spare  created   no runtime",

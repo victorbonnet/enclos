@@ -1,4 +1,5 @@
-//! `enclos sandbox`: create, list, show, stop and remove sandboxes.
+//! `enclos sandbox`: create, list, show, start, stop, restart and remove
+//! sandboxes.
 
 use clap::{Args, Subcommand};
 
@@ -146,8 +147,16 @@ fn print_list(views: &[SandboxView]) {
         println!("No sandboxes yet. Create one with `enclos sandbox create <name>`.");
         return;
     }
+    let widest = |header: &str, cell: fn(&SandboxView) -> &str| {
+        views
+            .iter()
+            .map(|v| cell(v).len())
+            .fold(header.len(), usize::max)
+    };
+    let name = widest("NAME", |v| v.record.name.as_str());
+    let template = widest("TEMPLATE", |v| v.record.template.as_str());
     println!(
-        "{:<20}  {:<10}  {:<10}  {:<8}  STATE",
+        "{:<name$}  {:<10}  {:<template$}  {:<8}  STATE",
         "NAME", "BACKEND", "TEMPLATE", "POLICY"
     );
     for v in views {
@@ -160,7 +169,7 @@ fn print_list(views: &[SandboxView]) {
             n => format!(" ({n} sessions)"),
         };
         println!(
-            "{:<20}  {:<10}  {:<10}  {:<8}  {}{sessions}",
+            "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
             v.record.name,
             v.record.backend,
             v.record.template,
