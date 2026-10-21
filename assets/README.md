@@ -4,10 +4,10 @@ The **Home base** icon uses four open corners around a central square. The horiz
 
 | Asset | Use on | Color |
 | --- | --- | --- |
-| [enclos-icon-light.svg](enclos-icon-light.svg) | Light backgrounds, such as paper `#fafaf8` | Ink `#1b1c1e` |
-| [enclos-icon-dark.svg](enclos-icon-dark.svg) | Dark backgrounds, such as charcoal `#1d1e21` | Paper `#ededeb` |
-| [enclos-wordmark-light.svg](enclos-wordmark-light.svg) | Light backgrounds | Ink `#1b1c1e` |
-| [enclos-wordmark-dark.svg](enclos-wordmark-dark.svg) | Dark backgrounds | Paper `#ededeb` |
+| [enclos-icon-light.svg](enclos-icon-light.svg) | Light backgrounds, such as ivory `#f5f5ed` | Forest `#173c31` |
+| [enclos-icon-dark.svg](enclos-icon-dark.svg) | Dark backgrounds, such as forest `#173c31` | Lime `#d5e6af` |
+| [enclos-wordmark-light.svg](enclos-wordmark-light.svg) | Light backgrounds | Forest `#173c31` |
+| [enclos-wordmark-dark.svg](enclos-wordmark-dark.svg) | Dark backgrounds | Lime `#d5e6af` |
 
 The suffix names the surrounding theme. Icons use a `64 × 64` viewBox; wordmarks use `260 × 64`. Preserve their aspect ratios when resizing. The wordmark's Arial Bold lettering is converted to paths, so rendering does not depend on installed fonts.
 
