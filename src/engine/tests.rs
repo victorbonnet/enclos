@@ -3460,8 +3460,11 @@ mod services {
 
     use super::*;
     use crate::audit::{AuditError, AuditTicket};
+    use crate::engine::ServiceWait;
+    use crate::engine::listener::ServiceTimes;
     use crate::engine::service::Unit;
     use crate::model::audit::{AuditEntry, AuditFilter, Intent, VerifyReport};
+    use crate::model::plan::Planned;
     use crate::model::runtime::RuntimeKind;
     use crate::model::sandbox::SandboxState;
     use crate::model::session::SessionKind;
@@ -3509,6 +3512,155 @@ mod services {
 
     fn state_of(engine: &Engine, name: &SandboxName) -> SandboxState {
         engine.state.get(name).unwrap().unwrap().state
+    }
+
+    /// `connect`'s wait, in milliseconds rather than a minute.
+    const QUICK: ServiceTimes = ServiceTimes {
+        start: Duration::from_millis(600),
+        gone: Duration::from_millis(200),
+        poll: Duration::from_millis(20),
+    };
+
+    /// A Hermes sandbox whose runtime's files are there.
+    fn hermes_with_services() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+        let (dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        (dir, engine, fake, name)
+    }
+
+    fn wait_for_gateway(engine: &Engine, name: &SandboxName) -> (ServiceWait, Vec<String>) {
+        let mut said = Vec::new();
+        let waited = engine
+            .start_listener_service_in(&alice(), name, &mut |what| said.push(what), QUICK)
+            .unwrap()
+            .expect("a gateway to wait for");
+        (waited, said)
+    }
+
+    fn dry_run(engine: &Engine, name: &SandboxName) -> Vec<String> {
+        let planned = engine
+            .connect(&alice(), name, Vec::new(), Confirm::DryRun)
+            .unwrap();
+        let Planned::DryRun(plan) = planned else {
+            panic!("a dry run ran");
+        };
+        plan.changes
+    }
+
+    /// Nothing of the sandbox installed: `connect` installs its services,
+    /// says so before it waits, and gives up early when no gateway session
+    /// opens, connecting anyway (ADR 0028).
+    #[test]
+    fn connect_starts_the_services_when_none_are_installed() {
+        let (_dir, engine, _fake, name) = hermes_with_services();
+        let plan = dry_run(&engine, &name);
+        assert!(
+            plan.iter()
+                .any(|c| c.starts_with("start the services of sandbox home")),
+            "{plan:?}"
+        );
+        // The proxy is the services' to start.
+        assert!(
+            !plan.iter().any(|c| c.contains("start the proxy")),
+            "{plan:?}"
+        );
+
+        let begun = std::time::Instant::now();
+        let (waited, said) = wait_for_gateway(&engine, &name);
+        assert!(waited.started, "{waited:?}");
+        assert_eq!(waited.late.as_deref(), Some("the gateway is not running"));
+        // Given up at `gone`, not `start`.
+        assert!(begun.elapsed() < QUICK.start, "{:?}", begun.elapsed());
+        assert!(
+            said[0].starts_with("starting the services of sandbox home"),
+            "{said:?}"
+        );
+        assert!(said[0].contains("at each login until `enclos sandbox stop home`"));
+        assert_eq!(
+            said[1],
+            "waiting for the gateway of sandbox home to listen…"
+        );
+        let started = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            started.iter().any(|l| l.ends_with(".gateway")),
+            "{started:?}"
+        );
+    }
+
+    /// Installed already, the services are the service manager's to start
+    /// again: `connect` waits, and installs nothing, which would stop the
+    /// proxy open sessions use.
+    #[test]
+    fn connect_waits_for_installed_services_and_starts_nothing() {
+        let (_dir, engine, fake, name) = hermes_with_services();
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let installed = fake.started.borrow().len();
+        let stopped = fake.stopped.borrow().len();
+        assert_eq!(
+            dry_run(&engine, &name),
+            [
+                "wait for the gateway of sandbox home to listen",
+                "run `/bin/zsh -l` in sandbox home under policy v1"
+            ]
+        );
+        let (waited, said) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started, "{waited:?}");
+        assert_eq!(waited.late.as_deref(), Some("the gateway is not running"));
+        assert_eq!(said, ["waiting for the gateway of sandbox home to listen…"]);
+        assert_eq!(fake.started.borrow().len(), installed);
+        assert_eq!(fake.stopped.borrow().len(), stopped);
+    }
+
+    /// A start that fails is no reason not to connect: it is said, and the
+    /// session goes ahead.
+    #[test]
+    fn a_failed_start_is_a_note_not_an_error() {
+        let (_dir, engine, fake, name) = hermes_with_services();
+        *fake.refuse.borrow_mut() = Some(".gateway".to_owned());
+        let (waited, _) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started, "{waited:?}");
+        let late = waited.late.unwrap();
+        assert!(late.starts_with("its services could not start:"), "{late}");
+        assert!(late.contains("refused"), "{late}");
+    }
+
+    #[test]
+    fn connect_starts_nothing_for_a_runtime_whose_files_are_gone() {
+        // Recorded, but `.hermes/hermes-agent` is not in the home: its
+        // gateway could not run, so nothing is started or waited for.
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let got = engine.start_listener_service_in(&alice(), &name, &mut |_| {}, QUICK);
+        assert_eq!(got.unwrap(), None);
+        assert!(fake.started.borrow().is_empty());
+        assert!(
+            !dry_run(&engine, &name)
+                .iter()
+                .any(|c| c.contains("gateway"))
+        );
+    }
+
+    /// Whether the runtime is there cannot be told: nothing is started, and
+    /// the session is told why.
+    #[test]
+    fn connect_starts_nothing_when_the_runtimes_files_cannot_be_read() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes")).unwrap();
+        std::os::unix::fs::symlink("/tmp", home.join(".hermes/hermes-agent")).unwrap();
+        let (waited, said) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started && said.is_empty(), "{waited:?} {said:?}");
+        let late = waited.late.unwrap();
+        assert!(
+            late.starts_with("whether hermes is installed cannot be told"),
+            "{late}"
+        );
+        assert!(fake.started.borrow().is_empty());
+        let plan = dry_run(&engine, &name);
+        assert!(
+            plan[0].starts_with("leave the gateway of sandbox home as it is, since whether hermes"),
+            "{plan:?}"
+        );
     }
 
     fn labels_of(status: &[(ServiceLabel, ServiceStatus)]) -> Vec<String> {
@@ -3560,7 +3712,7 @@ mod services {
                 },
             )
             .unwrap();
-        let waited = engine.start_listener_service(&alice(), &name);
+        let waited = engine.start_listener_service(&alice(), &name, &mut |_| {});
         let _ = gateway.kill();
         let _ = gateway.wait();
         let waited = waited.unwrap().expect("it listened only after the look");
@@ -5089,7 +5241,7 @@ mod status {
 mod listener {
     use super::policy::with_sandbox;
     use super::*;
-    use crate::engine::listener::{outside_proxy_range, service_listener};
+    use crate::engine::listener::{NoPort, outside_proxy_range, service_listener};
     use crate::model::runtime::RuntimeKind;
     use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
@@ -5170,31 +5322,31 @@ mod listener {
     }
 
     #[test]
-    fn connect_starts_nothing_for_a_runtime_whose_files_are_gone() {
+    fn connect_waits_for_nothing_when_the_gateway_listens() {
         let (_dir, engine, name) = with_sandbox();
-        engine
-            .write(
-                &super::alice(),
-                "test",
-                None,
-                |_| String::new(),
-                |lock| {
-                    let mut record = engine.state.get(&name)?.unwrap();
-                    record.runtime = Some(RuntimeKind::Hermes);
-                    Ok(engine.state.put(lock, &record)?)
-                },
-            )
-            .unwrap();
-        // Recorded, but `.hermes/hermes-agent` is not in the home: its
-        // gateway could not run, so nothing is started or waited for.
-        let started = std::time::Instant::now();
-        assert_eq!(
-            engine
-                .start_listener_service(&super::alice(), &name)
-                .unwrap(),
-            None
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        let (child, _) = gateway(&engine, &name, 1);
+        let got = engine.start_listener_service(&alice(), &name, &mut |_| panic!("said"));
+        end(child);
+        assert_eq!(got.unwrap(), None);
+    }
+
+    /// What waiting does not fix ends the wait at once.
+    #[test]
+    fn connect_stops_waiting_at_once_for_a_gateway_refused() {
+        let (_dir, engine, name) = with_sandbox();
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        let (child, _) = gateway(&engine, &name, 2);
+        let begun = std::time::Instant::now();
+        let got = engine.start_listener_service(&alice(), &name, &mut |_| {});
+        end(child);
+        assert!(begun.elapsed() < std::time::Duration::from_secs(10));
+        let waited = got.unwrap().unwrap();
+        assert!(!waited.started);
+        let late = waited.late.unwrap();
+        assert!(late.contains("listens on 2 ephemeral ports"), "{late}");
     }
 
     #[test]
@@ -5220,7 +5372,10 @@ mod listener {
         let (child, _) = gateway(&engine, &name, 2);
         let got = service_listener(engine.state.as_ref(), &name, "gateway");
         end(child);
-        assert!(got.unwrap_err().contains("listens on 2 ephemeral ports"));
+        assert!(
+            matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -5231,7 +5386,10 @@ mod listener {
         let got = service_listener(engine.state.as_ref(), &name, "gateway");
         end(one);
         end(two);
-        assert!(got.unwrap_err().contains("2 gateway sessions are running"));
+        assert!(
+            matches!(&got, Err(NoPort::Refused(why)) if why.contains("2 gateway sessions are running")),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -5246,7 +5404,10 @@ mod listener {
         };
         record_gateway(&engine, &name, root);
         let got = service_listener(engine.state.as_ref(), &name, "gateway");
-        assert!(got.unwrap_err().contains("not running"));
+        assert!(
+            matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -5262,7 +5423,7 @@ mod listener {
         let got = service_listener(engine.state.as_ref(), &name, "gateway");
         end(child);
         assert!(
-            got.unwrap_err().contains("no TCP listener at 127.0.0.1"),
+            matches!(&got, Err(NoPort::NotYet(why)) if why.contains("no TCP listener at 127.0.0.1")),
             "{held:?}"
         );
 
@@ -5290,7 +5451,10 @@ mod listener {
         end(owner);
         end(other);
         let why = got.unwrap_err();
-        assert!(why.contains("also listens at 127.0.0.1"), "{why}");
+        assert!(
+            matches!(&why, NoPort::Refused(why) if why.contains("also listens at 127.0.0.1")),
+            "{why:?}"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT};
 
 use super::Engine;
-use super::listener::service_listener;
+use super::listener::ConnectStep;
 use super::service::{PROXY_WAIT, STOP_GRACE};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
@@ -548,21 +548,29 @@ impl Engine {
         })?;
         let (version, _) = self.active_policy(name)?;
         let mut changes = Vec::new();
-        if let Some(listener) = Self::listener(&record) {
+        let mut starts_services = false;
+        if let Some((listener, step)) = self.connect_step(&record)? {
             let service = listener.service.as_str();
-            if service_listener(self.state.as_ref(), name, service).is_err() {
-                changes.push(match self.service_open(name, service)? {
-                    // Still starting: started again, it would be stopped.
-                    true => format!(
-                        "wait for the {service} of sandbox {name}, which is starting, to listen"
-                    ),
-                    false => format!(
-                        "start the services of sandbox {name}, since its runtime's clients need its {service} (ADR 0028), and wait for the {service} to listen"
-                    ),
-                });
+            match step {
+                ConnectStep::Nothing => {}
+                ConnectStep::Unreadable(why) => changes.push(format!(
+                    "leave the {service} of sandbox {name} as it is, since {why}"
+                )),
+                ConnectStep::Wait => changes.push(format!(
+                    "wait for the {service} of sandbox {name} to listen"
+                )),
+                ConnectStep::Start => {
+                    starts_services = true;
+                    changes.push(format!(
+                        "start the services of sandbox {name}, since its runtime's clients need its {service} (ADR 0028); they start again at each login until `enclos sandbox stop {name}`"
+                    ));
+                    changes.push(format!("wait for the {service} to listen"));
+                }
             }
         }
-        if !self.proxy_runs(name)? {
+        // With services installed, or about to be, the proxy is theirs to
+        // start.
+        if !starts_services && !self.has_services(name)? && !self.proxy_runs(name)? {
             changes.push(format!(
                 "start the proxy of sandbox {name} on port {}",
                 record.proxy_port
@@ -614,7 +622,7 @@ impl Engine {
         if self.has_services(&record.name)? {
             return Err(Error::Session {
                 what: format!(
-                    "the proxy service of sandbox {} has not started; see `enclos logs {}`, or run `enclos sandbox stop {}` to run without services",
+                    "the proxy service of sandbox {} has not started; see `enclos logs {}`, or run `enclos sandbox stop {}`, then connect again, to run it without services",
                     record.name, record.name, record.name
                 ),
             });

@@ -24,22 +24,17 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
     // The runtime's own clients need its service, and a session reaches it
     // only on the port it holds when the session starts (ADR 0028), so it
     // is started first. On stderr, so a command's output stays clean.
-    if confirm != Confirm::DryRun
-        && let Some(ServiceWait {
-            service,
-            started,
-            late,
-        }) = engine.start_listener_service(by, &args.sandbox)?
-    {
+    if confirm != Confirm::DryRun {
         let sandbox = &args.sandbox;
-        if started {
+        let mut say = |what: String| eprintln!("enclos: {what}");
+        if let Some(ServiceWait {
+            service,
+            late: Some(why),
+            ..
+        }) = engine.start_listener_service(by, sandbox, &mut say)?
+        {
             eprintln!(
-                "enclos: started the services of sandbox {sandbox}: its runtime's clients need its {service}. They start again at each login until `enclos sandbox stop {sandbox}`."
-            );
-        }
-        if let Some(why) = late {
-            eprintln!(
-                "enclos: the {service} is not listening yet ({why}); its log: `enclos logs {sandbox}`."
+                "enclos: connecting while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
             );
         }
     }
