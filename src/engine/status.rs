@@ -21,7 +21,6 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use serde::{Serialize, Serializer};
 
-use self::printable::printable;
 use super::Engine;
 use super::sandbox::needs_restart;
 use crate::error::{Error, Result};
@@ -35,6 +34,7 @@ use crate::model::session::{SessionKind, SessionRecord};
 use crate::runtime::home::{self, is_dot, wide};
 use crate::runtime::{DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, ValueAt, adapter};
 use crate::service::ServiceStatus;
+use printable::printable;
 
 /// Past this, a sandbox nobody used is worth a suggestion.
 pub const IDLE_DAYS: i64 = 30;
@@ -45,9 +45,6 @@ const REFUSED_DAYS: i64 = 7;
 const MAX_ENTRIES: usize = 1_000_000;
 /// The largest file of the sandbox home read for a fact.
 const MAX_FACT_FILE: u64 = 256 * 1024;
-/// The most characters of the sandbox home's text shown, such as a model
-/// name, counted after escaping.
-const MAX_FACT_TEXT: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusView {
