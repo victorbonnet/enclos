@@ -243,7 +243,7 @@ mod tests {
         assert!(listening(&out(0, "f3\nn127.0.0.1:80\n", "")).is_err());
     }
 
-    // `lsof` at that path is macOS's, where the forward runs (ADR 0028).
+    // `lsof` at that path is macOS's, where sandboxes listen (ADR 0028).
     #[cfg(target_os = "macos")]
     #[test]
     fn this_process_is_seen_listening() {
