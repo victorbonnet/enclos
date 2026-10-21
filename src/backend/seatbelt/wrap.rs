@@ -2,9 +2,10 @@
 //!
 //! The environment starts empty: a user's shell often holds tokens
 //! (`GITHUB_TOKEN`, API keys) that a sandboxed agent must not inherit. Only
-//! harmless terminal and locale variables come from the host; `HOME`,
-//! `TMPDIR`, caches and `PATH` point into the sandbox home, and every common
-//! proxy variable points at the sandbox's proxy (design §5).
+//! harmless terminal, locale, time zone and user name variables come from
+//! the host; `HOME`, `TMPDIR` and caches point into the sandbox home, `PATH`
+//! searches the home's `bin` folders before the host's system ones, and every
+//! common proxy variable points at the sandbox's proxy (design §5).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,8 @@ use super::super::{Launch, SandboxContext};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// Host variables a sandbox keeps: how to draw and which language to speak.
+/// Host variables a sandbox keeps: how to draw, which language to speak,
+/// the time zone and the user's name.
 /// Every `LC_*` variable is kept too.
 const PASSED_THROUGH: &[&str] = &[
     "TERM",
