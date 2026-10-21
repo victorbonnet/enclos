@@ -3,10 +3,10 @@
 //! and those the sandbox opens, reads of the sandbox home, the sensitive
 //! deny list for reads and writes (after those allows, so no grant covers
 //! it), the writable folders that cannot move (so no rename or clone carries
-//! a denied path elsewhere), network only to the sandbox's proxy port, the
-//! host-service denials, and last, so no rule above can override them,
-//! enclos's protected paths and the home and workspaces themselves, which
-//! stay where they are.
+//! a denied path elsewhere), network only over TCP to the sandbox's proxy
+//! port on loopback and to Unix sockets in its home, the host-service
+//! denials, and last, so no rule above can override them, enclos's protected
+//! paths and the home and workspaces themselves, which stay where they are.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
@@ -145,8 +145,14 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
             .into(),
     );
     line(format!("(deny network* (with message \"{tag}\"))"));
+    // `tcp`: TCP only, since the proxy holds no UDP socket at the port
+    // (`ip` let UDP through too on macOS 26.5.2). On that version `tcp`
+    // opens the port on `[::1]` as well as 127.0.0.1, so the proxy listens
+    // on both (`proxy::listen`). `tcp4` or `ip4` would leave only 127.0.0.1
+    // open on macOS 26.5.2, but on CI's macOS 14 runner `ip4` did not let
+    // the sandbox reach 127.0.0.1 at all.
     line(format!(
-        "(allow network-outbound (remote ip \"localhost:{}\"))",
+        "(allow network-outbound (remote tcp \"localhost:{}\"))",
         ctx.proxy_port
     ));
     line(format!(
@@ -307,8 +313,12 @@ mod tests {
         assert!(at("(allow default)") < at("(deny file-write* (with message \"enclos:home\"))"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/work\")"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/.ssh\")"));
-        assert_eq!(text.matches("(remote ip ").count(), 1);
-        assert!(text.contains("(remote ip \"localhost:41001\")"));
+        // One rule, `tcp`: not `ip`, which lets UDP through, nor `ip4`,
+        // which did not reach 127.0.0.1 on macOS 14. The proxy holds the
+        // port on both loopbacks.
+        assert_eq!(text.matches("(remote ip").count(), 0);
+        assert_eq!(text.matches("(remote tcp").count(), 1);
+        assert!(text.contains("(allow network-outbound (remote tcp \"localhost:41001\"))"));
         assert!(at("(deny network*") < at("(deny lsopen"));
         // The protected paths come after every allow, so nothing overrides them.
         let protected = at(";; ---- enclos's own files");

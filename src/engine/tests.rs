@@ -1656,7 +1656,7 @@ echo \"installed $*\" > \"$HOME/installed\"
             let proxy = dir.path().join("proxy.sh");
             std::fs::write(
                 &proxy,
-                "#!/bin/sh\necho \"fake proxy on $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"${5#*:}\"\n",
+                "#!/bin/sh\necho \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"\n",
             )
             .unwrap();
             std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1871,7 +1871,7 @@ echo \"installed $*\" > \"$HOME/installed\"
         let files = lab.engine.log_files(&lab.name).unwrap();
         assert_eq!(files.len(), 1, "{files:?}");
         let text = std::fs::read_to_string(&files[0]).unwrap();
-        assert!(text.contains("fake proxy on 127.0.0.1:"), "{text}");
+        assert!(text.contains("fake proxy on port "), "{text}");
     }
 
     #[cfg(target_os = "macos")]
@@ -3425,7 +3425,7 @@ mod services {
             .collect();
         assert_eq!(args[..4], ["proxy", "run", "home", "--record"]);
         let port = engine.show_sandbox(&name).unwrap().record.proxy_port;
-        assert!(args.contains(&format!("127.0.0.1:{port}")), "{args:?}");
+        assert!(args.contains(&port.to_string()), "{args:?}");
         assert!(unit.env.iter().any(|(k, _)| k == "ENCLOS_HOME"));
         assert!(unit.log.ends_with("sandboxes/home/logs/proxy.log"));
         assert_eq!(unit.stop_timeout, crate::engine::service::STOP_TIMEOUT);

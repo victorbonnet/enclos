@@ -2,10 +2,11 @@
 //! `sandbox-exec` in temporary folders, and the OS must refuse what the
 //! policy denies. Only processes these tests start are ever signalled.
 
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use super::super::{Backend, Launch, SandboxContext};
 use super::Seatbelt;
@@ -175,6 +176,10 @@ fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
     )));
 }
 
+/// TCP to the proxy port on 127.0.0.1, and nothing else on either loopback.
+/// What the rule opens at the proxy port on `[::1]` is not asserted: it was
+/// checked by hand on macOS 26.5.2 only, and the proxy holds that address
+/// too (`proxy::listen`).
 #[test]
 fn the_sandbox_reads_but_cannot_write_its_own_installers_folder() {
     // Where enclos copies an installer or an archive to import: the
@@ -209,6 +214,32 @@ fn the_network_reaches_only_the_proxy_port() {
         port(&w.allowed)
     )));
     assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 127.0.0.1 {}", port(&w.other))));
+    let other6 = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 ::1 {}", port(&other6))));
+}
+
+/// The rule opens the proxy port to TCP only: a program holding that port
+/// for UDP would get datagrams around the proxy, which holds TCP alone.
+#[test]
+fn no_datagram_reaches_the_proxy_port() {
+    let w = world();
+    let port = w.allowed.local_addr().unwrap().port();
+    for loopback in [
+        IpAddr::from(Ipv4Addr::LOCALHOST),
+        Ipv6Addr::LOCALHOST.into(),
+    ] {
+        // A program on the proxy port, for UDP.
+        let listener = UdpSocket::bind((loopback, port)).unwrap();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        w.sh(&format!("echo x | /usr/bin/nc -u -w 1 {loopback} {port}"));
+        let mut buf = [0; 16];
+        assert!(
+            listener.recv(&mut buf).is_err(),
+            "a datagram reached {loopback}:{port}"
+        );
+    }
 }
 
 #[test]
@@ -399,6 +430,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         workspaces: w.fs.writes.clone(),
         unmovable: w.fs.unmovable(),
         host_sockets: Vec::new(),
+        proxy_port: w.ctx.proxy_port,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -551,6 +583,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         workspaces: vec![w.base.join("alice/work"), w.base.join("alice/empty")],
         unmovable: Vec::new(),
         host_sockets: Vec::new(),
+        proxy_port: w.ctx.proxy_port,
         other_terminal: None,
         target: None,
         tag: 7,

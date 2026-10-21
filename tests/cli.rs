@@ -858,20 +858,24 @@ fn connect_refuses_a_port_another_program_listens_on() {
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
     let port = proxy_port(&home);
-    // Another program takes the sandbox's proxy port first.
-    let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-    let out = home.run(&["connect", "home", "--", "/usr/bin/true"]);
-    assert_eq!(out.code(), 1);
-    assert!(
-        out.stderr().contains("in use by another program"),
-        "{}",
-        out.stderr()
-    );
+    // Another program takes the sandbox's proxy port first, on either
+    // loopback: the sandbox can reach both.
+    for (loopback, named) in [("127.0.0.1", "127.0.0.1"), ("::1", "[::1]")] {
+        let _squatter = std::net::TcpListener::bind((loopback, port)).unwrap();
+        let out = home.run(&["connect", "home", "--", "/usr/bin/true"]);
+        assert_eq!(out.code(), 1, "{loopback}");
+        assert!(
+            out.stderr()
+                .contains(&format!("in use on {named} by another program; stop it")),
+            "{loopback}: {}",
+            out.stderr()
+        );
+    }
     // Design §8 step 7: the failure is saved on the sandbox.
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
     assert!(
         show.contains("Sandbox home: failed: connect failed: port")
-            && show.contains("in use by another program"),
+            && show.contains("by another program"),
         "{show}"
     );
 }
@@ -1190,26 +1194,33 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
     let port = proxy_port(&home);
-    let listen = format!("127.0.0.1:{port}");
-    let args = ["proxy", "run", "home", "--record", "--listen", &listen];
-    // With the port taken, it records nothing: a recorded proxy owns its
-    // port, which a service's `launch` relies on.
-    {
-        let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let port_arg = port.to_string();
+    let args = ["proxy", "run", "home", "--record", "--port", &port_arg];
+    // With the port taken on either loopback, it records nothing: a
+    // recorded proxy owns its port, which a service's `launch` relies on.
+    for (loopback, named) in [("127.0.0.1", "127.0.0.1"), ("::1", "[::1]")] {
+        let _squatter = std::net::TcpListener::bind((loopback, port)).unwrap();
         let out = home.run(&args);
-        assert_eq!(out.code(), 1, "{}", out.stderr());
-        // What the service's log shows: whose port it is, and the way out.
-        let taken = format!(
-            "port {port} of sandbox `home` is in use by another program; stop it, or recreate the sandbox to get another port"
+        assert_eq!(out.code(), 1, "{loopback}: {}", out.stderr());
+        assert!(
+            out.stderr()
+                .contains(&format!("in use on {named} by another program; stop it")),
+            "{loopback}: {}",
+            out.stderr()
         );
-        assert!(out.stderr().contains(&taken), "{}", out.stderr());
+        assert!(
+            out.stderr()
+                .contains("recreate the sandbox to get another port"),
+            "{}",
+            out.stderr()
+        );
         assert!(proxy_pid(&home).is_none());
         assert!(!home.audit_lines().iter().any(|l| l.contains("proxy start")));
         // A port other than the sandbox's own is not the sandbox's to give
         // up: no advice to recreate it.
         let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let elsewhere = other.local_addr().unwrap().to_string();
-        let out = home.run(&["proxy", "run", "home", "--listen", &elsewhere]);
+        let elsewhere = other.local_addr().unwrap().port().to_string();
+        let out = home.run(&["proxy", "run", "home", "--port", &elsewhere]);
         assert_eq!(out.code(), 1, "{}", out.stderr());
         assert!(
             out.stderr().contains("cannot listen on"),
@@ -1228,9 +1239,16 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
             .unwrap(),
     );
     assert!(eventually(|| proxy_pid(&home) == Some(proxy.0.id())));
+    // Once recorded, it holds the port on both loopbacks.
+    for loopback in ["127.0.0.1", "::1"] {
+        assert!(
+            std::net::TcpListener::bind((loopback, port)).is_err(),
+            "{loopback}"
+        );
+    }
     // A second proxy finds the port held by the sandbox's own: nothing to
     // stop or recreate.
-    let out = home.run(&["proxy", "run", "home", "--listen", &listen]);
+    let out = home.run(&["proxy", "run", "home", "--port", &port_arg]);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(
         out.stderr().contains("already runs") && !out.stderr().contains("recreate"),

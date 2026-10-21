@@ -128,7 +128,7 @@ pub struct SandboxRecord {
     pub backend: BackendKind,
     pub template: TemplateName,
     pub state: SandboxState,
-    /// The sandbox's proxy port on localhost (design §4), reserved when it
+    /// The sandbox's proxy port on loopback (design §4), reserved when it
     /// is created.
     pub proxy_port: u16,
     /// The runtime installed in it, if any (at most one, ADR 0003).

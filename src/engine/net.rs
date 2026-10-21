@@ -2,7 +2,6 @@
 //! running a sandbox's egress proxy (design §6).
 
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
 use super::Engine;
@@ -11,7 +10,7 @@ use crate::model::Timestamp;
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::SandboxName;
-use crate::proxy::{ActivePolicy, Proxy};
+use crate::proxy::{ActivePolicy, Proxy, listen};
 use crate::state::sqlite::SqliteStateStore;
 
 impl Engine {
@@ -27,19 +26,16 @@ impl Engine {
         Ok(self.state.denied(name)?)
     }
 
-    /// Runs the sandbox's egress proxy on `addr` until the process ends.
-    /// With `record`, it records itself as the sandbox's proxy once it holds
-    /// the port, never before: a recorded proxy owns its port. When the
-    /// sandbox's reserved port is taken, it says whether by the sandbox's
-    /// own proxy or by another program.
+    /// Runs the sandbox's egress proxy on `port`, on both loopbacks, until
+    /// the process ends. With `record`, it records itself as the sandbox's
+    /// proxy once `listen` holds the port (on both loopbacks, or on
+    /// 127.0.0.1 alone where `[::1]` is not configured), never before: a
+    /// recorded proxy owns its port.
+    /// When the sandbox's reserved port is taken, it says whether by the
+    /// sandbox's own proxy or by another program, and on which loopback.
     /// It reads the active policy for each new connection, so policy
     /// changes apply without a restart.
-    pub fn run_proxy(
-        &self,
-        name: &SandboxName,
-        addr: SocketAddr,
-        record: Option<&Actor>,
-    ) -> Result<()> {
+    pub fn run_proxy(&self, name: &SandboxName, port: u16, record: Option<&Actor>) -> Result<()> {
         let reserved = self.record(name)?.proxy_port;
         self.policy(name)?;
         let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
@@ -48,37 +44,30 @@ impl Engine {
             sandbox: name.clone(),
         };
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(store()));
-        let socket = match TcpListener::bind(addr) {
-            Ok(socket) => socket,
+        let listeners = listen(port).map_err(|e| match e.source.kind() {
             // Only the sandbox's reserved port is its to recreate.
-            Err(e) if e.kind() == ErrorKind::AddrInUse && addr.port() == reserved => {
-                let (sandbox, port) = (name.to_string(), reserved);
-                return Err(if self.proxy_runs(name)? {
-                    Error::ProxyRuns { sandbox, port }
-                } else {
-                    Error::ProxyPortTaken { sandbox, port }
-                });
-            }
-            Err(source) => {
-                return Err(Error::ProxyListen {
+            ErrorKind::AddrInUse if port == reserved => match self.proxy_runs(name) {
+                Ok(true) => Error::ProxyRuns {
                     sandbox: name.to_string(),
-                    addr: addr.to_string(),
-                    source,
-                });
-            }
-        };
+                    port,
+                },
+                Ok(false) => Error::proxy_port_taken(name.as_str(), e.addr),
+                Err(error) => error,
+            },
+            _ => Error::ProxyListen {
+                sandbox: name.to_string(),
+                addr: e.addr.to_string(),
+                source: e.source,
+            },
+        })?;
         if let Some(by) = record {
             self.record_proxy(by, name)?;
         }
-        let stopped = |source| Error::ProxyStopped {
+        // Serving ends only if an accept thread ended or could not start:
+        // an error, so the service manager starts the proxy again.
+        Err(Error::ProxyStopped {
             sandbox: name.to_string(),
-            source,
-        };
-        let _ = Arc::new(proxy).serve(socket).map_err(stopped)?.join();
-        // Serving ends only if the accept loop died: an error, so the
-        // service manager starts the proxy again.
-        Err(stopped(std::io::Error::other(
-            "it stopped accepting connections",
-        )))
+            source: Arc::new(proxy).serve_all(listeners),
+        })
     }
 }
