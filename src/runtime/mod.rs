@@ -184,6 +184,12 @@ pub trait RuntimeAdapter {
     /// started: none, one or several, each with a name of its own. Hermes
     /// has one gateway serving every agent (ADR 0021).
     fn services(&self) -> Vec<RuntimeService>;
+    /// The service that listens in the sandbox, whose port the sandbox's
+    /// sessions then reach (ADR 0028). `None`: the runtime's clients need
+    /// no listener of its own.
+    fn listener(&self) -> Option<RuntimeListener> {
+        None
+    }
     /// The names of the agents the runtime has in this sandbox home, as it
     /// would list them, sorted, read on the host without running anything.
     /// The sandbox writes its home, so implementations never follow a link,
@@ -319,6 +325,14 @@ impl fmt::Display for Unreadable {
 pub struct RuntimeService {
     pub name: ServiceName,
     pub command: SandboxCommand,
+}
+
+/// A runtime service that listens in its sandbox, on a loopback port it
+/// picks when it starts, which the runtime's own clients dial (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeListener {
+    /// One of the runtime's [`RuntimeAdapter::services`].
+    pub service: ServiceName,
 }
 
 /// A runtime's name for one of its services, stable across versions, as it

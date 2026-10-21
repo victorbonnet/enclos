@@ -101,6 +101,11 @@ pub struct Launch {
     /// session does: the backend then lets it open that terminal by name. A
     /// service or a probe never does, whatever terminal enclos runs in.
     pub in_terminal: bool,
+    /// The port on loopback where the sandbox's own runtime service listens,
+    /// which the program may then connect to besides the proxy (ADR 0028);
+    /// none for the service itself, a probe, or a sandbox whose runtime has
+    /// no such service.
+    pub service_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

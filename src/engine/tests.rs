@@ -139,7 +139,7 @@ mod policy {
     use crate::model::sandbox::SandboxName;
 
     /// An initialized engine with sandbox `home`, created as the CLI does.
-    fn with_sandbox() -> (TempDir, Engine, SandboxName) {
+    pub(super) fn with_sandbox() -> (TempDir, Engine, SandboxName) {
         with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt))
     }
 
@@ -644,6 +644,7 @@ mod compile {
             args: vec!["-c".into(), swap.into()],
             env: Vec::new(),
             in_terminal: false,
+            service_port: None,
         };
         let ctx = engine.sandbox_context(&name, 41001);
         let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
@@ -4959,5 +4960,97 @@ mod status {
                 "command": "enclos connect home -- hermes -p default setup"
             })
         );
+    }
+}
+
+/// The runtime's own service, whose port the sandbox's sessions reach (ADR
+/// 0028).
+#[cfg(target_os = "macos")]
+mod listener {
+    use super::policy::with_sandbox;
+    use super::*;
+    use crate::model::runtime::RuntimeKind;
+    use crate::model::session::{SessionId, SessionKind, SessionRecord};
+
+    /// A stand-in gateway listening on `ports` ports of loopback, and
+    /// recorded as the open session of the sandbox's `gateway` service.
+    fn gateway(engine: &Engine, name: &SandboxName, ports: usize) -> (std::process::Child, u16) {
+        use std::io::BufRead;
+        let script = format!(
+            "use Socket; for (1..{ports}) {{ socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30"
+        );
+        let mut child = std::process::Command::new("/usr/bin/perl")
+            .args(["-e", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let port: u16 = lines.next().unwrap().unwrap().parse().unwrap();
+        for _ in 1..ports {
+            lines.next().unwrap().unwrap();
+        }
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    engine.state.put(lock, &record)?;
+                    let session = SessionRecord {
+                        id: SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Service,
+                        service: Some("gateway".to_owned()),
+                        version: 1,
+                        snapshot: engine.policy(name)?.snapshot.id,
+                        compiled: None,
+                        root,
+                        pgid: None,
+                        tracked: Vec::new(),
+                        started_at: crate::model::now(),
+                        ended_at: None,
+                    };
+                    engine.state.start_session(lock, &session, &record)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        (child, port)
+    }
+
+    fn end(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_session_reaches_the_one_port_the_services_own_process_holds() {
+        let (_dir, engine, name) = with_sandbox();
+        assert_eq!(engine.service_port(&engine.record(&name).unwrap()), None);
+        let (child, port) = gateway(&engine, &name, 1);
+        let record = engine.record(&name).unwrap();
+        assert_eq!(engine.service_port(&record), Some(port));
+        end(child);
+        // Gone: no port, and why.
+        assert_eq!(engine.service_port(&record), None);
+        let why = super::super::listener::service_listener(engine.state.as_ref(), &name, "gateway")
+            .unwrap_err();
+        assert!(why.contains("not running"), "{why}");
+    }
+
+    #[test]
+    fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
+        let (_dir, engine, name) = with_sandbox();
+        let (child, _) = gateway(&engine, &name, 2);
+        let record = engine.record(&name).unwrap();
+        let got = super::super::listener::service_listener(engine.state.as_ref(), &name, "gateway");
+        let port = engine.service_port(&record);
+        end(child);
+        assert!(got.unwrap_err().contains("listens on 2 ephemeral ports"));
+        assert_eq!(port, None);
     }
 }

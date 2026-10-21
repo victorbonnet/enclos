@@ -202,6 +202,7 @@ impl Engine {
                         // The probes are enclos's own scripts: they get no
                         // more than a service does.
                         in_terminal: false,
+                        service_port: None,
                     };
                     backend
                         .wrap(&compiled, &ctx, &launch)

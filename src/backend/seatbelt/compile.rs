@@ -44,6 +44,12 @@ const TERMINALS: &str = "(regex #\"^/dev/ttys[0-9]+$\")";
 /// those the sandbox opens itself.
 pub const TERMINAL_PARAM: &str = "ENCLOS_TERMINAL";
 
+/// The `sandbox-exec` parameter that names, as `localhost:<port>`, the
+/// port where the sandbox's runtime service listens, set by `wrap` for a
+/// session started while it listens (ADR 0028). Unset, as for the service
+/// itself, the session reaches its proxy alone.
+pub const SERVICE_PARAM: &str = "ENCLOS_SERVICE";
+
 /// What macOS grants a process for a pseudo-terminal it opens through
 /// `/dev/ptmx`, which Apple's own `application.sb` allows the same way.
 const PTY_EXTENSION: &str = "com.apple.sandbox.pty";
@@ -185,13 +191,23 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         // running: an exact-port deny after the allow holds on 127.0.0.1,
         // 0.0.0.0, [::1] and [::] (backend tests), and Seatbelt refuses
         // before the port is found in use. It has no port ranges, hence one
-        // rule a port. Outbound is unchanged: only the proxy port.
+        // rule a port.
         line("(allow network-bind network-inbound (local tcp \"localhost:*\"))".into());
         for port in PORT_FIRST..=PORT_LAST {
             line(format!(
                 "(deny network-bind (local tcp \"*:{port}\") (with message \"{tag}\"))"
             ));
         }
+        // And a session started while the runtime's service listens reaches
+        // that one port, which `wrap` names: the port it held when the
+        // session started, so every agent's client finds it and gets its own
+        // ticket, as outside enclos. `tcp4` opens it on 127.0.0.1 alone,
+        // where the service listens, not on [::1], which another sandbox that
+        // listens could hold at that port (`tcp` opens both, macOS 26.5.2).
+        // A parameter, so every session runs under this one compiled policy.
+        line(format!(
+            "(if (param \"{SERVICE_PARAM}\")\n  (allow network-outbound (remote tcp4 (param \"{SERVICE_PARAM}\"))))"
+        ));
     }
 
     line(String::new());
@@ -348,6 +364,21 @@ mod tests {
         assert_eq!(text.matches("(local tcp").count(), 0, "{text}");
         assert_eq!(text.matches("(allow network-bind").count(), 1, "{text}");
         assert!(text.contains("(allow network-bind network-inbound (local unix-socket"));
+        // Nor reaches a service of its runtime: it has none that listens.
+        assert!(!text.contains("ENCLOS_SERVICE"), "{text}");
+    }
+
+    #[test]
+    fn a_policy_that_listens_lets_a_session_reach_the_service_port_it_is_given() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.net.listen = true;
+        let text = compile(&p, &ctx(base)).unwrap().text;
+        // A parameter, so every session runs under the same file.
+        assert!(text.contains(
+            "(if (param \"ENCLOS_SERVICE\")\n  (allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\"))))"
+        ));
+        assert!(!text.contains("61374"));
     }
 
     #[test]
@@ -370,8 +401,10 @@ mod tests {
             ));
             assert!(allow < deny, "{port}");
         }
-        // Outbound is unchanged: still the proxy port alone.
-        assert_eq!(text.matches("(remote tcp").count(), 1);
+        // Outbound: the proxy port, and the service port a session is given.
+        assert_eq!(text.matches("(remote tcp").count(), 2);
+        assert!(text.contains("(remote tcp \"localhost:41001\")"));
+        assert!(text.contains("(remote tcp4 (param \"ENCLOS_SERVICE\"))"));
         assert!(at("(deny network*") < allow);
     }
 

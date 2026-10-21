@@ -155,6 +155,9 @@ impl Engine {
             args: args.to_vec(),
             env: Vec::new(),
             in_terminal: true,
+            // The runtime's clients reach its service on the port it holds
+            // now (ADR 0028).
+            service_port: self.service_port(&record),
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         // TMPDIR inside the sandbox (the policy denies /tmp).

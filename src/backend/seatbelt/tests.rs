@@ -104,11 +104,17 @@ fn world() -> World {
 impl World {
     /// Runs a shell command in the sandbox; true when it exits 0.
     fn sh(&self, script: &str) -> bool {
+        self.sh_with_service(script, None)
+    }
+
+    /// [`World::sh`], for a session given the port of its runtime's service.
+    fn sh_with_service(&self, script: &str, service_port: Option<u16>) -> bool {
         let launch = Launch {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             env: vec![],
             in_terminal: false,
+            service_port,
         };
         let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -123,6 +129,7 @@ impl World {
             args: vec!["-c".into(), script.into()],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         let out = Seatbelt
             .wrap(&self.compiled, &self.ctx, &launch)
@@ -275,6 +282,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     args: vec!["-c".into(), sandboxed_script(&p).into()],
                     env: vec![],
                     in_terminal: false,
+                    service_port: None,
                 };
                 let out = Seatbelt
                     .wrap(&w.compiled, &w.ctx, &launch)
@@ -326,6 +334,22 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
     }
     let other = w.other.local_addr().unwrap().port();
     assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 127.0.0.1 {other}")));
+
+    // The runtime's service, as a listener on the host's loopback here: a
+    // session given its port reaches it on 127.0.0.1, and nothing else
+    // there, not even `[::1]` at that port, where another sandbox that
+    // listens could be; a session given none reaches neither.
+    let service_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = service_listener.local_addr().unwrap().port();
+    let squatter = TcpListener::bind(("::1", service));
+    let nc = |host: &str, port: u16| format!("/usr/bin/nc -z -w 3 {host} {port}");
+    assert!(w.sh_with_service(&nc("127.0.0.1", service), Some(service)));
+    if squatter.is_ok() {
+        assert!(!w.sh_with_service(&nc("::1", service), Some(service)));
+    }
+    assert!(!w.sh_with_service(&nc("127.0.0.1", other), Some(service)));
+    assert!(!w.sh(&nc("127.0.0.1", service)));
+    assert!(!w.sh(&nc("127.0.0.1", other)));
 
     // Without the deny rules, the probes read as open: the bind went
     // through. The proxy's stand-in is closed first, so the bind is not
@@ -579,6 +603,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 args: vec!["-c".into(), sandboxed_script(&p).into()],
                 env: vec![],
                 in_terminal: false,
+                service_port: None,
             };
             let (ok, stdout, stderr) = output(Seatbelt.wrap(compiled, &w.ctx, &launch));
             let Proof::Control { control, .. } = &p.proof else {
@@ -878,6 +903,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             args: vec!["-c".into(), script.into()],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
             .stdout(Stdio::null())
@@ -927,6 +953,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             ],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())
