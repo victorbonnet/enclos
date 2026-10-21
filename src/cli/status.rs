@@ -168,6 +168,9 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
         facts.push("no agents".into());
     }
     println!("  {}", facts.join(" · "));
+    if let Some(why) = &s.policy_refused {
+        println!("  nothing new starts here, and what runs keeps its policy: {why}");
+    }
 
     if let Some(list) = &s.agents {
         if let Some(why) = &list.unreadable {

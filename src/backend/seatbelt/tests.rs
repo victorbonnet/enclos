@@ -30,6 +30,8 @@ fn world() -> World {
     for d in [
         user.join(".ssh"),
         user.join("work/secret"),
+        user.join("empty"),
+        user.join("projects"),
         home.join("private"),
         home.join("tmp"),
         data.join("sandboxes/other"),
@@ -43,6 +45,8 @@ fn world() -> World {
     std::fs::write(data.join("state.db"), "state").unwrap();
     std::fs::write(data.join("sandboxes/other/policy.toml"), "theirs").unwrap();
     std::fs::write(user.join("readable.txt"), "fine").unwrap();
+    // A workspace the user reaches through a link of their own.
+    std::os::unix::fs::symlink(user.join("projects"), user.join("linked")).unwrap();
     let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
     let other = TcpListener::bind("127.0.0.1:0").unwrap();
     let ctx = SandboxContext::new(
@@ -51,7 +55,13 @@ fn world() -> World {
         allowed.local_addr().unwrap().port(),
     );
     let mut policy = Policy::default();
-    policy.fs.write = vec!["{home}".into(), "~/work".into()];
+    policy.fs.write = vec![
+        "{home}".into(),
+        "~/work".into(),
+        "~/empty".into(),
+        "~/linked".into(),
+        "~/later".into(),
+    ];
     policy.fs.read_deny = vec![
         "~/.ssh".into(),
         "~/work/secret".into(),
@@ -99,6 +109,13 @@ impl World {
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).trim().to_owned(),
         )
+    }
+
+    /// Whether the policy refused the command: it failed with Seatbelt's
+    /// `Operation not permitted`, not for another reason.
+    fn refused(&self, script: &str) -> bool {
+        let (ok, out) = self.out(&format!("{{ {script}; }} 2>&1"));
+        !ok && out.contains("Operation not permitted")
     }
 
     fn path(&self, rel: &str) -> String {
@@ -203,6 +220,128 @@ fn a_write_grant_never_opens_a_hidden_path() {
     assert!(!w.sh("cat \"$HOME/private/key\""));
     assert!(!w.sh("echo x > \"$HOME/private/new\""));
     assert!(w.sh("cat \"$HOME/written\" 2>/dev/null; echo ok > \"$HOME/written\""));
+}
+
+#[test]
+fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
+    let w = world();
+    let home = w.ctx.home.display().to_string();
+    let work = w.path("alice/work");
+    let empty = w.path("alice/empty");
+    let later = w.path("alice/later");
+    let linked = w.path("alice/linked");
+    let outside = w.path("alice");
+    // The home and each workspace can be neither moved nor removed, so
+    // nothing else can take their place.
+    assert!(w.refused(&format!("/bin/mv '{home}' '{work}/home'")));
+    assert!(w.refused(&format!("/bin/mv '{work}' \"$HOME/work\"")));
+    assert!(w.refused(&format!(
+        "/bin/rmdir '{empty}' && /bin/ln -s '{outside}' '{empty}'"
+    )));
+    // Nor swapped with a link in one step: renamex_np(RENAME_SWAP), through
+    // its system call (renameatx_np, 488; AT_FDCWD is -2).
+    let swap = |a: &str, b: &str| {
+        format!(
+            "/usr/bin/perl -e 'syscall(488, -2, $ARGV[0], -2, $ARGV[1], 2) == 0 or die \"$!\\n\"' '{a}' '{b}'"
+        )
+    };
+    assert!(w.sh(&format!("/bin/ln -s '{outside}' \"$HOME/link\"")));
+    assert!(w.refused(&swap(&format!("{home}/link"), &empty)));
+    assert!(w.refused(&swap(&format!("{home}/link"), &home)));
+    // A workspace not made yet cannot be made, as a link or a folder.
+    assert!(w.refused(&format!("/bin/ln -s '{outside}' '{later}'")));
+    assert!(w.refused(&format!("/bin/mkdir '{later}'")));
+    for folder in [&home, &work, &empty] {
+        let meta = Path::new(folder).symlink_metadata().unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink(), "{folder}");
+    }
+    assert!(Path::new(&later).symlink_metadata().is_err());
+    // A link the user made outside every writable folder stays theirs:
+    // the sandbox writes where it leads, and cannot point it elsewhere.
+    assert!(w.refused(&format!("/bin/ln -sfn '{outside}' '{linked}'")));
+    assert!(w.refused(&format!("/bin/rm '{linked}'")));
+    assert_eq!(
+        std::fs::read_link(&linked).unwrap(),
+        w.base.join("alice/projects")
+    );
+    assert!(w.sh(&format!("echo x > '{linked}/f'")));
+    // A link in the home is the sandbox's own to change, which is why
+    // `validate` refuses a workspace reached through one.
+    assert!(w.sh(&format!(
+        "/bin/rm \"$HOME/link\" && /bin/ln -s '{work}' \"$HOME/link\""
+    )));
+    // Inside them, everything still goes: files, folders, links and moves.
+    assert!(w.sh(&format!(
+        "cd '{empty}' && echo x > f && mkdir d && mv d e && ln -s '{outside}' l && rm l f && rmdir e"
+    )));
+    assert!(w.sh("/bin/mkdir -p \"$HOME/a/b\" && /bin/mv \"$HOME/a\" \"$HOME/c\""));
+
+    // The escape probes for these folders are closed under this policy.
+    let inputs = crate::probes::ProbeInputs {
+        user_home: w.base.join("alice"),
+        data: w.base.join("alice/.enclos"),
+        config_file: w.base.join("alice/.enclos/config.toml"),
+        sandbox_dir: w.base.join("alice/.enclos/sandboxes/home"),
+        other_sandboxes: Vec::new(),
+        writes: Vec::new(),
+        read_deny: Vec::new(),
+        home: w.ctx.home.clone(),
+        workspaces: vec![w.base.join("alice/work"), w.base.join("alice/empty")],
+        host_sockets: Vec::new(),
+        target: None,
+        tag: 7,
+    };
+    let folders: Vec<_> = crate::probes::probes(&inputs)
+        .into_iter()
+        .filter(|p| p.route == "writable folders")
+        .collect();
+    assert_eq!(folders.len(), 4);
+    for probe in &folders {
+        let (ok, out) = w.out(&probe.script);
+        assert!(
+            !ok && out.contains("Operation not permitted"),
+            "{}: {out}",
+            probe.name
+        );
+    }
+    assert!(w.ctx.home.join("tmp").is_dir());
+
+    // Without the rule, the probes read as open and still change nothing.
+    let mut w = w;
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let rule = text
+        .find("\n;; ---- The home and each workspace themselves")
+        .unwrap();
+    w.compiled = w.base.join("without-the-rule.sb");
+    std::fs::write(&w.compiled, &text[..rule]).unwrap();
+    for probe in &folders {
+        let (ok, out) = w.out(&probe.script);
+        assert!(
+            ok && out.contains("the policy let it through"),
+            "{}: {out}",
+            probe.name
+        );
+    }
+    for folder in [&home, &work, &empty] {
+        let meta = Path::new(folder).symlink_metadata().unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink(), "{folder}");
+    }
+}
+
+#[test]
+fn the_home_stays_in_place_when_the_policy_leaves_it_out_of_its_writes() {
+    let mut w = world();
+    let mut policy = Policy::default();
+    policy.fs.write = vec!["~/work".into()];
+    w.compiled = w.base.join("no-home.sb");
+    std::fs::write(&w.compiled, Seatbelt.compile(&policy, &w.ctx).unwrap().text).unwrap();
+    let home = w.ctx.home.display().to_string();
+    assert!(w.sh("echo x > \"$HOME/still-writable\""));
+    let work = w.path("alice/work");
+    // Into a workspace, which the sandbox writes: only the rule refuses it.
+    assert!(w.refused(&format!("/bin/mv '{home}' '{work}/home'")));
+    let meta = w.ctx.home.symlink_metadata().unwrap();
+    assert!(meta.is_dir() && !meta.file_type().is_symlink());
 }
 
 #[test]

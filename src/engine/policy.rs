@@ -241,7 +241,7 @@ impl Engine {
         }
     }
 
-    fn validation_context(&self, name: &SandboxName) -> ValidationContext {
+    pub(super) fn validation_context(&self, name: &SandboxName) -> ValidationContext {
         ValidationContext {
             paths: PathContext {
                 user_home: self.layout.user_home().to_owned(),

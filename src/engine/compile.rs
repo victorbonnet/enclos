@@ -11,10 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::Engine;
 use crate::backend::{Backend, Probe, SandboxContext};
-use crate::error::{Error, Result};
+use crate::error::{Error, HomeFound, Result};
 use crate::layout::LayoutError;
+use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::policy::sha256_hex;
+use crate::policy::validate::validate_writes;
 
 impl Engine {
     /// The backend of the sandbox, refused when this host cannot run it
@@ -80,6 +82,7 @@ impl Engine {
     ) -> Result<(PathBuf, String)> {
         let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
+        self.check_before_compile(name, &policy)?;
         let ctx = self.sandbox_context(name, proxy_port);
         let compiled = backend.compile(&policy, &ctx)?;
         let digest = sha256_hex(compiled.text.as_bytes());
@@ -88,6 +91,38 @@ impl Engine {
                 .join("compiled")
                 .join(format!("{}.{}", &digest[..16], compiled.extension));
         Ok((file, compiled.text))
+    }
+
+    /// What must hold of the paths each time a policy is compiled, since
+    /// the backend resolves them through symlinks as they are then: the
+    /// sandbox home is still a real folder at its path, not a link, a file
+    /// or missing, and the policy's write checks still pass on the paths as
+    /// they are now (design §5).
+    fn check_before_compile(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+        let home = self.layout.sandbox_home(name.as_str());
+        let found = match std::fs::symlink_metadata(&home) {
+            Ok(meta) if meta.is_dir() => None,
+            Ok(meta) if meta.is_symlink() => Some(HomeFound::Link {
+                to: std::fs::read_link(&home).map_err(io(&home))?,
+            }),
+            Ok(_) => Some(HomeFound::NotAFolder),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(HomeFound::Missing),
+            Err(source) => return Err(io(&home)(source)),
+        };
+        if let Some(found) = found {
+            return Err(Error::HomeNotAFolder {
+                sandbox: name.to_string(),
+                path: home,
+                found,
+            });
+        }
+        validate_writes(policy, &self.validation_context(name)).map_err(|source| {
+            Error::ActivePolicyInvalid {
+                sandbox: name.to_string(),
+                policy_file: self.layout.policy_file(name.as_str()),
+                source,
+            }
+        })
     }
 }
 

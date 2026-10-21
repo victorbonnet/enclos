@@ -92,6 +92,43 @@ fn follow(path: &Path, links: usize) -> PathBuf {
     real
 }
 
+/// Every symlink followed on the way to `path`, in the order `real_path`
+/// follows them, including links a link points through. Each is given as
+/// the link itself: its folder resolved, its own name kept.
+pub fn links_on_the_way(path: &Path) -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    walk(path, &mut links);
+    links
+}
+
+fn walk(path: &Path, links: &mut Vec<PathBuf>) {
+    let mut real = PathBuf::new();
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        match component {
+            Component::RootDir => real = PathBuf::from("/"),
+            Component::CurDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                real.pop();
+            }
+            Component::Normal(name) => {
+                real.push(name);
+                let is_link = real.symlink_metadata().is_ok_and(|m| m.is_symlink());
+                if !is_link || links.len() >= MAX_LINKS {
+                    continue;
+                }
+                let Ok(target) = std::fs::read_link(&real) else {
+                    continue;
+                };
+                links.push(real.clone());
+                real.pop();
+                let next = real.join(target).join(components.as_path());
+                return walk(&next, links);
+            }
+        }
+    }
+}
+
 /// Whether `inner` is `outer` or inside it, comparing whole components.
 pub fn is_within(inner: &Path, outer: &Path) -> bool {
     inner.starts_with(outer)
@@ -176,6 +213,34 @@ mod tests {
         link("loop-b", "work/loop-a");
         link("loop-a", "work/loop-b");
         real_path(&base.join("work/loop-a/x"));
+    }
+
+    #[test]
+    fn every_link_on_the_way_is_found_where_it_sits() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(base.join("a/real")).unwrap();
+        std::fs::create_dir(base.join("b")).unwrap();
+        let link = |target: &str, at: &str| {
+            std::os::unix::fs::symlink(target, base.join(at)).unwrap();
+        };
+        // `top` -> `b/hop` -> `a/real`, and a dangling one past it.
+        link("../a/real", "b/hop");
+        link("b/hop", "top");
+        link("../not-yet", "a/real/gone");
+        assert_eq!(
+            links_on_the_way(&base.join("top/gone/x")),
+            vec![
+                base.join("top"),
+                base.join("b/hop"),
+                base.join("a/real/gone")
+            ]
+        );
+        assert!(links_on_the_way(&base.join("a/real/new")).is_empty());
+        // A loop ends.
+        link("loop-b", "b/loop-a");
+        link("loop-a", "b/loop-b");
+        assert!(links_on_the_way(&base.join("b/loop-a")).len() <= MAX_LINKS);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use rustix::io::Errno;
 use serde::{Serialize, Serializer};
 
 use super::Engine;
-use super::sandbox::needs_restart;
+use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::members::is_gone;
 use crate::lifecycle::process::processes;
@@ -135,6 +135,9 @@ pub struct SandboxStatus {
     /// replaced: it needs a restart to run under it. The proxy applies
     /// network rules live and never does.
     pub restart_needed: bool,
+    /// Why enclos now refuses to compile the active policy, if it does:
+    /// nothing new starts in the sandbox until the user fixes it.
+    pub policy_refused: Option<String>,
     /// When a `connect` last started.
     pub last_connect: Option<Timestamp>,
     /// When the sandbox last tried a connection, allowed or refused.
@@ -604,7 +607,8 @@ impl Engine {
             gone_sessions: gone.len(),
             restart_needed: running
                 .iter()
-                .any(|s| needs_restart(s, compiled.as_deref())),
+                .any(|s| needs_restart(s, compiled.as_ref().ok().map(PathBuf::as_path))),
+            policy_refused: compile_refused(&compiled),
             last_connect,
             last_network,
             last_used,
