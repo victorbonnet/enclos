@@ -2718,6 +2718,10 @@ mod services {
         fn verify(&self) -> crate::audit::Result<VerifyReport> {
             self.inner.verify()
         }
+
+        fn check(&self) -> crate::audit::Result<()> {
+            self.inner.check()
+        }
     }
 
     /// Gives the engine an audit log that refuses the commands in the list
