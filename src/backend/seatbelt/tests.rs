@@ -12,6 +12,7 @@ use super::super::{Backend, Launch, SandboxContext};
 use super::Seatbelt;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
+use crate::policy::file::PolicyFile;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{Outcome, ProbeInputs, Proof, Run, outcome, probes, sandboxed_script};
 
@@ -139,6 +140,12 @@ impl World {
 
     fn path(&self, rel: &str) -> String {
         self.base.join(rel).display().to_string()
+    }
+
+    /// Compiles `policy` in place of the one [`world`] wrote.
+    fn enforce(&self, policy: &Policy) {
+        let text = Seatbelt.compile(policy, &self.ctx).unwrap().text;
+        std::fs::write(&self.compiled, text).unwrap();
     }
 }
 
@@ -636,6 +643,61 @@ fn the_home_stays_in_place_when_the_policy_leaves_it_out_of_its_writes() {
     assert!(w.refused(&format!("/bin/mv '{home}' '{work}/home'")));
     let meta = w.ctx.home.symlink_metadata().unwrap();
     assert!(meta.is_dir() && !meta.file_type().is_symlink());
+}
+
+/// Fake files at paths the built-in deny list names, relative to the user's
+/// home. Together they cover each shape of entry: a file, a folder, a name
+/// with spaces and a bundle.
+const DENIED_FAKES: &[&str] = &[
+    // File entries
+    ".cargo/credentials.toml",
+    ".cache/huggingface/token",
+    ".zhistory",
+    // Folder entries
+    ".config/rclone/rclone.conf",
+    ".local/share/atuin/history.db",
+    ".password-store/bank.gpg",
+    ".gemini/oauth_creds.json",
+    ".local/share/opencode/auth.json",
+    "Library/HTTPStorages/com.example.app/httpstorages.sqlite",
+    "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+    "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+    // A name with spaces
+    "Library/Application Support/Google/Chrome Beta/Default/Cookies",
+    // A bundle
+    "Pictures/Photos Library.photoslibrary/database/Photos.sqlite",
+];
+
+#[test]
+fn the_built_in_deny_list_hides_the_users_files_but_not_the_same_names_in_the_home() {
+    let w = world();
+    let mut policy = Policy::default();
+    PolicyFile::parse("built-in defaults", crate::policy::DEFAULTS)
+        .unwrap()
+        .apply(&mut policy);
+    w.enforce(&policy);
+    for rel in DENIED_FAKES {
+        let host = w.base.join("alice").join(rel);
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, "secret").unwrap();
+        assert!(
+            !w.sh(&format!("cat '{}'", host.display())),
+            "{rel} was read"
+        );
+        // A file of the same name in the sandbox home is the sandbox's own:
+        // `~` in the list is the user's home, not the sandbox home.
+        let own = format!("\"$HOME/{rel}\"");
+        assert!(
+            w.sh(&format!(
+                "/bin/mkdir -p \"$(dirname {own})\" && echo mine > {own} && cat {own}"
+            )),
+            "{rel} in the sandbox home"
+        );
+    }
+    // Only the named file is hidden, not the folder holding it.
+    std::fs::write(w.base.join("alice/.cargo/config.toml"), "fine").unwrap();
+    assert!(w.sh(&format!("cat '{}'", w.path("alice/.cargo/config.toml"))));
+    assert!(w.sh(&format!("/bin/ls '{}'", w.path("alice/.cache/huggingface"))));
 }
 
 #[test]
