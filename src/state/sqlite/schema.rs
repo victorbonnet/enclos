@@ -54,7 +54,6 @@ pub const MIGRATIONS: &[&str] = &[
         id          INTEGER PRIMARY KEY,
         sandbox     TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
         kind        TEXT NOT NULL,
-        service     TEXT,
         version     INTEGER NOT NULL,
         snapshot    TEXT NOT NULL,
         compiled    TEXT,
@@ -63,7 +62,8 @@ pub const MIGRATIONS: &[&str] = &[
         pgid        INTEGER,
         tracked     TEXT NOT NULL DEFAULT '[]',
         started_at  TEXT NOT NULL,
-        ended_at    TEXT
+        ended_at    TEXT,
+        service     TEXT CHECK ((kind = 'service') = (service IS NOT NULL))
     ) STRICT;
     CREATE INDEX sessions_running ON sessions (sandbox, ended_at);",
     // 5: the runtime installed in each sandbox, and its agents

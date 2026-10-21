@@ -60,9 +60,10 @@ pub struct Engine {
     /// The enclos program, to start the proxy and services with.
     exe: Option<std::path::PathBuf>,
     services: Box<dyn crate::service::ServiceManager>,
-    /// How a session's members are stopped once its program is told to end
-    /// (`enclos launch`): `lifecycle::stop::stop`, unless a test stands in
-    /// one that leaves them running.
+    /// How a session's members are stopped when `enclos launch` is told to
+    /// end, and when it or `sandbox start` stops the sessions a new one
+    /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
+    /// leaves them running.
     stop_members: StopMembers,
 }
 
@@ -222,7 +223,7 @@ impl Engine {
     }
 
     /// The same engine stopping a session's members with `stop`, for tests
-    /// of a program that outlives being told to end.
+    /// of members that outlive being stopped.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn with_stop_members(mut self, stop: StopMembers) -> Engine {
         self.stop_members = stop;

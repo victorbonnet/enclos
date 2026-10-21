@@ -2490,10 +2490,12 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     #[cfg(target_os = "macos")]
-    /// Waits for the stub gateway to write its pids, then sets `ended`.
+    /// Waits for the stub gateway to write its pids, runs `then`, then sets
+    /// `ended`.
     fn end_once_started(
         pids_file: PathBuf,
         ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        then: impl FnOnce() + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<u32>> {
         use std::time::{Duration, Instant};
         std::thread::spawn(move || {
@@ -2506,6 +2508,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 std::thread::sleep(Duration::from_millis(50));
             }
             let pids = pids_in(&pids_file);
+            then();
             ended.store(true, std::sync::atomic::Ordering::Relaxed);
             pids
         })
@@ -2528,21 +2531,32 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let other_id = record_service_session(&lab, "mail", other_root, Some(other.id()));
 
         let ended = Arc::new(AtomicBool::new(false));
-        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended));
+        // Whether the prior gateway still ran once the new one started; a
+        // zombie, not yet reaped by this test, does not count.
+        let prior_pid = prior.id();
+        let prior_ran = std::sync::Arc::new(AtomicBool::new(true));
+        let teller = {
+            let prior_ran = Arc::clone(&prior_ran);
+            end_once_started(
+                lab.home.join("gateway-pids"),
+                Arc::clone(&ended),
+                move || {
+                    let running = crate::lifecycle::process::reference(prior_pid).unwrap();
+                    prior_ran.store(running.is_some(), std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+        };
         let end = lab
             .engine
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap();
         let started = teller.join().unwrap();
 
-        // The prior gateway was stopped before the new one started: it was
-        // reaped here, so it is gone, not merely a zombie.
         assert!(
-            prior.try_wait().unwrap().is_some(),
-            "the prior gateway runs"
+            !prior_ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the prior gateway still ran when the new one started"
         );
-        assert_ne!(end.session, prior_id);
-        assert!(!started.contains(&prior.id()));
+        prior.wait().unwrap();
         assert_eq!(end.left, Left::Nothing, "{end:?}");
         assert_gone(&started);
         // The other service's session is untouched.
@@ -2560,7 +2574,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let audit = lab.audit();
         assert!(
             audit.contains(&format!(
-                "after stopping gateway service session {prior_id} left by an earlier launch"
+                "after stopping and ending gateway service session {prior_id}, left by an earlier launch"
             )),
             "{audit}"
         );
@@ -2592,7 +2606,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         });
         assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
         let ended = Arc::new(AtomicBool::new(false));
-        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended));
+        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
         let err = lab
             .engine
             .launch_until(&alice(), &lab.name, "gateway", &ended)
@@ -2608,20 +2622,143 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert_eq!(outcome.result, AuditResult::Failed, "{outcome:?}");
         let open = open_service_sessions(&lab);
         assert_eq!(open.len(), 1, "{open:?}");
+        let message = &outcome.message;
         assert!(
-            outcome
-                .message
-                .contains(&format!("pid {}", open[0].root.pid))
-                && outcome
-                    .message
-                    .contains(&format!("session {} stays open", open[0].id)),
-            "{}",
-            outcome.message
+            message.contains(&format!("pid {} hermes", open[0].root.pid)),
+            "{message}"
         );
+        assert!(
+            message.contains(&format!("session {} stays open", open[0].id)),
+            "{message}"
+        );
+        assert_eq!(err.to_string(), *message);
         // The session stays open while its program runs; `sandbox stop`,
         // with the real stop, ends it.
         drop(lab);
         assert_gone(&started);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_runtime_enclos_cannot_stop_is_audited_and_its_session_stays_open() {
+        use crate::lifecycle::process::PsError;
+        use crate::model::audit::AuditResult;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        // `ps` failing whenever the members are stopped: nothing is signalled.
+        let lab = Lab::stopping_with(|_, _| Err(PsError::new("ps failed")));
+        assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+        let ended = Arc::new(AtomicBool::new(false));
+        let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err();
+        let started = teller.join().unwrap();
+        assert!(
+            err.to_string()
+                .contains("could not stop the members of session"),
+            "{err}"
+        );
+
+        // `launch` returns instead of trying again forever, and the end is
+        // audited as failed.
+        let entries = lab.engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "service end");
+        let outcome = &last.finished.as_ref().expect("finished").outcome;
+        assert_eq!(outcome.result, AuditResult::Failed, "{outcome:?}");
+        assert!(outcome.message.contains("ps failed"), "{outcome:?}");
+        let open = open_service_sessions(&lab);
+        assert_eq!(open.len(), 1, "{open:?}");
+        drop(lab);
+        assert_gone(&started);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_launch_refuses_to_start_beside_an_earlier_session_that_does_not_stop() {
+        use crate::lifecycle::stop::{Stopped, Survivor, Why};
+        use crate::model::audit::AuditResult;
+        use crate::model::session::Member;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        // The pid of the one runtime this stop reports as surviving KILL,
+        // without signalling it; every other session it stops for real.
+        static STUBBORN: AtomicU32 = AtomicU32::new(0);
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::stopping_with(|session, grace| {
+            if session.root.pid != STUBBORN.load(Ordering::Relaxed) {
+                return crate::lifecycle::stop::stop(session, grace);
+            }
+            Ok(Stopped::Survivors(vec![Survivor {
+                member: Member {
+                    pid: session.root.pid,
+                    started: session.root.started.clone(),
+                    command: "hermes".into(),
+                },
+                why: Why::Survived,
+            }]))
+        });
+        assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+        // Two gateways that killed launches left: the first stops, the
+        // second does not.
+        let (mut first, first_root) = orphan_runtime();
+        let first_id = record_service_session(&lab, "gateway", first_root, Some(first.id()));
+        let (mut stubborn, stubborn_root) = orphan_runtime();
+        STUBBORN.store(stubborn.id(), Ordering::Relaxed);
+        let stubborn_id =
+            record_service_session(&lab, "gateway", stubborn_root, Some(stubborn.id()));
+
+        let ended = AtomicBool::new(false);
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err()
+            .to_string();
+        // It names the process to end, and the session it already ended.
+        assert!(
+            err.contains(&format!(
+                "the gateway service session {stubborn_id} of sandbox {} did not stop (pid {} hermes: still runs after TERM and KILL)",
+                lab.name,
+                stubborn.id()
+            )),
+            "{err}"
+        );
+        assert!(err.contains("a second gateway was not started"), "{err}");
+        assert!(err.contains("End what still runs"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "after stopping and ending gateway service session {first_id}, left by an earlier launch"
+            )),
+            "{err}"
+        );
+
+        // No gateway started; the first is stopped and its session ended;
+        // the stubborn one's session stays open.
+        assert!(!lab.home.join("gateway-pids").exists());
+        assert!(
+            first.try_wait().unwrap().is_some(),
+            "the first gateway runs"
+        );
+        let open = open_service_sessions(&lab);
+        assert_eq!(
+            open.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [stubborn_id],
+            "{open:?}"
+        );
+        // The failed launch entry says all of it.
+        let entries = lab.engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, "launch");
+        let outcome = &last.finished.as_ref().expect("finished").outcome;
+        assert_eq!(outcome.result, AuditResult::Failed, "{outcome:?}");
+        assert_eq!(outcome.message, err);
+        // `sandbox stop`, with the real stop, ends the stubborn runtime.
+        drop(lab);
+        stubborn.wait().unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -3829,7 +3966,7 @@ mod status {
             id: SessionId(0),
             sandbox: name.clone(),
             kind,
-            service: None,
+            service: (kind == SessionKind::Service).then(|| "gateway".to_owned()),
             version: 1,
             snapshot: engine.policy(name).unwrap().snapshot.id,
             compiled: compiled.map(str::to_owned),

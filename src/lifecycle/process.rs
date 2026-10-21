@@ -21,6 +21,14 @@ use crate::model::session::ProcessRef;
 #[error("cannot look at processes with /bin/ps: {0}")]
 pub struct PsError(String);
 
+#[cfg(test)]
+impl PsError {
+    /// A `ps` failure with this reason, for tests of what follows one.
+    pub(crate) fn new(why: &str) -> PsError {
+        PsError(why.to_owned())
+    }
+}
+
 /// Runs `ps`, reading dates in UTC and the C locale, so that a start time
 /// reads the same whoever asks.
 fn ps(args: &[&str]) -> Result<Output, PsError> {
