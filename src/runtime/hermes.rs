@@ -145,13 +145,14 @@ impl RuntimeAdapter for Hermes {
     }
 
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
-        // Hermes's own import of an archive its `profile export` made
-        // (Hermes 0.22): it extracts safely, refuses an existing profile and
-        // `default`, drops foreign runtime state, and the command writes
-        // the profile's wrapper unless the name collides with a command.
-        // The export leaves out `auth.json`, `.env` and the browser's data,
-        // and scrubs secret-shaped strings from its text files; whether
-        // that holds inside a sandbox is to verify (design §14).
+        // Hermes's own import of an archive its `profile export` made, by
+        // Hermes 0.22.2's code: it extracts without following links or
+        // leaving the profile folder, refuses an existing profile and
+        // `default`, removes the archive's `installs`, `tools` and `cache`
+        // folders, and writes the profile's wrapper unless the name
+        // collides with a command. Its export leaves out `auth.json`, `.env`
+        // and the browser's data and scrubs secret-shaped strings. Neither
+        // is shown by a prototype yet (design §14).
         let mut words: Vec<OsString> = [HERMES, "profile", "import"].map(OsString::from).to_vec();
         words.push(archive.as_os_str().to_owned());
         words.extend(["--name", name.as_str()].map(OsString::from));

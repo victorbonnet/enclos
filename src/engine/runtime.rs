@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use sha2::{Digest, Sha256};
 
 use super::Engine;
-use super::import::Archive;
+use super::import::{Archive, LeftCopy};
 use super::policy::{adapter_layer, differences};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
@@ -48,7 +48,8 @@ pub struct AgentAdded {
     pub how: Added,
 }
 
-/// How the record came to be (ADR 0023).
+/// How the record came to be: created, adopted (ADR 0023) or imported
+/// (issue #34).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Added {
     /// The runtime created the agent; how its command ended.
@@ -63,8 +64,35 @@ pub enum Added {
         archive: Archive,
         /// enclos's copy of the archive beside the sandbox home, when it
         /// could not be removed: the sandbox can read it.
-        copy_left: Option<PathBuf>,
+        copy_left: Option<LeftCopy>,
     },
+}
+
+impl Added {
+    /// The `agent add` audit entry's outcome.
+    fn outcome(&self) -> String {
+        match self {
+            Added::Created(_) => "added".to_owned(),
+            Added::Adopted => "adopted".to_owned(),
+            Added::Imported {
+                archive, copy_left, ..
+            } => {
+                let mut outcome = format!(
+                    "imported from {} (sha256 {})",
+                    archive.path.display(),
+                    archive.sha256
+                );
+                if let Some(copy) = copy_left {
+                    outcome.push_str(&format!(
+                        "; the copy at {} could not be removed: {}",
+                        copy.path.display(),
+                        copy.why
+                    ));
+                }
+                outcome
+            }
+        }
+    }
 }
 
 /// What `agent rm` did. The record is gone either way.
@@ -593,68 +621,7 @@ impl Engine {
                 Added::Created(created)
             }
         };
-        let summary = match how {
-            Added::Adopted => "adopted",
-            Added::Created(_) | Added::Imported { .. } => "added",
-        };
-        let record = self
-            .write(
-                by,
-                "agent add",
-                Some(format!("{name}/{agent}")),
-                |_| summary.to_owned(),
-                |lock| {
-                    // Checked again under the lock: another add may have
-                    // recorded it while the runtime worked, and a session in
-                    // the sandbox may have deleted what is being adopted.
-                    self.refuse_known_agent(name, &agent)?;
-                    if how == Added::Adopted {
-                        match runtime.agents_in(&home) {
-                            Ok(found) if runtime_has(&found) => {}
-                            Ok(_) => {
-                                return Err(Error::Session {
-                                    what: format!("{shown} no longer has agent {agent} in sandbox {name}"),
-                                });
-                            }
-                            Err(why) => {
-                                return Err(Error::Session {
-                                    what: format!("enclos cannot read {shown}'s agents in sandbox {name} any more: {why}"),
-                                });
-                            }
-                        }
-                    }
-                    let added = AgentRecord {
-                        name: agent.clone(),
-                        created_at: now(),
-                    };
-                    self.state.insert_agent(lock, name, &added)?;
-                    Ok(added)
-                },
-            )
-            .map_err(|e| {
-                // Already failing: what the state and the runtime say now
-                // only words what to do next.
-                let recorded = self
-                    .state
-                    .agents(name)
-                    .is_ok_and(|agents| agents.iter().any(|p| p.name == agent));
-                let next = if recorded {
-                    "Another command recorded it meanwhile; there is nothing more to do".to_owned()
-                } else {
-                    match runtime.agents_in(&home) {
-                        Ok(found) if runtime_has(&found) => format!(
-                            "Run `enclos agent add {name}/{agent}` again: it adopts an agent {shown} already has"
-                        ),
-                        Ok(_) => format!("{shown} does not list it any more either"),
-                        Err(why) => format!("enclos cannot read {shown}'s agents there: {why}"),
-                    }
-                };
-                Error::Session {
-                    what: format!(
-                        "{shown} has agent {agent} in sandbox {name}, but enclos could not record it: {e}. {next}"
-                    ),
-                }
-            })?;
+        let record = self.record_agent(by, name, &agent, kind, &how)?;
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,
@@ -663,26 +630,49 @@ impl Engine {
     }
 
     /// Records an agent the runtime now has, as one `agent add` audit entry
-    /// whose outcome says how it came to be. `then` is what to do if the
-    /// record fails, since the runtime keeps the agent either way.
+    /// whose outcome says how it came to be. Under the lock it checks again
+    /// that no other command recorded the agent meanwhile and, for an
+    /// adopted one, that the runtime still has it. When the record fails,
+    /// the runtime keeps the agent either way, so the error says what the
+    /// state and the runtime show now.
     pub(super) fn record_agent(
         &self,
         by: &Actor,
         name: &SandboxName,
         agent: &AgentName,
         kind: RuntimeKind,
-        outcome: String,
-        then: &str,
+        how: &Added,
     ) -> Result<AgentRecord> {
+        let runtime = adapter(kind);
+        let shown = kind.display_name();
+        let home = self.sandbox_home(name);
+        let runtime_has =
+            |found: &[RuntimeAgentName]| found.contains(&RuntimeAgentName::from(agent));
         self.write(
             by,
             "agent add",
             Some(format!("{name}/{agent}")),
-            |_| outcome,
+            |_| how.outcome(),
             |lock| {
                 // Checked again under the lock: another add may have
-                // recorded it while the runtime worked.
+                // recorded it while the runtime worked, and a session in
+                // the sandbox may have deleted what is being adopted.
                 self.refuse_known_agent(name, agent)?;
+                if *how == Added::Adopted {
+                    match runtime.agents_in(&home) {
+                        Ok(found) if runtime_has(&found) => {}
+                        Ok(_) => {
+                            return Err(Error::Session {
+                                what: format!("{shown} no longer has agent {agent} in sandbox {name}"),
+                            });
+                        }
+                        Err(why) => {
+                            return Err(Error::Session {
+                                what: format!("enclos cannot read {shown}'s agents in sandbox {name} any more: {why}"),
+                            });
+                        }
+                    }
+                }
                 let added = AgentRecord {
                     name: agent.clone(),
                     created_at: now(),
@@ -691,11 +681,35 @@ impl Engine {
                 Ok(added)
             },
         )
-        .map_err(|e| Error::Session {
-            what: format!(
-                "{} has agent {agent} in sandbox {name}, but enclos could not record it: {e}. {then}",
-                kind.display_name()
-            ),
+        .map_err(|e| {
+            // Already failing: what the state and the runtime say now
+            // only words what to do next.
+            let recorded = self
+                .state
+                .agents(name)
+                .is_ok_and(|agents| agents.iter().any(|p| p.name == *agent));
+            let next = if recorded {
+                "Another command recorded it meanwhile; there is nothing more to do".to_owned()
+            } else {
+                match runtime.agents_in(&home) {
+                    Ok(found) if runtime_has(&found) => {
+                        let mut next = format!(
+                            "Run `enclos agent add {name}/{agent}` again: it adopts an agent {shown} already has"
+                        );
+                        if let Added::Imported { .. } = how {
+                            next.push_str(" (without --from); the archive's SHA-256 is in the `agent import` audit entry");
+                        }
+                        next
+                    }
+                    Ok(_) => format!("{shown} does not list it any more either"),
+                    Err(why) => format!("enclos cannot read {shown}'s agents there: {why}"),
+                }
+            };
+            Error::Session {
+                what: format!(
+                    "{shown} has agent {agent} in sandbox {name}, but enclos could not record it: {e}. {next}"
+                ),
+            }
         })
     }
 

@@ -141,6 +141,31 @@ fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
 }
 
 #[test]
+fn the_sandbox_reads_but_cannot_write_its_own_installers_folder() {
+    // Where enclos copies an installer or an archive to import: the
+    // sandbox reads it there and can neither change, replace nor add one.
+    let w = world();
+    let installers = w.ctx.dir.join("installers");
+    std::fs::create_dir_all(&installers).unwrap();
+    let copy = installers.join("agent-main.1.tar.gz");
+    std::fs::write(&copy, "an export").unwrap();
+    let copy = copy.display().to_string();
+    let dir = installers.display().to_string();
+    assert!(w.sh(&format!("cat '{copy}'")));
+    assert!(!w.sh(&format!("echo x > '{copy}'")));
+    assert!(!w.sh(&format!("rm '{copy}'")));
+    assert!(!w.sh(&format!("echo x > '{dir}/new'")));
+    assert!(!w.sh(&format!("ln -s /etc/hosts '{dir}/link'")));
+    assert_eq!(std::fs::read_to_string(&copy).unwrap(), "an export");
+    assert_eq!(std::fs::read_dir(&installers).unwrap().count(), 1);
+    // Nor its own policy file.
+    assert!(!w.sh(&format!(
+        "echo x > '{}'",
+        w.ctx.dir.join("policy.toml").display()
+    )));
+}
+
+#[test]
 fn the_network_reaches_only_the_proxy_port() {
     let w = world();
     let port = |l: &TcpListener| l.local_addr().unwrap().port();

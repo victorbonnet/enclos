@@ -13,3 +13,4 @@ enclos creates named, persistent sandboxes, installs an agent in each, and gover
 ## Consequences
 
 - Inside a sandbox enclos created, agents made with the runtime's own commands are reported and adopted on request ([0023](0023-agents-made-inside-a-sandbox.md)); that is a read of the sandbox's own home, not discovery on the host.
+- An agent from the host comes in only from an export the user names, made with the runtime's own command ([0026](0026-agents-imported-through-the-runtimes-own-export.md)); enclos does not look for it.

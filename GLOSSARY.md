@@ -60,6 +60,10 @@ _Avoid_: main agent, root profile, default profile
 An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. It becomes a tracked agent when added.
 _Avoid_: orphan, rogue agent, unknown agent
 
+**Export**:
+An archive of an agent made by its runtime's own command, such as `hermes profile export`. An agent comes into a sandbox from the host only by importing an export with the runtime's own import; enclos has no archive format of its own.
+_Avoid_: backup, bundle, snapshot (a policy's word)
+
 **Session**:
 A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance

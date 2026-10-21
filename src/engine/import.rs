@@ -4,11 +4,13 @@
 //! the sandbox home and the runtime extracts it inside the sandbox; enclos
 //! never looks inside it.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
 
 use super::Engine;
@@ -32,9 +34,18 @@ pub struct Archive {
     pub sha256: String,
 }
 
-/// An archive the user named, opened once: the bytes hashed are the bytes
-/// copied. Written by whoever wrote the file, so it is a plain file, never
-/// a link, and never inside a sandbox's folder.
+/// enclos's copy of an archive beside the sandbox home that it could not
+/// remove: the sandbox can read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftCopy {
+    pub path: PathBuf,
+    /// Why it could not be removed.
+    pub why: String,
+}
+
+/// An archive the user named, opened once so the bytes hashed are the bytes
+/// copied. Refused when it is a link, not a plain file, or under a
+/// sandbox's folder, whose home the sandbox writes.
 struct Source {
     path: PathBuf,
     file: File,
@@ -62,12 +73,11 @@ impl Engine {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
-        // One copy per run, so two imports of the same name never share it.
-        let staged = self
-            .layout
-            .sandbox_dir(name.as_str())
-            .join("installers")
-            .join(format!("agent-{agent}.{}.tar.gz", std::process::id()));
+        // One copy per enclos process, so two imports of the same name never
+        // share it.
+        let installers = self.layout.sandbox_dir(name.as_str()).join("installers");
+        let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.tar.gz"));
+        let staged = copy_named(&std::process::id().to_string());
         let Some(command) = runtime.import_agent(&agent, &staged) else {
             return Err(failed(format!(
                 "{shown} cannot import an agent from an archive. `enclos agent add {name}/{agent}` creates a new one"
@@ -101,12 +111,15 @@ impl Engine {
         if confirm == Confirm::DryRun {
             let version = self.policy(name)?.version.version;
             let Archive { path, sha256 } = source.hash()?;
+            // The real run names its copy after its own process.
+            let planned = copy_named("<pid>");
+            let command = runtime.import_agent(&agent, &planned).unwrap_or(command);
             return Ok(Planned::DryRun(Plan {
                 changes: vec![
                     format!(
-                        "copy {} (sha256 {sha256} now) to {}, beside the home of sandbox {name}, where the sandbox reads it and cannot write",
+                        "copy {} (sha256 {sha256} now) to a new file such as {}, beside the home of sandbox {name}, where the sandbox reads it and cannot write",
                         path.display(),
-                        staged.display()
+                        planned.display()
                     ),
                     format!(
                         "run `{}` in sandbox {name} under policy v{version}: {shown} extracts the archive inside the sandbox",
@@ -119,20 +132,35 @@ impl Engine {
         }
         // Staging is audited on its own, so the archive and its hash are in
         // the audit log before the runtime runs, whatever happens after.
-        let archive = self.write(
+        let copied = Cell::new(false);
+        let staging = self.write(
             by,
             "agent import",
             Some(format!("{name}/{agent}")),
-            |a: &Archive| format!("staged {} (sha256 {})", a.path.display(), a.sha256),
-            |_| source.stage(&staged),
-        )?;
-        let ran = self.run_in_sandbox(by, name, command, "agent import run");
-        // The copy served its one import; the sandbox keeps what it took.
-        let copy_left = match std::fs::remove_file(&staged) {
-            Ok(()) => None,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => Some(staged),
+            |a: &Archive| {
+                format!(
+                    "copied {} (sha256 {}) to {}",
+                    a.path.display(),
+                    a.sha256,
+                    staged.display()
+                )
+            },
+            |_| {
+                let archive = source.stage(&staged)?;
+                copied.set(true);
+                Ok(archive)
+            },
+        );
+        let archive = match staging {
+            Ok(archive) => archive,
+            // The copy was made but its audit entry could not be closed: it
+            // goes, since the runtime will not run.
+            Err(e) if copied.get() => return Err(with_copy_left(e, remove_copy(&staged))),
+            Err(e) => return Err(e),
         };
+        let ran = self.run_in_sandbox(by, name, command, "agent import session");
+        // The copy served its one import; the sandbox keeps what it took.
+        let copy_left = remove_copy(&staged);
         // When the import fails, the runtime may have made the agent anyway.
         let delete_it = match runtime.delete_agent(&agent) {
             Some(delete) => format!("`enclos connect {name} -- {}`", delete.shown()),
@@ -146,49 +174,45 @@ impl Engine {
                     archive.path.display(),
                     end.exit
                 ));
-                return Err(with_copy_left(error, copy_left.as_deref()));
+                return Err(with_copy_left(error, copy_left));
             }
             Err(e) => {
+                // The session may not have started (the proxy, the policy),
+                // or may have started and then failed to report back.
                 let error = failed(format!(
-                    "enclos lost track of the import of {} into sandbox {name}: {e}. Nothing was recorded. If {shown} has agent {agent} now, `enclos agent list {name}` reports it: record it with `enclos agent add {name}/{agent}`, or delete it with {delete_it}; otherwise import again",
+                    "the import of {} into sandbox {name} did not finish: {e}. Nothing was recorded. If {shown} has agent {agent} anyway, `enclos agent list {name}` reports it: record it with `enclos agent add {name}/{agent}`, or delete it with {delete_it}; otherwise import again",
                     archive.path.display()
                 ));
-                return Err(with_copy_left(error, copy_left.as_deref()));
+                return Err(with_copy_left(error, copy_left));
             }
         };
-        let mut outcome = format!(
-            "imported from {} (sha256 {})",
-            archive.path.display(),
-            archive.sha256
-        );
-        if let Some(copy) = &copy_left {
-            outcome.push_str(&format!(
-                "; the copy at {} could not be removed",
-                copy.display()
-            ));
-        }
-        let then = format!(
-            "Run `enclos agent add {name}/{agent}` (without --from): it records the agent {shown} imported; the archive's SHA-256 is in the `agent import` audit entry"
-        );
-        let record = self.record_agent(by, name, &agent, kind, outcome, &then)?;
+        let how = Added::Imported {
+            end,
+            archive,
+            copy_left,
+        };
+        let record = self
+            .record_agent(by, name, &agent, kind, &how)
+            .map_err(|e| match &how {
+                Added::Imported { copy_left, .. } => with_copy_left(e, copy_left.clone()),
+                _ => e,
+            })?;
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,
-            how: Added::Imported {
-                end,
-                archive,
-                copy_left,
-            },
+            how,
         }))
     }
 }
 
 impl Source {
     /// Opens the archive the user named. It must be a plain file, not a link
-    /// and not inside a sandbox's folder: a sandbox writes its folder, and
-    /// the host must never carry what a sandbox points at into another
-    /// sandbox (ADR 0023). The file is checked, then opened, then checked
-    /// to be the same file, so nothing swapped in between is read.
+    /// and not under a sandbox's folder: a sandbox writes its home there,
+    /// and the host must never copy what a sandbox put or pointed at into a
+    /// sandbox. The file is opened without following a last link, and
+    /// without waiting on a pipe; the checks then hold for the opened file
+    /// itself, wherever its path pointed while it was opened. A workspace a
+    /// sandbox may write is not checked: an archive there is the user's call.
     fn open(layout: &Layout, path: &Path) -> Result<Source> {
         let path = std::path::absolute(path).map_err(|e| {
             failed(format!(
@@ -198,32 +222,48 @@ impl Source {
         })?;
         let shown = path.display();
         let name_an_export = "Name an export the runtime's own command made on this Mac";
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        let sandboxes = layout.sandboxes_dir();
+        let under_a_sandbox = || {
             failed(format!(
-                "cannot read the archive at {shown}: {e}. {name_an_export}"
+                "{shown} is under a sandbox's folder, whose home that sandbox writes. Copy the export to a folder of your own first, then import the copy"
             ))
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(failed(format!(
-                "{shown} is a link. Name the archive file itself"
-            )));
+        };
+        if path.starts_with(&sandboxes) {
+            return Err(under_a_sandbox());
         }
-        if !meta.is_file() {
-            return Err(failed(format!("{shown} is not a file. {name_an_export}")));
-        }
-        if inside(&path, &layout.sandboxes_dir()) {
-            return Err(failed(format!(
-                "{shown} is inside a sandbox's folder, which that sandbox writes. Copy the export to a folder of your own first, then import the copy"
-            )));
-        }
+        let no_follow = (OFlags::NOFOLLOW | OFlags::NONBLOCK).bits();
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(no_follow as i32)
+            .open(&path)
+            .map_err(|e| match e.raw_os_error() {
+                Some(code) if code == rustix::io::Errno::LOOP.raw_os_error() => {
+                    failed(format!("{shown} is a link. Name the archive file itself"))
+                }
+                _ => failed(format!(
+                    "cannot read the archive at {shown}: {e}. {name_an_export}"
+                )),
+            })?;
         let unreadable =
             |e: std::io::Error| failed(format!("cannot read the archive at {shown}: {e}"));
-        let file = File::open(&path).map_err(unreadable)?;
-        let opened = file.metadata().map_err(unreadable)?;
-        if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
-            return Err(failed(format!(
-                "{shown} changed while enclos opened it. Import again"
-            )));
+        if !file.metadata().map_err(unreadable)?.is_file() {
+            return Err(failed(format!("{shown} is not a file. {name_an_export}")));
+        }
+        // Where the opened file really is, with every link on the way
+        // resolved; when enclos cannot tell, it refuses.
+        let opened = opened_path(&file).map_err(unreadable)?;
+        let sandboxes = match sandboxes.canonicalize() {
+            Ok(dir) => Some(dir),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(failed(format!(
+                    "cannot tell whether {shown} is under a sandbox's folder: {}: {e}",
+                    sandboxes.display()
+                )));
+            }
+        };
+        if sandboxes.is_some_and(|dir| opened.starts_with(dir)) {
+            return Err(under_a_sandbox());
         }
         Ok(Source { path, file })
     }
@@ -244,8 +284,9 @@ impl Source {
 
     /// Copies the archive to `staged`, a new file in the sandbox's
     /// `installers/` folder, which the compiled policy denies the sandbox
-    /// writes to, hashing the bytes as they go. A failed copy leaves no
-    /// partial file behind.
+    /// writes to, hashing the bytes as they go. A copy that fails is
+    /// removed, or reported when it cannot be; one cut short by enclos
+    /// being killed stays.
     fn stage(mut self, staged: &Path) -> Result<Archive> {
         let dir = staged.parent().unwrap_or(staged);
         std::fs::create_dir_all(dir)
@@ -263,12 +304,12 @@ impl Source {
         let sha256 = match stream(&mut self.file, Some(&mut target)) {
             Ok(sha256) => sha256,
             Err(e) => {
-                let _ = std::fs::remove_file(staged);
-                return Err(failed(format!(
+                let error = failed(format!(
                     "cannot copy {} to {}: {e}. Check the disk and the folder's permissions",
                     self.path.display(),
                     staged.display()
-                )));
+                ));
+                return Err(with_copy_left(error, remove_copy(staged)));
             }
         };
         Ok(Archive {
@@ -283,18 +324,38 @@ fn failed(what: String) -> Error {
     Error::Session { what }
 }
 
-/// `error`, and what is left behind when enclos could not remove its copy
-/// of the archive, which the sandbox can read.
-fn with_copy_left(error: Error, copy_left: Option<&Path>) -> Error {
+/// Removes enclos's copy of an archive; what is left when it cannot.
+fn remove_copy(staged: &Path) -> Option<LeftCopy> {
+    match std::fs::remove_file(staged) {
+        Ok(()) => None,
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => Some(LeftCopy {
+            path: staged.to_owned(),
+            why: e.to_string(),
+        }),
+    }
+}
+
+/// `error`, and the copy of the archive enclos could not remove, which the
+/// sandbox can read.
+fn with_copy_left(error: Error, copy_left: Option<LeftCopy>) -> Error {
     match copy_left {
         None => error,
         Some(copy) => Error::CleanupFailed {
             error: Box::new(error),
-            left: format!(
-                "enclos's copy of the archive at {}, which the sandbox can read: remove it yourself",
-                copy.display()
-            ),
+            left: copy.to_string(),
         },
+    }
+}
+
+impl std::fmt::Display for LeftCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enclos's copy of the archive at {}, which the sandbox can read ({}): remove it yourself",
+            self.path.display(),
+            self.why
+        )
     }
 }
 
@@ -316,14 +377,46 @@ fn stream(file: &mut File, mut sink: Option<&mut File>) -> std::io::Result<Strin
     Ok(hex(&hasher.finalize()))
 }
 
-/// Whether `path` is under `folder`, by the paths as given and as resolved,
-/// so a link in a parent folder does not hide it.
-fn inside(path: &Path, folder: &Path) -> bool {
-    if path.starts_with(folder) {
-        return true;
-    }
-    match (path.canonicalize(), folder.canonicalize()) {
-        (Ok(p), Ok(f)) => p.starts_with(f),
-        _ => false,
+/// The path of an opened file, from the file itself, with every link
+/// resolved.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let path = rustix::fs::getpath(file)?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(
+        path.into_bytes(),
+    )))
+}
+
+/// The path of an opened file, from the file itself, with every link
+/// resolved.
+#[cfg(not(target_os = "macos"))]
+fn opened_path(file: &File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_left_behind_turns_the_error_into_a_cleanup_failure() {
+        let error = || failed("the import failed".into());
+        assert_eq!(
+            with_copy_left(error(), None).to_string(),
+            error().to_string()
+        );
+        let left = LeftCopy {
+            path: "/x/installers/agent-main.1.tar.gz".into(),
+            why: "Operation not permitted".into(),
+        };
+        let Error::CleanupFailed { error: inner, left } = with_copy_left(error(), Some(left))
+        else {
+            panic!("not a cleanup failure");
+        };
+        assert_eq!(inner.to_string(), "the import failed");
+        assert!(left.contains("/x/installers/agent-main.1.tar.gz"), "{left}");
+        assert!(left.contains("Operation not permitted"), "{left}");
     }
 }

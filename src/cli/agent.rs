@@ -25,7 +25,7 @@ enum AgentVerb {
     /// already has there.
     Add {
         agent: AgentTarget,
-        /// An export the runtime's own command made on this Mac (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
+        /// An export the runtime's own command made on the host (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
     },
@@ -104,35 +104,44 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                         archive.sha256
                     );
                     if let Some(copy) = copy_left {
-                        println!(
-                            "enclos could not remove its copy of the archive at {}. The sandbox can read it: remove it yourself.\n",
-                            copy.display()
-                        );
+                        eprintln!("enclos: {copy}.\n");
                     }
                 }
             }
+            let imported = matches!(added.how, Added::Imported { .. });
             let shell = format!("enclos connect {sandbox}");
             let talk = format!("{shell} -- {}", runtime.talk(name));
             let w = talk.len() + 3;
-            // The runtime's own output above suggests commands and `~` paths
-            // that only work inside the sandbox.
-            println!("{kind}'s next steps above are commands to run inside the sandbox:");
+            if imported {
+                println!("Commands to run inside the sandbox:");
+            } else {
+                // The runtime's own output above, after creating an agent,
+                // suggests commands and `~` paths that only work inside the
+                // sandbox.
+                println!("{kind}'s next steps above are commands to run inside the sandbox:");
+            }
             println!("  {talk:<w$}talk to the agent");
             println!("  {shell:<w$}a shell in the sandbox, for {kind}'s own commands");
             println!(
                 "There, ~ is the sandbox's home: {}",
                 engine.sandbox_home(&sandbox).display()
             );
-            println!(
-                "The agent shares the sandbox's {kind} login, made with `enclos connect {sandbox} -- {}`; it needs no login of its own.",
-                runtime.login()
-            );
-            if matches!(added.how, Added::Imported { .. }) {
+            let login = format!("`enclos connect {sandbox} -- {}`", runtime.login());
+            if imported {
+                // That an imported agent uses the sandbox's login is still
+                // to verify (design §14).
                 println!(
-                    "enclos copied no login in: keys its configuration needs go in its files inside the sandbox, with {kind}'s own commands."
+                    "enclos copied no login in: the agent should use the sandbox's {kind} login, made with {login}. If it asks for one of its own, its configuration names another provider: change it with {kind}'s own commands inside the sandbox."
+                );
+                println!(
+                    "Until secrets are granted per sandbox (milestone 2), values such as a bot token go in the agent's files inside the sandbox."
                 );
                 println!(
                     "Nothing in the archive widened the sandbox's policy: what the agent reaches shows in `enclos net log {sandbox}`, and what was refused in `enclos net denied {sandbox}`."
+                );
+            } else {
+                println!(
+                    "The agent shares the sandbox's {kind} login, made with {login}; it needs no login of its own."
                 );
             }
         }
