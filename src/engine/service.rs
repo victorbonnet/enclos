@@ -228,8 +228,8 @@ impl Engine {
                                         "run".into(),
                                         name.to_string().into(),
                                         "--record".into(),
-                                        "--listen".into(),
-                                        format!("127.0.0.1:{}", record.proxy_port).into(),
+                                        "--port".into(),
+                                        record.proxy_port.to_string().into(),
                                     ],
                                     Unit::Runtime(service) => vec![
                                         "launch".into(),

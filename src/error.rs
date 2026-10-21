@@ -95,12 +95,6 @@ pub enum Error {
     },
     #[error(transparent)]
     Compile(#[from] crate::backend::CompileError),
-    /// Ports are the host's, so another program may hold the sandbox's: the
-    /// proxy of another user's or another enclos install's sandbox, say.
-    #[error(
-        "port {port} of sandbox `{sandbox}` is in use by another program; stop it, or recreate the sandbox to get another port"
-    )]
-    ProxyPortTaken { sandbox: String, port: u16 },
     /// Its own proxy holds the port: there is nothing to stop or recreate.
     #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
     ProxyRuns { sandbox: String, port: u16 },
@@ -127,11 +121,28 @@ pub enum Error {
         policy_file: PathBuf,
         source: PolicyError,
     },
-    #[error("the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}")]
+    /// The proxy cannot hold its port on a loopback, for another reason
+    /// than another program having it. It serves only once it holds the
+    /// port on both, so it does not start.
+    #[error(
+        "the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}. It serves only once it holds its port on 127.0.0.1 and on [::1] (where `ifconfig lo0` lists ::1)"
+    )]
     ProxyListen {
         sandbox: String,
         addr: String,
         source: std::io::Error,
+    },
+    /// Another program holds the sandbox's proxy port on `loopback`, and
+    /// would receive its traffic. Ports are the host's, so it may be the
+    /// proxy of another user's or another enclos install's sandbox, say.
+    #[error(
+        "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names it), or recreate the sandbox to get another port"
+    )]
+    ProxyPortTaken {
+        sandbox: String,
+        port: u16,
+        /// `127.0.0.1` or `[::1]`.
+        loopback: String,
     },
     #[error("the proxy of sandbox `{sandbox}` stopped serving: {source}")]
     ProxyStopped {
@@ -179,6 +190,18 @@ impl std::fmt::Display for HomeFound {
 }
 
 impl Error {
+    /// [`Error::ProxyPortTaken`] for `addr`, the address found taken.
+    pub fn proxy_port_taken(sandbox: &str, addr: std::net::SocketAddr) -> Error {
+        Error::ProxyPortTaken {
+            sandbox: sandbox.to_owned(),
+            port: addr.port(),
+            loopback: match addr {
+                std::net::SocketAddr::V4(a) => a.ip().to_string(),
+                std::net::SocketAddr::V6(a) => format!("[{}]", a.ip()),
+            },
+        }
+    }
+
     /// The exit code for this error (design §10). A policy exits 2 only when
     /// `PolicyError::is_refused` holds. `Compile` stays 1: validation refuses
     /// a path the compiled policy cannot hold when the policy is stored, and

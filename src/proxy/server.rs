@@ -28,33 +28,74 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// The answer to a connection over the proxy's limit.
 const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 56\r\nConnection: close\r\n\r\nenclos: too many connections at once from this sandbox.\n";
 
-impl Proxy {
-    /// Serves the listener until the process ends.
-    pub fn serve(self: &Arc<Self>, listener: TcpListener) -> io::Result<thread::JoinHandle<()>> {
-        let proxy = Arc::clone(self);
-        thread::Builder::new()
+/// Tells [`until_one_ends`] that a thread ended, however it ended. A panic
+/// unwinds past any code after `work`, so only a drop signals it; without
+/// that, the other listeners would go on serving while the dead one's
+/// address at the port is free for another program to take.
+struct Ended(mpsc::Sender<()>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Runs `work` on each item, each on its own accept thread, and returns
+/// once any of them ends, by returning or by panicking, or a thread cannot
+/// start.
+pub(super) fn until_one_ends<T: Send + 'static>(
+    items: Vec<T>,
+    work: impl Fn(T) + Clone + Send + 'static,
+) -> io::Error {
+    let (ended, any_ended) = mpsc::channel();
+    for item in items {
+        let ended = Ended(ended.clone());
+        let work = work.clone();
+        let started = thread::Builder::new()
             .name("enclos-proxy-accept".into())
             .spawn(move || {
-                let open = Arc::new(AtomicUsize::new(0));
-                for client in listener.incoming() {
-                    let Ok(mut client) = client else {
-                        thread::sleep(ACCEPT_BACKOFF);
-                        continue;
-                    };
-                    let Some(slot) = Slot::take(&open, proxy.max_connections) else {
-                        let _ = client.write_all(BUSY);
-                        continue;
-                    };
-                    let proxy = Arc::clone(&proxy);
-                    let started = thread::Builder::new().spawn(move || {
-                        let _slot = slot;
-                        proxy.handle(client)
-                    });
-                    if let Err(e) = started {
-                        eprintln!("enclos proxy: cannot start a thread for a connection: {e}");
-                    }
-                }
-            })
+                let _ended = ended;
+                work(item);
+            });
+        if let Err(e) = started {
+            return e;
+        }
+    }
+    drop(ended);
+    let _ = any_ended.recv();
+    io::Error::other("it stopped accepting connections")
+}
+
+impl Proxy {
+    /// Serves every listener the same way, with one connection limit, until
+    /// the process ends. Returns only if one of them stopped accepting, or
+    /// an accept thread could not start: an error, so the service manager
+    /// starts the proxy again.
+    pub fn serve_all(self: &Arc<Self>, listeners: Vec<TcpListener>) -> io::Error {
+        let proxy = Arc::clone(self);
+        until_one_ends(listeners, move |listener| proxy.accept(listener))
+    }
+
+    /// Accepts connections on `listener`, each on its own thread.
+    fn accept(self: &Arc<Self>, listener: TcpListener) {
+        for client in listener.incoming() {
+            let Ok(mut client) = client else {
+                thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            };
+            let Some(slot) = Slot::take(&self.open, self.max_connections) else {
+                let _ = client.write_all(BUSY);
+                continue;
+            };
+            let proxy = Arc::clone(self);
+            let started = thread::Builder::new().spawn(move || {
+                let _slot = slot;
+                proxy.handle(client)
+            });
+            if let Err(e) = started {
+                eprintln!("enclos proxy: cannot start a thread for a connection: {e}");
+            }
+        }
     }
 
     fn handle(&self, mut client: TcpStream) {

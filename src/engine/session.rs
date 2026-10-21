@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -620,20 +620,22 @@ impl Engine {
             .open(&log_path)
             .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
         let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
-        // Anything else on this port would receive the sandbox's traffic.
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return Err(Error::ProxyPortTaken {
-                sandbox: record.name.to_string(),
-                port: record.proxy_port,
-            });
+        // Anything else on this port, on either loopback, would receive the
+        // sandbox's traffic.
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, record.proxy_port));
+        if let Some(taken) = [addr, v6]
+            .into_iter()
+            .find(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
+        {
+            return Err(Error::proxy_port_taken(record.name.as_str(), taken));
         }
         let child = Command::new(exe)
             .args([
                 "proxy",
                 "run",
                 record.name.as_str(),
-                "--listen",
-                &addr.to_string(),
+                "--port",
+                &record.proxy_port.to_string(),
             ])
             .process_group(0)
             .stdin(Stdio::null())
@@ -661,17 +663,29 @@ impl Engine {
         let start = Instant::now();
         loop {
             // Listening is not enough: it must be this proxy, still running.
-            let exited = child
-                .try_wait()
-                .map_err(|e| failed(format!("lost the proxy of sandbox {}: {e}", record.name)))?;
-            if let Some(status) = exited {
-                return Err(failed(format!(
-                    "the proxy of sandbox {} exited ({status}); see {}",
-                    record.name,
-                    log_path.display()
-                )));
-            }
+            let exited = |child: &mut Child| -> Result<()> {
+                let status = child.try_wait().map_err(|e| {
+                    failed(format!("lost the proxy of sandbox {}: {e}", record.name))
+                })?;
+                match status {
+                    None => Ok(()),
+                    Some(status) => Err(failed(format!(
+                        "the proxy of sandbox {} exited ({status}): {}; see {}",
+                        record.name,
+                        last_log_line(log_path),
+                        log_path.display()
+                    ))),
+                }
+            };
+            exited(child)?;
+            // It binds 127.0.0.1 after `[::1]`, so once 127.0.0.1 answers and
+            // the proxy is still running, it holds the port on every loopback
+            // it could. The answer itself could come from another program
+            // that took 127.0.0.1 just before the proxy did; the proxy then
+            // exits, which the second look usually catches.
             if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+                exited(child)?;
                 break;
             }
             if start.elapsed() > PROXY_START {
@@ -712,6 +726,27 @@ pub(super) fn abandon(mut child: Child, error: Error, what: &str) -> Error {
             error: Box::new(error),
             left: format!("{what} running as pid {} ({e})", child.id()),
         },
+    }
+}
+
+/// The last line the proxy wrote to its log, which says why it exited: at
+/// most its last 4 KiB are read.
+fn last_log_line(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let tail = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(4096)))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    match tail() {
+        Ok(text) => match text.lines().rev().find(|l| !l.trim().is_empty()) {
+            Some(line) => line.trim().to_owned(),
+            None => "it wrote nothing to its log".to_owned(),
+        },
+        Err(e) => format!("cannot read its log: {e}"),
     }
 }
 

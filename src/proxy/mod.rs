@@ -12,7 +12,7 @@ pub mod request;
 mod server;
 
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -95,6 +95,9 @@ pub struct Proxy {
     /// Whether the proxy said on stderr that the lookups are full, since a
     /// lookup last started.
     lookups_full: AtomicBool,
+    /// Client connections open now, on every listener: the limit is the
+    /// proxy's, not each listener's.
+    open: Arc<AtomicUsize>,
 }
 
 impl Proxy {
@@ -115,6 +118,7 @@ impl Proxy {
             max_lookups: MAX_LOOKUPS,
             lookups: Arc::new(AtomicUsize::new(0)),
             lookups_full: AtomicBool::new(false),
+            open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -126,15 +130,48 @@ impl Proxy {
         self.classify = classify;
         self
     }
+}
 
-    /// Binds the sandbox's listener, then serves it until the process ends.
-    /// Returns only if serving stopped, as an error, so the service manager
-    /// restarts the proxy.
-    pub fn run(self, addr: SocketAddr) -> io::Result<()> {
-        let socket = TcpListener::bind(addr)?;
-        let _ = Arc::new(self).serve(socket)?.join();
-        Err(io::Error::other("the proxy stopped accepting connections"))
+/// A listener the proxy could not open.
+#[derive(Debug)]
+pub struct ListenError {
+    pub addr: SocketAddr,
+    pub source: io::Error,
+}
+
+/// The proxy's listeners at `port`, on both loopbacks. The Seatbelt rule
+/// opens the port to TCP on loopback (design §5), and on macOS 26.5.2 that
+/// was shown to include `[::1]` as well as `127.0.0.1`, so the proxy holds
+/// both: any address it left free at the port, another program could
+/// listen on, and the sandbox would reach it around the proxy.
+///
+/// `[::1]` comes first, so that once `127.0.0.1` answers, both are held.
+/// Port 0 means any port: the one `[::1]` got is used for `127.0.0.1` too.
+/// Where `[::1]` is not configured (binding it fails with "address not
+/// available"), no program can listen there, so `127.0.0.1` alone is
+/// served; that is said on stderr. Any other failure on either address is
+/// an error, and leaves neither listened on.
+pub fn listen(port: u16) -> Result<Vec<TcpListener>, ListenError> {
+    let bind =
+        |addr: SocketAddr| TcpListener::bind(addr).map_err(|source| ListenError { addr, source });
+    let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+    let mut listeners = Vec::new();
+    let mut port = port;
+    match bind(v6) {
+        Ok(listener) => {
+            port = listener
+                .local_addr()
+                .map_err(|source| ListenError { addr: v6, source })?
+                .port();
+            listeners.push(listener);
+        }
+        Err(e) if e.source.kind() == io::ErrorKind::AddrNotAvailable => eprintln!(
+            "enclos proxy: [::1] is not configured here, so no program can listen on [::1]:{port}; serving 127.0.0.1 only. Restart the proxy if IPv6 loopback is turned on later."
+        ),
+        Err(e) => return Err(e),
     }
+    listeners.push(bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?);
+    Ok(listeners)
 }
 
 #[cfg(test)]

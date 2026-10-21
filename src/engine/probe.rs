@@ -267,6 +267,7 @@ impl Engine {
             workspaces,
             unmovable,
             host_sockets: host_sockets(&ctx.user_home),
+            proxy_port: ctx.proxy_port,
             target,
             other_terminal,
             tag: std::process::id(),
@@ -343,10 +344,11 @@ fn run_probe(
 }
 
 /// Runs the probe's control on the host: its success and output, none when
-/// the probe's proof is the proxy's answer, or why it could not run.
+/// the probe's proof is the proxy's 403 alone, or why it could not run.
 fn control(probe: &Probe) -> std::result::Result<Option<(bool, String)>, String> {
-    let Proof::Control { control, .. } = &probe.proof else {
-        return Ok(None);
+    let control = match &probe.proof {
+        Proof::Control { control, .. } | Proof::OnlyTheProxy { control } => control,
+        Proof::ProxyRefuses => return Ok(None),
     };
     let out = Command::new("/bin/sh")
         .args(["-c", control.as_str()])
@@ -565,6 +567,7 @@ mod tests {
             workspaces: Vec::new(),
             unmovable: Vec::new(),
             host_sockets: Vec::new(),
+            proxy_port: 41001,
             target: Some(target),
             other_terminal: None,
             tag: 7,

@@ -61,7 +61,7 @@ pub struct SandboxContext {
     pub hidden_files: Vec<PathBuf>,
     /// Folders the sandbox may not read.
     pub hidden_dirs: Vec<PathBuf>,
-    /// The sandbox's proxy port on localhost: its only way out.
+    /// The sandbox's proxy port, on 127.0.0.1 and [::1]: its only way out.
     pub proxy_port: u16,
 }
 

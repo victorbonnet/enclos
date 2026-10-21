@@ -3,7 +3,7 @@
 //! real one never would.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -148,6 +148,40 @@ fn start_with(
     check: fn(IpAddr) -> AddrClass,
     tweak: impl FnOnce(&mut Proxy),
 ) -> Running {
+    let (proxy, log, policy) = built(allow, resolver, check, tweak);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proxy = Arc::new(proxy);
+    std::thread::spawn(move || proxy.serve_all(vec![listener]));
+    Running { addr, log, policy }
+}
+
+/// A proxy that allows nothing, served as `proxy run` serves it: on both
+/// loopbacks at one port, which it returns with the proxy.
+fn start_on_both_loopbacks(tweak: impl FnOnce(&mut Proxy)) -> (u16, MemoryLog, Arc<Proxy>) {
+    let (proxy, log, _) = built(&[], Box::new(NoResolver), classify, tweak);
+    // Any port, so no other test can take it between choosing and binding.
+    let listeners = listen(0).unwrap();
+    let port = listeners[0].local_addr().unwrap().port();
+    assert_eq!(listeners.len(), 2);
+    // `[::1]` first, so that once 127.0.0.1 answers, both are held.
+    assert!(listeners[0].local_addr().unwrap().is_ipv6());
+    assert_eq!(
+        listeners[1].local_addr().unwrap(),
+        (Ipv4Addr::LOCALHOST, port).into()
+    );
+    let proxy = Arc::new(proxy);
+    let serving = Arc::clone(&proxy);
+    std::thread::spawn(move || serving.serve_all(listeners));
+    (port, log, proxy)
+}
+
+fn built(
+    allow: &[String],
+    resolver: Box<dyn Resolve>,
+    check: fn(IpAddr) -> AddrClass,
+    tweak: impl FnOnce(&mut Proxy),
+) -> (Proxy, MemoryLog, Arc<Mutex<Policy>>) {
     let mut p = Policy::default();
     p.net.allow = allow.to_vec();
     let policy = Arc::new(Mutex::new(p));
@@ -159,10 +193,7 @@ fn start_with(
     )
     .for_tests(resolver, check);
     tweak(&mut proxy);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    Arc::new(proxy).serve(listener).unwrap();
-    Running { addr, log, policy }
+    (proxy, log, policy)
 }
 
 fn send(addr: std::net::SocketAddr, request: &str) -> (TcpStream, String) {
@@ -441,6 +472,80 @@ fn connections_over_the_limit_are_turned_away() {
     drop(first);
     let reply = send_once_free(proxy.addr, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n");
     assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+}
+
+#[test]
+fn the_proxy_serves_both_loopbacks_the_same_way() {
+    let (port, log, _) = start_on_both_loopbacks(|_| {});
+    let request = "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n";
+    let (_v4, reply) = send((Ipv4Addr::LOCALHOST, port).into(), request);
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    let (_v6, reply) = send((Ipv6Addr::LOCALHOST, port).into(), request);
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    // One log for both.
+    let events = log.wait_for(2);
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| e.verdict == Verdict::Denied));
+}
+
+#[test]
+fn both_loopbacks_share_one_connection_limit() {
+    let (port, _log, proxy) = start_on_both_loopbacks(|p| p.max_connections = 1);
+    // Holds the one place on 127.0.0.1: it sends nothing yet.
+    let _first = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while proxy.open.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first connection was never accepted"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (_conn, reply) = send(
+        (Ipv6Addr::LOCALHOST, port).into(),
+        "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n",
+    );
+    assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+}
+
+#[test]
+fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
+    // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
+    let squatter = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let e = listen(port).unwrap_err();
+    assert_eq!(e.addr, (Ipv6Addr::LOCALHOST, port).into());
+    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
+    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+    // Taken on 127.0.0.1: the `[::1]` listener it already had is let go.
+    let squatter = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let e = listen(port).unwrap_err();
+    assert_eq!(e.addr, (Ipv4Addr::LOCALHOST, port).into());
+    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
+    assert!(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok());
+}
+
+#[test]
+fn serving_ends_when_any_accept_thread_ends_even_by_panicking() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let e = super::server::until_one_ends(vec![true, false], |panics| {
+            if panics {
+                panic!("an accept thread panicked (expected by this test)");
+            }
+            loop {
+                std::thread::park();
+            }
+        });
+        let _ = done.send(e.to_string());
+    });
+    // Otherwise the other thread would serve its loopback alone, and the
+    // dead one's port would be free for another program.
+    assert!(
+        finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "serving went on with one accept thread dead"
+    );
 }
 
 #[test]

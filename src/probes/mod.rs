@@ -11,7 +11,8 @@
 //! inconclusive, not closed: `crontab -l` fails anyway for an account
 //! without a crontab, and a connection fails anyway on a host that is
 //! offline. The probes through the proxy are their own proof: the proxy answers
-//! 403.
+//! 403. The one at the proxy port on `[::1]` also has a control: the proxy
+//! must answer the same request from the host.
 //!
 //! Each probe's script prints a marker before anything else, so a sandbox
 //! that never ran it (`sandbox-exec` refusing the compiled policy) is not
@@ -85,6 +86,13 @@ pub enum Proof {
     /// The proxy answers 403: the proxy is what the probe tests, so there is
     /// nothing to try outside.
     ProxyRefuses,
+    /// A request to the proxy port on `[::1]`, which must reach the proxy
+    /// (it answers 403) or nothing (curl cannot connect, exit 7): never
+    /// another program. The control, the same request from the host, must
+    /// get the proxy's 403: it shows the proxy holds `[::1]` at the port, so
+    /// no other program can listen there later. Both scripts print curl's
+    /// code and exit status.
+    OnlyTheProxy { control: HostScript },
 }
 
 /// What the host checks, before the probe and after it, and removes if the
@@ -125,7 +133,8 @@ const SETUID_REFUSED: &str =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Refused in the sandbox, with its proof: its control worked on the
-    /// host, or the proxy answered 403.
+    /// host, or the proxy answered 403. For [`Proof::OnlyTheProxy`]: the
+    /// proxy answered, or nothing did, and from the host the proxy answered.
     Closed,
     /// The route is open: what showed it.
     Open(String),
@@ -210,6 +219,8 @@ pub struct ProbeInputs {
     pub unmovable: Vec<PathBuf>,
     /// Unix sockets of host services that exist here (SSH agent, Docker).
     pub host_sockets: Vec<PathBuf>,
+    /// The sandbox's proxy port.
+    pub proxy_port: u16,
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
@@ -473,10 +484,31 @@ fn proxy_probe(name: &str, url: &str) -> Probe {
     Probe {
         route: "network",
         name: name.into(),
-        script: format!(
-            "/usr/bin/curl -s -o /dev/null -w '%{{http_connect}}' --max-time 15 --noproxy '' {url}"
-        ),
+        script: curl_through_proxy(url),
         proof: Proof::ProxyRefuses,
+        host: None,
+        closed_by_platform: None,
+    }
+}
+
+/// curl through the proxy, printing only the proxy's answer to CONNECT.
+fn curl_through_proxy(url: &str) -> String {
+    format!("/usr/bin/curl -s -o /dev/null -w '%{{http_connect}}' --max-time 15 --noproxy '' {url}")
+}
+
+/// The proxy port on `[::1]`. On macOS 26.5.2 the Seatbelt rule was shown
+/// to open the port there too, so the proxy listens there; whatever the
+/// sandbox reaches at that address must be the proxy.
+fn ipv6_loopback_probe(port: u16) -> Probe {
+    let url = format!("--proxy 'http://[::1]:{port}' https://probe.enclos.invalid:8443/");
+    let script = format!("{}; echo \" $?\"", curl_through_proxy(&url));
+    Probe {
+        route: "network",
+        name: "the proxy port on IPv6 loopback reaches only the proxy".into(),
+        script: script.clone(),
+        proof: Proof::OnlyTheProxy {
+            control: HostScript::new(script),
+        },
         host: None,
         closed_by_platform: None,
     }
@@ -579,6 +611,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "a direct connection, around the proxy",
         "/usr/bin/nc -z -w 3 1.1.1.1 443",
     ));
+    list.push(ipv6_loopback_probe(i.proxy_port));
     list.push(same_outside(
         "dns",
         "DNS on port 53",
@@ -836,6 +869,14 @@ pub fn outcome(
         (Err(why), _) => Outcome::NotRun(format!("could not check from the host: {why}")),
         (Ok(None), Outcome::Closed) => match (&probe.proof, control) {
             (Proof::ProxyRefuses, _) => Outcome::Closed,
+            (Proof::OnlyTheProxy { .. }, Some((_, host))) => match host.split_whitespace().next() {
+                Some("403") => Outcome::Closed,
+                _ => Outcome::Inconclusive(format!(
+                    "from the host, the proxy does not answer on [::1] at its port (curl printed `{}`), so another program could listen there; is IPv6 loopback off?",
+                    last_line(host)
+                )),
+            },
+            (Proof::OnlyTheProxy { .. }, None) => Outcome::NotRun("its control did not run".into()),
             (Proof::Control { .. }, Some((true, _))) => Outcome::Closed,
             (Proof::Control { expect, .. }, Some((false, output))) => {
                 let why = match expect {
@@ -865,6 +906,19 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
                 // curl reached no proxy at all.
                 "" | "000" => Outcome::NotRun("could not reach the sandbox's proxy".into()),
                 other => Outcome::Open(format!("the proxy answered `{other}`, not 403")),
+            };
+        }
+        Proof::OnlyTheProxy { .. } => {
+            let mut words = output.split_whitespace();
+            return match (words.next(), words.next()) {
+                (Some("403"), _) => Outcome::Closed,
+                // Nothing there to reach: the rule refused it, or nothing
+                // listens, which only the control rules out.
+                (Some("000"), Some("7")) => Outcome::Closed,
+                _ => Outcome::Open(format!(
+                    "curl printed `{}`: neither the proxy's 403 nor no connection",
+                    last_line(output)
+                )),
             };
         }
         Proof::Control { expect, .. } => expect,
@@ -943,6 +997,7 @@ mod tests {
             workspaces: vec![dir.join("work")],
             unmovable: vec![dir.join("it's here"), dir.join("not-a-folder")],
             host_sockets: vec![dir.join("agent.sock")],
+            proxy_port: 41001,
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
@@ -1408,6 +1463,67 @@ mod tests {
     }
 
     #[test]
+    fn the_proxy_port_on_ipv6_loopback_must_reach_the_proxy_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = probes(&inputs(dir.path()));
+        let p = list
+            .iter()
+            .find(|p| p.name.contains("IPv6 loopback"))
+            .unwrap();
+        assert_eq!(p.route, "network");
+        let Proof::OnlyTheProxy { control } = &p.proof else {
+            panic!("{:?}", p.proof);
+        };
+        // The control is the same request, from the host.
+        assert_eq!(control.as_str(), p.script);
+        assert!(
+            p.script.contains("--proxy 'http://[::1]:41001'")
+                && p.script.ends_with("; echo \" $?\""),
+            "{}",
+            p.script
+        );
+        let held = Some((true, "403 0\n"));
+        // The proxy refused it, as it refuses that port. The script always
+        // ends with `echo`, so it always succeeds.
+        for answer in ["403 56\n", "403"] {
+            assert_eq!(
+                outcome(p, ran(true, answer), Ok(None), held),
+                Outcome::Closed
+            );
+        }
+        // No connection: the rule refused it, and the proxy holds the port.
+        assert_eq!(
+            outcome(p, ran(true, "000 7\n"), Ok(None), held),
+            Outcome::Closed
+        );
+        // Without the proxy on `[::1]` from the host, no connection proves
+        // nothing: the port is free for another program to take.
+        for host in ["000 7\n", ""] {
+            assert!(
+                matches!(
+                    outcome(p, ran(true, "000 7\n"), Ok(None), Some((true, host))),
+                    Outcome::Inconclusive(why) if why.contains("another program could listen there")
+                ),
+                "{host}"
+            );
+        }
+        assert!(matches!(
+            outcome(p, ran(true, "000 7\n"), Ok(None), None),
+            Outcome::NotRun(_)
+        ));
+        // Anything else answered, or accepted and said nothing.
+        for other in ["200 0", "502 56", "000 28", "000 52", ""] {
+            assert!(
+                matches!(
+                    outcome(p, ran(true, other), Ok(None), held),
+                    Outcome::Open(_)
+                ),
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
     fn without_a_target_there_is_no_signal_probe() {
         let dir = tempfile::tempdir().unwrap();
         let mut i = inputs(dir.path());
@@ -1629,7 +1745,9 @@ mod tests {
                 .filter(|p| ["renames", "clones"].contains(&p.route))
                 .map(|p| match p.proof {
                     Proof::Control { control, .. } => control,
-                    Proof::ProxyRefuses => panic!("{} has no control", p.name),
+                    Proof::ProxyRefuses | Proof::OnlyTheProxy { .. } => {
+                        panic!("{} has no control", p.name)
+                    }
                 })
                 .collect()
         };
