@@ -11,12 +11,16 @@ use super::super::{Backend, Launch, SandboxContext};
 use super::Seatbelt;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
+use crate::policy::paths::{FsPaths, PathContext};
+use crate::probes::{Outcome, ProbeInputs, Proof, Run, outcome, probes, sandboxed_script};
 
 struct World {
     _dir: tempfile::TempDir,
     base: PathBuf,
     ctx: SandboxContext,
     compiled: PathBuf,
+    /// The policy's paths, as the compiler and `policy test` see them.
+    fs: FsPaths,
     allowed: TcpListener,
     other: TcpListener,
 }
@@ -32,6 +36,8 @@ fn world() -> World {
         user.join("work/secret"),
         user.join("empty"),
         user.join("projects"),
+        user.join("work/project/private"),
+        user.join("plain"),
         home.join("private"),
         home.join("tmp"),
         data.join("sandboxes/other"),
@@ -41,6 +47,7 @@ fn world() -> World {
     }
     std::fs::write(user.join(".ssh/id_ed25519"), "secret").unwrap();
     std::fs::write(user.join("work/secret/key"), "secret").unwrap();
+    std::fs::write(user.join("work/project/private/key"), "secret").unwrap();
     std::fs::write(home.join("private/key"), "secret").unwrap();
     std::fs::write(data.join("state.db"), "state").unwrap();
     std::fs::write(data.join("sandboxes/other/policy.toml"), "theirs").unwrap();
@@ -55,25 +62,34 @@ fn world() -> World {
         allowed.local_addr().unwrap().port(),
     );
     let mut policy = Policy::default();
+    // `~/plain` holds nothing hidden: only being writable keeps it in place.
     policy.fs.write = vec![
         "{home}".into(),
         "~/work".into(),
         "~/empty".into(),
         "~/linked".into(),
         "~/later".into(),
+        "~/plain".into(),
     ];
     policy.fs.read_deny = vec![
         "~/.ssh".into(),
         "~/work/secret".into(),
+        "~/work/project/private".into(),
         "{home}/private".into(),
     ];
     let compiled = base.join("policy.sb");
     std::fs::write(&compiled, Seatbelt.compile(&policy, &ctx).unwrap().text).unwrap();
+    let paths = PathContext {
+        user_home: ctx.user_home.clone(),
+        sandbox_home: ctx.home.clone(),
+    };
+    let fs = FsPaths::of(&policy.fs, &paths).unwrap();
     World {
         _dir: dir,
         base,
         ctx,
         compiled,
+        fs,
         allowed,
         other,
     }
@@ -222,6 +238,248 @@ fn a_write_grant_never_opens_a_hidden_path() {
     assert!(w.sh("cat \"$HOME/written\" 2>/dev/null; echo ok > \"$HOME/written\""));
 }
 
+/// `renameatx_np(2)` with `RENAME_SWAP`, through perl: swaps two folders in
+/// one call, so neither ends up named the way it was.
+fn swap(a: &str, b: &str) -> String {
+    format!(
+        "/usr/bin/perl -e 'syscall(488, -2, $ARGV[0], -2, $ARGV[1], 2) == 0 or die \"$!\\n\"' '{a}' '{b}'"
+    )
+}
+
+#[test]
+fn a_folder_holding_a_hidden_path_cannot_be_moved_to_uncover_it() {
+    let w = world();
+    let project = w.path("alice/work/project");
+    let moved = w.path("alice/work/moved");
+    // Deny rules name paths: under its new name, the key would be readable.
+    assert!(w.refused(&format!(
+        "/bin/mv '{project}' '{moved}' && cat '{moved}/private/key'"
+    )));
+    assert!(Path::new(&project).join("private/key").exists());
+    assert!(!Path::new(&moved).exists());
+    std::fs::create_dir_all(&moved).unwrap();
+    assert!(w.refused(&format!(
+        "{} && cat '{moved}/private/key'",
+        swap(&moved, &project)
+    )));
+    assert!(Path::new(&project).join("private/key").exists());
+    // The same for the sandbox home, into a workspace.
+    assert!(w.refused(&format!(
+        "/bin/mv \"$HOME\" '{}'",
+        w.path("alice/work/home")
+    )));
+    assert!(w.ctx.home.join("private/key").exists());
+}
+
+#[test]
+fn a_workspace_cannot_be_moved_away() {
+    let w = world();
+    let work = w.path("alice/work");
+    assert!(w.refused(&format!("/bin/mv '{work}' \"$HOME/stolen\"")));
+    assert!(Path::new(&work).join("project/private/key").exists());
+    assert!(!w.ctx.home.join("stolen").exists());
+    std::fs::create_dir_all(w.ctx.home.join("empty")).unwrap();
+    assert!(w.refused(&swap(
+        &w.ctx.home.join("empty").display().to_string(),
+        &work
+    )));
+    assert!(Path::new(&work).join("project/private/key").exists());
+    // A workspace holding nothing hidden stays in place too, and the home
+    // cannot be moved into it; what is inside it can still be removed.
+    let plain = w.path("alice/plain");
+    assert!(w.refused(&format!("/bin/mv '{plain}' \"$HOME/plain\"")));
+    assert!(w.refused(&format!("/bin/mv \"$HOME\" '{plain}/home'")));
+    assert!(w.refused(&swap(
+        &w.ctx.home.join("empty").display().to_string(),
+        &plain
+    )));
+    assert!(w.sh(&format!(
+        "/usr/bin/touch '{plain}/file' && /bin/rm '{plain}/file'"
+    )));
+    assert!(w.refused(&format!("/bin/rmdir '{plain}'")));
+    assert!(Path::new(&plain).is_dir());
+    assert!(!w.ctx.home.join("plain").exists());
+    assert!(w.ctx.home.join("private/key").exists());
+}
+
+/// `clonefileat(2)` through perl: copies a folder and everything under it
+/// in one call.
+fn clone(from: &str, to: &str) -> String {
+    format!(
+        "/usr/bin/perl -e 'syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0 or die \"$!\\n\"' '{from}' '{to}'"
+    )
+}
+
+#[test]
+fn a_folder_holding_a_hidden_path_cannot_be_cloned_to_copy_it_out() {
+    let w = world();
+    let work = w.path("alice/work");
+    for (from, to) in [
+        (format!("{work}/project"), format!("{work}/copy")),
+        (work.clone(), w.ctx.home.join("copy").display().to_string()),
+        (
+            w.ctx.home.display().to_string(),
+            format!("{work}/home-copy"),
+        ),
+        (w.path("alice/plain"), format!("{work}/plain-copy")),
+        // The denied folder itself, which its own denial covers.
+        (
+            format!("{work}/project/private"),
+            format!("{work}/private-copy"),
+        ),
+    ] {
+        assert!(w.refused(&clone(&from, &to)), "{from}");
+        assert!(!Path::new(&to).exists(), "{to}");
+    }
+    // Files, and folders that hold nothing hidden, still clone.
+    assert!(w.sh(&format!(
+        "/bin/mkdir -p '{work}/project/src' && /usr/bin/touch '{work}/project/src/a'"
+    )));
+    assert!(w.sh(&clone(
+        &format!("{work}/project/src"),
+        &format!("{work}/src-copy")
+    )));
+    assert!(w.sh(&format!(
+        "/bin/cp -c '{work}/project/src/a' '{work}/project/b'"
+    )));
+    assert!(Path::new(&work).join("src-copy/a").exists());
+}
+
+#[test]
+fn folders_and_files_in_a_workspace_are_still_made_renamed_and_removed() {
+    let w = world();
+    let work = w.path("alice/work");
+    for script in [
+        format!("/bin/mkdir -p '{work}/new/deep/er'"),
+        format!("/bin/mkdir -p '{work}/project/src/lib'"),
+        format!("/usr/bin/touch '{work}/project/file' '{work}/top'"),
+        format!("/bin/mv '{work}/project/file' '{work}/project/renamed'"),
+        format!("/bin/rm '{work}/project/renamed'"),
+        format!("/bin/mv '{work}/new' '{work}/newer'"),
+        format!("/bin/rm -r '{work}/newer'"),
+        format!("/bin/mv '{work}/project/src' '{work}/project/source'"),
+        // Two folders that hold nothing hidden still swap.
+        format!("/bin/mkdir '{work}/x' '{work}/y' && /usr/bin/touch '{work}/x/in-x'"),
+        swap(&format!("{work}/x"), &format!("{work}/y")),
+        "/bin/mkdir -p \"$HOME/a/b\" && /bin/mv \"$HOME/a\" \"$HOME/c\"".to_owned(),
+        "/usr/bin/touch \"$HOME/c/f\" && /bin/cp -c \"$HOME/c/f\" \"$HOME/c/g\"".to_owned(),
+        clone(
+            &w.ctx.home.join("c").display().to_string(),
+            &w.ctx.home.join("d").display().to_string(),
+        ),
+        "/bin/rm \"$HOME/c/f\" && /bin/rm -r \"$HOME/d\"".to_owned(),
+    ] {
+        assert!(w.sh(&script), "{script}");
+    }
+    assert!(Path::new(&work).join("project/source/lib").is_dir());
+    assert!(Path::new(&work).join("top").exists());
+    assert!(!Path::new(&work).join("newer").exists());
+    assert!(Path::new(&work).join("y/in-x").exists());
+    assert!(w.ctx.home.join("c/b").is_dir());
+    assert!(w.ctx.home.join("c/g").exists());
+    assert!(!w.ctx.home.join("c/f").exists());
+    assert!(!w.ctx.home.join("d").exists());
+}
+
+/// The rename and clone probes of `policy test` for the world's policy, each
+/// run under `compiled` and judged as `policy test` does.
+fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
+    let user = w.base.join("alice");
+    let inputs = ProbeInputs {
+        user_home: user.clone(),
+        data: user.join(".enclos"),
+        config_file: user.join(".enclos/config.toml"),
+        sandbox_dir: user.join(".enclos/sandboxes/home"),
+        other_sandboxes: Vec::new(),
+        writes: w.fs.writes.clone(),
+        read_deny: w.fs.read_deny.clone(),
+        home: w.fs.home.clone(),
+        workspaces: w.fs.writes.clone(),
+        unmovable: w.fs.unmovable(),
+        host_sockets: Vec::new(),
+        target: None,
+        tag: 7,
+    };
+    let output = |mut command: Command| {
+        let out = command.stdin(Stdio::null()).output().unwrap();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        (out.status.success(), text(&out.stdout), text(&out.stderr))
+    };
+    probes(&inputs)
+        .into_iter()
+        .filter(|p| ["renames", "clones"].contains(&p.route))
+        .map(|p| {
+            let launch = Launch {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), sandboxed_script(&p).into()],
+                env: vec![],
+            };
+            let (ok, stdout, stderr) = output(Seatbelt.wrap(compiled, &w.ctx, &launch));
+            let Proof::Control { control, .. } = &p.proof else {
+                panic!("{} has no control", p.name);
+            };
+            let mut host = Command::new("/bin/sh");
+            host.args(["-c", control.as_str()]);
+            let (control_ok, control_out, _) = output(host);
+            let got = outcome(
+                &p,
+                Run::read(ok, &stdout, &stderr),
+                Ok(None),
+                Some((control_ok, &control_out)),
+            );
+            (p.name, got)
+        })
+        .collect()
+}
+
+/// The compiled policy at `compiled` without the two rules that keep
+/// writable folders in place: the folders that cannot move (no unlink or
+/// clone) and, last, the home and each workspace themselves (no unlink or
+/// create). Each covers the home and the workspaces, so a probe of them
+/// reads as open only once both are gone.
+fn without_folder_rules(compiled: &Path) -> String {
+    let text = std::fs::read_to_string(compiled).unwrap();
+    let roots = text
+        .find("\n;; ---- The home and each workspace themselves")
+        .unwrap();
+    let text = &text[..roots];
+    let start = text.find("(deny file-write-unlink file-clone").unwrap();
+    let end = start + text[start..].find("\n\n").unwrap();
+    format!("{}{}\n", &text[..start], &text[end..])
+}
+
+#[test]
+fn the_rename_and_clone_probes_are_closed_and_would_say_open_without_the_rule() {
+    let w = world();
+    let closed = folder_probes(&w, &w.compiled);
+    // The home, the five workspaces, and the folder holding a hidden path in
+    // one, each that is a folder here renamed and cloned.
+    assert_eq!(w.fs.unmovable().len(), 7, "{:?}", w.fs.unmovable());
+    let folders = w.fs.unmovable().iter().filter(|f| f.is_dir()).count();
+    assert_eq!(closed.len(), 2 * folders, "{closed:?}");
+    for (name, got) in &closed {
+        assert_eq!(*got, Outcome::Closed, "{name}");
+    }
+    // The same policy without the rules that keep these folders in place.
+    let without = w.base.join("without-unmovable.sb");
+    std::fs::write(&without, without_folder_rules(&w.compiled)).unwrap();
+    for (name, got) in folder_probes(&w, &without) {
+        assert!(matches!(got, Outcome::Open(_)), "{name}: {got:?}");
+    }
+    // Nothing moved or was copied either way.
+    assert!(w.base.join("alice/work/project/private/key").exists());
+    assert!(w.ctx.home.join("private/key").exists());
+    // `~/later` is a workspace not made yet, so it has nothing to keep.
+    for folder in w.fs.unmovable().iter().filter(|f| !f.ends_with("later")) {
+        assert!(folder.is_dir(), "{}", folder.display());
+        assert!(
+            !folder.join("enclos-probe-7").exists(),
+            "{}",
+            folder.display()
+        );
+    }
+}
+
 #[test]
 fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
     let w = world();
@@ -287,6 +545,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         read_deny: Vec::new(),
         home: w.ctx.home.clone(),
         workspaces: vec![w.base.join("alice/work"), w.base.join("alice/empty")],
+        unmovable: Vec::new(),
         host_sockets: Vec::new(),
         target: None,
         tag: 7,
@@ -306,14 +565,11 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
     }
     assert!(w.ctx.home.join("tmp").is_dir());
 
-    // Without the rule, the probes read as open and still change nothing.
+    // Without the rules, the probes read as open and still change nothing.
     let mut w = w;
-    let text = std::fs::read_to_string(&w.compiled).unwrap();
-    let rule = text
-        .find("\n;; ---- The home and each workspace themselves")
-        .unwrap();
+    let without = without_folder_rules(&w.compiled);
     w.compiled = w.base.join("without-the-rule.sb");
-    std::fs::write(&w.compiled, &text[..rule]).unwrap();
+    std::fs::write(&w.compiled, without).unwrap();
     for probe in &folders {
         let (ok, out) = w.out(&probe.script);
         assert!(

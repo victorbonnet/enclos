@@ -1,20 +1,22 @@
 //! Compiling a policy for Seatbelt (design §5): `(allow default)`,
 //! then writes only where granted, reads of the sandbox home, the sensitive
 //! deny list for reads and writes (after those allows, so no grant covers
-//! it), network only to the sandbox's proxy port, the host-service denials,
-//! and last, so no rule above can override them, enclos's protected paths
-//! and the home and workspaces themselves, which stay where they are.
+//! it), the writable folders that cannot move (so no rename or clone carries
+//! a denied path elsewhere), network only to the sandbox's proxy port, the
+//! host-service denials, and last, so no rule above can override them,
+//! enclos's protected paths and the home and workspaces themselves, which
+//! stay where they are.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
 //! the unified log repeats, to tell sandboxes apart.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::super::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
-use crate::policy::paths::{PathContext, is_within, real_path};
+use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
 
 const HOST_SERVICES: &str = include_str!("host-services.sb");
 
@@ -43,15 +45,12 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         user_home: ctx.user_home.clone(),
         sandbox_home: ctx.home.clone(),
     };
-    let expand = |entries: &[String]| -> Result<Vec<PathBuf>, CompileError> {
-        entries
-            .iter()
-            .map(|e| paths.expand(e).map(|p| real_path(&p)).map_err(unsupported))
-            .collect()
-    };
-    let home = real_path(&ctx.home);
-    let writes = expand(&policy.fs.write)?;
-    let read_deny = expand(&policy.fs.read_deny)?;
+    let fs = FsPaths::of(&policy.fs, &paths).map_err(unsupported)?;
+    let FsPaths {
+        home,
+        writes,
+        read_deny,
+    } = &fs;
 
     let mut sb = String::new();
     let mut line = |text: String| {
@@ -67,14 +66,14 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
 
     line("\n;; ---- Writes: the sandbox home, granted workspaces and device files".into());
     line(format!("(deny file-write* (with message \"{tag}\"))"));
-    let mut allowed = vec![subpath(&home)?];
-    for path in &writes {
+    let mut allowed = vec![subpath(home)?];
+    for path in writes {
         allowed.push(subpath(path)?);
     }
     allowed.extend(DEVICES.iter().map(|d| d.to_string()));
     line(format!("(allow file-write*\n  {})", allowed.join("\n  ")));
 
-    line(format!("(allow file-read* {})", subpath(&home)?));
+    line(format!("(allow file-read* {})", subpath(home)?));
 
     line(
         "\n;; ---- Sensitive paths: neither read nor written, whatever a grant covers (ADR 0015)"
@@ -86,11 +85,11 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
             .map(|p| {
                 // An entry holding the home leaves the home out: later rules
                 // win, and the sandbox must keep its home.
-                if is_within(&home, p) {
+                if is_within(home, p) {
                     Ok(format!(
                         "(require-all {} (require-not {}))",
                         subpath(p)?,
-                        subpath(&home)?
+                        subpath(home)?
                     ))
                 } else {
                     subpath(p)
@@ -104,6 +103,12 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     }
 
     line(
+        "\n;; ---- Writable folders that cannot move, so no rename or clone carries a denied path elsewhere"
+            .into(),
+    );
+    line(unmovable_rule(&fs, &tag)?);
+
+    line(
         "\n;; ---- Network: only the sandbox's proxy, and Unix sockets in its home (ADR 0007)"
             .into(),
     );
@@ -114,11 +119,11 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     ));
     line(format!(
         "(allow network-bind network-inbound (local unix-socket {}))",
-        subpath(&home)?
+        subpath(home)?
     ));
     line(format!(
         "(allow network-outbound (remote unix-socket {}))",
-        subpath(&home)?
+        subpath(home)?
     ));
 
     line(String::new());
@@ -129,7 +134,7 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         line(format!(
             "(deny file-write* (with message \"{tag}\")\n  (require-all {} (require-not {})))",
             subpath(&real_path(root))?,
-            subpath(&home)?
+            subpath(home)?
         ));
     }
     let mut hidden = Vec::new();
@@ -160,8 +165,8 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         "\n;; ---- The home and each workspace themselves: never removed, renamed or replaced"
             .into(),
     );
-    let mut roots = vec![literal(&home)?];
-    for path in &writes {
+    let mut roots = vec![literal(home)?];
+    for path in writes {
         let root = literal(path)?;
         if !roots.contains(&root) {
             roots.push(root);
@@ -175,6 +180,27 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         text: sb,
         extension: "sb",
     })
+}
+
+/// The writable folders that must not move (design §5): deny rules match
+/// paths, so a folder holding a denied path, renamed, would carry it to a
+/// path no rule names, and a workspace could be moved into the home. A
+/// rename needs `file-write-unlink` on its source, and on its destination
+/// when that exists, and so does a removal, so denying it on these folders
+/// alone stops them moving while the other files and folders inside them
+/// are still made, renamed and removed. `file-clone` is denied on them too:
+/// cloning a folder copies everything under it in one call, so it would
+/// copy denied paths with it.
+fn unmovable_rule(fs: &FsPaths, tag: &str) -> Result<String, CompileError> {
+    let folders = fs
+        .unmovable()
+        .iter()
+        .map(|f| literal(f))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!(
+        "(deny file-write-unlink file-clone (with message \"{tag}\")\n  {})",
+        folders.join("\n  ")
+    ))
 }
 
 fn unsupported(reason: String) -> CompileError {
@@ -331,6 +357,50 @@ mod tests {
             .unwrap();
         let roots = &text[rule..];
         assert!(roots[..roots.find("))").unwrap()].contains(home), "{text}");
+    }
+
+    #[test]
+    fn writable_folders_holding_a_hidden_path_cannot_move() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.fs.read_deny.push("~/work/project/private".into());
+        p.fs.read_deny.push("{home}/a/private".into());
+        let text = compile(&p, &ctx(base)).unwrap().text;
+        let rule = text
+            .find("(deny file-write-unlink")
+            .unwrap_or_else(|| panic!("no unmovable folders:\n{text}"));
+        let home = "/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home";
+        let folders: Vec<&str> = text[rule..]
+            .lines()
+            .skip(1)
+            .take_while(|l| l.starts_with("  (literal "))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect();
+        assert_eq!(
+            folders,
+            [
+                home.to_owned(),
+                format!("{home}/a"),
+                "/nonexistent-enclos-test/alice/work".to_owned(),
+                "/nonexistent-enclos-test/alice/work/project".to_owned(),
+            ],
+            "{text}"
+        );
+        assert!(
+            text[rule..]
+                .starts_with("(deny file-write-unlink file-clone (with message \"enclos:home\")")
+        );
+        // A deny rule: after every allow for files, before the protected paths.
+        let last_allow = ["(allow file-write*", "(allow file-read*"]
+            .iter()
+            .filter_map(|a| text.rfind(a))
+            .max()
+            .unwrap();
+        assert!(last_allow < rule, "{text}");
+        assert!(
+            rule < text.find(";; ---- enclos's own files").unwrap(),
+            "{text}"
+        );
     }
 
     #[test]
