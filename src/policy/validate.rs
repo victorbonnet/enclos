@@ -1,17 +1,18 @@
 //! Checking a resolved policy before it is stored (design §5, §7).
 //!
 //! Refused: a write to enclos's own folders except the sandbox's own home,
-//! also through a broad path or a symlink; a dropped built-in read-deny
-//! entry; a path the compiled policy cannot hold; a destination the proxy
-//! never lets a sandbox reach. Malformed: a path or destination that does
-//! not parse, or a `network.private` opt-in for a host not in
-//! `network.allow`. A policy exits 2 only when every problem is a refusal
-//! (design §10).
+//! also through a broad path or a symlink; a workspace inside the home or
+//! inside another workspace, or one reached through a symlink the sandbox
+//! can change; a dropped built-in read-deny entry; a path the compiled
+//! policy cannot hold; a destination the proxy never lets a sandbox reach.
+//! Malformed: a path or destination that does not parse, or a
+//! `network.private` opt-in for a host not in `network.allow`. A policy
+//! exits 2 only when every problem is a refusal (design §10).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::file::PolicyFile;
-use super::paths::{PathContext, is_within, real_path};
+use super::paths::{PathContext, is_within, links_on_the_way, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
 use crate::net::addr::{AddrClass, classify};
@@ -41,6 +42,21 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
     }
     check_default_denies(policy, &mut problems);
     check_network(policy, &mut problems);
+    invalid_if_any(problems)
+}
+
+/// The write checks of [`validate`] alone, on the paths as they are now: run
+/// again each time a stored policy is compiled, since a symlink on the way
+/// to a workspace may have changed since the policy was stored. The other
+/// checks are not repeated there: the active policy is used as stored
+/// (ADR 0018).
+pub fn validate_writes(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyError> {
+    let mut problems = Vec::new();
+    check_writes(policy, ctx, &mut problems);
+    invalid_if_any(problems)
+}
+
+fn invalid_if_any(problems: Vec<Problem>) -> Result<(), PolicyError> {
     if problems.is_empty() {
         Ok(())
     } else {
@@ -51,14 +67,16 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
 fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Problem>) {
     let own_home = real_path(&ctx.paths.sandbox_home);
     let protected: Vec<PathBuf> = ctx.protected.iter().map(|p| real_path(p)).collect();
+    let mut granted = Vec::new();
     for entry in &policy.fs.write {
-        let path = match ctx.paths.expand(entry) {
-            Ok(path) => real_path(&path),
+        let expanded = match ctx.paths.expand(entry) {
+            Ok(path) => path,
             Err(e) => {
                 problems.push(Problem::Malformed(format!("filesystem.write: {e}")));
                 continue;
             }
         };
+        let path = real_path(&expanded);
         check_holdable_in_a_compiled_policy("write", entry, &path, problems);
         for root in &protected {
             let contains_root = is_within(root, &path);
@@ -69,6 +87,74 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
                     path.display(),
                     root.display()
                 )));
+            }
+        }
+        granted.push(Granted {
+            entry,
+            expanded,
+            path,
+        });
+    }
+    check_nesting(&granted, &own_home, problems);
+    check_links(&granted, &own_home, problems);
+}
+
+/// A write entry, as written, expanded, and resolved.
+struct Granted<'a> {
+    entry: &'a str,
+    expanded: PathBuf,
+    path: PathBuf,
+}
+
+/// The folder the sandbox writes that holds `path`, as a problem names it:
+/// its home, or a granted folder other than those `skip` leaves out.
+fn writable_folder_holding(
+    path: &Path,
+    own_home: &Path,
+    granted: &[Granted],
+    skip: impl Fn(&Granted) -> bool,
+) -> Option<String> {
+    match is_within(path, own_home) {
+        true => Some("the sandbox home".to_owned()),
+        false => granted
+            .iter()
+            .find(|g| !skip(g) && is_within(path, &g.path))
+            .map(|g| format!("`{}` ({})", g.entry, g.path.display())),
+    }
+}
+
+/// A workspace is a folder of its own: never inside the sandbox home, which
+/// the sandbox always writes, nor inside another workspace. The compiled
+/// policy keeps only each granted folder's own path in place (design §5),
+/// so a workspace inside another writable folder would not be kept there.
+fn check_nesting(granted: &[Granted], own_home: &Path, problems: &mut Vec<Problem>) {
+    for g in granted.iter().filter(|g| g.path != own_home) {
+        let outer = writable_folder_holding(&g.path, own_home, granted, |o| o.path == g.path);
+        if let Some(outer) = outer {
+            problems.push(Problem::Refused(format!(
+                "filesystem.write: `{}` ({}) is inside {outer}, which the sandbox can already write; a workspace must be a folder of its own, so list only the outer one",
+                g.entry,
+                g.path.display()
+            )));
+        }
+    }
+}
+
+/// A symlink on the way to a granted folder must sit where the sandbox
+/// cannot write: one inside its home or a granted folder, the sandbox could
+/// point elsewhere, and the next compile would follow it there.
+fn check_links(granted: &[Granted], own_home: &Path, problems: &mut Vec<Problem>) {
+    for g in granted {
+        for link in links_on_the_way(&g.expanded) {
+            let at = real_path(link.parent().unwrap_or(&link));
+            if let Some(outer) = writable_folder_holding(&at, own_home, granted, |_| false) {
+                problems.push(Problem::Refused(format!(
+                    "filesystem.write: `{}` ({}) goes through a link at {} inside {outer}, which the sandbox can change; grant the folder it points to directly",
+                    g.entry,
+                    g.path.display(),
+                    link.display()
+                )));
+                break;
             }
         }
     }
@@ -216,7 +302,77 @@ mod tests {
     #[test]
     fn the_sandbox_home_and_a_workspace_are_writable() {
         let f = fixture();
-        assert!(problems(&policy(&["{home}", "{tmp}", "~/work"], &[], &[]), &f).is_empty());
+        assert!(problems(&policy(&["{home}", "~/work"], &[], &[]), &f).is_empty());
+        // The same folder twice is still one workspace.
+        assert!(problems(&policy(&["~/work", "~/work/"], &[], &[]), &f).is_empty());
+    }
+
+    #[test]
+    fn a_workspace_inside_the_home_or_another_workspace_is_refused() {
+        let f = fixture();
+        let home = f.ctx.paths.sandbox_home.clone();
+        let work = f.ctx.paths.user_home.join("work");
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        // Reached through a link that sits outside both.
+        std::os::unix::fs::symlink(&work, f.ctx.paths.user_home.join("work-link")).unwrap();
+        for (entries, outer) in [
+            (&["{home}", "{tmp}"][..], "the sandbox home"),
+            (&["{home}/projects"], "the sandbox home"),
+            (&["~/work", "~/work/sub"], "`~/work`"),
+            (&["~/work/sub", "~/work"], "`~/work`"),
+            (&["~/work", "~/work-link/sub"], "`~/work`"),
+        ] {
+            let found = problems(&policy(entries, &[], &[]), &f);
+            assert_eq!(found.len(), 1, "{entries:?}: {found:?}");
+            assert!(
+                found[0].contains(&format!("is inside {outer}")),
+                "{entries:?}: {found:?}"
+            );
+        }
+        let found = problems(&policy(&["~/work", "~/work/sub"], &[], &[]), &f);
+        assert!(
+            found[0].starts_with("filesystem.write: `~/work/sub`"),
+            "{found:?}"
+        );
+        assert!(validate_writes(&policy(&["~/work/sub", "~/work"], &[], &[]), &f.ctx).is_err());
+        assert!(validate_writes(&policy(&["{home}", "~/work"], &[], &[]), &f.ctx).is_ok());
+    }
+
+    #[test]
+    fn a_workspace_reached_through_a_link_the_sandbox_can_change_is_refused() {
+        let f = fixture();
+        let user = f.ctx.paths.user_home.clone();
+        let home = f.ctx.paths.sandbox_home.clone();
+        let link = |target: &Path, at: &Path| std::os::unix::fs::symlink(target, at).unwrap();
+        std::fs::create_dir(user.join("docs")).unwrap();
+        // Links in folders the sandbox writes: its home, and `~/work`.
+        link(&user.join("docs"), &home.join("out"));
+        link(&user.join("not-yet"), &home.join("dangling"));
+        link(&user.join("docs"), &user.join("work/out"));
+        // A link the sandbox cannot change, on the way to one it can.
+        link(&user.join("work/out"), &user.join("via-work"));
+        for (entries, at) in [
+            (&["{home}", "{home}/out"][..], "the sandbox home"),
+            (&["{home}/out"], "the sandbox home"),
+            (&["{home}/dangling"], "the sandbox home"),
+            (&["~/work", "~/work/out"], "`~/work`"),
+            (&["~/work/out", "~/work"], "`~/work`"),
+            (&["~/work", "~/via-work"], "`~/work`"),
+        ] {
+            let found = problems(&policy(entries, &[], &[]), &f);
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("through a link") && p.contains(&format!("inside {at}"))),
+                "{entries:?}: {found:?}"
+            );
+            assert!(validate_writes(&policy(entries, &[], &[]), &f.ctx).is_err());
+        }
+        // A link outside every folder the sandbox writes is the user's own.
+        link(&user.join("docs"), &user.join("docs-link"));
+        assert!(problems(&policy(&["{home}", "~/work", "~/docs-link"], &[], &[]), &f).is_empty());
+        // `~/work/out` is not granted, so the sandbox cannot change it.
+        assert!(problems(&policy(&["{home}", "~/via-work"], &[], &[]), &f).is_empty());
     }
 
     #[test]

@@ -748,7 +748,12 @@ fn policy_test_fails_when_the_sandbox_home_is_unusable() {
     std::fs::write(&sandbox_home, "not a folder").unwrap();
     let out = home.run(&["policy", "test", "home"]);
     assert_ne!(out.code(), 0, "{}", out.stdout());
-    assert!(out.stderr().contains("home/tmp"), "{}", out.stderr());
+    // Refused before anything is compiled.
+    assert!(
+        out.stderr().contains("is not a real folder"),
+        "{}",
+        out.stderr()
+    );
     assert!(!out.stdout().contains("shown closed"), "{}", out.stdout());
 }
 

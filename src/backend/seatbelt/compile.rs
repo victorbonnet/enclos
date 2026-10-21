@@ -2,7 +2,8 @@
 //! then writes only where granted, reads of the sandbox home, the sensitive
 //! deny list for reads and writes (after those allows, so no grant covers
 //! it), network only to the sandbox's proxy port, the host-service denials,
-//! and last, so no rule above can override them, enclos's protected paths.
+//! and last, so no rule above can override them, enclos's protected paths
+//! and the home and workspaces themselves, which stay where they are.
 //!
 //! Seatbelt matches real paths, so every path is resolved first (`/tmp` is
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
@@ -151,6 +152,25 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         literal(&sandboxes)?,
         subpath(&real_path(&ctx.dir))?
     ));
+    // The sandbox writes inside its home and each workspace, but may not
+    // remove, rename or create the folder itself (a rename checks
+    // `file-write-unlink` on the old path): each stays the folder this
+    // policy was compiled for, and never becomes a link elsewhere.
+    line(
+        "\n;; ---- The home and each workspace themselves: never removed, renamed or replaced"
+            .into(),
+    );
+    let mut roots = vec![literal(&home)?];
+    for path in &writes {
+        let root = literal(path)?;
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    line(format!(
+        "(deny file-write-unlink file-write-create (with message \"{tag}\")\n  {})",
+        roots.join("\n  ")
+    ));
     Ok(Compiled {
         text: sb,
         extension: "sb",
@@ -279,6 +299,38 @@ mod tests {
         assert!(text[hidden..].contains(
             "(require-all (subpath \"/nonexistent-enclos-test/alice\") (require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))"
         ), "{text}");
+    }
+
+    #[test]
+    fn the_home_and_each_workspace_cannot_be_removed_renamed_or_created() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let text = compile(&policy(), &ctx(base)).unwrap().text;
+        let rule = text
+            .find("(deny file-write-unlink file-write-create")
+            .unwrap_or_else(|| panic!("no rule for the folders themselves:\n{text}"));
+        // After every allow, so no grant reopens it.
+        assert!(text.rfind("(allow ").unwrap() < rule, "{text}");
+        let roots = &text[rule..];
+        let roots = &roots[..roots.find("))").unwrap() + 1];
+        let home = "(literal \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")";
+        assert!(roots.contains(home), "{text}");
+        assert!(
+            roots.contains("(literal \"/nonexistent-enclos-test/alice/work\")"),
+            "{text}"
+        );
+        // `{home}` is in the policy too: listed once.
+        assert_eq!(roots.matches(home).count(), 1, "{text}");
+
+        // A policy that leaves `{home}` out still writes the home, so it
+        // keeps the home in place too.
+        let mut p = policy();
+        p.fs.write = vec!["~/work".into()];
+        let text = compile(&p, &ctx(base)).unwrap().text;
+        let rule = text
+            .find("(deny file-write-unlink file-write-create")
+            .unwrap();
+        let roots = &text[rule..];
+        assert!(roots[..roots.find("))").unwrap()].contains(home), "{text}");
     }
 
     #[test]

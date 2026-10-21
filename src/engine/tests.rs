@@ -2,7 +2,7 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::backend::fake::FakeBackend;
-use crate::error::Error;
+use crate::error::{Error, HomeFound};
 use crate::model::audit::AuditResult;
 
 fn alice() -> Actor {
@@ -472,6 +472,194 @@ mod compile {
         assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
         assert_eq!(err.exit_code(), 2);
         assert!(engine.list_sandboxes().unwrap().is_empty());
+    }
+
+    /// Puts the sandbox home aside, as the host can, and lets `replace` put
+    /// something else at its path.
+    fn replace_home(engine: &Engine, replace: impl FnOnce(&std::path::Path)) {
+        let home = engine.layout.sandbox_home("home");
+        std::fs::rename(&home, home.with_file_name("home-aside")).unwrap();
+        replace(&home);
+    }
+
+    #[test]
+    fn a_home_that_is_not_a_real_folder_is_never_compiled() {
+        let outside = std::path::PathBuf::from("/nonexistent-enclos-outside");
+        let link_out = |home: &std::path::Path| std::os::unix::fs::symlink(&outside, home).unwrap();
+        let a_file = |home: &std::path::Path| std::fs::write(home, "x").unwrap();
+        let nothing = |_: &std::path::Path| {};
+        for (replace, expected) in [
+            (
+                &link_out as &dyn Fn(&std::path::Path),
+                HomeFound::Link {
+                    to: outside.clone(),
+                },
+            ),
+            (&a_file, HomeFound::NotAFolder),
+            (&nothing, HomeFound::Missing),
+        ] {
+            let (_dir, engine, name) =
+                with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+            engine.compile_policy(&name, 41001).unwrap();
+            replace_home(&engine, replace);
+            let err = engine.compile_policy(&name, 41001).unwrap_err();
+            assert!(
+                matches!(&err, Error::HomeNotAFolder { found, .. } if *found == expected),
+                "{expected}: {err}"
+            );
+            assert!(err.to_string().contains("enclos sandbox rm home"), "{err}");
+            assert_eq!(err.exit_code(), 1);
+            // `show` and `status` say so: nothing new starts there.
+            let shown = engine.show_sandbox(&name).unwrap().policy_refused;
+            assert!(shown.is_some_and(|why| why.contains(&expected.to_string())));
+        }
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        assert_eq!(engine.show_sandbox(&name).unwrap().policy_refused, None);
+        replace_home(&engine, link_out);
+        let status = engine.status(Some(&name)).unwrap();
+        let refused = status.sandboxes[0].policy_refused.as_deref().unwrap();
+        assert!(
+            refused.contains("a symbolic link to /nonexistent"),
+            "{refused}"
+        );
+    }
+
+    /// Grants writes to `entries` by hand-editing `policy.toml`, applied by
+    /// the next `policy allow`.
+    fn grant_writes(engine: &Engine, name: &SandboxName, entries: &str) {
+        let file = engine.layout.policy_file(name.as_str());
+        let text = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("write_add = []", &format!("write_add = [{entries}]"));
+        std::fs::write(&file, text).unwrap();
+        done(
+            engine
+                .policy_allow(&alice(), name, "api.example.com", Confirm::Yes)
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
+        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let user = dir.path().canonicalize().unwrap();
+        for d in ["a", "b"] {
+            std::fs::create_dir(user.join(d)).unwrap();
+        }
+        grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
+        let ctx = engine.sandbox_context(&name, 41001);
+        let inputs = engine.probe_inputs(&name, &ctx, None).unwrap();
+        let home = ctx.home.canonicalize().unwrap();
+        assert_eq!(inputs.home, home);
+        assert_eq!(
+            inputs.workspaces,
+            [user.join("a"), user.join("b"), user.join("later")]
+        );
+        let names: Vec<String> = crate::probes::probes(&inputs)
+            .into_iter()
+            .filter(|p| p.route == "writable folders")
+            .map(|p| p.name)
+            .collect();
+        let rename = |p: &std::path::Path| format!("rename {}", p.display());
+        assert_eq!(
+            names,
+            [
+                "remove the sandbox home".to_owned(),
+                rename(&home),
+                rename(&user.join("a")),
+                rename(&user.join("b")),
+            ]
+        );
+        let missing = crate::probes::missing_workspaces(&inputs);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, rename(&user.join("later")));
+        assert!(
+            matches!(&missing[0].outcome, crate::probes::Outcome::NotRun(why) if why.contains("create it on the host"))
+        );
+    }
+
+    #[test]
+    fn the_write_rules_are_checked_again_as_the_paths_are_when_compiled() {
+        let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        grant_writes(&engine, &name, "\"~/work\"");
+        assert!(
+            engine
+                .policy(&name)
+                .unwrap()
+                .snapshot
+                .policy
+                .fs
+                .write
+                .contains(&"~/work".into())
+        );
+        engine.compile_policy(&name, 41001).unwrap();
+
+        // The host points the workspace at enclos's own folder afterwards.
+        std::fs::remove_dir(&work).unwrap();
+        std::os::unix::fs::symlink(engine.layout.data(), &work).unwrap();
+        let err = engine.compile_policy(&name, 41001).unwrap_err();
+        assert!(matches!(err, Error::ActivePolicyInvalid { .. }), "{err}");
+        assert!(err.to_string().contains("enclos's own files"), "{err}");
+        assert_eq!(err.exit_code(), 1);
+
+        // Or through a link in the sandbox home, which the sandbox can
+        // point anywhere before the next compile.
+        std::fs::remove_file(&work).unwrap();
+        let in_home = engine.layout.sandbox_home("home").join("out");
+        std::os::unix::fs::symlink(dir.path(), &in_home).unwrap();
+        std::os::unix::fs::symlink(&in_home, &work).unwrap();
+        let err = engine.compile_policy(&name, 41001).unwrap_err();
+        assert!(matches!(err, Error::ActivePolicyInvalid { .. }), "{err}");
+        assert!(err.to_string().contains("through a link"), "{err}");
+    }
+
+    /// With macOS's own Seatbelt: the sandbox cannot put a link in place of
+    /// its home, and when the host does, the policy is not compiled.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
+        use crate::backend::Launch;
+        use crate::backend::seatbelt::Seatbelt;
+
+        let (dir, engine) = engine_with(vec![Box::new(Seatbelt)]);
+        done(engine.init(&alice(), Confirm::Yes).unwrap());
+        let name: SandboxName = "home".parse().unwrap();
+        let spec = crate::engine::SandboxSpec {
+            name: name.clone(),
+            backend: BackendKind::Seatbelt,
+            template: "assistant".parse().unwrap(),
+        };
+        done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+        let compiled = engine.compile_policy(&name, 41001).unwrap();
+        let home = engine.layout.sandbox_home("home");
+        let outside = dir.path().canonicalize().unwrap();
+        let swap = format!(
+            "/bin/rmdir \"$HOME/tmp\"; /bin/rmdir \"$HOME\" && /bin/ln -s '{}' \"$HOME\"",
+            outside.display()
+        );
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), swap.into()],
+            env: Vec::new(),
+        };
+        let ctx = engine.sandbox_context(&name, 41001);
+        let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(stderr.contains("Operation not permitted"), "{stderr}");
+        let meta = home.symlink_metadata().unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+
+        replace_home(&engine, |home| {
+            std::os::unix::fs::symlink(&outside, home).unwrap();
+        });
+        let err = engine.compile_policy(&name, 41001).unwrap_err();
+        assert!(
+            matches!(&err, Error::HomeNotAFolder { found: HomeFound::Link { to }, .. } if *to == outside),
+            "{err}"
+        );
     }
 }
 

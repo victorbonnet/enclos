@@ -196,6 +196,9 @@ fn print_show(v: &SandboxView) {
             p.snapshot.short()
         );
     }
+    if let Some(why) = &v.policy_refused {
+        println!("  nothing new starts here, and what runs keeps its policy: {why}");
+    }
     let all_gone = v.sessions.iter().all(|s| s.gone());
     if all_gone {
         println!("  no sessions running");

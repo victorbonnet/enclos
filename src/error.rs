@@ -4,6 +4,7 @@ use crate::audit::AuditError;
 use crate::layout::LayoutError;
 use crate::policy::PolicyError;
 use crate::state::StateError;
+use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -103,6 +104,29 @@ pub enum Error {
     /// Its own proxy holds the port: there is nothing to stop or recreate.
     #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
     ProxyRuns { sandbox: String, port: u16 },
+    /// The sandbox's home is not a real folder (a link, a file, or missing),
+    /// so its policy is not compiled: Seatbelt resolves the path when the
+    /// policy is compiled, and a link would carry the grant elsewhere.
+    #[error(
+        "the home of sandbox `{sandbox}` is not a real folder: {} is {found}, so enclos will not compile its policy. If the folder was moved aside, put it back there; otherwise stop the sandbox with `enclos sandbox stop {sandbox}`, remove it with `enclos sandbox rm {sandbox}` (which deletes its home) and create it again",
+        path.display()
+    )]
+    HomeNotAFolder {
+        sandbox: String,
+        path: PathBuf,
+        found: HomeFound,
+    },
+    /// The active policy's write checks, run again on the paths as they are
+    /// when it is compiled, no longer pass.
+    #[error(
+        "the active policy of sandbox `{sandbox}` no longer passes enclos's write checks on the paths as they are now, so enclos will not compile it. If a link on the way changed, point it back; or edit {} and apply it with `enclos policy allow {sandbox} <destination>`, which applies the edit too. {source}",
+        policy_file.display()
+    )]
+    ActivePolicyInvalid {
+        sandbox: String,
+        policy_file: PathBuf,
+        source: PolicyError,
+    },
     #[error("the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}")]
     ProxyListen {
         sandbox: String,
@@ -133,6 +157,27 @@ pub mod exit {
     pub const NEEDS_CONFIRMATION: u8 = 3;
 }
 
+/// What enclos found at a sandbox home's path instead of a real folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeFound {
+    /// A symbolic link, and where it points.
+    Link {
+        to: PathBuf,
+    },
+    NotAFolder,
+    Missing,
+}
+
+impl std::fmt::Display for HomeFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HomeFound::Link { to } => write!(f, "a symbolic link to {}", to.display()),
+            HomeFound::NotAFolder => f.write_str("not a folder"),
+            HomeFound::Missing => f.write_str("missing"),
+        }
+    }
+}
+
 impl Error {
     /// The exit code for this error (design §10). A policy exits 2 only when
     /// `PolicyError::is_refused` holds. `Compile` stays 1: validation refuses
@@ -155,6 +200,8 @@ impl Error {
             | Error::ProxyListen { .. }
             | Error::ProxyStopped { .. }
             | Error::Compile(_)
+            | Error::HomeNotAFolder { .. }
+            | Error::ActivePolicyInvalid { .. }
             | Error::SandboxExists { .. }
             | Error::SandboxRunning { .. }
             | Error::SandboxHasServices { .. }

@@ -33,6 +33,9 @@ pub struct SandboxSpec {
 pub struct SandboxView {
     pub record: SandboxRecord,
     pub policy: Option<PolicyVersion>,
+    /// Why enclos now refuses to compile the active policy, if it does: see
+    /// [`compile_refused`].
+    pub policy_refused: Option<String>,
     /// Sessions not ended yet, and the sandbox's proxy, which is recorded
     /// beside them.
     pub sessions: Vec<SessionView>,
@@ -255,22 +258,22 @@ impl Engine {
     /// another one runs file and program rules the active policy no longer
     /// has. A sandbox this host cannot compile for runs nothing. Compiled in
     /// memory only: nothing is written.
-    pub(super) fn active_compiled(&self, record: &SandboxRecord) -> Option<PathBuf> {
+    pub(super) fn active_compiled(&self, record: &SandboxRecord) -> Result<PathBuf> {
         self.compiled_file(&record.name, record.proxy_port)
-            .ok()
             .map(|(file, _)| file)
     }
 
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
-        let active = self.active_compiled(&record);
+        let compiled = self.active_compiled(&record);
+        let active = compiled.as_ref().ok().map(PathBuf::as_path);
         let sessions = self
             .state
             .sessions(&record.name, true)?
             .into_iter()
             .map(|session| {
                 let members = members(&session)?;
-                let needs_restart = needs_restart(&session, active.as_deref());
+                let needs_restart = needs_restart(&session, active);
                 Ok(SessionView {
                     session,
                     members,
@@ -281,6 +284,7 @@ impl Engine {
         Ok(SandboxView {
             record,
             policy,
+            policy_refused: compile_refused(&compiled),
             sessions,
         })
     }
@@ -534,6 +538,20 @@ fn join_ids(ids: &[SessionId]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Why enclos refuses to compile the active policy because a path changed
+/// since it was stored (design §5): nothing new starts in the sandbox until
+/// the user fixes it, while what already runs keeps the policy it started
+/// with. Other failures, such as a backend this host cannot run, are told
+/// where the sandbox is started.
+pub(super) fn compile_refused(compiled: &Result<PathBuf>) -> Option<String> {
+    match compiled {
+        Err(e @ (Error::HomeNotAFolder { .. } | Error::ActivePolicyInvalid { .. })) => {
+            Some(e.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Whether a running session needs a restart to run under the active

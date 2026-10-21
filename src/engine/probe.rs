@@ -17,8 +17,8 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{PathContext, real_path};
 use crate::probes::{
-    HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, Run, host_service_probes, not_here,
-    outcome, probes, sandboxed_script,
+    HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, Run, host_service_probes,
+    missing_workspaces, not_here, outcome, probes, sandboxed_script,
 };
 
 /// What `enclos policy test` found.
@@ -171,6 +171,7 @@ impl Engine {
                 let outcome = run_probe(&probe, run_in_sandbox, &mut target.0);
                 results.push(ProbeResult::of(probe, outcome));
             }
+            results.extend(missing_workspaces(&inputs));
             Ok(TestReport {
                 results,
                 host_services,
@@ -182,7 +183,7 @@ impl Engine {
 
     /// What the probes are built from. `target` is the process the signal
     /// probe aims at.
-    fn probe_inputs(
+    pub(super) fn probe_inputs(
         &self,
         name: &SandboxName,
         ctx: &SandboxContext,
@@ -207,8 +208,15 @@ impl Engine {
                 })
         };
         let read_deny = expand(&policy.fs.read_deny)?;
+        let home = real_path(&ctx.home);
         let mut writes = expand(&policy.fs.write)?;
-        writes.push(real_path(&ctx.home));
+        let mut workspaces: Vec<PathBuf> = Vec::new();
+        for path in &writes {
+            if *path != home && !workspaces.contains(path) {
+                workspaces.push(path.clone());
+            }
+        }
+        writes.push(home.clone());
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
@@ -223,6 +231,8 @@ impl Engine {
                 .map(|r| self.layout.sandbox_dir(r.name.as_str()))
                 .collect(),
             read_deny,
+            home,
+            workspaces,
             host_sockets: host_sockets(&ctx.user_home),
             target,
             tag: std::process::id(),
@@ -516,6 +526,8 @@ mod tests {
             other_sandboxes: Vec::new(),
             writes: Vec::new(),
             read_deny: Vec::new(),
+            home: dir.join("enclos/sandboxes/home/home"),
+            workspaces: Vec::new(),
             host_sockets: Vec::new(),
             target: Some(target),
             tag: 7,
