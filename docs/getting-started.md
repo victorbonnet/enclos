@@ -10,7 +10,7 @@ The words used here:
 
 ## Before you start
 
-- An Apple silicon Mac running macOS 14 or later.
+- An Apple silicon Mac running macOS 15 or later.
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 

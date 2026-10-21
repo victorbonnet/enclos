@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-26, ubuntu-latest]
+        os: [macos-15, macos-26, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,7 +34,7 @@ jobs:
       matrix:
         # macOS 26 too: Seatbelt rules such as hid-control behave differently
         # there (design §5).
-        os: [macos-14, macos-26, ubuntu-latest, ubuntu-24.04-arm]
+        os: [macos-15, macos-26, ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     env:
       # The escape probes that would act on the host if a rule did not hold

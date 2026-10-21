@@ -37,7 +37,7 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 
 ## Quick start
 
-On an Apple silicon Mac running macOS 14 or later, with an account with a model provider Hermes supports:
+On an Apple silicon Mac running macOS 15 or later, with an account with a model provider Hermes supports:
 
 ```bash
 curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
