@@ -89,14 +89,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod exit {
     pub const OK: u8 = 0;
     pub const ERROR: u8 = 1;
+    /// A policy whose problems are all refusals, or a backend this host
+    /// cannot run (ADR 0009).
     pub const REFUSED: u8 = 2;
     pub const NEEDS_CONFIRMATION: u8 = 3;
 }
 
 impl Error {
-    /// Refused by policy: a policy its checks refuse for what it grants or
-    /// reaches, or what the backend cannot enforce, and a backend this host
-    /// cannot run (ADR 0009). Input that does not parse is an error.
+    /// The exit code for this error (design §10). A policy exits 2 only when
+    /// `PolicyError::is_refused` holds. `Compile` stays 1: validation refuses
+    /// a path the compiled policy cannot hold when the policy is stored, and
+    /// a compile failure at start is an error. A failed cleanup keeps the
+    /// code of the error it followed.
     pub fn exit_code(&self) -> u8 {
         match self {
             Error::Policy(e) if e.is_refused() => exit::REFUSED,

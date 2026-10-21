@@ -23,14 +23,15 @@ pub enum HostPattern {
     Ip(IpAddr),
 }
 
-/// Why an entry is not accepted. The two kinds exit differently (design
-/// §10): a refusal with 2, an entry that does not parse with 1.
+/// Why an entry is not accepted. A policy whose problems are all refusals
+/// exits 2 (design §10); one malformed entry makes it exit 1.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EntryError {
     /// It is not written as a destination: fix how it is written.
     #[error("{0}")]
     Malformed(String),
-    /// It is a destination a sandbox may never reach.
+    /// A destination enclos never allows: loopback, link-local, localhost,
+    /// every destination (`*`) or a wildcard over a public suffix.
     #[error("{0}")]
     Refused(String),
 }
@@ -48,7 +49,8 @@ pub struct AllowEntry {
 }
 
 impl AllowEntry {
-    /// Parses and checks one entry; the error says what is wrong with it.
+    /// Parses and checks one entry; the error says what is wrong with it and
+    /// whether it is a refusal.
     pub fn parse(entry: &str) -> Result<AllowEntry, EntryError> {
         let entry = entry.trim();
         let (host, port) = split_port(entry).map_err(EntryError::Malformed)?;
@@ -63,19 +65,25 @@ impl AllowEntry {
                 port,
             });
         }
+        if host == "*" {
+            return Err(EntryError::Refused(
+                "* would allow every destination; name a domain someone owns, such as *.example.com"
+                    .to_owned(),
+            ));
+        }
         if let Some(domain) = host.strip_prefix("*.") {
-            // A public suffix (com, co.uk, githubusercontent.com) is refused
-            // first: its subdomains belong to everyone.
-            let lowered = domain
-                .strip_suffix('.')
-                .unwrap_or(domain)
-                .to_ascii_lowercase();
-            if psl::domain_str(&lowered).is_none() {
+            // The syntax first, so a typo is not taken for a public suffix.
+            // Then a public suffix (com, co.uk, githubusercontent.com) is
+            // refused before the full-name check would call `com` malformed:
+            // its subdomains belong to everyone.
+            let domain = host_syntax(domain)?;
+            refuse_localhost(&domain)?;
+            if psl::domain_str(&domain).is_none() {
                 return Err(EntryError::Refused(format!(
-                    "*.{lowered} would allow a whole public suffix; name a domain someone owns, such as *.example.com"
+                    "*.{domain} would allow a whole public suffix; name a domain someone owns, such as *.example.com"
                 )));
             }
-            let domain = normalize_host(domain)?;
+            full_domain(&domain)?;
             return Ok(AllowEntry {
                 host: HostPattern::Subdomains(domain),
                 port,
@@ -167,9 +175,20 @@ pub fn canonical_private(entry: &str) -> Result<String, EntryError> {
     }
 }
 
-/// Lowercases a host name, drops a trailing dot, and checks it is a domain
-/// name: dot-separated labels of letters, digits and hyphens.
+/// Lowercases a host name, drops a trailing dot, and checks it is a full
+/// domain name: dot-separated labels of letters, digits and hyphens.
+/// `localhost` and its subdomains are refused; any other problem is
+/// malformed.
 pub fn normalize_host(host: &str) -> Result<String, EntryError> {
+    let host = host_syntax(host)?;
+    refuse_localhost(&host)?;
+    full_domain(&host)?;
+    Ok(host)
+}
+
+/// The host lowercased, without a trailing dot, if it is written as
+/// dot-separated labels of letters, digits and hyphens.
+fn host_syntax(host: &str) -> Result<String, EntryError> {
     let malformed = |why: String| Err(EntryError::Malformed(why));
     let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
     if host.is_empty() {
@@ -192,15 +211,26 @@ pub fn normalize_host(host: &str) -> Result<String, EntryError> {
     if !host.split('.').all(label_ok) {
         return malformed(format!("`{host}` is not a host name"));
     }
+    Ok(host)
+}
+
+/// Checked before the full-name check, so a bare `localhost` is refused
+/// rather than malformed.
+fn refuse_localhost(host: &str) -> Result<(), EntryError> {
     if host == "localhost" || host.ends_with(".localhost") {
         return Err(EntryError::Refused(
             "localhost is never reachable from a sandbox".to_owned(),
         ));
     }
+    Ok(())
+}
+
+/// A name with a dot whose last label is not a number.
+fn full_domain(host: &str) -> Result<(), EntryError> {
     if !host.contains('.') {
-        return malformed(format!(
+        return Err(EntryError::Malformed(format!(
             "`{host}` is not a full domain name, such as api.example.com"
-        ));
+        )));
     }
     // No top-level domain is a number. A resolver reads `127.1`, `0x7f.1` or
     // `0177.0.0.1` as an IPv4 address, so these would get past the checks on
@@ -210,11 +240,19 @@ pub fn normalize_host(host: &str) -> Result<String, EntryError> {
     if last.bytes().all(|b| b.is_ascii_digit())
         || (last.starts_with("0x") && hex.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        return malformed(format!(
+        return Err(EntryError::Malformed(format!(
             "`{host}` reads as an IP address: write an IPv4 address as four decimal numbers, such as 192.0.2.10"
-        ));
+        )));
     }
-    Ok(host)
+    Ok(())
+}
+
+/// The host an allowlist entry names, in the form `canonical_private`
+/// gives, whether or not the entry is accepted: `network.private` is checked
+/// against what the user listed, not only against what was allowed.
+pub fn listed_host(entry: &str) -> Option<String> {
+    let (host, _) = split_port(entry.trim()).ok()?;
+    canonical_private(host).ok()
 }
 
 #[cfg(test)]
@@ -244,12 +282,16 @@ mod tests {
     #[test]
     fn destinations_a_sandbox_may_never_reach_are_refused() {
         for bad in [
+            "*",
+            "*:8443",
             // githubusercontent.com is on the Public Suffix List: each subdomain is someone else's.
             "*.com",
+            "*.com.",
             "*.co.uk",
             "*.githubusercontent.com",
             "localhost",
             "api.localhost",
+            "*.localhost",
             "127.0.0.1",
             "[::1]:443",
             "169.254.169.254",
@@ -262,8 +304,18 @@ mod tests {
     #[test]
     fn entries_that_are_not_destinations_are_malformed() {
         for bad in [
-            "*",
             "a*.example.com",
+            // A wildcard over a name that does not parse is a typo, not a
+            // public suffix.
+            "*.",
+            "*.*",
+            "*.a b",
+            "*.-bad",
+            "*.a_b",
+            "*.ünïcode",
+            // The default PSL rule makes 127.1 registrable, so the IP check
+            // below the public-suffix one applies.
+            "*.127.1",
             "intranet",
             "example.com:0",
             "example.com:99999",
@@ -281,8 +333,6 @@ mod tests {
             let err = AllowEntry::parse(bad).unwrap_err();
             assert!(!err.is_refused(), "{bad}: {err}");
         }
-        // Not a domain someone owns, whichever way it is read.
-        assert!(AllowEntry::parse("*.127.1").is_err());
     }
 
     #[test]

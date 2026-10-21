@@ -394,6 +394,7 @@ mod policy {
             .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
             .unwrap_err();
         assert!(err.to_string().contains("enclos's own files"), "{err}");
+        assert_eq!(err.exit_code(), 2, "{err}");
         assert_eq!(engine.policy(&name).unwrap().version.version, 1);
     }
 

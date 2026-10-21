@@ -376,8 +376,9 @@ fn policy_commands_name_an_unknown_sandbox() {
 fn policy_allow_refuses_an_unsafe_destination_before_anything_else() {
     let home = Home::new();
     home.init(1);
-    // Refused by policy (design §10): exit 2, with what to do instead.
+    // Refused by policy (design §10): exit 2, naming why.
     for (destination, says) in [
+        ("*", "every destination"),
         ("*.com", "public suffix"),
         ("127.0.0.1", "never reachable"),
         ("localhost", "never reachable"),
@@ -396,7 +397,7 @@ fn policy_allow_refuses_an_unsafe_destination_before_anything_else() {
 fn policy_allow_of_a_destination_that_does_not_parse_is_an_error() {
     let home = Home::new();
     home.init(1);
-    for destination in ["exa mple.com", "example.com:0", "a*.example.com"] {
+    for destination in ["exa mple.com", "example.com:0", "a*.example.com", "*.-bad"] {
         let out = home.run(&["policy", "allow", "lab", destination]);
         assert_eq!(out.code(), 1, "{destination}: {}", out.stderr());
         assert!(

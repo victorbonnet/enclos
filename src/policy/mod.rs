@@ -53,22 +53,25 @@ impl PolicyError {
 /// One reason a policy is not accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
-    /// An entry that is not written as a path or a destination.
+    /// The policy is written wrong: an entry that is not a path or a
+    /// destination, or one that contradicts another (an opt-in for a host
+    /// not in `network.allow`). Fixing it changes what the policy means.
     Malformed(String),
-    /// A well-formed entry enclos never grants: it reaches what a sandbox may
-    /// never reach, writes enclos's own files, drops a built-in read-deny
-    /// entry, or asks for what the backend cannot enforce (ADR 0009).
+    /// What enclos does not accept as written: a destination a sandbox never
+    /// reaches, a private address without its opt-in, every destination or
+    /// a wildcard over a public suffix, a write to enclos's own files, a
+    /// dropped built-in read-deny entry, or a path the compiled policy
+    /// cannot hold (ADR 0009).
     Refused(String),
 }
 
 impl Problem {
-    /// `entry`'s problem, as `{context}: {error}`.
+    /// An allowlist entry's problem, worded `{context}: {error}`, refused or
+    /// malformed as `error` is.
     pub fn entry(context: impl std::fmt::Display, error: EntryError) -> Problem {
-        let text = format!("{context}: {error}");
-        if error.is_refused() {
-            Problem::Refused(text)
-        } else {
-            Problem::Malformed(text)
+        match error {
+            EntryError::Refused(why) => Problem::Refused(format!("{context}: {why}")),
+            EntryError::Malformed(why) => Problem::Malformed(format!("{context}: {why}")),
         }
     }
 

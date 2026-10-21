@@ -1,10 +1,12 @@
 //! Checking a resolved policy before it is stored (design §5, §7).
 //!
-//! A policy may not grant writes to enclos's own folders except the sandbox's
-//! own home, including through a broad path or a symlink, may not drop the
-//! built-in read-deny entries, and its network entries must be ones the proxy
-//! can enforce. Each of these is a refusal (exit 2); an entry that does not
-//! parse is malformed (exit 1).
+//! Refused: a write to enclos's own folders except the sandbox's own home,
+//! also through a broad path or a symlink; a dropped built-in read-deny
+//! entry; a path the compiled policy cannot hold; a destination the proxy
+//! never lets a sandbox reach. Malformed: a path or destination that does
+//! not parse, or a `network.private` opt-in for a host not in
+//! `network.allow`. A policy exits 2 only when every problem is a refusal
+//! (design §10).
 
 use std::path::PathBuf;
 
@@ -13,7 +15,7 @@ use super::paths::{PathContext, is_within, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
 use crate::net::addr::{AddrClass, classify};
-use crate::net::host::{AllowEntry, HostPattern, canonical_private};
+use crate::net::host::{AllowEntry, HostPattern, canonical_private, listed_host};
 
 /// What a policy is checked against.
 #[derive(Debug, Clone)]
@@ -28,9 +30,12 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
     check_writes(policy, ctx, &mut problems);
     for entry in &policy.fs.read_deny {
         match ctx.paths.expand(entry) {
-            Ok(path) => {
-                check_writable_in_a_profile("read_deny", entry, &real_path(&path), &mut problems)
-            }
+            Ok(path) => check_holdable_in_a_compiled_policy(
+                "read_deny",
+                entry,
+                &real_path(&path),
+                &mut problems,
+            ),
             Err(e) => problems.push(Problem::Malformed(format!("filesystem.read_deny: {e}"))),
         }
     }
@@ -54,7 +59,7 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
                 continue;
             }
         };
-        check_writable_in_a_profile("write", entry, &path, problems);
+        check_holdable_in_a_compiled_policy("write", entry, &path, problems);
         for root in &protected {
             let contains_root = is_within(root, &path);
             let inside_root = is_within(&path, root) && !is_within(&path, &own_home);
@@ -73,7 +78,7 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
 /// would change a Seatbelt rule, so the compiler refuses them, and a policy
 /// that holds one could never start its sandbox. The backend cannot enforce
 /// such a path, so it is refused (ADR 0009).
-fn check_writable_in_a_profile(
+fn check_holdable_in_a_compiled_policy(
     list: &str,
     entry: &str,
     path: &std::path::Path,
@@ -82,7 +87,7 @@ fn check_writable_in_a_profile(
     match path.to_str() {
         Some(text) if !text.contains(['"', '\\']) => {}
         Some(text) => problems.push(Problem::Refused(format!(
-            "filesystem.{list}: `{entry}` ({text}) holds a double quote or a backslash, which enclos cannot put in a sandbox profile"
+            "filesystem.{list}: `{entry}` ({text}) holds a double quote or a backslash, which enclos cannot put in a compiled policy; rename it or pick another path"
         ))),
         None => problems.push(Problem::Refused(format!(
             "filesystem.{list}: `{entry}` ({}) is not valid UTF-8",
@@ -115,6 +120,14 @@ fn check_default_denies(policy: &Policy, problems: &mut Vec<Problem>) {
 
 fn check_network(policy: &Policy, problems: &mut Vec<Problem>) {
     let mut allowed = Vec::new();
+    // Every host the list names, refused ones too: opting in a refused
+    // address is not a second problem.
+    let listed: Vec<String> = policy
+        .net
+        .allow
+        .iter()
+        .filter_map(|e| listed_host(e))
+        .collect();
     for entry in &policy.net.allow {
         match AllowEntry::parse(entry) {
             Ok(parsed) => allowed.push(parsed),
@@ -132,7 +145,7 @@ fn check_network(policy: &Policy, problems: &mut Vec<Problem>) {
         };
         // An opt-in that unlocks nothing: a mistake in how the policy is
         // written, not a grant enclos refuses.
-        if !allowed.iter().any(|a| a.host_text() == host) {
+        if !listed.contains(&host) {
             problems.push(Problem::Malformed(format!(
                 "network.private: `{entry}` must also be in network.allow; the opt-in only unlocks private addresses for allowed hosts"
             )));
@@ -211,6 +224,8 @@ mod tests {
         let f = fixture();
         let mut dropped = policy(&[], &[], &[]);
         dropped.fs.read_deny.retain(|e| e != "~/.ssh");
+        let mut quoted_deny = policy(&[], &[], &[]);
+        quoted_deny.fs.read_deny.push("~/a\"b".into());
         for (case, p) in [
             ("loopback", policy(&[], &["127.0.0.1"], &[])),
             ("link-local", policy(&[], &["169.254.169.254"], &[])),
@@ -219,6 +234,25 @@ mod tests {
             ("public suffix", policy(&[], &["*.co.uk"], &[])),
             ("enclos's own files", policy(&["~/.enclos"], &[], &[])),
             ("not enforceable", policy(&["~/work/a\\b"], &[], &[])),
+            (
+                "refused opt-in",
+                policy(&[], &["api.example.com"], &["localhost"]),
+            ),
+            // The opt-in names an entry that is in allow but refused: only
+            // the refusal is a problem.
+            (
+                "loopback opted in",
+                policy(&[], &["127.0.0.1"], &["127.0.0.1"]),
+            ),
+            (
+                "link-local opted in",
+                policy(&[], &["169.254.169.254"], &["169.254.169.254"]),
+            ),
+            (
+                "IPv6 loopback opted in",
+                policy(&[], &["[::1]:8443"], &["::1"]),
+            ),
+            ("not enforceable deny", quoted_deny),
             ("default deny dropped", dropped),
         ] {
             let found = checked(&p, &f);
@@ -226,7 +260,10 @@ mod tests {
             assert!(found[0].is_refused(), "{case}: {found:?}");
             let err = validate(&p, &f.ctx).unwrap_err();
             assert!(err.is_refused(), "{case}: {err}");
-            assert!(err.to_string().starts_with("refused by policy:"), "{err}");
+            assert!(
+                err.to_string().starts_with("refused by policy:"),
+                "{case}: {err}"
+            );
         }
         for (case, p) in [
             ("bad destination", policy(&[], &["exa mple.com"], &[])),
@@ -239,6 +276,10 @@ mod tests {
             assert!(!found[0].is_refused(), "{case}: {found:?}");
             assert!(!validate(&p, &f.ctx).unwrap_err().is_refused(), "{case}");
         }
+        // Both spellings of a local service are refused, as allowed and as
+        // opted in.
+        let local = policy(&[], &["localhost"], &["localhost"]);
+        assert!(validate(&local, &f.ctx).unwrap_err().is_refused());
         // One malformed entry makes the whole list an error: what it means is
         // not known until it is fixed.
         let mixed = policy(&[], &["127.0.0.1", "exa mple.com"], &[]);
@@ -285,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_a_sandbox_profile_cannot_hold_are_refused_when_stored() {
+    fn paths_a_compiled_policy_cannot_hold_are_refused_when_stored() {
         let f = fixture();
         let found = problems(&policy(&["~/work/\"Q3\" report"], &[], &[]), &f);
         assert_eq!(found.len(), 1, "{found:?}");
