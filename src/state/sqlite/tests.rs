@@ -214,7 +214,7 @@ fn a_new_sandbox_and_its_first_policy_are_recorded_together_or_not_at_all() {
     let v1 = store
         .create_sandbox(&lock, &record("home"), &snap, &by)
         .unwrap();
-    assert_eq!(v1.version, 1);
+    assert_eq!((v1.version, &v1.by, v1.restores), (1, &by, None));
     assert_eq!(store.get(&name).unwrap(), Some(record("home")));
     assert_eq!(
         store.active_policy(&name).unwrap().unwrap(),

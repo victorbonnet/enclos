@@ -56,6 +56,19 @@ pub struct StopReport {
     pub survivors: Vec<(SessionId, Vec<Survivor>)>,
 }
 
+/// What a sandbox's folder held before `sandbox create` wrote to it, so
+/// that a failed create can put it back.
+enum Before {
+    /// No folder: the create makes it.
+    Nothing,
+    /// A folder without `policy.toml`, such as one left by a create that
+    /// stopped before writing it.
+    Folder,
+    /// A folder and the `policy.toml` it held, such as one kept by
+    /// `sandbox rm --keep-data`.
+    Kept(String),
+}
+
 impl Engine {
     /// Creates a sandbox: its folder and home, its `policy.toml` from the
     /// template, then its record, with a proxy port, and version 1 of its
@@ -95,10 +108,11 @@ impl Engine {
                     });
                 }
                 // The backend must run here (ADR 0009), and the template
-                // must resolve, before anything is written. A new sandbox
-                // has no runtime, so no adapter layer.
+                // must resolve, before any file or record is written. A new
+                // sandbox has no runtime, so no adapter layer.
+                let name = spec.name.as_str();
                 self.backend_for(&spec.name, spec.backend)?;
-                let overrides = policy::initial_overrides(spec.name.as_str(), &spec.template);
+                let overrides = policy::initial_overrides(name, &spec.template);
                 let snapshot = self.checked_policy_with(&spec.name, &overrides, None)?;
                 let record = SandboxRecord {
                     name: spec.name.clone(),
@@ -112,18 +126,18 @@ impl Engine {
                 // The folder first, then the record and version 1 of its
                 // policy in one transaction. A crash in between leaves only
                 // the folder, which the next create of this name reuses as it
-                // does one kept by `sandbox rm --keep-data` (design §11).
-                let name = spec.name.as_str();
-                let existed = self.layout.sandbox_dir(name).exists();
-                let previous = self.layout.read_policy(name).ok();
-                let made = self
-                    .layout
-                    .create_sandbox_dirs(name)
-                    .and_then(|()| self.layout.write_policy(name, &overrides))
-                    .map_err(Error::from)
-                    .and_then(|()| Ok(self.state.create_sandbox(lock, &record, &snapshot, by)?));
+                // does one kept by `sandbox rm --keep-data`: its home is kept
+                // and its `policy.toml` written again from the template
+                // (design §11).
+                let before = self.before_create(name)?;
+                let made = (|| -> Result<()> {
+                    self.layout.create_sandbox_dirs(name)?;
+                    self.layout.write_policy(name, &overrides)?;
+                    self.state.create_sandbox(lock, &record, &snapshot, by)?;
+                    Ok(())
+                })();
                 if let Err(error) = made {
-                    return Err(match self.undo_create(name, existed, previous) {
+                    return Err(match self.undo_create(name, before) {
                         Ok(()) => error,
                         Err(left) => Error::CleanupFailed {
                             error: Box::new(error),
@@ -137,36 +151,53 @@ impl Engine {
         Ok(Planned::Done(record))
     }
 
-    /// Takes back what a failed create wrote, so that nothing is left but
-    /// what was there before, such as a folder kept by `sandbox rm
-    /// --keep-data`. Returns what it could not take back.
-    fn undo_create(
-        &self,
-        name: &str,
-        existed: bool,
-        previous: Option<String>,
-    ) -> std::result::Result<(), String> {
-        let dir = self.layout.sandbox_dir(name);
-        match (existed, previous) {
-            (false, _) => match std::fs::remove_dir_all(&dir) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    Err(format!("{} ({e})", dir.display()))
-                }
-                _ => Ok(()),
-            },
-            (true, Some(previous)) => self
-                .layout
-                .write_policy(name, &previous)
-                .map_err(|e| format!("the template's policy in place of the kept one ({e})")),
-            (true, None) => {
-                let file = self.layout.policy_file(name);
-                match std::fs::remove_file(&file) {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        Err(format!("{} ({e})", file.display()))
-                    }
-                    _ => Ok(()),
+    /// What the sandbox's folder holds before `sandbox create` writes to
+    /// it. Only a missing `policy.toml` counts as none: one that cannot be
+    /// read stops the create before anything is written, since its undo
+    /// could not put it back.
+    fn before_create(&self, name: &str) -> Result<Before> {
+        match self.layout.read_policy(name) {
+            Ok(policy) => Ok(Before::Kept(policy)),
+            Err(LayoutError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let dir = self.layout.sandbox_dir(name);
+                match dir.try_exists() {
+                    Ok(true) => Ok(Before::Folder),
+                    Ok(false) => Ok(Before::Nothing),
+                    Err(source) => Err(LayoutError::Io { path: dir, source }.into()),
                 }
             }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Takes back what a failed create wrote: the folder it made, or the
+    /// `policy.toml` it wrote into a folder that was there before. A kept
+    /// home stays as it is, with any `home/tmp` the create added. Returns
+    /// what it could not take back.
+    fn undo_create(&self, name: &str, before: Before) -> std::result::Result<(), String> {
+        let gone = |path: &Path, removed: std::io::Result<()>| match removed {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("{} ({e})", path.display()))
+            }
+            _ => Ok(()),
+        };
+        match before {
+            Before::Nothing => {
+                let dir = self.layout.sandbox_dir(name);
+                gone(&dir, std::fs::remove_dir_all(&dir))
+            }
+            Before::Folder => {
+                let file = self.layout.policy_file(name);
+                gone(&file, std::fs::remove_file(&file))
+            }
+            Before::Kept(policy) => self.layout.write_policy(name, &policy).map_err(|e| {
+                format!(
+                    "{} with the template's policy in place of the kept one ({e})",
+                    self.layout.policy_file(name).display()
+                )
+            }),
         }
     }
 

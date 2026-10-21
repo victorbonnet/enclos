@@ -40,6 +40,7 @@ use crate::layout::Layout;
 use crate::model::audit::{Actor, AuditEntry, AuditFilter, Intent, Outcome, Since, VerifyReport};
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
+use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::state::sqlite::SqliteStateStore;
 use crate::state::{Migration, StateLock, StateStore};
@@ -177,6 +178,23 @@ impl Engine {
                 name: name.to_string(),
             }),
         }
+    }
+
+    /// The sandbox's active policy version and its snapshot. A record
+    /// without one is refused with the steps that make it again from its
+    /// own backend and template.
+    fn active_policy(&self, name: &SandboxName) -> Result<(PolicyVersion, PolicySnapshot)> {
+        if let Some(active) = self.state.active_policy(name)? {
+            return Ok(active);
+        }
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Err(Error::NoPolicy {
+            sandbox: name.to_string(),
+            backend: record.backend.to_string(),
+            template: record.template.to_string(),
+        })
     }
 
     /// The program started as the sandbox's proxy, for tests that stand one

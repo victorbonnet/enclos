@@ -335,12 +335,7 @@ impl Engine {
                 // timeout: its process is gone, so it ends here.
                 self.end_dead_sessions(lock, name, SessionKind::Service)?;
                 let compiled = self.compile_policy(name, record.proxy_port)?;
-                let (version, snapshot) =
-                    self.state
-                        .active_policy(name)?
-                        .ok_or_else(|| Error::NoPolicy {
-                            sandbox: name.to_string(),
-                        })?;
+                let (version, snapshot) = self.active_policy(name)?;
                 let launch = Launch {
                     program: program.clone(),
                     args: args.to_vec(),
@@ -414,12 +409,7 @@ impl Engine {
             |id| format!("session {id}"),
             |lock| {
                 self.end_dead_sessions(lock, name, SessionKind::Proxy)?;
-                let (version, snapshot) =
-                    self.state
-                        .active_policy(name)?
-                        .ok_or_else(|| Error::NoPolicy {
-                            sandbox: name.to_string(),
-                        })?;
+                let (version, snapshot) = self.active_policy(name)?;
                 let session = SessionRecord {
                     id: SessionId(0),
                     sandbox: name.clone(),

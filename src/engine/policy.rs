@@ -53,13 +53,7 @@ struct AllowPlan {
 impl Engine {
     /// The sandbox's active policy.
     pub fn policy(&self, name: &SandboxName) -> Result<PolicyView> {
-        self.require_sandbox(name)?;
-        let (version, snapshot) =
-            self.state
-                .active_policy(name)?
-                .ok_or_else(|| Error::NoPolicy {
-                    sandbox: name.to_string(),
-                })?;
+        let (version, snapshot) = self.active_policy(name)?;
         Ok(PolicyView {
             sandbox: name.clone(),
             version,
@@ -169,7 +163,7 @@ impl Engine {
     }
 
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
-    /// records the snapshot as the active version.
+    /// records the snapshot as the active version. Only tests call it.
     #[cfg(test)]
     pub(super) fn save_policy(
         &self,
@@ -182,8 +176,10 @@ impl Engine {
         self.store_policy(lock, by, name, overrides, &snapshot)
     }
 
-    /// As `save_policy`, with `runtime`'s endpoints instead of the installed
-    /// runtime's: while a runtime installs, before it is recorded.
+    /// Resolves and checks `overrides` with `runtime`'s endpoints instead of
+    /// the installed runtime's, writes them to `policy.toml`, then records
+    /// the snapshot as the active version: while a runtime installs, before
+    /// it is recorded.
     pub(super) fn save_policy_for_runtime(
         &self,
         lock: &StateLock,

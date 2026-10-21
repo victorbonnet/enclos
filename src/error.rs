@@ -55,11 +55,16 @@ pub enum Error {
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
     /// A record without an active policy, which `sandbox create` never
-    /// leaves: it records both in one transaction.
+    /// leaves: it records both in one transaction. The steps make it again
+    /// from the backend and template it was recorded with.
     #[error(
-        "sandbox `{sandbox}` has no active policy, so its record is incomplete. Remove the record with `enclos sandbox rm {sandbox} --keep-data`, then run `enclos sandbox create {sandbox}` again: its home is kept"
+        "sandbox `{sandbox}` has no active policy, so its record is incomplete. Remove the record with `enclos sandbox rm {sandbox} --keep-data`, then run `enclos sandbox create {sandbox} --backend {backend} --template {template}` again: its home is kept"
     )]
-    NoPolicy { sandbox: String },
+    NoPolicy {
+        sandbox: String,
+        backend: String,
+        template: String,
+    },
     /// A backend this host cannot run; never overridden (ADR 0009).
     #[error("sandbox `{sandbox}` uses the {backend} backend, which this host cannot run: {reason}")]
     BackendUnavailable {

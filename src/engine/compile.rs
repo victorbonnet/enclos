@@ -26,8 +26,10 @@ impl Engine {
         self.backend_for(name, record.backend)
     }
 
-    /// The backend `kind`, for sandbox `name`, refused when this host cannot
-    /// run it; for a sandbox not recorded yet.
+    /// The backend `kind`, refused when this host cannot run it (ADR 0009:
+    /// no override); `name` only names the sandbox in the error. `backend_of`
+    /// passes a recorded sandbox's kind, `sandbox create` the kind it is
+    /// about to record.
     pub(crate) fn backend_for(
         &self,
         name: &SandboxName,
