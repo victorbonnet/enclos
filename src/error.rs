@@ -42,6 +42,13 @@ pub enum Error {
     NoFreePorts,
     #[error("{what}")]
     Session { what: String },
+    /// Guidance for a failed operation, preserving its cause and exit code.
+    #[error("{what}")]
+    WithContext {
+        #[source]
+        error: Box<Error>,
+        what: String,
+    },
     #[error(transparent)]
     Processes(#[from] crate::lifecycle::process::PsError),
     /// A failed command whose cleanup failed too.
@@ -111,7 +118,9 @@ impl Error {
             | Error::Session { .. }
             | Error::Service(_)
             | Error::Processes(_) => exit::ERROR,
-            Error::CleanupFailed { error, .. } => error.exit_code(),
+            Error::CleanupFailed { error, .. } | Error::WithContext { error, .. } => {
+                error.exit_code()
+            }
             Error::BackendUnavailable { .. } => exit::REFUSED,
         }
     }
@@ -120,6 +129,35 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_and_cleanup_preserve_the_original_exit_code() {
+        for (error, code) in [
+            (Error::Session { what: "x".into() }, 1),
+            (Error::Refused { reason: "x".into() }, 2),
+            (
+                Error::BackendUnavailable {
+                    sandbox: "home".into(),
+                    backend: "seatbelt".into(),
+                    reason: "not available".into(),
+                },
+                2,
+            ),
+            (Error::NeedsConfirmation { what: "x".into() }, 3),
+        ] {
+            let error = Error::WithContext {
+                error: Box::new(error),
+                what: "the operation did not finish".into(),
+            };
+            assert_eq!(error.exit_code(), code);
+            assert!(std::error::Error::source(&error).is_some());
+            let error = Error::CleanupFailed {
+                error: Box::new(error),
+                left: "the staged archive".into(),
+            };
+            assert_eq!(error.exit_code(), code);
+        }
+    }
 
     #[test]
     fn maps_errors_to_exit_codes() {

@@ -1732,6 +1732,32 @@ echo \"installed $*\" > \"$HOME/installed\"
     }
 
     #[test]
+    fn an_import_preserves_the_exit_code_when_the_backend_is_unavailable() {
+        let (dir, mut engine, name, _make) = with_hermes();
+        engine.backends = vec![Box::new(FakeBackend::unavailable(
+            BackendKind::Seatbelt,
+            "this host cannot run the backend",
+        ))];
+        let archive = dir.path().join("fresh.tar.gz");
+        std::fs::write(&archive, b"an export").unwrap();
+        let err = engine
+            .import_agent(&alice(), &name, agent("fresh"), &archive, Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::exit::REFUSED, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("this host cannot run the backend")
+                && text.contains("did not finish")
+                && text.contains("Nothing was recorded")
+                && text.contains("enclos agent add home/fresh"),
+            "{text}"
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        let installers = engine.layout.sandbox_dir("home").join("installers");
+        assert_eq!(std::fs::read_dir(installers).unwrap().count(), 0);
+    }
+
+    #[test]
     fn an_import_whose_session_fails_records_nothing_and_leaves_no_copy() {
         let (dir, engine, name, _make) = with_hermes();
         let archive = dir.path().join("fresh.tar.gz");

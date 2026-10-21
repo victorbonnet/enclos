@@ -179,10 +179,14 @@ impl Engine {
             Err(e) => {
                 // The session may not have started (the proxy, the policy),
                 // or may have started and then failed to report back.
-                let error = failed(format!(
+                let what = format!(
                     "the import of {} into sandbox {name} did not finish: {e}. Nothing was recorded. If {shown} has agent {agent} anyway, `enclos agent list {name}` reports it: record it with `enclos agent add {name}/{agent}`, or delete it with {delete_it}; otherwise import again",
                     archive.path.display()
-                ));
+                );
+                let error = Error::WithContext {
+                    error: Box::new(e),
+                    what,
+                };
                 return Err(with_copy_left(error, copy_left));
             }
         };
