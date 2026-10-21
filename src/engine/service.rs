@@ -144,6 +144,9 @@ impl Engine {
         // Before anything is stopped: an unavailable manager (no login
         // session, another system) would leave the sandbox with nothing.
         self.services.available()?;
+        // A damaged audit log would refuse the audited install after the
+        // removal, leaving the sandbox with nothing.
+        self.audit.check()?;
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
         self.stop_services(name)?;

@@ -2405,6 +2405,29 @@ mod services {
     }
 
     #[test]
+    fn a_damaged_audit_log_refuses_start_and_stop_before_they_remove_services() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let path = engine.layout.audit_log();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let damaged = text.replacen("\"init\"", "\"edited\"", 1);
+        assert_ne!(damaged, text);
+        std::fs::write(&path, &damaged).unwrap();
+
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(err.to_string().contains("is damaged"), "{err}");
+        let err = engine
+            .stop_sandbox(&alice(), &name, Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("is damaged"), "{err}");
+        // Nothing was removed, so the sandbox keeps running.
+        assert_eq!(fake.started.borrow().len(), 2);
+        assert!(fake.stopped.borrow().is_empty());
+        assert_eq!(state_of(&engine, &name), SandboxState::Running);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
+    }
+
+    #[test]
     fn a_sandbox_with_services_installed_is_not_removed() {
         let (_dir, engine, fake, name) = sandbox_with_services(None);
         engine.start_sandbox(&alice(), &name).unwrap();

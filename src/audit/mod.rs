@@ -42,6 +42,10 @@ pub trait AuditLog {
     fn entries(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>>;
     /// Checks the hash chain and lists entries that never finished.
     fn verify(&self) -> Result<VerifyReport>;
+    /// Fails as `begin` would on a damaged log, without writing: for a
+    /// command that must change something outside the lock before it opens
+    /// its entry.
+    fn check(&self) -> Result<()>;
 }
 
 /// Why the audit log could not be read or written.
@@ -49,7 +53,11 @@ pub trait AuditLog {
 pub enum AuditError {
     #[error("audit log {path} not found: enclos is not initialized. Run `enclos init` first")]
     NotFound { path: PathBuf },
-    #[error("audit log {path} is damaged: {reason}. Run `enclos audit verify` for details")]
+    #[error(
+        "audit log {path} is damaged: {reason}. No state-changing command runs until it is \
+         repaired: keep the file under another name, such as `audit.jsonl.damaged`, and the \
+         next command starts a new chain"
+    )]
     Damaged { path: PathBuf, reason: String },
     #[error("cannot use audit log {path}: {source}")]
     Io {

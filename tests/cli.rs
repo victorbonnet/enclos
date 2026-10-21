@@ -221,6 +221,46 @@ fn verify_fails_on_an_edited_line() {
 }
 
 #[test]
+fn a_damaged_log_refuses_writes_until_it_is_set_aside() {
+    let home = Home::new();
+    home.init(3);
+    let mut lines = home.audit_lines();
+    lines[2] = lines[2].replace("\"command\":\"init\"", "\"command\":\"oops\"");
+    home.write_audit_lines(&lines);
+
+    let out = home.run(&["init"]);
+    assert_eq!(out.code(), 1, "stdout: {}", out.stdout());
+    assert!(
+        out.stderr()
+            .contains("line 3 was changed after it was written"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        out.stderr().contains("audit.jsonl.damaged"),
+        "{}",
+        out.stderr()
+    );
+    assert_eq!(home.audit_lines(), lines);
+
+    let verify = home.run(&["audit", "verify"]);
+    assert_eq!(verify.code(), 1);
+    assert!(
+        verify.stderr().contains("audit.jsonl.damaged"),
+        "{}",
+        verify.stderr()
+    );
+
+    // The repair the messages give: keep the file under another name, and
+    // the next command starts a new chain.
+    let log = home.root.join("audit.jsonl");
+    std::fs::rename(&log, home.root.join("audit.jsonl.damaged")).unwrap();
+    home.init(1);
+    assert_eq!(home.audit_lines().len(), 2);
+    home.run(&["audit", "verify"]).ok();
+}
+
+#[test]
 fn verify_fails_on_a_deleted_middle_line() {
     let home = Home::new();
     home.init(3);
