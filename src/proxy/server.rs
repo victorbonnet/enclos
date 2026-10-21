@@ -1,8 +1,9 @@
 //! Serving connections: one thread per client connection, two while a
 //! tunnel relays bytes, and one for each name lookup. Every connection the
 //! proxy decides on gets one network log record, written at the decision.
-//! If that write fails, the proxy says so on its standard error and serves
-//! the connection anyway (ADR 0027 proposes refusing it instead).
+//! If that write fails, the proxy says so on its standard error and goes on
+//! as if it had succeeded: an allowed connection is served without a record
+//! (ADR 0027 proposes refusing it instead).
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -114,8 +115,12 @@ impl Proxy {
             .record(event)
             .inspect_err(|e| {
                 eprintln!(
-                    "enclos proxy: could not log a connection to {}: {e}",
-                    event.host
+                    "enclos proxy: could not log a connection to {}: {e}; {} it without a record",
+                    destination(&event.host, event.port),
+                    match event.verdict {
+                        Verdict::Allowed => "serving",
+                        Verdict::Denied => "refusing",
+                    }
                 )
             })
             .ok()
@@ -574,13 +579,15 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
             "400 Bad Request",
             "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL.\n".to_owned(),
         ),
-        (_, Reason::PolicyUnreadable) => (
-            "403 Forbidden",
-            format!(
-                "enclos: the proxy cannot read this sandbox's policy, so it refuses every destination for now, {dest} included. There is nothing to allow: see why from the host with `enclos logs {}`.\n",
-                event.sandbox
-            ),
-        ),
+        (_, Reason::PolicyUnreadable) => {
+            let sandbox = &event.sandbox;
+            (
+                "403 Forbidden",
+                format!(
+                    "enclos: the proxy cannot read this sandbox's policy, so it refuses every destination for now, {dest} included. There is nothing to allow: see why from the host with `enclos logs {sandbox}`.\n"
+                ),
+            )
+        }
         _ => (
             "403 Forbidden",
             format!(

@@ -96,23 +96,23 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
         } else {
             format!("{} times", d.count)
         };
-        out += &format!(
+        out.push_str(&format!(
             "  {}  {}  {times}, last {}\n",
             destination(&d.host, d.port),
             d.reason,
             d.last.strftime("%Y-%m-%d %H:%M:%S UTC")
-        );
+        ));
     }
-    let unreadable = |d: &DeniedDestination| d.reason == Reason::PolicyUnreadable;
-    if !denied.iter().all(unreadable) {
-        out +=
-            &format!("Allow what you trust with `enclos policy allow {sandbox} <destination>`.\n");
+    if denied.iter().any(|d| !d.reason.nothing_to_allow()) {
+        out.push_str(&format!(
+            "Allow what you trust with `enclos policy allow {sandbox} <destination>`.\n"
+        ));
     }
-    if denied.iter().any(unreadable) {
-        out += &format!(
-            "{}: the proxy could not read the sandbox's policy, so it refused every destination; there is nothing to allow. See why with `enclos logs {sandbox}`.\n",
+    if denied.iter().any(|d| d.reason == Reason::PolicyUnreadable) {
+        out.push_str(&format!(
+            "{}: the proxy could not read the sandbox's policy at those times, so it refused every destination; there is nothing to allow. See why with `enclos logs {sandbox}`.\n",
             Reason::PolicyUnreadable
-        );
+        ));
     }
     out
 }
@@ -133,11 +133,14 @@ mod tests {
         }
     }
 
+    fn lab() -> SandboxName {
+        "lab".parse().unwrap()
+    }
+
     #[test]
     fn a_refusal_because_the_policy_was_unreadable_is_not_offered_to_allow() {
-        let lab: SandboxName = "lab".parse().unwrap();
         let text = denied_text(
-            &lab,
+            &lab(),
             &[refused("api.example.com", Reason::PolicyUnreadable)],
         );
         assert!(
@@ -147,23 +150,29 @@ mod tests {
         assert!(!text.contains("policy allow"), "{text}");
         assert!(text.contains("nothing to allow"), "{text}");
         assert!(text.contains("`enclos logs lab`"), "{text}");
+    }
 
-        let both = denied_text(
-            &lab,
+    #[test]
+    fn mixed_refusals_get_both_hints() {
+        let text = denied_text(
+            &lab(),
             &[
                 refused("api.example.com", Reason::PolicyUnreadable),
                 refused("evil.example.com", Reason::NotAllowed),
             ],
         );
         assert!(
-            both.contains("enclos policy allow lab <destination>"),
-            "{both}"
+            text.contains("enclos policy allow lab <destination>"),
+            "{text}"
         );
-        assert!(both.contains("nothing to allow"), "{both}");
+        assert!(text.contains("nothing to allow"), "{text}");
+    }
 
-        let plain = denied_text(&lab, &[refused("evil.example.com", Reason::NotAllowed)]);
-        assert!(plain.contains("enclos policy allow lab"), "{plain}");
-        assert!(!plain.contains("nothing to allow"), "{plain}");
+    #[test]
+    fn a_plain_refusal_gets_only_the_allow_hint() {
+        let text = denied_text(&lab(), &[refused("evil.example.com", Reason::NotAllowed)]);
+        assert!(text.contains("enclos policy allow lab"), "{text}");
+        assert!(!text.contains("nothing to allow"), "{text}");
     }
 }
 

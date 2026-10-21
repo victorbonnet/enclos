@@ -1,7 +1,8 @@
 //! The egress proxy: one per sandbox, the sandbox's only way out (ADRs 0007,
 //! 0017). A domain-level CONNECT proxy without TLS interception: it checks
 //! the destination against the allowlist, resolves the name itself, connects
-//! only to validated addresses, and logs every connection.
+//! only to validated addresses, and logs every connection it decides on
+//! (design §6 says when a record can be missing).
 //!
 //! It reads the sandbox's active policy for each new connection, so
 //! `enclos policy allow` applies without a restart.

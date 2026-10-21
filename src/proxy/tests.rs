@@ -29,6 +29,26 @@ impl PolicySource for UnreadablePolicy {
     }
 }
 
+/// A log store that cannot write, as with a full disk.
+struct FailingLog;
+
+impl NetLogStore for FailingLog {
+    fn record(&self, _: &NetEvent) -> StateResult<i64> {
+        Err(crate::state::StateError::Locked {
+            path: "state.db".into(),
+        })
+    }
+    fn finish(&self, _: i64, _: &NetEvent) -> StateResult<()> {
+        unreachable!("a connection without a record has no row to finish")
+    }
+    fn events(&self, _: &SandboxName, _: Option<Timestamp>) -> StateResult<Vec<NetEvent>> {
+        Ok(Vec::new())
+    }
+    fn denied(&self, _: &SandboxName) -> StateResult<Vec<DeniedDestination>> {
+        Ok(Vec::new())
+    }
+}
+
 /// Every name resolves to the address it was given.
 struct FakeResolver(IpAddr);
 
@@ -219,17 +239,16 @@ fn an_unlisted_destination_is_denied_at_once_and_logged() {
 }
 
 #[test]
-fn an_unreadable_policy_denies_even_an_allowed_destination_and_is_nothing_to_allow() {
-    let (port, _received) = upstream(b"");
+fn an_unreadable_policy_denies_with_its_own_reason_and_nothing_to_allow() {
     let proxy = start_with(
-        &[format!("allowed.example.com:{port}")],
+        &[],
         Box::new(FakeResolver(LOCAL)),
         loopback_is_global,
         |p| p.policy = Box::new(UnreadablePolicy),
     );
     let mut conn = TcpStream::connect(proxy.addr).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    write!(conn, "CONNECT allowed.example.com:{port} HTTP/1.1\r\n\r\n").unwrap();
+    write!(conn, "CONNECT allowed.example.com:443 HTTP/1.1\r\n\r\n").unwrap();
     let mut reply = String::new();
     let _ = conn.read_to_string(&mut reply);
     assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
@@ -241,6 +260,29 @@ fn an_unreadable_policy_denies_even_an_allowed_destination_and_is_nothing_to_all
         (Verdict::Denied, Some(Reason::PolicyUnreadable))
     );
     assert_eq!(events[0].address, None);
+}
+
+#[test]
+fn an_allowed_tunnel_is_served_even_when_its_record_cannot_be_written() {
+    // Today's behaviour, fail open (design §6). ADR 0027 proposes refusing
+    // it instead; accepting it turns this test around.
+    let (port, received) = upstream(b"pong");
+    let proxy = start_with(
+        &[format!("allowed.example.com:{port}")],
+        Box::new(FakeResolver(LOCAL)),
+        loopback_is_global,
+        |p| p.log = Box::new(FailingLog),
+    );
+    let (mut conn, reply) = send(
+        proxy.addr,
+        &format!("CONNECT allowed.example.com:{port} HTTP/1.1\r\n\r\n"),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    conn.write_all(b"ping").unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        b"ping"
+    );
 }
 
 #[test]

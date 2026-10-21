@@ -31,8 +31,9 @@ pub enum Reason {
     ConnectFailed,
     /// The client did not send a request the proxy understands.
     BadRequest,
-    /// The proxy could not read the sandbox's active policy, so it refused
-    /// the connection whatever its destination: nothing to allow.
+    /// The proxy could not get the sandbox's active policy (`state.db`
+    /// unreadable, or no active policy), so it refused the connection
+    /// whatever its destination: nothing to allow.
     PolicyUnreadable,
     /// Allowed, then closed by the proxy: no byte moved either way, or a
     /// peer read nothing, for the idle limit (design §6).
@@ -50,6 +51,22 @@ impl Reason {
             Reason::BadRequest => "bad-request",
             Reason::PolicyUnreadable => "policy-unreadable",
             Reason::Idle => "idle",
+        }
+    }
+
+    /// Whether the refusal left nothing for `enclos policy allow` to change,
+    /// because it did not depend on the destination. Every reason is listed,
+    /// so a new one has to decide.
+    pub fn nothing_to_allow(self) -> bool {
+        match self {
+            Reason::PolicyUnreadable => true,
+            Reason::NotAllowed
+            | Reason::BlockedAddress
+            | Reason::PrivateAddress
+            | Reason::ResolveFailed
+            | Reason::ConnectFailed
+            | Reason::BadRequest
+            | Reason::Idle => false,
         }
     }
 
@@ -130,6 +147,26 @@ mod tests {
     fn an_ipv6_destination_is_bracketed() {
         assert_eq!(destination("2606:4700::1111", 443), "[2606:4700::1111]:443");
         assert_eq!(destination("api.example.com", 8443), "api.example.com:8443");
+    }
+
+    #[test]
+    fn every_reason_is_in_all() {
+        // No `_` arm: a new reason does not compile until it gets the next
+        // index here, which is its place in `ALL`, the list `FromStr` reads.
+        fn index(reason: Reason) -> usize {
+            match reason {
+                Reason::NotAllowed => 0,
+                Reason::BlockedAddress => 1,
+                Reason::PrivateAddress => 2,
+                Reason::ResolveFailed => 3,
+                Reason::ConnectFailed => 4,
+                Reason::BadRequest => 5,
+                Reason::PolicyUnreadable => 6,
+            }
+        }
+        for (i, reason) in Reason::ALL.into_iter().enumerate() {
+            assert_eq!(index(reason), i, "{reason}");
+        }
     }
 
     #[test]
