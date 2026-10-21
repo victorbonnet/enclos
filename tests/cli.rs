@@ -562,6 +562,18 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         ("Library/LaunchAgents/org.example.fake.plist", "not a plist"),
         ("work/.secrets/token", "not a token"),
         ("work/.env", "TOKEN=x"),
+        (".cargo/credentials.toml", "secret"),
+        (".zhistory", "secret"),
+        (
+            "Library/Application Support/Google/Chrome Beta/Default/Cookies",
+            "secret",
+        ),
+        (".password-store/bank.gpg", "secret"),
+        (".gemini/oauth_creds.json", "secret"),
+        (
+            "Library/Group Containers/group.com.apple.notes/NoteStore.sqlite",
+            "secret",
+        ),
     ] {
         let file = user.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -682,6 +694,23 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         report.contains("by Seatbelt itself rather than"),
         "{report}"
     );
+    // Each fake file's deny entry: the folder, or the file itself.
+    for entry in [
+        "/.ssh",
+        "/.cargo/credentials.toml",
+        "/.zhistory",
+        "/Library/Application Support/Google/Chrome Beta",
+        "/.password-store",
+        "/.gemini",
+        "/Library/Group Containers/group.com.apple.notes",
+    ] {
+        let closed = report.lines().any(|l| {
+            l.trim_start().starts_with("closed ")
+                && l.contains(" sensitive files ")
+                && l.ends_with(entry)
+        });
+        assert!(closed, "no closed probe reads {entry}:\n{report}");
+    }
     assert!(report.contains("probes were shown closed"), "{report}");
     // `.env`, LaunchAgents and the sandbox's policy keep what the test put
     // there; any other file a probe left would show as OPEN above.

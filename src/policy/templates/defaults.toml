@@ -19,42 +19,92 @@ read_deny = [
     "~/.pypirc",
     "~/.git-credentials",
     "~/.config/gh",
+    "~/.config/hub",
+    "~/.config/glab-cli",
+    "~/.config/rclone",
+    "~/.rclone.conf",
+    "~/.cargo/credentials.toml",
+    "~/.cargo/credentials",
+    "~/.gem/credentials",
+    "~/.pgpass",
+    "~/.my.cnf",
+    "~/.mylogin.cnf",
+    "~/.vault-token",
+    "~/.terraform.d/credentials.tfrc.json",
+    "~/Library/Application Support/com.vercel.cli",
     "~/Library/Keychains",
-    # Shell and REPL history
+    # Hugging Face's login at its default location, not its download cache
+    "~/.cache/huggingface/token",
+    "~/.cache/huggingface/stored_tokens",
+    # Shell, REPL and pager history
     "~/.zsh_history",
     "~/.zsh_sessions",
     "~/.bash_history",
     "~/.bash_sessions",
+    "~/.sh_history",
+    "~/.zhistory",
+    "~/.histfile",
     "~/.local/share/fish",
+    "~/.local/share/atuin",
     "~/.python_history",
     "~/.node_repl_history",
     "~/.psql_history",
     "~/.mysql_history",
+    "~/.lesshst",
     # Browser data
     "~/Library/Application Support/Google/Chrome",
+    "~/Library/Application Support/Google/Chrome Beta",
+    "~/Library/Application Support/Google/Chrome Canary",
+    "~/Library/Application Support/Google/Chrome Dev",
     "~/Library/Application Support/Chromium",
     "~/Library/Application Support/BraveSoftware",
     "~/Library/Application Support/Microsoft Edge",
     "~/Library/Application Support/Arc",
     "~/Library/Application Support/Firefox",
+    "~/Library/Application Support/Vivaldi",
+    "~/Library/Application Support/com.operasoftware.Opera",
+    "~/Library/Application Support/Orion",
     "~/Library/Safari",
+    "~/Library/Containers/com.apple.Safari",
+    # Cookies and site data apps keep through macOS's own web stack
     "~/Library/Cookies",
-    # Mail and messages
+    "~/Library/HTTPStorages",
+    "~/Library/WebKit",
+    # Mail, messages and Apple apps' personal data. macOS privacy permissions
+    # (TCC) usually hide these, but a terminal with Full Disk Access passes
+    # that on to the sandbox (design §5).
     "~/Library/Mail",
+    "~/Library/Containers/com.apple.mail",
     "~/Library/Messages",
+    "~/Library/Group Containers/group.com.apple.notes",
+    "~/Library/Application Support/AddressBook",
+    "~/Library/Calendars",
+    "~/Library/Group Containers/group.com.apple.calendar",
+    "~/Pictures/Photos Library.photoslibrary",
     # Password managers
     "~/Library/Application Support/1Password",
     "~/Library/Group Containers/2BUA8C4S2C.com.1password",
     "~/Library/Application Support/Bitwarden",
+    "~/Library/Application Support/Bitwarden CLI",
     "~/Library/Application Support/Proton Pass",
+    # KeePassXC's settings: its databases stay wherever the user keeps them
+    "~/Library/Application Support/KeePassXC",
+    "~/.password-store",
+    "~/.config/op",
     # Launch agents: Hermes finds the real home through the user database, not
     # $HOME, and read the host's own gateway job here (prototype, issue #5).
     "~/Library/LaunchAgents",
-    # The host's own agent configuration
+    # The host's own assistant tools' configuration and logins
     "~/.claude",
     "~/.claude.json",
+    "~/Library/Application Support/Claude",
     "~/.codex",
     "~/.hermes",
+    "~/.gemini",
+    "~/.cursor",
+    "~/Library/Application Support/Cursor",
+    "~/.config/opencode",
+    "~/.local/share/opencode",
 ]
 
 [network]

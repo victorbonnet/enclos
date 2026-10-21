@@ -268,6 +268,73 @@ mod tests {
         assert_eq!(snap.id.0.len(), 64);
     }
 
+    // The list repeats entries of `defaults.toml` on purpose: it guards against
+    // one being dropped from the file, which `check_default_denies` cannot
+    // catch since it compares against that same file.
+    #[test]
+    fn the_defaults_hide_logins_history_browsers_password_managers_assistant_tools_and_apple_data()
+    {
+        let snap = resolve(&overrides(""), None).unwrap();
+        for entry in [
+            // Credentials and keys
+            "~/.cargo/credentials.toml",
+            "~/.cargo/credentials",
+            "~/.gem/credentials",
+            "~/.pgpass",
+            "~/.my.cnf",
+            "~/.mylogin.cnf",
+            "~/.vault-token",
+            "~/.terraform.d/credentials.tfrc.json",
+            "~/Library/Application Support/com.vercel.cli",
+            "~/.config/hub",
+            "~/.config/glab-cli",
+            "~/.config/rclone",
+            "~/.rclone.conf",
+            "~/.cache/huggingface/token",
+            "~/.cache/huggingface/stored_tokens",
+            // History
+            "~/.sh_history",
+            "~/.zhistory",
+            "~/.histfile",
+            "~/.lesshst",
+            "~/.local/share/atuin",
+            // Browsers
+            "~/Library/Application Support/Google/Chrome Beta",
+            "~/Library/Application Support/Google/Chrome Canary",
+            "~/Library/Application Support/Google/Chrome Dev",
+            "~/Library/Application Support/Vivaldi",
+            "~/Library/Application Support/com.operasoftware.Opera",
+            "~/Library/Application Support/Orion",
+            "~/Library/Containers/com.apple.Safari",
+            "~/Library/HTTPStorages",
+            "~/Library/WebKit",
+            // Password managers
+            "~/Library/Application Support/KeePassXC",
+            "~/.password-store",
+            "~/.config/op",
+            "~/Library/Application Support/Bitwarden CLI",
+            // Other assistant tools
+            "~/Library/Application Support/Claude",
+            "~/.gemini",
+            "~/.cursor",
+            "~/Library/Application Support/Cursor",
+            "~/.config/opencode",
+            "~/.local/share/opencode",
+            // Mail and Apple apps' data
+            "~/Library/Containers/com.apple.mail",
+            "~/Library/Group Containers/group.com.apple.notes",
+            "~/Library/Application Support/AddressBook",
+            "~/Library/Calendars",
+            "~/Library/Group Containers/group.com.apple.calendar",
+            "~/Pictures/Photos Library.photoslibrary",
+        ] {
+            assert!(
+                snap.policy.fs.read_deny.contains(&entry.to_owned()),
+                "{entry} is not denied"
+            );
+        }
+    }
+
     #[test]
     fn resolution_is_deterministic_and_order_insensitive() {
         let a = resolve(&overrides("\"b.example.com\", \"A.example.com\""), None).unwrap();
