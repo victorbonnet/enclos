@@ -33,7 +33,7 @@ pub enum PolicyError {
     #[error("a template cannot extend another; `{0}` names `extends`")]
     NestedTemplate(String),
     #[error(
-        "the {runtime} adapter's layer may only add network destinations (`[network] allow_add`) and allow listening (`listen`); it sets {}",
+        "the {runtime} adapter's layer may only add network destinations (`[network] allow_add`) and set `listen`; it sets {}",
         sets.join(", ")
     )]
     AdapterLayer { runtime: String, sets: Vec<String> },
@@ -361,6 +361,48 @@ mod tests {
         assert_eq!(with.policy.net.allow, ["chatgpt.com"]);
         assert_eq!(with.inputs.adapter.as_ref().unwrap().version, "1.2.3");
         assert_ne!(with.id, without.id);
+    }
+
+    fn layer(text: &str) -> AdapterLayer {
+        AdapterLayer {
+            runtime: "hermes".into(),
+            version: "2".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn an_adapter_layer_may_set_listen_and_add_destinations_and_nothing_else() {
+        let listens = resolve(&overrides(""), Some(&layer("[network]\nlisten = true\n"))).unwrap();
+        assert!(listens.policy.net.listen);
+        for (text, sets) in [
+            (
+                "[network]\nlisten = true\nlog = \"metadata\"\n",
+                "network.log",
+            ),
+            ("[network]\nmode = \"public\"\n", "network.mode"),
+            ("[filesystem]\nwrite_add = [\"~/x\"]\n", "filesystem"),
+        ] {
+            let err = resolve(&overrides(""), Some(&layer(text))).unwrap_err();
+            let PolicyError::AdapterLayer { sets: found, .. } = err else {
+                panic!("{text}: {err}");
+            };
+            assert_eq!(found, [sets], "{text}");
+        }
+    }
+
+    #[test]
+    fn policy_toml_turning_listening_off_wins_over_the_adapter() {
+        let off = overrides("").replace("[network]", "[network]\nlisten = false");
+        let snap = resolve(&off, Some(&layer("[network]\nlisten = true\n"))).unwrap();
+        assert!(!snap.policy.net.listen);
+    }
+
+    #[test]
+    fn a_policy_stored_before_listening_existed_does_not_listen() {
+        let json = r#"{"fs":{"write":[],"read_deny":[]},"net":{"mode":"allowlist","allow":[],"private":[],"log":"metadata"}}"#;
+        let policy: Policy = serde_json::from_str(json).unwrap();
+        assert!(!policy.net.listen);
     }
 
     #[test]

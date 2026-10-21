@@ -54,6 +54,9 @@ impl PolicyFile {
         if self.filesystem != FsLayer::default() {
             found.push("filesystem");
         }
+        if self.network.mode.is_some() {
+            found.push("network.mode");
+        }
         if self.network.allow.is_some() {
             found.push("network.allow");
         }

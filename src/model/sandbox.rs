@@ -138,7 +138,8 @@ pub struct SandboxRecord {
 
 /// The range sandbox proxy ports are taken from, every install's. A sandbox
 /// that may listen binds none of them (ADR 0028), denied one by one since
-/// Seatbelt has no port ranges: 1,000 rules add about 0.03 s to a launch.
+/// Seatbelt has no port ranges: 1,000 rules add about 0.03 s to a launch
+/// (macOS 26.5.2, ADR 0028).
 pub const PORT_FIRST: u16 = 41000;
 pub const PORT_LAST: u16 = 41999;
 

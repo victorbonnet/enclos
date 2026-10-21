@@ -133,9 +133,12 @@ struct InstallPlan {
     active: u32,
     /// The runtime's destinations the active policy does not allow yet.
     added: Vec<String>,
-    /// Whether the runtime's layer lets the sandbox listen, which the active
-    /// policy does not yet (ADR 0028).
+    /// Whether the runtime's layer turns listening on, and the new policy
+    /// listens where the active one does not (ADR 0028).
     listens: bool,
+    /// Whether the runtime's layer turns listening on and `policy.toml`
+    /// keeps it off, so the runtime's service cannot start.
+    listen_kept_off: bool,
     /// What else the new version changes: edits to `policy.toml` not
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
@@ -420,17 +423,22 @@ impl Engine {
             .cloned()
             .collect();
         let mut also = differences(&active.snapshot.policy, &snapshot.policy, &expected);
-        // Listening the adapter's layer asks for is what the runtime brings,
-        // like its destinations (ADR 0028), unless `policy.toml` overrides it.
+        // Listening the adapter's layer turns on is what the runtime brings,
+        // like its destinations (ADR 0028); any other change of it is an edit
+        // of `policy.toml`, which stays an "also" change. Kept off by
+        // `policy.toml`, the runtime's service cannot start, which the plan
+        // says.
+        let asks = layer.network.listen == Some(true);
         let listening = snapshot.policy.net.listen;
-        if layer.network.listen == Some(listening) {
-            also.retain(|c| *c != listen_change(listening));
+        if asks && listening {
+            also.retain(|c| *c != listen_change(true));
         }
         Ok(InstallPlan {
             overrides,
             active: active.version.version,
             added,
-            listens: listening && !active.snapshot.policy.net.listen,
+            listens: asks && listening && !active.snapshot.policy.net.listen,
+            listen_kept_off: asks && !listening,
             also,
             proxy_runs: self.proxy_runs(name)?,
         })
@@ -921,8 +929,14 @@ impl InstallPlan {
         let kind = runtime.kind();
         let mut changes = Vec::new();
         match self.added.len() {
+            0 if self.also.is_empty() && !self.listens && !self.listen_kept_off => {
+                changes.push(format!(
+                    "keep the policy of sandbox {name} at v{}: it already allows what {kind} needs",
+                    self.active
+                ))
+            }
             0 if self.also.is_empty() && !self.listens => changes.push(format!(
-                "keep the policy of sandbox {name} at v{}: it already allows what {kind} needs",
+                "keep the policy of sandbox {name} at v{}",
                 self.active
             )),
             0 => changes.push(format!(
@@ -935,7 +949,12 @@ impl InstallPlan {
         }
         if self.listens {
             changes.push(format!(
-                "let {kind}'s own service listen in sandbox {name} (ADR 0028): on TCP, any port but enclos's proxy ports, on every address, so what listens there can serve the network"
+                "let sandbox {name} listen on TCP for {kind} (ADR 0028): any port but enclos's proxy ports, on every address, and anything in it can serve the network"
+            ));
+        }
+        if self.listen_kept_off {
+            changes.push(format!(
+                "keep sandbox {name} from listening, as its policy.toml sets `listen = false`: {kind}'s service cannot start without it (ADR 0028)"
             ));
         }
         changes.extend(self.also.iter().map(|c| format!("also {c}")));

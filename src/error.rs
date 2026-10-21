@@ -38,7 +38,7 @@ pub enum Error {
     )]
     SandboxNotStopped { name: String, reason: String },
     #[error(
-        "no free proxy port is left between {} and {}. Remove a sandbox you no longer use",
+        "no free proxy port is left between {} and {}. Remove a sandbox you no longer use, or stop what else listens on those ports",
         crate::model::sandbox::PORT_FIRST,
         crate::model::sandbox::PORT_LAST
     )]

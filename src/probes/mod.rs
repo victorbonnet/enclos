@@ -314,38 +314,78 @@ fn open_for_writing_probe(route: &'static str, name: &str, file: &Path) -> Probe
     )
 }
 
-/// A script that binds TCP `port` on 127.0.0.1 and exits at once: it never
+/// A loopback address a bind probe tries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loopback {
+    V4,
+    V6,
+}
+
+impl Loopback {
+    fn shown(self) -> &'static str {
+        match self {
+            Loopback::V4 => "127.0.0.1",
+            Loopback::V6 => "[::1]",
+        }
+    }
+}
+
+/// A script that binds TCP `port` on `at` and exits at once: it never
 /// listens, so nothing can connect even if the bind is allowed. Port 0 lets
 /// the system choose one. `perl` ships with macOS and prints the error it
-/// gets, Seatbelt's `Operation not permitted` included.
-fn bind_script(port: u16) -> String {
+/// gets, Seatbelt's `Operation not permitted` included, after `bind: `, so
+/// a refusal of anything else is not taken for the bind's.
+fn bind_script(at: Loopback, port: u16) -> String {
+    let (family, address) = match at {
+        Loopback::V4 => (
+            "AF_INET",
+            format!("sockaddr_in({port}, inet_aton(\"127.0.0.1\"))"),
+        ),
+        Loopback::V6 => (
+            "AF_INET6",
+            format!("pack_sockaddr_in6({port}, inet_pton(AF_INET6, \"::1\"))"),
+        ),
+    };
     format!(
-        "/usr/bin/perl -MSocket -e 'socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"socket: $!\\n\"; bind($s, sockaddr_in({port}, inet_aton(\"127.0.0.1\"))) or die \"bind: $!\\n\"'"
+        "/usr/bin/perl -MSocket=:all -e 'socket(my $s, {family}, SOCK_STREAM, 0) or die \"socket: $!\\n\"; bind($s, {address}) or die \"bind: $!\\n\"'"
     )
 }
 
-/// Listening (ADR 0028). Without `listen`, no TCP bind at all. With it, any
-/// port but the proxy ports, so the probe binds the sandbox's own: Seatbelt
-/// refuses before the port is found in use, so it is refused the same way
-/// while the proxy holds it, where the host would get `Address already in
-/// use`. Either way the control is a bind the system chooses the port for,
-/// on the host. That listening itself is open when allowed is said by the
-/// report, not shown as closed.
-pub(crate) fn listen_probe(listen: bool, proxy_port: u16) -> Probe {
-    let (name, port) = match listen {
-        false => ("listen on a TCP port".to_owned(), 0),
-        true => (
-            format!("listen on the sandbox's proxy port, {proxy_port}"),
-            proxy_port,
-        ),
-    };
-    probe(
-        "network",
-        name,
-        bind_script(port),
-        Expect::FailsWith(REFUSED),
-        bind_script(0),
-    )
+/// What a bind Seatbelt refused prints.
+const BIND_REFUSED: &str = "bind: Operation not permitted";
+
+/// Listening (ADR 0028), on 127.0.0.1 and on `[::1]`. Without `listen`, no
+/// TCP bind at all. With it, any port but the proxy range, so the probes bind
+/// the sandbox's own proxy port: Seatbelt refuses before the port is found
+/// in use, so the bind is refused the same way while the proxy holds it,
+/// where the host would get `Address already in use`. The control is a bind
+/// of the same address on a port the system chooses, on the host: where
+/// `[::1]` is not configured it fails, and that probe is inconclusive. That
+/// listening itself is open when allowed is said by the report, not shown
+/// as closed.
+pub(crate) fn listen_probes(listen: bool, proxy_port: u16) -> Vec<Probe> {
+    [Loopback::V4, Loopback::V6]
+        .into_iter()
+        .map(|at| {
+            let (name, port) = match listen {
+                false => (format!("bind a TCP port on {}", at.shown()), 0),
+                true => (
+                    format!(
+                        "bind the sandbox's proxy port, {proxy_port}, on {}",
+                        at.shown()
+                    ),
+                    proxy_port,
+                ),
+            };
+            probe(
+                "network",
+                name,
+                bind_script(at, port),
+                Expect::FailsWith(BIND_REFUSED),
+                bind_script(at, 0),
+            )
+        })
+        .collect()
 }
 
 /// Whether a probe can read or write `path` without waiting: a folder or a
@@ -648,7 +688,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "/usr/bin/nc -z -w 3 1.1.1.1 443",
     ));
     list.push(ipv6_loopback_probe(i.proxy_port));
-    list.push(listen_probe(i.listen, i.proxy_port));
+    list.extend(listen_probes(i.listen, i.proxy_port));
     list.push(same_outside(
         "dns",
         "DNS on port 53",

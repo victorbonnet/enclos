@@ -140,6 +140,18 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     );
     line(unmovable_rule(&fs, &tag)?);
 
+    // A sandbox that listens binds no port of the proxy range (below): one
+    // whose proxy port is elsewhere could have it taken by another sandbox.
+    if !(PORT_FIRST..=PORT_LAST).contains(&ctx.proxy_port) {
+        return Err(CompileError::Unsupported {
+            backend: BackendKind::Seatbelt,
+            reason: format!(
+                "sandbox {name} has proxy port {port}, outside enclos's proxy range {PORT_FIRST} to {PORT_LAST}, which sandboxes that listen are kept from binding (ADR 0028); make it again with `enclos sandbox rm {name}`, then `enclos sandbox create {name}`",
+                name = ctx.name,
+                port = ctx.proxy_port,
+            ),
+        });
+    }
     line(
         "\n;; ---- Network: only the sandbox's proxy, and Unix sockets in its home (ADR 0007)"
             .into(),
@@ -170,10 +182,10 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         // address. Then each port of the proxy range is closed again, every
         // install's, reserved before this policy was compiled or after, so
         // no sandbox takes another's proxy port while that proxy is not
-        // running: an exact-port deny after the allow held on every address,
-        // and Seatbelt refuses before the port is found in use. It has no
-        // port ranges, hence one rule a port. Outbound is unchanged: only the
-        // proxy port.
+        // running: an exact-port deny after the allow holds on 127.0.0.1,
+        // 0.0.0.0, [::1] and [::] (backend tests), and Seatbelt refuses
+        // before the port is found in use. It has no port ranges, hence one
+        // rule a port. Outbound is unchanged: only the proxy port.
         line("(allow network-bind network-inbound (local tcp \"localhost:*\"))".into());
         for port in PORT_FIRST..=PORT_LAST {
             line(format!(
@@ -318,6 +330,15 @@ mod tests {
         p.fs.write = vec!["{home}".into(), "~/work".into()];
         p.fs.read_deny = vec!["~/.ssh".into(), "~/.netrc".into()];
         p
+    }
+
+    #[test]
+    fn a_proxy_port_outside_the_range_is_refused() {
+        let layout = Layout::at(Path::new("/nonexistent-enclos-test/alice/.enclos"));
+        let ctx = SandboxContext::new(&layout, &"home".parse().unwrap(), 45000);
+        let err = compile(&policy(), &ctx).unwrap_err().to_string();
+        assert!(err.contains("proxy port 45000, outside"), "{err}");
+        assert!(err.contains("enclos sandbox rm home"), "{err}");
     }
 
     #[test]

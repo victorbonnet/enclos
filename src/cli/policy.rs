@@ -112,7 +112,7 @@ fn print_policy(view: &PolicyView) {
     }
     if policy.net.listen {
         println!(
-            "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens here can serve the network"
+            "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
         );
     }
     println!("\nEdit {} to change it.", view.file.display());
@@ -184,7 +184,7 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     );
     if report.listens {
         println!(
-            "Open by the policy, not probed: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028). What listens in this sandbox can serve the network."
+            "Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network."
         );
     }
     println!(

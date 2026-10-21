@@ -56,7 +56,11 @@ fn world() -> World {
     std::fs::write(user.join("readable.txt"), "fine").unwrap();
     // A workspace the user reaches through a link of their own.
     std::os::unix::fs::symlink(user.join("projects"), user.join("linked")).unwrap();
-    let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+    // The proxy's port: one of enclos's proxy range, which the compiler
+    // requires (ADR 0028).
+    let allowed = (crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap();
     let other = TcpListener::bind("127.0.0.1:0").unwrap();
     let ctx = SandboxContext::new(
         &Layout::at(&data),
@@ -226,56 +230,121 @@ fn the_network_reaches_only_the_proxy_port() {
 }
 
 /// Listening (ADR 0028). Without `listen`, no TCP bind at all. With it, any
-/// port outside the proxy range, on loopback and on every address, and none
-/// in it, held by a proxy or not, whatever install reserved it; outbound
-/// still reaches only the proxy port. The `policy test` probe is closed in
-/// both cases, with its control working on the host.
+/// port outside the proxy range, on both loopbacks and on every address, and
+/// none in it, held by a proxy or not, whatever install reserved it: an IPv6
+/// socket that also takes IPv4 (`[::]`) included. Outbound still reaches only
+/// the proxy port. The `policy test` probes are closed in both cases, judged
+/// as `policy test` judges them, and open without the deny rules.
 #[test]
 fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
-    let w = world();
+    let mut w = world();
     let bind = |addr: &str, port: u16| {
+        let (family, sockaddr) = match addr.contains(':') {
+            false => (
+                "AF_INET",
+                format!("sockaddr_in({port}, inet_aton(\"{addr}\"))"),
+            ),
+            true => (
+                "AF_INET6",
+                format!("pack_sockaddr_in6({port}, inet_pton(AF_INET6, \"{addr}\"))"),
+            ),
+        };
         format!(
-            "/usr/bin/perl -MSocket -e 'socket(my $s, PF_INET, SOCK_STREAM, 0) or die \"$!\\n\"; bind($s, sockaddr_in({port}, inet_aton(\"{addr}\"))) or die \"$!\\n\"; listen($s, 1) or die \"$!\\n\"'"
+            "/usr/bin/perl -MSocket=:all -e 'socket(my $s, {family}, SOCK_STREAM, 0) or die \"$!\\n\"; bind($s, {sockaddr}) or die \"$!\\n\"; listen($s, 1) or die \"$!\\n\"'"
         )
     };
-    // Two ports of the proxy range, every install's: one a proxy holds, as
-    // the host does here, and one nothing holds, such as the port of a
-    // sandbox made after this policy was compiled.
-    let mut range = (crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
-        .filter_map(|port| TcpListener::bind(("127.0.0.1", port)).ok());
-    let held = range.next().unwrap();
-    let proxy = held.local_addr().unwrap().port();
-    let free = range.next().unwrap().local_addr().unwrap().port();
-    drop(range);
-    let probe_closes = |w: &World, listen: bool| {
-        let probe = crate::probes::listen_probe(listen, proxy);
-        let Proof::Control { control, .. } = &probe.proof else {
-            panic!("{} has no control", probe.name);
-        };
-        let host = Command::new("/bin/sh")
-            .args(["-c", control.as_str()])
-            .status()
-            .unwrap();
-        assert!(host.success(), "the control fails on the host");
-        assert!(w.refused(&probe.script), "{}", probe.name);
+    // Two ports of the proxy range, every install's: the world's proxy port,
+    // held by a listener standing in for its proxy, and one nothing holds,
+    // such as the port of a sandbox made after this policy was compiled.
+    let proxy = w.ctx.proxy_port;
+    let free = (crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let v6 = TcpListener::bind(("::1", 0)).is_ok();
+    // Each probe as `policy test` runs it: the sandbox, then the control.
+    let judged = |w: &World, listen: bool| -> Vec<(String, Outcome)> {
+        crate::probes::listen_probes(listen, proxy)
+            .into_iter()
+            .filter(|p| v6 || !p.name.ends_with("[::1]"))
+            .map(|p| {
+                let launch = Launch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), sandboxed_script(&p).into()],
+                    env: vec![],
+                    in_terminal: false,
+                };
+                let out = Seatbelt
+                    .wrap(&w.compiled, &w.ctx, &launch)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap();
+                let Proof::Control { control, .. } = &p.proof else {
+                    panic!("{} has no control", p.name);
+                };
+                let host = Command::new("/bin/sh")
+                    .args(["-c", control.as_str()])
+                    .output()
+                    .unwrap();
+                let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+                let got = outcome(
+                    &p,
+                    Run::read(out.status.success(), &text(&out.stdout), &text(&out.stderr)),
+                    Ok(None),
+                    Some((host.status.success(), &text(&host.stdout))),
+                );
+                (p.name, got)
+            })
+            .collect()
     };
     assert!(w.refused(&bind("127.0.0.1", 0)));
-    probe_closes(&w, false);
+    if v6 {
+        assert!(w.refused(&bind("::1", 0)));
+    }
+    for (name, got) in judged(&w, false) {
+        assert_eq!(got, Outcome::Closed, "{name}");
+    }
 
     let mut policy = Policy::default();
     policy.fs.write = vec!["{home}".into()];
     policy.net.listen = true;
     w.enforce(&policy);
-    for addr in ["127.0.0.1", "0.0.0.0"] {
+    let mut addrs = vec!["127.0.0.1", "0.0.0.0"];
+    if v6 {
+        addrs.extend(["::1", "::"]);
+    }
+    for addr in addrs {
         assert!(w.sh(&bind(addr, 0)), "{addr}:0");
         // Seatbelt refuses before the port is found in use.
         assert!(w.refused(&bind(addr, proxy)), "{addr}:{proxy}, held");
         assert!(w.refused(&bind(addr, free)), "{addr}:{free}");
     }
-    drop(held);
-    probe_closes(&w, true);
+    for (name, got) in judged(&w, true) {
+        assert_eq!(got, Outcome::Closed, "{name}");
+    }
     let other = w.other.local_addr().unwrap().port();
     assert!(!w.sh(&format!("/usr/bin/nc -z -w 3 127.0.0.1 {other}")));
+
+    // Without the deny rules, the probes read as open: the bind went
+    // through. The proxy's stand-in is closed first, so the bind is not
+    // refused for the port being in use instead.
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let without: String = text
+        .lines()
+        .filter(|l| !l.starts_with("(deny network-bind (local tcp"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    w.compiled = w.base.join("without-the-deny.sb");
+    std::fs::write(&w.compiled, without).unwrap();
+    drop(std::mem::replace(
+        &mut w.allowed,
+        TcpListener::bind("127.0.0.1:0").unwrap(),
+    ));
+    for (name, got) in judged(&w, true) {
+        assert!(matches!(got, Outcome::Open(_)), "{name}: {got:?}");
+    }
 }
 
 /// The rule opens the proxy port to TCP only: a program holding that port
