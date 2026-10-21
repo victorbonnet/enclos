@@ -1291,6 +1291,7 @@ mod tests {
     use super::*;
 
     /// A running session of `kind` whose root is `root`.
+    #[cfg(target_os = "macos")]
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
         SessionRecord {
             id: crate::model::session::SessionId(1),
@@ -1311,8 +1312,11 @@ mod tests {
     /// Listens on every address and on loopback, and says both ports. Perl,
     /// which macOS signs, so the firewall asks nothing of whoever runs the
     /// tests.
+    #[cfg(target_os = "macos")]
     const LISTENS: &str = "use Socket; for my $a (INADDR_ANY, INADDR_LOOPBACK) { socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, $a)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); } $| = 1; STDOUT->flush; sleep 30";
 
+    // `lsof` at /usr/sbin is macOS's, where sandboxes listen (ADR 0028).
+    #[cfg(target_os = "macos")]
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
