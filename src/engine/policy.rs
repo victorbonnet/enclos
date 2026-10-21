@@ -15,7 +15,7 @@ use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate};
-use crate::policy::{self, AdapterLayer, PolicyError};
+use crate::policy::{self, AdapterLayer, PolicyError, Problem};
 use crate::state::StateLock;
 
 /// A sandbox's active policy, as `enclos policy show` prints it.
@@ -82,7 +82,7 @@ impl Engine {
     ) -> Result<Planned<PolicyApplied>> {
         let entry = AllowEntry::parse(destination)
             .map_err(|e| PolicyError::Invalid {
-                problems: vec![format!("`{destination}`: {e}")],
+                problems: vec![Problem::entry(format!("`{destination}`"), e)],
             })?
             .to_string();
         let plan = self.plan_allow(name, &entry)?;

@@ -76,9 +76,6 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
-    /// The policy does not allow the command; see design principle 6.
-    #[error("refused by policy: {reason}")]
-    Refused { reason: String },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -92,14 +89,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod exit {
     pub const OK: u8 = 0;
     pub const ERROR: u8 = 1;
+    /// A policy whose problems are all refusals, or a backend this host
+    /// cannot run (ADR 0009).
     pub const REFUSED: u8 = 2;
     pub const NEEDS_CONFIRMATION: u8 = 3;
 }
 
 impl Error {
+    /// The exit code for this error (design §10). A policy exits 2 only when
+    /// `PolicyError::is_refused` holds. `Compile` stays 1: validation refuses
+    /// a path the compiled policy cannot hold when the policy is stored, and
+    /// a compile failure at start is an error. A failed cleanup keeps the
+    /// code of the error it followed.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Error::Refused { .. } => exit::REFUSED,
+            Error::Policy(e) if e.is_refused() => exit::REFUSED,
+            Error::BackendUnavailable { .. } => exit::REFUSED,
             Error::NeedsConfirmation { .. } => exit::NEEDS_CONFIRMATION,
             Error::Layout(_)
             | Error::State(_)
@@ -121,7 +126,6 @@ impl Error {
             Error::CleanupFailed { error, .. } | Error::WithContext { error, .. } => {
                 error.exit_code()
             }
-            Error::BackendUnavailable { .. } => exit::REFUSED,
         }
     }
 }
@@ -129,12 +133,17 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::Problem;
+
+    fn invalid(problems: Vec<Problem>) -> Error {
+        Error::Policy(PolicyError::Invalid { problems })
+    }
 
     #[test]
     fn context_and_cleanup_preserve_the_original_exit_code() {
         for (error, code) in [
             (Error::Session { what: "x".into() }, 1),
-            (Error::Refused { reason: "x".into() }, 2),
+            (invalid(vec![Problem::Refused("x".into())]), 2),
             (
                 Error::BackendUnavailable {
                     sandbox: "home".into(),
@@ -161,11 +170,36 @@ mod tests {
 
     #[test]
     fn maps_errors_to_exit_codes() {
-        let refused = Error::Refused { reason: "x".into() };
+        let backend = Error::BackendUnavailable {
+            sandbox: "home".into(),
+            backend: "bubblewrap".into(),
+            reason: "not Linux".into(),
+        };
         let confirm = Error::NeedsConfirmation { what: "x".into() };
         let error = Error::Layout(LayoutError::NoHome);
-        assert_eq!(refused.exit_code(), 2);
+        assert_eq!(backend.exit_code(), 2);
         assert_eq!(confirm.exit_code(), 3);
         assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_policy_refusal_exits_2_and_a_policy_written_wrong_exits_1() {
+        let refused = || Problem::Refused("127.0.0.1 is a loopback address".into());
+        let malformed = || Problem::Malformed("`exa mple.com` is not a host name".into());
+        assert_eq!(invalid(vec![refused()]).exit_code(), 2);
+        assert_eq!(invalid(vec![refused(), refused()]).exit_code(), 2);
+        assert_eq!(invalid(vec![malformed()]).exit_code(), 1);
+        assert_eq!(invalid(vec![refused(), malformed()]).exit_code(), 1);
+        let syntax = Error::Policy(PolicyError::Parse {
+            layer: "policy.toml".into(),
+            reason: "expected `=`".into(),
+        });
+        assert_eq!(syntax.exit_code(), 1);
+        // A refusal keeps its exit code when cleaning up after it fails too.
+        let cleanup = Error::CleanupFailed {
+            error: Box::new(invalid(vec![refused()])),
+            left: "x".into(),
+        };
+        assert_eq!(cleanup.exit_code(), 2);
     }
 }

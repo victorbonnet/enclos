@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::model::policy::{
     AdapterInput, Policy, PolicyInputs, PolicySnapshot, SnapshotId, TemplateName,
 };
-use crate::net::host::{AllowEntry, canonical_private};
+use crate::net::host::{AllowEntry, EntryError, canonical_private};
 use file::PolicyFile;
 
 /// The built-in defaults every template builds on.
@@ -37,8 +37,75 @@ pub enum PolicyError {
         sets.join(", ")
     )]
     AdapterLayer { runtime: String, sets: Vec<String> },
-    #[error("the policy is not valid:\n  - {}", problems.join("\n  - "))]
-    Invalid { problems: Vec<String> },
+    #[error("{}:\n  - {}", heading(problems), list(problems))]
+    Invalid { problems: Vec<Problem> },
+}
+
+impl PolicyError {
+    /// Whether the policy's own checks refused it (exit 2, design §10),
+    /// rather than it being written wrong. A list with a malformed entry is
+    /// an error: what it means is not known until it is fixed.
+    pub fn is_refused(&self) -> bool {
+        matches!(self, PolicyError::Invalid { problems } if all_refused(problems))
+    }
+}
+
+/// One reason a policy is not accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// The policy is written wrong: an entry that is not a path or a
+    /// destination, or one that contradicts another (an opt-in for a host
+    /// not in `network.allow`). Fixing it changes what the policy means.
+    Malformed(String),
+    /// What enclos does not accept as written: a destination a sandbox never
+    /// reaches, a private address without its opt-in, every destination or
+    /// a wildcard over a public suffix, a write to enclos's own files, a
+    /// dropped built-in read-deny entry, or a path the compiled policy
+    /// cannot hold (ADR 0009).
+    Refused(String),
+}
+
+impl Problem {
+    /// An allowlist entry's problem, worded `{context}: {error}`, refused or
+    /// malformed as `error` is.
+    pub fn entry(context: impl std::fmt::Display, error: EntryError) -> Problem {
+        match error {
+            EntryError::Refused(why) => Problem::Refused(format!("{context}: {why}")),
+            EntryError::Malformed(why) => Problem::Malformed(format!("{context}: {why}")),
+        }
+    }
+
+    pub fn is_refused(&self) -> bool {
+        matches!(self, Problem::Refused(_))
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Problem::Malformed(text) | Problem::Refused(text) => f.write_str(text),
+        }
+    }
+}
+
+fn all_refused(problems: &[Problem]) -> bool {
+    !problems.is_empty() && problems.iter().all(Problem::is_refused)
+}
+
+fn heading(problems: &[Problem]) -> &'static str {
+    if all_refused(problems) {
+        "refused by policy"
+    } else {
+        "the policy is not valid"
+    }
+}
+
+fn list(problems: &[Problem]) -> String {
+    problems
+        .iter()
+        .map(Problem::to_string)
+        .collect::<Vec<_>>()
+        .join("\n  - ")
 }
 
 pub fn template_names() -> Vec<&'static str> {
