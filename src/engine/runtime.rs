@@ -499,7 +499,7 @@ impl Engine {
         let installer = self.download_installer(&dir, runtime)?;
         let mut script = home_files_script(&staged);
         script.push_str("exec /bin/bash \"$0\" \"$@\"\n");
-        let mut words: Vec<std::ffi::OsString> = vec![
+        let mut words: Vec<OsString> = vec![
             "/bin/sh".into(),
             "-c".into(),
             script.into(),
@@ -523,16 +523,23 @@ impl Engine {
         ));
         let failed = |what: String| Error::Session { what };
         let status = Command::new("/usr/bin/curl")
-            .args(download_args(&installer.url, &part))
+            .args(download_args(&installer.url, &part, cfg!(test)))
             .stdin(Stdio::null())
             .status()
             .map_err(|e| failed(format!("cannot run curl: {e}")))?;
         if !status.success() {
             let _ = std::fs::remove_file(&part);
-            return Err(failed(format!(
-                "could not download {} ({status})",
-                installer.url
-            )));
+            // curl exits 1, unsupported protocol, when `--proto` or
+            // `--proto-redir` refuses the URL or a redirect.
+            return Err(failed(if status.code() == Some(1) {
+                format!(
+                    "could not download {}: it is not served over HTTPS, or redirects off HTTPS, and enclos downloads installers over HTTPS only. Update enclos, or report it if the {} installer moved",
+                    installer.url,
+                    runtime.kind()
+                )
+            } else {
+                format!("could not download {} ({status})", installer.url)
+            }));
         }
         let bytes = std::fs::read(&part)
             .map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
@@ -972,34 +979,32 @@ pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
 
 /// The arguments of the curl that downloads an installer from `url` to
 /// `out`. `-q` comes first, the only place curl reads it, so no `.curlrc`
-/// adds options; the download and every redirect must stay on HTTPS, so
-/// curl refuses any other URL. The SHA-256 check after it is what decides
-/// whether the file is run.
-fn download_args(url: &str, out: &Path) -> Vec<OsString> {
-    // This crate's own tests install from a file; a build of enclos never
-    // reads one.
-    let proto = if cfg!(test) && url.starts_with("file://") {
+/// adds options; curl's environment variables, such as `https_proxy`, still
+/// apply. The download and every redirect must stay on HTTPS, so curl
+/// refuses any other URL, except a `file://` one when `allow_file` is set:
+/// only this crate's tests set it, to install from a file. The SHA-256 check
+/// after it is what decides whether the file is run.
+fn download_args(url: &str, out: &Path, allow_file: bool) -> Vec<OsString> {
+    let proto = if allow_file && url.starts_with("file://") {
         "=file"
     } else {
         "=https"
     };
-    let mut args: Vec<OsString> = [
-        "-q",
-        "--proto",
-        proto,
-        "--proto-redir",
-        "=https",
-        "-fsSL",
-        "--max-time",
-        "120",
-        "--max-filesize",
+    vec![
+        "-q".into(),
+        "--proto".into(),
+        proto.into(),
+        "--proto-redir".into(),
+        "=https".into(),
+        "-fsSL".into(),
+        "--max-time".into(),
+        "120".into(),
+        "--max-filesize".into(),
+        INSTALLER_MAX_BYTES.to_string().into(),
+        "-o".into(),
+        out.into(),
+        url.into(),
     ]
-    .into_iter()
-    .map(Into::into)
-    .collect();
-    args.push(INSTALLER_MAX_BYTES.to_string().into());
-    args.extend(["-o".into(), out.into(), url.into()]);
-    args
 }
 
 /// `s` as one `sh` word.
@@ -1017,7 +1022,7 @@ mod tests {
             "https://example.com/install.sh",
             "http://example.com/install.sh",
         ] {
-            let args = download_args(url, Path::new("/tmp/x.part"));
+            let args = download_args(url, Path::new("/tmp/x.part"), false);
             let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
             // curl reads `-q` only as its first argument.
             assert_eq!(args[0], "-q", "{args:?}");
@@ -1032,5 +1037,50 @@ mod tests {
             assert!(pair("-o", "/tmp/x.part"), "{args:?}");
             assert_eq!(args.last(), Some(&url));
         }
+    }
+
+    #[test]
+    fn a_release_build_refuses_an_installer_url_to_a_file() {
+        let args = download_args("file:///etc/hosts", Path::new("/tmp/x.part"), false);
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert!(
+            args.windows(2).any(|w| w == ["--proto", "=https"]),
+            "{args:?}"
+        );
+        assert!(!args.contains(&"=file"), "{args:?}");
+        // Only a `file://` URL gets the tests' exception.
+        let args = download_args("http://example.com/x", Path::new("/tmp/x.part"), true);
+        assert!(!args.contains(&OsString::from("=file")), "{args:?}");
+    }
+
+    #[test]
+    fn the_host_curl_reads_no_curlrc_for_an_installer_download() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".curlrc"),
+            "write-out = \"CURLRC-READ\\n\"\n",
+        )
+        .unwrap();
+        let src = dir.path().join("install.sh");
+        std::fs::write(&src, "echo hi\n").unwrap();
+        let out = dir.path().join("install.part");
+        let url = format!("file://{}", src.display());
+        let curl = |args: &[OsString]| {
+            let output = Command::new("/usr/bin/curl")
+                .args(args)
+                .env("CURL_HOME", dir.path())
+                .env("HOME", dir.path())
+                .env_remove("XDG_CONFIG_HOME")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let args = download_args(&url, &out, true);
+        assert!(!curl(&args).contains("CURLRC-READ"));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "echo hi\n");
+        // Without `-q` the same curl reads it, so the check above can fail.
+        assert!(curl(&args[1..]).contains("CURLRC-READ"));
     }
 }

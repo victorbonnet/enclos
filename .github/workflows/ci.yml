@@ -60,6 +60,9 @@ jobs:
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The action leaves its gitleaks on the PATH
+      - name: Check what the home-folder-path rule catches
+        run: sh tests/gitleaks_rule.sh
 
   deny:
     runs-on: ubuntu-latest
