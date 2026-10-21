@@ -18,13 +18,13 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::process::{group_of, is_same, reference, reference_of_child};
-use crate::model::audit::Actor;
+use crate::model::audit::{Actor, Outcome};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::policy::sha256_hex;
 use crate::runtime::{RuntimeService, ServiceName, adapter};
-use crate::service::{LABEL_PREFIX, ServiceLabel, ServiceStatus, ServiceUnit};
+use crate::service::{LABEL_PREFIX, ServiceError, ServiceLabel, ServiceStatus, ServiceUnit};
 
 /// One of a sandbox's services: its proxy, or one its runtime declares,
 /// by the name the runtime gives it.
@@ -155,30 +155,44 @@ impl Engine {
         self.audit.check()?;
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
-        self.stop_services(name)?;
-        self.install_services(by, name)
-            .map_err(|error| match self.stop_services(name) {
-                Ok(_) => error,
+        self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop)?
+            .into_result()?;
+        self.install_services(by, name).map_err(|error| {
+            // None may stay installed: the undo removes them even when its
+            // first entry cannot be written, as the start's entry records
+            // the attempt.
+            let undo = "after a failed sandbox start";
+            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway) {
                 Err(left) => Error::CleanupFailed {
                     error: Box::new(error),
                     left: left.to_string(),
                 },
-            })
+                Ok(Removal {
+                    labels,
+                    failed: None,
+                    unrecorded: Some(audit),
+                }) => Error::CleanupUnrecorded {
+                    error: Box::new(error),
+                    done: format!("removed {}", joined(&labels)),
+                    audit: Box::new(audit),
+                },
+                Ok(removal) => match removal.into_result() {
+                    Ok(_) => error,
+                    Err(left) => Error::CleanupFailed {
+                        error: Box::new(error),
+                        left: left.to_string(),
+                    },
+                },
+            }
+        })
     }
 
     fn install_services(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
-        let summary = |labels: &Vec<ServiceLabel>| {
-            labels
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         self.write(
             by,
             "sandbox start",
             Some(name.to_string()),
-            summary,
+            |labels: &Vec<ServiceLabel>| joined(labels),
             |lock| {
                 let mut record = self.record(name)?;
                 let installed = (|| -> Result<Vec<ServiceLabel>> {
@@ -237,14 +251,67 @@ impl Engine {
         )
     }
 
-    /// Removes every service of the sandbox installed now, the proxy last,
-    /// and returns what it removed; `stop_sandbox` calls this first.
-    pub(super) fn stop_services(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// Removes every service of the sandbox installed now, the proxy last;
+    /// `stop_sandbox` calls this first, and `start_sandbox` before it
+    /// installs and after a failed install, as `why` says.
+    ///
+    /// Outside the lock, which a runtime service told to end needs to
+    /// record its end, so two audit entries surround the removal: one
+    /// naming what is about to be removed, closed before the first removal,
+    /// then one saying what was removed and what is left. Nothing is written
+    /// when none is installed. If the first entry cannot be written, this
+    /// fails without removing anything, unless `if_unrecorded` says to go
+    /// on. If the second cannot be written, the first still shows the
+    /// removal began, and the [`Removal`] says why the result is not
+    /// recorded.
+    pub(super) fn remove_services(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        why: &str,
+        if_unrecorded: IfUnrecorded,
+    ) -> Result<Removal> {
         let labels = self.installed_labels(name)?;
-        for label in &labels {
-            self.services.stop(label)?;
+        if labels.is_empty() {
+            return Ok(Removal {
+                labels,
+                failed: None,
+                unrecorded: None,
+            });
         }
-        Ok(labels)
+        let target = Some(name.to_string());
+        let message = format!("removing {} {why}", joined(&labels));
+        let begun = self.note(by, "services remove", target.clone(), Outcome::ok(message));
+        if if_unrecorded == IfUnrecorded::Stop {
+            begun?;
+        }
+        let mut failed = None;
+        for (i, label) in labels.iter().enumerate() {
+            if let Err(e) = self.services.stop(label) {
+                failed = Some((i, e));
+                break;
+            }
+        }
+        let outcome = match &failed {
+            None => Outcome::ok(format!("removed {}", joined(&labels))),
+            Some((i, e)) => {
+                let (done, left) = labels.split_at(*i);
+                Outcome::failed(format!(
+                    "removed {}; could not remove {}: {e}; still installed: {}",
+                    joined(done),
+                    labels[*i],
+                    joined(left)
+                ))
+            }
+        };
+        // When the first entry was not written either, this one still
+        // records the whole removal.
+        let unrecorded = self.note(by, "services removed", target, outcome).err();
+        Ok(Removal {
+            labels,
+            failed: failed.map(|(_, e)| e),
+            unrecorded,
+        })
     }
 
     /// Whether the sandbox has services installed, running or not.
@@ -463,6 +530,56 @@ impl Engine {
         files.sort_by_key(|p| (*p != proxy, p.clone()));
         Ok(files)
     }
+}
+
+/// What `remove_services` does when the entry opening a removal cannot be
+/// written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IfUnrecorded {
+    /// Removes nothing and fails: the command changes nothing.
+    Stop,
+    /// Removes the services anyway, when none may stay installed.
+    RemoveAnyway,
+}
+
+/// What `remove_services` did.
+pub(super) struct Removal {
+    /// The services installed when it began, the proxy last.
+    pub labels: Vec<ServiceLabel>,
+    /// The removal that failed; the services from it on are still installed.
+    pub failed: Option<ServiceError>,
+    /// Why the audit log does not record the removal's result.
+    pub unrecorded: Option<Error>,
+}
+
+impl Removal {
+    /// The services removed, or what failed: the removal, its audit entry,
+    /// or both.
+    pub fn into_result(self) -> Result<Vec<ServiceLabel>> {
+        match (self.failed, self.unrecorded) {
+            (None, None) => Ok(self.labels),
+            (Some(e), None) => Err(e.into()),
+            (failed, Some(audit)) => Err(Error::Unrecorded {
+                what: match failed {
+                    None => format!("removed {}", joined(&self.labels)),
+                    Some(e) => e.to_string(),
+                },
+                audit: Box::new(audit),
+            }),
+        }
+    }
+}
+
+/// Labels as an audit message lists them: `a, b`, or `none`.
+fn joined(labels: &[ServiceLabel]) -> String {
+    if labels.is_empty() {
+        return "none".to_owned();
+    }
+    labels
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Sets `ended` on TERM, INT and HUP while it lives, instead of ending this

@@ -54,6 +54,20 @@ pub enum Error {
     /// A failed command whose cleanup failed too.
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
+    /// A failed command whose cleanup worked but could not be recorded in
+    /// the audit log.
+    #[error(
+        "{error}; cleaning up after it {done}, but the audit log could not record that: {audit}"
+    )]
+    CleanupUnrecorded {
+        error: Box<Error>,
+        done: String,
+        audit: Box<Error>,
+    },
+    /// A change made outside the state lock, or one that failed, whose
+    /// audit entry could not be written.
+    #[error("{what}, but the audit log could not record it: {audit}")]
+    Unrecorded { what: String, audit: Box<Error> },
     /// A record without an active policy, which `sandbox create` never
     /// leaves: it records both in one transaction. The steps make it again
     /// from the backend and template it was recorded with.
@@ -131,10 +145,11 @@ impl Error {
             | Error::NoFreePorts
             | Error::Session { .. }
             | Error::Service(_)
-            | Error::Processes(_) => exit::ERROR,
-            Error::CleanupFailed { error, .. } | Error::WithContext { error, .. } => {
-                error.exit_code()
-            }
+            | Error::Processes(_)
+            | Error::Unrecorded { .. } => exit::ERROR,
+            Error::CleanupFailed { error, .. }
+            | Error::CleanupUnrecorded { error, .. }
+            | Error::WithContext { error, .. } => error.exit_code(),
         }
     }
 }

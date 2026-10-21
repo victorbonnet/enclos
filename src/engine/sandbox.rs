@@ -2,6 +2,7 @@
 //! (design §8, §10).
 
 use super::Engine;
+use super::service::IfUnrecorded;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::members;
@@ -312,10 +313,12 @@ impl Engine {
         };
         // The services first, so the service manager does not restart what
         // is stopped; outside the lock, which a service told to end needs to
-        // record its end. A damaged audit log would refuse the audited stop
-        // after the removal, so it is checked before.
+        // record its end, and audited on its own. A damaged audit log would
+        // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
-        let services = self.stop_services(name)?;
+        let services = self
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop)?
+            .into_result()?;
         self.write(
             by,
             "sandbox stop",
