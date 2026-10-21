@@ -1073,10 +1073,11 @@ mod runtime {
     }
 
     #[cfg(target_os = "macos")]
-    /// Hermes's adapter with an installer of the test's own, read from a
-    /// file; `sha256` is its real hash unless the test says otherwise.
+    /// Hermes's adapter with an installer of the test's own: `url` is a
+    /// `file://` URL to it and `sha256` its real hash, unless the test says
+    /// otherwise.
     struct TestRuntime {
-        installer: PathBuf,
+        url: String,
         sha256: String,
     }
 
@@ -1087,7 +1088,10 @@ mod runtime {
             std::fs::write(&installer, script).unwrap();
             let digest = <sha2::Sha256 as sha2::Digest>::digest(script.as_bytes());
             let sha256 = digest.iter().map(|b| format!("{b:02x}")).collect();
-            TestRuntime { installer, sha256 }
+            TestRuntime {
+                url: format!("file://{}", installer.display()),
+                sha256,
+            }
         }
     }
 
@@ -1104,7 +1108,7 @@ mod runtime {
         }
         fn installer(&self) -> Installer {
             Installer {
-                url: format!("file://{}", self.installer.display()),
+                url: self.url.clone(),
                 sha256: self.sha256.clone(),
                 args: vec!["--non-interactive".into()],
             }
@@ -1270,6 +1274,39 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(lab.runtime(), None);
         assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
         assert!(!lab.home.join("bin/mktemp").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_installer_not_served_over_https_is_not_downloaded() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+        // Nothing listens here, so a curl that tried would exit 7 (could
+        // not connect); it exits 1, unsupported protocol, before trying.
+        runtime.url = "http://127.0.0.1:9/install.sh".into();
+        let err = lab
+            .engine
+            .install_runtime_with(&alice(), &lab.name, &runtime, Confirm::Yes)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "could not download http://127.0.0.1:9/install.sh: it is not served over HTTPS"
+            ) && text.contains("Update enclos"),
+            "{text}"
+        );
+        assert_eq!(lab.runtime(), None);
+        assert!(!lab.allows("chatgpt.com"));
+        assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
+        let installers = lab.engine.layout.sandbox_dir("home").join("installers");
+        assert!(!installers.join("hermes-install.sh").exists());
+        assert!(
+            std::fs::read_dir(&installers)
+                .unwrap()
+                .all(|e| { !e.unwrap().file_name().to_string_lossy().ends_with(".part") })
+        );
+        assert!(!lab.audit().contains("runtime install"), "{}", lab.audit());
     }
 
     #[cfg(target_os = "macos")]
