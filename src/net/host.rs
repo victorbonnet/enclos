@@ -295,10 +295,18 @@ mod tests {
             "127.0.0.1",
             "[::1]:443",
             "169.254.169.254",
+            // IPv6 that is not global unicast.
+            "[64:ff9b:1::1]:443",
+            "100:0:0:1::1",
+            "4000::1",
         ] {
             let err = AllowEntry::parse(bad).unwrap_err();
             assert!(err.is_refused(), "{bad}: {err}");
         }
+        assert_eq!(
+            AllowEntry::parse("4000::1").unwrap_err().to_string(),
+            "4000::1 is a reserved IPv6 address, which is never reachable"
+        );
     }
 
     #[test]
