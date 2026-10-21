@@ -837,6 +837,13 @@ fn connect_refuses_a_port_another_program_listens_on() {
         "{}",
         out.stderr()
     );
+    // Design §8 step 7: the failure is saved on the sandbox.
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(
+        show.contains("Sandbox home: failed: connect failed: port")
+            && show.contains("in use by another program"),
+        "{show}"
+    );
 }
 
 /// The proxy port `sandbox show` lists for the sandbox.

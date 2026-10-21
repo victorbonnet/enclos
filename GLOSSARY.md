@@ -68,6 +68,10 @@ _Avoid_: backup, bundle, snapshot (a policy's word)
 A single use of a sandbox from start to end: an interactive `connect`, an `exec`, or a service, with every process it starts. A session records the policy snapshot it started under.
 _Avoid_: run, job, instance
 
+**Gone session**:
+A session whose end is not recorded though none of its members runs any more, because nothing was left to record it, as after a crash or a restart of the Mac.
+_Avoid_: stale session, zombie session
+
 **Secret**:
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key

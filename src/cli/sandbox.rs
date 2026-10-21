@@ -164,9 +164,12 @@ fn print_list(views: &[SandboxView]) {
             .policy
             .as_ref()
             .map_or("-".to_owned(), |p| format!("v{}", p.version));
-        let sessions = match v.sessions.len() {
-            0 => String::new(),
-            n => format!(" ({n} sessions)"),
+        let running = v.sessions.iter().filter(|s| !s.gone()).count();
+        let gone = v.sessions.len() - running;
+        let sessions = match (running, gone) {
+            (0, 0) => String::new(),
+            (n, 0) => format!(" ({n} sessions)"),
+            (n, g) => format!(" ({n} sessions, {g} gone, not recorded)"),
         };
         println!(
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
@@ -193,13 +196,31 @@ fn print_show(v: &SandboxView) {
             p.snapshot.short()
         );
     }
-    if v.sessions.is_empty() {
+    let all_gone = v.sessions.iter().all(|s| s.gone());
+    if all_gone {
         println!("  no sessions running");
     }
+    // `stop` also ends the sessions still running: said, since it asks
+    // nothing first.
+    let records = match all_gone {
+        true => format!("`enclos sandbox stop {}` records its end", r.name),
+        false => format!(
+            "`enclos sandbox stop {}` records its end, and also stops the sessions still running",
+            r.name
+        ),
+    };
     let active = v.policy.as_ref().map_or(0, |p| p.version);
     for view in &v.sessions {
         let s = &view.session;
-        if s.kind == SessionKind::Proxy {
+        if view.gone() {
+            // Nothing ran to record its end (a crash, a restart of the Mac,
+            // `enclos` killed): a read records nothing.
+            println!(
+                "  session {} {}: gone, not recorded; {records}",
+                s.id,
+                s.kind.as_str(),
+            );
+        } else if s.kind == SessionKind::Proxy {
             // Outside the sandbox, with the network policy, which is live.
             println!(
                 "  proxy, session {}: port {}, network v{active} (live)",
@@ -224,15 +245,22 @@ fn print_show(v: &SandboxView) {
 }
 
 fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
+    let gone = match report.gone.len() {
+        0 => String::new(),
+        n => format!(", {n} found gone and recorded"),
+    };
     if report.survivors.is_empty() {
         println!(
-            "Stopped sandbox {name}: {} services removed, {} sessions ended.",
+            "Stopped sandbox {name}: {} services removed, {} sessions ended{gone}.",
             report.services.len(),
             report.stopped.len()
         );
         return exit::OK;
     }
-    eprintln!("error: sandbox {name} is marked failed: some processes survived stop:");
+    eprintln!(
+        "error: sandbox {name} is marked failed: some processes survived stop ({} sessions ended{gone}):",
+        report.stopped.len()
+    );
     for (session, survivors) in &report.survivors {
         for s in survivors {
             eprintln!(

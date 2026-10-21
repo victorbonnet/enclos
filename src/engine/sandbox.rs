@@ -5,7 +5,8 @@ use super::Engine;
 use super::service::IfUnrecorded;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::members::members;
+use crate::lifecycle::members::{is_gone, members};
+use crate::lifecycle::process::processes;
 use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -48,12 +49,31 @@ pub struct SessionView {
     pub needs_restart: bool,
 }
 
+impl StopReport {
+    /// The sessions whose end the stop records.
+    fn ended(&self) -> Vec<SessionId> {
+        self.stopped.iter().chain(&self.gone).copied().collect()
+    }
+}
+
+impl SessionView {
+    /// Nothing of the session runs any more, as after a crash or a restart
+    /// of the Mac, but its end is not recorded: `show` reads and changes
+    /// nothing, and `sandbox stop` or `sandbox rm` records it.
+    pub fn gone(&self) -> bool {
+        self.members.is_empty()
+    }
+}
+
 /// What stopping a sandbox did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopReport {
     /// The services removed, so they do not start again.
     pub services: Vec<ServiceLabel>,
+    /// Sessions whose members it stopped.
     pub stopped: Vec<SessionId>,
+    /// Sessions of which nothing ran any more, whose end it recorded.
+    pub gone: Vec<SessionId>,
     pub survivors: Vec<(SessionId, Vec<Survivor>)>,
 }
 
@@ -278,13 +298,18 @@ impl Engine {
             let mut changes: Vec<String> = view
                 .sessions
                 .iter()
-                .map(|v| {
-                    format!(
+                .map(|v| match v.gone() {
+                    true => format!(
+                        "record the end of session {} ({}), whose processes are gone",
+                        v.session.id,
+                        v.session.kind.as_str()
+                    ),
+                    false => format!(
                         "stop session {} ({}, {} processes)",
                         v.session.id,
                         v.session.kind.as_str(),
                         v.members.len()
-                    )
+                    ),
                 })
                 .collect();
             changes.splice(
@@ -299,17 +324,34 @@ impl Engine {
                 ..Plan::default()
             }));
         }
-        let summary = |r: &StopReport| match r.survivors.is_empty() {
-            true => format!(
-                "removed {} services, stopped {} sessions",
-                r.services.len(),
-                r.stopped.len()
-            ),
-            false => format!(
-                "removed {} services; {} sessions left members running",
-                r.services.len(),
-                r.survivors.len()
-            ),
+        let summary = |r: &StopReport| {
+            let done = match r.survivors.is_empty() {
+                true => format!(
+                    "removed {} services, stopped {} sessions",
+                    r.services.len(),
+                    r.stopped.len()
+                ),
+                false => format!(
+                    "removed {} services; {} sessions left members running",
+                    r.services.len(),
+                    r.survivors.len()
+                ),
+            };
+            format!("{done}{}", ended_gone(&r.gone))
+        };
+        // Which sessions still run, looked at before the services are
+        // removed: a session a service ran (the proxy service's always)
+        // ends with its service, and is stopped, not found gone. A listing
+        // that fails tells none apart, so none is said to be gone; the stop
+        // below looks again, and fails on its own if it still cannot.
+        let open = self.state.sessions(name, true)?;
+        let ran: Vec<SessionId> = match processes() {
+            Ok(procs) => open
+                .iter()
+                .filter(|s| !is_gone(&procs, s))
+                .map(|s| s.id)
+                .collect(),
+            Err(_) => open.iter().map(|s| s.id).collect(),
         };
         // The services first, so the service manager does not restart what
         // is stopped; outside the lock, which a service told to end needs to
@@ -331,35 +373,56 @@ impl Engine {
                 let mut report = StopReport {
                     services: services.clone(),
                     stopped: Vec::new(),
+                    gone: Vec::new(),
                     survivors: Vec::new(),
                 };
+                let mut cannot_look = None;
                 for session in self.state.sessions(name, true)? {
                     match stop(&session, GRACE) {
-                        Ok(Stopped::Clean) => {
-                            self.state.end_session(lock, session.id)?;
-                            report.stopped.push(session.id);
+                        // Nothing of it ran before this stop either: it ended
+                        // with nothing to record its end (a crash, a restart
+                        // of the Mac, `enclos` killed), which the audit entry
+                        // tells apart.
+                        Ok(Stopped::Gone) if !ran.contains(&session.id) => {
+                            report.gone.push(session.id)
                         }
+                        Ok(Stopped::Gone | Stopped::Clean) => report.stopped.push(session.id),
                         Ok(Stopped::Survivors(left)) => report.survivors.push((session.id, left)),
                         // Without a listing, nothing shows the members are
-                        // gone: the session stays open.
+                        // gone: this session and those after it stay open.
                         Err(e) => {
-                            record.state = SandboxState::Failed {
-                                reason: format!("stop could not look at processes: {e}"),
-                            };
-                            self.state.put(lock, &record)?;
-                            return Err(e.into());
+                            cannot_look = Some(e);
+                            break;
                         }
                     }
                 }
-                record.state = if report.survivors.is_empty() {
-                    SandboxState::Stopped
-                } else {
-                    SandboxState::Failed {
+                record.state = match (&cannot_look, report.survivors.is_empty()) {
+                    (Some(e), _) => SandboxState::Failed {
+                        reason: format!("stop could not look at processes: {e}"),
+                    },
+                    (None, true) => SandboxState::Stopped,
+                    (None, false) => SandboxState::Failed {
                         reason: "members survived stop".to_owned(),
-                    }
+                    },
                 };
-                self.state.put(lock, &record)?;
-                Ok(report)
+                // The ends and the state in one transaction, so that a crash
+                // or a failed write never leaves every session ended and the
+                // sandbox still running.
+                let saved = self.state.end_sessions(lock, &report.ended(), &record);
+                match (cannot_look, saved) {
+                    (None, saved) => {
+                        saved?;
+                        Ok(report)
+                    }
+                    (Some(e), Ok(())) => Err(e.into()),
+                    (Some(e), Err(saved)) => Err(Error::CleanupFailed {
+                        error: Box::new(e.into()),
+                        left: format!(
+                            "sandbox {name} not marked failed, and the end of sessions {} not recorded ({saved})",
+                            join_ids(&report.ended())
+                        ),
+                    }),
+                }
             },
         )
         .map(Planned::Done)
@@ -374,7 +437,7 @@ impl Engine {
         keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<()>> {
-        self.require_stopped(name)?;
+        let gone = self.require_stopped(name)?;
         let dir = self.layout.sandbox_dir(name.as_str());
         let what = if keep_data {
             "remove its record"
@@ -383,8 +446,13 @@ impl Engine {
         };
         match confirm {
             Confirm::DryRun => {
+                let mut changes: Vec<String> = gone
+                    .iter()
+                    .map(|id| format!("record the end of session {id}, whose processes are gone"))
+                    .collect();
+                changes.push(format!("remove sandbox {name}: {what} ({})", dir.display()));
                 return Ok(Planned::DryRun(Plan {
-                    changes: vec![format!("remove sandbox {name}: {what} ({})", dir.display())],
+                    changes,
                     ..Plan::default()
                 }));
             }
@@ -399,11 +467,13 @@ impl Engine {
             by,
             "sandbox rm",
             Some(name.to_string()),
-            |_| what.to_owned(),
+            |gone: &Vec<SessionId>| format!("{what}{}", ended_gone(gone)),
             |lock| {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
-                self.require_stopped(name)?;
+                let gone = self.require_stopped(name)?;
+                // The sessions' rows go with the record: only the audit
+                // entry keeps their ends.
                 self.state.remove(lock, name)?;
                 if !keep_data && dir.exists() {
                     std::fs::remove_dir_all(&dir).map_err(|source| LayoutError::Io {
@@ -411,15 +481,16 @@ impl Engine {
                         source,
                     })?;
                 }
-                Ok(())
+                Ok(gone)
             },
         )?;
         Ok(Planned::Done(()))
     }
 
-    /// Refuses a sandbox with services installed or sessions open, saying
-    /// how to end them.
-    fn require_stopped(&self, name: &SandboxName) -> Result<()> {
+    /// Refuses a sandbox with services installed or sessions running, saying
+    /// how to end them. Returns the open sessions of which nothing runs any
+    /// more, whose end is left to record.
+    fn require_stopped(&self, name: &SandboxName) -> Result<Vec<SessionId>> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
@@ -430,15 +501,39 @@ impl Engine {
                 name: name.to_string(),
             });
         }
-        if self.state.sessions(name, true)?.is_empty() {
-            return Ok(());
+        let open = self.state.sessions(name, true)?;
+        if open.is_empty() {
+            return Ok(Vec::new());
+        }
+        let procs = processes()?;
+        if open.iter().all(|s| is_gone(&procs, s)) {
+            return Ok(open.iter().map(|s| s.id).collect());
         }
         let name = name.to_string();
         Err(match record.state {
-            SandboxState::Failed { .. } => Error::SandboxNotStopped { name },
+            SandboxState::Failed { reason } => Error::SandboxNotStopped { name, reason },
             _ => Error::SandboxRunning { name },
         })
     }
+}
+
+/// What an audit summary adds for the sessions of which nothing ran any
+/// more, whose end the command recorded.
+fn ended_gone(gone: &[SessionId]) -> String {
+    match gone {
+        [] => String::new(),
+        ids => format!(
+            "; recorded the end of sessions {}, whose processes were gone",
+            join_ids(ids)
+        ),
+    }
+}
+
+fn join_ids(ids: &[SessionId]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether a running session needs a restart to run under the active

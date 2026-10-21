@@ -16,6 +16,10 @@ pub struct FakeServices {
     /// Runs after each stop that worked, given its label, for a test to act
     /// in between.
     pub on_stop: RefCell<Option<Meanwhile>>,
+    /// Processes a test started to stand in for a unit's job: stopping the
+    /// unit ends and reaps them, as launchd's `bootout` waits for the job
+    /// to exit.
+    pub jobs: RefCell<Vec<(ServiceLabel, std::process::Child)>>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -63,6 +67,10 @@ impl ServiceManager for FakeServices {
         }
         self.started.borrow_mut().retain(|u| u.label != *label);
         self.stopped.borrow_mut().push(label.clone());
+        for (_, mut job) in self.jobs.borrow_mut().extract_if(.., |(l, _)| l == label) {
+            let _ = job.kill();
+            let _ = job.wait();
+        }
         if let Some(meanwhile) = self.on_stop.borrow().as_ref() {
             meanwhile(label);
         }

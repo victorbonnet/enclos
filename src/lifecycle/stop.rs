@@ -20,6 +20,9 @@ const POLL: Duration = Duration::from_millis(50);
 /// What stopping one session did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stopped {
+    /// Nothing of the session ran when `stop` first looked: nothing was
+    /// signalled, and only its end is left to record.
+    Gone,
     /// Every member is gone.
     Clean,
     /// These members still run.
@@ -72,6 +75,9 @@ pub fn describe_survivors(left: &[Survivor]) -> String {
 
 pub fn stop(session: &SessionRecord, grace: Duration) -> Result<Stopped, PsError> {
     let first = find(&processes()?, session, &session.tracked);
+    if first.is_empty() {
+        return Ok(Stopped::Gone);
+    }
     if !first.iter().any(|f| f.sure) {
         // Nothing enclos may signal: what is only counted is reported.
         return Ok(survivors(first, &Signals::default()));
@@ -240,6 +246,15 @@ mod tests {
             pid: m.pid,
             started: m.started.clone(),
         }
+    }
+
+    #[test]
+    fn a_session_of_which_nothing_runs_is_gone_and_nothing_is_signalled() {
+        let mut child = shell_until_input_closes("");
+        let session = session_of(&child);
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Gone);
     }
 
     #[test]
