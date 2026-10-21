@@ -26,7 +26,7 @@ pub fn tcp_listeners(pid: u32) -> Result<Vec<SocketAddr>, LsofError> {
 
 /// The TCP addresses each of `pids` listens on, with the pid that holds it,
 /// in one look. A process that is gone holds none.
-fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
+pub fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, LsofError> {
     if pids.is_empty() {
         return Ok(Vec::new());
     }
