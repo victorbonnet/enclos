@@ -905,6 +905,19 @@ fn agent_commands_need_a_runtime_and_their_dry_runs_change_nothing() {
     assert!(out.stderr().contains("no runtime yet"), "{}", out.stderr());
     let out = home.run(&["agent", "rm", "home/main", "--dry-run"]);
     assert_eq!(out.code(), 1);
+    let archive = home.root.join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let out = home.run(&[
+        "agent",
+        "add",
+        "home/main",
+        "--from",
+        archive.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("no runtime yet"), "{}", out.stderr());
+    assert!(!home.root.join("sandboxes/home/installers").exists());
     assert_eq!(home.audit_lines().len(), before);
     // Names are checked before anything else.
     for bad in [
@@ -1089,6 +1102,52 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
         add.stderr().contains("~/.hermes is a link"),
         "{}",
         add.stderr()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn agent_add_from_an_archive_imports_it_and_its_dry_run_copies_nothing() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _make = record_hermes(&home, "home");
+    let archive = home.root.join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let before = home.audit_lines().len();
+    let out = home.run(&[
+        "agent",
+        "add",
+        "home/main",
+        "--from",
+        archive.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    let stdout = out.ok().stdout();
+    assert!(
+        stdout.starts_with(&format!("Would copy {} (sha256 ", archive.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Would run `hermes profile import ") && stdout.contains("--name main`"),
+        "{stdout}"
+    );
+    assert!(!home.root.join("sandboxes/home/installers").exists());
+    assert_eq!(home.audit_lines().len(), before);
+    let missing = home.root.join("missing.tar.gz");
+    let out = home.run(&[
+        "agent",
+        "add",
+        "home/main",
+        "--from",
+        missing.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("cannot read the archive at"),
+        "{}",
+        out.stderr()
     );
 }
 

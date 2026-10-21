@@ -1,5 +1,6 @@
 //! `enclos agent`: the runtime's agents in a sandbox.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
@@ -20,8 +21,14 @@ pub struct AgentArgs {
 #[derive(Subcommand)]
 enum AgentVerb {
     /// Add an agent, such as `lab/main`: the runtime creates it in the
-    /// sandbox, or enclos tracks one the runtime already has there.
-    Add { agent: AgentTarget },
+    /// sandbox, imports it with --from, or enclos tracks one the runtime
+    /// already has there.
+    Add {
+        agent: AgentTarget,
+        /// An export the runtime's own command made on the host (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
+        #[arg(long, value_name = "ARCHIVE")]
+        from: Option<PathBuf>,
+    },
     /// List a sandbox's agents, and report the ones made inside it that
     /// enclos does not track.
     List { sandbox: SandboxName },
@@ -57,9 +64,13 @@ impl FromStr for AgentTarget {
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
-        AgentVerb::Add { agent } => {
+        AgentVerb::Add { agent, from } => {
             let AgentTarget { sandbox, agent } = agent;
-            let added = match engine.add_agent(by, &sandbox, agent, confirm)? {
+            let planned = match &from {
+                Some(archive) => engine.import_agent(by, &sandbox, agent, archive, confirm)?,
+                None => engine.add_agent(by, &sandbox, agent, confirm)?,
+            };
+            let added = match planned {
                 Planned::DryRun(plan) => {
                     plan.changes.iter().for_each(|c| println!("Would {c}."));
                     return Ok(exit::OK);
@@ -68,41 +79,71 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             };
             let name = &added.agent.name;
             let runtime = enclos::runtime::adapter(added.kind);
+            let kind = added.kind.display_name();
             match &added.how {
-                Added::Created(end) => super::connect::report_end(&sandbox, end),
                 Added::Adopted => {
                     println!(
-                        "Tracked agent {sandbox}/{name}, which {} already had. Talk to it with `enclos connect {sandbox} -- {}`.",
-                        added.kind.display_name(),
+                        "Tracked agent {sandbox}/{name}, which {kind} already had. Talk to it with `enclos connect {sandbox} -- {}`.",
                         runtime.talk(name)
                     );
                     return Ok(exit::OK);
                 }
+                Added::Created(end) => {
+                    super::connect::report_end(&sandbox, end);
+                    println!("\nAdded agent {sandbox}/{name}.\n");
+                }
+                Added::Imported {
+                    end,
+                    archive,
+                    copy_left,
+                } => {
+                    super::connect::report_end(&sandbox, end);
+                    println!(
+                        "\nImported agent {sandbox}/{name} from {} (sha256 {}).\n",
+                        archive.path.display(),
+                        archive.sha256
+                    );
+                    if let Some(copy) = copy_left {
+                        eprintln!("enclos: {copy}.\n");
+                    }
+                }
             }
+            let imported = matches!(added.how, Added::Imported { .. });
             let shell = format!("enclos connect {sandbox}");
             let talk = format!("{shell} -- {}", runtime.talk(name));
             let w = talk.len() + 3;
-            // The runtime's own output above suggests commands and `~` paths
-            // that only work inside the sandbox.
-            println!("\nAdded agent {sandbox}/{name}.\n");
-            println!(
-                "{}'s next steps above are commands to run inside the sandbox:",
-                added.kind.display_name()
-            );
+            if imported {
+                println!("Commands to run inside the sandbox:");
+            } else {
+                // The runtime's own output above, after creating an agent,
+                // suggests commands and `~` paths that only work inside the
+                // sandbox.
+                println!("{kind}'s next steps above are commands to run inside the sandbox:");
+            }
             println!("  {talk:<w$}talk to the agent");
-            println!(
-                "  {shell:<w$}a shell in the sandbox, for {}'s own commands",
-                added.kind.display_name()
-            );
+            println!("  {shell:<w$}a shell in the sandbox, for {kind}'s own commands");
             println!(
                 "There, ~ is the sandbox's home: {}",
                 engine.sandbox_home(&sandbox).display()
             );
-            println!(
-                "The agent shares the sandbox's {} login, made with `enclos connect {sandbox} -- {}`; it needs no login of its own.",
-                added.kind.display_name(),
-                runtime.login()
-            );
+            let login = format!("`enclos connect {sandbox} -- {}`", runtime.login());
+            if imported {
+                // That an imported agent uses the sandbox's login is still
+                // to verify (design §14).
+                println!(
+                    "enclos copied no login in: the agent should use the sandbox's {kind} login, made with {login}. If it asks for one of its own, its configuration names another provider: change it with {kind}'s own commands inside the sandbox."
+                );
+                println!(
+                    "Until secrets are granted per sandbox (milestone 2), values such as a bot token go in the agent's files inside the sandbox."
+                );
+                println!(
+                    "Nothing in the archive widened the sandbox's policy: what the agent reaches shows in `enclos net log {sandbox}`, and what was refused in `enclos net denied {sandbox}`."
+                );
+            } else {
+                println!(
+                    "The agent shares the sandbox's {kind} login, made with {login}; it needs no login of its own."
+                );
+            }
         }
         AgentVerb::List { sandbox } => {
             let agents = engine.agents(&sandbox)?;

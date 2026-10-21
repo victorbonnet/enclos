@@ -930,6 +930,7 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 if [ \"$1 $2\" = \"profile delete\" ] && [ ! -f \"$HOME/hermes-keeps\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
 fi
+[ \"$2\" = import ] && cat \"$3\" > \"$HOME/imported-$5\"
 exit 0
 STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
@@ -1329,6 +1330,217 @@ echo \"installed $*\" > \"$HOME/installed\"
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded() {
+        use sha2::{Digest, Sha256};
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+        // Larger than one read of the hashing buffer.
+        let bytes: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        let archive = lab._dir.path().join("main-20261020.tar.gz");
+        std::fs::write(&archive, &bytes).unwrap();
+        let sha256 = crate::engine::runtime::hex(&Sha256::digest(&bytes));
+        let installers = lab.engine.layout.sandbox_dir("home").join("installers");
+        let staged = installers.join(format!("agent-main.{}.tar.gz", std::process::id()));
+        let planned = installers.join("agent-main.<pid>.tar.gz");
+        let copies = || {
+            std::fs::read_dir(&installers)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("agent-")
+                })
+                .count()
+        };
+        let main: AgentName = "main".parse().unwrap();
+
+        // A dry run says what would happen and copies nothing.
+        let Planned::DryRun(plan) = lab
+            .engine
+            .import_agent(&alice(), &lab.name, main.clone(), &archive, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run imported");
+        };
+        assert_eq!(
+            plan.changes,
+            [
+                format!(
+                    "copy {} (sha256 {sha256} now) to a new file such as {}, beside the home of sandbox home, where the sandbox reads it and cannot write",
+                    archive.display(),
+                    planned.display()
+                ),
+                format!(
+                    "run `hermes profile import {} --name main` in sandbox home under policy v2: Hermes extracts the archive inside the sandbox",
+                    planned.display()
+                ),
+                "record agent home/main as imported from that archive".to_owned(),
+            ]
+        );
+        assert_eq!(copies(), 0);
+        assert!(!lab.home.join("hermes-calls").exists());
+
+        // The runtime imports the staged copy inside the sandbox: the bytes
+        // it reads are the archive's, and the copy goes once it served. The
+        // archive and its hash are audited before the runtime runs, and
+        // again with the record.
+        let added = done(
+            lab.engine
+                .import_agent(&alice(), &lab.name, main.clone(), &archive, Confirm::Yes)
+                .unwrap(),
+        );
+        assert_eq!(added.agent.name, main);
+        let Added::Imported {
+            end,
+            archive: imported,
+            copy_left,
+        } = &added.how
+        else {
+            panic!("not imported: {:?}", added.how);
+        };
+        assert_eq!(end.exit, 0);
+        assert_eq!(
+            (imported.path.as_path(), imported.sha256.as_str()),
+            (archive.as_path(), sha256.as_str())
+        );
+        assert!(copy_left.is_none());
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
+            format!("profile import {} --name main\n", staged.display())
+        );
+        assert_eq!(
+            std::fs::read(lab.home.join("imported-main")).unwrap(),
+            bytes
+        );
+        assert!(!staged.exists());
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        // Read afresh each time: the audit log grows below.
+        let outcome = |command: &str| {
+            lab.engine
+                .audit(None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.intent.command == command)
+                .map(|e| e.finished.as_ref().unwrap().outcome.message.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            outcome("agent import"),
+            [format!(
+                "copied {} (sha256 {sha256}) to {}",
+                archive.display(),
+                staged.display()
+            )]
+        );
+        assert_eq!(outcome("agent import session").len(), 1);
+        assert_eq!(
+            outcome("agent add"),
+            [format!(
+                "imported from {} (sha256 {sha256})",
+                archive.display()
+            )]
+        );
+        // In that order: the copy is audited before the runtime runs.
+        let commands: Vec<String> = lab
+            .engine
+            .audit(None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.intent.command)
+            .filter(|c| c.starts_with("agent "))
+            .collect();
+        assert_eq!(
+            commands,
+            ["agent import", "agent import session", "agent add"]
+        );
+
+        // Refused before the archive is read: a known name, and a name that
+        // is a command on the sandbox's PATH.
+        let err = lab
+            .engine
+            .import_agent(&alice(), &lab.name, main.clone(), &archive, Confirm::Yes)
+            .unwrap_err();
+        assert!(err.to_string().contains("already has agent main"), "{err}");
+        let missing = lab._dir.path().join("missing.tar.gz");
+        let err = lab
+            .engine
+            .import_agent(
+                &alice(),
+                &lab.name,
+                "curl".parse().unwrap(),
+                &missing,
+                Confirm::Yes,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("command on the sandbox's PATH"),
+            "{err}"
+        );
+
+        // An archive that is not a plain file of the user's own is refused.
+        let other: AgentName = "other".parse().unwrap();
+        let refused = |path: &Path, what: &str| {
+            let err = lab
+                .engine
+                .import_agent(&alice(), &lab.name, other.clone(), path, Confirm::Yes)
+                .unwrap_err();
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        };
+        refused(&missing, "missing.tar.gz");
+        refused(&missing, "Name an export");
+        refused(lab._dir.path(), "is not a file");
+        let link = lab._dir.path().join("link.tar.gz");
+        std::os::unix::fs::symlink(&archive, &link).unwrap();
+        refused(&link, "is a link");
+        let inside = lab.home.join("export.tar.gz");
+        std::fs::write(&inside, &bytes).unwrap();
+        refused(&inside, "under a sandbox's folder");
+        // Also through a link in a parent folder, and through `..`: only
+        // where the opened file really is counts.
+        let linked = lab._dir.path().join("exports");
+        std::os::unix::fs::symlink(&lab.home, &linked).unwrap();
+        refused(&linked.join("export.tar.gz"), "under a sandbox's folder");
+        let sandboxes = lab.engine.layout.sandboxes_dir();
+        refused(
+            &sandboxes.join("../sandboxes/home/home/export.tar.gz"),
+            "under a sandbox's folder",
+        );
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
+            format!("profile import {} --name main\n", staged.display())
+        );
+
+        // A failing import records nothing, leaves no copy, and says how
+        // to delete what the runtime may have kept.
+        std::fs::write(lab.home.join("hermes-fails"), "").unwrap();
+        let err = lab
+            .engine
+            .import_agent(&alice(), &lab.name, other.clone(), &archive, Confirm::Yes)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("exit 3")
+                && text.contains("enclos agent list home")
+                && text.contains("hermes profile delete other --yes"),
+            "{text}"
+        );
+        assert_eq!(copies(), 0);
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        // The copy is audited again, with its hash; no record is.
+        let copied = outcome("agent import");
+        assert_eq!(copied.len(), 2);
+        assert!(
+            copied[1].contains(&format!("(sha256 {sha256})")),
+            "{copied:?}"
+        );
+        assert_eq!(outcome("agent add").len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn an_install_with_unapplied_policy_edits_asks_first() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let lab = Lab::new();
@@ -1455,6 +1667,156 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(outcome.result, AuditResult::Ok);
         assert_eq!(outcome.message, "adopted");
         assert!(engine.show_sandbox(&name).unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn an_import_is_refused_before_anything_runs_and_a_dry_run_copies_nothing() {
+        let (dir, engine, name, make) = with_hermes();
+        make("scout");
+        let archive = dir.path().join("scout.tar.gz");
+        std::fs::write(&archive, b"an export").unwrap();
+        // Refused before anything runs: the fake backend would fail.
+        let err = engine
+            .import_agent(
+                &alice(),
+                &name,
+                "scout".parse().unwrap(),
+                &archive,
+                Confirm::Yes,
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("needs a fresh name") && text.contains("enclos agent add home/scout"),
+            "{text}"
+        );
+        let err = engine
+            .import_agent(
+                &alice(),
+                &name,
+                "default".parse().unwrap(),
+                &archive,
+                Confirm::Yes,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("built-in agent"), "{err}");
+        // A dry run of a fresh name copies nothing and makes no folder.
+        let Planned::DryRun(plan) = engine
+            .import_agent(
+                &alice(),
+                &name,
+                "fresh".parse().unwrap(),
+                &archive,
+                Confirm::DryRun,
+            )
+            .unwrap()
+        else {
+            panic!("a dry run imported");
+        };
+        assert!(
+            plan.changes[0].starts_with(&format!("copy {} (sha256 ", archive.display())),
+            "{plan:?}"
+        );
+        assert_eq!(
+            plan.changes[2],
+            "record agent home/fresh as imported from that archive"
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        assert!(
+            !engine
+                .layout
+                .sandbox_dir("home")
+                .join("installers")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn an_import_preserves_the_exit_code_when_the_backend_is_unavailable() {
+        let (dir, mut engine, name, _make) = with_hermes();
+        engine.backends = vec![Box::new(FakeBackend::unavailable(
+            BackendKind::Seatbelt,
+            "this host cannot run the backend",
+        ))];
+        let archive = dir.path().join("fresh.tar.gz");
+        std::fs::write(&archive, b"an export").unwrap();
+        let err = engine
+            .import_agent(&alice(), &name, agent("fresh"), &archive, Confirm::Yes)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::error::exit::REFUSED, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("this host cannot run the backend")
+                && text.contains("did not finish")
+                && text.contains("Nothing was recorded")
+                && text.contains("enclos agent add home/fresh"),
+            "{text}"
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        let installers = engine.layout.sandbox_dir("home").join("installers");
+        assert_eq!(std::fs::read_dir(installers).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_import_whose_session_fails_records_nothing_and_leaves_no_copy() {
+        let (dir, engine, name, _make) = with_hermes();
+        let archive = dir.path().join("fresh.tar.gz");
+        std::fs::write(&archive, b"an export").unwrap();
+        // The fake backend cannot start a session: the copy is made and
+        // audited, then the session fails.
+        let err = engine
+            .import_agent(&alice(), &name, agent("fresh"), &archive, Confirm::Yes)
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("did not finish")
+                && text.contains("Nothing was recorded")
+                && text.contains("enclos agent add home/fresh"),
+            "{text}"
+        );
+        assert!(engine.agents(&name).unwrap().is_empty());
+        let installers = engine.layout.sandbox_dir("home").join("installers");
+        assert_eq!(std::fs::read_dir(&installers).unwrap().count(), 0);
+        let entries = engine.audit(None).unwrap();
+        let copied: Vec<_> = entries
+            .iter()
+            .filter(|e| e.intent.command == "agent import")
+            .collect();
+        assert_eq!(copied.len(), 1);
+        let outcome = &copied[0].finished.as_ref().unwrap().outcome;
+        assert_eq!(outcome.result, AuditResult::Ok);
+        assert!(
+            outcome.message.contains(&archive.display().to_string())
+                && outcome.message.contains("(sha256 "),
+            "{}",
+            outcome.message
+        );
+        assert!(!entries.iter().any(|e| e.intent.command == "agent add"));
+    }
+
+    #[test]
+    fn an_import_is_refused_when_the_runtimes_agents_cannot_be_read() {
+        let (dir, engine, name, _make) = with_hermes();
+        // Something in the sandbox replaced ~/.hermes with a link.
+        let home = engine.sandbox_home(&name);
+        std::os::unix::fs::symlink(dir.path(), home.join(".hermes")).unwrap();
+        let archive = dir.path().join("fresh.tar.gz");
+        std::fs::write(&archive, b"an export").unwrap();
+        let err = engine
+            .import_agent(&alice(), &name, agent("fresh"), &archive, Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot tell whether agent fresh is already there"),
+            "{err}"
+        );
+        assert!(
+            !engine
+                .layout
+                .sandbox_dir("home")
+                .join("installers")
+                .exists()
+        );
     }
 
     #[test]

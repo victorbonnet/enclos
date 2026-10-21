@@ -1,6 +1,6 @@
 //! Runtime adapters (design §9): what each runtime needs from enclos, as
-//! data and commands. The commands enclos runs (the installer, creating an
-//! agent) run inside the sandbox, never on the host: they are
+//! data and commands. The commands enclos runs (the installer and the
+//! agent commands) run inside the sandbox, never on the host: they are
 //! [`SandboxCommand`]s, which only the engine's session code can start.
 //! `login` and `talk` are text enclos shows, never runs (ADR 0024).
 
@@ -201,6 +201,16 @@ pub trait RuntimeAdapter {
     /// the sandbox by `enclos agent rm`. `None`: the runtime has none, so
     /// `agent rm` removes only the record and says the files stay.
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
+    /// The runtime's own command that creates agent `name` from `archive`,
+    /// an export made with the runtime's own command (for Hermes, `hermes
+    /// profile export`), run in the sandbox by `enclos agent add --from`
+    /// (issue #34). `archive` is a host path beside the sandbox home, which
+    /// the sandbox reads and never writes; the runtime extracts it inside
+    /// the sandbox, so the host never does. `None`: the runtime cannot
+    /// import an agent.
+    fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
         None
     }
 

@@ -5,6 +5,7 @@
 //! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
 //! the prototype used them (design §14: to verify in this build).
 
+use std::ffi::OsString;
 use std::path::Path;
 
 use rustix::fs::{Dir, FileType};
@@ -141,6 +142,21 @@ impl RuntimeAdapter for Hermes {
             name.as_str(),
             "--yes",
         ]))
+    }
+
+    fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
+        // Hermes's own import of an archive its `profile export` made, by
+        // Hermes 0.22.2's code: it extracts without following links or
+        // leaving the profile folder, refuses an existing profile and
+        // `default`, removes the archive's `installs`, `tools` and `cache`
+        // folders, and writes the profile's wrapper unless the name
+        // collides with a command. Its export leaves out `auth.json`, `.env`
+        // and the browser's data and scrubs secret-shaped strings. Neither
+        // is shown by a prototype yet (design §14).
+        let mut words: Vec<OsString> = [HERMES, "profile", "import"].map(OsString::from).to_vec();
+        words.push(archive.as_os_str().to_owned());
+        words.extend(["--name", name.as_str()].map(OsString::from));
+        Some(SandboxCommand::new(words))
     }
 
     fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> {
@@ -531,6 +547,17 @@ mod tests {
         assert_eq!(
             Hermes.create_agent(&main),
             SandboxCommand::from_words(&["hermes", "profile", "create", "main"])
+        );
+        assert_eq!(
+            Hermes.import_agent(&main, Path::new("/x/installers/agent-main.tar.gz")),
+            Some(SandboxCommand::from_words(&[
+                "hermes",
+                "profile",
+                "import",
+                "/x/installers/agent-main.tar.gz",
+                "--name",
+                "main"
+            ]))
         );
         assert_eq!(Hermes.installer().sha256.len(), 64);
         assert!(
