@@ -22,22 +22,25 @@ use rustix::io::Errno;
 use serde::{Serialize, Serializer};
 
 use super::Engine;
-use super::listener::service_listener;
+use super::listener::{NoPort, outside_proxy_range, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
 use crate::lifecycle::members::{find, is_gone};
-use crate::lifecycle::process::{Proc, processes};
+use crate::lifecycle::process::{Proc, is_same, processes};
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::session::{SessionKind, SessionRecord};
+use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 use crate::runtime::home::{self, is_dot, wide};
-use crate::runtime::{DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, ValueAt, adapter};
+use crate::runtime::{
+    DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, RuntimeListener, ValueAt, adapter,
+};
 use crate::service::ServiceStatus;
+use crate::state::StateStore;
 use printable::printable;
 
 /// Past this, a sandbox nobody used is worth a suggestion.
@@ -156,9 +159,12 @@ pub struct SandboxStatus {
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,
-    /// The page the runtime's service serves on the host while it listens,
-    /// such as Hermes's dashboard (ADR 0028).
-    pub dashboard: Option<String>,
+    /// The address of the page the runtime's service serves on the host,
+    /// such as Hermes's dashboard (ADR 0028), at the port sessions are
+    /// given: absent while no session of the service runs, "cannot tell"
+    /// while it holds no such port or one that cannot be trusted, not
+    /// provided for a runtime with no such page.
+    pub dashboard: Fact<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback
     /// (ADR 0028).
@@ -590,18 +596,10 @@ impl Engine {
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
         let network_listeners = network_listeners(&procs, &running);
-        let dashboard = runtime
-            .and_then(|rt| rt.listener())
-            .and_then(|l| Some((l.page?, l.service.as_str())))
-            .filter(|(_, service)| {
-                running.iter().any(|s| {
-                    s.kind == SessionKind::Service && s.service.as_deref() == Some(*service)
-                })
-            })
-            .and_then(|(page, service)| {
-                let port = service_listener(self.state.as_ref(), &name, service).ok()?;
-                Some(format!("http://127.0.0.1:{port}{page}"))
-            });
+        let dashboard = match runtime.and_then(|rt| rt.listener()) {
+            Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
+            None => Fact::NotProvided,
+        };
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -1247,15 +1245,48 @@ fn count(usage: &mut Usage, linked: &mut HashMap<(i128, i128), Linked>, slot: &S
     *usage.by_slot.entry(slot.clone()).or_default() += bytes;
 }
 
+/// The address of the page `listener`'s service serves on the host, at the
+/// port sessions are given (ADR 0028), found the same way.
+fn dashboard(
+    store: &dyn StateStore,
+    name: &SandboxName,
+    listener: &RuntimeListener,
+    running: &[SessionRecord],
+) -> Fact<String> {
+    let Some(page) = listener.page else {
+        return Fact::NotProvided;
+    };
+    let service = listener.service.as_str();
+    let runs = running
+        .iter()
+        .any(|s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service));
+    if !runs {
+        return Fact::Absent;
+    }
+    match service_listener(store, name, service).and_then(outside_proxy_range) {
+        Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
+        Err(NoPort::NotRunning(_)) => Fact::Absent,
+        Err(why) => Fact::CannotTell(why.to_string()),
+    }
+}
+
 /// Members of the `running` sessions that run in the sandbox (the proxy runs
 /// outside it) listening beyond loopback, which the host's network can
 /// reach: nothing narrows a sandbox's listener to loopback (ADR 0028). Each
-/// pid and port once, a listener on every address shown as `*`.
+/// pid and address once, a listener on every address (`0.0.0.0` or `[::]`)
+/// shown as `*:<port>`. A pid is named only while it is still the member
+/// `procs` listed, checked after `lsof` looked, so a pid reused meanwhile
+/// is not.
 fn network_listeners(procs: &[Proc], running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
-    let mut members: BTreeMap<u32, String> = BTreeMap::new();
+    let mut members: BTreeMap<u32, (ProcessRef, String)> = BTreeMap::new();
     for session in running.iter().filter(|s| s.kind != SessionKind::Proxy) {
         for found in find(procs, session, &session.tracked) {
-            members.insert(found.member.pid, found.member.command);
+            let member = found.member;
+            let at = ProcessRef {
+                pid: member.pid,
+                started: member.started,
+            };
+            members.insert(member.pid, (at, member.command));
         }
     }
     let pids: Vec<u32> = members.keys().copied().collect();
@@ -1263,27 +1294,36 @@ fn network_listeners(procs: &[Proc], running: &[SessionRecord]) -> Fact<Vec<Netw
         Ok(held) => held,
         Err(e) => return Fact::CannotTell(e.to_string()),
     };
-    let shown: BTreeSet<(u32, String)> = held
-        .into_iter()
-        .filter(|(_, addr)| !addr.ip().is_loopback())
-        .map(|(pid, addr)| {
-            let address = match addr.ip().is_unspecified() {
-                true => format!("*:{}", addr.port()),
-                false => addr.to_string(),
-            };
-            (pid, address)
-        })
-        .collect();
-    Fact::Known(
-        shown
-            .into_iter()
-            .map(|(pid, address)| NetworkListener {
+    let mut shown: BTreeSet<(u32, String)> = BTreeSet::new();
+    for (pid, addr) in held {
+        // A v4-mapped address is the IPv4 one (`::ffff:127.0.0.1`).
+        let ip = addr.ip().to_canonical();
+        if ip.is_loopback() {
+            continue;
+        }
+        let address = match ip.is_unspecified() {
+            true => format!("*:{}", addr.port()),
+            false => addr.to_string(),
+        };
+        shown.insert((pid, address));
+    }
+    let mut found = Vec::new();
+    for (pid, address) in shown {
+        let Some((at, command)) = members.get(&pid) else {
+            return Fact::CannotTell(format!("lsof answered for pid {pid}, which was not asked"));
+        };
+        match is_same(at) {
+            Ok(true) => found.push(NetworkListener {
                 pid,
-                command: printable(members.get(&pid).map_or("", String::as_str)),
+                command: printable(command),
                 address,
-            })
-            .collect(),
-    )
+            }),
+            // Gone, or another process now: not the member's listener.
+            Ok(false) => {}
+            Err(e) => return Fact::CannotTell(e.to_string()),
+        }
+    }
+    Fact::Known(found)
 }
 
 #[cfg(test)]

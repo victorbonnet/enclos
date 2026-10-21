@@ -7,7 +7,8 @@ use clap::Args;
 
 use enclos::engine::Engine;
 use enclos::engine::{
-    AgentKind, AgentStatus, Fact, Presence, SandboxStatus, ServiceState, StatusView, human_bytes,
+    AgentKind, AgentStatus, Fact, NetworkListener, Presence, SandboxStatus, ServiceState,
+    StatusView, human_bytes,
 };
 use enclos::error::{Result, exit};
 use enclos::model::sandbox::{SandboxName, SandboxState};
@@ -103,6 +104,29 @@ fn fact<T>(f: &Fact<T>, shown: impl Fn(&T) -> String) -> String {
     }
 }
 
+/// What the sandbox serves on the host: its runtime's dashboard, and each
+/// member the host's network can reach (ADR 0028).
+fn listener_lines(dashboard: &Fact<String>, listeners: &Fact<Vec<NetworkListener>>) -> Vec<String> {
+    let mut lines = Vec::new();
+    match dashboard {
+        Fact::Known(page) => lines.push(format!("dashboard {page}")),
+        Fact::CannotTell(why) => lines.push(format!("dashboard: cannot tell ({why})")),
+        // Its service is not running, as the services line shows.
+        Fact::Absent | Fact::NotProvided => {}
+    }
+    match listeners {
+        Fact::Known(list) => lines.extend(list.iter().map(|l| {
+            format!(
+                "your network can reach {} (pid {}), listening on {}",
+                l.command, l.pid, l.address
+            )
+        })),
+        Fact::CannotTell(why) => lines.push(format!("listeners: cannot tell ({why})")),
+        Fact::Absent | Fact::NotProvided => {}
+    }
+    lines
+}
+
 fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     let complete = s.disk.incomplete.is_none();
     let runtime = match &s.runtime {
@@ -171,20 +195,8 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     if let Some(why) = &s.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
-    if let Some(page) = &s.dashboard {
-        println!("  dashboard {page}");
-    }
-    match &s.network_listeners {
-        Fact::Known(list) => {
-            for l in list {
-                println!(
-                    "  your network can reach {} (pid {}), listening on {}",
-                    l.command, l.pid, l.address
-                );
-            }
-        }
-        Fact::CannotTell(why) => println!("  listeners: cannot tell ({why})"),
-        Fact::Absent | Fact::NotProvided => {}
+    for line in listener_lines(&s.dashboard, &s.network_listeners) {
+        println!("  {line}");
     }
 
     if let Some(list) = &s.agents {
@@ -316,6 +328,38 @@ fn agents(tracked: usize, untracked: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_sandbox_serves_on_the_host_is_one_line_each() {
+        let perl = NetworkListener {
+            pid: 42,
+            command: "perl".into(),
+            address: "*:8000".into(),
+        };
+        assert_eq!(
+            listener_lines(
+                &Fact::Known("http://127.0.0.1:61374/".into()),
+                &Fact::Known(vec![perl])
+            ),
+            [
+                "dashboard http://127.0.0.1:61374/",
+                "your network can reach perl (pid 42), listening on *:8000"
+            ]
+        );
+        assert_eq!(
+            listener_lines(
+                &Fact::CannotTell("two ports".into()),
+                &Fact::CannotTell("lsof failed".into())
+            ),
+            [
+                "dashboard: cannot tell (two ports)",
+                "listeners: cannot tell (lsof failed)"
+            ]
+        );
+        // Not running, no such page, nothing listening: nothing to say.
+        assert!(listener_lines(&Fact::Absent, &Fact::Known(Vec::new())).is_empty());
+        assert!(listener_lines(&Fact::NotProvided, &Fact::Known(Vec::new())).is_empty());
+    }
 
     #[test]
     fn the_agent_count_says_how_many_are_not_tracked() {

@@ -247,8 +247,9 @@ impl RuntimeAdapter for Hermes {
         // `hermes_cli/gateway_client.py`).
         Some(RuntimeListener {
             service: GATEWAY,
-            // Its web dashboard, on the same listener; on loopback Hermes
-            // asks no login for it (`__HERMES_AUTH_REQUIRED__=false`).
+            // Its web dashboard, on the same listener. Bound to loopback,
+            // Hermes asks no login for it, by its code
+            // (`listener_auth_required` in `gateway/run_api.py`).
             page: Some("/"),
         })
     }
