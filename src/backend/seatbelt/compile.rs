@@ -16,7 +16,7 @@ use std::path::Path;
 
 use super::super::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
-use crate::model::sandbox::BackendKind;
+use crate::model::sandbox::{BackendKind, PORT_FIRST, PORT_LAST};
 use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
 
 const HOST_SERVICES: &str = include_str!("host-services.sb");
@@ -167,13 +167,15 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         // A runtime's own listener (ADR 0028). Seatbelt refuses `localhost:0`
         // and `localhost` does not hold a bind to loopback (a bind on 0.0.0.0
         // passes too, macOS 26.5.2), so this opens every port on every
-        // address. Then each proxy port of the install is closed again, so no
-        // sandbox takes another's proxy port while that proxy is not running:
-        // an exact-port deny after the allow held on every address, and
-        // Seatbelt refuses before the port is found in use. Outbound is
-        // unchanged: only the proxy port.
+        // address. Then each port of the proxy range is closed again, every
+        // install's, reserved before this policy was compiled or after, so
+        // no sandbox takes another's proxy port while that proxy is not
+        // running: an exact-port deny after the allow held on every address,
+        // and Seatbelt refuses before the port is found in use. It has no
+        // port ranges, hence one rule a port. Outbound is unchanged: only the
+        // proxy port.
         line("(allow network-bind network-inbound (local tcp \"localhost:*\"))".into());
-        for port in &ctx.reserved_ports {
+        for port in PORT_FIRST..=PORT_LAST {
             line(format!(
                 "(deny network-bind (local tcp \"*:{port}\") (with message \"{tag}\"))"
             ));
@@ -328,20 +330,20 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_that_listens_binds_tcp_but_no_proxy_port_of_the_install() {
+    fn a_policy_that_listens_binds_tcp_but_no_proxy_port_of_any_install() {
         let base = Path::new("/nonexistent-enclos-test");
         let mut p = policy();
         p.net.listen = true;
-        let mut c = ctx(base);
-        c.reserved_ports = vec![41000, 41001, 41005];
-        let text = compile(&p, &c).unwrap().text;
+        let text = compile(&p, &ctx(base)).unwrap().text;
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
         };
         let allow = at("(allow network-bind network-inbound (local tcp \"localhost:*\"))");
-        // Later rules win: each deny comes after the allow, on every address.
-        for port in [41000, 41001, 41005] {
+        // Later rules win: each deny comes after the allow, on every address,
+        // for the whole range, not only the ports reserved now.
+        assert_eq!(text.matches("(deny network-bind (local tcp").count(), 1000);
+        for port in [PORT_FIRST, 41001, 41500, PORT_LAST] {
             let deny = at(&format!(
                 "(deny network-bind (local tcp \"*:{port}\") (with message \"enclos:home\"))"
             ));
