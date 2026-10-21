@@ -564,14 +564,17 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         std::fs::write(file, contents).unwrap();
     }
     let policy_file = home.root.join("sandboxes/home/policy.toml");
-    let policy = std::fs::read_to_string(&policy_file).unwrap().replace(
+    let original = std::fs::read_to_string(&policy_file).unwrap();
+    let policy = original.replace(
         "write_add = []\nread_deny_add = []",
         "write_add = [\"~/work\"]\nread_deny_add = [\"~/work/.secrets\", \"~/work/.env\"]",
     );
+    assert_ne!(policy, original, "the grant was not added:\n{original}");
     std::fs::write(&policy_file, policy).unwrap();
     // `policy allow` applies the file's other changes with `--yes`.
     home.run(&["policy", "allow", "home", "example.com", "--yes"])
         .ok();
+    let policy = std::fs::read_to_string(&policy_file).unwrap();
     // The host-service probes act on the host if a rule fails: only where
     // CI asks for them by name, never because some tool set `CI`.
     let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
@@ -595,7 +598,6 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "enclos files",
         "other sandboxes",
         "writes",
-        "launch agents",
         "network",
         "dns",
         "signals",
@@ -603,7 +605,13 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "at",
     ];
     if host_services {
-        routes.extend(["launchservices", "apple events", "launchd", "preferences"]);
+        routes.extend([
+            "launchservices",
+            "apple events",
+            "launchd",
+            "preferences",
+            "launch agents",
+        ]);
     }
     let closed = |text: &str| {
         report
@@ -635,12 +643,22 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     for probe in [
         "/work/.secrets, under a write grant",
         "/work/.env, under a write grant",
-        "the sandbox's own policy.toml",
+        "write the sandbox's own policy.toml",
         "the sandbox's own compiled folder",
-        "write in ~/Library/LaunchAgents",
         "lab/home",
+        "/state.lock",
     ] {
         assert!(closed(probe), "{probe} is not shown closed:\n{report}");
+    }
+    assert!(
+        report
+            .lines()
+            .any(|l| l.trim_start().starts_with("closed ") && l.trim_end().ends_with("/run")),
+        "reading run/ is not shown closed:\n{report}"
+    );
+    if host_services {
+        let agents = "write in ~/Library/LaunchAgents";
+        assert!(closed(agents), "{agents} is not shown closed:\n{report}");
     }
     assert!(!report.contains("denied paths exists here"), "{report}");
     assert!(
@@ -658,8 +676,8 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "{report}"
     );
     assert!(report.contains("probes were shown closed"), "{report}");
-    // Nothing a probe wrote stayed: the files under the grant and the
-    // sandbox's policy are as the test left them.
+    // `.env`, LaunchAgents and the sandbox's policy keep what the test put
+    // there; any other file a probe left would show as OPEN above.
     assert_eq!(
         std::fs::read_to_string(user.join("work/.env")).unwrap(),
         "TOKEN=x"
@@ -670,11 +688,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
             .count(),
         1
     );
-    assert!(
-        std::fs::read_to_string(&policy_file)
-            .unwrap()
-            .contains("~/work/.env")
-    );
+    assert_eq!(std::fs::read_to_string(&policy_file).unwrap(), policy);
     let audit = home.run(&["audit"]).ok().stdout();
     assert!(
         audit.contains("policy test") && audit.contains(" 0 open,") && audit.contains(" 0 not run"),

@@ -40,12 +40,21 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route Seatbelt itself closes, under any profile:
-    /// they show no rule enclos adds.
+    /// Closed probes whose route Seatbelt itself closes, whatever the
+    /// compiled policy says: they show no rule enclos adds.
     pub fn closed_by_platform(&self) -> usize {
+        self.count_closed(|r| r.closed_by_platform.is_some())
+    }
+
+    /// Closed probes that show a rule enclos adds.
+    pub fn closed_by_enclos(&self) -> usize {
+        self.count_closed(|r| r.closed_by_platform.is_none())
+    }
+
+    fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
         self.results
             .iter()
-            .filter(|r| r.outcome == Outcome::Closed && r.closed_by_platform.is_some())
+            .filter(|r| r.outcome == Outcome::Closed && which(r))
             .count()
     }
 
@@ -63,10 +72,11 @@ impl TestReport {
     }
 
     /// Whether the test passed: nothing got through, every probe ran, and at
-    /// least one was shown closed. An inconclusive probe does not fail it,
-    /// but a test where none was closed showed nothing.
+    /// least one was shown closed by an enclos rule. An inconclusive probe
+    /// does not fail it, but a test where none was closed, or only those
+    /// Seatbelt itself closes, showed nothing about the policy.
     pub fn passed(&self) -> bool {
-        self.open() == 0 && self.not_run() == 0 && self.closed() > 0
+        self.open() == 0 && self.not_run() == 0 && self.closed_by_enclos() > 0
     }
 }
 
@@ -111,8 +121,12 @@ impl Engine {
             return self.plan_test(name, host_services).map(Planned::DryRun);
         }
         let summary = |r: &TestReport| {
+            let platform = match r.closed_by_platform() {
+                0 => String::new(),
+                n => format!(" ({n} by Seatbelt itself)"),
+            };
             format!(
-                "{} probes: {} closed, {} open, {} inconclusive, {} not run",
+                "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run",
                 r.results.len(),
                 r.closed(),
                 r.open(),
@@ -472,6 +486,21 @@ mod tests {
         let unrun = report(vec![Outcome::NotRun("x".into()); 3]);
         assert!(!unrun.passed());
         assert_eq!(unrun.not_run(), 3);
+        // Seatbelt's own refusal of setuid programs shows no enclos rule.
+        let mut platform = report(vec![Outcome::Closed, Outcome::Inconclusive("x".into())]);
+        for r in &mut platform.results {
+            r.closed_by_platform = Some("Seatbelt itself");
+        }
+        assert!(!platform.passed());
+        assert_eq!(platform.closed_by_platform(), 1);
+        platform
+            .results
+            .extend(report(vec![Outcome::Closed]).results);
+        assert!(platform.passed());
+        assert_eq!(
+            (platform.closed_by_platform(), platform.closed_by_enclos()),
+            (1, 1)
+        );
         assert!(!report(vec![Outcome::Closed, Outcome::Open("x".into())]).passed());
         // Nothing closed is nothing shown.
         assert!(!report(vec![Outcome::Inconclusive("x".into()); 2]).passed());

@@ -149,10 +149,12 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     println!("Escape probes in sandbox {sandbox}: each tries one way out and must fail.");
     for r in &report.results {
         let (mark, detail) = match &r.outcome {
-            Outcome::Closed => match r.closed_by_platform {
-                Some(why) => ("closed      ", format!("  ({why})")),
-                None => ("closed      ", String::new()),
-            },
+            Outcome::Closed => (
+                "closed      ",
+                r.closed_by_platform
+                    .map(|why| format!("  ({why})"))
+                    .unwrap_or_default(),
+            ),
             Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
             Outcome::Inconclusive(why) => ("inconclusive", format!("  ({why})")),
             Outcome::NotRun(why) => ("NOT RUN     ", format!("  <- {why}")),
@@ -196,8 +198,10 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
             report.not_run()
         );
     }
-    if report.open() == 0 && report.not_run() == 0 && report.closed() == 0 {
-        eprintln!("error: no probe was shown closed, so this test showed nothing.");
+    if report.open() == 0 && report.not_run() == 0 && report.closed_by_enclos() == 0 {
+        eprintln!(
+            "error: no probe was shown closed by an enclos rule, so this test showed nothing about the policy."
+        );
     }
     match report.passed() {
         true => {
