@@ -54,6 +54,14 @@ pub fn members(session: &SessionRecord) -> Result<Vec<Member>, PsError> {
         .collect())
 }
 
+/// Whether nothing of `session` runs in `procs`: its root and every member
+/// it recorded are gone (no longer listed, or listed with another start
+/// time, as after a restart of the Mac), and nothing else counts as its
+/// member. Only its end is then left to record.
+pub fn is_gone(procs: &[Proc], session: &SessionRecord) -> bool {
+    find(procs, session, &session.tracked).is_empty()
+}
+
 /// The members of `session` in `procs`, also looking for the `tracked`
 /// processes, which replace what the session recorded.
 pub fn find(procs: &[Proc], session: &SessionRecord, tracked: &[ProcessRef]) -> Vec<Found> {
@@ -259,6 +267,50 @@ mod tests {
         let procs = vec![proc(21, 20, 21), proc(22, 21, 21), proc(30, 1, 22)];
         let found = find(&procs, &session(21, Some(20)), &[]);
         assert_eq!(pids(&found), [(21, true), (22, true)]);
+    }
+
+    #[test]
+    fn a_session_is_gone_only_when_nothing_of_it_runs() {
+        let mut s = session(30, Some(30));
+        s.tracked = vec![at(40)];
+        // After a restart of the Mac: its pids are free, or used again by
+        // processes started at other times.
+        let restarted = vec![proc(10, 1, 10), proc(31, 1, 31)];
+        let mut reused = proc(30, 1, 30);
+        reused.started = "later".into();
+        assert!(is_gone(&restarted, &s));
+        assert!(is_gone(&[reused], &s));
+        // Its root, a member it recorded, or what is left in its group
+        // keeps it open.
+        assert!(!is_gone(&[proc(30, 1, 30)], &s));
+        assert!(!is_gone(&[proc(40, 1, 40)], &s));
+        assert!(!is_gone(&[proc(31, 1, 30)], &s));
+    }
+
+    #[test]
+    fn after_a_restart_a_recorded_member_or_the_terminals_job_whose_pids_were_reused_is_gone() {
+        // A shell (21) run from a terminal, whose job the `enclos` holding
+        // it (20) led, and a job of the shell (22) it recorded.
+        let mut s = session(21, Some(20));
+        s.tracked = vec![at(22)];
+        // After the restart, every one of those pids runs another process,
+        // started at another time, each in a group of its own, as launchd
+        // starts its jobs; one of them has a child in its group.
+        let mut restarted = vec![
+            proc(20, 1, 20),
+            proc(21, 1, 21),
+            proc(22, 1, 22),
+            proc(23, 20, 20),
+        ];
+        for p in &mut restarted[..3] {
+            p.started = "after the restart".into();
+        }
+        assert!(is_gone(&restarted, &s));
+        // A process that lost its parent in a group with the number of the
+        // terminal's job still counts, never signalled: nothing tells it
+        // apart from what the session left, so the session stays open rather
+        // than ending while a member may run.
+        assert!(!is_gone(&[proc(24, 1, 20)], &s));
     }
 
     #[test]

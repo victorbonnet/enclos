@@ -422,6 +422,63 @@ fn only_a_service_session_names_a_service() {
 }
 
 #[test]
+fn a_session_and_its_sandboxs_state_are_written_together_or_not_at_all() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let session = |sandbox: &str| SessionRecord {
+        id: SessionId(0),
+        sandbox: sandbox.parse().unwrap(),
+        kind: SessionKind::Interactive,
+        service: None,
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: None,
+        root: ProcessRef {
+            pid: 10,
+            started: "Thu Oct 8 09:31:10 2026".into(),
+        },
+        pgid: None,
+        tracked: Vec::new(),
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    let mut running = record("home");
+    running.state = SandboxState::Running;
+
+    // The session names no sandbox there is: its insert fails after the
+    // record was saved, and the record's change is undone with it.
+    store
+        .start_session(&lock, &session("other"), &running)
+        .unwrap_err();
+    assert_eq!(
+        store.get(&name).unwrap().unwrap().state,
+        SandboxState::Created
+    );
+
+    let id = store
+        .start_session(&lock, &session("home"), &running)
+        .unwrap();
+    assert_eq!(
+        store.get(&name).unwrap().unwrap().state,
+        SandboxState::Running
+    );
+    assert_eq!(store.sessions(&name, true).unwrap()[0].id, id);
+
+    let mut stopped = running.clone();
+    stopped.state = SandboxState::Stopped;
+    store.end_sessions(&lock, &[id], &stopped).unwrap();
+    assert!(store.sessions(&name, true).unwrap().is_empty());
+    assert_eq!(
+        store.get(&name).unwrap().unwrap().state,
+        SandboxState::Stopped
+    );
+}
+
+#[test]
 fn reports_corrupt_session_members() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();

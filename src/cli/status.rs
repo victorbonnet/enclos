@@ -156,6 +156,9 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     if s.restart_needed {
         facts.push("sessions on a replaced policy".into());
     }
+    if s.gone_sessions > 0 {
+        facts.push(format!("{} sessions gone, not recorded", s.gone_sessions));
+    }
     facts.push(format!("last connect {}", ago(s.last_connect, now)));
     facts.push(format!("last network {}", ago(s.last_network, now)));
     if s.agents

@@ -100,6 +100,23 @@ pub trait StateStore: NetLogStore {
     fn track(&self, lock: &StateLock, id: SessionId, tracked: &[ProcessRef]) -> Result<()>;
     /// Records that a session ended.
     fn end_session(&self, lock: &StateLock, id: SessionId) -> Result<()>;
+    /// Saves `rec` and records `session`, which started in that sandbox,
+    /// in one transaction: a crash or a failed write never leaves one
+    /// without the other. The session's `id` is ignored and assigned.
+    fn start_session(
+        &self,
+        lock: &StateLock,
+        session: &SessionRecord,
+        rec: &SandboxRecord,
+    ) -> Result<SessionId>;
+    /// Saves `rec` and records that `ended`, sessions of that sandbox,
+    /// ended, in one transaction.
+    fn end_sessions(
+        &self,
+        lock: &StateLock,
+        ended: &[SessionId],
+        rec: &SandboxRecord,
+    ) -> Result<()>;
     /// The sandbox's sessions, oldest first; only those not ended yet when
     /// `running_only`.
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>>;

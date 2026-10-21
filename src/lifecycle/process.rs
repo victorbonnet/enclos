@@ -56,22 +56,40 @@ fn parse_start(line: &str) -> Option<(String, String)> {
     Some((stat, lstart(&mut words)?))
 }
 
+/// What `ps -o ... -p <pid>` answered: its line, or `None` when no such
+/// process exists. For a pid that does not exist, `ps` prints nothing and
+/// exits 1, with nothing on stderr either (macOS and procps alike). Any other
+/// failure, a success that prints nothing, or a failure that prints a line,
+/// means it could not look.
+fn listed(out: &Output) -> Result<Option<String>, PsError> {
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    match (out.status.code(), text.is_empty(), why.is_empty()) {
+        (Some(0), false, _) => Ok(Some(text)),
+        (Some(1), true, true) => Ok(None),
+        _ => Err(PsError(format!(
+            "{}{}{}",
+            out.status,
+            match why.as_str() {
+                "" => String::new(),
+                why => format!(": {why}"),
+            },
+            match text.as_str() {
+                "" => " and printed nothing".to_owned(),
+                text => format!(", printing `{text}`"),
+            },
+        ))),
+    }
+}
+
 /// The state and start time of `pid`, or `None` when no such process exists.
 fn stat_and_start(pid: u32) -> Result<Option<(String, String)>, PsError> {
-    let out = ps(&["-o", "stat=,lstart=", "-p", &pid.to_string()])?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if text.trim().is_empty() {
-        // For a pid that does not exist, `ps` prints nothing and fails; any
-        // other failure says why on stderr.
-        let why = String::from_utf8_lossy(&out.stderr);
-        return match why.trim() {
-            "" => Ok(None),
-            why => Err(PsError(why.to_owned())),
-        };
-    }
+    let Some(text) = listed(&ps(&["-o", "stat=,lstart=", "-p", &pid.to_string()])?)? else {
+        return Ok(None);
+    };
     parse_start(&text)
         .map(Some)
-        .ok_or_else(|| PsError(format!("unexpected output `{}`", text.trim())))
+        .ok_or_else(|| PsError(format!("unexpected output `{text}`")))
 }
 
 /// The start time of `pid`, or `None` when no such process runs. A process
@@ -106,15 +124,12 @@ pub fn is_same(process: &ProcessRef) -> Result<bool, PsError> {
 
 /// The process group of `pid`, or `None` when no such process exists.
 pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
-    let out = ps(&["-o", "pgid=", "-p", &pid.to_string()])?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    match text.trim() {
-        "" => Ok(None),
-        pgid => pgid
-            .parse()
-            .map(Some)
-            .map_err(|_| PsError(format!("unexpected group `{pgid}`"))),
-    }
+    let Some(pgid) = listed(&ps(&["-o", "pgid=", "-p", &pid.to_string()])?)? else {
+        return Ok(None);
+    };
+    pgid.parse()
+        .map(Some)
+        .map_err(|_| PsError(format!("unexpected group `{pgid}`")))
 }
 
 /// A process as one listing shows it.
@@ -147,6 +162,19 @@ fn parse_listing(line: &str) -> Option<(Proc, bool)> {
     Some((proc, zombie))
 }
 
+/// Each line of a whole listing, and whether its process is a zombie. A
+/// line that does not parse fails the listing: a process left out would
+/// read as gone.
+fn parse_processes(text: &str) -> Result<Vec<(Proc, bool)>, PsError> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            parse_listing(line)
+                .ok_or_else(|| PsError(format!("unexpected line `{}` in the listing", line.trim())))
+        })
+        .collect()
+}
+
 /// Every running process. Read-only. Zombies run nothing and are left out.
 pub fn processes() -> Result<Vec<Proc>, PsError> {
     let out = ps(&["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=,comm="])?;
@@ -154,10 +182,7 @@ pub fn processes() -> Result<Vec<Proc>, PsError> {
         let why = String::from_utf8_lossy(&out.stderr);
         return Err(PsError(format!("{} {}", out.status, why.trim())));
     }
-    let listed: Vec<(Proc, bool)> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(parse_listing)
-        .collect();
+    let listed = parse_processes(&String::from_utf8_lossy(&out.stdout))?;
     // A listing that misses the process asking cannot be read, or is not
     // the whole listing.
     let me = std::process::id();
@@ -288,6 +313,59 @@ mod tests {
         assert_eq!(listed.started, alone);
         assert_eq!((listed.pid, listed.ppid, listed.pgid), (3701, 1, 3701));
         assert_eq!(listed.command, "/usr/libexec/x y");
+    }
+
+    /// What `ps` returned, as `Command::output` gives it: `raw` is the wait
+    /// status, the exit code shifted left by 8, or the signal alone.
+    fn output(raw: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn only_an_exit_1_with_no_output_means_no_such_process() {
+        // As `ps -o stat=,lstart= -p <pid>` answers for a reaped pid.
+        assert_eq!(listed(&output(1 << 8, "", "")).unwrap(), None);
+        assert_eq!(
+            listed(&output(0, "Ss   Thu Oct  8 09:31:55 2026   \n", "")).unwrap(),
+            Some("Ss   Thu Oct  8 09:31:55 2026".to_owned())
+        );
+        // A `ps` that could not run its listing, was killed, failed another
+        // way, or answered in a way it never does, could not look.
+        for (out, says) in [
+            (
+                output(1 << 8, "", "ps: bogus: keyword not found\n"),
+                "keyword not found",
+            ),
+            (output(9, "", ""), "signal"),
+            (output(2 << 8, "", ""), "printed nothing"),
+            (output(1 << 8, "  501\n", ""), "printing `501`"),
+            (output(0, "", ""), "printed nothing"),
+        ] {
+            let err = listed(&out).unwrap_err();
+            assert!(err.to_string().contains(says), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_listing_with_a_line_it_cannot_read_is_an_error() {
+        let ok = "  1     0     1 Ss   Thu Oct  8 09:31:10 2026 /sbin/launchd\n\n";
+        assert_eq!(parse_processes(ok).unwrap().len(), 1);
+        let err = parse_processes(&format!("{ok}  12 garbled\n")).unwrap_err();
+        assert!(err.to_string().contains("`12 garbled`"), "{err}");
+    }
+
+    #[test]
+    fn a_reaped_pid_has_no_start_time_and_no_group() {
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(stat_and_start(pid).unwrap(), None);
+        assert_eq!(group_of(pid).unwrap(), None);
     }
 
     #[test]

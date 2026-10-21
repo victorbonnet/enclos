@@ -29,11 +29,13 @@ pub enum Error {
         "sandbox `{name}` has background services installed, which come back on their own. Remove them first with `enclos sandbox stop {name}`"
     )]
     SandboxHasServices { name: String },
-    /// A stop left members running; `rm` waits until they are gone.
+    /// A sandbox marked failed, by a stop that left members running or by
+    /// a command that failed, still has sessions running; `rm` waits until
+    /// they are gone.
     #[error(
-        "sandbox `{name}` still has processes `enclos sandbox stop` could not end; `enclos sandbox show {name}` lists them. End them, then run `enclos sandbox stop {name}` again"
+        "sandbox `{name}` is marked failed ({reason}) and still has processes running; `enclos sandbox show {name}` lists them. Run `enclos sandbox stop {name}`, and end yourself what it cannot"
     )]
-    SandboxNotStopped { name: String },
+    SandboxNotStopped { name: String, reason: String },
     #[error(
         "no free proxy port is left between {} and {}. Remove a sandbox you no longer use",
         crate::model::sandbox::PORT_FIRST,

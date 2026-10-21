@@ -480,7 +480,7 @@ mod sandbox {
     use super::*;
     use crate::engine::SandboxSpec;
     use crate::lifecycle::process::reference;
-    use crate::model::sandbox::{SandboxRecord, SandboxState};
+    use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
     use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
     fn spec(name: &str) -> SandboxSpec {
@@ -580,27 +580,76 @@ mod sandbox {
         assert_eq!(lab.proxy_port, 1);
     }
 
-    #[test]
-    fn a_remove_that_waited_for_the_lock_checks_for_sessions_again() {
-        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
-        let session = SessionRecord {
+    /// An interactive session of sandbox `name` whose program is `root`.
+    fn session_of(engine: &Engine, name: &SandboxName, root: ProcessRef) -> SessionRecord {
+        SessionRecord {
             id: SessionId(0),
             sandbox: name.clone(),
             kind: SessionKind::Interactive,
             service: None,
             version: 1,
-            snapshot: engine.policy(&name).unwrap().snapshot.id,
+            snapshot: engine.policy(name).unwrap().snapshot.id,
             compiled: None,
-            // Matches no process: this test never stops it.
-            root: ProcessRef {
-                pid: u32::MAX,
-                started: "never".into(),
-            },
+            root,
             pgid: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
-        };
+        }
+    }
+
+    /// A process this test started and reaped: nothing runs as that process
+    /// any more (its pid is free, or used again with another start time), as
+    /// a session's after a crash or a restart of the Mac.
+    fn gone_process() -> ProcessRef {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let recorded = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        child.wait().unwrap();
+        recorded
+    }
+
+    /// A `sleep` this test started, ended and reaped when dropped.
+    struct Sleeping(std::process::Child);
+
+    impl Sleeping {
+        fn new() -> Sleeping {
+            Sleeping(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn process(&self) -> ProcessRef {
+            reference(self.0.id()).unwrap().unwrap()
+        }
+    }
+
+    impl Drop for Sleeping {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn mark(engine: &Engine, name: &SandboxName, state: SandboxState) {
+        let lock = engine.state.lock().unwrap();
+        let mut record = engine.state.get(name).unwrap().unwrap();
+        record.state = state;
+        engine.state.put(&lock, &record).unwrap();
+    }
+
+    fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
+        let lock = engine.state.lock().unwrap();
+        engine.state.put_session(&lock, session).unwrap()
+    }
+
+    #[test]
+    fn a_remove_that_waited_for_the_lock_checks_for_sessions_again() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let sleeping = Sleeping::new();
+        let session = session_of(&engine, &name, sleeping.process());
         let err = while_waiting(
             &engine,
             || engine.remove_sandbox(&alice(), &name, false, Confirm::Yes),
@@ -611,6 +660,216 @@ mod sandbox {
         .unwrap_err();
         assert!(matches!(err, Error::SandboxRunning { .. }), "{err}");
         assert!(engine.layout.sandbox_home("home").is_dir());
+    }
+
+    #[test]
+    fn show_and_status_say_a_session_is_gone_and_record_nothing() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        mark(&engine, &name, SandboxState::Running);
+        let sleeping = Sleeping::new();
+        let live = put(&engine, &session_of(&engine, &name, sleeping.process()));
+        let gone = put(&engine, &session_of(&engine, &name, gone_process()));
+        let entries = engine.audit(None).unwrap().len();
+
+        let view = engine.show_sandbox(&name).unwrap();
+        let shown: Vec<(SessionId, bool)> = view
+            .sessions
+            .iter()
+            .map(|v| (v.session.id, v.gone()))
+            .collect();
+        assert_eq!(shown, [(live, false), (gone, true)]);
+        let status = engine.status(None).unwrap();
+        let home = &status.sandboxes[0];
+        assert_eq!((home.running_sessions, home.gone_sessions), (1, 1));
+
+        // Reads: the sessions stay open, the sandbox running, the audit log
+        // as it was.
+        assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 2);
+        assert_eq!(state_of(&engine, &name), SandboxState::Running);
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+    }
+
+    fn state_of(engine: &Engine, name: &SandboxName) -> SandboxState {
+        engine.state.get(name).unwrap().unwrap().state
+    }
+
+    fn last_audit(engine: &Engine) -> String {
+        let entries = engine.audit(None).unwrap();
+        let finished = entries.last().unwrap().finished.as_ref().unwrap();
+        assert_eq!(finished.outcome.result, AuditResult::Ok);
+        finished.outcome.message.clone()
+    }
+
+    #[test]
+    fn rm_records_the_end_of_sessions_gone_after_a_crash_and_removes_the_sandbox() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        mark(&engine, &name, SandboxState::Running);
+        let sleeping = Sleeping::new();
+        let live = put(&engine, &session_of(&engine, &name, sleeping.process()));
+        let gone = put(&engine, &session_of(&engine, &name, gone_process()));
+
+        // While one session still runs, nothing is removed or recorded.
+        let entries = engine.audit(None).unwrap().len();
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SandboxRunning { .. }), "{err}");
+        assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 2);
+        assert_eq!(engine.audit(None).unwrap().len(), entries);
+
+        // Once it is gone too, rm records both ends, in its audit entry.
+        drop(sleeping);
+        let Planned::DryRun(plan) = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run removed the sandbox");
+        };
+        assert_eq!(
+            plan.changes[..2],
+            [
+                format!("record the end of session {live}, whose processes are gone"),
+                format!("record the end of session {gone}, whose processes are gone"),
+            ]
+        );
+        done(
+            engine
+                .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(engine.list_sandboxes().unwrap().is_empty());
+        assert_eq!(
+            last_audit(&engine),
+            format!(
+                "delete its folder and home; recorded the end of sessions {live}, {gone}, whose processes were gone"
+            )
+        );
+    }
+
+    /// Another engine on `engine`'s folder, on which the sandboxes' backend
+    /// no longer runs: whatever starts a session fails half-way.
+    pub(super) fn without_backend(engine: &Engine) -> Engine {
+        let layout = engine.layout.clone();
+        Engine::new(
+            layout.clone(),
+            Box::new(SqliteStateStore::new(
+                layout.state_db(),
+                layout.state_lock(),
+            )),
+            Box::new(JsonlAuditLog::new(layout.audit_log())),
+            vec![Box::new(FakeBackend::unavailable(
+                BackendKind::Seatbelt,
+                "taken away by the test",
+            ))],
+        )
+    }
+
+    /// The sandbox is marked failed by `command`, whose audit entry closed
+    /// as failed, and no session but the proxy's was recorded.
+    pub(super) fn assert_failed_by(engine: &Engine, name: &SandboxName, command: &str) {
+        match state_of(engine, name) {
+            SandboxState::Failed { reason } => assert!(
+                reason.starts_with(&format!("{command} failed: "))
+                    && reason.contains("taken away by the test"),
+                "{reason}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        let entries = engine.audit(None).unwrap();
+        let last = entries.last().unwrap();
+        assert_eq!(last.intent.command, command);
+        let finished = last.finished.as_ref().unwrap();
+        assert_eq!(finished.outcome.result, AuditResult::Failed);
+        assert!(
+            engine
+                .state
+                .sessions(name, false)
+                .unwrap()
+                .iter()
+                .all(|s| s.kind == SessionKind::Proxy)
+        );
+    }
+
+    #[test]
+    fn a_connect_that_fails_marks_the_sandbox_failed_in_its_audited_write() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let err = without_backend(&engine)
+            .connect(&alice(), &name, vec!["/usr/bin/true".into()], Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
+        assert_failed_by(&engine, &name, "connect");
+        // A connect to no sandbox has nothing to mark.
+        let err = engine
+            .connect(&alice(), &"nope".parse().unwrap(), Vec::new(), Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
+    }
+
+    #[test]
+    fn stop_records_the_end_of_a_session_gone_after_a_crash_and_marks_the_sandbox_stopped() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        mark(&engine, &name, SandboxState::Running);
+        let gone = put(&engine, &session_of(&engine, &name, gone_process()));
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert_eq!(report.gone, [gone]);
+        assert!(report.stopped.is_empty() && report.survivors.is_empty());
+        assert!(engine.state.sessions(&name, true).unwrap().is_empty());
+        assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
+        assert_eq!(
+            last_audit(&engine),
+            format!(
+                "removed 0 services, stopped 0 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            )
+        );
+    }
+
+    #[test]
+    fn stop_ends_a_session_still_running_and_records_one_gone_beside_it() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        mark(&engine, &name, SandboxState::Running);
+        let mut sleeping = Sleeping::new();
+        let live = put(&engine, &session_of(&engine, &name, sleeping.process()));
+        let gone = put(&engine, &session_of(&engine, &name, gone_process()));
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert_eq!(report.stopped, [live]);
+        assert_eq!(report.gone, [gone]);
+        assert!(report.survivors.is_empty());
+        // The sleep was signalled: it exited by TERM.
+        let status = sleeping
+            .0
+            .try_wait()
+            .unwrap()
+            .expect("the sleep still runs");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(15));
+        assert!(engine.state.sessions(&name, true).unwrap().is_empty());
+        assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
+        assert_eq!(
+            last_audit(&engine),
+            format!(
+                "removed 0 services, stopped 1 sessions; recorded the end of sessions {gone}, whose processes were gone"
+            )
+        );
+    }
+
+    #[test]
+    fn a_connect_that_fails_beside_a_running_session_makes_rm_say_why() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        mark(&engine, &name, SandboxState::Running);
+        let sleeping = Sleeping::new();
+        put(&engine, &session_of(&engine, &name, sleeping.process()));
+        without_backend(&engine)
+            .connect(&alice(), &name, vec!["/usr/bin/true".into()], Confirm::Yes)
+            .unwrap_err();
+        let err = engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap_err();
+        let Error::SandboxNotStopped { reason, .. } = &err else {
+            panic!("{err}");
+        };
+        assert!(reason.starts_with("connect failed: "), "{reason}");
+        assert!(err.to_string().contains("connect failed: "), "{err}");
+        drop(sleeping);
     }
 
     #[test]
@@ -944,7 +1203,8 @@ mod sandbox {
             .unwrap_err();
         assert!(matches!(err, Error::SandboxNotStopped { .. }), "{err}");
 
-        // Once the user ends it, stop finds the session empty and ends it.
+        // Once the user ends it, stop finds nothing of the session left and
+        // records its end.
         let sleep = ProcessRef {
             pid: sleep.pid,
             started: sleep.started,
@@ -957,7 +1217,7 @@ mod sandbox {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
-        assert_eq!(report.stopped, [id]);
+        assert_eq!(report.gone, [id]);
         assert_eq!(
             engine.show_sandbox(&name).unwrap().record.state,
             SandboxState::Stopped
@@ -2419,6 +2679,38 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn a_launch_that_succeeds_after_one_that_failed_marks_the_sandbox_running() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(LEAVES, Confirm::Yes).unwrap()).installed);
+        // As a `launch` that failed leaves it, for the service manager to
+        // start it again.
+        {
+            let lock = lab.engine.state.lock().unwrap();
+            let mut record = lab.engine.state.get(&lab.name).unwrap().unwrap();
+            record.state = crate::model::sandbox::SandboxState::Failed {
+                reason: "launch failed: for the test".into(),
+            };
+            lab.engine.state.put(&lock, &record).unwrap();
+        }
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        lab.engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        let sessions = lab.engine.state.sessions(&lab.name, false).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.kind == crate::model::session::SessionKind::Service)
+        );
+        assert_eq!(
+            lab.engine.state.get(&lab.name).unwrap().unwrap().state,
+            crate::model::sandbox::SandboxState::Running
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn a_launch_ends_a_service_session_whose_launch_was_killed() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let lab = Lab::new();
@@ -3587,7 +3879,16 @@ mod services {
                 .proxy_started(&name, Duration::from_millis(50))
                 .unwrap()
         );
-        // This process stands in for the proxy.
+        stand_in_proxy(&engine, &name);
+        assert!(engine.proxy_started(&name, Duration::ZERO).unwrap());
+        let err = engine
+            .proxy_started(&"nope".parse().unwrap(), Duration::ZERO)
+            .unwrap_err();
+        assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
+    }
+
+    /// Records this process as the sandbox's proxy, which it stands in for.
+    fn stand_in_proxy(engine: &Engine, name: &SandboxName) {
         let me = std::process::id();
         engine
             .write(
@@ -3596,7 +3897,7 @@ mod services {
                 None,
                 |_| String::new(),
                 |lock| {
-                    let (version, snapshot) = engine.state.active_policy(&name)?.unwrap();
+                    let (version, snapshot) = engine.state.active_policy(name)?.unwrap();
                     let session = crate::model::session::SessionRecord {
                         id: crate::model::session::SessionId(0),
                         sandbox: name.clone(),
@@ -3616,11 +3917,86 @@ mod services {
                 },
             )
             .unwrap();
-        assert!(engine.proxy_started(&name, Duration::ZERO).unwrap());
-        let err = engine
-            .proxy_started(&"nope".parse().unwrap(), Duration::ZERO)
+    }
+
+    #[test]
+    fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        let label = engine.label(&name, Unit::Proxy).unwrap();
+        fake.seed(label.as_str());
+        // A sleep stands in for the proxy service's job, which ends when its
+        // service is removed, before the stop looks at the sessions.
+        let job = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let root = crate::lifecycle::process::reference(job.id())
+            .unwrap()
+            .unwrap();
+        fake.jobs.borrow_mut().push((label.clone(), job));
+        let id = engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let (version, snapshot) = engine.state.active_policy(&name)?.unwrap();
+                    let session = crate::model::session::SessionRecord {
+                        id: crate::model::session::SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Proxy,
+                        service: None,
+                        version: version.version,
+                        snapshot: snapshot.id,
+                        compiled: None,
+                        pgid: None,
+                        root: root.clone(),
+                        tracked: Vec::new(),
+                        started_at: crate::model::now(),
+                        ended_at: None,
+                    };
+                    Ok(engine.state.put_session(lock, &session)?)
+                },
+            )
+            .unwrap();
+
+        let Planned::DryRun(plan) = engine
+            .stop_sandbox(&alice(), &name, Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("a dry run stopped the sandbox");
+        };
+        assert!(
+            plan.changes
+                .contains(&format!("stop session {id} (proxy, 1 processes)")),
+            "{plan:?}"
+        );
+        let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert!(fake.jobs.borrow().is_empty());
+        assert_eq!(report.services, [label]);
+        assert_eq!(report.stopped, [id]);
+        assert!(report.gone.is_empty() && report.survivors.is_empty());
+        let entries = engine.audit(None).unwrap();
+        let finished = entries.last().unwrap().finished.as_ref().unwrap();
+        assert_eq!(
+            finished.outcome.message,
+            "removed 1 services, stopped 1 sessions"
+        );
+        assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
+    }
+
+    #[test]
+    fn a_launch_that_fails_marks_the_sandbox_failed_in_its_audited_write() {
+        use super::sandbox::{assert_failed_by, without_backend};
+        let (_dir, engine, _, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        stand_in_proxy(&engine, &name);
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let err = without_backend(&engine)
+            .launch_until(&alice(), &name, GATEWAY.as_str(), &ended)
             .unwrap_err();
-        assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
+        assert!(matches!(err, Error::BackendUnavailable { .. }), "{err}");
+        assert_failed_by(&engine, &name, "launch");
     }
 
     #[test]

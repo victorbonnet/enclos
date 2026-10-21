@@ -24,6 +24,8 @@ use serde::{Serialize, Serializer};
 use super::Engine;
 use super::sandbox::needs_restart;
 use crate::error::{Error, Result};
+use crate::lifecycle::members::is_gone;
+use crate::lifecycle::process::processes;
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
@@ -125,6 +127,10 @@ pub struct SandboxStatus {
     pub policy_version: Option<u32>,
     /// Running sessions, the proxy's included.
     pub running_sessions: usize,
+    /// Sessions of which nothing runs any more, as after a crash or a
+    /// restart of the Mac, whose end is not recorded: a read records
+    /// nothing, and `sandbox stop` or `sandbox rm` does.
+    pub gone_sessions: usize,
     /// Some running session started under a compiled policy the active one
     /// replaced: it needs a restart to run under it. The proxy applies
     /// network rules live and never does.
@@ -508,7 +514,13 @@ impl Engine {
         let home = self.layout.sandbox_home(name.as_str());
         let active = self.state.active_policy(&name)?.map(|(v, _)| v.version);
         let compiled = self.active_compiled(&record);
-        let running = self.state.sessions(&name, true)?;
+        let open = self.state.sessions(&name, true)?;
+        // Looked at only when a session is open: most sandboxes have none.
+        let procs = match open.is_empty() {
+            true => Vec::new(),
+            false => processes()?,
+        };
+        let (gone, running): (Vec<_>, Vec<_>) = open.into_iter().partition(|s| is_gone(&procs, s));
         let sessions = self.state.sessions(&name, false)?;
         let last_connect = sessions
             .iter()
@@ -589,6 +601,7 @@ impl Engine {
             services,
             policy_version: active,
             running_sessions: running.len(),
+            gone_sessions: gone.len(),
             restart_needed: running
                 .iter()
                 .any(|s| needs_restart(s, compiled.as_deref())),

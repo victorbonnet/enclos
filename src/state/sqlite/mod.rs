@@ -209,6 +209,18 @@ fn insert_sandbox(
     Ok(())
 }
 
+/// Inserts or replaces the sandbox's record.
+fn put_record(conn: &Connection, rec: &SandboxRecord) -> rusqlite::Result<()> {
+    insert_sandbox(
+        conn,
+        rec,
+        "ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
+             state = excluded.state, failed_reason = excluded.failed_reason,
+             created_at = excluded.created_at, template = excluded.template,
+             proxy_port = excluded.proxy_port, runtime = excluded.runtime",
+    )
+}
+
 fn io_err(path: &Path) -> impl Fn(std::io::Error) -> StateError + '_ {
     |source| StateError::Io {
         path: path.to_owned(),
@@ -313,15 +325,7 @@ impl StateStore for SqliteStateStore {
 
     fn put(&self, _lock: &StateLock, rec: &SandboxRecord) -> Result<()> {
         let conn = self.open()?;
-        insert_sandbox(
-            &conn,
-            rec,
-            "ON CONFLICT (name) DO UPDATE SET backend = excluded.backend,
-                 state = excluded.state, failed_reason = excluded.failed_reason,
-                 created_at = excluded.created_at, template = excluded.template,
-                 proxy_port = excluded.proxy_port, runtime = excluded.runtime",
-        )
-        .map_err(self.sqlite_err())
+        put_record(&conn, rec).map_err(self.sqlite_err())
     }
 
     fn remove(&self, _lock: &StateLock, name: &SandboxName) -> Result<()> {
@@ -387,6 +391,42 @@ impl StateStore for SqliteStateStore {
     fn end_session(&self, _lock: &StateLock, id: SessionId) -> Result<()> {
         let conn = self.open()?;
         sessions::end(&conn, id, now()).map_err(self.sqlite_err())
+    }
+
+    fn start_session(
+        &self,
+        _lock: &StateLock,
+        session: &SessionRecord,
+        rec: &SandboxRecord,
+    ) -> Result<SessionId> {
+        let mut conn = self.open()?;
+        (|| {
+            let tx = conn.transaction()?;
+            put_record(&tx, rec)?;
+            let id = sessions::insert(&tx, session)?;
+            tx.commit()?;
+            Ok(id)
+        })()
+        .map_err(self.sqlite_err())
+    }
+
+    fn end_sessions(
+        &self,
+        _lock: &StateLock,
+        ended: &[SessionId],
+        rec: &SandboxRecord,
+    ) -> Result<()> {
+        let mut conn = self.open()?;
+        let at = now();
+        (|| {
+            let tx = conn.transaction()?;
+            for id in ended {
+                sessions::end(&tx, *id, at)?;
+            }
+            put_record(&tx, rec)?;
+            tx.commit()
+        })()
+        .map_err(self.sqlite_err())
     }
 
     fn sessions(&self, name: &SandboxName, running_only: bool) -> Result<Vec<SessionRecord>> {

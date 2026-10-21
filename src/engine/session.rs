@@ -108,7 +108,6 @@ impl Engine {
         audit_name: &str,
     ) -> Result<SessionEnd> {
         let command = command.into_words();
-        let target = name.to_string();
         let summary = |(session, ..): &(SessionRecord, _, _)| format!("session {}", session.id);
         // Which process group the program starts in (design §8). When this
         // command leads its group, as a terminal's job does, that group:
@@ -123,71 +122,123 @@ impl Engine {
         let own_group = !leads_group && !std::io::stdin().is_terminal();
         self.wait_service_proxy(name)?;
         let (session, mut child, _keep_waiting) =
-            self.write(by, audit_name, Some(target.clone()), summary, |lock| {
-                let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-                    name: name.to_string(),
-                })?;
-                let compiled = self.compile_policy(name, record.proxy_port)?;
-                self.ensure_proxy(lock, &record)?;
-                let (version, snapshot) = self.active_policy(name)?;
-                let (program, args) = command.split_first().ok_or_else(|| Error::Session {
-                    what: "no command to run".into(),
-                })?;
-                let launch = Launch {
-                    program: program.clone(),
-                    args: args.to_vec(),
-                    env: Vec::new(),
-                };
-                let ctx = self.sandbox_context(name, record.proxy_port);
-                // TMPDIR inside the sandbox (the policy denies /tmp).
-                let tmp = ctx.home.join("tmp");
-                std::fs::create_dir_all(&tmp)
-                    .map_err(|source| LayoutError::Io { path: tmp, source })?;
-                let backend = self.backend_of(name)?;
-                let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
-                if own_group {
-                    wrapped.process_group(0);
-                }
-                let child = wrapped.spawn().map_err(|e| Error::Session {
-                    what: format!(
-                        "could not start {} in {target}: {e}",
-                        launch.program.to_string_lossy()
-                    ),
-                })?;
-                let recorded = (|| -> Result<(SessionRecord, KeepWaiting)> {
-                    let mut session = SessionRecord {
-                        id: SessionId(0),
-                        sandbox: name.clone(),
-                        kind: SessionKind::Interactive,
-                        service: None,
-                        version: version.version,
-                        snapshot: snapshot.id,
-                        compiled: Some(compiled.display().to_string()),
-                        // Read even if the program already exited: it is
-                        // still a session, with an exit status to report.
-                        root: reference_of_child(&child)?,
-                        pgid: match (own_group, leads_group) {
-                            (true, _) => Some(child.id()),
-                            (false, true) => Some(me),
-                            (false, false) => None,
-                        },
-                        tracked: Vec::new(),
-                        started_at: now(),
-                        ended_at: None,
-                    };
-                    session.id = self.state.put_session(lock, &session)?;
-                    record.state = SandboxState::Running;
-                    self.state.put(lock, &record)?;
-                    Ok((session, KeepWaiting::new()?))
-                })();
-                match recorded {
-                    Ok((session, keep_waiting)) => Ok((session, child, keep_waiting)),
-                    Err(e) => Err(abandon(child, e, "the program")),
-                }
+            self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
+                let started = self.start_in_sandbox(lock, name, &command, own_group, leads_group);
+                self.failed_on_error(lock, name, audit_name, started)
             })?;
 
         let waited = self.wait_session(&session, &mut child, None)?;
         self.finish_session(by, "session end", &session, waited)
+    }
+
+    /// Starts `command` in the sandbox and records it as a session (design
+    /// §8 steps 2-4), under the state lock.
+    fn start_in_sandbox(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        command: &[OsString],
+        own_group: bool,
+        leads_group: bool,
+    ) -> Result<(SessionRecord, Child, KeepWaiting)> {
+        let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let compiled = self.compile_policy(name, record.proxy_port)?;
+        self.ensure_proxy(lock, &record)?;
+        let (version, snapshot) = self.active_policy(name)?;
+        let (program, args) = command.split_first().ok_or_else(|| Error::Session {
+            what: "no command to run".into(),
+        })?;
+        let launch = Launch {
+            program: program.clone(),
+            args: args.to_vec(),
+            env: Vec::new(),
+        };
+        let ctx = self.sandbox_context(name, record.proxy_port);
+        // TMPDIR inside the sandbox (the policy denies /tmp).
+        let tmp = ctx.home.join("tmp");
+        std::fs::create_dir_all(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
+        let backend = self.backend_of(name)?;
+        let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
+        if own_group {
+            wrapped.process_group(0);
+        }
+        let child = wrapped.spawn().map_err(|e| Error::Session {
+            what: format!(
+                "could not start {} in {name}: {e}",
+                launch.program.to_string_lossy()
+            ),
+        })?;
+        let recorded = (|| -> Result<(SessionRecord, KeepWaiting)> {
+            // Before the session is recorded, so that a failure here leaves
+            // no session open for a program that is ended.
+            let keep_waiting = KeepWaiting::new()?;
+            let me = std::process::id();
+            let mut session = SessionRecord {
+                id: SessionId(0),
+                sandbox: name.clone(),
+                kind: SessionKind::Interactive,
+                service: None,
+                version: version.version,
+                snapshot: snapshot.id,
+                compiled: Some(compiled.display().to_string()),
+                // Read even if the program already exited: it is still a
+                // session, with an exit status to report.
+                root: reference_of_child(&child)?,
+                pgid: match (own_group, leads_group) {
+                    (true, _) => Some(child.id()),
+                    (false, true) => Some(me),
+                    (false, false) => None,
+                },
+                tracked: Vec::new(),
+                started_at: now(),
+                ended_at: None,
+            };
+            record.state = SandboxState::Running;
+            session.id = self.state.start_session(lock, &session, &record)?;
+            Ok((session, keep_waiting))
+        })();
+        match recorded {
+            Ok((session, keep_waiting)) => Ok((session, child, keep_waiting)),
+            Err(e) => Err(abandon(child, e, "the program")),
+        }
+    }
+
+    /// Saves `Failed { reason: "<what> failed: …" }` on the sandbox when
+    /// `done`, the work of the audited command `what`, failed (design §8
+    /// step 7): in the same write, whose audit entry then closes as failed.
+    /// The program the work started and could not record, it ended already;
+    /// a proxy it started stays recorded and running, as after a `connect`
+    /// that succeeds, for `sandbox stop` to end.
+    pub(super) fn failed_on_error<T>(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        what: &str,
+        done: Result<T>,
+    ) -> Result<T> {
+        let error = match done {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let marked = self.state.get(name).and_then(|record| match record {
+            // No record, no state to mark: the sandbox does not exist.
+            None => Ok(()),
+            Some(mut record) => {
+                record.state = SandboxState::Failed {
+                    reason: format!("{what} failed: {error}"),
+                };
+                self.state.put(lock, &record)
+            }
+        });
+        Err(match marked {
+            Ok(()) => error,
+            Err(e) => Error::CleanupFailed {
+                error: Box::new(error),
+                left: format!("sandbox {name} not marked failed ({e})"),
+            },
+        })
     }
 
     /// Records how a session's program ended (design §8 step 6), as
@@ -331,7 +382,7 @@ impl Engine {
                 // survived TERM and KILL, or enclos could not stop it, so
                 // waiting more would not end.
                 let failed = match stopping.take().map(std::thread::JoinHandle::join) {
-                    Some(Ok(Ok(Stopped::Clean))) | None => None,
+                    Some(Ok(Ok(Stopped::Clean | Stopped::Gone))) | None => None,
                     Some(Ok(Ok(Stopped::Survivors(left)))) => Some(format!(
                         "the program of session {} survived TERM and KILL ({})",
                         session.id,
@@ -460,7 +511,7 @@ impl Engine {
                 what: format!("could not stop {label} of sandbox {name}: {e}"),
             })?;
             match stopped {
-                Stopped::Clean => {
+                Stopped::Clean | Stopped::Gone => {
                     self.state.end_session(lock, session.id)?;
                     ended.push(session.id);
                 }
