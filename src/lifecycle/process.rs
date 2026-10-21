@@ -21,7 +21,7 @@ use crate::model::session::ProcessRef;
 #[error("cannot look at processes with /bin/ps: {0}")]
 pub struct PsError(String);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl PsError {
     /// A `ps` failure with this reason, for tests of what follows one.
     pub(crate) fn new(why: &str) -> PsError {
