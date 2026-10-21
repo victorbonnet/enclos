@@ -162,6 +162,7 @@ mod tests {
                 Reason::ConnectFailed => 4,
                 Reason::BadRequest => 5,
                 Reason::PolicyUnreadable => 6,
+                Reason::Idle => 7,
             }
         }
         for (i, reason) in Reason::ALL.into_iter().enumerate() {

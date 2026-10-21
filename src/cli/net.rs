@@ -174,11 +174,6 @@ mod tests {
         assert!(text.contains("enclos policy allow lab"), "{text}");
         assert!(!text.contains("nothing to allow"), "{text}");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn an_idle_close_is_not_shown_as_a_failure() {
