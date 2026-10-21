@@ -7,6 +7,8 @@ pub mod backend;
 pub mod config;
 pub mod engine;
 pub mod error;
+#[cfg(all(test, target_os = "macos"))]
+mod host_ports;
 pub mod layout;
 pub mod lifecycle;
 pub mod model;

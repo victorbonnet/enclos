@@ -1158,8 +1158,9 @@ echo \"installed $*\" > \"$HOME/installed\"
 ";
 
     #[cfg(target_os = "macos")]
-    /// Engine tests start real proxies on this host's ports: one at a time.
-    static HOST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Engine tests start real proxies on this host's ports: one at a time,
+    /// with every other test run of this user too.
+    static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
 
     #[cfg(target_os = "macos")]
     /// A sandbox whose proxy is a listener this test stands in (`nc`), so

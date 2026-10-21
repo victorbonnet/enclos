@@ -570,10 +570,10 @@ impl Engine {
         let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
         // Anything else on this port would receive the sandbox's traffic.
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return Err(failed(format!(
-                "port {} of sandbox {} is in use by another program; stop it, or recreate the sandbox to get another port",
-                record.proxy_port, record.name
-            )));
+            return Err(Error::ProxyPortTaken {
+                sandbox: record.name.to_string(),
+                port: record.proxy_port,
+            });
         }
         let child = Command::new(exe)
             .args([

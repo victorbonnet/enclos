@@ -1,6 +1,7 @@
 //! The engine's network calls: the network log, denied destinations, and
 //! running a sandbox's egress proxy (design §6).
 
+use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 
@@ -28,7 +29,9 @@ impl Engine {
 
     /// Runs the sandbox's egress proxy on `addr` until the process ends.
     /// With `record`, it records itself as the sandbox's proxy once it holds
-    /// the port, never before: a recorded proxy owns its port.
+    /// the port, never before: a recorded proxy owns its port. When the
+    /// sandbox's reserved port is taken, it says whether by the sandbox's
+    /// own proxy or by another program.
     /// It reads the active policy for each new connection, so policy
     /// changes apply without a restart.
     pub fn run_proxy(
@@ -37,7 +40,7 @@ impl Engine {
         addr: SocketAddr,
         record: Option<&Actor>,
     ) -> Result<()> {
-        self.require_sandbox(name)?;
+        let reserved = self.record(name)?.proxy_port;
         self.policy(name)?;
         let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
         let policy = ActivePolicy {
@@ -45,11 +48,25 @@ impl Engine {
             sandbox: name.clone(),
         };
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(store()));
-        let socket = TcpListener::bind(addr).map_err(|source| Error::ProxyListen {
-            sandbox: name.to_string(),
-            addr: addr.to_string(),
-            source,
-        })?;
+        let socket = match TcpListener::bind(addr) {
+            Ok(socket) => socket,
+            // Only the sandbox's reserved port is its to recreate.
+            Err(e) if e.kind() == ErrorKind::AddrInUse && addr.port() == reserved => {
+                let (sandbox, port) = (name.to_string(), reserved);
+                return Err(if self.proxy_runs(name)? {
+                    Error::ProxyRuns { sandbox, port }
+                } else {
+                    Error::ProxyPortTaken { sandbox, port }
+                });
+            }
+            Err(source) => {
+                return Err(Error::ProxyListen {
+                    sandbox: name.to_string(),
+                    addr: addr.to_string(),
+                    source,
+                });
+            }
+        };
         if let Some(by) = record {
             self.record_proxy(by, name)?;
         }
