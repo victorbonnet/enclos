@@ -4,7 +4,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -164,8 +164,11 @@ impl Proxy {
         let resolved = match dest.ip {
             Some(ip) => vec![ip],
             None => self
-                .resolve(&dest.host, dest.port, deadline)
-                .map_err(|_| Reason::ResolveFailed)?,
+                .lookup(&dest.host, dest.port, deadline)
+                .map_err(|failed| {
+                    self.report(&dest.host, failed);
+                    Reason::ResolveFailed
+                })?,
         };
         let addrs = validated(&policy, &dest, &resolved, self.classify).inspect_err(|_| {
             event.verdict = Verdict::Denied;
@@ -178,23 +181,61 @@ impl Proxy {
     /// Resolves the name on a thread of its own and stops waiting at
     /// `deadline`, since the resolver has no deadline of its own. A lookup
     /// given up on keeps its place among the lookups until it returns, so
-    /// names that never resolve cannot pile up threads: past
-    /// `max_connections` lookups at once, the next one fails at once.
-    fn resolve(&self, host: &str, port: u16, deadline: Instant) -> io::Result<Vec<IpAddr>> {
-        let lookup = Slot::take(&self.lookups, self.max_connections)
-            .ok_or_else(|| io::Error::other("too many lookups still running"))?;
+    /// names that never resolve cannot pile up threads: while `max_lookups`
+    /// are running, the next one fails right away.
+    fn lookup(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: Instant,
+    ) -> Result<Vec<IpAddr>, LookupFailed> {
+        let place = Slot::take(&self.lookups, self.max_lookups).ok_or(LookupFailed::Full)?;
+        self.lookups_full.store(false, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         let resolver = Arc::clone(&self.resolver);
-        let host = host.to_owned();
+        let name = host.to_owned();
         thread::Builder::new()
             .name("enclos-proxy-resolve".into())
             .spawn(move || {
-                let _lookup = lookup;
-                let _ = tx.send(resolver.resolve(&host, port));
-            })?;
+                let _place = place;
+                let _ = tx.send(resolver.resolve(&name, port));
+            })
+            .map_err(LookupFailed::NoThread)?;
         let left = deadline.saturating_duration_since(Instant::now());
-        rx.recv_timeout(left)
-            .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+        match rx.recv_timeout(left) {
+            Ok(answer) => answer.map_err(|_| LookupFailed::Resolver),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(LookupFailed::TimedOut),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(LookupFailed::Lost),
+        }
+    }
+
+    /// Says on the proxy's stderr why a lookup failed, when the cause is on
+    /// the host rather than the name: the network log records all of them
+    /// alike, as `resolve-failed`.
+    fn report(&self, host: &str, failed: LookupFailed) {
+        match failed {
+            // The resolver's own answer, such as no such name.
+            LookupFailed::Resolver => {}
+            LookupFailed::Full => {
+                // Once until a lookup starts again, not for every connection.
+                if !self.lookups_full.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "enclos proxy: {} lookups are still waiting on the host's resolver; new lookups fail as resolve-failed until one returns",
+                        self.max_lookups
+                    );
+                }
+            }
+            LookupFailed::NoThread(e) => {
+                eprintln!("enclos proxy: cannot start a thread to look up {host}: {e}");
+            }
+            LookupFailed::TimedOut => eprintln!(
+                "enclos proxy: the host's resolver did not answer for {host} within {:?}",
+                self.connect_timeout
+            ),
+            LookupFailed::Lost => {
+                eprintln!("enclos proxy: the lookup of {host} ended without an answer");
+            }
+        }
     }
 
     /// Connects to the first validated address that answers, by address, so
@@ -225,6 +266,20 @@ impl Proxy {
         }
         Err(Reason::ConnectFailed)
     }
+}
+
+/// Why a lookup gave no addresses.
+enum LookupFailed {
+    /// The resolver answered with an error, such as no such name.
+    Resolver,
+    /// `max_lookups` lookups are still running, so this one never started.
+    Full,
+    /// No thread could be started for it.
+    NoThread(io::Error),
+    /// The resolver did not answer before the deadline.
+    TimedOut,
+    /// Its thread ended without an answer.
+    Lost,
 }
 
 /// A place among the connections, or the lookups, the proxy runs at once;
@@ -282,24 +337,30 @@ pub(super) fn interleaved(addrs: &[IpAddr]) -> Vec<IpAddr> {
 }
 
 /// Sends upstream what the client asked for, then relays both ways until
-/// the connection ends, or until no byte moved either way for `idle`. Adds
-/// the bytes moved to `event`, and the reason `idle` when it was closed for
-/// that.
+/// the connection ends or hits the idle limit: no byte moved either way, or
+/// a peer read nothing, for `limit`. Adds the bytes moved to `event`, and
+/// the reason `idle` when the proxy closed it for that.
 fn forward(
     client: &TcpStream,
     upstream: &TcpStream,
     request: Request,
     early: &[u8],
-    idle: Duration,
+    limit: Duration,
     event: &mut NetEvent,
 ) {
-    // A peer that stops reading holds up a write no longer than it may stay
-    // quiet.
+    // A peer that stops reading holds up a write no longer than the limit.
     for stream in [client, upstream] {
-        if stream.set_write_timeout(Some(idle)).is_err() {
+        if let Err(e) = stream.set_write_timeout(Some(limit)) {
+            eprintln!(
+                "enclos proxy: cannot set a timeout on a connection to {}: {e}",
+                event.host
+            );
             return;
         }
     }
+    // A plain-HTTP client closed on before any answer is told why; a
+    // tunnel's client already had its `200`.
+    let mut unanswered = None;
     let mut first = match request {
         Request::Connect { .. } => {
             let mut client = client;
@@ -317,7 +378,16 @@ fn forward(
             version,
             headers,
             ..
-        } => origin_head(&method, &path, &version, &headers, &event.host, event.port).into_bytes(),
+        } => {
+            let dest = destination(&event.host, event.port);
+            unanswered = Some(response(
+                "504 Gateway Timeout",
+                &format!(
+                    "enclos: {dest} sent no answer within the proxy's idle limit, so the proxy closed the connection (idle).\n"
+                ),
+            ));
+            origin_head(&method, &path, &version, &headers, &event.host, event.port).into_bytes()
+        }
     };
     first.extend_from_slice(early);
     let mut writer = upstream;
@@ -325,28 +395,28 @@ fn forward(
         return;
     }
     event.bytes_up += first.len() as u64;
-    let relayed = relay(client, upstream, idle);
+    let relayed = relay(client, upstream, limit, unanswered.as_deref());
     event.bytes_up += relayed.up;
     event.bytes_down += relayed.down;
-    if relayed.idle {
+    if relayed.went_idle {
         event.reason = Some(Reason::Idle);
     }
 }
 
-/// What a relay moved, and whether it ended because nothing moved for the
-/// idle limit.
+/// What a relay moved, and whether the proxy ended it for the idle limit.
 struct Relayed {
     up: u64,
     down: u64,
-    idle: bool,
+    went_idle: bool,
 }
 
 /// When bytes last moved through a connection, either way, as both copies
-/// of a relay see it.
+/// of a relay see it, and whether one of them closed it for the idle limit.
 struct Activity {
     start: Instant,
     /// Milliseconds from `start` to the last move.
     last: AtomicU64,
+    went_idle: AtomicBool,
 }
 
 impl Activity {
@@ -354,6 +424,7 @@ impl Activity {
         Activity {
             start: Instant::now(),
             last: AtomicU64::new(0),
+            went_idle: AtomicBool::new(false),
         }
     }
 
@@ -367,75 +438,119 @@ impl Activity {
         let last = Duration::from_millis(self.last.load(Ordering::Relaxed));
         self.start.elapsed().saturating_sub(last)
     }
+
+    fn close_idle(&self) {
+        self.went_idle.store(true, Ordering::Relaxed);
+    }
+
+    fn went_idle(&self) -> bool {
+        self.went_idle.load(Ordering::Relaxed)
+    }
 }
 
 /// Copies bytes both ways. When the client is done, the server is told so
 /// and may still answer; when the server is done, the connection ends; when
-/// nothing moved either way for `idle`, both sides are closed.
-fn relay(client: &TcpStream, upstream: &TcpStream, idle: Duration) -> Relayed {
+/// it hits the idle limit, both sides are closed, and a client that got no
+/// byte back is first sent `unanswered`, when given.
+fn relay(
+    client: &TcpStream,
+    upstream: &TcpStream,
+    limit: Duration,
+    unanswered: Option<&str>,
+) -> Relayed {
     let activity = Activity::new();
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            let (n, quiet) = copy(client, upstream, &activity, idle);
-            let _ = upstream.shutdown(if quiet {
+            let moved = copy(client, upstream, &activity, limit);
+            let how = if activity.went_idle() {
                 Shutdown::Both
             } else {
                 Shutdown::Write
-            });
-            (n, quiet)
+            };
+            let _ = upstream.shutdown(how);
+            moved
         });
-        let (down, quiet_down) = match up {
-            Ok(_) => copy(upstream, client, &activity, idle),
-            Err(_) => (0, false),
+        let down = match up {
+            Ok(_) => copy(upstream, client, &activity, limit),
+            Err(_) => 0,
         };
+        // Nothing went down yet, so the client's send buffer is empty and
+        // this short answer does not wait on the client.
+        if let Some(answer) = unanswered
+            && down == 0
+            && activity.went_idle()
+        {
+            let _ = (&*client).write_all(answer.as_bytes());
+        }
         // Ends the client side too, which also ends the copy reading it.
         let _ = client.shutdown(Shutdown::Both);
-        let (up, quiet_up) = up.map_or((0, false), |up| up.join().unwrap_or((0, false)));
+        let up = up.map_or(0, |up| up.join().unwrap_or(0));
         Relayed {
             up,
             down,
-            idle: quiet_up || quiet_down,
+            went_idle: activity.went_idle(),
         }
     })
 }
 
-/// Copies until the reader ends, either side fails, or nothing moved either
-/// way for `idle`. Returns the bytes it moved, also when an error, such as
-/// a reset, ended it, and whether it stopped for being idle.
-fn copy(
-    mut from: &TcpStream,
-    mut to: &TcpStream,
-    activity: &Activity,
-    idle: Duration,
-) -> (u64, bool) {
+/// Copies until the reader ends, either side fails, or the connection hits
+/// the idle limit: nothing moved either way for `limit`, or `to` read
+/// nothing for that long. Returns the bytes that reached `to`, also when an
+/// error, such as a reset, ended it.
+fn copy(mut from: &TcpStream, to: &TcpStream, activity: &Activity, limit: Duration) -> u64 {
     let mut buf = [0u8; 16 * 1024];
     let mut moved = 0;
     loop {
         let quiet = activity.quiet();
-        if quiet >= idle {
-            return (moved, true);
+        if quiet >= limit {
+            activity.close_idle();
+            return moved;
         }
-        // Wakes when the connection would turn idle, unless the other copy
-        // moved bytes in the meantime.
-        if from.set_read_timeout(Some(idle - quiet)).is_err() {
-            return (moved, false);
+        // Waits at most until the connection would turn idle; if the other
+        // copy moved bytes meanwhile, the next turn of the loop waits again.
+        if from.set_read_timeout(Some(limit - quiet)).is_err() {
+            return moved;
         }
         match from.read(&mut buf) {
-            Ok(0) => return (moved, false),
+            Ok(0) => return moved,
             Ok(n) => {
                 activity.moved();
-                if let Err(e) = to.write_all(&buf[..n]) {
-                    // A peer that stopped reading for the idle limit.
-                    return (moved, timed_out(&e) && activity.quiet() >= idle);
+                if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
+                    // A write times out after the limit: `to` stopped reading.
+                    if timed_out(&e) {
+                        activity.close_idle();
+                    }
+                    return moved;
                 }
-                activity.moved();
-                moved += n as u64;
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if timed_out(&e) => {}
-            Err(_) => return (moved, false),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted || timed_out(&e) => {}
+            Err(_) => return moved,
         }
     }
+}
+
+/// Writes all of `buf`, adding to `moved` what each write sent, so a write
+/// cut short still counts what got through. Each write is activity, so the
+/// other copy does not count the time a slow write took as quiet.
+fn write_counted(
+    mut to: &TcpStream,
+    mut buf: &[u8],
+    activity: &Activity,
+    moved: &mut u64,
+) -> io::Result<()> {
+    while !buf.is_empty() {
+        match to.write(buf) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                *moved += n as u64;
+                activity.moved();
+                buf = &buf[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Whether a read or write failed only because its timeout passed.
@@ -464,9 +579,13 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
             ),
         ),
     };
-    let response = format!(
+    client.write_all(response(status, &body).as_bytes())
+}
+
+/// A whole plain-text HTTP response, after which the proxy closes.
+fn response(status: &str, body: &str) -> String {
+    format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    );
-    client.write_all(response.as_bytes())
+    )
 }

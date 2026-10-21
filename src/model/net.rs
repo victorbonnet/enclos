@@ -31,8 +31,8 @@ pub enum Reason {
     ConnectFailed,
     /// The client did not send a request the proxy understands.
     BadRequest,
-    /// Allowed, then closed by the proxy: no byte moved either way for the
-    /// idle limit (design §6).
+    /// Allowed, then closed by the proxy: no byte moved either way, or a
+    /// peer read nothing, for the idle limit (design §6).
     Idle,
 }
 

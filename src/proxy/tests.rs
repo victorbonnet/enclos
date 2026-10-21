@@ -317,13 +317,7 @@ fn connections_over_the_limit_are_turned_away() {
     assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
     // Once it is gone, the place is free again.
     drop(first);
-    let reply = (0..50)
-        .map(|_| {
-            std::thread::sleep(Duration::from_millis(20));
-            send(proxy.addr, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n").1
-        })
-        .find(|reply| !reply.starts_with("HTTP/1.1 503"))
-        .unwrap();
+    let reply = send_once_free(proxy.addr, "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n");
     assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
 }
 
@@ -460,13 +454,13 @@ fn an_idle_tunnel_is_closed_and_frees_its_place() {
 
 #[test]
 fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
-    // Ten bytes, one every 100 ms: a second in all, five idle limits.
-    let port = ticker(10, Duration::from_millis(100));
+    // Twenty bytes, one every 50 ms: a second in all, over three idle limits.
+    let port = ticker(20, Duration::from_millis(50));
     let proxy = start_with(
         &[format!("stream.example.com:{port}")],
         Box::new(FakeResolver(LOCAL)),
         loopback_is_global,
-        |p| p.idle_timeout = Duration::from_millis(200),
+        |p| p.idle_timeout = Duration::from_millis(300),
     );
     let (mut conn, reply) = send(
         proxy.addr,
@@ -476,14 +470,14 @@ fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
     // The client sends nothing: bytes coming down are enough.
     let mut answer = Vec::new();
     conn.read_to_end(&mut answer).unwrap();
-    assert_eq!(answer, b"..........");
+    assert_eq!(answer, b"....................");
     drop(conn);
     let events = proxy
         .log
         .wait_until(|e| e.len() == 1 && e[0].bytes_down > 0);
     assert_eq!(
         (events[0].reason, events[0].bytes_down),
-        (None, 10),
+        (None, 20),
         "{events:?}"
     );
 }
@@ -492,10 +486,9 @@ fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
 fn plain_http_waiting_on_a_silent_server_is_closed_when_idle() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Accepts and reads, never answers.
+    // Accepts and holds each connection, never reads or answers.
     std::thread::spawn(move || {
-        let held: Vec<TcpStream> = listener.incoming().flatten().collect();
-        drop(held);
+        let _held: Vec<TcpStream> = listener.incoming().flatten().collect();
     });
     let proxy = start_with(
         &[format!("silent.example.com:{port}")],
@@ -504,14 +497,20 @@ fn plain_http_waiting_on_a_silent_server_is_closed_when_idle() {
         |p| p.idle_timeout = Duration::from_millis(200),
     );
     let started = Instant::now();
-    let (_conn, reply) = send(
+    let (mut conn, reply) = send(
         proxy.addr,
         &format!(
             "GET http://silent.example.com:{port}/ HTTP/1.1\r\nHost: silent.example.com\r\n\r\n"
         ),
     );
-    assert_eq!(reply, "");
+    // The client learns why, rather than getting an empty reply.
+    assert!(reply.starts_with("HTTP/1.1 504"), "{reply}");
     assert!(started.elapsed() < Duration::from_secs(2));
+    let mut rest = String::new();
+    conn.read_to_string(&mut rest).unwrap();
+    let body = (reply + &rest).split_once("\r\n\r\n").unwrap().1.to_owned();
+    assert!(body.starts_with("enclos: "), "{body}");
+    assert!(body.contains("(idle)"), "{body}");
     let events = proxy
         .log
         .wait_until(|e| e.len() == 1 && e[0].reason.is_some());
@@ -540,25 +539,120 @@ fn a_resolver_that_hangs_is_cut_at_the_deadline() {
     );
 }
 
+/// A local server that sends as fast as it can and drops what it is sent,
+/// until the other end closes.
+fn flood() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming().flatten() {
+            let reader = conn.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut &reader, &mut std::io::sink());
+            });
+            std::thread::spawn(move || {
+                let chunk = [b'x'; 16 * 1024];
+                while (&conn).write_all(&chunk).is_ok() {}
+            });
+        }
+    });
+    port
+}
+
 #[test]
-fn lookups_given_up_on_count_against_the_limit_until_they_return() {
+fn a_client_that_stops_reading_is_closed_even_while_it_sends() {
+    let port = flood();
     let proxy = start_with(
-        &["slow.example.com".to_owned()],
-        Box::new(HangingResolver),
+        &[format!("flood.example.com:{port}")],
+        Box::new(FakeResolver(LOCAL)),
         loopback_is_global,
         |p| {
             p.max_connections = 1;
-            p.connect_timeout = Duration::from_millis(300);
+            p.idle_timeout = Duration::from_millis(300);
         },
     );
-    let request = "CONNECT slow.example.com:443 HTTP/1.1\r\n\r\n";
-    assert!(send(proxy.addr, request).1.starts_with("HTTP/1.1 502"));
-    // The first lookup still runs and holds the one place for lookups: the
-    // next one fails at once rather than start another thread.
-    let started = Instant::now();
-    let reply = send_once_free(proxy.addr, request);
+    let (conn, reply) = send(
+        proxy.addr,
+        &format!("CONNECT flood.example.com:{port} HTTP/1.1\r\n\r\n"),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    // The client keeps sending, a byte every 50 ms, so the connection is
+    // never quiet, but it never reads what comes down again.
+    let sender = conn.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(10) && (&sender).write_all(b".").is_ok() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let events = proxy
+        .log
+        .wait_until(|e| e.len() == 1 && e[0].reason.is_some());
+    assert_eq!(
+        (events[0].verdict, events[0].reason),
+        (Verdict::Allowed, Some(Reason::Idle)),
+        "{events:?}"
+    );
+    // Its place is free again, while the client still holds its end.
+    let reply = send_once_free(proxy.addr, "CONNECT other.example.com:443 HTTP/1.1\r\n\r\n");
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    drop(conn);
+}
+
+/// Takes `slow` to answer for `name`, as a resolver waiting on a server
+/// that answers late does, and answers at once for any other name.
+struct SlowFor {
+    name: &'static str,
+    slow: Duration,
+}
+
+impl Resolve for SlowFor {
+    fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<IpAddr>> {
+        if host == self.name {
+            std::thread::sleep(self.slow);
+        }
+        Ok(vec![LOCAL])
+    }
+}
+
+#[test]
+fn lookups_given_up_on_count_against_the_limit_until_they_return() {
+    let port = echo();
+    let proxy = start_with(
+        &[
+            "slow.example.com".to_owned(),
+            format!("fast.example.com:{port}"),
+        ],
+        Box::new(SlowFor {
+            name: "slow.example.com",
+            slow: Duration::from_secs(1),
+        }),
+        loopback_is_global,
+        |p| {
+            p.max_lookups = 1;
+            p.connect_timeout = Duration::from_millis(200);
+        },
+    );
+    let slow = "CONNECT slow.example.com:443 HTTP/1.1\r\n\r\n";
+    assert!(send(proxy.addr, slow).1.starts_with("HTTP/1.1 502"));
+    // The first lookup still runs and holds the one place for lookups: a
+    // name that would resolve at once fails rather than start another.
+    let fast = format!("CONNECT fast.example.com:{port} HTTP/1.1\r\n\r\n");
+    let reply = send(proxy.addr, &fast).1;
     assert!(reply.starts_with("HTTP/1.1 502"), "{reply}");
-    assert!(started.elapsed() < Duration::from_millis(250));
     let events = proxy.log.wait_for(2);
-    assert_eq!(events[1].reason, Some(Reason::ResolveFailed));
+    assert_eq!(
+        (events[1].verdict, events[1].reason),
+        (Verdict::Allowed, Some(Reason::ResolveFailed))
+    );
+    // Once the first lookup returns, its place is free again.
+    let started = Instant::now();
+    let reply = loop {
+        let reply = send(proxy.addr, &fast).1;
+        if reply.starts_with("HTTP/1.1 200") || started.elapsed() > Duration::from_secs(5) {
+            break reply;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
 }
