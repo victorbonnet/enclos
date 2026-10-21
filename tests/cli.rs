@@ -452,10 +452,14 @@ fn sandbox_list_lines_up_its_columns_for_names_of_any_length() {
     }
 }
 
-/// Tests that start proxies take turns: proxy ports are the host's, shared
-/// by every test's enclos folder.
 #[cfg(target_os = "macos")]
-static HOST_PORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[path = "../src/host_ports.rs"]
+mod host_ports;
+
+/// Tests that start proxies take turns: proxy ports are the host's, shared
+/// by every test's enclos folder and every other test run of this user.
+#[cfg(target_os = "macos")]
+static HOST_PORTS: host_ports::HostPorts = host_ports::HostPorts;
 
 /// Stops the sandbox when the test ends, passed or not, so the proxy it
 /// started never outlives the test.
@@ -1157,8 +1161,25 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
         let _squatter = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         let out = home.run(&args);
         assert_eq!(out.code(), 1, "{}", out.stderr());
+        // What the service's log shows: whose port it is, and the way out.
+        let taken = format!(
+            "port {port} of sandbox `home` is in use by another program; stop it, or recreate the sandbox to get another port"
+        );
+        assert!(out.stderr().contains(&taken), "{}", out.stderr());
         assert!(proxy_pid(&home).is_none());
         assert!(!home.audit_lines().iter().any(|l| l.contains("proxy start")));
+        // A port other than the sandbox's own is not the sandbox's to give
+        // up: no advice to recreate it.
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let elsewhere = other.local_addr().unwrap().to_string();
+        let out = home.run(&["proxy", "run", "home", "--listen", &elsewhere]);
+        assert_eq!(out.code(), 1, "{}", out.stderr());
+        assert!(
+            out.stderr().contains("cannot listen on"),
+            "{}",
+            out.stderr()
+        );
+        assert!(!out.stderr().contains("recreate"), "{}", out.stderr());
     }
     // As the service manager runs it.
     let mut proxy = KillOnDrop(
@@ -1170,6 +1191,15 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
             .unwrap(),
     );
     assert!(eventually(|| proxy_pid(&home) == Some(proxy.0.id())));
+    // A second proxy finds the port held by the sandbox's own: nothing to
+    // stop or recreate.
+    let out = home.run(&["proxy", "run", "home", "--listen", &listen]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("already runs") && !out.stderr().contains("recreate"),
+        "{}",
+        out.stderr()
+    );
     // `connect` uses it rather than starting another.
     home.run(&["connect", "home", "--", "/usr/bin/true"]).ok();
     assert_eq!(proxy_pid(&home), Some(proxy.0.id()));

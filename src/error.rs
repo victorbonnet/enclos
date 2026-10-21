@@ -92,6 +92,15 @@ pub enum Error {
     },
     #[error(transparent)]
     Compile(#[from] crate::backend::CompileError),
+    /// Ports are the host's, so another program may hold the sandbox's: the
+    /// proxy of another user's or another enclos install's sandbox, say.
+    #[error(
+        "port {port} of sandbox `{sandbox}` is in use by another program; stop it, or recreate the sandbox to get another port"
+    )]
+    ProxyPortTaken { sandbox: String, port: u16 },
+    /// Its own proxy holds the port: there is nothing to stop or recreate.
+    #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
+    ProxyRuns { sandbox: String, port: u16 },
     #[error("the proxy of sandbox `{sandbox}` cannot listen on {addr}: {source}")]
     ProxyListen {
         sandbox: String,
@@ -139,6 +148,8 @@ impl Error {
             | Error::Policy(_)
             | Error::NoSuchSandbox { .. }
             | Error::NoPolicy { .. }
+            | Error::ProxyPortTaken { .. }
+            | Error::ProxyRuns { .. }
             | Error::ProxyListen { .. }
             | Error::ProxyStopped { .. }
             | Error::Compile(_)

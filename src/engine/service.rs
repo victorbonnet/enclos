@@ -136,7 +136,7 @@ impl Engine {
         self.log_file(name, Unit::Proxy)
     }
 
-    fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
+    pub(super) fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
         self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })
