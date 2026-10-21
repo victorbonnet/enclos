@@ -7,11 +7,14 @@
 //! searches the home's `bin` folders before the host's system ones, and every
 //! common proxy variable points at the sandbox's proxy (design §5).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::super::{Launch, SandboxContext};
+use super::compile::TERMINAL_PARAM;
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -38,7 +41,28 @@ const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
 const FALLBACK_TERM: &str = "xterm-256color";
 
 pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
+    let terminal = match launch.in_terminal {
+        true => own_terminal(),
+        false => None,
+    };
+    wrap_in(compiled, ctx, launch, terminal.as_deref())
+}
+
+/// [`wrap`], for a program in `terminal`, which the compiled policy then
+/// lets the sandbox open by name. Without one, no terminal device opens by
+/// name but those the sandbox opens itself.
+pub(super) fn wrap_in(
+    compiled: &Path,
+    ctx: &SandboxContext,
+    launch: &Launch,
+    terminal: Option<&Path>,
+) -> Command {
     let mut command = Command::new(SANDBOX_EXEC);
+    if let Some(terminal) = terminal {
+        let mut param = OsString::from(format!("{TERMINAL_PARAM}="));
+        param.push(terminal);
+        command.arg("-D").arg(param);
+    }
     command
         .arg("-f")
         .arg(compiled)
@@ -72,6 +96,33 @@ pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     }
     command.current_dir(&ctx.home);
     command
+}
+
+/// The terminal this process runs in, from its stdin, stdout and stderr.
+fn own_terminal() -> Option<PathBuf> {
+    let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    terminal_of([stdin.as_fd(), stdout.as_fd(), stderr.as_fd()])
+}
+
+/// The terminal device of the first of `fds` that is one. A session's
+/// program inherits these streams, so naming their terminal opens nothing
+/// it does not already hold, and a program that reopens its terminal by
+/// name (`tty`, `ttyname`) finds this one.
+fn terminal_of(fds: [BorrowedFd<'_>; 3]) -> Option<PathBuf> {
+    fds.into_iter()
+        .filter(|fd| rustix::termios::isatty(fd))
+        .filter_map(|fd| rustix::termios::ttyname(fd, Vec::new()).ok())
+        .map(|name| PathBuf::from(OsString::from_vec(name.into_bytes())))
+        .find(|path| is_terminal_device(path))
+}
+
+/// Whether `path` names a terminal device, `/dev/ttys` and digits: the only
+/// ones the compiled policy can open by name (`compile::TERMINALS`, which
+/// checks the name again).
+fn is_terminal_device(path: &Path) -> bool {
+    path.to_str()
+        .and_then(|p| p.strip_prefix("/dev/ttys"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Whether `term` has no description a sandboxed program would find: no
@@ -201,8 +252,9 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec![],
             env: vec![],
+            in_terminal: false,
         };
-        let command = wrap(Path::new("/x.sb"), &ctx(), &launch);
+        let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, None);
         let names: Vec<_> = command
             .get_envs()
             .map(|(k, _)| k.to_string_lossy().into_owned())
@@ -218,5 +270,88 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args, ["-f", "/x.sb", "/bin/sh"]);
+    }
+
+    #[test]
+    fn a_session_names_its_own_terminal_to_the_policy() {
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec![],
+            env: vec![],
+            in_terminal: false,
+        };
+        let terminal = Path::new("/dev/ttys004");
+        let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, Some(terminal));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-D",
+                "ENCLOS_TERMINAL=/dev/ttys004",
+                "-f",
+                "/x.sb",
+                "/bin/sh"
+            ]
+        );
+    }
+
+    /// The device of a pseudo-terminal the test opened, as a stream a
+    /// program might inherit; never the test's own terminal.
+    #[cfg(target_os = "macos")]
+    fn device(terminal: &Path) -> std::os::fd::OwnedFd {
+        use rustix::fs::{Mode, OFlags, open};
+        open(terminal, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_terminal_named_is_the_first_standard_stream_that_is_one() {
+        use super::super::tests::terminal;
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let (_first, first) = terminal();
+        let (_second, second) = terminal();
+        let (in_first, in_second) = (device(&first), device(&second));
+        let (null, a, b) = (null.as_fd(), in_first.as_fd(), in_second.as_fd());
+        assert_eq!(terminal_of([null, null, null]), None);
+        assert_eq!(terminal_of([null, a, null]), Some(first.clone()));
+        assert_eq!(terminal_of([null, null, b]), Some(second.clone()));
+        assert_eq!(terminal_of([a, b, null]), Some(first));
+        assert_eq!(terminal_of([b, a, a]), Some(second));
+    }
+
+    #[test]
+    fn a_launch_outside_a_terminal_names_none_to_the_policy() {
+        // Whatever terminal this test runs in, as `enclos launch` run by
+        // hand would be.
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec![],
+            env: vec![],
+            in_terminal: false,
+        };
+        let command = wrap(Path::new("/x.sb"), &ctx(), &launch);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-f", "/x.sb", "/bin/sh"]);
+    }
+
+    #[test]
+    fn only_terminal_devices_are_named_to_the_policy() {
+        assert!(is_terminal_device(Path::new("/dev/ttys004")));
+        for other in [
+            "/dev/ttys",
+            "/dev/ttys00a",
+            "/dev/ttys004/../null",
+            "/dev/console",
+            "/dev/tty",
+            "/Users/alice/ttys004",
+        ] {
+            assert!(!is_terminal_device(Path::new(other)), "{other}");
+        }
     }
 }

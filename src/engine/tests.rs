@@ -548,7 +548,7 @@ mod compile {
         }
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
-        let inputs = engine.probe_inputs(&name, &ctx, None).unwrap();
+        let inputs = engine.probe_inputs(&name, &ctx, None, None).unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
         assert_eq!(
@@ -643,6 +643,7 @@ mod compile {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), swap.into()],
             env: Vec::new(),
+            in_terminal: false,
         };
         let ctx = engine.sandbox_context(&name, 41001);
         let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
@@ -2778,6 +2779,19 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
+    /// A runtime whose gateway records whether it was launched in enclos's
+    /// terminal, and exits.
+    #[cfg(target_os = "macos")]
+    const RECORDS_TERMINAL: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+[ \"$1\" = gateway ] || exit 0
+printf '%s' \"${ENCLOS_FAKE_IN_TERMINAL:-unset}\" > \"$HOME/in-terminal\"
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+";
+
     #[cfg(target_os = "macos")]
     fn pids_in(file: &Path) -> Vec<u32> {
         std::fs::read_to_string(file)
@@ -2895,6 +2909,24 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             lab.engine.state.get(&lab.name).unwrap().unwrap().state,
             crate::model::sandbox::SandboxState::Running
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_service_is_never_launched_in_enclos_s_terminal() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RECORDS_TERMINAL, Confirm::Yes).unwrap()).installed);
+        // Even when `enclos launch` runs in one, as when run by hand: the
+        // service outlives that terminal.
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert_eq!(end.exit, 0, "{end:?}");
+        let seen = std::fs::read_to_string(lab.home.join("in-terminal")).unwrap();
+        assert_eq!(seen, "false");
     }
 
     #[cfg(target_os = "macos")]

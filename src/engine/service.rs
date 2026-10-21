@@ -486,6 +486,9 @@ impl Engine {
             program: program.clone(),
             args: args.to_vec(),
             env: Vec::new(),
+            // Even when `enclos launch` is run by hand in a terminal: a
+            // service outlives it.
+            in_terminal: false,
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);

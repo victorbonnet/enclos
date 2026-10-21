@@ -97,6 +97,10 @@ pub struct Launch {
     pub args: Vec<OsString>,
     /// Variables set on top of the sandbox's environment.
     pub env: Vec<(String, String)>,
+    /// Whether the program runs in the terminal enclos runs in, as a
+    /// session does: the backend then lets it open that terminal by name. A
+    /// service or a probe never does, whatever terminal enclos runs in.
+    pub in_terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

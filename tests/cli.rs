@@ -607,6 +607,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "network",
         "dns",
         "signals",
+        "terminals",
         "pasteboard",
         "at",
     ];
@@ -824,6 +825,28 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     home.run(&["sandbox", "stop", "home"]).ok();
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
     assert!(show.contains("no sessions running"), "{show}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_opens_the_terminal_it_runs_in_by_name() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    // `script` runs enclos in a terminal of its own, never this test's.
+    let script = r#"t=$(/usr/bin/tty) && : < "$t" && : >> "$t" && echo own-by-name"#;
+    let out = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_enclos")])
+        .args(["connect", "home", "--", "/bin/sh", "-c", script])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("own-by-name"), "{out}");
 }
 
 #[cfg(target_os = "macos")]
