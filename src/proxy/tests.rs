@@ -360,6 +360,52 @@ fn a_host_that_is_not_a_name_is_logged_escaped() {
     assert_eq!(events[0].host, "evil\\u{1b}[2J\\nnot-allowed.example.com");
 }
 
+/// The full set of targets is in `loggable_host`'s own test; these check
+/// that each way a target reaches the log goes through it.
+#[test]
+fn a_bad_target_is_logged_without_its_user_or_query() {
+    let cases = [
+        ("user:secret@api.example.com:443", "api.example.com"),
+        ("[user:secret@::1]:443", "::1"),
+        ("api.example.com?token=secret:443", "api.example.com"),
+    ];
+    for (target, logged) in cases {
+        let proxy = start(&[], LOCAL, loopback_is_global);
+        let (_conn, reply) = send(proxy.addr, &format!("CONNECT {target} HTTP/1.1\r\n\r\n"));
+        assert!(reply.starts_with("HTTP/1.1 400"), "{target}: {reply}");
+        let events = proxy.log.wait_for(1);
+        assert_eq!(events[0].reason, Some(Reason::BadRequest), "{target}");
+        assert_eq!(events[0].host, logged, "{target}");
+    }
+}
+
+#[test]
+fn a_plain_http_target_is_logged_without_its_query_or_fragment() {
+    for target in [
+        "http://api.example.com?token=secret",
+        "http://api.example.com#secret",
+    ] {
+        let proxy = start(&[], LOCAL, loopback_is_global);
+        let (_conn, reply) = send(proxy.addr, &format!("GET {target} HTTP/1.1\r\n\r\n"));
+        assert!(reply.starts_with("HTTP/1.1 400"), "{target}: {reply}");
+        let events = proxy.log.wait_for(1);
+        assert_eq!(events[0].reason, Some(Reason::BadRequest), "{target}");
+        assert_eq!(events[0].host, "api.example.com", "{target}");
+    }
+}
+
+#[test]
+fn a_plain_http_target_with_a_user_gets_a_400_and_no_log_row() {
+    let proxy = start(&[], LOCAL, loopback_is_global);
+    let (_conn, reply) = send(
+        proxy.addr,
+        "GET http://user:secret@api.example.com/ HTTP/1.1\r\n\r\n",
+    );
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(proxy.log.0.lock().unwrap().is_empty());
+}
+
 #[test]
 fn an_allowed_name_that_does_not_resolve_failed_and_was_not_refused() {
     let proxy = start_with(
