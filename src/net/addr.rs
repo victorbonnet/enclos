@@ -1,9 +1,17 @@
 //! Which addresses the proxy may connect to (ADR 0017).
 //!
 //! Every IANA IPv4 and IPv6 special-purpose block that is not globally
-//! reachable is refused, except the private ranges, which a policy's
-//! `private` opt-in unlocks for named hosts. IPv6 forms that carry an IPv4
-//! address (mapped, NAT64, 6to4, Teredo) are judged by that address.
+//! reachable is refused, except two kinds. The private ranges (RFC 1918,
+//! carrier-grade NAT, unique-local `fc00::/7`) are unlocked for named hosts by
+//! a policy's `private` opt-in. IPv6 forms that carry an IPv4 address at a
+//! fixed place (mapped, the well-known NAT64 prefix, 6to4, Teredo) are judged
+//! by that address. The local-use NAT64 prefix is refused whole, since where
+//! it carries the IPv4 address depends on the operator.
+//!
+//! Any other IPv6 address outside `2000::/3`, the only block IANA allocates
+//! for global unicast, is refused too. That covers a block reserved later
+//! outside `2000::/3`; a block reserved later inside it is taken as global
+//! until it is added to the table here.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -88,10 +96,6 @@ fn embedded_v4(ip: Ipv6Addr) -> Vec<Ipv4Addr> {
     if in_v6(ip, [0x64, 0xff9b, 0, 0, 0, 0, 0, 0], 96) {
         return vec![v4(o[12], o[13], o[14], o[15])];
     }
-    if in_v6(ip, [0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48) {
-        // RFC 6052 /48: bits 48-63 and 72-87, around the zero u octet.
-        return vec![v4(o[6], o[7], o[9], o[10])];
-    }
     if in_v6(ip, [0x2002, 0, 0, 0, 0, 0, 0, 0], 16) {
         return vec![v4(o[2], o[3], o[4], o[5])];
     }
@@ -131,11 +135,20 @@ pub fn classify_v6(ip: Ipv6Addr) -> AddrClass {
     {
         return AddrClass::Global;
     }
+    // Only the three entries inside `2000::/3` (`2001::/23`, `2001:db8::/32`,
+    // `3fff::/20`) decide anything: the others would be refused by the
+    // `2000::/3` check below anyway, and are listed so the reason names the
+    // block.
     const BLOCKED: &[([u16; 8], u32, &str)] = &[
         ([0, 0, 0, 0, 0, 0, 0, 0], 128, "unspecified"),
         ([0, 0, 0, 0, 0, 0, 0, 1], 128, "loopback"),
         ([0, 0, 0, 0, 0, 0, 0, 0], 96, "deprecated IPv4-compatible"),
+        // RFC 8215 lets an operator use an RFC 6052 prefix of /48, /56, /64
+        // or /96 inside this /48, so the IPv4 address it carries cannot be
+        // located.
+        ([0x64, 0xff9b, 1, 0, 0, 0, 0, 0], 48, "local-use NAT64"),
         ([0x100, 0, 0, 0, 0, 0, 0, 0], 64, "discard-only"),
+        ([0x100, 0, 0, 1, 0, 0, 0, 0], 64, "dummy prefix"),
         (
             [0x2001, 0, 0, 0, 0, 0, 0, 0],
             23,
@@ -153,6 +166,10 @@ pub fn classify_v6(ip: Ipv6Addr) -> AddrClass {
     }
     if in_v6(ip, [0xfc00, 0, 0, 0, 0, 0, 0, 0], 7) {
         return AddrClass::Private;
+    }
+    if !in_v6(ip, [0x2000, 0, 0, 0, 0, 0, 0, 0], 3) {
+        // IANA's IPv6 address space registry marks these "Reserved by IETF".
+        return AddrClass::Blocked("reserved IPv6");
     }
     AddrClass::Global
 }
@@ -172,7 +189,19 @@ mod tests {
             "140.82.112.4",
             "192.0.0.9",
             "2606:4700::1111",
+            "2001:4860:4860::8888",
+            "2a00:1450:4001::1",
+            "2620:4f:8000::1",
             "2001:4:112::1",
+            "2001:1::1",
+            "2001:3::1",
+            "2001:20::1",
+            "2001:30::1",
+            "64:ff9b::101:101",
+            "::ffff:1.1.1.1",
+            // Both ends of 2000::/3.
+            "2000::",
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
         ] {
             assert_eq!(class(ip), AddrClass::Global, "{ip}");
         }
@@ -221,13 +250,9 @@ mod tests {
 
     #[test]
     fn ipv6_forms_carrying_ipv4_are_judged_by_it() {
-        // Mapped, NAT64 /96 and /48, 6to4.
+        // Mapped, the well-known NAT64 prefix, 6to4.
         assert!(matches!(class("::ffff:127.0.0.1"), AddrClass::Blocked(_)));
         assert!(matches!(class("64:ff9b::a9fe:a9fe"), AddrClass::Blocked(_)));
-        assert!(matches!(
-            class("64:ff9b:1:7f00:0:100::"),
-            AddrClass::Blocked(_)
-        ));
         assert!(matches!(class("2002:7f00:1::"), AddrClass::Blocked(_)));
         assert_eq!(class("2002:c0a8:101::"), AddrClass::Private);
         assert_eq!(class("::ffff:1.1.1.1"), AddrClass::Global);
@@ -236,5 +261,56 @@ mod tests {
             class("2001:0:4136:e378:8000:63bf:80ff:fffe"),
             AddrClass::Blocked(_)
         ));
+    }
+
+    #[test]
+    fn the_local_use_nat64_prefix_is_blocked_whatever_it_carries() {
+        // Operators may use a /48, /56, /64 or /96 prefix inside
+        // 64:ff9b:1::/48, so where the IPv4 address sits is unknown: the
+        // whole block is refused, including addresses that a /48 layout
+        // reads as public.
+        for ip in [
+            "64:ff9b:1::",
+            "64:ff9b:1::1",
+            "64:ff9b:1:101:1:100::",
+            "64:ff9b:1:808:8:808:a9fe:a9fe",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert_eq!(class(ip), AddrClass::Blocked("local-use NAT64"), "{ip}");
+        }
+    }
+
+    #[test]
+    fn the_dummy_prefix_is_blocked() {
+        for ip in [
+            "100:0:0:1::",
+            "100:0:0:1::1",
+            "100:0:0:1:ffff:ffff:ffff:ffff",
+        ] {
+            assert_eq!(class(ip), AddrClass::Blocked("dummy prefix"), "{ip}");
+        }
+    }
+
+    #[test]
+    fn ipv6_outside_global_unicast_is_blocked() {
+        for ip in [
+            "1:2::3",
+            "100:0:0:2::1",
+            "1000::1",
+            "4000::1",
+            "c000::1",
+            "fe00::1",
+            "::1:0:0:1",
+            "::ffff:0:1.1.1.1",
+            // Next to the IPv4-carrying forms, read as 1.1.1.1 by a lax
+            // decoder: past 64:ff9b::/96, below ::ffff:0:0/96.
+            "64:ff9b::1:101:101",
+            "64:ff9b:2::1",
+            "::fffe:101:101",
+            // Just below 2000::/3.
+            "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert_eq!(class(ip), AddrClass::Blocked("reserved IPv6"), "{ip}");
+        }
     }
 }
