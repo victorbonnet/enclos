@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(confirm.exit_code(), 3);
         assert_eq!(error.exit_code(), 1);
         let after = Error::FailedAfter {
-            error: Box::new(Error::Refused { reason: "x".into() }),
+            error: Box::new(invalid(vec![Problem::Refused("x".into())])),
             done: "y".into(),
         };
         assert_eq!(after.exit_code(), 2);

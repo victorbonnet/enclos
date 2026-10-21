@@ -19,7 +19,6 @@ use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::process::{group_of, is_same, reference, reference_of_child};
-use crate::lifecycle::stop::{GRACE, Stopped, stop};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
