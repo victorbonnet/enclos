@@ -171,6 +171,21 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     if let Some(why) = &s.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
+    if let Some(page) = &s.dashboard {
+        println!("  dashboard {page}");
+    }
+    match &s.network_listeners {
+        Fact::Known(list) => {
+            for l in list {
+                println!(
+                    "  your network can reach {} (pid {}), listening on {}",
+                    l.command, l.pid, l.address
+                );
+            }
+        }
+        Fact::CannotTell(why) => println!("  listeners: cannot tell ({why})"),
+        Fact::Absent | Fact::NotProvided => {}
+    }
 
     if let Some(list) = &s.agents {
         if let Some(why) = &list.unreadable {

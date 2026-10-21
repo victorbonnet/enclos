@@ -245,7 +245,12 @@ impl RuntimeAdapter for Hermes {
         // `gateway.sock` in the home, and dials the WebSocket the gateway
         // serves on 127.0.0.1:0 (`gateway/run_api.py`,
         // `hermes_cli/gateway_client.py`).
-        Some(RuntimeListener { service: GATEWAY })
+        Some(RuntimeListener {
+            service: GATEWAY,
+            // Its web dashboard, on the same listener; on loopback Hermes
+            // asks no login for it (`__HERMES_AUTH_REQUIRED__=false`).
+            page: Some("/"),
+        })
     }
 
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable> {
