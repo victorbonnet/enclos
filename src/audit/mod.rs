@@ -64,4 +64,13 @@ pub enum AuditError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "cannot save the incomplete last line of the audit log to {path}: {source}. No \
+         state-changing command runs until it can: fix the cause, such as a full disk or the \
+         folder's permissions, then run the command again"
+    )]
+    SaveTorn {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
