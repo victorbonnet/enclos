@@ -150,9 +150,7 @@ impl Proxy {
         };
         event.port = port;
         let dest = Destination::parse(host, port).inspect_err(|_| {
-            // Shown later in a terminal on the host: nothing the client
-            // wrote may reach it unescaped.
-            event.host = host.escape_default().take(255).collect();
+            event.host = loggable_host(host);
         })?;
         event.host = dest.host.clone();
 
@@ -273,6 +271,30 @@ impl Proxy {
         }
         Err(Reason::ConnectFailed)
     }
+}
+
+/// What the network log keeps of a host the proxy could not parse: the
+/// text after the last `@` and before the first `/`, `\`, `?` or `#`. A
+/// user and password, a path, a query or a fragment may hold a secret, so
+/// they are dropped. Nothing is kept when an `@` comes after that cut,
+/// since the user part may not end where it seems, or when the host holds
+/// a `%`, since percent-encoding can hide any of these delimiters and no
+/// host name or address contains one. The result is shown later in a
+/// terminal on the host, so nothing the client wrote may reach it
+/// unescaped.
+fn loggable_host(host: &str) -> String {
+    if host.contains('%') {
+        return "<invalid>".to_owned();
+    }
+    let end = host.find(['/', '\\', '?', '#']).unwrap_or(host.len());
+    let (authority, rest) = host.split_at(end);
+    let name = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, name)| name);
+    if name.is_empty() || rest.contains('@') {
+        return "<invalid>".to_owned();
+    }
+    name.escape_default().take(255).collect()
 }
 
 /// Why a lookup gave no addresses.
@@ -604,4 +626,40 @@ fn response(status: &str, body: &str) -> String {
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loggable_host;
+
+    #[test]
+    fn a_bad_host_keeps_only_what_can_be_a_host() {
+        let long = "a".repeat(300);
+        let cases = [
+            ("user:secret@api.example.com", "api.example.com"),
+            ("token@api.example.com", "api.example.com"),
+            ("user:p@ss@api.example.com", "api.example.com"),
+            ("api.example.com?token=secret", "api.example.com"),
+            ("api.example.com#secret", "api.example.com"),
+            ("api.example.com/secret", "api.example.com"),
+            ("api.example.com\\secret", "api.example.com"),
+            ("user:secret@::1", "::1"),
+            ("user:secret@evil\x1bhost/secret", "evil\\u{1b}host"),
+            (&format!("{long}?secret"), &long[..255]),
+            // Nothing that could be a host is left: a fixed placeholder.
+            ("user:secret@", "<invalid>"),
+            ("?token=secret", "<invalid>"),
+            // Where the user part ends is unclear: none of it is kept.
+            ("user:se/cret@api.example.com", "<invalid>"),
+            ("api.example.com?to@ken=secret", "<invalid>"),
+            // Percent-encoding can hide any delimiter, and no host holds a `%`.
+            ("user%3Asecret%40api.example.com", "<invalid>"),
+            ("token%40api.example.com", "<invalid>"),
+            ("api.example.com%3Ftoken%3Dsecret", "<invalid>"),
+        ];
+        for (host, logged) in cases {
+            assert_eq!(loggable_host(host), logged, "{host}");
+            assert!(!loggable_host(host).contains("secret"), "{host}");
+        }
+    }
 }
