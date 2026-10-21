@@ -9,6 +9,7 @@ repository = "https://github.com/victorbonnet/enclos"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+icu_properties = "2.3.0"
 jiff = { version = "0.2.38", features = ["serde"] }
 psl = "2.1.242"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

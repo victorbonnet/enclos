@@ -8,6 +8,8 @@
 //! descriptors that never follow a link (`runtime::home`, ADR 0023), sizes
 //! and counts are bounded, and "cannot tell", with why, is an answer.
 
+mod printable;
+
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::os::fd::OwnedFd;
@@ -32,6 +34,7 @@ use crate::model::session::{SessionKind, SessionRecord};
 use crate::runtime::home::{self, is_dot, wide};
 use crate::runtime::{DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, ValueAt, adapter};
 use crate::service::ServiceStatus;
+use printable::printable;
 
 /// Past this, a sandbox nobody used is worth a suggestion.
 pub const IDLE_DAYS: i64 = 30;
@@ -42,9 +45,6 @@ const REFUSED_DAYS: i64 = 7;
 const MAX_ENTRIES: usize = 1_000_000;
 /// The largest file of the sandbox home read for a fact.
 const MAX_FACT_FILE: u64 = 256 * 1024;
-/// The most characters of the sandbox home's text shown, such as a model
-/// name, counted after escaping.
-const MAX_FACT_TEXT: usize = 120;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusView {
@@ -1002,44 +1002,6 @@ fn scalar(rest: &str) -> Yaml {
     }
 }
 
-/// Characters that move or hide text on a terminal without being control
-/// characters: format characters such as bidi overrides, zero-width
-/// characters, line and paragraph separators, and tags.
-fn invisible(c: char) -> bool {
-    matches!(c,
-        '\u{AD}' | '\u{61C}' | '\u{180E}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{206F}'
-        | '\u{FEFF}'
-        | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{E0000}'..='\u{E007F}')
-}
-
-/// Text the sandbox wrote, safe for a terminal: control and invisible
-/// characters escaped, then cut to at most `MAX_FACT_TEXT` characters,
-/// never inside an escape.
-pub(super) fn printable(text: &str) -> String {
-    let mut out = String::new();
-    let mut shown = 0;
-    for c in text.chars() {
-        let piece = if c.is_control() {
-            c.escape_default().to_string()
-        } else if invisible(c) {
-            c.escape_unicode().to_string()
-        } else {
-            c.to_string()
-        };
-        let n = piece.chars().count();
-        if shown + n > MAX_FACT_TEXT {
-            break;
-        }
-        out.push_str(&piece);
-        shown += n;
-    }
-    out
-}
-
 // ---- Disk usage ----
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1444,18 +1406,6 @@ mod tests {
             yaml_value("\"model.default\": x\n", "model.default"),
             Yaml::Missing
         );
-    }
-
-    #[test]
-    fn printable_text_escapes_controls_and_invisible_characters_then_cuts() {
-        assert_eq!(printable("a\u{1b}[31mb\n"), "a\\u{1b}[31mb\\n");
-        assert_eq!(printable("ab\u{202e}cd"), "ab\\u{202e}cd");
-        assert_eq!(printable("a\u{200b}\u{feff}b"), "a\\u{200b}\\u{feff}b");
-        assert_eq!(printable(&"x".repeat(500)).chars().count(), MAX_FACT_TEXT);
-        // Escapes count, and an escape is never cut in half.
-        let escaped = printable(&"\u{1b}".repeat(100));
-        assert!(escaped.chars().count() <= MAX_FACT_TEXT);
-        assert!(escaped.ends_with("\\u{1b}"), "{escaped}");
     }
 
     #[test]
