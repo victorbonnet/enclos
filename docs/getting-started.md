@@ -85,6 +85,22 @@ lab/scout: Hermes has this agent; enclos does not track it. Track it with `enclo
 
 `enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`); `--keep-data` removes only enclos's record and leaves the files, so Hermes still has the agent and enclos reports it as one it does not track. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
 
+### Bring an agent from your Mac
+
+To test an agent that already runs on your Mac, export it there with Hermes's own command, then add it to the sandbox from the archive:
+
+```bash
+hermes profile export default -o ~/exports/main.tar.gz   # on your Mac, with your own Hermes
+enclos agent add lab/main --from ~/exports/main.tar.gz   # Hermes imports it inside the sandbox
+enclos connect lab -- hermes -p main
+```
+
+Hermes's export of `default` carries the agent's configuration, personality, skills, cron jobs, memories and sessions, and leaves out its credentials (`auth.json`, `.env`, the browser's data), its databases, logs and caches; an export of a named agent (`hermes profile export scout`) leaves out the credentials and the browser's data but carries its database, history and logs. That is Hermes's doing, by its code, and not shown by a prototype yet (design §14). enclos never looks inside the archive: it copies it beside the sandbox home, Hermes imports it inside the sandbox under its policy, and enclos records the agent with the archive's SHA-256 in the audit log, once when the copy is made and once with the record. Your Mac's built-in agent, `default`, comes in as a named agent: Hermes refuses to import as `default`. The archive must be a file of your own, not a link and not inside a sandbox's folder.
+
+Three things stay on your Mac. The login: enclos copies none in, so the agent uses the sandbox's, made with `enclos connect lab -- hermes -p default setup`, and keys its configuration needs (a channel token, another provider's key) go in its files inside the sandbox. Network grants: nothing in the archive widens the sandbox's policy, so what the agent reaches shows in `enclos net log lab` and what was refused in `enclos net denied lab`, where you decide. Your own Hermes: enclos never runs it or reads `~/.hermes`.
+
+Its cron jobs are meant to run under the sandbox's gateway once `enclos sandbox start lab` runs; that, and that the imported agent uses the sandbox's login, is still to verify (design §14). To take an agent back out, run the export inside the sandbox: `enclos connect lab -- hermes profile export main -o ~/main.tar.gz` writes the archive under the sandbox home (`~/.enclos/sandboxes/lab/home/main.tar.gz` on your Mac). Copy it to a folder of your own before importing it elsewhere: enclos refuses an archive that sits inside a sandbox's folder.
+
 ## Check the sandbox
 
 ```bash

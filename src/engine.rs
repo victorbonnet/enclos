@@ -3,6 +3,7 @@
 //! opens an audit entry, does the work and closes the entry, also on failure.
 
 mod compile;
+mod import;
 mod net;
 mod policy;
 mod probe;
@@ -14,6 +15,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+pub use import::Archive;
 pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]

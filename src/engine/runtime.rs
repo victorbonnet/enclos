@@ -1,6 +1,7 @@
 //! The engine's runtime calls: install a runtime in a sandbox and manage
 //! its agents (design §9 "Runtime adapter"). Logging it in is the runtime's
-//! own command, through `enclos connect` (ADR 0024).
+//! own command, through `enclos connect` (ADR 0024); importing an agent
+//! from the host is in `import.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,6 +9,7 @@ use std::process::{Command, Stdio};
 use sha2::{Digest, Sha256};
 
 use super::Engine;
+use super::import::Archive;
 use super::policy::{adapter_layer, differences};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
@@ -54,6 +56,15 @@ pub enum Added {
     /// The runtime already had the agent, made inside the sandbox; only the
     /// record is new.
     Adopted,
+    /// The runtime's own command imported it from an export made on the
+    /// host, with `--from` (issue #34); how that command ended.
+    Imported {
+        end: SessionEnd,
+        archive: Archive,
+        /// enclos's copy of the archive beside the sandbox home, when it
+        /// could not be removed: the sandbox can read it.
+        copy_left: Option<PathBuf>,
+    },
 }
 
 /// What `agent rm` did. The record is gone either way.
@@ -198,7 +209,12 @@ impl Engine {
 
     /// The runtime's built-in agent comes and goes with the runtime: enclos
     /// neither adds nor removes it.
-    fn refuse_builtin(&self, name: &SandboxName, kind: RuntimeKind, agent: &str) -> Result<()> {
+    pub(super) fn refuse_builtin(
+        &self,
+        name: &SandboxName,
+        kind: RuntimeKind,
+        agent: &str,
+    ) -> Result<()> {
         let runtime = adapter(kind);
         if let Some(builtin) = runtime.builtin_agent()
             && builtin.as_str() == agent
@@ -477,10 +493,7 @@ impl Engine {
         }
         let bytes = std::fs::read(&part)
             .map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
-        let got: String = Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let got = hex(&Sha256::digest(&bytes));
         if got != installer.sha256 {
             let _ = std::fs::remove_file(&part);
             return Err(failed(format!(
@@ -533,14 +546,14 @@ impl Engine {
                 });
             }
         };
-        // A new agent's alias would shadow a command of that name; an
+        // A new agent's alias would collide with a command of that name; an
         // adopted one already has its alias there.
         if let Adoption::Create(_) = adoption
             && let Some(path) = self.command_named(name, &agent)?
         {
             return Err(Error::Session {
                 what: format!(
-                    "`{agent}` is a command on the sandbox's PATH ({}); {shown} would shadow it with the agent's alias. Pick another name",
+                    "`{agent}` is a command on the sandbox's PATH ({}); {shown} would not give the agent its alias. Pick another name",
                     path.display()
                 ),
             });
@@ -582,7 +595,7 @@ impl Engine {
         };
         let summary = match how {
             Added::Adopted => "adopted",
-            Added::Created(_) => "added",
+            Added::Created(_) | Added::Imported { .. } => "added",
         };
         let record = self
             .write(
@@ -649,7 +662,44 @@ impl Engine {
         }))
     }
 
-    fn refuse_known_agent(&self, name: &SandboxName, agent: &AgentName) -> Result<()> {
+    /// Records an agent the runtime now has, as one `agent add` audit entry
+    /// whose outcome says how it came to be. `then` is what to do if the
+    /// record fails, since the runtime keeps the agent either way.
+    pub(super) fn record_agent(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        kind: RuntimeKind,
+        outcome: String,
+        then: &str,
+    ) -> Result<AgentRecord> {
+        self.write(
+            by,
+            "agent add",
+            Some(format!("{name}/{agent}")),
+            |_| outcome,
+            |lock| {
+                // Checked again under the lock: another add may have
+                // recorded it while the runtime worked.
+                self.refuse_known_agent(name, agent)?;
+                let added = AgentRecord {
+                    name: agent.clone(),
+                    created_at: now(),
+                };
+                self.state.insert_agent(lock, name, &added)?;
+                Ok(added)
+            },
+        )
+        .map_err(|e| Error::Session {
+            what: format!(
+                "{} has agent {agent} in sandbox {name}, but enclos could not record it: {e}. {then}",
+                kind.display_name()
+            ),
+        })
+    }
+
+    pub(super) fn refuse_known_agent(&self, name: &SandboxName, agent: &AgentName) -> Result<()> {
         if self.state.agents(name)?.iter().any(|p| p.name == *agent) {
             return Err(Error::Session {
                 what: format!("sandbox {name} already has agent {agent}"),
@@ -659,8 +709,12 @@ impl Engine {
     }
 
     /// A command named `agent` on the sandbox's PATH, if there is one: the
-    /// runtime's alias for the agent would shadow it inside the sandbox.
-    fn command_named(&self, name: &SandboxName, agent: &AgentName) -> Result<Option<PathBuf>> {
+    /// runtime's alias for the agent would collide with it.
+    pub(super) fn command_named(
+        &self,
+        name: &SandboxName,
+        agent: &AgentName,
+    ) -> Result<Option<PathBuf>> {
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
@@ -856,6 +910,11 @@ fn needs_confirmation(kind: RuntimeKind, name: &SandboxName, also: &[String]) ->
             also.join("; ")
         ),
     }
+}
+
+/// `bytes` as lowercase hex: how enclos writes a SHA-256.
+pub(super) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The `sh` lines that copy staged files into the sandbox home. They run

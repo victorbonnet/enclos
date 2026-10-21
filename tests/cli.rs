@@ -905,6 +905,19 @@ fn agent_commands_need_a_runtime_and_their_dry_runs_change_nothing() {
     assert!(out.stderr().contains("no runtime yet"), "{}", out.stderr());
     let out = home.run(&["agent", "rm", "home/main", "--dry-run"]);
     assert_eq!(out.code(), 1);
+    let archive = home.root.join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let out = home.run(&[
+        "agent",
+        "add",
+        "home/main",
+        "--from",
+        archive.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("no runtime yet"), "{}", out.stderr());
+    assert!(!home.root.join("sandboxes/home/installers").exists());
     assert_eq!(home.audit_lines().len(), before);
     // Names are checked before anything else.
     for bad in [

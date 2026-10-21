@@ -64,7 +64,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 | `enclos status [<sandbox>]` | Every sandbox and agent, its size on disk, and what you could do, such as removing an unused sandbox |
 | `enclos sandbox create \| list \| show \| start \| stop \| restart \| rm` | Manage sandboxes and their background services |
 | `enclos runtime install` | Install a runtime in a sandbox |
-| `enclos agent add \| list \| rm` | Manage a sandbox's agents, including ones made inside it with the runtime's own commands |
+| `enclos agent add \| list \| rm` | Manage a sandbox's agents, including ones made inside it with the runtime's own commands, or imported from an export made on your Mac (`--from`) |
 | `enclos connect <sandbox> [-- <command>]` | Open a shell in a sandbox, or run a command there, such as the runtime's own to talk to an agent |
 | `enclos policy show \| allow \| test` | Read or widen a sandbox's policy, and run its escape probes |
 | `enclos net log \| denied` | The network log, and what was refused |
