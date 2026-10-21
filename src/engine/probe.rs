@@ -40,6 +40,24 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
+    /// Closed probes whose route Seatbelt itself closes, whatever the
+    /// compiled policy says: they show no rule enclos adds.
+    pub fn closed_by_platform(&self) -> usize {
+        self.count_closed(|r| r.closed_by_platform.is_some())
+    }
+
+    /// Closed probes that show a rule enclos adds.
+    pub fn closed_by_enclos(&self) -> usize {
+        self.count_closed(|r| r.closed_by_platform.is_none())
+    }
+
+    fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.outcome == Outcome::Closed && which(r))
+            .count()
+    }
+
     pub fn open(&self) -> usize {
         self.count(|o| matches!(o, Outcome::Open(_)))
     }
@@ -54,10 +72,11 @@ impl TestReport {
     }
 
     /// Whether the test passed: nothing got through, every probe ran, and at
-    /// least one was shown closed. An inconclusive probe does not fail it,
-    /// but a test where none was closed showed nothing.
+    /// least one was shown closed by an enclos rule. An inconclusive probe
+    /// does not fail it, but a test where none was closed, or only those
+    /// Seatbelt itself closes, showed nothing about the policy.
     pub fn passed(&self) -> bool {
-        self.open() == 0 && self.not_run() == 0 && self.closed() > 0
+        self.open() == 0 && self.not_run() == 0 && self.closed_by_enclos() > 0
     }
 }
 
@@ -102,8 +121,12 @@ impl Engine {
             return self.plan_test(name, host_services).map(Planned::DryRun);
         }
         let summary = |r: &TestReport| {
+            let platform = match r.closed_by_platform() {
+                0 => String::new(),
+                n => format!(" ({n} by Seatbelt itself)"),
+            };
             format!(
-                "{} probes: {} closed, {} open, {} inconclusive, {} not run",
+                "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run",
                 r.results.len(),
                 r.closed(),
                 r.open(),
@@ -172,21 +195,26 @@ impl Engine {
         };
         // Every stored policy was validated, so each entry expands; one that
         // does not is an error, never a path silently left out.
-        let read_deny = policy
-            .fs
-            .read_deny
-            .iter()
-            .map(|e| paths.expand(e).map(|p| real_path(&p)))
-            .collect::<std::result::Result<Vec<_>, String>>()
-            .map_err(|reason| Error::Session {
-                what: format!(
-                    "the policy of sandbox {name} has a path enclos cannot expand: {reason}"
-                ),
-            })?;
+        let expand = |entries: &[String]| {
+            entries
+                .iter()
+                .map(|e| paths.expand(e).map(|p| real_path(&p)))
+                .collect::<std::result::Result<Vec<_>, String>>()
+                .map_err(|reason| Error::Session {
+                    what: format!(
+                        "the policy of sandbox {name} has a path enclos cannot expand: {reason}"
+                    ),
+                })
+        };
+        let read_deny = expand(&policy.fs.read_deny)?;
+        let mut writes = expand(&policy.fs.write)?;
+        writes.push(real_path(&ctx.home));
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
+            sandbox_dir: self.layout.sandbox_dir(name.as_str()),
+            writes,
             other_sandboxes: self
                 .state
                 .list()?
@@ -431,6 +459,7 @@ mod tests {
                     route: "r",
                     name: "n".into(),
                     outcome,
+                    closed_by_platform: None,
                 })
                 .collect(),
             host_services: false,
@@ -457,6 +486,21 @@ mod tests {
         let unrun = report(vec![Outcome::NotRun("x".into()); 3]);
         assert!(!unrun.passed());
         assert_eq!(unrun.not_run(), 3);
+        // Seatbelt's own refusal of setuid programs shows no enclos rule.
+        let mut platform = report(vec![Outcome::Closed, Outcome::Inconclusive("x".into())]);
+        for r in &mut platform.results {
+            r.closed_by_platform = Some("Seatbelt itself");
+        }
+        assert!(!platform.passed());
+        assert_eq!(platform.closed_by_platform(), 1);
+        platform
+            .results
+            .extend(report(vec![Outcome::Closed]).results);
+        assert!(platform.passed());
+        assert_eq!(
+            (platform.closed_by_platform(), platform.closed_by_enclos()),
+            (1, 1)
+        );
         assert!(!report(vec![Outcome::Closed, Outcome::Open("x".into())]).passed());
         // Nothing closed is nothing shown.
         assert!(!report(vec![Outcome::Inconclusive("x".into()); 2]).passed());
@@ -468,7 +512,9 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: Vec::new(),
+            writes: Vec::new(),
             read_deny: Vec::new(),
             host_sockets: Vec::new(),
             target: Some(target),

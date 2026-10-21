@@ -546,6 +546,35 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     home.run(&["sandbox", "create", "home"]).ok();
     home.run(&["sandbox", "create", "lab"]).ok();
     let _stop = StopOnDrop(&home, "home");
+    // Fake sensitive files at default deny-list paths in this test's own
+    // HOME, so that the default deny list is probed wherever this runs, and
+    // a workspace grant holding deny-list entries of its own.
+    let user = home._dir.path();
+    for (path, contents) in [
+        (".ssh/id_ed25519", "not a key"),
+        (".aws/credentials", "not a credential"),
+        (".netrc", "machine example.com"),
+        (".zsh_history", "echo hi"),
+        ("Library/LaunchAgents/org.example.fake.plist", "not a plist"),
+        ("work/.secrets/token", "not a token"),
+        ("work/.env", "TOKEN=x"),
+    ] {
+        let file = user.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, contents).unwrap();
+    }
+    let policy_file = home.root.join("sandboxes/home/policy.toml");
+    let original = std::fs::read_to_string(&policy_file).unwrap();
+    let policy = original.replace(
+        "write_add = []\nread_deny_add = []",
+        "write_add = [\"~/work\"]\nread_deny_add = [\"~/work/.secrets\", \"~/work/.env\"]",
+    );
+    assert_ne!(policy, original, "the grant was not added:\n{original}");
+    std::fs::write(&policy_file, policy).unwrap();
+    // `policy allow` applies the file's other changes with `--yes`.
+    home.run(&["policy", "allow", "home", "example.com", "--yes"])
+        .ok();
+    let policy = std::fs::read_to_string(&policy_file).unwrap();
     // The host-service probes act on the host if a rule fails: only where
     // CI asks for them by name, never because some tool set `CI`.
     let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
@@ -565,6 +594,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     assert!(!report.contains("OPEN"), "{report}");
     assert!(!report.contains("NOT RUN"), "{report}");
     let mut routes = vec![
+        "sensitive files",
         "enclos files",
         "other sandboxes",
         "writes",
@@ -572,17 +602,93 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         "dns",
         "signals",
         "pasteboard",
+        "at",
     ];
     if host_services {
-        routes.extend(["launchservices", "apple events", "launchd", "preferences"]);
+        routes.extend([
+            "launchservices",
+            "apple events",
+            "launchd",
+            "preferences",
+            "launch agents",
+        ]);
     }
-    for route in routes {
-        let closed = report
+    let closed = |text: &str| {
+        report
             .lines()
-            .any(|l| l.trim_start().starts_with("closed ") && l.contains(&format!(" {route} ")));
-        assert!(closed, "no closed {route} probe:\n{report}");
+            .any(|l| l.trim_start().starts_with("closed ") && l.contains(text))
+    };
+    for route in routes {
+        assert!(
+            closed(&format!(" {route} ")),
+            "no closed {route} probe:\n{report}"
+        );
     }
+    for path in [
+        "/.ssh",
+        "/.aws",
+        "/.netrc",
+        "/.zsh_history",
+        "/Library/LaunchAgents",
+        "/work/.secrets",
+        "/work/.env",
+    ] {
+        let read = report.lines().any(|l| {
+            l.trim_start().starts_with("closed ")
+                && l.contains(" read ")
+                && l.trim_end().ends_with(path)
+        });
+        assert!(read, "reading {path} is not shown closed:\n{report}");
+    }
+    for probe in [
+        "/work/.secrets, under a write grant",
+        "/work/.env, under a write grant",
+        "write the sandbox's own policy.toml",
+        "the sandbox's own compiled folder",
+        "lab/home",
+        "/state.lock",
+    ] {
+        assert!(closed(probe), "{probe} is not shown closed:\n{report}");
+    }
+    assert!(
+        report
+            .lines()
+            .any(|l| l.trim_start().starts_with("closed ") && l.trim_end().ends_with("/run")),
+        "reading run/ is not shown closed:\n{report}"
+    );
+    if host_services {
+        let agents = "write in ~/Library/LaunchAgents";
+        assert!(closed(agents), "{agents} is not shown closed:\n{report}");
+    }
+    assert!(!report.contains("denied paths exists here"), "{report}");
+    assert!(
+        !report.contains("no ~/Library/LaunchAgents here"),
+        "{report}"
+    );
+    // Seatbelt itself refuses setuid programs: the report says so.
+    let at = report
+        .lines()
+        .find(|l| l.contains("list the `at` queue"))
+        .unwrap();
+    assert!(at.contains("Seatbelt itself refuses"), "{at}");
+    assert!(
+        report.contains("by Seatbelt itself rather than"),
+        "{report}"
+    );
     assert!(report.contains("probes were shown closed"), "{report}");
+    // `.env`, LaunchAgents and the sandbox's policy keep what the test put
+    // there; any other file a probe left would show as OPEN above.
+    assert_eq!(
+        std::fs::read_to_string(user.join("work/.env")).unwrap(),
+        "TOKEN=x"
+    );
+    assert_eq!(
+        std::fs::read_dir(user.join("Library/LaunchAgents"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(&policy_file).unwrap(), policy);
     let audit = home.run(&["audit"]).ok().stdout();
     assert!(
         audit.contains("policy test") && audit.contains(" 0 open,") && audit.contains(" 0 not run"),
