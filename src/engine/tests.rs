@@ -2480,17 +2480,21 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 }
 
 mod services {
+    use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::Duration;
 
     use super::*;
+    use crate::audit::{AuditError, AuditTicket};
     use crate::engine::service::Unit;
+    use crate::model::audit::{AuditEntry, AuditFilter, Intent, VerifyReport};
     use crate::model::runtime::RuntimeKind;
     use crate::model::sandbox::SandboxState;
     use crate::model::session::SessionKind;
     use crate::runtime::ServiceName;
     use crate::service::fake::FakeServices;
     use crate::service::{ServiceLabel, ServiceStatus};
+    use crate::state::{StateError, StateLock};
 
     const GATEWAY: ServiceName = ServiceName::new("gateway");
 
@@ -2664,12 +2668,13 @@ mod services {
         assert!(left.contains("would not stop"), "{left}");
     }
 
-    /// The command, result and message of each audit entry after the first
-    /// `from`.
+    /// The command, result and message of each audit entry from index
+    /// `from` on; panics on an entry left open or about another target.
     fn entries_after(engine: &Engine, from: usize) -> Vec<(String, AuditResult, String)> {
         engine.audit(None).unwrap()[from..]
             .iter()
             .map(|e| {
+                assert_eq!(e.intent.target.as_deref(), Some("home"), "{e:?}");
                 let outcome = &e.finished.as_ref().expect("a closed entry").outcome;
                 (
                     e.intent.command.clone(),
@@ -2678,6 +2683,128 @@ mod services {
                 )
             })
             .collect()
+    }
+
+    /// The audit log, except that entries of the commands listed in
+    /// `refused` cannot be opened, as when the disk is full.
+    struct RefusingAudit {
+        inner: JsonlAuditLog,
+        refused: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl AuditLog for RefusingAudit {
+        fn begin<'l>(
+            &self,
+            lock: &'l StateLock,
+            intent: Intent,
+        ) -> crate::audit::Result<AuditTicket<'l>> {
+            if self.refused.borrow().contains(&intent.command.as_str()) {
+                return Err(AuditError::Io {
+                    path: "audit.jsonl".into(),
+                    source: std::io::Error::other("disk full"),
+                });
+            }
+            self.inner.begin(lock, intent)
+        }
+
+        fn finish(&self, ticket: AuditTicket<'_>, outcome: Outcome) -> crate::audit::Result<()> {
+            self.inner.finish(ticket, outcome)
+        }
+
+        fn entries(&self, filter: &AuditFilter) -> crate::audit::Result<Vec<AuditEntry>> {
+            self.inner.entries(filter)
+        }
+
+        fn verify(&self) -> crate::audit::Result<VerifyReport> {
+            self.inner.verify()
+        }
+    }
+
+    /// Gives the engine an audit log that refuses the commands in the list
+    /// returned, empty at first.
+    fn refusing_audit(engine: &mut Engine) -> Rc<RefCell<Vec<&'static str>>> {
+        let refused = Rc::default();
+        engine.audit = Box::new(RefusingAudit {
+            inner: JsonlAuditLog::new(engine.layout.audit_log()),
+            refused: Rc::clone(&refused),
+        });
+        refused
+    }
+
+    #[test]
+    fn a_restart_and_a_stop_record_their_removals_in_order() {
+        let (_dir, engine, _fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let [proxy, gateway] =
+            [Unit::Proxy, Unit::Runtime(GATEWAY)].map(|u| engine.label(&name, u).unwrap());
+        engine.start_sandbox(&alice(), &name).unwrap();
+
+        let from = engine.audit(None).unwrap().len();
+        engine.start_sandbox(&alice(), &name).unwrap();
+        assert_eq!(
+            entries_after(&engine, from),
+            [
+                (
+                    "services remove".to_owned(),
+                    AuditResult::Ok,
+                    format!("removing {gateway}, {proxy} before sandbox start")
+                ),
+                (
+                    "services removed".to_owned(),
+                    AuditResult::Ok,
+                    format!("removed {gateway}, {proxy}")
+                ),
+                (
+                    "sandbox start".to_owned(),
+                    AuditResult::Ok,
+                    format!("{proxy}, {gateway}")
+                ),
+            ]
+        );
+
+        let from = engine.audit(None).unwrap().len();
+        done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+        assert_eq!(
+            entries_after(&engine, from),
+            [
+                (
+                    "services remove".to_owned(),
+                    AuditResult::Ok,
+                    format!("removing {gateway}, {proxy} for sandbox stop")
+                ),
+                (
+                    "services removed".to_owned(),
+                    AuditResult::Ok,
+                    format!("removed {gateway}, {proxy}")
+                ),
+                (
+                    "sandbox stop".to_owned(),
+                    AuditResult::Ok,
+                    "removed 2 services, stopped 0 sessions".to_owned()
+                ),
+            ]
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
+    #[test]
+    fn a_stop_or_start_whose_first_entry_cannot_be_written_removes_nothing() {
+        let (_dir, mut engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let from = engine.audit(None).unwrap().len();
+        refusing_audit(&mut engine)
+            .borrow_mut()
+            .push("services remove");
+
+        let err = engine
+            .stop_sandbox(&alice(), &name, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::Audit(_)), "{err:?}");
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(matches!(err, Error::Audit(_)), "{err:?}");
+        assert_eq!(fake.started.borrow().len(), 2);
+        assert!(fake.stopped.borrow().is_empty());
+        assert_eq!(state_of(&engine, &name), SandboxState::Running);
+        assert_eq!(entries_after(&engine, from), []);
     }
 
     #[test]
@@ -2692,6 +2819,7 @@ mod services {
         let err = engine
             .stop_sandbox(&alice(), &name, Confirm::Yes)
             .unwrap_err();
+        assert!(matches!(err, Error::Service(_)), "{err:?}");
         assert!(err.to_string().contains("would not stop"), "{err}");
         assert_eq!(
             entries_after(&engine, from),
@@ -2709,6 +2837,41 @@ mod services {
                     )
                 ),
             ]
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
+    #[test]
+    fn a_removal_that_fails_and_cannot_be_recorded_says_both() {
+        let (_dir, mut engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let [proxy, gateway] =
+            [Unit::Proxy, Unit::Runtime(GATEWAY)].map(|u| engine.label(&name, u).unwrap());
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let from = engine.audit(None).unwrap().len();
+        refusing_audit(&mut engine)
+            .borrow_mut()
+            .push("services removed");
+
+        *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
+        let err = engine
+            .stop_sandbox(&alice(), &name, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unrecorded { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "would not stop {proxy}, but the audit log could not record it: "
+            )),
+            "{text}"
+        );
+        assert!(text.contains("disk full"), "{text}");
+        assert_eq!(
+            entries_after(&engine, from),
+            [(
+                "services remove".to_owned(),
+                AuditResult::Ok,
+                format!("removing {gateway}, {proxy} for sandbox stop")
+            )]
         );
         assert!(engine.verify_audit().unwrap().intact());
     }
@@ -2746,17 +2909,82 @@ mod services {
         let from = engine.audit(None).unwrap().len();
         *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
         engine.start_sandbox(&alice(), &name).unwrap_err();
-        let last = entries_after(&engine, from).pop().unwrap();
+        let entries = entries_after(&engine, from);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].0, "sandbox start");
+        assert_eq!(entries[0].1, AuditResult::Failed);
         assert_eq!(
-            last,
+            entries[1..],
+            [
+                (
+                    "services remove".to_owned(),
+                    AuditResult::Ok,
+                    format!("removing {proxy} after a failed sandbox start")
+                ),
+                (
+                    "services removed".to_owned(),
+                    AuditResult::Failed,
+                    format!(
+                        "removed none; could not remove {proxy}: would not stop {proxy}; still installed: {proxy}"
+                    )
+                ),
+            ]
+        );
+        assert!(engine.verify_audit().unwrap().intact());
+    }
+
+    #[test]
+    fn a_failed_start_removes_what_it_installed_even_when_that_cannot_be_recorded() {
+        let (_dir, mut engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let proxy = engine.label(&name, Unit::Proxy).unwrap();
+        let refused = refusing_audit(&mut engine);
+        *fake.refuse.borrow_mut() = Some(".gateway".to_owned());
+
+        // Without its first entry, the second records the whole removal.
+        refused.borrow_mut().push("services remove");
+        let from = engine.audit(None).unwrap().len();
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(matches!(err, Error::Service(_)), "{err:?}");
+        assert!(
+            fake.started.borrow().is_empty(),
+            "the proxy stayed installed"
+        );
+        let entries = entries_after(&engine, from);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].0, "sandbox start");
+        assert_eq!(entries[0].1, AuditResult::Failed);
+        assert_eq!(
+            entries[1],
             (
                 "services removed".to_owned(),
-                AuditResult::Failed,
-                format!(
-                    "removed none; could not remove {proxy}: would not stop {proxy}; still installed: {proxy}"
-                )
+                AuditResult::Ok,
+                format!("removed {proxy}")
             )
         );
+
+        // Without either, the error says the cleanup worked.
+        refused.borrow_mut().push("services removed");
+        let from = engine.audit(None).unwrap().len();
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        let Error::CleanupUnrecorded { error, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(matches!(**error, Error::Service(_)), "{error:?}");
+        assert!(
+            fake.started.borrow().is_empty(),
+            "the proxy stayed installed"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "; cleaning up after it removed {proxy}, but the audit log could not record that: "
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("failed too"), "{text}");
+        let entries = entries_after(&engine, from);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, "sandbox start");
         assert!(engine.verify_audit().unwrap().intact());
     }
 
@@ -2771,7 +2999,7 @@ mod services {
         // Another command takes the lock while the services are removed,
         // and keeps it past the wait.
         let other = SqliteStateStore::new(engine.layout.state_db(), engine.layout.state_lock());
-        let held = Rc::new(std::cell::RefCell::new(None));
+        let held = Rc::new(RefCell::new(None));
         let holder = Rc::clone(&held);
         *fake.on_stop.borrow_mut() = Some(Box::new(move |_: &ServiceLabel| {
             if holder.borrow().is_none() {
@@ -2781,12 +3009,19 @@ mod services {
         let err = engine
             .stop_sandbox(&alice(), &name, Confirm::Yes)
             .unwrap_err();
+        // Every service is gone; only the record of it is missing.
+        let Error::Unrecorded { what, audit } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*what, format!("removed {gateway}, {proxy}"));
         assert!(
-            matches!(err, Error::State(crate::state::StateError::Locked { .. })),
-            "{err:?}"
+            matches!(**audit, Error::State(StateError::Locked { .. })),
+            "{audit:?}"
         );
         assert!(fake.started.borrow().is_empty());
         held.borrow_mut().take();
+        // `sandbox stop` never ran, so the record still says running.
+        assert_eq!(state_of(&engine, &name), SandboxState::Running);
 
         assert_eq!(
             entries_after(&engine, from),

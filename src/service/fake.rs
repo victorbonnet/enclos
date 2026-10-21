@@ -13,12 +13,11 @@ pub struct FakeServices {
     pub refuse: RefCell<Option<String>>,
     /// Stops of labels ending with this fail.
     pub refuse_stop: RefCell<Option<String>>,
-    /// Called after each stop that worked, as if something else happened
-    /// meanwhile.
+    /// Runs after each stop that worked, given its label, for a test to act
+    /// in between.
     pub on_stop: RefCell<Option<Meanwhile>>,
 }
 
-/// What a test has happen meanwhile, given the label just stopped.
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
 
 impl FakeServices {

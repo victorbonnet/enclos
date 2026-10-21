@@ -1,8 +1,9 @@
 //! The engine: the API every client calls, and the only place components
 //! meet (design §9). Reads are not audited. Every write takes the state lock,
 //! opens an audit entry, does the work and closes the entry, also on failure.
-//! Removing a sandbox's services is the one change made outside the lock,
-//! with an entry before it and one after (`remove_services`).
+//! Removing a sandbox's services is done outside the lock, which a runtime
+//! service told to end needs, and is audited before and after instead
+//! (`remove_services`).
 
 mod compile;
 mod import;
@@ -215,9 +216,11 @@ impl Engine {
             .map(|b| b.kind())
     }
 
-    /// Records a closed audit entry for a change made outside the lock,
-    /// such as removing a sandbox's services, which a runtime service told
-    /// to end needs the lock for. Takes the lock only to write the entry.
+    /// Writes one closed audit entry, taking the lock only for the write,
+    /// for a change made outside the lock (removing a sandbox's services,
+    /// since a runtime service told to end needs the lock to record its
+    /// end). The entry may come before or after the change. Not built on
+    /// `write`, whose entry fails only when its work does.
     fn note(
         &self,
         by: &Actor,
