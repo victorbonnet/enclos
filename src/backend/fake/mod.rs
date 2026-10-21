@@ -10,6 +10,10 @@ use super::{
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 
+/// The variable that tells a program the fake runs whether it was launched
+/// in enclos's terminal (`Launch::in_terminal`): `true` or `false`.
+pub const IN_TERMINAL: &str = "ENCLOS_FAKE_IN_TERMINAL";
+
 pub struct FakeBackend {
     kind: BackendKind,
     probe: Probe,
@@ -71,7 +75,9 @@ impl Backend for FakeBackend {
 
     /// Runs the program as it is, outside any sandbox, but with the
     /// sandbox's environment (its home, PATH and TMPDIR), so that a test's
-    /// program never touches the developer's own home.
+    /// program never touches the developer's own home. It also gets
+    /// [`IN_TERMINAL`], so a test sees whether the program was to run in
+    /// enclos's terminal.
     fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
@@ -82,6 +88,7 @@ impl Backend for FakeBackend {
         for (name, value) in &launch.env {
             command.env(name, value);
         }
+        command.env(IN_TERMINAL, launch.in_terminal.to_string());
         command.current_dir(&ctx.home);
         command
     }

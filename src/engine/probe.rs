@@ -1,6 +1,9 @@
 //! `enclos policy test`: runs the escape probes inside a sandbox and checks
 //! from the host what they managed to do (design §5, ADR 0016).
 
+use std::ffi::OsString;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -108,6 +111,35 @@ impl Drop for Target {
     }
 }
 
+/// The terminal the terminal probes try to open: opened by this command,
+/// as a terminal app opens one for each tab, and closed when the test ends.
+struct OtherTerminal {
+    _main: OwnedFd,
+    path: PathBuf,
+}
+
+impl OtherTerminal {
+    fn open() -> Result<OtherTerminal> {
+        OtherTerminal::open_pty().map_err(|e| Error::Session {
+            what: format!(
+                "cannot open a terminal for the terminal probes: {e}. If many terminal tabs are open, close some and run `enclos policy test` again"
+            ),
+        })
+    }
+
+    fn open_pty() -> rustix::io::Result<OtherTerminal> {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let main = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        grantpt(&main)?;
+        unlockpt(&main)?;
+        let name = ptsname(&main, Vec::new())?;
+        Ok(OtherTerminal {
+            _main: main,
+            path: PathBuf::from(OsString::from_vec(name.into_bytes())),
+        })
+    }
+}
+
 impl Engine {
     /// Runs every probe in the sandbox under its active policy.
     pub fn policy_test(
@@ -150,7 +182,9 @@ impl Engine {
             let backend = self.backend_of(name)?;
 
             let mut target = Target::start()?;
-            let inputs = self.probe_inputs(name, &ctx, Some(target.0.id()))?;
+            let terminal = OtherTerminal::open()?;
+            let inputs =
+                self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
             let mut list = probes(&inputs);
             if host_services {
                 list.extend(host_service_probes(&inputs));
@@ -162,6 +196,9 @@ impl Engine {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), script.into()],
                         env: Vec::new(),
+                        // The probes are enclos's own scripts: they get no
+                        // more than a service does.
+                        in_terminal: false,
                     };
                     backend
                         .wrap(&compiled, &ctx, &launch)
@@ -182,12 +219,14 @@ impl Engine {
     }
 
     /// What the probes are built from. `target` is the process the signal
-    /// probe aims at.
+    /// probe aims at, and `other_terminal` the terminal the terminal probes
+    /// try to open.
     pub(super) fn probe_inputs(
         &self,
         name: &SandboxName,
         ctx: &SandboxContext,
         target: Option<u32>,
+        other_terminal: Option<PathBuf>,
     ) -> Result<ProbeInputs> {
         let policy = self.policy(name)?.snapshot.policy;
         let paths = PathContext {
@@ -229,6 +268,7 @@ impl Engine {
             unmovable,
             host_sockets: host_sockets(&ctx.user_home),
             target,
+            other_terminal,
             tag: std::process::id(),
         })
     }
@@ -240,9 +280,10 @@ impl Engine {
         })?;
         let version = self.policy(name)?.version.version;
         let ctx = self.sandbox_context(name, record.proxy_port);
-        let inputs = self.probe_inputs(name, &ctx, None)?;
-        // The signal probe needs its target, which a dry run does not start.
-        let mut count = probes(&inputs).len() + 1;
+        // A dry run starts no target and opens no terminal: placeholders
+        // stand for them, only to count the probes that use them.
+        let inputs = self.probe_inputs(name, &ctx, Some(0), Some(PathBuf::from("/dev/ttys0")))?;
+        let mut count = probes(&inputs).len();
         if host_services {
             count += host_service_probes(&inputs).len();
         }
@@ -525,6 +566,7 @@ mod tests {
             unmovable: Vec::new(),
             host_sockets: Vec::new(),
             target: Some(target),
+            other_terminal: None,
             tag: 7,
         }
     }

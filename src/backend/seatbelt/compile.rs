@@ -1,5 +1,6 @@
 //! Compiling a policy for Seatbelt (design §5): `(allow default)`,
-//! then writes only where granted, reads of the sandbox home, the sensitive
+//! then writes only where granted, no terminal device but the session's own
+//! and those the sandbox opens, reads of the sandbox home, the sensitive
 //! deny list for reads and writes (after those allows, so no grant covers
 //! it), the writable folders that cannot move (so no rename or clone carries
 //! a denied path elsewhere), network only to the sandbox's proxy port, the
@@ -21,7 +22,8 @@ use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
 const HOST_SERVICES: &str = include_str!("host-services.sb");
 
 /// Device files every runtime writes to (shown by the prototype: shells,
-/// Python, Node and Hermes).
+/// Python, Node and Hermes). `/dev/tty` is the terminal a session runs in,
+/// whatever its name; terminal devices by name are in [`TERMINALS`].
 const DEVICES: &[&str] = &[
     "(literal \"/dev/null\")",
     "(literal \"/dev/zero\")",
@@ -30,9 +32,21 @@ const DEVICES: &[&str] = &[
     "(literal \"/dev/tty\")",
     "(literal \"/dev/ptmx\")",
     "(literal \"/dev/dtracehelper\")",
-    "(regex #\"^/dev/ttys[0-9]+$\")",
     "(regex #\"^/dev/fd/[0-9]+$\")",
 ];
+
+/// Every terminal device: one per terminal tab or window, the user's other
+/// sessions included. `wrap` checks a name it passes against the same form.
+const TERMINALS: &str = "(regex #\"^/dev/ttys[0-9]+$\")";
+
+/// The `sandbox-exec` parameter that names the terminal a session runs in,
+/// set by `wrap`. Unset, as for a service, no terminal opens by name but
+/// those the sandbox opens itself.
+pub const TERMINAL_PARAM: &str = "ENCLOS_TERMINAL";
+
+/// What macOS grants a process for a pseudo-terminal it opens through
+/// `/dev/ptmx`, which Apple's own `application.sb` allows the same way.
+const PTY_EXTENSION: &str = "com.apple.sandbox.pty";
 
 /// The tag a sandbox's denials carry in the unified log.
 pub fn tag(ctx: &SandboxContext) -> String {
@@ -72,6 +86,24 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     }
     allowed.extend(DEVICES.iter().map(|d| d.to_string()));
     line(format!("(allow file-write*\n  {})", allowed.join("\n  ")));
+
+    line("\n;; ---- Terminals: the session's own and those the sandbox opens, no other".into());
+    line(format!(
+        "(deny file-read* file-write* (with message \"{tag}\") {TERMINALS})"
+    ));
+    // Under `(allow default)` a sandbox may issue extensions (Apple's
+    // `application.sb` starts from `(deny default)`, which refuses them):
+    // without this rule it could grant itself this one for another terminal.
+    // A backend test shows both.
+    line(format!(
+        "(deny file-issue-extension (with message \"{tag}\") (extension-class \"{PTY_EXTENSION}\"))"
+    ));
+    line(format!(
+        "(allow file-read* file-write* (require-all {TERMINALS} (extension \"{PTY_EXTENSION}\")))"
+    ));
+    line(format!(
+        "(if (param \"{TERMINAL_PARAM}\")\n  (allow file-read* file-write* (require-all {TERMINALS} (literal (param \"{TERMINAL_PARAM}\")))))"
+    ));
 
     line(format!("(allow file-read* {})", subpath(home)?));
 
@@ -309,8 +341,12 @@ mod tests {
         p.fs.read_deny.push("{home}/private".into());
         p.fs.read_deny.push("~".into());
         let text = compile(&p, &ctx(base)).unwrap().text;
-        let hidden = text
+        let sensitive = text
+            .find(";; ---- Sensitive paths")
+            .unwrap_or_else(|| panic!("no sensitive paths:\n{text}"));
+        let hidden = text[sensitive..]
             .find("(deny file-read* file-write*")
+            .map(|at| sensitive + at)
             .unwrap_or_else(|| panic!("no hidden paths:\n{text}"));
         // Later rules win: no allow for files may follow the hidden paths.
         let last_allow = ["(allow file-write*", "(allow file-read*"]
@@ -401,6 +437,49 @@ mod tests {
             rule < text.find(";; ---- enclos's own files").unwrap(),
             "{text}"
         );
+    }
+
+    #[test]
+    fn terminal_devices_are_open_only_for_the_session_and_ptys_the_sandbox_makes() {
+        let text = compile(&policy(), &ctx(Path::new("/x"))).unwrap().text;
+        // No rule allows every terminal device: each allow narrows it.
+        let ttys = "(regex #\"^/dev/ttys[0-9]+$\")";
+        let allowed = text
+            .lines()
+            .filter(|l| l.contains(ttys) && l.contains("(allow "))
+            .collect::<Vec<_>>();
+        assert_eq!(allowed.len(), 2, "{text}");
+        assert!(
+            allowed
+                .iter()
+                .all(|l| l.contains(&format!("(require-all {ttys} "))),
+            "{text}"
+        );
+        assert!(!text.contains(&format!("\n  {ttys}")), "{text}");
+        let terminals = text
+            .find(";; ---- Terminals")
+            .unwrap_or_else(|| panic!("no terminals section:\n{text}"));
+        let deny = text
+            .find(&format!(
+                "(deny file-read* file-write* (with message \"enclos:home\") {ttys})"
+            ))
+            .unwrap_or_else(|| panic!("no terminal deny:\n{text}"));
+        assert!(deny > terminals, "{text}");
+        assert!(text.contains(
+            "(deny file-issue-extension (with message \"enclos:home\") (extension-class \"com.apple.sandbox.pty\"))"
+        ), "{text}");
+        assert!(
+            text.contains(&format!(
+                "(require-all {ttys} (extension \"com.apple.sandbox.pty\"))"
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&format!(
+            "(if (param \"ENCLOS_TERMINAL\")\n  (allow file-read* file-write* (require-all {ttys} (literal (param \"ENCLOS_TERMINAL\")))))"
+        )), "{text}");
+        // The allows come after the deny, so they win for what they match.
+        let first_allow = text.find(&format!("(require-all {ttys} ")).unwrap();
+        assert!(first_allow > deny, "{text}");
     }
 
     #[test]

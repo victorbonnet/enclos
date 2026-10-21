@@ -102,6 +102,7 @@ impl World {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             env: vec![],
+            in_terminal: false,
         };
         let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -115,6 +116,7 @@ impl World {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             env: vec![],
+            in_terminal: false,
         };
         let out = Seatbelt
             .wrap(&self.compiled, &self.ctx, &launch)
@@ -397,6 +399,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         workspaces: w.fs.writes.clone(),
         unmovable: w.fs.unmovable(),
         host_sockets: Vec::new(),
+        other_terminal: None,
         target: None,
         tag: 7,
     };
@@ -413,6 +416,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), sandboxed_script(&p).into()],
                 env: vec![],
+                in_terminal: false,
             };
             let (ok, stdout, stderr) = output(Seatbelt.wrap(compiled, &w.ctx, &launch));
             let Proof::Control { control, .. } = &p.proof else {
@@ -547,6 +551,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         workspaces: vec![w.base.join("alice/work"), w.base.join("alice/empty")],
         unmovable: Vec::new(),
         host_sockets: Vec::new(),
+        other_terminal: None,
         target: None,
         tag: 7,
     };
@@ -617,6 +622,140 @@ fn the_sandbox_cannot_type_into_its_terminal() {
     let out = String::from_utf8_lossy(&out.stdout);
     assert!(out.contains("REFUSED"), "{out}");
     assert!(!out.contains("INJECTED"), "{out}");
+}
+
+/// A pseudo-terminal this test opens, as a terminal app does for each tab:
+/// its primary (master) side, kept open while the test runs, and its
+/// device's name.
+pub(super) fn terminal() -> (std::os::fd::OwnedFd, PathBuf) {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let main = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    grantpt(&main).unwrap();
+    unlockpt(&main).unwrap();
+    let name = ptsname(&main, Vec::new()).unwrap();
+    (main, PathBuf::from(name.into_string().unwrap()))
+}
+
+#[test]
+fn the_sandbox_opens_no_terminal_but_its_own() {
+    let w = world();
+    let (_mine, mine) = terminal();
+    let (_other, other) = terminal();
+    // Opening it to read, then to write.
+    let opens = |t: &Path| {
+        let t = t.display();
+        (format!(": < '{t}'"), format!(": >> '{t}'"))
+    };
+    let (read_mine, write_mine) = opens(&mine);
+    let (read, write) = opens(&other);
+    // Each works outside the sandbox.
+    for script in [&read_mine, &write_mine, &read, &write] {
+        let host = Command::new("/bin/sh").args(["-c", script]).status();
+        assert!(host.unwrap().success(), "{script}");
+    }
+    let run = |terminal: Option<&Path>, script: &str| {
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+            in_terminal: false,
+        };
+        super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    // Without a terminal, as a service runs: no terminal opens by name.
+    for script in [&read_mine, &write_mine, &read, &write] {
+        assert!(!run(None, script), "{script}");
+    }
+    // A session in `mine` opens it by name, and still no other.
+    assert!(run(Some(&mine), &read_mine));
+    assert!(run(Some(&mine), &write_mine));
+    assert!(!run(Some(&mine), &read));
+    assert!(!run(Some(&mine), &write));
+    // Only a terminal device opens by name: naming another file grants
+    // nothing.
+    let file = w.base.join("alice/readable.txt");
+    let append = format!("echo x >> '{}'", file.display());
+    assert!(!run(Some(&file), &append));
+    assert!(run(None, "echo x > /dev/null && : < /dev/null"));
+}
+
+#[test]
+fn the_sandbox_cannot_grant_itself_another_terminal() {
+    let w = world();
+    let (_other, other) = terminal();
+    // Asks macOS for the pty extension for `other`, through JavaScript for
+    // Automation (so enclos needs no code of its own for it), then opens it.
+    let issue = "ObjC.bindFunction('sandbox_extension_issue_file', ['char *', ['char *', 'char *', 'int']]);
+        ObjC.bindFunction('sandbox_extension_consume', ['long long', ['char *']]);
+        function run(argv) {
+            try { $.sandbox_extension_consume($.sandbox_extension_issue_file('com.apple.sandbox.pty', argv[0], 0)) } catch (e) {}
+        }";
+    let script = r#"/usr/bin/osascript -l JavaScript -e "$1" "$2" >/dev/null 2>&1; : < "$2""#;
+    let run = |compiled: &Path| {
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                issue.into(),
+                other.clone().into(),
+            ],
+            env: vec![],
+            in_terminal: false,
+        };
+        super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    // The control: without the rule that refuses it, the extension opens
+    // `other`, so the route exists and this test can see it closed.
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let without: String = text
+        .lines()
+        .filter(|l| !l.starts_with("(deny file-issue-extension"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(without.len() < text.len(), "no rule to remove");
+    let open = w.base.join("without-the-rule.sb");
+    std::fs::write(&open, without).unwrap();
+    assert!(run(&open), "the route is gone: nothing to test");
+    assert!(!run(&w.compiled));
+}
+
+#[test]
+fn a_session_keeps_its_terminal_and_the_terminals_it_opens() {
+    let w = world();
+    // `script` gives the session a terminal of its own, named to the policy
+    // as `wrap` names the one enclos runs in.
+    let session = r#"exec /usr/bin/sandbox-exec -D "ENCLOS_TERMINAL=$(/usr/bin/tty)" -f "$0" /bin/sh -c "$1""#;
+    let inside = [
+        "echo via-tty > /dev/tty",
+        "t=$(/usr/bin/tty) && : < \"$t\" && : >> \"$t\" && echo own-by-name",
+        // A terminal the sandbox opens itself, as tmux or an agent's shell tool does.
+        "/usr/bin/script -q /dev/null /bin/echo in-a-new-terminal",
+    ]
+    .join("; ");
+    let out = Command::new("/usr/bin/script")
+        .args(["-q", "/dev/null", "/bin/sh", "-c", session])
+        .arg(&w.compiled)
+        .arg(&inside)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    for expected in ["via-tty", "own-by-name", "in-a-new-terminal"] {
+        assert!(out.contains(expected), "{expected}: {out}");
+    }
 }
 
 fn staged_wrapper(w: &World) -> (PathBuf, HomeFile) {

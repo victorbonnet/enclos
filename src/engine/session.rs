@@ -154,6 +154,7 @@ impl Engine {
             program: program.clone(),
             args: args.to_vec(),
             env: Vec::new(),
+            in_terminal: true,
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         // TMPDIR inside the sandbox (the policy denies /tmp).

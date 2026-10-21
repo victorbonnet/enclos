@@ -213,6 +213,10 @@ pub struct ProbeInputs {
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
+    /// A terminal the host opened for the terminal probe, as a terminal app
+    /// opens one for each tab; none on a dry run, and then there is no
+    /// terminal probe.
+    pub other_terminal: Option<PathBuf>,
     /// Makes names of things a probe might create unique.
     pub tag: u32,
 }
@@ -241,6 +245,9 @@ fn probe(
         closed_by_platform: None,
     }
 }
+
+/// What a shell prints when Seatbelt refuses to open a file.
+const REFUSED: &str = "Operation not permitted";
 
 /// A probe whose control is the same script, run on the host: it only reads
 /// or connects, and its output is discarded.
@@ -603,6 +610,30 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         signal.host = Some(HostCheck::Target);
         list.push(signal);
     }
+    if let Some(terminal) = &i.other_terminal {
+        // Opened to read, as reading another tab's keystrokes would, then to
+        // write, as writing into it would: either open is the route. Outside
+        // too, where it only opens it, and writes nothing.
+        let t = sh_quote(terminal);
+        for (name, open) in [
+            (
+                "open a terminal that is not the session's, to read",
+                format!(": < {t}"),
+            ),
+            (
+                "open a terminal that is not the session's, to write",
+                format!(": >> {t}"),
+            ),
+        ] {
+            list.push(probe(
+                "terminals",
+                name,
+                open.clone(),
+                Expect::FailsWith(REFUSED),
+                open,
+            ));
+        }
+    }
     let keychain = i.user_home.join("Library/Keychains/login.keychain-db");
     if keychain.exists() {
         // Its settings (lock timeout), not its items.
@@ -913,6 +944,7 @@ mod tests {
             unmovable: vec![dir.join("it's here"), dir.join("not-a-folder")],
             host_sockets: vec![dir.join("agent.sock")],
             target: Some(4242),
+            other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
         }
     }
@@ -955,6 +987,7 @@ mod tests {
         for route in [
             "network",
             "signals",
+            "terminals",
             "writes",
             "other sandboxes",
             "pasteboard",
@@ -1481,6 +1514,29 @@ mod tests {
             proven(proxy, ran(false, "000")),
             Outcome::NotRun(_)
         ));
+    }
+
+    #[test]
+    fn a_terminal_is_probed_for_reading_and_writing_apart_and_closed_only_on_the_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = probes(&inputs(dir.path()));
+        let terminals: Vec<_> = list.iter().filter(|p| p.route == "terminals").collect();
+        let scripts: Vec<_> = terminals.iter().map(|p| p.script.as_str()).collect();
+        assert_eq!(scripts, [": < '/dev/ttys042'", ": >> '/dev/ttys042'"]);
+        let refused = "/bin/sh: /dev/ttys042: Operation not permitted";
+        for p in terminals {
+            assert_eq!(proven(p, ran(false, refused)), Outcome::Closed);
+            let busy = "/bin/sh: /dev/ttys042: Resource busy";
+            assert!(matches!(
+                proven(p, ran(false, busy)),
+                Outcome::Inconclusive(_)
+            ));
+            assert!(matches!(proven(p, ran(true, "")), Outcome::Open(_)));
+        }
+        // A dry run opens no terminal, so there is no such probe.
+        let mut none = inputs(dir.path());
+        none.other_terminal = None;
+        assert!(probes(&none).iter().all(|p| p.route != "terminals"));
     }
 
     #[test]
