@@ -1183,7 +1183,7 @@ echo \"installed $*\" > \"$HOME/installed\"
             let proxy = dir.path().join("proxy.sh");
             std::fs::write(
                 &proxy,
-                "#!/bin/sh\nexec /usr/bin/nc -lk 127.0.0.1 \"${5#*:}\"\n",
+                "#!/bin/sh\necho \"fake proxy on $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"${5#*:}\"\n",
             )
             .unwrap();
             std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1354,6 +1354,18 @@ echo \"installed $*\" > \"$HOME/installed\"
             lab.summary("runtime install failed"),
             "the installer exited with 3; hermes still recorded as installed, under policy v2"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_proxy_a_session_started_writes_where_enclos_logs_reads() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        done(lab.install("#!/bin/sh\nexit 3\n", Confirm::Yes).unwrap());
+        let files = lab.engine.log_files(&lab.name).unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(text.contains("fake proxy on 127.0.0.1:"), "{text}");
     }
 
     #[cfg(target_os = "macos")]
@@ -3390,6 +3402,52 @@ mod status {
         );
         let later = now.checked_add(jiff::SignedDuration::from_secs(1)).unwrap();
         let status = engine.sandbox_status(record, Some(&Bare), later).unwrap();
+        assert_eq!(status.refused_recently, 0);
+    }
+
+    #[test]
+    fn a_refusal_because_the_policy_was_unreadable_is_not_a_destination_to_review() {
+        use crate::model::net::Reason;
+        let (_dir, engine, name) = with_runtime();
+        let record = engine.state.get(&name).unwrap().unwrap();
+        let now = record.created_at.checked_add(days(1)).unwrap();
+        let mut event = net_event(&name, now, true);
+        event.reason = Some(Reason::PolicyUnreadable);
+        engine.state.record(&event).unwrap();
+        // `net denied` still lists it, with its reason.
+        let denied = engine.net_denied(&name).unwrap();
+        assert_eq!(denied.len(), 1, "{denied:?}");
+        assert_eq!(denied[0].reason, Reason::PolicyUnreadable);
+        let status = engine
+            .sandbox_status(record.clone(), Some(&Bare), now)
+            .unwrap();
+        assert_eq!(status.refused_recently, 0);
+        assert_eq!(status.policy_unreadable_at, Some(now));
+        // Not a destination to review, but a proxy to look at.
+        let s = suggest(std::slice::from_ref(&status), now);
+        let listed = commands(&s);
+        assert!(!listed.contains(&"enclos net denied home".into()), "{s:?}");
+        assert!(listed.contains(&"enclos logs home".into()), "{s:?}");
+
+        // A real refusal beside it is still one to review.
+        let mut other = net_event(&name, now, true);
+        other.host = "evil.example.com".into();
+        engine.state.record(&other).unwrap();
+        let status = engine
+            .sandbox_status(record.clone(), Some(&Bare), now)
+            .unwrap();
+        assert_eq!(status.refused_recently, 1);
+        let listed = commands(&suggest(std::slice::from_ref(&status), now));
+        assert!(
+            listed.contains(&"enclos net denied home".into()),
+            "{listed:?}"
+        );
+        assert!(listed.contains(&"enclos logs home".into()), "{listed:?}");
+
+        // After 7 days, neither is suggested.
+        let later = now.checked_add(days(8)).unwrap();
+        let status = engine.sandbox_status(record, Some(&Bare), later).unwrap();
+        assert_eq!(status.policy_unreadable_at, None);
         assert_eq!(status.refused_recently, 0);
     }
 

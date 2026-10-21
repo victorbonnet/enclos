@@ -129,6 +129,12 @@ impl Engine {
         self.logs_dir(name).join(format!("{}.log", unit.as_str()))
     }
 
+    /// The proxy's log, whether the service manager or a session started
+    /// it, so that `enclos logs` shows it either way.
+    pub(super) fn proxy_log(&self, name: &SandboxName) -> PathBuf {
+        self.log_file(name, Unit::Proxy)
+    }
+
     fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
         self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),

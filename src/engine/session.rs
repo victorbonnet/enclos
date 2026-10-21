@@ -490,10 +490,11 @@ impl Engine {
             .exe
             .clone()
             .ok_or_else(|| failed("cannot find the enclos program to start the proxy".into()))?;
-        let log_path = self
-            .layout
-            .sandbox_dir(record.name.as_str())
-            .join("proxy.log");
+        let log_path = self.proxy_log(&record.name);
+        if let Some(dir) = log_path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| failed(format!("cannot create {}: {e}", dir.display())))?;
+        }
         let log = OpenOptions::new()
             .create(true)
             .append(true)

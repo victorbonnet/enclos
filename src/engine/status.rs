@@ -24,6 +24,7 @@ use super::sandbox::needs_restart;
 use crate::error::{Error, Result};
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
+use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -127,8 +128,12 @@ pub struct SandboxStatus {
     /// The latest of: its creation, a `connect` or service session starting
     /// or ending, and a connection tried. The proxy alone does not count.
     pub last_used: Timestamp,
-    /// Destinations refused in the last 7 days.
+    /// Destinations refused in the last 7 days, leaving out refusals that
+    /// left nothing to allow.
     pub refused_recently: usize,
+    /// The last refusal, within the last 7 days, because the proxy could
+    /// not read the sandbox's policy.
+    pub policy_unreadable_at: Option<Timestamp>,
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,
@@ -281,6 +286,10 @@ pub enum Suggestion {
         sandbox: SandboxName,
         refused: usize,
     },
+    LookAtProxy {
+        sandbox: SandboxName,
+        last: Timestamp,
+    },
     Restart {
         sandbox: SandboxName,
     },
@@ -315,6 +324,7 @@ impl Suggestion {
             Suggestion::RemoveGoneAgent { .. } => "remove_gone_agent",
             Suggestion::LookAtAgents { .. } => "look_at_agents",
             Suggestion::ReviewRefused { .. } => "review_refused",
+            Suggestion::LookAtProxy { .. } => "look_at_proxy",
             Suggestion::Restart { .. } => "restart",
             Suggestion::InstallRuntime { .. } => "install_runtime",
             Suggestion::Reinstall { .. } => "reinstall",
@@ -330,6 +340,7 @@ impl Suggestion {
             | Suggestion::RemoveGoneAgent { sandbox, .. }
             | Suggestion::LookAtAgents { sandbox, .. }
             | Suggestion::ReviewRefused { sandbox, .. }
+            | Suggestion::LookAtProxy { sandbox, .. }
             | Suggestion::Restart { sandbox }
             | Suggestion::InstallRuntime { sandbox }
             | Suggestion::Reinstall { sandbox, .. }
@@ -358,6 +369,10 @@ impl Suggestion {
             Suggestion::ReviewRefused { refused, .. } => {
                 format!("{refused} destinations refused in the last {REFUSED_DAYS} days")
             }
+            Suggestion::LookAtProxy { last, .. } => format!(
+                "the proxy could not read the policy and refused every connection, last at {}",
+                last.strftime("%Y-%m-%d %H:%M UTC")
+            ),
             Suggestion::Restart { .. } => {
                 "sessions run under a policy the active one replaced".into()
             }
@@ -390,6 +405,7 @@ impl Suggestion {
             Suggestion::RemoveGoneAgent { agent, .. } => format!("enclos agent rm {sb}/{agent}"),
             Suggestion::LookAtAgents { .. } => format!("enclos connect {sb}"),
             Suggestion::ReviewRefused { .. } => format!("enclos net denied {sb}"),
+            Suggestion::LookAtProxy { .. } => format!("enclos logs {sb}"),
             Suggestion::Restart { .. } => format!("enclos sandbox restart {sb}"),
             Suggestion::InstallRuntime { .. } => {
                 format!("enclos runtime install <runtime> --sandbox {sb}")
@@ -484,12 +500,21 @@ impl Engine {
         let since = now
             .checked_sub(jiff::SignedDuration::from_hours(24 * REFUSED_DAYS))
             .unwrap_or(now);
-        let refused_recently = self
+        let denied: Vec<_> = self
             .state
             .denied(&name)?
-            .iter()
+            .into_iter()
             .filter(|d| d.last >= since)
+            .collect();
+        let refused_recently = denied
+            .iter()
+            .filter(|d| !d.reason.nothing_to_allow())
             .count();
+        let policy_unreadable_at = denied
+            .iter()
+            .filter(|d| d.reason == Reason::PolicyUnreadable)
+            .map(|d| d.last)
+            .max();
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(
                 list.into_iter()
@@ -551,6 +576,7 @@ impl Engine {
             last_network,
             last_used,
             refused_recently,
+            policy_unreadable_at,
             agents,
             disk,
             name,
@@ -741,6 +767,12 @@ pub fn suggest(sandboxes: &[SandboxStatus], now: Timestamp) -> Vec<Suggestion> {
             out.push(Suggestion::ReviewRefused {
                 sandbox: sandbox(),
                 refused: s.refused_recently,
+            });
+        }
+        if let Some(last) = s.policy_unreadable_at {
+            out.push(Suggestion::LookAtProxy {
+                sandbox: sandbox(),
+                last,
             });
         }
         if s.restart_needed {
