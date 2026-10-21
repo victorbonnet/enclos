@@ -37,12 +37,14 @@ pub fn record(conn: &Connection, e: &NetEvent) -> rusqlite::Result<i64> {
 
 pub fn finish(conn: &Connection, row: i64, e: &NetEvent) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE net_events SET bytes_up = ?2, bytes_down = ?3, duration_ms = ?4 WHERE id = ?1",
+        "UPDATE net_events SET bytes_up = ?2, bytes_down = ?3, duration_ms = ?4, reason = ?5
+         WHERE id = ?1",
         params![
             row,
             e.bytes_up as i64,
             e.bytes_down as i64,
-            e.duration_ms as i64
+            e.duration_ms as i64,
+            e.reason.map(|r| r.as_str()),
         ],
     )?;
     Ok(())

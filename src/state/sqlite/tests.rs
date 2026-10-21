@@ -228,7 +228,7 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         store.record(&e).unwrap();
     }
     // A tunnel opened first and closed last: listed by when it opened, with
-    // the bytes it moved once it closed.
+    // the bytes it moved and why it closed, once it closed.
     let long = event(
         "2026-01-01T10:00:04Z",
         "long.example.com",
@@ -241,6 +241,7 @@ fn the_network_log_filters_by_time_and_groups_denials() {
             row,
             &NetEvent {
                 bytes_down: 5_000_000,
+                reason: Some(Reason::Idle),
                 ..long
             },
         )
@@ -248,8 +249,8 @@ fn the_network_log_filters_by_time_and_groups_denials() {
     let all = store.events(&name, None).unwrap();
     assert_eq!(all.len(), 4);
     assert_eq!(
-        (all[0].host.as_str(), all[0].bytes_down),
-        ("long.example.com", 5_000_000)
+        (all[0].host.as_str(), all[0].bytes_down, all[0].reason),
+        ("long.example.com", 5_000_000, Some(Reason::Idle))
     );
     assert_eq!(
         store.last_event(&name).unwrap(),

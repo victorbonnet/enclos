@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Since;
-use enclos::model::net::{DeniedDestination, NetEvent, Verdict, destination};
+use enclos::model::net::{DeniedDestination, NetEvent, Reason, Verdict, destination};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
 
@@ -57,21 +57,27 @@ fn print_log(events: &[NetEvent]) {
         "TIME (UTC)", "VERDICT", "DESTINATION", "ADDRESS", "UP", "DOWN"
     );
     for e in events {
-        let verdict = match (e.verdict, e.reason) {
-            (Verdict::Allowed, None) => "allowed".to_owned(),
-            (Verdict::Allowed, Some(r)) => format!("failed: {r}"),
-            (Verdict::Denied, Some(r)) => format!("denied: {r}"),
-            (Verdict::Denied, None) => "denied".to_owned(),
-        };
         println!(
             "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
             e.at.strftime("%Y-%m-%d %H:%M:%S"),
-            verdict,
+            verdict(e.verdict, e.reason),
             destination(&e.host, e.port),
             e.address.as_deref().unwrap_or("-"),
             bytes(e.bytes_up),
             bytes(e.bytes_down),
         );
+    }
+}
+
+/// What became of a connection, as the log shows it.
+fn verdict(verdict: Verdict, reason: Option<Reason>) -> String {
+    match (verdict, reason) {
+        (Verdict::Allowed, None) => "allowed".to_owned(),
+        // The proxy closed a connection it had allowed: not a failure.
+        (Verdict::Allowed, Some(Reason::Idle)) => "closed: idle".to_owned(),
+        (Verdict::Allowed, Some(r)) => format!("failed: {r}"),
+        (Verdict::Denied, Some(r)) => format!("denied: {r}"),
+        (Verdict::Denied, None) => "denied".to_owned(),
     }
 }
 
@@ -95,4 +101,31 @@ fn print_denied(sandbox: &SandboxName, denied: &[DeniedDestination]) {
         );
     }
     println!("Allow what you trust with `enclos policy allow {sandbox} <destination>`.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_idle_close_is_not_shown_as_a_failure() {
+        let cases = [
+            (Verdict::Allowed, None, "allowed"),
+            (Verdict::Allowed, Some(Reason::Idle), "closed: idle"),
+            (
+                Verdict::Allowed,
+                Some(Reason::ResolveFailed),
+                "failed: resolve-failed",
+            ),
+            (
+                Verdict::Denied,
+                Some(Reason::NotAllowed),
+                "denied: not-allowed",
+            ),
+            (Verdict::Denied, None, "denied"),
+        ];
+        for (v, r, shown) in cases {
+            assert_eq!(verdict(v, r), shown);
+        }
+    }
 }
