@@ -542,6 +542,40 @@ impl Engine {
         Ok(made.unwrap_or(version))
     }
 
+    /// Once a runtime is recorded as installed, resolves again what a change
+    /// made while its installer ran resolved without its destinations: the
+    /// active policy from its own `policy.toml`, and a pending one from the
+    /// file. Nothing else changes: the file is not resolved on its own.
+    pub(super) fn resolve_with_runtime(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+    ) -> Result<()> {
+        let (_, active) = self.active_policy(name)?;
+        let now = match active.overrides_text() {
+            Some(text) => Some(self.checked_policy(name, text)?),
+            None => None,
+        }
+        .filter(|now| now.id != active.id && now.policy != active.policy);
+        match self.state.pending_policy(name)? {
+            Some((_, pending)) => {
+                let overrides = self.layout.read_policy(name.as_str())?;
+                let again = self.checked_policy(name, &overrides)?;
+                if again.id != pending.id || now.is_some() {
+                    self.state
+                        .save_pending(lock, name, &again, now.as_ref(), by)?;
+                }
+            }
+            None => {
+                if let Some(now) = &now {
+                    self.state.save_policy(lock, name, now, by, None)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drops the pending policy, and any edit of `policy.toml` not applied:
     /// the file goes back to the one the active policy was resolved from,
     /// what it held is kept beside it in `policy.toml.discarded`, and an

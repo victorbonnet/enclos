@@ -847,6 +847,33 @@ fn a_session_gone_after_a_crash_does_not_hold_a_change_back() {
 }
 
 #[test]
+fn a_change_made_while_a_runtime_installed_gets_its_destinations_once_it_is_recorded() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    // Made while the installer ran: resolved without the runtime.
+    make_pending(&engine, &name, &before, &after);
+    engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = engine.state.get(&name)?.unwrap();
+                record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+                engine.state.put(lock, &record)?;
+                engine.resolve_with_runtime(lock, &alice(), &name)
+            },
+        )
+        .unwrap();
+    let view = engine.policy(&name).unwrap();
+    let hermes = "chatgpt.com".to_owned();
+    assert!(view.snapshot.policy.net.allow.contains(&hermes));
+    assert!(view.pending.unwrap().1.policy.net.allow.contains(&hermes));
+}
+
+#[test]
 fn a_restart_with_yes_whose_start_fails_says_the_change_is_in_force_not_pending() {
     let (dir, engine, fake, name) = with_services();
     let (_sleeping, _id) = running(&engine, &name);

@@ -382,7 +382,9 @@ impl Engine {
                 })?;
                 record.runtime = Some(kind);
                 self.state.put(lock, &record)?;
-                Ok(())
+                // A change made while the installer ran was resolved without
+                // the runtime's destinations, as it was not recorded yet.
+                self.resolve_with_runtime(lock, by, name)
             },
         )?;
         Ok(Planned::Done(InstallEnd {
