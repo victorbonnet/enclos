@@ -2286,12 +2286,28 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
             .stderr(Stdio::piped());
         let child = cmd.spawn().unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        rustix::io::write(&master, keys).unwrap();
+        // From a thread: a paste longer than the terminal's queue waits for
+        // enclos to read it.
+        let keys = keys.to_vec();
+        let writer = master.try_clone().unwrap();
+        let typing = std::thread::spawn(move || {
+            let mut keys = &keys[..];
+            while !keys.is_empty() {
+                match rustix::io::write(&writer, keys) {
+                    Ok(n) => keys = &keys[n..],
+                    Err(_) => break,
+                }
+            }
+        });
         let out = Run(child.wait_with_output().unwrap());
+        typing.join().unwrap();
         let echo = tcgetattr(&slave)
             .unwrap()
             .local_modes
             .contains(LocalModes::ECHO);
+        // What the shell would read next: nothing of the value.
+        let left = rustix::io::ioctl_fionread(&slave).unwrap();
+        assert_eq!(left, 0, "{left} bytes left for the shell");
         (out, echo)
     };
     let (out, echo) = at_terminal("long", &[b"k".repeat(1500), b"\r".to_vec()].concat());
@@ -2302,6 +2318,30 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
     assert!(echo);
     let (out, echo) = at_terminal("pasted", b"first-line\rsecond-part");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    // A paste far past the limit and the terminal's queue: refused, and
+    // none of it left for the shell.
+    let (out, echo) = at_terminal("huge", &b"k".repeat(6000));
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("at most 4096 bytes"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    let pem = [
+        b"-----BEGIN KEY-----\r".to_vec(),
+        b"k".repeat(3000),
+        b"\r-----END KEY-----\r".to_vec(),
+    ]
+    .concat();
+    let (out, echo) = at_terminal("pem", &pem);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(
         out.stderr().contains("more came after the line"),

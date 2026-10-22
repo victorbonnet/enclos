@@ -397,6 +397,7 @@ impl SecretStore for WritesThenFails {
         self.0.set(secret, value)?;
         Err(crate::secrets::SecretError {
             what: "the read back did not answer".into(),
+            untouched: false,
         })
     }
     fn get(
@@ -428,4 +429,48 @@ fn a_new_value_a_failed_store_left_goes_again() {
     assert!(err.to_string().contains("did not answer"), "{err}");
     assert!(store.0.borrow().is_empty(), "a value stays");
     assert!(engine.secret_list(&name).unwrap().is_empty());
+}
+
+/// A store that refuses every value before it writes, as the Keychain does
+/// a value too long for one line.
+struct RefusesFirst(Rc<InMemory>);
+
+impl SecretStore for RefusesFirst {
+    fn set(
+        &self,
+        _: &SecretRef,
+        _: &SecretValue,
+    ) -> std::result::Result<(), crate::secrets::SecretError> {
+        Err(crate::secrets::SecretError {
+            what: "the value is too long".into(),
+            untouched: true,
+        })
+    }
+    fn get(
+        &self,
+        secret: &SecretRef,
+    ) -> std::result::Result<Option<SecretValue>, crate::secrets::SecretError> {
+        self.0.get(secret)
+    }
+    fn remove(&self, secret: &SecretRef) -> std::result::Result<bool, crate::secrets::SecretError> {
+        self.0.remove(secret)
+    }
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        self.0.whereabouts(secret)
+    }
+}
+
+#[test]
+fn a_store_refused_before_it_wrote_leaves_what_was_there() {
+    let (_dir, engine, store, _name) = with_store();
+    // A value left by an earlier sandbox of that name, with no record.
+    let telegram = secret("home/telegram");
+    store.set(&telegram, &value(VALUE)).unwrap();
+    let engine = engine.with_secrets(Box::new(RefusesFirst(Rc::clone(&store))));
+    let err = engine
+        .secret_set(&alice(), &telegram, Some(&value("other")), Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("too long"), "{err}");
+    assert!(!err.to_string().contains("cleaning up"), "{err}");
+    assert_eq!(store.get(&telegram).unwrap(), Some(value(VALUE)));
 }

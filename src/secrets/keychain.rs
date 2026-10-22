@@ -87,20 +87,26 @@ impl Keychain {
     fn fail(&self, what: &str, secret: &SecretRef, why: impl std::fmt::Display) -> SecretError {
         SecretError {
             what: format!("cannot {what} secret {secret} in the Keychain: {why}"),
+            untouched: false,
         }
     }
 
     /// Refuses a keychain file that is not there, which `security` would
     /// answer as it answers an item that is not there.
     fn require_file(&self, what: &str, secret: &SecretRef) -> Result<(), SecretError> {
-        match &self.file {
-            Some(file) if !file.exists() => Err(self.fail(
+        match self.file.as_ref().map(|f| (f, f.try_exists())) {
+            Some((file, Ok(false))) => Err(self.fail(
                 what,
                 secret,
                 format!(
                     "the keychain {} ({KEYCHAIN_VAR}) does not exist",
                     file.display()
                 ),
+            )),
+            Some((file, Err(e))) => Err(self.fail(
+                what,
+                secret,
+                format!("cannot look at the keychain {} ({e})", file.display()),
             )),
             _ => Ok(()),
         }
@@ -184,16 +190,19 @@ impl Keychain {
 
 impl SecretStore for Keychain {
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
-        let line = self.store_line(secret, value.expose())?;
-        self.require_keychain(secret)?;
-        let out = run(Command::new(SECURITY).arg("-i"), Some(line.as_bytes()))
-            .map_err(|e| self.fail("store", secret, e))?;
+        // Refused before `security` runs: the keychain is as it was.
+        let untouched = |e: SecretError| SecretError {
+            untouched: true,
+            ..e
+        };
+        let line = self.store_line(secret, value.expose()).map_err(untouched)?;
+        self.require_keychain(secret).map_err(untouched)?;
         // What `security -i` prints may repeat its input, the value with
         // it: only its words are kept, never a run of the value's hex.
-        let why = scrub(
-            &stderr(&out.stderr, out.status),
-            &hex(value.expose().as_bytes()),
-        );
+        let shown = hex(value.expose().as_bytes());
+        let out = run(Command::new(SECURITY).arg("-i"), Some(line.as_bytes()))
+            .map_err(|e| self.fail("store", secret, scrub(&e, &shown)))?;
+        let why = scrub(&stderr(&out.stderr, out.status), &shown);
         if !out.status.success() {
             return Err(self.fail("store", secret, why));
         }
@@ -401,7 +410,9 @@ fn scrub(text: &str, value: &str) -> String {
             run.push(c);
             continue;
         }
-        let of_value = run.len() >= 4 && value.contains(&run.to_ascii_lowercase());
+        let lower = run.to_ascii_lowercase();
+        let of_value =
+            !run.is_empty() && (lower == value || (run.len() >= 4 && value.contains(&lower)));
         match run.len() >= 16 || of_value {
             true => out.push('…'),
             false => out.push_str(&run),
