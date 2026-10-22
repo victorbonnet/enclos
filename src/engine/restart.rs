@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use super::Engine;
 use crate::error::Result;
-use crate::lifecycle::process::{Signalled, signal_process};
+use crate::lifecycle::process::{Signalled, is_same, signal_process};
 use crate::model::audit::{Actor, Intent, Outcome};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::model::session::SessionRecord;
+use crate::model::session::{SessionKind, SessionRecord};
 use crate::runtime::home::read_text;
 use crate::runtime::{HomePath, Signal, Unreadable, adapter};
 
@@ -25,6 +25,10 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// The most of one file read; a larger one counts as too large, by that
 /// reason, however it changes.
 const MAX_SETTINGS: u64 = 1024 * 1024;
+/// How long after a restart that was not sent it is asked again, when the
+/// files do not change meanwhile: a failure that lasts does not fill the
+/// audit log.
+const RETRY: Duration = Duration::from_secs(60);
 
 /// One file as read: its text, `None` when it is not there, or why it
 /// could not be read.
@@ -39,6 +43,9 @@ pub(super) struct SettingsWatch {
     /// read so.
     changed: Option<(Vec<Read>, Instant)>,
     read_at: Option<Instant>,
+    /// When the change is asked for again, after a restart that was not
+    /// sent.
+    retry_at: Option<Instant>,
 }
 
 impl SettingsWatch {
@@ -54,13 +61,15 @@ impl SettingsWatch {
             started,
             changed: None,
             read_at: None,
+            retry_at: None,
         })
     }
 
     /// The files that differ from when the service started, once they have
     /// read the same for `SETTLE`; `None` until then. Reads them at most
     /// every `READ_EVERY`. A file changed and changed back counts as not
-    /// changed.
+    /// changed. After [`SettingsWatch::failed`], the same change is
+    /// answered again only after `RETRY`; a new one, once it has settled.
     pub(super) fn settled(&mut self, now: Instant) -> Option<Vec<HomePath>> {
         if self
             .read_at
@@ -72,10 +81,14 @@ impl SettingsWatch {
         let read = read_all(&self.home, &self.files);
         if read == self.started {
             self.changed = None;
+            self.retry_at = None;
             return None;
         }
         match &self.changed {
             Some((last, since)) if *last == read => {
+                if self.retry_at.is_some_and(|at| now < at) {
+                    return None;
+                }
                 (now.duration_since(*since) >= SETTLE).then(|| {
                     self.files
                         .iter()
@@ -87,9 +100,15 @@ impl SettingsWatch {
             }
             _ => {
                 self.changed = Some((read, now));
+                self.retry_at = None;
                 None
             }
         }
+    }
+
+    /// The restart `settled` answered was not sent at `now`.
+    pub(super) fn failed(&mut self, now: Instant) {
+        self.retry_at = Some(now + RETRY);
     }
 }
 
@@ -121,6 +140,19 @@ impl Engine {
         let agents = runtime.agents_in(&home).unwrap_or_default();
         let watch = SettingsWatch::new(home, runtime.settings_files(&agents))?;
         Some((watch, signal))
+    }
+
+    /// Whether a person may still be changing the runtime's settings in
+    /// sandbox `name`: an interactive session's program still runs there,
+    /// such as the runtime's setup, which saves each answer as it is given,
+    /// or its TUI, which the service serves and a restart would cut off. A
+    /// program that cannot be looked at counts as running.
+    pub(super) fn someone_connected(&self, name: &SandboxName) -> Result<bool> {
+        Ok(self
+            .state
+            .sessions(name, true)?
+            .iter()
+            .any(|s| s.kind == SessionKind::Interactive && is_same(&s.root).unwrap_or(true)))
     }
 
     /// Records that the service's settings `changed` and sends its program
@@ -226,6 +258,26 @@ mod tests {
         let t = Instant::now();
         assert_eq!(watch.settled(t), None);
         assert_eq!(watch.settled(t + SETTLE + READ_EVERY), Some(vec![rel("a")]));
+    }
+
+    #[test]
+    fn a_restart_not_sent_is_asked_again_after_a_change_or_a_while() {
+        let (home, mut watch) = watched();
+        let t = Instant::now();
+        std::fs::write(home.path().join("b"), "token").unwrap();
+        assert_eq!(watch.settled(t), None);
+        let first = t + SETTLE;
+        assert_eq!(watch.settled(first), Some(vec![rel("b")]));
+        watch.failed(first);
+        // The same change: not before `RETRY`.
+        assert_eq!(watch.settled(first + READ_EVERY), None);
+        assert_eq!(watch.settled(first + RETRY), Some(vec![rel("b")]));
+        watch.failed(first + RETRY);
+        // A new change: once it has settled.
+        std::fs::write(home.path().join("b"), "token2").unwrap();
+        let later = first + RETRY + READ_EVERY;
+        assert_eq!(watch.settled(later), None);
+        assert_eq!(watch.settled(later + SETTLE), Some(vec![rel("b")]));
     }
 
     #[test]

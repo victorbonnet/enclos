@@ -459,8 +459,9 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
-        // Once the runtime's settings change, the program is asked to
-        // restart, once: it exits, and the service manager starts it again.
+        // Once the runtime's settings change, and no one is connected to the
+        // sandbox, the program is asked to restart, once: it exits, and the
+        // service manager starts it again.
         let mut restarting = false;
         let mut look = |notes: &mut Vec<String>| {
             let Some((settings, signal)) = watch.as_mut() else {
@@ -471,24 +472,43 @@ impl Engine {
             };
             let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
             let files = files.join(", ");
-            let asked = match self.ask_restart(by, &session, *signal, &changed) {
+            // Asked again at the next read, once the last session has ended.
+            match self.someone_connected(name) {
+                Ok(false) => {}
+                Ok(true) => return,
+                Err(e) => {
+                    super::session::note(
+                        notes,
+                        format!(
+                            "{files} changed, but whether anyone is connected cannot be told, so the {service} service waits: {e}"
+                        ),
+                    );
+                    return;
+                }
+            }
+            let why = match self.ask_restart(by, &session, *signal, &changed) {
                 // Another command holds the lock: the next look asks.
                 Ok(None) => return,
                 Ok(Some(Ok(()))) => {
                     restarting = true;
-                    format!("{files} changed: asked the {service} service to restart")
+                    super::session::note(
+                        notes,
+                        format!("{files} changed: asked the {service} service to restart"),
+                    );
+                    watch = None;
+                    return;
                 }
-                Ok(Some(Err(why))) => {
-                    format!(
-                        "{files} changed, but the {service} service was not asked to restart: {why}"
-                    )
-                }
-                Err(e) => format!(
-                    "{files} changed, but the {service} service was not asked to restart: {e}"
-                ),
+                Ok(Some(Err(why))) => why,
+                Err(e) => e.to_string(),
             };
-            super::session::note(notes, asked);
-            watch = None;
+            // Not sent: asked again after the next change, or a while later.
+            settings.failed(Instant::now());
+            super::session::note(
+                notes,
+                format!(
+                    "{files} changed, but the {service} service was not asked to restart: {why}"
+                ),
+            );
         };
         // As for `connect`, the members the service starts are recorded.
         // Unlike `connect`, what it leaves running is stopped: under a
