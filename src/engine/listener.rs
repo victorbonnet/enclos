@@ -8,6 +8,7 @@ use std::fs::{OpenOptions, TryLockError};
 use std::time::{Duration, Instant};
 
 use super::Engine;
+use super::service::Unit;
 use crate::error::Result;
 use crate::layout::LayoutError;
 use crate::lifecycle::listeners::{
@@ -154,12 +155,13 @@ pub(super) enum ConnectStep {
     /// Whether the runtime's files are there cannot be told: nothing is
     /// started, and this says why.
     Unreadable(String),
-    /// A session of the service is open, or the sandbox's services are
-    /// installed and the service manager starts it again: wait for it to
-    /// listen. Installing them again would stop the proxy that open sessions
-    /// use, and a service still starting.
+    /// A session of the service is open, or the service is installed and
+    /// the service manager starts it again: wait for it to listen.
+    /// Installing the services again would stop the proxy that open
+    /// sessions use, and a service still starting.
     Wait,
-    /// Nothing of the sandbox is installed: start its services, then wait.
+    /// The service is not installed, as when the sandbox was started before
+    /// its runtime was installed: start the sandbox's services, then wait.
     Start,
 }
 
@@ -167,8 +169,8 @@ pub(super) enum ConnectStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceWait {
     pub service: String,
-    /// Whether it started the sandbox's services: false when they were
-    /// installed already, or one could not tell whether the runtime is
+    /// Whether it started the sandbox's services: false when the service
+    /// was installed already, or one could not tell whether the runtime is
     /// there.
     pub started: bool,
     /// Why the service was not listening when the wait ended, if it was not:
@@ -229,7 +231,11 @@ impl Engine {
         }
         let step = match service_listener(self.state.as_ref(), name, listener.service.as_str()) {
             Ok(_) => ConnectStep::Nothing,
-            Err(NoPort::NotRunning(_)) if !self.has_services(name)? => ConnectStep::Start,
+            Err(NoPort::NotRunning(_))
+                if !self.unit_installed(name, Unit::Runtime(listener.service))? =>
+            {
+                ConnectStep::Start
+            }
             Err(_) => ConnectStep::Wait,
         };
         Ok(Some((listener, step)))

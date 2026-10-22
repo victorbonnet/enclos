@@ -3623,6 +3623,59 @@ mod services {
         assert_eq!(fake.stopped.borrow().len(), stopped);
     }
 
+    /// Started before its runtime was installed, the sandbox has its proxy
+    /// service and no gateway service: nothing would ever start the
+    /// gateway, so `connect` starts the services, and says that the proxy
+    /// restarts.
+    #[test]
+    fn connect_starts_the_services_when_only_the_proxy_is_installed() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        engine.start_sandbox(&alice(), &name).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    Ok(engine.state.put(lock, &record)?)
+                },
+            )
+            .unwrap();
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            !installed.iter().any(|l| l.ends_with(".gateway")),
+            "{installed:?}"
+        );
+
+        let plan = dry_run(&engine, &name);
+        assert!(
+            plan[0].starts_with("start the services of sandbox home"),
+            "{plan:?}"
+        );
+        let (waited, said) = wait_for_gateway(&engine, &name);
+        assert!(waited.started, "{waited:?}");
+        assert!(
+            said[0].starts_with("starting the services of sandbox home"),
+            "{said:?}"
+        );
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            installed.iter().any(|l| l.ends_with(".gateway")),
+            "{installed:?}"
+        );
+        assert!(
+            fake.started
+                .borrow()
+                .iter()
+                .any(|u| u.label.as_str().ends_with(".gateway"))
+        );
+    }
+
     /// A start that fails is no reason not to connect: it is said, and the
     /// session goes ahead.
     #[test]
