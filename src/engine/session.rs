@@ -487,15 +487,18 @@ impl Engine {
         let mut members = session.clone();
         members.tracked = waited.known.clone();
         members.tracked.extend(sure);
-        if let Err(e) = stop(&members, STOP_GRACE) {
+        // With what holds its marker, looked at again once stopped.
+        if let Err(e) = self.stop_marked(&members, STOP_GRACE, stop) {
             note(
                 &mut waited.notes,
                 format!("could not stop what it left running: {e}"),
             );
         }
-        waited.left = processes()
-            .map(|procs| find(&procs, session, &waited.known))
-            .map_err(Error::from);
+        let mut known = session.clone();
+        known.tracked = waited.known.clone();
+        waited.left = self
+            .marked_listed(&known)
+            .map(|(procs, marked)| find(&procs, session, &marked.tracked));
     }
 
     /// Ends the session, or, while it left members running or enclos could
@@ -591,9 +594,11 @@ impl Engine {
     }
 
     /// Removes an ended session's marker, once a fresh look shows nothing
-    /// holds it: removed, a marker a member still holds would hide that
-    /// member for good. One left behind is an empty file, which a later
-    /// session cannot take for its own (its name has the root's start time).
+    /// holds it. A session ends only once nothing of it runs, its marker's
+    /// holders included; this second look keeps the file for one that
+    /// gained the marker since. One left behind is an empty file, which a
+    /// later session cannot take for its own (its name has the root's start
+    /// time).
     pub(super) fn forget_marker(&self, session: &SessionRecord) {
         let dir = self.markers(&session.sandbox);
         if let Ok(held) = marker::holders(&dir)
@@ -614,11 +619,19 @@ impl Engine {
     /// its own start time and fails the same-process check before a signal,
     /// where the other order would name the process that reused the pid.
     pub(super) fn marked(&self, session: &SessionRecord) -> Result<SessionRecord> {
+        Ok(self.marked_listed(session)?.1)
+    }
+
+    /// `marked`, with the listing it was made from, to look at it again.
+    pub(super) fn marked_listed(
+        &self,
+        session: &SessionRecord,
+    ) -> Result<(Vec<Proc>, SessionRecord)> {
         let procs = processes()?;
         let held = self.held(&session.sandbox)?;
         let mut marked = session.clone();
         marked.tracked = marked_in(session, &session.tracked, &procs, &held);
-        Ok(marked)
+        Ok((procs, marked))
     }
 
     /// Stops `session`'s members, with what holds its marker (ADR 0030),

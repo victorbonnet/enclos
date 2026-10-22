@@ -350,23 +350,27 @@ impl Engine {
         // that fails tells none apart, so none is said to be gone; the stop
         // below looks again, and fails on its own if it still cannot.
         let open = self.state.sessions(name, true)?;
-        let ran: Vec<SessionId> = match processes() {
-            Ok(procs) => {
-                // What holds a marker is a member too (ADR 0030), looked at
-                // after the listing (see `Engine::marked`).
-                let held = match open.is_empty() {
-                    true => Held::new(),
-                    false => self.held(name)?,
-                };
-                open.iter()
-                    .filter(|s| {
-                        let mut marked = (*s).clone();
-                        marked.tracked = marked_in(s, &s.tracked, &procs, &held);
-                        !is_gone(&procs, &marked)
-                    })
-                    .map(|s| s.id)
-                    .collect()
-            }
+        // What holds a marker is a member too (ADR 0030), looked at after
+        // the listing (see `Engine::marked`); a failed look at either is as
+        // a failed listing.
+        let looked = (|| -> Result<Vec<SessionId>> {
+            let procs = processes()?;
+            let held = match open.is_empty() {
+                true => Held::new(),
+                false => self.held(name)?,
+            };
+            Ok(open
+                .iter()
+                .filter(|s| {
+                    let mut marked = (*s).clone();
+                    marked.tracked = marked_in(s, &s.tracked, &procs, &held);
+                    !is_gone(&procs, &marked)
+                })
+                .map(|s| s.id)
+                .collect())
+        })();
+        let ran: Vec<SessionId> = match looked {
+            Ok(ran) => ran,
             Err(_) => open.iter().map(|s| s.id).collect(),
         };
         // The services first, so the service manager does not restart what

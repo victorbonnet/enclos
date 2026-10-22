@@ -547,9 +547,10 @@ impl Engine {
             if session.kind != kind || is_same(&session.root)? {
                 continue;
             }
-            // What holds its marker still runs (ADR 0030): the session stays
-            // open, for a stop to end it.
-            if self.marked(&session)?.tracked.len() > session.tracked.len() {
+            // What it tracked, or what holds its marker (ADR 0030), still
+            // runs: the session stays open, for a stop to end it.
+            let (procs, marked) = self.marked_listed(&session)?;
+            if !crate::lifecycle::members::is_gone(&procs, &marked) {
                 continue;
             }
             self.state.end_session(lock, session.id)?;
