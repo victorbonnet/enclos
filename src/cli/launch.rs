@@ -48,51 +48,81 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     if args.follow {
         tail.arg("-F");
     }
-    let cannot = |e: io::Error| Error::Session {
-        what: format!("cannot run tail: {e}"),
-    };
     let mut tail = tail
         .args(&files)
         .stdout(Stdio::piped())
         .spawn()
-        .map_err(cannot)?;
-    // The sandbox wrote these lines: shown escaped, so they cannot drive the
-    // terminal (design §6).
-    if let Some(out) = tail.stdout.take() {
-        let shown = show_escaped(out, &mut io::stdout().lock());
-        if let Err(e) = shown
-            && e.kind() != io::ErrorKind::BrokenPipe
-        {
-            let _ = tail.kill();
-            let _ = tail.wait();
-            return Err(cannot(e));
-        }
+        .map_err(|e| failed(format!("cannot run tail: {e}")))?;
+    let out = tail.stdout.take().expect("tail's output is piped");
+    // What the services print comes from the sandbox: shown escaped, so it
+    // cannot drive the terminal (design §4).
+    let shown = show_escaped(out, &mut io::stdout().lock());
+    if let Err(e) = shown {
+        // tail would otherwise wait for a service's next line to learn that
+        // nobody reads it any more.
+        let _ = tail.kill();
+        let _ = tail.wait();
+        return match e {
+            // Whoever read the logs, such as `head`, has what it wanted.
+            Failed::Write(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+            Failed::Write(e) => Err(failed(format!(
+                "cannot write the logs to standard output: {e}"
+            ))),
+            Failed::Read(e) => Err(failed(format!("cannot read tail's output: {e}"))),
+        };
     }
-    let status = tail.wait().map_err(cannot)?;
+    let status = tail
+        .wait()
+        .map_err(|e| failed(format!("cannot wait for tail: {e}")))?;
     Ok(if status.success() { 0 } else { 1 })
 }
 
-/// The most of one line held before it is shown: a service that never ends
-/// a line cannot make `enclos logs` hold all it wrote.
+fn failed(what: String) -> Error {
+    Error::Session { what }
+}
+
+/// The most bytes of one line held before it is shown, its newline
+/// included: a service that never ends a line cannot make `enclos logs`
+/// hold all it wrote.
 const MAX_LINE: u64 = 64 * 1024;
 
-/// Copies `from` to `to` line by line, each line escaped, and a line longer
-/// than `MAX_LINE` shown in pieces.
-fn show_escaped(from: impl Read, to: &mut impl Write) -> io::Result<()> {
+/// Which side of `show_escaped` failed.
+#[derive(Debug)]
+enum Failed {
+    Read(io::Error),
+    Write(io::Error),
+}
+
+/// Shows `from` on `to` line by line, each line escaped and without its
+/// line ending (`\n` or `\r\n`). Bytes that are not UTF-8 show as U+FFFD,
+/// and a line of `MAX_LINE` bytes or more is shown in pieces.
+fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
+    // Whether the last piece was cut before its line ended.
+    let mut cut = false;
     loop {
         line.clear();
-        if (&mut from).take(MAX_LINE).read_until(b'\n', &mut line)? == 0 {
+        let read = (&mut from)
+            .take(MAX_LINE)
+            .read_until(b'\n', &mut line)
+            .map_err(Failed::Read)?;
+        if read == 0 {
             return Ok(());
         }
+        let ended = line.ends_with(b"\n");
+        // The end of a line cut right before it is no line of its own.
+        if std::mem::replace(&mut cut, !ended) && line == b"\n" {
+            continue;
+        }
         let text = String::from_utf8_lossy(&line);
-        writeln!(
-            to,
-            "{}",
-            printable_line(text.strip_suffix('\n').unwrap_or(&text))
-        )?;
-        to.flush()?;
+        let text = text
+            .strip_suffix("\r\n")
+            .or_else(|| text.strip_suffix('\n'))
+            .unwrap_or(&text);
+        writeln!(to, "{}", printable_line(text))
+            .and_then(|()| to.flush())
+            .map_err(Failed::Write)?;
     }
 }
 
@@ -119,5 +149,60 @@ mod tests {
         let shown = String::from_utf8(shown).unwrap();
         let lines: Vec<_> = shown.lines().map(str::len).collect();
         assert_eq!(lines, [MAX_LINE as usize, MAX_LINE as usize, 1]);
+    }
+
+    fn shown(written: &[u8]) -> String {
+        let mut shown = Vec::new();
+        show_escaped(written, &mut shown).unwrap();
+        String::from_utf8(shown).unwrap()
+    }
+
+    #[test]
+    fn line_endings_are_not_shown_but_a_carriage_return_inside_is() {
+        assert_eq!(shown(b"a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(shown(b"ok\rhidden\n"), "ok\\rhidden\n");
+    }
+
+    #[test]
+    fn a_line_as_long_as_the_limit_is_shown_without_an_empty_line_after() {
+        let max = MAX_LINE as usize;
+        let mut written = vec![b'x'; max];
+        written.extend_from_slice(b"\nnext\n");
+        let lines: Vec<_> = shown(&written).lines().map(str::len).collect();
+        assert_eq!(lines, [max, 4]);
+        let mut written = vec![b'x'; max - 1];
+        written.push(b'\n');
+        let lines: Vec<_> = shown(&written).lines().map(str::len).collect();
+        assert_eq!(lines, [max - 1]);
+    }
+
+    #[test]
+    fn a_piece_cut_inside_an_escape_sequence_shows_no_control() {
+        let mut written = vec![b'x'; MAX_LINE as usize - 1];
+        written.extend_from_slice("\x1b[2Jé\u{9b}2J\n".as_bytes());
+        let shown = shown(&written);
+        assert!(
+            shown.lines().all(|l| !l.chars().any(char::is_control)),
+            "{shown}"
+        );
+        assert!(shown.contains("\\u{9b}2J"), "{shown}");
+    }
+
+    #[test]
+    fn a_reader_that_left_is_a_write_failure() {
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let e = show_escaped(&b"line\n"[..], &mut Gone).unwrap_err();
+        assert!(
+            matches!(e, Failed::Write(ref e) if e.kind() == io::ErrorKind::BrokenPipe),
+            "{e:?}"
+        );
     }
 }

@@ -1316,6 +1316,32 @@ fn logs_of_a_sandbox_without_services_say_how_to_start_it() {
     assert_eq!(out.code(), 1);
 }
 
+/// What the services print comes from the sandbox, so `enclos logs` shows
+/// it escaped: this one would set the clipboard and clear the screen.
+#[cfg(target_os = "macos")]
+#[test]
+fn logs_show_what_the_services_printed_escaped() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let logs = home.root.join("sandboxes/home/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("gateway.log"),
+        "ok\n\x1b]52;c;cHduZWQ=\x07\x1b[2Jcleared\n",
+    )
+    .unwrap();
+    let out = home.run(&["logs", "home"]);
+    out.ok();
+    assert!(
+        out.stdout()
+            .contains("\\u{1b}]52;c;cHduZWQ=\\u{7}\\u{1b}[2Jcleared"),
+        "{}",
+        out.stdout()
+    );
+    assert!(!out.stdout().contains('\x1b'), "{}", out.stdout());
+}
+
 /// Records Hermes as the runtime of sandbox `name` without installing it,
 /// and gives back a way to make a Hermes profile in the sandbox home as
 /// `hermes profile create` would, so the agent commands have something to

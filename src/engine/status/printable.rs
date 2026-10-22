@@ -65,13 +65,14 @@ pub(super) fn printable(text: &str) -> String {
     escaped(text, MAX_FACT_TEXT)
 }
 
-/// One line the sandbox wrote to a service's log, escaped as `printable`
-/// escapes, but not cut: `enclos logs` shows it whole.
+/// `line` escaped as `printable` escapes, but never cut: for a line of a
+/// service's log, whose length the caller bounds.
 pub fn printable_line(line: &str) -> String {
     escaped(line, usize::MAX)
 }
 
-/// `text` escaped, then cut to at most `max` characters.
+/// `text` escaped as `printable` describes, then cut to at most `max`
+/// characters, never inside an escape and never after a joiner.
 fn escaped(text: &str, max: usize) -> String {
     let mut out = String::new();
     let mut shown: usize = 0;
