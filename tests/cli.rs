@@ -419,6 +419,49 @@ fn editor(home: &Home, script: &str) -> String {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn policy_history_diff_rollback_and_refresh() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["policy", "allow", "home", "a.example.com"]).ok();
+    home.run(&["policy", "allow", "home", "b.example.com"]).ok();
+
+    let history = home.run(&["policy", "history", "home"]).ok().stdout();
+    let lines: Vec<&str> = history.lines().collect();
+    assert_eq!(lines.len(), 5, "{history}");
+    assert!(
+        lines[4].trim_start().starts_with("v3") && lines[4].ends_with("in force"),
+        "{history}"
+    );
+    let diff = home.run(&["policy", "diff", "home"]).ok().stdout();
+    assert!(diff.contains("what v3 changes from v2"), "{diff}");
+    assert!(diff.contains("allow b.example.com"), "{diff}");
+    let diff = home
+        .run(&["policy", "diff", "home", "--from", "1", "--to", "1"])
+        .ok()
+        .stdout();
+    assert!(diff.contains("grants the same"), "{diff}");
+
+    let out = home
+        .run(&["policy", "rollback", "home", "--to", "1"])
+        .ok()
+        .stdout();
+    assert!(out.contains("policy v4, from v1"), "{out}");
+    assert!(out.contains("stop allowing a.example.com"), "{out}");
+    let history = home.run(&["policy", "history", "home"]).ok().stdout();
+    assert!(history.contains("in force; restores v1"), "{history}");
+    let shown = home.run(&["policy", "show", "home"]).ok().stdout();
+    assert!(shown.contains("allowed: nothing listed"), "{shown}");
+
+    let out = home.run(&["policy", "refresh", "home"]).ok().stdout();
+    assert!(out.contains("nothing changed"), "{out}");
+    let out = home.run(&["policy", "rollback", "home", "--to", "9"]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("no policy v9"), "{}", out.stderr());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     let home = Home::new();
     home.init(1);

@@ -84,6 +84,8 @@ pub const MIGRATIONS: &[&str] = &[
         by_host  TEXT NOT NULL,
         at       TEXT NOT NULL
     ) STRICT;",
+    // 7: the version a pending rollback restores (design §7)
+    "ALTER TABLE pending_policies ADD COLUMN restores INTEGER;",
 ];
 
 /// The schema version this enclos reads and writes.

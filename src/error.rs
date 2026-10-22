@@ -177,6 +177,21 @@ pub enum Error {
         version: u32,
         file: PathBuf,
     },
+    #[error(
+        "sandbox `{sandbox}` has no policy v{version}: its versions are v1 to v{last}. `enclos policy history {sandbox}` lists them"
+    )]
+    NoSuchPolicyVersion {
+        sandbox: String,
+        version: u32,
+        last: u32,
+    },
+    /// `policy.toml` holds an edit not applied, which rollback or refresh
+    /// would overwrite.
+    #[error(
+        "{} holds an edit not applied, which this would overwrite. Apply it with `enclos policy edit {sandbox}`, or drop it with `enclos policy discard {sandbox}`, then run this again",
+        file.display()
+    )]
+    PolicyFileEdited { sandbox: String, file: PathBuf },
     /// A command that resolves `policy.toml` on its own, refused while a
     /// change waits: it would put the pending change in force without the
     /// restart it needs.
@@ -274,6 +289,8 @@ impl Error {
             | Error::PolicyFileChanged { .. }
             | Error::PolicyTextUnknown { .. }
             | Error::PolicyPending { .. }
+            | Error::NoSuchPolicyVersion { .. }
+            | Error::PolicyFileEdited { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

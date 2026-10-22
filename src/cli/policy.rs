@@ -7,7 +7,8 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 
 use enclos::engine::{
-    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyView, Restarted, TestReport,
+    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyDiff, PolicyHistory,
+    PolicyView, Restarted, TestReport,
 };
 use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
@@ -44,6 +45,26 @@ enum PolicyVerb {
     Apply { sandbox: SandboxName },
     /// Drop the pending policy, and any edit of policy.toml not applied.
     Discard { sandbox: SandboxName },
+    /// List every version of the sandbox's policy.
+    History { sandbox: SandboxName },
+    /// Show what one policy version changes from another: by default the
+    /// pending policy from the active one, or the active one from the one before.
+    Diff {
+        sandbox: SandboxName,
+        #[arg(long, value_name = "VERSION")]
+        from: Option<u32>,
+        #[arg(long, value_name = "VERSION")]
+        to: Option<u32>,
+    },
+    /// Make an earlier version's policy the sandbox's again, as a new version.
+    Rollback {
+        sandbox: SandboxName,
+        #[arg(long, value_name = "VERSION")]
+        to: u32,
+    },
+    /// Resolve the policy again against this enclos's templates and the
+    /// runtime's adapter, and apply what changed once you accept it.
+    Refresh { sandbox: SandboxName },
     /// Try each way out of the sandbox from inside it; every probe must fail.
     Test {
         sandbox: SandboxName,
@@ -94,6 +115,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
         }
         PolicyVerb::Discard { sandbox } => {
             print_discarded(&sandbox, engine.policy_discard(by, &sandbox, confirm)?)
+        }
+        PolicyVerb::History { sandbox } => print_history(&engine.policy_history(&sandbox)?),
+        PolicyVerb::Diff { sandbox, from, to } => {
+            print_diff(&sandbox, &engine.policy_diff(&sandbox, from, to)?)
+        }
+        PolicyVerb::Rollback { sandbox, to } => {
+            let planned = engine.policy_rollback(by, &sandbox, to, confirm)?;
+            return print_replaced(engine, &sandbox, &format!("v{to}"), planned);
+        }
+        PolicyVerb::Refresh { sandbox } => {
+            let planned = engine.policy_refresh(by, &sandbox, confirm)?;
+            return print_replaced(engine, &sandbox, "this enclos's templates", planned);
         }
     }
     Ok(exit::OK)
@@ -278,6 +311,110 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
         true => Ok(exit::OK),
         false => super::sandbox::print_started(engine, sandbox, &r.started),
     }
+}
+
+fn print_history(history: &PolicyHistory) {
+    println!("Policy versions of sandbox {}:", history.sandbox);
+    let rows: Vec<[String; 5]> = history
+        .versions
+        .iter()
+        .map(|v| {
+            let note = match (v.version == history.active, v.restores) {
+                (true, Some(r)) => format!("in force; restores v{r}"),
+                (true, None) => "in force".to_owned(),
+                (false, Some(r)) => format!("restores v{r}"),
+                (false, None) => String::new(),
+            };
+            [
+                format!("v{}", v.version),
+                v.at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+                format!("{}@{}", v.by.user, v.by.host),
+                v.snapshot.short().to_owned(),
+                note,
+            ]
+        })
+        .collect();
+    let header = ["VERSION", "TIME (UTC)", "BY", "SNAPSHOT", ""].map(str::to_owned);
+    let mut widths = [0; 4];
+    for cells in std::iter::once(&header).chain(&rows) {
+        for (width, cell) in widths.iter_mut().zip(cells) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    for [version, at, by, snapshot, note] in std::iter::once(&header).chain(&rows) {
+        let [w0, w1, w2, w3] = widths;
+        let line = format!("  {version:<w0$}  {at:<w1$}  {by:<w2$}  {snapshot:<w3$}  {note}");
+        println!("{}", line.trim_end());
+    }
+    if let Some(p) = &history.pending {
+        let restores = p
+            .restores
+            .map(|r| format!(", restoring v{r}"))
+            .unwrap_or_default();
+        println!(
+            "Pending: snapshot {}, by {}@{} at {}{restores}; `enclos policy apply {}` restarts the sandbox into it.",
+            p.snapshot.short(),
+            p.by.user,
+            p.by.host,
+            p.at.strftime("%Y-%m-%d %H:%M:%S"),
+            history.sandbox
+        );
+    }
+}
+
+fn print_diff(sandbox: &SandboxName, diff: &PolicyDiff) {
+    if diff.changes.is_empty() && diff.inputs.is_empty() {
+        println!(
+            "Sandbox {sandbox}: {} grants the same as {}.",
+            diff.to, diff.from
+        );
+        return;
+    }
+    println!(
+        "Sandbox {sandbox}: what {} changes from {}:",
+        diff.to, diff.from
+    );
+    if diff.changes.is_empty() {
+        println!("  it grants the same");
+    }
+    for change in &diff.changes {
+        println!("  {change}");
+    }
+    for input in &diff.inputs {
+        println!("  {input}");
+    }
+}
+
+/// How a rollback or refresh went: the version in force, the pending
+/// change it made, or the restart.
+fn print_replaced(
+    engine: &Engine,
+    sandbox: &SandboxName,
+    from: &str,
+    planned: Planned<PolicyApplied>,
+) -> Result<u8> {
+    let applied = match planned {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            return Ok(exit::OK);
+        }
+        Planned::Done(applied) => applied,
+    };
+    let version = applied.version.version;
+    match (&applied.outcome, applied.changed) {
+        (ChangeOutcome::Pending(_), _) => {
+            println!("Sandbox {sandbox} keeps policy v{version} for now.")
+        }
+        (ChangeOutcome::InForce { dropped: None }, false) => {
+            println!("Sandbox {sandbox} already has that policy: v{version}, nothing changed.")
+        }
+        (_, false) => println!("Sandbox {sandbox} keeps policy v{version}."),
+        (_, true) => println!("Sandbox {sandbox} has policy v{version}, from {from}."),
+    }
+    for change in &applied.also {
+        println!("  {change}");
+    }
+    print_outcome(engine, sandbox, &applied)
 }
 
 fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {

@@ -216,6 +216,8 @@ pub struct PendingPolicy {
     pub snapshot: SnapshotId,
     pub by: Actor,
     pub at: Timestamp,
+    /// The version it restores, when it is a rollback.
+    pub restores: Option<u32>,
 }
 
 /// One entry of a sandbox's append-only policy history.

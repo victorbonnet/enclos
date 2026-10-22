@@ -25,6 +25,29 @@ use crate::policy::PolicyError;
 use crate::service::ServiceLabel;
 use crate::state::StateLock;
 
+/// A change to record with `propose`.
+pub(super) struct Change<'a> {
+    /// The `policy.toml` it was resolved from.
+    pub overrides: &'a str,
+    pub snapshot: &'a PolicySnapshot,
+    /// The destination `policy allow` adds, which applies at once.
+    pub entry: Option<&'a str>,
+    /// The version a rollback restores.
+    pub restores: Option<u32>,
+}
+
+impl<'a> Change<'a> {
+    /// `policy.toml` as a whole, as `policy edit` makes it.
+    pub fn edit(overrides: &'a str, snapshot: &'a PolicySnapshot) -> Self {
+        Change {
+            overrides,
+            snapshot,
+            entry: None,
+            restores: None,
+        }
+    }
+}
+
 /// A change once recorded, and whether it brought rules a running session
 /// keeps from its start: with `--yes`, only such a change restarts the
 /// sandbox, not one that was pending before it.
@@ -113,10 +136,14 @@ impl Engine {
         lock: &StateLock,
         by: &Actor,
         name: &SandboxName,
-        overrides: &str,
-        snapshot: &PolicySnapshot,
-        entry: Option<&str>,
+        change: Change<'_>,
     ) -> Result<Recorded> {
+        let Change {
+            overrides,
+            snapshot,
+            entry,
+            restores,
+        } = change;
         let (active_version, active) = self.active_policy(name)?;
         let before = self.state.pending_policy(name)?;
         let in_force = |version: PolicyVersion, changed: bool| Recorded {
@@ -144,7 +171,7 @@ impl Engine {
         if snapshot.policy.same_at_launch(&active.policy)
             || self.sessions_under_rules(name)?.is_empty()
         {
-            let version = self.store_policy(lock, by, name, overrides, snapshot)?;
+            let version = self.store_policy(lock, by, name, overrides, snapshot, restores)?;
             return Ok(in_force(version, true));
         }
         let base = before.as_ref().map_or(&active, |(_, s)| s);
@@ -174,7 +201,7 @@ impl Engine {
         }
         match self
             .state
-            .save_pending(lock, name, snapshot, live.as_ref(), by)
+            .save_pending(lock, name, snapshot, live.as_ref(), by, restores)
         {
             Ok((Some(version), p)) => Ok(pending(version, p, true)),
             Ok((None, p)) => Ok(pending(active_version, p, false)),
@@ -302,7 +329,7 @@ impl Engine {
                     });
                 }
                 let snapshot = self.checked_policy(name, after)?;
-                let mut recorded = self.propose(lock, by, name, after, &snapshot, None)?;
+                let mut recorded = self.propose(lock, by, name, Change::edit(after, &snapshot))?;
                 recorded.applied.also = changes;
                 Ok(recorded)
             },
@@ -538,7 +565,9 @@ impl Engine {
         let now = self.checked_policy(name, text)?;
         let pending = self.checked_policy(name, &overrides)?;
         let active = (now.id != active.id).then_some(&now);
-        let (made, _) = self.state.save_pending(lock, name, &pending, active, by)?;
+        let (made, _) = self
+            .state
+            .save_pending(lock, name, &pending, active, by, None)?;
         Ok(made.unwrap_or(version))
     }
 
@@ -559,12 +588,12 @@ impl Engine {
         }
         .filter(|now| now.id != active.id && now.policy != active.policy);
         match self.state.pending_policy(name)? {
-            Some((_, pending)) => {
+            Some((p, pending)) => {
                 let overrides = self.layout.read_policy(name.as_str())?;
                 let again = self.checked_policy(name, &overrides)?;
                 if again.id != pending.id || now.is_some() {
                     self.state
-                        .save_pending(lock, name, &again, now.as_ref(), by)?;
+                        .save_pending(lock, name, &again, now.as_ref(), by, p.restores)?;
                 }
             }
             None => {

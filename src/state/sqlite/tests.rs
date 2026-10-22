@@ -202,7 +202,7 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
 
     // A network change applies at once beside the pending one.
     let (version, saved) = store
-        .save_pending(&lock, &name, &pending, Some(&live), &by)
+        .save_pending(&lock, &name, &pending, Some(&live), &by, Some(1))
         .unwrap();
     assert_eq!(version.unwrap().version, 2);
     let (shown, stored) = store.pending_policy(&name).unwrap().unwrap();
@@ -220,14 +220,19 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
         .unwrap()
         .unwrap();
     assert_eq!(applied.version, 3);
+    assert_eq!(applied.restores, Some(1), "the rollback it was");
     assert!(store.pending_policy(&name).unwrap().is_none());
     assert_eq!(store.active_policy(&name).unwrap().unwrap().1, pending);
 
     // Dropped, or replaced by a new active version.
-    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    store
+        .save_pending(&lock, &name, &v1, None, &by, None)
+        .unwrap();
     assert!(store.discard_pending(&lock, &name).unwrap());
     assert!(!store.discard_pending(&lock, &name).unwrap());
-    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    store
+        .save_pending(&lock, &name, &v1, None, &by, None)
+        .unwrap();
     store.save_policy(&lock, &name, &live, &by, None).unwrap();
     assert!(store.pending_policy(&name).unwrap().is_none());
 }

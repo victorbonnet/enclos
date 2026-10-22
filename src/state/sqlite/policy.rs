@@ -120,7 +120,8 @@ fn append_version(
 /// Makes `pending` the sandbox's pending policy, in place of any other, and
 /// with `active` a new active version first, in one transaction: a network
 /// change made while a change is pending applies at once and is part of the
-/// pending one too (design §7).
+/// pending one too (design §7). `restores` is the version a pending
+/// rollback restores.
 pub fn save_pending(
     conn: &mut Connection,
     name: &SandboxName,
@@ -128,6 +129,7 @@ pub fn save_pending(
     active: Option<&PolicySnapshot>,
     by: &Actor,
     at: Timestamp,
+    restores: Option<u32>,
 ) -> rusqlite::Result<(Option<PolicyVersion>, PendingPolicy)> {
     let tx = conn.transaction()?;
     let version = active
@@ -135,16 +137,18 @@ pub fn save_pending(
         .transpose()?;
     insert_snapshot(&tx, pending)?;
     tx.execute(
-        "INSERT INTO pending_policies (sandbox, snapshot, by_user, by_host, at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO pending_policies (sandbox, snapshot, by_user, by_host, at, restores)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT (sandbox) DO UPDATE SET snapshot = excluded.snapshot,
-             by_user = excluded.by_user, by_host = excluded.by_host, at = excluded.at",
+             by_user = excluded.by_user, by_host = excluded.by_host, at = excluded.at,
+             restores = excluded.restores",
         params![
             name.as_str(),
             pending.id.0,
             by.user,
             by.host,
-            at.to_string()
+            at.to_string(),
+            restores
         ],
     )?;
     tx.commit()?;
@@ -154,6 +158,7 @@ pub fn save_pending(
             snapshot: pending.id.clone(),
             by: by.clone(),
             at,
+            restores,
         },
     ))
 }
@@ -178,17 +183,20 @@ pub fn apply_pending(
     at: Timestamp,
 ) -> rusqlite::Result<Option<PolicyVersion>> {
     let tx = conn.transaction()?;
-    let pending: Option<String> = tx
+    let pending: Option<(String, Option<u32>)> = tx
         .query_row(
-            "SELECT snapshot FROM pending_policies WHERE sandbox = ?1",
+            "SELECT snapshot, restores FROM pending_policies WHERE sandbox = ?1",
             params![name.as_str()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    if pending.as_deref() != Some(expected.0.as_str()) {
+    let Some((snapshot, restores)) = pending else {
+        return Ok(None);
+    };
+    if snapshot != expected.0 {
         return Ok(None);
     }
-    let version = append_version(&tx, name, expected, by, at, None)?;
+    let version = append_version(&tx, name, expected, by, at, restores)?;
     tx.commit()?;
     Ok(Some(version))
 }
@@ -259,13 +267,43 @@ pub fn active(
     Ok(Some((version, snapshot)))
 }
 
+/// Version `number` of the sandbox's policy and its snapshot.
+pub fn version_of(
+    conn: &Connection,
+    name: &SandboxName,
+    number: u32,
+) -> Result<Option<(PolicyVersion, PolicySnapshot)>, ReadError> {
+    let sql = format!(
+        "SELECT {VERSION_COLUMNS}, s.inputs, s.policy, s.overrides
+         FROM policy_versions v JOIN policy_snapshots s ON s.id = v.snapshot
+         WHERE v.sandbox = ?1 AND v.version = ?2"
+    );
+    let row = conn
+        .query_row(&sql, params![name.as_str(), number], |row| {
+            Ok((
+                version(row),
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })
+        .optional()?;
+    let Some((version, inputs, policy, overrides)) = row else {
+        return Ok(None);
+    };
+    let version = version?;
+    let snapshot = snapshot(version.snapshot.clone(), &inputs, &policy, overrides)?;
+    Ok(Some((version, snapshot)))
+}
+
 pub fn pending(
     conn: &Connection,
     name: &SandboxName,
 ) -> Result<Option<(PendingPolicy, PolicySnapshot)>, ReadError> {
     let row = conn
         .query_row(
-            "SELECT p.snapshot, p.by_user, p.by_host, p.at, s.inputs, s.policy, s.overrides
+            "SELECT p.snapshot, p.by_user, p.by_host, p.at, s.inputs, s.policy, s.overrides,
+                 p.restores
              FROM pending_policies p JOIN policy_snapshots s ON s.id = p.snapshot
              WHERE p.sandbox = ?1",
             params![name.as_str()],
@@ -278,11 +316,12 @@ pub fn pending(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<u32>>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, user, host, at, inputs, policy, overrides)) = row else {
+    let Some((id, user, host, at, inputs, policy, overrides, restores)) = row else {
         return Ok(None);
     };
     let pending = PendingPolicy {
@@ -291,6 +330,7 @@ pub fn pending(
         at: at
             .parse()
             .map_err(|e| corrupt(format!("pending policy time `{at}`: {e}")))?,
+        restores,
     };
     let snapshot = snapshot(pending.snapshot.clone(), &inputs, &policy, overrides)?;
     Ok(Some((pending, snapshot)))
