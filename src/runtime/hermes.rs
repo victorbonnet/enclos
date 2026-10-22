@@ -14,7 +14,7 @@ use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
     RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService, SandboxCommand, ServiceName,
-    Unreadable, ValueAt,
+    Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -67,6 +67,16 @@ fn hermes_id(name: &str) -> bool {
 /// A path of the home Hermes writes; every one here is a literal.
 fn at(path: &str) -> HomePath {
     HomePath::new(path).expect("a plain path inside the home")
+}
+
+/// The folder of an agent's own data. The built-in agent's is the whole
+/// home of Hermes.
+fn agent_folder(agent: &RuntimeAgentName) -> HomePath {
+    if agent.as_str() == DEFAULT_PROFILE.as_str() {
+        at(".hermes")
+    } else {
+        at(".hermes/profiles").join(agent)
+    }
 }
 
 /// Whether the entry is a link or a plain file, without following it.
@@ -179,11 +189,7 @@ impl RuntimeAdapter for Hermes {
         // The built-in agent's folder is the whole home of Hermes: the parts
         // counted on their own (runtime, caches, other profiles) leave it its
         // own data.
-        let folder = if agent.as_str() == DEFAULT_PROFILE.as_str() {
-            at(".hermes")
-        } else {
-            at(".hermes/profiles").join(agent)
-        };
+        let folder = agent_folder(agent);
         let file = |name: &str| folder.child(name).expect("a plain file name");
         AgentFacts {
             model: Some(ValueAt {
@@ -231,7 +237,26 @@ impl RuntimeAdapter for Hermes {
                 "run",
                 "--external-supervisor",
             ]),
+            // Hermes's own graceful restart for a supervised gateway: it
+            // stops taking turns, lets the running ones finish and exits
+            // (75). From outside the sandbox, so Seatbelt does not refuse it
+            // as it does `hermes gateway restart` from a `connect` session.
+            restart: Some(Signal::Usr1),
         }]
+    }
+
+    fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> {
+        // The gateway reads them as it starts: a Telegram token added to
+        // `.env` reaches Telegram only once it starts again. Agents made
+        // later are served without a restart, and watched from the next
+        // start.
+        std::iter::once(DEFAULT_PROFILE.runtime_name())
+            .chain(agents.iter().cloned())
+            .flat_map(|agent| {
+                let folder = agent_folder(&agent);
+                ["config.yaml", ".env"].map(|name| folder.child(name).expect("a plain file name"))
+            })
+            .collect()
     }
 
     fn listener(&self) -> Option<RuntimeListener> {
@@ -362,6 +387,27 @@ mod tests {
             crate::net::host::AllowEntry::parse(entry).unwrap();
             assert!(!entry.starts_with('*'), "no wildcard: {entry}");
         }
+    }
+
+    #[test]
+    fn the_gateway_restarts_gracefully_for_the_settings_of_every_agent() {
+        // Hermes's graceful restart for a supervised gateway (ADR 0031).
+        assert_eq!(Hermes.services()[0].restart, Some(Signal::Usr1));
+        let main = RuntimeAgentName::new("main").unwrap();
+        let files: Vec<String> = Hermes
+            .settings_files(&[main])
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "~/.hermes/config.yaml",
+                "~/.hermes/.env",
+                "~/.hermes/profiles/main/config.yaml",
+                "~/.hermes/profiles/main/.env",
+            ]
+        );
     }
 
     #[test]

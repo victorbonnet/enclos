@@ -2831,6 +2831,63 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
+    /// A runtime whose gateway restarts on USR1 as Hermes's does, by
+    /// exiting 75, and says when it runs.
+    #[cfg(target_os = "macos")]
+    const RESTARTS: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\" \"$HOME/.hermes\"
+printf 'model: a\\n' > \"$HOME/.hermes/config.yaml\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+[ \"$1\" = gateway ] || exit 0
+trap 'exit 75' USR1
+: > \"$HOME/gateway-up\"
+i=0
+while [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i+1)); done
+exit 0
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_service_restarts_once_its_runtime_settings_change() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
+        // A Telegram token added while the gateway runs, as the setup
+        // wizard adds it.
+        let home = lab.home.clone();
+        let edit = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !home.join("gateway-up").exists() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "no gateway"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
+        });
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        edit.join().unwrap();
+        // Not the 60 s the gateway runs for on its own.
+        assert_eq!(end.exit, 75, "{end:?}");
+        assert!(end.restarting, "{end:?}");
+        assert_eq!(
+            end.notes,
+            ["~/.hermes/.env changed: asked the gateway service to restart"],
+            "{end:?}"
+        );
+        let audit = lab.audit();
+        assert!(audit.contains("service restart"), "{audit}");
+        assert!(open_service_sessions(&lab).is_empty());
+    }
+
     /// A runtime whose gateway records whether it was launched in enclos's
     /// terminal, and exits.
     #[cfg(target_os = "macos")]

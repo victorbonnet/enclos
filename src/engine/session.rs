@@ -41,8 +41,12 @@ pub struct SessionEnd {
     /// The signal that ended the program, if one did.
     pub signal: Option<i32>,
     pub left: Left,
-    /// Problems met while recording the session's members, each said once.
+    /// Problems met while recording the session's members, and what else
+    /// enclos did while it ran, each said once.
     pub notes: Vec<String>,
+    /// Whether enclos asked the program to restart, as a service whose
+    /// runtime's settings changed (ADR 0031).
+    pub restarting: bool,
 }
 
 /// What the program left running when it exited.
@@ -130,7 +134,7 @@ impl Engine {
                 self.failed_on_error(lock, name, audit_name, started)
             })?;
 
-        let waited = self.wait_session(&session, &mut child, None)?;
+        let waited = self.wait_session(&session, &mut child, None, &mut |_| {})?;
         let mut end = self.finish_session(by, "session end", &session, waited)?;
         // Why the session could not reach its runtime's service (ADR 0028),
         // which explains a runtime's own "connection failed".
@@ -292,6 +296,7 @@ impl Engine {
             signal,
             left,
             notes: waited.notes,
+            restarting: false,
         })
     }
 
@@ -363,12 +368,16 @@ impl Engine {
     /// starts as they appear (design §8), and returns its exit status and
     /// the members it left running. Once `ended` is set, it stops every
     /// member, TERM then KILL after `STOP_GRACE` each, as `sandbox stop`
-    /// does with `GRACE`; a program that survives both is an error.
+    /// does with `GRACE`; a program that survives both is an error. Until
+    /// then, `look` runs at each look at its processes, while the program
+    /// has not been reaped, so its pid cannot have been reused, and adds
+    /// its notes to the session's.
     pub(super) fn wait_session(
         &self,
         session: &SessionRecord,
         child: &mut Child,
         ended: Option<&AtomicBool>,
+        look: &mut dyn FnMut(&mut Vec<String>),
     ) -> Result<Waited> {
         let lost = |e: std::io::Error| Error::Session {
             what: format!("lost the session's program: {e}"),
@@ -447,6 +456,9 @@ impl Engine {
                         Ok(None) => {}
                         Err(e) => note(&mut notes, format!("could not record its members: {e}")),
                     }
+                }
+                if stopping.is_none() {
+                    look(&mut notes);
                 }
             }
             std::thread::sleep(EXIT_POLL);
@@ -926,7 +938,7 @@ fn last_log_line(path: &std::path::Path) -> String {
     }
 }
 
-fn note(notes: &mut Vec<String>, note: String) {
+pub(super) fn note(notes: &mut Vec<String>, note: String) {
     if !notes.contains(&note) {
         notes.push(note);
     }

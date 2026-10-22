@@ -416,6 +416,8 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+        // As the program will read them as it starts (ADR 0031).
+        let mut watch = self.settings_watch(name, kind, service);
         let summary = |(session, _, replaced): &(SessionRecord, _, Vec<SessionId>)| {
             let earlier = replaced_earlier(service, replaced);
             match earlier {
@@ -457,16 +459,49 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
+        // Once the runtime's settings change, the program is asked to
+        // restart, once: it exits, and the service manager starts it again.
+        let mut restarting = false;
+        let mut look = |notes: &mut Vec<String>| {
+            let Some((settings, signal)) = watch.as_mut() else {
+                return;
+            };
+            let Some(changed) = settings.settled(Instant::now()) else {
+                return;
+            };
+            let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
+            let files = files.join(", ");
+            let asked = match self.ask_restart(by, &session, *signal, &changed) {
+                // Another command holds the lock: the next look asks.
+                Ok(None) => return,
+                Ok(Some(Ok(()))) => {
+                    restarting = true;
+                    format!("{files} changed: asked the {service} service to restart")
+                }
+                Ok(Some(Err(why))) => {
+                    format!(
+                        "{files} changed, but the {service} service was not asked to restart: {why}"
+                    )
+                }
+                Err(e) => format!(
+                    "{files} changed, but the {service} service was not asked to restart: {e}"
+                ),
+            };
+            super::session::note(notes, asked);
+            watch = None;
+        };
         // As for `connect`, the members the service starts are recorded.
         // Unlike `connect`, what it leaves running is stopped: under a
         // service manager the service is its program, which the manager
         // starts again, and what it last left would run beside it.
-        let mut waited = match self.wait_session(&session, &mut child, Some(ended)) {
+        let mut waited = match self.wait_session(&session, &mut child, Some(ended), &mut look) {
             Ok(waited) => waited,
             Err(error) => return Err(self.record_unended(by, "service end", &session, error)),
         };
         self.stop_left(&session, &mut waited);
-        self.finish_session(by, "service end", &session, waited)
+        let mut end = self.finish_session(by, "service end", &session, waited)?;
+        end.restarting = restarting;
+        Ok(end)
     }
 
     /// Starts the service's `program` in the sandbox and records it as a
@@ -742,6 +777,7 @@ mod tests {
         let service = |name| RuntimeService {
             name: ServiceName::new(name),
             command: SandboxCommand::from_words(&["x"]),
+            restart: None,
         };
         assert_eq!(Engine::units_for(&[]), [Unit::Proxy]);
         assert_eq!(
