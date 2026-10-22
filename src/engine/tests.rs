@@ -3084,6 +3084,12 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         ));
         let first = Stopped::Survivors(vec![survivor(3, Why::NotSignalled)]);
         assert!(matches!(merged(first, Stopped::Gone), Stopped::Clean));
+        // One only counted that still runs stays reported, never signalled.
+        let first = Stopped::Survivors(vec![survivor(1, Why::NotSignalled)]);
+        let Stopped::Survivors(left) = merged(first, Stopped::Gone) else {
+            panic!("a counted survivor still running was dropped");
+        };
+        assert_eq!(left, [survivor(1, Why::NotSignalled)]);
     }
 
     /// A process holding one session's marker is that session's member,
