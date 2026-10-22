@@ -38,6 +38,12 @@ pub enum Reason {
     /// Allowed, then closed by the proxy: no byte moved either way, or a
     /// peer read nothing, for the idle limit (design §6).
     Idle,
+    /// A tunnel whose TLS ClientHello asks for another server than the
+    /// host it was opened for: closed by the server name check (design §6).
+    NameMismatch,
+    /// A tunnel whose first bytes start a TLS handshake that does not read
+    /// as a ClientHello: closed, since the name it asks for is unknown.
+    HelloUnreadable,
 }
 
 impl Reason {
@@ -51,6 +57,8 @@ impl Reason {
             Reason::BadRequest => "bad-request",
             Reason::PolicyUnreadable => "policy-unreadable",
             Reason::Idle => "idle",
+            Reason::NameMismatch => "name-mismatch",
+            Reason::HelloUnreadable => "hello-unreadable",
         }
     }
 
@@ -59,8 +67,13 @@ impl Reason {
     /// so a new one has to decide.
     pub fn nothing_to_allow(self) -> bool {
         match self {
-            // A bad request is refused whatever the policy says.
-            Reason::PolicyUnreadable | Reason::BadRequest => true,
+            // A bad request is refused whatever the policy says, and a
+            // tunnel naming another server whatever host it was opened for:
+            // allowing that server lets it be reached directly, not this way.
+            Reason::PolicyUnreadable
+            | Reason::BadRequest
+            | Reason::NameMismatch
+            | Reason::HelloUnreadable => true,
             Reason::NotAllowed
             | Reason::BlockedAddress
             | Reason::PrivateAddress
@@ -70,7 +83,7 @@ impl Reason {
         }
     }
 
-    const ALL: [Reason; 8] = [
+    const ALL: [Reason; 10] = [
         Reason::NotAllowed,
         Reason::BlockedAddress,
         Reason::PrivateAddress,
@@ -79,7 +92,57 @@ impl Reason {
         Reason::BadRequest,
         Reason::PolicyUnreadable,
         Reason::Idle,
+        Reason::NameMismatch,
+        Reason::HelloUnreadable,
     ];
+}
+
+/// What the client's first bytes on a tunnel said about the server it asks
+/// for, as the server name check read them (design §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSeen {
+    /// A TLS ClientHello naming a server: the event's `server_name`.
+    Name,
+    /// A TLS ClientHello naming none.
+    NoName,
+    /// A TLS ClientHello hiding the name it asks for (Encrypted Client
+    /// Hello); `server_name` is the public name it shows, if any.
+    Encrypted,
+    /// Not TLS: another protocol, which the check leaves alone.
+    NotTls,
+    /// A TLS handshake that does not read as a ClientHello.
+    Unreadable,
+}
+
+impl NameSeen {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NameSeen::Name => "name",
+            NameSeen::NoName => "no-name",
+            NameSeen::Encrypted => "encrypted",
+            NameSeen::NotTls => "not-tls",
+            NameSeen::Unreadable => "unreadable",
+        }
+    }
+
+    const ALL: [NameSeen; 5] = [
+        NameSeen::Name,
+        NameSeen::NoName,
+        NameSeen::Encrypted,
+        NameSeen::NotTls,
+        NameSeen::Unreadable,
+    ];
+}
+
+impl FromStr for NameSeen {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NameSeen::ALL
+            .into_iter()
+            .find(|n| n.as_str() == s)
+            .ok_or_else(|| format!("unknown server name outcome `{s}`"))
+    }
 }
 
 impl fmt::Display for Reason {
@@ -126,6 +189,11 @@ pub struct NetEvent {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub duration_ms: u64,
+    /// For a tunnel, what its first bytes said about the server it asks
+    /// for; none for plain HTTP, and before they are read.
+    pub name_seen: Option<NameSeen>,
+    /// The server name its ClientHello showed, when one did.
+    pub server_name: Option<String>,
 }
 
 /// One destination the proxy refused, with how often and when.
@@ -163,6 +231,8 @@ mod tests {
                 Reason::BadRequest => 5,
                 Reason::PolicyUnreadable => 6,
                 Reason::Idle => 7,
+                Reason::NameMismatch => 8,
+                Reason::HelloUnreadable => 9,
             }
         }
         for (i, reason) in Reason::ALL.into_iter().enumerate() {
@@ -174,6 +244,9 @@ mod tests {
     fn reasons_round_trip_through_their_names() {
         for reason in Reason::ALL {
             assert_eq!(reason.as_str().parse::<Reason>(), Ok(reason));
+        }
+        for seen in NameSeen::ALL {
+            assert_eq!(seen.as_str().parse::<NameSeen>(), Ok(seen));
         }
     }
 }

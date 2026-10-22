@@ -4,7 +4,7 @@ use rusqlite::{Connection, Row, params};
 
 use super::policy::ReadError;
 use crate::model::Timestamp;
-use crate::model::net::{DeniedDestination, NetEvent, Reason, Verdict};
+use crate::model::net::{DeniedDestination, NameSeen, NetEvent, Reason, Verdict};
 use crate::model::sandbox::SandboxName;
 
 /// Times in one fixed width, so that comparing them as text, as SQLite does,
@@ -16,8 +16,8 @@ fn fixed(t: Timestamp) -> String {
 pub fn record(conn: &Connection, e: &NetEvent) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO net_events (at, sandbox, host, port, method, address, verdict,
-             reason, bytes_up, bytes_down, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             reason, bytes_up, bytes_down, duration_ms, name_seen, server_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             fixed(e.at),
             e.sandbox.as_str(),
@@ -30,14 +30,20 @@ pub fn record(conn: &Connection, e: &NetEvent) -> rusqlite::Result<i64> {
             e.bytes_up as i64,
             e.bytes_down as i64,
             e.duration_ms as i64,
+            e.name_seen.map(|n| n.as_str()),
+            e.server_name,
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+/// Fills in what a connection's record learns as it closes: its bytes,
+/// duration and reason, what its first bytes said about the server, and
+/// its verdict, which the server name check may turn to denied.
 pub fn finish(conn: &Connection, row: i64, e: &NetEvent) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE net_events SET bytes_up = ?2, bytes_down = ?3, duration_ms = ?4, reason = ?5
+        "UPDATE net_events SET bytes_up = ?2, bytes_down = ?3, duration_ms = ?4, reason = ?5,
+             verdict = ?6, name_seen = ?7, server_name = ?8
          WHERE id = ?1",
         params![
             row,
@@ -45,6 +51,9 @@ pub fn finish(conn: &Connection, row: i64, e: &NetEvent) -> rusqlite::Result<()>
             e.bytes_down as i64,
             e.duration_ms as i64,
             e.reason.map(|r| r.as_str()),
+            verdict_text(e.verdict),
+            e.name_seen.map(|n| n.as_str()),
+            e.server_name,
         ],
     )?;
     Ok(())
@@ -89,6 +98,11 @@ fn event(row: &Row<'_>) -> Result<NetEvent, ReadError> {
         bytes_up: row.get::<_, i64>(8)? as u64,
         bytes_down: row.get::<_, i64>(9)? as u64,
         duration_ms: row.get::<_, i64>(10)? as u64,
+        name_seen: row
+            .get::<_, Option<String>>(11)?
+            .map(|t| t.parse::<NameSeen>().map_err(corrupt))
+            .transpose()?,
+        server_name: row.get(12)?,
     })
 }
 
@@ -99,7 +113,7 @@ pub fn events(
 ) -> Result<Vec<NetEvent>, ReadError> {
     let mut stmt = conn.prepare(
         "SELECT at, sandbox, host, port, method, address, verdict, reason,
-                bytes_up, bytes_down, duration_ms
+                bytes_up, bytes_down, duration_ms, name_seen, server_name
          FROM net_events
          WHERE sandbox = ?1 AND (?2 IS NULL OR at >= ?2)
          ORDER BY at, id",

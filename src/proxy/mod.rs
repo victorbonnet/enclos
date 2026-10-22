@@ -8,6 +8,7 @@
 //! `enclos policy allow` applies without a restart.
 
 pub mod decide;
+mod hello;
 pub mod request;
 mod server;
 

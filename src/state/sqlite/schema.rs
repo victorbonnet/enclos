@@ -95,6 +95,10 @@ pub const MIGRATIONS: &[&str] = &[
         updated_at TEXT NOT NULL,
         PRIMARY KEY (sandbox, name)
     ) STRICT;",
+    // 9: what a tunnel's first bytes said about the server it asks for
+    // (design §6, server name check)
+    "ALTER TABLE net_events ADD COLUMN name_seen TEXT;
+    ALTER TABLE net_events ADD COLUMN server_name TEXT;",
 ];
 
 /// The schema version this enclos reads and writes.
