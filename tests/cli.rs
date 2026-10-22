@@ -419,6 +419,78 @@ fn editor(home: &Home, script: &str) -> String {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn policy_history_diff_rollback_and_refresh() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["policy", "allow", "home", "a.example.com"]).ok();
+    home.run(&["policy", "allow", "home", "b.example.com"]).ok();
+
+    let history = home.run(&["policy", "history", "home"]).ok().stdout();
+    let row = |v: &str| {
+        history
+            .lines()
+            .find(|l| l.trim_start().starts_with(v))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(
+        !row("v1").is_empty() && !row("v2").contains("in force"),
+        "{history}"
+    );
+    assert!(row("v3").ends_with("in force"), "{history}");
+    let diff = home.run(&["policy", "diff", "home"]).ok().stdout();
+    assert!(diff.contains("what v3 changes from v2"), "{diff}");
+    assert!(diff.contains("allow b.example.com"), "{diff}");
+    let diff = home
+        .run(&["policy", "diff", "home", "--from", "1", "--to", "1"])
+        .ok()
+        .stdout();
+    assert!(diff.contains("grants the same"), "{diff}");
+
+    let out = home
+        .run(&["policy", "rollback", "home", "--to", "1"])
+        .ok()
+        .stdout();
+    assert!(out.contains("policy v4, from v1"), "{out}");
+    assert!(out.contains("stop allowing a.example.com"), "{out}");
+    let history = home.run(&["policy", "history", "home"]).ok().stdout();
+    assert!(history.contains("in force; restores v1"), "{history}");
+    let shown = home.run(&["policy", "show", "home"]).ok().stdout();
+    assert!(shown.contains("allowed: nothing listed"), "{shown}");
+
+    let out = home.run(&["policy", "refresh", "home"]).ok().stdout();
+    assert!(out.contains("nothing changed"), "{out}");
+    let out = home.run(&["policy", "rollback", "home", "--to", "9"]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains("no policy v9"), "{}", out.stderr());
+
+    // An edit of policy.toml by hand stops a rollback, and `policy edit`
+    // closed as it is applies it, as the refusal says.
+    let file = home.root.join("sandboxes/home/policy.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("allow_add = []", "allow_add = [\"d.example.com\"]"),
+    )
+    .unwrap();
+    let out = home.run(&["policy", "rollback", "home", "--to", "2"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("holds an edit not applied"),
+        "{}",
+        out.stderr()
+    );
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL")
+        .env("EDITOR", editor(&home, "true"));
+    let out = Run(edit.output().unwrap());
+    assert!(out.ok().stdout().contains("policy v5"), "{}", out.stdout());
+    home.run(&["policy", "rollback", "home", "--to", "2"]).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     let home = Home::new();
     home.init(1);

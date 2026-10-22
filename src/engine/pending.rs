@@ -1,8 +1,8 @@
 //! The pending policy (design §7): a change to the rules a running session
 //! keeps from its start waits until `policy apply`, or the change made with
-//! `--yes`, restarts the sandbox into it. `policy allow` and `policy edit`
-//! record their change through `propose`, and `policy discard` drops what
-//! waits.
+//! `--yes`, restarts the sandbox into it. `policy allow`, `edit`, `rollback`
+//! and `refresh` record their change through `propose`, and `policy
+//! discard` drops what waits.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -24,6 +24,30 @@ use crate::model::session::SessionRecord;
 use crate::policy::PolicyError;
 use crate::service::ServiceLabel;
 use crate::state::StateLock;
+
+/// A change to record with `propose`.
+pub(super) struct Change<'a> {
+    /// The `policy.toml` it was resolved from.
+    pub overrides: &'a str,
+    pub snapshot: &'a PolicySnapshot,
+    /// The destination `policy allow` adds, which goes in force at once
+    /// when it can (see `propose`).
+    pub entry: Option<&'a str>,
+    /// The version a rollback restores.
+    pub restores: Option<u32>,
+}
+
+impl<'a> Change<'a> {
+    /// `policy.toml` as a whole, as `policy edit` makes it.
+    pub fn edit(overrides: &'a str, snapshot: &'a PolicySnapshot) -> Self {
+        Change {
+            overrides,
+            snapshot,
+            entry: None,
+            restores: None,
+        }
+    }
+}
 
 /// A change once recorded, and whether it brought rules a running session
 /// keeps from its start: with `--yes`, only such a change restarts the
@@ -113,10 +137,14 @@ impl Engine {
         lock: &StateLock,
         by: &Actor,
         name: &SandboxName,
-        overrides: &str,
-        snapshot: &PolicySnapshot,
-        entry: Option<&str>,
+        change: Change<'_>,
     ) -> Result<Recorded> {
+        let Change {
+            overrides,
+            snapshot,
+            entry,
+            restores,
+        } = change;
         let (active_version, active) = self.active_policy(name)?;
         let before = self.state.pending_policy(name)?;
         let in_force = |version: PolicyVersion, changed: bool| Recorded {
@@ -144,7 +172,7 @@ impl Engine {
         if snapshot.policy.same_at_launch(&active.policy)
             || self.sessions_under_rules(name)?.is_empty()
         {
-            let version = self.store_policy(lock, by, name, overrides, snapshot)?;
+            let version = self.store_policy(lock, by, name, overrides, snapshot, restores)?;
             return Ok(in_force(version, true));
         }
         let base = before.as_ref().map_or(&active, |(_, s)| s);
@@ -164,17 +192,24 @@ impl Engine {
             },
             restarts,
         };
+        // A pending rollback stays one when only network rules join it: the
+        // change is re-resolved with them (design §7).
+        let restores = match (&before, restarts) {
+            (Some((p, _)), false) if restores.is_none() => p.restores,
+            _ => restores,
+        };
         let previous = self.layout.read_policy(name.as_str())?;
         self.layout.write_policy(name.as_str(), overrides)?;
         if live.is_none()
             && let Some((p, s)) = &before
             && s.id == snapshot.id
+            && p.restores == restores
         {
             return Ok(pending(active_version, p.clone(), false));
         }
         match self
             .state
-            .save_pending(lock, name, snapshot, live.as_ref(), by)
+            .save_pending(lock, name, snapshot, live.as_ref(), by, restores)
         {
             Ok((Some(version), p)) => Ok(pending(version, p, true)),
             Ok((None, p)) => Ok(pending(active_version, p, false)),
@@ -293,7 +328,7 @@ impl Engine {
             by,
             "policy edit",
             Some(name.to_string()),
-            |r: &Recorded| edit_summary(&r.applied),
+            |r: &Recorded| change_summary(&r.applied),
             |lock| {
                 if self.layout.read_policy(name.as_str())? != before {
                     return Err(Error::PolicyFileChanged {
@@ -302,7 +337,7 @@ impl Engine {
                     });
                 }
                 let snapshot = self.checked_policy(name, after)?;
-                let mut recorded = self.propose(lock, by, name, after, &snapshot, None)?;
+                let mut recorded = self.propose(lock, by, name, Change::edit(after, &snapshot))?;
                 recorded.applied.also = changes;
                 Ok(recorded)
             },
@@ -514,57 +549,46 @@ impl Engine {
     }
 
     /// After a failed `runtime install`, resolves the sandbox's policy again
-    /// with the runtime its record has, keeping a change that became pending
-    /// while the installer ran pending: the active policy is resolved from
-    /// its own `policy.toml`, and the pending one from the file.
+    /// with the runtime its record has, as [`Engine::resolve_with_runtime`]
+    /// does: a change that became pending while the installer ran stays
+    /// pending, and an edit of the file not applied stays as it is.
+    /// Returns the version in force.
     pub(super) fn resolve_again(
         &self,
         lock: &StateLock,
         by: &Actor,
         name: &SandboxName,
     ) -> Result<PolicyVersion> {
-        let overrides = self.layout.read_policy(name.as_str())?;
-        if self.state.pending_policy(name)?.is_none() {
-            return self.save_policy(lock, by, name, &overrides);
-        }
-        let (version, active) = self.active_policy(name)?;
-        let text = active
-            .overrides_text()
-            .ok_or_else(|| Error::PolicyTextUnknown {
-                sandbox: name.to_string(),
-                version: version.version,
-                file: self.layout.policy_file(name.as_str()),
-            })?;
-        let now = self.checked_policy(name, text)?;
-        let pending = self.checked_policy(name, &overrides)?;
-        let active = (now.id != active.id).then_some(&now);
-        let (made, _) = self.state.save_pending(lock, name, &pending, active, by)?;
-        Ok(made.unwrap_or(version))
+        self.resolve_with_runtime(lock, by, name)?;
+        Ok(self.active_policy(name)?.0)
     }
 
-    /// Once a runtime is recorded as installed, resolves again what a change
-    /// made while its installer ran resolved without its destinations: the
-    /// active policy from its own `policy.toml`, and a pending one from the
-    /// file. Nothing else changes: the file is not resolved on its own.
+    /// Once a runtime is recorded as installed, or after an install failed,
+    /// resolves again what was resolved with another runtime's destinations:
+    /// the active policy and a pending one, each from its own `policy.toml`
+    /// (the file's when that text is not known). A pending rollback keeps
+    /// what it restores. An edit of the file not applied stays as it is.
     pub(super) fn resolve_with_runtime(
         &self,
         lock: &StateLock,
         by: &Actor,
         name: &SandboxName,
     ) -> Result<()> {
+        let own_text = |snapshot: &PolicySnapshot| -> Result<String> {
+            match snapshot.overrides_text() {
+                Some(text) => Ok(text.to_owned()),
+                None => Ok(self.layout.read_policy(name.as_str())?),
+            }
+        };
         let (_, active) = self.active_policy(name)?;
-        let now = match active.overrides_text() {
-            Some(text) => Some(self.checked_policy(name, text)?),
-            None => None,
-        }
-        .filter(|now| now.id != active.id && now.policy != active.policy);
+        let now = self.checked_policy(name, &own_text(&active)?)?;
+        let now = (now.id != active.id && now.policy != active.policy).then_some(now);
         match self.state.pending_policy(name)? {
-            Some((_, pending)) => {
-                let overrides = self.layout.read_policy(name.as_str())?;
-                let again = self.checked_policy(name, &overrides)?;
+            Some((p, pending)) => {
+                let again = self.checked_policy(name, &own_text(&pending)?)?;
                 if again.id != pending.id || now.is_some() {
                     self.state
-                        .save_pending(lock, name, &again, now.as_ref(), by)?;
+                        .save_pending(lock, name, &again, now.as_ref(), by, p.restores)?;
                 }
             }
             None => {
@@ -825,7 +849,7 @@ fn sessions(n: usize) -> String {
     }
 }
 
-fn edit_summary(applied: &PolicyApplied) -> String {
+pub(super) fn change_summary(applied: &PolicyApplied) -> String {
     let changes = match applied.also.len() {
         0 => String::new(),
         _ => format!(": {}", applied.also.join("; ")),

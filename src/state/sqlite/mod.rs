@@ -378,6 +378,15 @@ impl StateStore for SqliteStateStore {
         policy::history(&conn, name).map_err(|e| self.read_err(e))
     }
 
+    fn policy_version(
+        &self,
+        name: &SandboxName,
+        number: u32,
+    ) -> Result<Option<(PolicyVersion, PolicySnapshot)>> {
+        let conn = self.open()?;
+        policy::version_of(&conn, name, number).map_err(|e| self.read_err(e))
+    }
+
     fn save_pending(
         &self,
         _lock: &StateLock,
@@ -385,9 +394,11 @@ impl StateStore for SqliteStateStore {
         pending: &PolicySnapshot,
         active: Option<&PolicySnapshot>,
         by: &Actor,
+        restores: Option<u32>,
     ) -> Result<(Option<PolicyVersion>, PendingPolicy)> {
         let mut conn = self.open()?;
-        policy::save_pending(&mut conn, name, pending, active, by, now()).map_err(self.sqlite_err())
+        policy::save_pending(&mut conn, name, pending, active, by, now(), restores)
+            .map_err(self.sqlite_err())
     }
 
     fn pending_policy(

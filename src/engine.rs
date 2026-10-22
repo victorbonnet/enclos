@@ -6,6 +6,7 @@
 //! (`remove_services`).
 
 mod compile;
+mod history;
 mod import;
 mod listener;
 mod net;
@@ -21,6 +22,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};

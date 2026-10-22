@@ -183,6 +183,44 @@ fn policy_versions_append_and_identical_snapshots_are_stored_once() {
 }
 
 #[test]
+fn a_version_is_read_from_its_own_sandbox_and_a_replaced_rollback_restores_nothing() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let (a, b): (SandboxName, SandboxName) = ("home".parse().unwrap(), "lab".parse().unwrap());
+    store.put(&lock, &record("home")).unwrap();
+    store.put(&lock, &record("lab")).unwrap();
+    let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
+    let (one, two) = (
+        resolve("extends = \"assistant\"\n"),
+        resolve("[network]\nallow_add = [\"b.example.com\"]\n"),
+    );
+    store.save_policy(&lock, &a, &one, &by, None).unwrap();
+    store.save_policy(&lock, &b, &one, &by, None).unwrap();
+    store.save_policy(&lock, &b, &two, &by, None).unwrap();
+    assert_eq!(store.policy_version(&b, 2).unwrap().unwrap().1, two);
+    assert!(store.policy_version(&a, 2).unwrap().is_none());
+
+    store
+        .save_pending(&lock, &a, &two, None, &by, Some(1))
+        .unwrap();
+    store
+        .save_pending(&lock, &a, &two, None, &by, None)
+        .unwrap();
+    assert_eq!(store.pending_policy(&a).unwrap().unwrap().0.restores, None);
+    let applied = store
+        .apply_pending(&lock, &a, &two.id, &by)
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.restores, None);
+}
+
+#[test]
 fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
     use crate::model::audit::Actor;
     let (_dir, store) = store();
@@ -202,7 +240,7 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
 
     // A network change applies at once beside the pending one.
     let (version, saved) = store
-        .save_pending(&lock, &name, &pending, Some(&live), &by)
+        .save_pending(&lock, &name, &pending, Some(&live), &by, Some(1))
         .unwrap();
     assert_eq!(version.unwrap().version, 2);
     let (shown, stored) = store.pending_policy(&name).unwrap().unwrap();
@@ -220,14 +258,19 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
         .unwrap()
         .unwrap();
     assert_eq!(applied.version, 3);
+    assert_eq!(applied.restores, Some(1), "the rollback it was");
     assert!(store.pending_policy(&name).unwrap().is_none());
     assert_eq!(store.active_policy(&name).unwrap().unwrap().1, pending);
 
     // Dropped, or replaced by a new active version.
-    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    store
+        .save_pending(&lock, &name, &v1, None, &by, None)
+        .unwrap();
     assert!(store.discard_pending(&lock, &name).unwrap());
     assert!(!store.discard_pending(&lock, &name).unwrap());
-    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    store
+        .save_pending(&lock, &name, &v1, None, &by, None)
+        .unwrap();
     store.save_policy(&lock, &name, &live, &by, None).unwrap();
     assert!(store.pending_policy(&name).unwrap().is_none());
 }
