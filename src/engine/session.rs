@@ -564,6 +564,11 @@ impl Engine {
                     changes.push(format!(
                         "start the services of sandbox {name}, since its runtime's clients need its {service} (ADR 0028); they start again at each login until `enclos sandbox stop {name}`"
                     ));
+                    if self.proxy_runs(name)? {
+                        changes.push(format!(
+                            "start the running proxy of sandbox {name} again as a service, which cuts the connections of its open sessions"
+                        ));
+                    }
                     changes.push(format!("wait for the {service} to listen"));
                 }
             }

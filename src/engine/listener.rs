@@ -169,9 +169,10 @@ pub(super) enum ConnectStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceWait {
     pub service: String,
-    /// Whether it started the sandbox's services: false when the service
-    /// was installed already, or one could not tell whether the runtime is
-    /// there.
+    /// Whether it started the sandbox's services: false when it only
+    /// waited (the service was installed, or a session of it was open),
+    /// when the start failed, or when whether the runtime is there could
+    /// not be told.
     pub started: bool,
     /// Why the service was not listening when the wait ended, if it was not:
     /// it did not listen in time, its port cannot be told, its services
@@ -245,7 +246,8 @@ impl Engine {
     /// session (ADR 0028): Hermes's chat no longer starts a gateway of its
     /// own, which could not reach it, and a session reaches the service only
     /// on the port it held when the session started. Starts the sandbox's
-    /// services when nothing of it is installed, then waits for the service
+    /// services when its service is not installed and does not run, which
+    /// replaces a proxy service already installed, then waits for the service
     /// to listen, saying what it does through `say` before it waits. It
     /// gives up sooner while no session of the service is open, as when it
     /// exits at once, and at once for what waiting does not fix (several
@@ -287,8 +289,9 @@ impl Engine {
             ConnectStep::Unreadable(why) => return done(false, Some(why)),
             ConnectStep::Wait => false,
             ConnectStep::Start => {
-                // The proxy an earlier `connect` started gives way to the
-                // proxy service, on the same port.
+                // A running proxy, one an earlier `connect` started or the
+                // proxy service, gives way to the proxy service installed
+                // now, on the same port.
                 let cut = match self.proxy_runs(name)? {
                     true => {
                         " Its proxy starts again as a service, so the connections of its open sessions are cut."
@@ -298,8 +301,19 @@ impl Engine {
                 say(format!(
                     "starting the services of sandbox {name}, since its runtime's clients need its {service}. They start again at each login until `enclos sandbox stop {name}`.{cut}"
                 ));
+                // A start that fails removes every service it replaced.
+                let had_proxy = self.unit_installed(name, Unit::Proxy)?;
                 if let Err(e) = self.start_sandbox(by, name) {
-                    return done(false, Some(format!("its services could not start: {e}")));
+                    let lost = match had_proxy {
+                        true => format!(
+                            "; its proxy service was removed with them and no longer starts at login, until `enclos sandbox start {name}`"
+                        ),
+                        false => String::new(),
+                    };
+                    return done(
+                        false,
+                        Some(format!("its services could not start: {e}{lost}")),
+                    );
                 }
                 true
             }
