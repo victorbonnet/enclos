@@ -202,12 +202,10 @@ pub fn processes() -> Result<Vec<Proc>, PsError> {
 pub enum Signal {
     Term,
     Kill,
-    /// What some runtimes take as "restart gracefully" (ADR 0031).
     Usr1,
 }
 
 impl Signal {
-    /// As `kill -s` names it.
     pub fn name(self) -> &'static str {
         match self {
             Signal::Term => "TERM",

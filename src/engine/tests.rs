@@ -2831,8 +2831,7 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
-    /// A runtime whose gateway restarts on USR1 as Hermes's does, by
-    /// exiting 75, and says when it runs.
+    /// A gateway that exits 75 on USR1, as Hermes's does.
     #[cfg(target_os = "macos")]
     const RESTARTS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\" \"$HOME/.hermes\"
@@ -2855,8 +2854,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let lab = Lab::new();
         assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
-        // A Telegram token added while the gateway runs, as the setup
-        // wizard adds it.
         let home = lab.home.clone();
         let edit = std::thread::spawn(move || {
             let start = std::time::Instant::now();
@@ -2875,7 +2872,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap();
         edit.join().unwrap();
-        // Not the 60 s the gateway runs for on its own.
         assert_eq!(end.exit, 75, "{end:?}");
         assert!(end.restarting, "{end:?}");
         assert_eq!(
@@ -2907,13 +2903,11 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             let mode = |m| std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(m));
-            // The audit entry cannot be written: no restart is asked.
             mode(0o400).unwrap();
             std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
-            // Room for the attempt, 5 to 9 s after the write, on a slow host.
+            // The failed attempt comes 5 to 9 s after the write.
             std::thread::sleep(std::time::Duration::from_secs(20));
             mode(0o600).unwrap();
-            // The next change is asked for.
             std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=y\n").unwrap();
         });
         let ended = std::sync::atomic::AtomicBool::new(false);
@@ -2967,8 +2961,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         // Stands for the service's program: USR1 ends a `sleep`.
         let mut service = sleep();
         let service_session = record(&service, crate::model::session::SessionKind::Service);
-        // A `connect` that recorded its session just before the restart
-        // takes the lock, as it does under the lock.
         let mut connected = sleep();
         {
             let lock = lab.engine.state.lock().unwrap();
@@ -3021,7 +3013,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let lab = Lab::new();
         assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
-        // Someone in the runtime's setup, as `connect` records it.
         let mut setup = std::process::Command::new("/bin/sleep")
             .arg("60")
             .process_group(0)
@@ -3049,8 +3040,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 .start_session(&lock, &session, &record)
                 .unwrap();
         }
-        // The setup saves an answer, and the person takes longer than the
-        // settling time over the next one before leaving.
+        // Connected for longer than `SETTLE` after the change.
         let home = lab.home.clone();
         let edit = std::thread::spawn(move || {
             let start = std::time::Instant::now();

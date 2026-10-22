@@ -1,8 +1,4 @@
-//! A runtime service restarts when its runtime's settings change (ADR
-//! 0031): `launch` reads the settings files while the service runs, and
-//! once one has changed and stayed the same a while, sends the program the
-//! runtime's restart signal. The program exits, and the service manager
-//! starts it again.
+//! Restarts a runtime service once its settings files change (ADR 0031).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,42 +14,28 @@ use crate::runtime::home::read_text;
 use crate::runtime::{HomePath, Signal, Unreadable, adapter};
 use crate::state::StateLock;
 
-/// How often the files are read.
 const READ_EVERY: Duration = Duration::from_secs(2);
-/// How long a change stays the same before the service restarts: setting
-/// Hermes up writes `.env` and `config.yaml` one after the other.
+/// Hermes's setup writes `.env` and `config.yaml` one after the other.
 const SETTLE: Duration = Duration::from_secs(5);
-/// The most of one file read; a larger one counts as too large, by that
-/// reason, however it changes.
 const MAX_SETTINGS: u64 = 1024 * 1024;
-/// How long after a restart that was not sent it is asked again, when the
-/// files do not change meanwhile, doubled after each failure up to
-/// `RETRY_MAX`: a failure that lasts does not fill the audit log.
+/// Doubled after each failure, so one that lasts does not fill the audit log.
 const RETRY: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(64 * 60);
 
-/// One file as read: its text, `None` when it is not there, or why it
-/// could not be read.
 type Read = std::result::Result<Option<String>, Unreadable>;
 
-/// The settings files of a sandbox home, as the service started with them.
 pub(super) struct SettingsWatch {
     home: PathBuf,
     files: Vec<HomePath>,
     started: Vec<Read>,
-    /// The last read that differed from `started`, and when it was first
-    /// read so.
+    /// The last read that differs from `started`, and since when.
     changed: Option<(Vec<Read>, Instant)>,
     read_at: Option<Instant>,
-    /// When the change is asked for again, after a restart that was not
-    /// sent.
     retry_at: Option<Instant>,
-    /// How long the next failure waits.
     retry: Duration,
 }
 
 impl SettingsWatch {
-    /// Reads `files` in `home` as they are now. `None` when there are none.
     pub(super) fn new(home: PathBuf, files: Vec<HomePath>) -> Option<SettingsWatch> {
         if files.is_empty() {
             return None;
@@ -70,12 +52,7 @@ impl SettingsWatch {
         })
     }
 
-    /// The files that differ from when the service started, once they have
-    /// read the same for `SETTLE`; `None` until then. Reads them at most
-    /// every `READ_EVERY`. A file changed and changed back counts as not
-    /// changed. After [`SettingsWatch::failed`], the same change is
-    /// answered again only after the retry delay; a new one, once it has
-    /// settled.
+    /// The files that differ from the start, once unchanged for `SETTLE`.
     pub(super) fn settled(&mut self, now: Instant) -> Option<Vec<HomePath>> {
         if self
             .read_at
@@ -112,7 +89,6 @@ impl SettingsWatch {
         }
     }
 
-    /// The restart `settled` answered was not sent at `now`.
     pub(super) fn failed(&mut self, now: Instant) {
         self.retry_at = Some(now + self.retry);
         self.retry = (self.retry * 2).min(RETRY_MAX);
@@ -127,10 +103,7 @@ fn read_all(home: &Path, files: &[HomePath]) -> Vec<Read> {
 }
 
 impl Engine {
-    /// What restarts the `service` of sandbox `name` when its settings
-    /// change: the files read now, and the signal. `None` when the service
-    /// has no restart signal or the runtime names no file. Agents that
-    /// cannot be listed leave the built-in agent's files only.
+    /// `None` when the service has no restart signal or its runtime no files.
     pub(super) fn settings_watch(
         &self,
         name: &SandboxName,
@@ -149,13 +122,9 @@ impl Engine {
         Some((watch, signal))
     }
 
-    /// Whether a person may still be changing the runtime's settings in
-    /// sandbox `name`: an interactive session's program still runs there,
-    /// such as the runtime's setup, which saves each answer as it is given,
-    /// or its TUI, which the service serves and a restart would cut off. A
-    /// program that cannot be looked at counts as running. Asked under the
-    /// state lock, under which `connect` starts and records its program, so
-    /// a session cannot start between this answer and the restart.
+    /// A setup or TUI may still be in use (ADR 0031). Under the state lock,
+    /// which `connect` holds to start its program, so none starts before
+    /// the restart.
     fn someone_connected(&self, _lock: &StateLock, name: &SandboxName) -> Result<bool> {
         Ok(self
             .state
@@ -164,11 +133,7 @@ impl Engine {
             .any(|s| s.kind == SessionKind::Interactive && is_same(&s.root).unwrap_or(true)))
     }
 
-    /// Records that the service's settings `changed` and sends its program
-    /// `signal`, if it is still the same process and no one is connected
-    /// to the sandbox. `Ok(None)`: another command holds the state lock, or
-    /// someone is connected, so nothing was done, and a later look tries
-    /// again. `Ok(Some(Err(why)))`: no signal was sent, for `why`.
+    /// `Ok(None)`: the lock is busy or someone is connected; ask later.
     pub(super) fn ask_restart(
         &self,
         by: &Actor,
@@ -176,8 +141,7 @@ impl Engine {
         signal: Signal,
         changed: &[HomePath],
     ) -> Result<Option<std::result::Result<(), String>>> {
-        // Never waits for the lock, as recording members does: while it
-        // waited, the program's exit would not be seen.
+        // Never waits: the wait loop would miss the program's exit.
         let Some(lock) = self.state.try_lock()? else {
             return Ok(None);
         };
@@ -206,9 +170,7 @@ impl Engine {
                 signal.name()
             )),
         };
-        // The signal is sent: what follows must say so, so a failure to
-        // close the entry is not an error here. It leaves the entry
-        // unfinished, which `enclos audit verify` reports, as `write` does.
+        // The signal is already sent; `audit verify` reports the unfinished entry.
         let _ = self.audit.finish(ticket, outcome);
         Ok(Some(sent))
     }
@@ -222,7 +184,6 @@ mod tests {
         HomePath::new(p).unwrap()
     }
 
-    /// A watch of `a` and `b` in a fresh home, with `a` holding "1".
     fn watched() -> (tempfile::TempDir, SettingsWatch) {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("a"), "1").unwrap();
@@ -236,10 +197,8 @@ mod tests {
         let t = Instant::now();
         assert_eq!(watch.settled(t), None);
         std::fs::write(home.path().join("b"), "token").unwrap();
-        // Read too soon after the last read: not looked at yet.
         assert_eq!(watch.settled(t + Duration::from_secs(1)), None);
         assert_eq!(watch.settled(t + READ_EVERY), None);
-        // Changed again before it settled: the wait starts again.
         std::fs::write(home.path().join("b"), "token2").unwrap();
         let again = t + 2 * READ_EVERY;
         assert_eq!(watch.settled(again), None);
@@ -282,16 +241,13 @@ mod tests {
         let first = t + SETTLE;
         assert_eq!(watch.settled(first), Some(vec![rel("b")]));
         watch.failed(first);
-        // The same change: not before `RETRY`.
         assert_eq!(watch.settled(first + READ_EVERY), None);
         assert_eq!(watch.settled(first + RETRY), Some(vec![rel("b")]));
-        // Failing again waits twice as long.
         let second = first + RETRY;
         watch.failed(second);
         assert_eq!(watch.settled(second + RETRY), None);
         assert_eq!(watch.settled(second + 2 * RETRY), Some(vec![rel("b")]));
         watch.failed(second + 2 * RETRY);
-        // A new change: once it has settled.
         std::fs::write(home.path().join("b"), "token2").unwrap();
         let later = second + 2 * RETRY + READ_EVERY;
         assert_eq!(watch.settled(later), None);

@@ -69,8 +69,7 @@ fn at(path: &str) -> HomePath {
     HomePath::new(path).expect("a plain path inside the home")
 }
 
-/// The folder of an agent's own data. The built-in agent's is the whole
-/// home of Hermes.
+/// The built-in agent's is all of `.hermes`.
 fn agent_folder(agent: &RuntimeAgentName) -> HomePath {
     if agent.as_str() == DEFAULT_PROFILE.as_str() {
         at(".hermes")
@@ -237,19 +236,14 @@ impl RuntimeAdapter for Hermes {
                 "run",
                 "--external-supervisor",
             ]),
-            // Hermes's own graceful restart for a supervised gateway: it
-            // stops taking turns, lets the running ones finish and exits
-            // (75). From outside the sandbox, so Seatbelt does not refuse it
-            // as it does `hermes gateway restart` from a `connect` session.
+            // Hermes's graceful restart: running turns finish, then it exits
+            // 75. Sent from outside the sandbox, which Seatbelt allows.
             restart: Some(Signal::Usr1),
         }]
     }
 
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> {
-        // The gateway reads them as it starts: a Telegram token added to
-        // `.env` reaches Telegram only once it starts again. Agents made
-        // later are served without a restart, and watched from the next
-        // start.
+        // Agents added later are served without a restart.
         std::iter::once(DEFAULT_PROFILE.runtime_name())
             .chain(agents.iter().cloned())
             .flat_map(|agent| {
@@ -391,7 +385,6 @@ mod tests {
 
     #[test]
     fn the_gateway_restarts_gracefully_for_the_settings_of_every_agent() {
-        // Hermes's graceful restart for a supervised gateway (ADR 0031).
         assert_eq!(Hermes.services()[0].restart, Some(Signal::Usr1));
         let main = RuntimeAgentName::new("main").unwrap();
         let files: Vec<String> = Hermes

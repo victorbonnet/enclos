@@ -416,7 +416,6 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        // As the program will read them as it starts (ADR 0031).
         let mut watch = self.settings_watch(name, kind, service);
         let summary = |(session, _, replaced): &(SessionRecord, _, Vec<SessionId>)| {
             let earlier = replaced_earlier(service, replaced);
@@ -459,9 +458,7 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
-        // Once the runtime's settings change, and no one is connected to the
-        // sandbox, the program is asked to restart, once: it exits, and the
-        // service manager starts it again.
+        // Asked to restart once its settings change (ADR 0031).
         let mut restarting = false;
         let mut look = |notes: &mut Vec<String>| {
             let Some((settings, signal)) = watch.as_mut() else {
@@ -473,8 +470,6 @@ impl Engine {
             let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
             let files = files.join(", ");
             let why = match self.ask_restart(by, &session, *signal, &changed) {
-                // Another command holds the lock, or someone is connected:
-                // the next look asks, once the last session has ended.
                 Ok(None) => return,
                 Ok(Some(Ok(()))) => {
                     restarting = true;
@@ -488,7 +483,6 @@ impl Engine {
                 Ok(Some(Err(why))) => why,
                 Err(e) => e.to_string(),
             };
-            // Not sent: asked again after the next change, or a while later.
             settings.failed(Instant::now());
             super::session::note(
                 notes,

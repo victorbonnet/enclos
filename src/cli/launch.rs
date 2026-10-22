@@ -26,9 +26,8 @@ pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
     Ok(service_exit(&end))
 }
 
-/// What `launch` exits with. Asked to restart (ADR 0031), the service ends
-/// as a failure, which the service manager starts again, even when its
-/// program exits 0.
+/// A service asked to restart exits non-zero, so the service manager starts
+/// it again, even when its program exits 0 (ADR 0031).
 fn service_exit(end: &SessionEnd) -> u8 {
     let exit = if end.restarting && end.exit == 0 {
         EX_TEMPFAIL
@@ -38,7 +37,7 @@ fn service_exit(end: &SessionEnd) -> u8 {
     u8::try_from(exit).unwrap_or(1)
 }
 
-/// "Try again later" (`sysexits.h`), as Hermes exits to be restarted.
+/// `sysexits.h`, as Hermes exits to be restarted.
 const EX_TEMPFAIL: i32 = 75;
 
 #[derive(Args)]
@@ -231,7 +230,6 @@ mod tests {
             notes: Vec::new(),
             restarting,
         };
-        // A runtime whose graceful restart exits 0 would stay down.
         assert_eq!(service_exit(&end(0, true)), 75);
         assert_eq!(service_exit(&end(75, true)), 75);
         assert_eq!(service_exit(&end(143, true)), 143);

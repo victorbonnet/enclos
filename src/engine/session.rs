@@ -41,11 +41,10 @@ pub struct SessionEnd {
     /// The signal that ended the program, if one did.
     pub signal: Option<i32>,
     pub left: Left,
-    /// Problems met while recording the session's members, and what else
-    /// enclos did while it ran, each said once.
+    /// Problems met while recording the session's members, and restarts
+    /// asked, each said once.
     pub notes: Vec<String>,
-    /// Whether enclos asked the program to restart, as a service whose
-    /// runtime's settings changed (ADR 0031).
+    /// Asked to restart because its settings changed (ADR 0031).
     pub restarting: bool,
 }
 
@@ -369,9 +368,8 @@ impl Engine {
     /// the members it left running. Once `ended` is set, it stops every
     /// member, TERM then KILL after `STOP_GRACE` each, as `sandbox stop`
     /// does with `GRACE`; a program that survives both is an error. Until
-    /// then, `look` runs at each look at its processes, while the program
-    /// has not been reaped, so its pid cannot have been reused, and adds
-    /// its notes to the session's.
+    /// then `look` runs at each look, before the program is reaped, so its
+    /// pid cannot have been reused.
     pub(super) fn wait_session(
         &self,
         session: &SessionRecord,

@@ -190,11 +190,8 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
-    /// The files in the sandbox home the runtime's services read only as
-    /// they start, for the built-in agent and for `agents`, as
-    /// [`RuntimeAdapter::agents_in`] lists them: when one changes, a service
-    /// with a [`RuntimeService::restart`] signal restarts (ADR 0031). None,
-    /// the default: a runtime that applies its settings as they change.
+    /// Files in the home the services read only as they start, for the
+    /// built-in agent and `agents` (ADR 0031).
     fn settings_files(&self, _agents: &[RuntimeAgentName]) -> Vec<HomePath> {
         Vec::new()
     }
@@ -333,11 +330,8 @@ impl fmt::Display for Unreadable {
 pub struct RuntimeService {
     pub name: ServiceName,
     pub command: SandboxCommand,
-    /// The signal that makes the program restart, once one of the
-    /// runtime's [`RuntimeAdapter::settings_files`] has changed: it exits,
-    /// and the service manager starts it again (ADR 0031). `TERM` for a
-    /// runtime without a graceful restart; `None`: the service reads none of
-    /// them, and is never restarted for them.
+    /// Sent once [`RuntimeAdapter::settings_files`] change (ADR 0031); `TERM`
+    /// without a graceful restart, `None` to never restart.
     pub restart: Option<Signal>,
 }
 
