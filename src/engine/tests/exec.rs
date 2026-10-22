@@ -26,7 +26,7 @@ fn exec_needs_a_command_and_its_dry_run_runs_nothing() {
 }
 
 #[test]
-fn an_exec_session_is_recorded_as_one() {
+fn the_exec_kind_round_trips_through_its_name() {
     assert_eq!(SessionKind::Exec.as_str(), "exec");
     assert_eq!("exec".parse::<SessionKind>(), Ok(SessionKind::Exec));
 }

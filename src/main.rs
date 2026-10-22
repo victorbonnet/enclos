@@ -99,11 +99,17 @@ fn main() -> ExitCode {
             Arc::new(AtomicBool::new(true)),
         );
     }
+    // `exec` exits with its command's code, so its own failures take one
+    // no command gives them by convention (design §10).
+    let exec = matches!(cli.command, Command::Exec(_));
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("error: {err}");
-            ExitCode::from(err.exit_code())
+            ExitCode::from(match exec {
+                true => exit::EXEC_FAILED,
+                false => err.exit_code(),
+            })
         }
     }
 }

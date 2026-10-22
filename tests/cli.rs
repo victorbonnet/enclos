@@ -447,9 +447,57 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
     let out = Run(child.wait_with_output().unwrap());
     assert_eq!(out.ok().stdout(), "piped in\n");
 
-    // Each is a session of its own, recorded as an exec and audited.
-    let audit = home.run(&["audit"]).ok().stdout();
-    assert_eq!(audit.matches("exec home").count(), 2, "{audit}");
+    // A command a signal ended exits as a shell says it: 128 plus the signal.
+    let out = home.run(&[
+        "exec",
+        "home",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo a; kill -TERM $$",
+    ]);
+    assert_eq!(out.code(), 143, "{}", out.stderr());
+    assert_eq!(out.stdout(), "a\n");
+    assert!(
+        out.stderr().contains("ended by signal 15"),
+        "{}",
+        out.stderr()
+    );
+
+    // A TERM sent to enclos reaches the command, in a group of its own
+    // without a terminal, and enclos records its end.
+    let child = home
+        .command(&["exec", "home", "--", "/bin/sleep", "30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    assert!(eventually(|| {
+        home.run(&["sandbox", "show", "home"])
+            .stdout()
+            .contains("/bin/sleep")
+    }));
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains(" exec: "), "{show}");
+    Command::new("/bin/kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.code(), 143, "{}", out.stderr());
+    assert!(
+        !home
+            .run(&["sandbox", "show", "home"])
+            .ok()
+            .stdout()
+            .contains("/bin/sleep")
+    );
+
+    // Each is a session of its own, audited as `exec`; a dry run and a
+    // usage error record nothing.
+    let lines = home.audit_lines().len();
     let out = home.run(&["exec", "home"]);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     let out = home.run(&["--dry-run", "exec", "home", "--", "/bin/ls"]);
@@ -457,6 +505,19 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
         out.ok().stdout().contains("Would run `/bin/ls`"),
         "{}",
         out.stdout()
+    );
+    assert_eq!(home.audit_lines().len(), lines);
+    let audit = home.run(&["audit"]).ok().stdout();
+    assert_eq!(audit.matches("exec home").count(), 4, "{audit}");
+
+    // When enclos itself fails, it exits 125, which tells its failure apart
+    // from the command's own 1, 2 or 3.
+    let out = home.run(&["exec", "nope", "--", "/bin/ls"]);
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
     );
 }
 
@@ -1355,9 +1416,9 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     let _stop = StopOnDrop(&home, "home");
 
     // Without a terminal the program runs in a group of its own: the INT
-    // sent below reaches this enclos alone, as a terminal's Ctrl-C reaches
-    // it beside a program that handles it and goes on.
-    let script = "/bin/sleep 2; exit 3";
+    // sent below reaches this enclos alone, which outlives it and passes it
+    // on to the program, which handles it and exits 3.
+    let script = "trap 'exit 3' INT; /bin/sleep 10 & wait";
     let mut connect = KillOnDrop(
         home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
             .stdin(Stdio::null())

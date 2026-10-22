@@ -20,7 +20,8 @@ impl fmt::Display for SessionId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
-    /// `enclos connect`, in the user's terminal.
+    /// `enclos connect`, and the installers and agent commands enclos runs,
+    /// in the user's terminal.
     Interactive,
     /// `enclos exec`: one command, for a script or another program.
     Exec,

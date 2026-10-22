@@ -3016,6 +3016,65 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn an_exec_session_does_not_hold_back_a_settings_restart() {
+        use std::os::unix::process::CommandExt;
+        let lab = Lab::new();
+        let sleep = || {
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
+            id: crate::model::session::SessionId(0),
+            sandbox: lab.name.clone(),
+            kind,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            pgid: Some(child.id()),
+            root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let mut service = sleep();
+        let service_session = record(&service, crate::model::session::SessionKind::Service);
+        // A script's command, running: nobody is in a setup or a TUI.
+        let mut exec = sleep();
+        {
+            let lock = lab.engine.state.lock().unwrap();
+            let sandbox = lab.engine.state.get(&lab.name).unwrap().unwrap();
+            let session = record(&exec, crate::model::session::SessionKind::Exec);
+            lab.engine
+                .state
+                .start_session(&lock, &session, &sandbox)
+                .unwrap();
+        }
+        let env = [crate::runtime::HomePath::new(".hermes/.env").unwrap()];
+        let asked = lab
+            .engine
+            .ask_restart(
+                &alice(),
+                &service_session,
+                crate::runtime::Signal::Usr1,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(asked, Some(Ok(())));
+        let status = service.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(30)
+        );
+        exec.kill().unwrap();
+        exec.wait().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn a_settings_restart_waits_until_no_one_is_connected() {
         use std::os::unix::process::CommandExt;
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());

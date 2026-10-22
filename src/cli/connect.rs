@@ -1,7 +1,18 @@
 //! `enclos connect`: a shell, or a command, inside a sandbox, in this
-//! terminal; and `enclos exec`: one command, for a script or a program.
+//! terminal; and `enclos exec`: one command, for a script or another
+//! program.
 
 use std::ffi::OsString;
+
+/// Writes a line to stderr, where enclos's own messages go so that a
+/// command's output stays clean. A stderr closed already (`2>&1 | head`)
+/// never turns the command's exit code into a panic's.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
 
 use clap::Args;
 
@@ -41,7 +52,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
     finish(engine, &args.sandbox, &end)
 }
 
-/// `enclos exec`: one command in the sandbox, which exits with its code.
+/// `enclos exec`: one command in the sandbox; enclos exits with the
+/// command's code, or 125 when it fails itself.
 pub fn exec(engine: &Engine, by: &Actor, confirm: Confirm, args: ExecArgs) -> Result<u8> {
     start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.exec(by, &args.sandbox, args.command, confirm)? {
@@ -66,29 +78,30 @@ fn start_service_first(
     if confirm == Confirm::DryRun {
         return Ok(());
     }
-    let mut say = |what: String| eprintln!("enclos: {what}");
+    let mut say = |what: String| say!("enclos: {what}");
     if let Some(ServiceWait {
         service,
         late: Some(why),
         ..
     }) = engine.start_listener_service(by, sandbox, &mut say)?
     {
-        eprintln!(
+        say!(
             "enclos: starting the session while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
         );
     }
     Ok(())
 }
 
-/// Reports the session's end and returns the command's exit code.
+/// Reports the session's end and the sandbox's agent changes, and returns
+/// the command's exit code.
 fn finish(engine: &Engine, sandbox: &SandboxName, end: &SessionEnd) -> Result<u8> {
     report_end(sandbox, end);
     // Agents made or deleted in the session with the runtime's own commands.
     // On stderr, so a command's output stays clean; the session's exit code
     // stays the command's.
     match super::agent::check_notes(engine, sandbox, false) {
-        Ok(notes) => notes.iter().for_each(|note| eprintln!("enclos: {note}")),
-        Err(e) => eprintln!("enclos: could not check the sandbox's agents: {e}"),
+        Ok(notes) => notes.iter().for_each(|note| say!("enclos: {note}")),
+        Err(e) => say!("enclos: could not check the sandbox's agents: {e}"),
     }
     Ok(u8::try_from(end.exit).unwrap_or(1))
 }
@@ -98,10 +111,10 @@ fn finish(engine: &Engine, sandbox: &SandboxName, end: &SessionEnd) -> Result<u8
 pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
     let shown = format!("sandbox {sandbox}");
     for note in &end.notes {
-        eprintln!("enclos: session {} in {shown}: {note}", end.session);
+        say!("enclos: session {} in {shown}: {note}", end.session);
     }
     if let Some(signal) = end.signal {
-        eprintln!("enclos: the command was ended by signal {signal}");
+        say!("enclos: the command was ended by signal {signal}");
     }
     let stays_open = format!(
         "Session {} stays open until `enclos sandbox stop {}` finds them gone",
@@ -114,7 +127,7 @@ pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
                 .iter()
                 .map(|m| format!("{} ({})", m.pid, m.command))
                 .collect();
-            eprintln!(
+            say!(
                 "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",
                 left.len(),
                 pids.join(", "),
@@ -122,7 +135,7 @@ pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
             );
         }
         Left::Unknown(why) => {
-            eprintln!(
+            say!(
                 "enclos: the command exited, but enclos could not look at what it left running in {shown}: {why}. {stays_open}."
             );
         }
