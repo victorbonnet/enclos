@@ -70,8 +70,14 @@ impl Launchd {
     /// longer has it: `bootout` can return while launchd is still ending
     /// the job (about 0.7 s for a Hermes gateway on macOS 26.5), and loading
     /// the same label meanwhile fails with `Bootstrap failed: 5`. Nothing to
-    /// do when launchd has no such job.
-    fn bootout(&self, label: &ServiceLabel, wait: Duration) -> Result<(), ServiceError> {
+    /// do when launchd has no such job. `why_slow` ends the error when the
+    /// job was still loaded at the end of `wait`.
+    fn bootout(
+        &self,
+        label: &ServiceLabel,
+        wait: Duration,
+        why_slow: &str,
+    ) -> Result<(), ServiceError> {
         if self.status(label)? == ServiceStatus::NotLoaded {
             return Ok(());
         }
@@ -80,7 +86,7 @@ impl Launchd {
         if !until_unloaded(|| self.status(label), wait, UNLOAD_POLL)? {
             let why = match wait.is_zero() {
                 true => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-                false => format!("it was still loaded after {} s", wait.as_secs()),
+                false => format!("it was still loaded after {} s{why_slow}", wait.as_secs()),
             };
             return Err(ServiceError {
                 what: format!("launchd did not stop {label}: {why}"),
@@ -219,12 +225,11 @@ impl ServiceManager for Launchd {
         std::fs::write(&path, plist(unit))
             .map_err(|e| failed(format!("cannot write {}: {e}", path.display())))?;
         // Replace a previous load of the same unit.
-        self.bootout(&unit.label, REPLACE_WAIT).map_err(|e| ServiceError {
-            what: format!(
-                "{}; another enclos command may be starting or stopping this sandbox's services",
-                e.what
-            ),
-        })?;
+        self.bootout(
+            &unit.label,
+            REPLACE_WAIT,
+            "; another enclos command may be starting or stopping this sandbox's services",
+        )?;
         let out = launchctl(&["bootstrap", &Self::domain()?, &path.display().to_string()])?;
         if !out.status.success() {
             return Err(failed(format!(
@@ -237,7 +242,7 @@ impl ServiceManager for Launchd {
     }
 
     fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
-        self.bootout(label, UNLOAD_WAIT)?;
+        self.bootout(label, UNLOAD_WAIT, "")?;
         let path = self.plist_path(label);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| ServiceError {
