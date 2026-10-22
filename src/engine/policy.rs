@@ -328,7 +328,19 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             NetMode::Allowlist => "limit its network to the allowlist".to_owned(),
         });
     }
+    if old.net.listen != new.net.listen {
+        found.push(listen_change(new.net.listen));
+    }
     found
+}
+
+/// How a change of [`NetPolicy::listen`](crate::model::policy::NetPolicy)
+/// to `listen` is worded (ADR 0028).
+pub(super) fn listen_change(listen: bool) -> String {
+    match listen {
+        true => "let it listen on TCP, on any port but enclos's proxy ports, on every address (sessions started from now on)".to_owned(),
+        false => "stop it listening on TCP (sessions started from now on)".to_owned(),
+    }
 }
 
 /// `policy.toml` with `entry` added to `[network] allow_add`, keeping the
@@ -434,6 +446,18 @@ mod tests {
         assert_eq!(
             differences(&public, &old, &["a.example.com"]),
             ["limit its network to the allowlist"]
+        );
+        let mut listens = old.clone();
+        listens.net.listen = true;
+        assert_eq!(
+            differences(&old, &listens, &[]),
+            [
+                "let it listen on TCP, on any port but enclos's proxy ports, on every address (sessions started from now on)"
+            ]
+        );
+        assert_eq!(
+            differences(&listens, &old, &[]),
+            ["stop it listening on TCP (sessions started from now on)"]
         );
     }
 }

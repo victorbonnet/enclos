@@ -1734,6 +1734,13 @@ echo \"installed $*\" > \"$HOME/installed\"
             plan.contains("allow the 13 destinations hermes needs"),
             "{plan}"
         );
+        // Listening is what the adapter brings, like its destinations: named,
+        // and not an "also" change that would ask first (ADR 0028).
+        assert!(
+            plan.contains("let sandbox home listen on TCP for hermes"),
+            "{plan}"
+        );
+        assert!(!plan.contains("also "), "{plan}");
         assert!(
             plan.contains("download the hermes installer from file://"),
             "{plan}"
@@ -1743,6 +1750,37 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(lab.runtime(), None);
         assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
         assert!(!lab.home.join("bin/mktemp").exists());
+    }
+
+    /// `policy.toml` keeping listening off wins over the adapter, and the
+    /// plan says Hermes's gateway then cannot start (ADR 0028).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_install_says_when_policy_toml_keeps_listening_off() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let toml = lab.engine.layout.read_policy("home").unwrap();
+        let off = toml.replace("[network]", "[network]\nlisten = false");
+        lab.engine.layout.write_policy("home", &off).unwrap();
+        let Planned::DryRun(plan) = lab.install(INSTALLS, Confirm::DryRun).unwrap() else {
+            panic!("a dry run installed");
+        };
+        let plan = plan.changes.join("\n");
+        assert!(
+            plan.contains("keep sandbox home from listening, as its policy.toml sets `listen = false`: hermes's service cannot start"),
+            "{plan}"
+        );
+        assert!(!plan.contains("listen on TCP for hermes"), "{plan}");
+        done(lab.install(INSTALLS, Confirm::Yes).unwrap());
+        assert!(
+            !lab.engine
+                .policy(&lab.name)
+                .unwrap()
+                .snapshot
+                .policy
+                .net
+                .listen
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1884,6 +1922,8 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(end.policy, 2);
         assert_eq!(lab.runtime(), Some(RuntimeKind::Hermes));
         assert!(lab.allows("chatgpt.com") && lab.allows("github.com"));
+        let installed = lab.engine.policy(&lab.name).unwrap().snapshot.policy;
+        assert!(installed.net.listen, "the gateway may listen (ADR 0028)");
         assert_eq!(
             std::fs::read_to_string(lab.home.join("installed")).unwrap(),
             "installed --non-interactive\n"

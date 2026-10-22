@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::Engine;
 use super::import::{Archive, LeftCopy};
-use super::policy::{adapter_layer, differences};
+use super::policy::{adapter_layer, differences, listen_change};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
@@ -133,6 +133,12 @@ struct InstallPlan {
     active: u32,
     /// The runtime's destinations the active policy does not allow yet.
     added: Vec<String>,
+    /// Whether the runtime's layer turns listening on, and the new policy
+    /// listens where the active one does not (ADR 0028).
+    listens: bool,
+    /// Whether the runtime's layer turns listening on and `policy.toml`
+    /// keeps it off, so the runtime's service cannot start.
+    listen_kept_off: bool,
     /// What else the new version changes: edits to `policy.toml` not
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
@@ -416,11 +422,23 @@ impl Engine {
             .filter(|d| !active.snapshot.policy.net.allow.contains(d))
             .cloned()
             .collect();
-        let also = differences(&active.snapshot.policy, &snapshot.policy, &expected);
+        let mut also = differences(&active.snapshot.policy, &snapshot.policy, &expected);
+        // Listening the adapter's layer turns on is what the runtime brings,
+        // like its destinations (ADR 0028); any other change of it is an edit
+        // of `policy.toml`, which stays an "also" change. Kept off by
+        // `policy.toml`, the runtime's service cannot start, which the plan
+        // says.
+        let asks = layer.network.listen == Some(true);
+        let listening = snapshot.policy.net.listen;
+        if asks && listening {
+            also.retain(|c| *c != listen_change(true));
+        }
         Ok(InstallPlan {
             overrides,
             active: active.version.version,
             added,
+            listens: asks && listening && !active.snapshot.policy.net.listen,
+            listen_kept_off: asks && !listening,
             also,
             proxy_runs: self.proxy_runs(name)?,
         })
@@ -911,14 +929,33 @@ impl InstallPlan {
         let kind = runtime.kind();
         let mut changes = Vec::new();
         match self.added.len() {
-            0 if self.also.is_empty() => changes.push(format!(
-                "keep the policy of sandbox {name} at v{}: it already allows what {kind} needs",
+            0 if self.also.is_empty() && !self.listens && !self.listen_kept_off => {
+                changes.push(format!(
+                    "keep the policy of sandbox {name} at v{}: it already allows what {kind} needs",
+                    self.active
+                ))
+            }
+            0 if self.also.is_empty() && !self.listens => changes.push(format!(
+                "keep the policy of sandbox {name} at v{}",
                 self.active
+            )),
+            0 => changes.push(format!(
+                "change the policy of sandbox {name} for {kind}, as a new policy version"
             )),
             n => changes.push(format!(
                 "allow the {n} destinations {kind} needs in sandbox {name}, as a new policy version: {}",
                 self.added.join(", ")
             )),
+        }
+        if self.listens {
+            changes.push(format!(
+                "let sandbox {name} listen on TCP for {kind} (ADR 0028): any port but enclos's proxy ports, on every address, and anything in it can serve the network"
+            ));
+        }
+        if self.listen_kept_off {
+            changes.push(format!(
+                "keep sandbox {name} from listening, as its policy.toml sets `listen = false`: {kind}'s service cannot start without it (ADR 0028)"
+            ));
         }
         changes.extend(self.also.iter().map(|c| format!("also {c}")));
         changes.push(format!(

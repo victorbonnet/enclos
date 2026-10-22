@@ -110,6 +110,11 @@ fn print_policy(view: &PolicyView) {
             policy.net.private.join(", ")
         );
     }
+    if policy.net.listen {
+        println!(
+            "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
+        );
+    }
     println!("\nEdit {} to change it.", view.file.display());
 }
 
@@ -177,6 +182,11 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
         "No probe tries these routes yet: {}.",
         NOT_PROBED.join(", ")
     );
+    if report.listens {
+        println!(
+            "Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network."
+        );
+    }
     println!(
         "Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists."
     );
@@ -235,6 +245,7 @@ mod tests {
             }],
             host_services: false,
             not_here: Vec::new(),
+            listens: false,
         }
     }
 
