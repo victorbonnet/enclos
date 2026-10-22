@@ -58,8 +58,12 @@ impl Resolve for FakeResolver {
     }
 }
 
+/// The records, and how many were finished.
 #[derive(Clone, Default)]
-struct MemoryLog(Arc<Mutex<Vec<NetEvent>>>);
+struct MemoryLog(
+    Arc<Mutex<Vec<NetEvent>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
 
 /// Resolves nothing.
 struct NoResolver;
@@ -78,6 +82,7 @@ impl NetLogStore for MemoryLog {
     }
     fn finish(&self, row: i64, event: &NetEvent) -> StateResult<()> {
         self.0.lock().unwrap()[row as usize] = event.clone();
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
     fn events(&self, _: &SandboxName, _: Option<Timestamp>) -> StateResult<Vec<NetEvent>> {
@@ -92,6 +97,12 @@ impl MemoryLog {
     /// Waits for `n` records.
     fn wait_for(&self, n: usize) -> Vec<NetEvent> {
         self.wait_until(|events| events.len() >= n)
+    }
+
+    /// Waits for `n` records to be finished.
+    fn wait_finished(&self, n: usize) -> Vec<NetEvent> {
+        let finished = &self.1;
+        self.wait_until(|_| finished.load(std::sync::atomic::Ordering::SeqCst) >= n)
     }
 
     /// Waits until the records are `done`, for at most five seconds.
@@ -1024,80 +1035,138 @@ fn tunnel(proxy: &Running, host: &str, port: u16) -> TcpStream {
     conn
 }
 
-/// The one record, once its tunnel closed and its first bytes were read.
-fn checked(proxy: &Running) -> NetEvent {
-    let events = proxy
-        .log
-        .wait_until(|e| e.len() == 1 && (e[0].name_seen.is_some() || e[0].reason.is_some()));
+/// The one record, once its tunnel closed.
+fn closed(proxy: &Running) -> NetEvent {
+    let events = proxy.log.wait_finished(1);
     assert_eq!(events.len(), 1, "{events:?}");
     events[0].clone()
 }
 
-#[test]
-fn a_tunnel_whose_hello_names_its_host_goes_through_with_the_name_logged() {
-    let (port, received) = upstream(b"pong");
-    let proxy = start(
+/// Reads until the proxy closes `conn`, which must be soon.
+fn closed_soon(conn: &mut TcpStream) -> Vec<u8> {
+    let started = Instant::now();
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "not closed");
+    rest
+}
+
+fn api(port: u16) -> Running {
+    start(
         &[format!("api.example.com:{port}")],
         LOCAL,
         loopback_is_global,
-    );
+    )
+}
+
+#[test]
+fn a_tunnel_whose_hello_names_its_host_goes_through_with_the_name_logged() {
+    let (port, received) = upstream_reading_all(b"pong");
+    let proxy = api(port);
     let mut conn = tunnel(&proxy, "api.example.com", port);
     // Another case and a final dot name the same host; sent in two parts,
-    // the hello goes up whole, once complete.
+    // the hello goes up whole, once complete, and what follows after it.
     let hello = hello::client_hello_bytes(Some("API.example.com."), false, 16_384);
     conn.write_all(&hello[..10]).unwrap();
     std::thread::sleep(Duration::from_millis(50));
-    conn.write_all(&hello[10..]).unwrap();
+    conn.write_all(&[&hello[10..], b"extra"].concat()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    conn.write_all(b"more").unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
     assert_eq!(
         received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        hello
+        [&hello[..], b"extra", b"more"].concat()
     );
     let mut answer = String::new();
     conn.read_to_string(&mut answer).unwrap();
     assert_eq!(answer, "pong");
-    drop(conn);
-    let e = checked(&proxy);
+    let e = closed(&proxy);
     assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None));
-    assert_eq!(e.name_seen, Some(NameSeen::Name));
-    assert_eq!(e.server_name.as_deref(), Some("API.example.com."));
-    assert_eq!(e.bytes_up, hello.len() as u64);
+    assert_eq!(e.name_seen, Some(NameSeen::Name("API.example.com.".into())));
+    assert_eq!(e.bytes_up, hello.len() as u64 + 9);
+}
+
+#[test]
+fn a_hello_split_between_the_request_and_the_tunnel_goes_up_once() {
+    let (port, received) = upstream_reading_all(b"");
+    let proxy = api(port);
+    let hello = hello::client_hello_bytes(Some("api.example.com"), false, 100);
+    let mut conn = TcpStream::connect(proxy.addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    conn.write_all(
+        &[
+            format!("CONNECT api.example.com:{port} HTTP/1.1\r\n\r\n").as_bytes(),
+            &hello[..300],
+        ]
+        .concat(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    conn.write_all(&hello[300..]).unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        hello
+    );
 }
 
 #[test]
 fn a_tunnel_whose_hello_names_another_server_is_closed_before_it_reaches_it() {
-    let (port, received) = upstream(b"pong");
-    let proxy = start(
-        &[format!("api.example.com:{port}")],
-        LOCAL,
-        loopback_is_global,
-    );
-    // The hello sent with the request, as a client in a hurry sends it.
-    let mut conn = TcpStream::connect(proxy.addr).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut request = format!("CONNECT api.example.com:{port} HTTP/1.1\r\n\r\n").into_bytes();
-    request.extend(hello::client_hello_bytes(
-        Some("evil.example.com"),
-        false,
+    // A server that never closes on its own: only the proxy ends this.
+    let port = echo();
+    let proxy = api(port);
+    for (early, record) in [(true, 16_384), (false, 100)] {
+        proxy.log.0.lock().unwrap().clear();
+        proxy.log.1.store(0, std::sync::atomic::Ordering::SeqCst);
+        let hello = hello::client_hello_bytes(Some("evil.example.com"), false, record);
+        let mut conn = TcpStream::connect(proxy.addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = format!("CONNECT api.example.com:{port} HTTP/1.1\r\n\r\n");
+        // Sent with the request, as a client in a hurry sends it, or after.
+        match early {
+            true => conn
+                .write_all(&[request.as_bytes(), &hello].concat())
+                .unwrap(),
+            false => {
+                conn.write_all(request.as_bytes()).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                conn.write_all(&hello).unwrap();
+            }
+        }
+        let reply = String::from_utf8_lossy(&closed_soon(&mut conn)).into_owned();
+        // The `200` and nothing else: the echo never saw the hello.
+        assert_eq!(reply, "HTTP/1.1 200 Connection established\r\n\r\n");
+        let e = closed(&proxy);
+        assert_eq!(
+            (e.verdict, e.reason),
+            (Verdict::Denied, Some(Reason::NameMismatch))
+        );
+        assert_eq!(e.name_seen, Some(NameSeen::Name("evil.example.com".into())));
+        assert_eq!((e.bytes_up, e.bytes_down), (0, 0));
+    }
+}
+
+#[test]
+fn a_server_name_is_logged_escaped_and_cut() {
+    let port = echo();
+    let proxy = api(port);
+    let mut conn = tunnel(&proxy, "api.example.com", port);
+    let name = format!("evil\u{1b}[2J\n2026-01-01 allowed {}", "a".repeat(400));
+    conn.write_all(&hello::hello_with(
+        &[hello::sni(name.as_bytes())],
+        10,
         16_384,
-    ));
-    conn.write_all(&request).unwrap();
-    let mut reply = Vec::new();
-    let _ = conn.read_to_end(&mut reply);
-    let reply = String::from_utf8_lossy(&reply);
-    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
-    assert!(!reply.contains("pong"), "{reply}");
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"",
-        "the hello reached the server"
-    );
-    let e = checked(&proxy);
-    assert_eq!(
-        (e.verdict, e.reason),
-        (Verdict::Denied, Some(Reason::NameMismatch))
-    );
-    assert_eq!(e.server_name.as_deref(), Some("evil.example.com"));
-    assert_eq!(e.bytes_up, 0);
+    ))
+    .unwrap();
+    closed_soon(&mut conn);
+    let e = closed(&proxy);
+    assert_eq!(e.reason, Some(Reason::NameMismatch));
+    let Some(NameSeen::Name(shown)) = e.name_seen else {
+        panic!("{e:?}")
+    };
+    assert!(!shown.chars().any(char::is_control), "{shown}");
+    assert!(shown.starts_with("evil\\u{1b}[2J\\n"), "{shown}");
+    assert_eq!(shown.len(), 255);
 }
 
 #[test]
@@ -1132,23 +1201,59 @@ fn a_tunnel_whose_server_speaks_first_works_and_is_logged_as_not_tls() {
     conn.read_to_string(&mut rest).unwrap();
     assert_eq!(rest, "250 ok\r\n");
     drop(conn);
-    let e = checked(&proxy);
+    let e = closed(&proxy);
     assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None));
-    assert_eq!((e.name_seen, e.server_name), (Some(NameSeen::NotTls), None));
+    assert_eq!(e.name_seen, Some(NameSeen::NotTls));
 }
 
 #[test]
-fn a_tunnel_whose_hello_shows_no_name_or_hides_it_goes_through() {
+fn a_client_done_before_it_sent_anything_still_gets_the_servers_answer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Some(mut conn) = listener.incoming().flatten().next() {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = conn.write_all(b"220 banner\r\n");
+        }
+    });
+    let proxy = start(
+        &[format!("mail.example.com:{port}")],
+        LOCAL,
+        loopback_is_global,
+    );
+    let mut conn = tunnel(&proxy, "mail.example.com", port);
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer).unwrap();
+    assert_eq!(answer, "220 banner\r\n");
+    let e = closed(&proxy);
+    assert_eq!(
+        (e.verdict, e.reason, e.name_seen),
+        (Verdict::Allowed, None, None)
+    );
+}
+
+#[test]
+fn a_hello_with_no_name_or_ech_with_another_goes_through_and_one_with_its_own_is_checked() {
     for (name, encrypted, seen) in [
         (None, false, NameSeen::NoName),
-        (Some("public.example.net"), true, NameSeen::Encrypted),
+        (
+            Some("public.example.net"),
+            true,
+            NameSeen::Encrypted {
+                public: Some("public.example.net".into()),
+            },
+        ),
+        // Browsers send an ECH extension of no use (GREASE) with the name
+        // they ask for: it is compared.
+        (
+            Some("api.example.com"),
+            true,
+            NameSeen::Name("api.example.com".into()),
+        ),
     ] {
         let (port, received) = upstream(b"pong");
-        let proxy = start(
-            &[format!("api.example.com:{port}")],
-            LOCAL,
-            loopback_is_global,
-        );
+        let proxy = api(port);
         let mut conn = tunnel(&proxy, "api.example.com", port);
         let hello = hello::client_hello_bytes(name, encrypted, 16_384);
         conn.write_all(&hello).unwrap();
@@ -1157,34 +1262,98 @@ fn a_tunnel_whose_hello_shows_no_name_or_hides_it_goes_through() {
             hello
         );
         drop(conn);
-        let e = checked(&proxy);
+        let e = closed(&proxy);
         assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None), "{seen:?}");
         assert_eq!(e.name_seen, Some(seen));
-        assert_eq!(e.server_name.as_deref(), name);
     }
 }
 
 #[test]
-fn a_tunnel_whose_handshake_is_no_client_hello_is_closed() {
+fn a_tunnel_whose_tls_does_not_read_as_one_hello_is_closed() {
+    let good = hello::client_hello_bytes(Some("evil.example.com"), false, 16_384);
+    let mut old_version = good.clone();
+    old_version[1] = 0;
+    for bytes in [
+        vec![0x16, 3, 1, 0, 4, 0x02, 0, 0, 0],
+        old_version,
+        [&[0x15, 3, 1, 0, 2, 1, 0x5a][..], &good].concat(),
+        hello::hello_with(
+            &[
+                hello::sni(b"evil.example.com"),
+                hello::sni(b"api.example.com"),
+            ],
+            10,
+            16_384,
+        ),
+    ] {
+        let (port, received) = upstream(b"pong");
+        let proxy = api(port);
+        let mut conn = tunnel(&proxy, "api.example.com", port);
+        conn.write_all(&bytes).unwrap();
+        assert!(closed_soon(&mut conn).is_empty());
+        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+        let e = closed(&proxy);
+        assert_eq!(
+            (e.verdict, e.reason, e.name_seen, e.bytes_up),
+            (
+                Verdict::Denied,
+                Some(Reason::HelloUnreadable),
+                Some(NameSeen::Unreadable),
+                0
+            )
+        );
+    }
+}
+
+#[test]
+fn a_hello_that_never_ends_is_closed_at_the_cap() {
     let (port, received) = upstream(b"pong");
-    let proxy = start(
+    let proxy = api(port);
+    let mut conn = tunnel(&proxy, "api.example.com", port);
+    // A handshake that says it is 16 MiB long, then zeros.
+    conn.write_all(&[0x16, 3, 1, 0xff, 0xff, 0x01, 0xff, 0xff, 0xff])
+        .unwrap();
+    let chunk = [0u8; 4096];
+    let mut sent = 9;
+    while sent < 70 * 1024 && conn.write_all(&chunk).is_ok() {
+        sent += chunk.len();
+    }
+    closed_soon(&mut conn);
+    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    let e = closed(&proxy);
+    assert_eq!(
+        (e.verdict, e.reason, e.bytes_up),
+        (Verdict::Denied, Some(Reason::HelloUnreadable), 0)
+    );
+}
+
+#[test]
+fn a_hello_left_half_sent_goes_idle_frees_its_place_and_sends_nothing() {
+    let (port, received) = upstream(b"pong");
+    let proxy = start_with(
         &[format!("api.example.com:{port}")],
-        LOCAL,
+        Box::new(FakeResolver(LOCAL)),
         loopback_is_global,
+        |p| {
+            p.max_connections = 1;
+            p.idle_timeout = Duration::from_millis(200);
+        },
     );
     let mut conn = tunnel(&proxy, "api.example.com", port);
-    conn.write_all(&[0x16, 3, 1, 0, 4, 0x02, 0, 0, 0]).unwrap();
-    let mut rest = Vec::new();
-    let _ = conn.read_to_end(&mut rest);
-    assert!(rest.is_empty(), "{rest:?}");
+    let hello = hello::client_hello_bytes(Some("api.example.com"), false, 16_384);
+    conn.write_all(&hello[..10]).unwrap();
+    closed_soon(&mut conn);
     assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
-    let e = checked(&proxy);
+    let e = closed(&proxy);
     assert_eq!(
-        (e.verdict, e.reason, e.name_seen),
+        (e.verdict, e.reason, e.name_seen, e.bytes_up),
         (
-            Verdict::Denied,
-            Some(Reason::HelloUnreadable),
-            Some(NameSeen::Unreadable)
+            Verdict::Allowed,
+            Some(Reason::Idle),
+            Some(NameSeen::Incomplete),
+            0
         )
     );
+    let reply = send_once_free(proxy.addr, "CONNECT other.example.com:443 HTTP/1.1\r\n\r\n");
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
 }

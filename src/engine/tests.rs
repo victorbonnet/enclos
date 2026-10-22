@@ -5763,7 +5763,6 @@ mod status {
             bytes_down: 0,
             duration_ms: 0,
             name_seen: None,
-            server_name: None,
         }
     }
 

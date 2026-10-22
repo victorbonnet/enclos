@@ -296,14 +296,12 @@ fn a_tunnel_closed_for_the_name_it_asks_for_is_denied_with_that_name() {
         bytes_down: 0,
         duration_ms: 0,
         name_seen: None,
-        server_name: None,
     };
     let row = store.record(&opened).unwrap();
     let closed = NetEvent {
         verdict: Verdict::Denied,
         reason: Some(Reason::NameMismatch),
-        name_seen: Some(NameSeen::Name),
-        server_name: Some("evil.example.com".into()),
+        name_seen: Some(NameSeen::Name("evil.example.com".into())),
         duration_ms: 4,
         ..opened
     };
@@ -411,8 +409,7 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         bytes_up: 1,
         bytes_down: 2,
         duration_ms: 3,
-        name_seen: Some(crate::model::net::NameSeen::Name),
-        server_name: Some(host.into()),
+        name_seen: Some(crate::model::net::NameSeen::Name(host.into())),
     };
     // Whole seconds and milliseconds mixed: the order must still be by time.
     for e in [

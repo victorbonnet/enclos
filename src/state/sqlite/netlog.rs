@@ -30,8 +30,8 @@ pub fn record(conn: &Connection, e: &NetEvent) -> rusqlite::Result<i64> {
             e.bytes_up as i64,
             e.bytes_down as i64,
             e.duration_ms as i64,
-            e.name_seen.map(|n| n.as_str()),
-            e.server_name,
+            e.name_seen.as_ref().map(NameSeen::as_str),
+            e.name_seen.as_ref().and_then(NameSeen::name),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -52,8 +52,8 @@ pub fn finish(conn: &Connection, row: i64, e: &NetEvent) -> rusqlite::Result<()>
             e.duration_ms as i64,
             e.reason.map(|r| r.as_str()),
             verdict_text(e.verdict),
-            e.name_seen.map(|n| n.as_str()),
-            e.server_name,
+            e.name_seen.as_ref().map(NameSeen::as_str),
+            e.name_seen.as_ref().and_then(NameSeen::name),
         ],
     )?;
     Ok(())
@@ -100,9 +100,8 @@ fn event(row: &Row<'_>) -> Result<NetEvent, ReadError> {
         duration_ms: row.get::<_, i64>(10)? as u64,
         name_seen: row
             .get::<_, Option<String>>(11)?
-            .map(|t| t.parse::<NameSeen>().map_err(corrupt))
+            .map(|kind| NameSeen::from_columns(&kind, row.get(12)?).map_err(corrupt))
             .transpose()?,
-        server_name: row.get(12)?,
     })
 }
 

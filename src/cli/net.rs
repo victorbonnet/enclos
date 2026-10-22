@@ -77,18 +77,22 @@ fn print_log(events: &[NetEvent]) {
     }
 }
 
-/// What a tunnel's ClientHello showed of the server it asked for, as the
-/// log shows it (design §6, server name check).
+/// What a tunnel's first bytes showed of the server it asked for, as the
+/// log shows it (design §6, server name check). The name is kept escaped.
 fn server_name(e: &NetEvent) -> String {
-    match (e.name_seen, e.server_name.as_deref()) {
-        (Some(NameSeen::Name), Some(name)) => name.to_owned(),
-        (Some(NameSeen::Encrypted), Some(public)) => format!("hidden (ECH), public name {public}"),
-        (Some(NameSeen::Encrypted), None) => "hidden (ECH)".to_owned(),
-        (Some(NameSeen::NotTls), _) => "not TLS".to_owned(),
-        (Some(NameSeen::Unreadable), _) => "unreadable hello".to_owned(),
-        (Some(NameSeen::Name | NameSeen::NoName), _) => "no name seen".to_owned(),
-        // Plain HTTP, or a tunnel whose client sent nothing.
-        (None, _) => "-".to_owned(),
+    match &e.name_seen {
+        Some(NameSeen::Name(name)) => name.clone(),
+        Some(NameSeen::Encrypted {
+            public: Some(public),
+        }) => format!("ECH, public name {public}"),
+        Some(NameSeen::Encrypted { public: None }) => "ECH".to_owned(),
+        Some(NameSeen::NoName) => "no name seen".to_owned(),
+        Some(NameSeen::NotTls) => "not TLS".to_owned(),
+        Some(NameSeen::Unreadable) => "unreadable hello".to_owned(),
+        Some(NameSeen::Incomplete) => "client stopped first".to_owned(),
+        // Plain HTTP, a refused request, a tunnel still open, or one whose
+        // client sent nothing.
+        None => "-".to_owned(),
     }
 }
 
@@ -142,7 +146,7 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
         .any(|d| matches!(d.reason, Reason::NameMismatch | Reason::HelloUnreadable))
     {
         out.push_str(&format!(
-            "{}, {}: the tunnel was allowed, but its TLS hello asked for another server than its host, or could not be read, so the proxy closed it; there is nothing to allow. `enclos net log {sandbox}` shows the name it asked for.\n",
+            "{}, {}: the policy allowed the tunnel, but its TLS hello asked for another server than its destination, or could not be read, so the proxy closed it; there is nothing to allow. `enclos net log {sandbox}` shows the name it asked for, if any.\n",
             Reason::NameMismatch,
             Reason::HelloUnreadable
         ));
@@ -196,13 +200,13 @@ mod tests {
             text.contains("api.example.com:443  name-mismatch"),
             "{text}"
         );
-        assert!(!text.contains("policy allow"), "{text}");
+        assert!(!text.contains("enclos policy allow"), "{text}");
         assert!(text.contains("enclos net log lab"), "{text}");
     }
 
     #[test]
     fn the_log_shows_the_server_name_a_tunnel_asked_for() {
-        let event = |seen, name: Option<&str>| NetEvent {
+        let event = |seen| NetEvent {
             at: "2026-10-20T12:00:00Z".parse().unwrap(),
             sandbox: lab(),
             host: "api.example.com".into(),
@@ -215,24 +219,26 @@ mod tests {
             bytes_down: 0,
             duration_ms: 0,
             name_seen: seen,
-            server_name: name.map(str::to_owned),
         };
-        for (seen, name, shown) in [
+        for (seen, shown) in [
             (
-                Some(NameSeen::Name),
-                Some("api.example.com"),
+                Some(NameSeen::Name("api.example.com".into())),
                 "api.example.com",
             ),
-            (Some(NameSeen::NoName), None, "no name seen"),
+            (Some(NameSeen::NoName), "no name seen"),
             (
-                Some(NameSeen::Encrypted),
-                Some("public.example.net"),
-                "hidden (ECH), public name public.example.net",
+                Some(NameSeen::Encrypted {
+                    public: Some("public.example.net".into()),
+                }),
+                "ECH, public name public.example.net",
             ),
-            (Some(NameSeen::NotTls), None, "not TLS"),
-            (None, None, "-"),
+            (Some(NameSeen::Encrypted { public: None }), "ECH"),
+            (Some(NameSeen::NotTls), "not TLS"),
+            (Some(NameSeen::Unreadable), "unreadable hello"),
+            (Some(NameSeen::Incomplete), "client stopped first"),
+            (None, "-"),
         ] {
-            assert_eq!(server_name(&event(seen, name)), shown);
+            assert_eq!(server_name(&event(seen)), shown);
         }
     }
 
