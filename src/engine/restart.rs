@@ -16,6 +16,7 @@ use crate::model::sandbox::SandboxName;
 use crate::model::session::{SessionKind, SessionRecord};
 use crate::runtime::home::read_text;
 use crate::runtime::{HomePath, Signal, Unreadable, adapter};
+use crate::state::StateLock;
 
 /// How often the files are read.
 const READ_EVERY: Duration = Duration::from_secs(2);
@@ -152,8 +153,10 @@ impl Engine {
     /// sandbox `name`: an interactive session's program still runs there,
     /// such as the runtime's setup, which saves each answer as it is given,
     /// or its TUI, which the service serves and a restart would cut off. A
-    /// program that cannot be looked at counts as running.
-    pub(super) fn someone_connected(&self, name: &SandboxName) -> Result<bool> {
+    /// program that cannot be looked at counts as running. Asked under the
+    /// state lock, under which `connect` starts and records its program, so
+    /// a session cannot start between this answer and the restart.
+    fn someone_connected(&self, _lock: &StateLock, name: &SandboxName) -> Result<bool> {
         Ok(self
             .state
             .sessions(name, true)?
@@ -162,9 +165,10 @@ impl Engine {
     }
 
     /// Records that the service's settings `changed` and sends its program
-    /// `signal`, if it is still the same process. `Ok(None)`: another
-    /// command holds the state lock, so nothing was done, and a later look
-    /// tries again. `Ok(Some(why))`: no signal was sent, for `why`.
+    /// `signal`, if it is still the same process and no one is connected
+    /// to the sandbox. `Ok(None)`: another command holds the state lock, or
+    /// someone is connected, so nothing was done, and a later look tries
+    /// again. `Ok(Some(Err(why)))`: no signal was sent, for `why`.
     pub(super) fn ask_restart(
         &self,
         by: &Actor,
@@ -177,6 +181,9 @@ impl Engine {
         let Some(lock) = self.state.try_lock()? else {
             return Ok(None);
         };
+        if self.someone_connected(&lock, &session.sandbox)? {
+            return Ok(None);
+        }
         let intent = Intent {
             by: by.clone(),
             command: "service restart".to_owned(),

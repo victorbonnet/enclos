@@ -472,22 +472,9 @@ impl Engine {
             };
             let files: Vec<String> = changed.iter().map(ToString::to_string).collect();
             let files = files.join(", ");
-            // Asked again at the next read, once the last session has ended.
-            match self.someone_connected(name) {
-                Ok(false) => {}
-                Ok(true) => return,
-                Err(e) => {
-                    super::session::note(
-                        notes,
-                        format!(
-                            "{files} changed, but whether anyone is connected cannot be told, so the {service} service waits: {e}"
-                        ),
-                    );
-                    return;
-                }
-            }
             let why = match self.ask_restart(by, &session, *signal, &changed) {
-                // Another command holds the lock: the next look asks.
+                // Another command holds the lock, or someone is connected:
+                // the next look asks, once the last session has ended.
                 Ok(None) => return,
                 Ok(Some(Ok(()))) => {
                     restarting = true;

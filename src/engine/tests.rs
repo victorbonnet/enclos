@@ -2940,6 +2940,82 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
+        use std::os::unix::process::CommandExt;
+        let lab = Lab::new();
+        let sleep = || {
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
+            id: crate::model::session::SessionId(0),
+            sandbox: lab.name.clone(),
+            kind,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            pgid: Some(child.id()),
+            root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        // Stands for the service's program: USR1 ends a `sleep`.
+        let mut service = sleep();
+        let service_session = record(&service, crate::model::session::SessionKind::Service);
+        // A `connect` that recorded its session just before the restart
+        // takes the lock, as it does under the lock.
+        let mut connected = sleep();
+        {
+            let lock = lab.engine.state.lock().unwrap();
+            let sandbox = lab.engine.state.get(&lab.name).unwrap().unwrap();
+            let session = record(&connected, crate::model::session::SessionKind::Interactive);
+            lab.engine
+                .state
+                .start_session(&lock, &session, &sandbox)
+                .unwrap();
+        }
+        let env = [crate::runtime::HomePath::new(".hermes/.env").unwrap()];
+        let asked = lab
+            .engine
+            .ask_restart(
+                &alice(),
+                &service_session,
+                crate::runtime::Signal::Usr1,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(asked, None);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(service.try_wait().unwrap().is_none(), "signalled");
+        assert!(!lab.audit().contains("service restart"), "{}", lab.audit());
+
+        connected.kill().unwrap();
+        connected.wait().unwrap();
+        let asked = lab
+            .engine
+            .ask_restart(
+                &alice(),
+                &service_session,
+                crate::runtime::Signal::Usr1,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(asked, Some(Ok(())));
+        let status = service.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(30)
+        );
+        assert!(lab.audit().contains("service restart"), "{}", lab.audit());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn a_settings_restart_waits_until_no_one_is_connected() {
         use std::os::unix::process::CommandExt;
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
