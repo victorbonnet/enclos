@@ -3,6 +3,7 @@
 
 use super::Engine;
 use super::service::IfUnrecorded;
+use super::session::{Held, marked_in};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{is_gone, members};
@@ -267,12 +268,15 @@ impl Engine {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
-        let sessions = self
-            .state
-            .sessions(&record.name, true)?
+        let open = self.state.sessions(&record.name, true)?;
+        let held = match open.is_empty() {
+            true => Held::new(),
+            false => self.held(&record.name)?,
+        };
+        let sessions = open
             .into_iter()
             .map(|session| {
-                let members = members(&session)?;
+                let members = members(&self.marked(&session, &held)?)?;
                 let needs_restart = needs_restart(&session, active);
                 Ok(SessionView {
                     session,
@@ -349,10 +353,20 @@ impl Engine {
         // that fails tells none apart, so none is said to be gone; the stop
         // below looks again, and fails on its own if it still cannot.
         let open = self.state.sessions(name, true)?;
+        // What holds a marker is a member too (ADR 0030). Looked at once,
+        // before anything is stopped: a marker cannot be gained later.
+        let held = match open.is_empty() {
+            true => Held::new(),
+            false => self.held(name)?,
+        };
         let ran: Vec<SessionId> = match processes() {
             Ok(procs) => open
                 .iter()
-                .filter(|s| !is_gone(&procs, s))
+                .filter(|s| {
+                    let mut marked = (*s).clone();
+                    marked.tracked = marked_in(s, &s.tracked, &procs, &held);
+                    !is_gone(&procs, &marked)
+                })
                 .map(|s| s.id)
                 .collect(),
             Err(_) => open.iter().map(|s| s.id).collect(),
@@ -381,8 +395,20 @@ impl Engine {
                     survivors: Vec::new(),
                 };
                 let mut cannot_look = None;
-                for session in self.state.sessions(name, true)? {
-                    match stop(&session, GRACE) {
+                let sessions = self.state.sessions(name, true)?;
+                for session in &sessions {
+                    let marked = match processes() {
+                        Ok(procs) => {
+                            let mut marked = session.clone();
+                            marked.tracked = marked_in(session, &session.tracked, &procs, &held);
+                            marked
+                        }
+                        Err(e) => {
+                            cannot_look = Some(e);
+                            break;
+                        }
+                    };
+                    match stop(&marked, GRACE) {
                         // Nothing of it ran before this stop either: it ended
                         // with nothing to record its end (a crash, a restart
                         // of the Mac, `enclos` killed), which the audit entry
@@ -416,6 +442,10 @@ impl Engine {
                 match (cannot_look, saved) {
                     (None, saved) => {
                         saved?;
+                        let ended = report.ended();
+                        for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
+                            self.forget_marker(session);
+                        }
                         Ok(report)
                     }
                     (Some(e), Ok(())) => Err(e.into()),
@@ -510,7 +540,12 @@ impl Engine {
             return Ok(Vec::new());
         }
         let procs = processes()?;
-        if open.iter().all(|s| is_gone(&procs, s)) {
+        let held = self.held(name)?;
+        if open.iter().all(|s| {
+            let mut marked = s.clone();
+            marked.tracked = marked_in(s, &s.tracked, &procs, &held);
+            is_gone(&procs, &marked)
+        }) {
             return Ok(open.iter().map(|s| s.id).collect());
         }
         let name = name.to_string();

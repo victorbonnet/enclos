@@ -54,6 +54,8 @@ pub enum Error {
     },
     #[error(transparent)]
     Processes(#[from] crate::lifecycle::process::PsError),
+    #[error(transparent)]
+    Markers(#[from] crate::lifecycle::marker::MarkerError),
     /// A failed command whose cleanup failed too.
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
@@ -233,6 +235,7 @@ impl Error {
             | Error::Session { .. }
             | Error::Service(_)
             | Error::Processes(_)
+            | Error::Markers(_)
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

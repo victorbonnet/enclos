@@ -2872,6 +2872,62 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .collect()
     }
 
+    /// A process the session's program double-forks, in a group of its own
+    /// and with no parent, still holds the session's marker, so `sandbox
+    /// stop` ends it (ADR 0030); before markers it was not even seen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_ends_a_process_that_left_its_session_by_a_double_fork() {
+        use std::time::{Duration, Instant};
+
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let escape = "/usr/bin/perl -e 'use POSIX; exit if fork; POSIX::setsid(); exit if fork; \
+            open(my $f, \">\", \"$ENV{HOME}/escaped\") or die; print $f $$; close $f; \
+            exec(\"/bin/sleep\", \"600\")'; /bin/sleep 1";
+        done(
+            lab.engine
+                .connect(
+                    &alice(),
+                    &lab.name,
+                    vec!["/bin/sh".into(), "-c".into(), escape.into()],
+                    Confirm::Yes,
+                )
+                .unwrap(),
+        );
+        let file = lab.home.join("escaped");
+        let start = Instant::now();
+        while !file.exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let pid: u32 = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let escaped = crate::lifecycle::process::reference(pid).unwrap().unwrap();
+        assert_ne!(
+            crate::lifecycle::process::group_of(pid).unwrap(),
+            Some(std::process::id()),
+            "the process did not leave the test's group"
+        );
+
+        let report = done(
+            lab.engine
+                .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+                .unwrap(),
+        );
+        let survived = crate::lifecycle::process::is_same(&escaped).unwrap();
+        if survived {
+            // The test's own process, by the pid it wrote: never left running.
+            let _ = std::process::Command::new("/bin/kill")
+                .arg(pid.to_string())
+                .status();
+        }
+        assert!(!survived, "the double-forked process survived the stop");
+        assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_runtime_service_told_to_end_stops_its_runtime_and_records_the_end() {

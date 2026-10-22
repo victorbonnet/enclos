@@ -499,13 +499,16 @@ impl Engine {
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
-        let child = wrapped
-            .process_group(0)
-            .spawn()
-            .map_err(|e| Error::Session {
-                what: format!("could not start the {kind} {service} service: {e}"),
-            })?;
+        let marker = self.new_marker(name)?;
+        let (child, marked) =
+            marker
+                .spawn(wrapped.process_group(0))
+                .map_err(|e| Error::Session {
+                    what: format!("could not start the {kind} {service} service: {e}"),
+                })?;
         let recorded = (|| -> Result<SessionRecord> {
+            let root = reference_of_child(&child)?;
+            self.name_marker(name, marked, &root)?;
             let mut session = SessionRecord {
                 id: SessionId(0),
                 sandbox: name.clone(),
@@ -516,7 +519,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 // In a group made for it, which it leads.
                 pgid: Some(child.id()),
-                root: reference_of_child(&child)?,
+                root,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,

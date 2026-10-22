@@ -24,6 +24,7 @@ use serde::{Serialize, Serializer};
 use super::Engine;
 use super::listener::{NoPort, outside_proxy_range, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
+use super::session::marked_in;
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
 use crate::lifecycle::members::{find, is_gone};
@@ -548,6 +549,19 @@ impl Engine {
         let procs = match open.is_empty() {
             true => Vec::new(),
             false => processes()?,
+        };
+        // With what holds each session's marker, its members too (ADR 0030).
+        let open: Vec<SessionRecord> = match open.is_empty() {
+            true => open,
+            false => {
+                let held = self.held(&name)?;
+                open.into_iter()
+                    .map(|mut s| {
+                        s.tracked = marked_in(&s, &s.tracked, &procs, &held);
+                        s
+                    })
+                    .collect()
+            }
         };
         let (gone, running): (Vec<_>, Vec<_>) = open.into_iter().partition(|s| is_gone(&procs, s));
         let sessions = self.state.sessions(&name, false)?;

@@ -19,8 +19,9 @@ use super::service::{PROXY_WAIT, STOP_GRACE};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::process::{Proc, PsError, group_of, is_same, processes, reference_of_child};
 use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -177,7 +178,8 @@ impl Engine {
         if own_group {
             wrapped.process_group(0);
         }
-        let child = wrapped.spawn().map_err(|e| Error::Session {
+        let marker = self.new_marker(name)?;
+        let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
             what: format!(
                 "could not start {} in {name}: {e}",
                 launch.program.to_string_lossy()
@@ -187,6 +189,8 @@ impl Engine {
             // Before the session is recorded, so that a failure here leaves
             // no session open for a program that is ended.
             let keep_waiting = KeepWaiting::new()?;
+            let root = reference_of_child(&child)?;
+            self.name_marker(name, marked, &root)?;
             let me = std::process::id();
             let mut session = SessionRecord {
                 id: SessionId(0),
@@ -198,7 +202,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 // Read even if the program already exited: it is still a
                 // session, with an exit status to report.
-                root: reference_of_child(&child)?,
+                root,
                 pgid: match (own_group, leads_group) {
                     (true, _) => Some(child.id()),
                     (false, true) => Some(me),
@@ -454,8 +458,19 @@ impl Engine {
             Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
         }
         // The program's exit is not the session's end: what it left running
-        // keeps the session open, so `show`, `stop` and `rm` still see it.
-        let left = processes().map(|procs| find(&procs, session, &known));
+        // keeps the session open, so `show`, `stop` and `rm` still see it,
+        // what holds its marker included (ADR 0030).
+        let held = match self.held(&session.sandbox) {
+            Ok(held) => held,
+            Err(e) => {
+                note(&mut notes, format!("could not look at its marker: {e}"));
+                Held::new()
+            }
+        };
+        let left = processes().map(|procs| {
+            known = marked_in(session, &known, &procs, &held);
+            find(&procs, session, &known)
+        });
         Ok(Waited {
             status,
             left,
@@ -492,7 +507,10 @@ impl Engine {
         waited: &Waited,
     ) -> Result<()> {
         match &waited.left {
-            Ok(left) if left.is_empty() => self.state.end_session(lock, session.id)?,
+            Ok(left) if left.is_empty() => {
+                self.state.end_session(lock, session.id)?;
+                self.forget_marker(session);
+            }
             Ok(left) => {
                 let sure: Vec<ProcessRef> = left.iter().filter_map(Found::sure_ref).collect();
                 self.state.track(lock, session.id, &sure)?;
@@ -515,17 +533,29 @@ impl Engine {
         refused: &str,
         ended: &mut Vec<SessionId>,
     ) -> Result<()> {
-        for session in self.state.sessions(name, true)?.into_iter().filter(&which) {
+        let open: Vec<SessionRecord> = self
+            .state
+            .sessions(name, true)?
+            .into_iter()
+            .filter(&which)
+            .collect();
+        let held = match open.is_empty() {
+            true => Held::new(),
+            false => self.held(name)?,
+        };
+        for session in open {
+            let marked = self.marked(&session, &held)?;
             let label = match &session.service {
                 Some(service) => format!("the {service} service session {}", session.id),
                 None => format!("the {} session {}", session.kind.as_str(), session.id),
             };
-            let stopped = (self.stop_members)(&session, GRACE).map_err(|e| Error::Session {
+            let stopped = (self.stop_members)(&marked, GRACE).map_err(|e| Error::Session {
                 what: format!("could not stop {label} of sandbox {name}: {e}"),
             })?;
             match stopped {
                 Stopped::Clean | Stopped::Gone => {
                     self.state.end_session(lock, session.id)?;
+                    self.forget_marker(&session);
                     ended.push(session.id);
                 }
                 Stopped::Survivors(left) => {
@@ -539,6 +569,56 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The folder of the sandbox's markers (ADR 0030).
+    pub(super) fn markers(&self, name: &SandboxName) -> std::path::PathBuf {
+        self.layout.sandbox_dir(name.as_str()).join("members")
+    }
+
+    /// A new marker for a program about to start in sandbox `name`.
+    pub(super) fn new_marker(&self, name: &SandboxName) -> Result<Marker> {
+        let dir = self.markers(name);
+        Marker::new(&dir).map_err(|source| LayoutError::Io { path: dir, source }.into())
+    }
+
+    /// Names a started program's marker after its session's `root`, before
+    /// the session is recorded.
+    pub(super) fn name_marker(
+        &self,
+        name: &SandboxName,
+        marked: marker::Started,
+        root: &ProcessRef,
+    ) -> Result<()> {
+        marked.name(root).map_err(|source| {
+            LayoutError::Io {
+                path: self.markers(name),
+                source,
+            }
+            .into()
+        })
+    }
+
+    /// Removes an ended session's marker. One left behind is an empty file
+    /// nothing holds, so failing to remove it changes nothing.
+    pub(super) fn forget_marker(&self, session: &SessionRecord) {
+        let _ = marker::remove(&self.markers(&session.sandbox), &session.root);
+    }
+
+    /// The processes holding each marker of sandbox `name`, by marker.
+    pub(super) fn held(&self, name: &SandboxName) -> Result<Held> {
+        Ok(marker::holders(&self.markers(name))?)
+    }
+
+    /// `session`, with the processes holding its marker added to those it
+    /// tracked: each is shown to be its member (ADR 0030). Lists the
+    /// processes only when something holds the marker.
+    pub(super) fn marked(&self, session: &SessionRecord, held: &Held) -> Result<SessionRecord> {
+        let mut marked = session.clone();
+        if held.contains_key(&marker::name_of(&session.root)) {
+            marked.tracked = marked_in(session, &session.tracked, &processes()?, held);
+        }
+        Ok(marked)
     }
 
     /// What `connect` would start, without starting anything.
@@ -822,4 +902,30 @@ impl Drop for KeepWaiting {
             signal_hook::low_level::unregister(id);
         }
     }
+}
+
+/// The processes holding each marker of a sandbox, by marker file name.
+pub(super) type Held = std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>;
+
+/// `tracked`, with the processes in `procs` that hold `session`'s marker
+/// (ADR 0030).
+pub(super) fn marked_in(
+    session: &SessionRecord,
+    tracked: &[ProcessRef],
+    procs: &[Proc],
+    held: &Held,
+) -> Vec<ProcessRef> {
+    let mut tracked = tracked.to_vec();
+    if let Some(pids) = held.get(&marker::name_of(&session.root)) {
+        for p in procs.iter().filter(|p| pids.contains(&p.pid)) {
+            let holder = ProcessRef {
+                pid: p.pid,
+                started: p.started.clone(),
+            };
+            if !tracked.contains(&holder) {
+                tracked.push(holder);
+            }
+        }
+    }
+    tracked
 }
