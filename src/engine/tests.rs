@@ -1807,7 +1807,12 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(!lab.allows("chatgpt.com"));
         assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
         let installers = lab.engine.layout.sandbox_dir("home").join("installers");
-        assert!(!installers.join("hermes-install.sh").exists());
+        assert!(std::fs::read_dir(&installers).unwrap().all(|e| {
+            !e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hermes-install")
+        }));
         assert!(
             std::fs::read_dir(&installers)
                 .unwrap()
@@ -1837,7 +1842,14 @@ echo \"installed $*\" > \"$HOME/installed\"
             audit.contains(&format!("installer sha256 {}", runtime.sha256)),
             "{audit}"
         );
+        // At a path of its own hash, so an install running at the same time
+        // with another version cannot replace what this one runs.
         let installers = lab.engine.layout.sandbox_dir("home").join("installers");
+        let named = format!("hermes-install-{}.sh", runtime.sha256);
+        assert_eq!(
+            std::fs::read(installers.join(&named)).unwrap(),
+            INSTALLS.as_bytes()
+        );
         assert!(
             std::fs::read_dir(&installers)
                 .unwrap()

@@ -530,16 +530,17 @@ impl Engine {
 
     /// Downloads the runtime's installer on the host into `dir`, outside the
     /// sandbox home, with its SHA-256, which the audit entry names. Any
-    /// version is run (ADR 0029). It is downloaded under a name of its own and
-    /// moved into place once read, so an install already reading the file
-    /// keeps what it opened.
+    /// version is run (ADR 0029), so the file is named after its hash: an
+    /// install running at the same time that got another version moves its
+    /// own to another path, and the bytes this install runs are the ones its
+    /// entry names. It is downloaded under a name of its own and moved into
+    /// place once read.
     fn download_installer(
         &self,
         dir: &Path,
         runtime: &dyn RuntimeAdapter,
     ) -> Result<(PathBuf, String)> {
         let installer = runtime.installer();
-        let path = dir.join(format!("{}-install.sh", runtime.kind()));
         let part = dir.join(format!(
             "{}-install.{}.part",
             runtime.kind(),
@@ -568,6 +569,7 @@ impl Engine {
         let bytes = std::fs::read(&part)
             .map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
         let sha256 = hex(&Sha256::digest(&bytes));
+        let path = dir.join(format!("{}-install-{sha256}.sh", runtime.kind()));
         std::fs::rename(&part, &path).map_err(|e| {
             failed(format!(
                 "cannot move the installer into place at {}: {e}",
