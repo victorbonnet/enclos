@@ -135,11 +135,11 @@ fn run(cli: Cli) -> Result<u8> {
     }
 }
 
-/// Whether `command` only does its work and prints, so that a reader that
-/// left early, as `head` does, ends it as it ends any Unix tool, by SIGPIPE,
-/// not by a panic on the next print. Not for those that run programs
-/// (`connect`, `runtime`, `agent`), keep running (`proxy`, `launch`), or
-/// handle a closed output themselves (`logs`).
+/// Whether a reader that left early, as `head` does, ends `command` as it
+/// ends any Unix tool, by SIGPIPE, not by a panic on the next print. Not for
+/// those that run the user's or a runtime's programs (`connect`, `runtime`,
+/// `agent`), keep running (`proxy`, `launch`), or handle a closed output
+/// themselves (`logs`).
 fn ends_on_closed_output(command: &Command) -> bool {
     matches!(
         command,
