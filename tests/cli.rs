@@ -2315,6 +2315,18 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
         // What the shell would read next: nothing of the value.
         let left = rustix::io::ioctl_fionread(&slave).unwrap();
         assert_eq!(left, 0, "{left} bytes left for the shell");
+        // enclos turned bracketed paste on, then off, on this terminal.
+        rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut shown = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = rustix::io::read(&master, &mut buf[..]) {
+            shown.extend_from_slice(&buf[..n]);
+        }
+        let shown = String::from_utf8_lossy(&shown);
+        assert!(
+            shown.contains("\x1b[?2004h") && shown.ends_with("\x1b[?2004l"),
+            "{shown:?}"
+        );
         (out, echo)
     };
     let (out, echo) = at_terminal("long", &[b"k".repeat(1500), b"\r".to_vec()].concat());

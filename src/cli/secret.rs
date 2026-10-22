@@ -3,6 +3,7 @@
 //! which other processes can list.
 
 use std::io::{IsTerminal, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 
 use clap::{Args, Subcommand};
 
@@ -183,20 +184,12 @@ fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Resul
             0x04 if line.is_empty() => break Typed::Ended,
             0x04 => break Typed::Line(line),
             0x03 | 0x1a | 0x1c => break Typed::Cancelled,
-            0x1b => {
-                let mut mark = [0u8; 5];
-                for byte in &mut mark {
-                    match keys.next().transpose()? {
-                        Some(next) => *byte = next,
-                        None => break,
-                    }
-                }
-                match &mark {
-                    PASTE_STARTS => pasting = true,
-                    PASTE_ENDS => pasting = false,
-                    _ => break Typed::Control(0x1b),
-                }
-            }
+            0x1b => match paste_mark(keys)? {
+                Mark::Starts => pasting = true,
+                Mark::Ends => pasting = false,
+                Mark::Cancelled => break Typed::Cancelled,
+                Mark::Not => break Typed::Control(0x1b),
+            },
             // A character's last byte, and any continuation bytes before it.
             0x7f | 0x08 => {
                 while let Some(byte) = line.pop() {
@@ -226,6 +219,39 @@ fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Resul
 /// Escape, and after it.
 const PASTE_STARTS: &[u8; 5] = b"[200~";
 const PASTE_ENDS: &[u8; 5] = b"[201~";
+
+/// What followed an Escape.
+enum Mark {
+    Starts,
+    Ends,
+    /// A key that would signal: the read is cancelled at once.
+    Cancelled,
+    /// Anything else: an Escape or an arrow key, refused.
+    Not,
+}
+
+/// Reads what follows an Escape as far as it can be a paste's mark, and no
+/// further: the first byte that cannot continue one ends it, so a lone
+/// Escape or an arrow key takes no more keys than its own.
+fn paste_mark(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<Mark> {
+    let mut read = Vec::new();
+    while read.len() < PASTE_STARTS.len() {
+        let Some(byte) = keys.next().transpose()? else {
+            return Ok(Mark::Not);
+        };
+        if matches!(byte, 0x03 | 0x1a | 0x1c) {
+            return Ok(Mark::Cancelled);
+        }
+        read.push(byte);
+        if !PASTE_STARTS.starts_with(&read) && !PASTE_ENDS.starts_with(&read) {
+            return Ok(Mark::Not);
+        }
+    }
+    Ok(match read.as_slice() == PASTE_STARTS {
+        true => Mark::Starts,
+        false => Mark::Ends,
+    })
+}
 
 /// Whether `drained`, what came after the line, holds anything but the
 /// marks around a paste and line endings.
@@ -283,10 +309,16 @@ impl<'a> Quiet<'a> {
         tcsetattr(stdin, OptionalActions::Now, &quiet)?;
         // Bracketed paste, so a paste's end is known whatever pauses its
         // bytes come with (ssh on a slow link, a slow paste).
-        let tty = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/tty")
+        // On the terminal the value is read from, which need not be the
+        // controlling one.
+        let tty = rustix::termios::ttyname(stdin, Vec::new())
             .ok()
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(std::ffi::OsStr::from_bytes(path.as_bytes()))
+                    .ok()
+            })
             .filter(|mut tty| tty.write_all(b"\x1b[?2004h").is_ok());
         Ok(Quiet {
             stdin,
@@ -302,11 +334,14 @@ impl<'a> Quiet<'a> {
     /// but the end of a paste came.
     fn drain(&self, paste_open: bool) -> std::io::Result<bool> {
         use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
-        let mut waiting = tcgetattr(self.stdin)?;
-        waiting.special_codes[SpecialCodeIndex::VMIN] = 0;
-        waiting.special_codes[SpecialCodeIndex::VTIME] = 5;
-        tcsetattr(self.stdin, OptionalActions::Now, &waiting)?;
-        let drained = self.drained(paste_open);
+        let drained = tcgetattr(self.stdin)
+            .and_then(|mut waiting| {
+                waiting.special_codes[SpecialCodeIndex::VMIN] = 0;
+                waiting.special_codes[SpecialCodeIndex::VTIME] = 5;
+                tcsetattr(self.stdin, OptionalActions::Now, &waiting)
+            })
+            .map_err(std::io::Error::from)
+            .and_then(|()| self.drained(paste_open));
         // Flushed whatever happened, so as little as can be reaches the
         // shell when it went wrong.
         let flushed = rustix::termios::tcflush(self.stdin, rustix::termios::QueueSelector::IFlush);
@@ -354,8 +389,12 @@ impl<'a> Quiet<'a> {
     }
 
     fn put_back(&mut self) {
-        if let Some(mut tty) = self.tty.take() {
-            let _ = tty.write_all(b"\x1b[?2004l");
+        if let Some(mut tty) = self.tty.take()
+            && let Err(e) = tty.write_all(b"\x1b[?2004l")
+        {
+            eprintln!(
+                "\nwarning: cannot turn the terminal's bracketed paste back off ({e}); run `printf '\\e[?2004l'`"
+            );
         }
         if let Some(before) = self.before.take()
             && let Err(e) = rustix::termios::tcsetattr(
@@ -493,7 +532,20 @@ mod tests {
     fn the_keys_that_would_signal_cancel_at_once() {
         for key in [0x03, 0x1a, 0x1c] {
             assert_eq!(keys(&[b't', key, b'x']).unwrap(), Typed::Cancelled);
+            // After an Escape too, and after the start of a mark.
+            assert_eq!(keys(&[0x1b, key]).unwrap(), Typed::Cancelled);
+            assert_eq!(keys(&[0x1b, b'[', b'2', key]).unwrap(), Typed::Cancelled);
         }
+    }
+
+    #[test]
+    fn an_escape_takes_no_more_keys_than_its_own() {
+        // An arrow key in a paste does not eat the start of its end mark.
+        let pasted = |bytes: &[u8]| typed(&mut bytes.iter().map(|b| Ok(*b))).unwrap();
+        let mut rest = b"\x1b[200~ab\x1b[D\x1b[201~".iter().map(|b| Ok(*b));
+        assert_eq!(typed(&mut rest).unwrap(), (Typed::Control(0x1b), true));
+        assert_eq!(rest.map(|b| b.unwrap()).collect::<Vec<_>>(), b"\x1b[201~");
+        assert_eq!(pasted(b"\x1bx"), (Typed::Control(0x1b), false));
     }
 
     #[test]
