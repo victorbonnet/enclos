@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A session's processes hold a marker enclos can find

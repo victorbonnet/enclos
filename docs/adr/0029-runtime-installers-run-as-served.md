@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A runtime's installer runs as the runtime serves it, not pinned by hash
