@@ -95,7 +95,7 @@ enum Failed {
 
 /// Shows `from` on `to` line by line, each line escaped and without its
 /// line ending (`\n` or `\r\n`). Bytes that are not UTF-8 show as U+FFFD,
-/// and a line of `MAX_LINE` bytes or more is shown in pieces.
+/// and a line longer than `MAX_LINE` bytes is shown in pieces.
 fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
