@@ -605,10 +605,12 @@ fn relay(
 /// nothing for that long. Returns the bytes that reached `to`, also when an
 /// error, such as a reset, ended it.
 ///
-/// With `room`, only that many bytes reach `to`, and the copy ends once
-/// `from` sends more, dropping it: a plain-HTTP client's second request,
-/// which could name another site on the same address. `to` is then told the
-/// client is done, and still answers the first.
+/// With `room`, only that many bytes reach `to`. Once `from` sends more, a
+/// plain-HTTP client's second request, which could name another site on the
+/// same address, `to` is told the client is done, and still answers the
+/// first; what `from` sends from then on is read and dropped, and is no
+/// activity. Read, so that closing `from` later does not reset it and lose
+/// the answer on its way.
 fn copy(
     mut from: &TcpStream,
     to: &TcpStream,
@@ -618,6 +620,8 @@ fn copy(
 ) -> u64 {
     let mut buf = [0u8; 16 * 1024];
     let mut moved = 0;
+    // Whether `to` was told the client is done.
+    let mut told = false;
     loop {
         let quiet = activity.quiet();
         if quiet >= limit {
@@ -640,16 +644,19 @@ fn copy(
                     }
                     None => read,
                 };
-                activity.moved();
-                if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
-                    // A write times out after the limit: `to` stopped reading.
-                    if timed_out(&e) {
-                        activity.close_idle();
+                if n > 0 {
+                    activity.moved();
+                    if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
+                        // A write times out after the limit: `to` stopped reading.
+                        if timed_out(&e) {
+                            activity.close_idle();
+                        }
+                        return moved;
                     }
-                    return moved;
                 }
-                if n < read {
-                    return moved;
+                if n < read && !told {
+                    let _ = to.shutdown(Shutdown::Write);
+                    told = true;
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted || timed_out(&e) => {}
