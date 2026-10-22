@@ -630,7 +630,12 @@ fn copy(
         }
         // Waits at most until the connection would turn idle; if the other
         // copy moved bytes meanwhile, the next turn of the loop waits again.
-        if from.set_read_timeout(Some(limit - quiet)).is_err() {
+        // macOS refuses the option once the connection is closed both ways
+        // (EINVAL), while what it received can still be read, and a read
+        // then cannot wait: stopping here would lose a server's answer.
+        if let Err(e) = from.set_read_timeout(Some(limit - quiet))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
             return moved;
         }
         match from.read(&mut buf) {
@@ -738,6 +743,39 @@ fn response(status: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::loggable_host;
+
+    /// A server that answered and closed after the proxy told it the client
+    /// was done: its connection is closed both ways, and its answer is
+    /// still copied.
+    #[test]
+    fn an_answer_from_a_connection_closed_both_ways_is_copied() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let pair = || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (far, _) = listener.accept().unwrap();
+            (near, far)
+        };
+        let (upstream, mut server) = pair();
+        let (client, mut reader) = pair();
+        upstream.shutdown(Shutdown::Write).unwrap();
+        server.write_all(b"answer").unwrap();
+        drop(server);
+        // Time for the server's end to arrive: on macOS, the socket then
+        // refuses a read timeout.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let activity = super::Activity::new();
+        let moved = super::copy(&upstream, &client, &activity, Duration::from_secs(5), None);
+        assert_eq!(moved, 6);
+        drop(client);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"answer");
+    }
 
     #[test]
     fn a_bad_host_keeps_only_what_can_be_a_host() {
