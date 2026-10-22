@@ -20,6 +20,10 @@ pub enum Request {
         version: String,
         /// The header lines after the request line, without the final blank line.
         headers: Vec<String>,
+        /// The length of the body that follows the head, from its
+        /// `Content-Length`: the proxy forwards that much and no more, so
+        /// the connection carries this one request.
+        body: u64,
     },
 }
 
@@ -76,14 +80,46 @@ pub fn parse(head: &str) -> Option<Request> {
         return None;
     }
     let (host, port) = split_host_port(authority, Some(80))?;
+    let headers: Vec<String> = lines.map(str::to_owned).collect();
+    let body = body_length(&headers)?;
     Some(Request::Http {
         method: method.to_owned(),
         host,
         port,
         path: path.to_owned(),
         version: version.to_owned(),
-        headers: lines.map(str::to_owned).collect(),
+        headers,
+        body,
     })
+}
+
+/// The length of a plain-HTTP request's body: its `Content-Length`, or 0
+/// without one. `None` when the proxy cannot tell where the body ends from
+/// the head alone, so that what follows could be read as a second request:
+/// a `Transfer-Encoding`, or lengths that are not one number.
+fn body_length(headers: &[String]) -> Option<u64> {
+    let mut length = None;
+    for line in headers {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return None;
+        }
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        for value in value.split(',').map(str::trim) {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let value: u64 = value.parse().ok()?;
+            if length.is_some_and(|l| l != value) {
+                return None;
+            }
+            length = Some(value);
+        }
+    }
+    Some(length.unwrap_or(0))
 }
 
 /// Whether `text` is an HTTP token, as a method must be.
@@ -196,9 +232,35 @@ mod tests {
             "BREW pot HTCPCP/1.0\r\n\r\n",
             "GET http://example.com/ HTTP/1.9x\r\n\r\n",
             "G\x1b[2JET http://example.com/ HTTP/1.1\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 40\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nContent-Length: 4, 40\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nContent-Length: +4\r\n\r\n",
+            "POST http://example.com/ HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+            "GET http://example.com/ HTTP/1.1\r\nno colon\r\n\r\n",
         ] {
             assert_eq!(parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_plain_http_body_is_as_long_as_its_content_length() {
+        let body = |head: &str| match parse(head) {
+            Some(Request::Http { body, .. }) => body,
+            other => panic!("{head}: {other:?}"),
+        };
+        assert_eq!(body("GET http://example.com/ HTTP/1.1\r\n\r\n"), 0);
+        assert_eq!(
+            body("POST http://example.com/ HTTP/1.1\r\ncontent-length: 12\r\n\r\n"),
+            12
+        );
+        assert_eq!(
+            body(
+                "POST http://example.com/ HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5, 5\r\n\r\n"
+            ),
+            5
+        );
     }
 
     #[test]

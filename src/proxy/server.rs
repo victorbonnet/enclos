@@ -431,6 +431,9 @@ fn forward(
     // A plain-HTTP client closed on before any answer is told why; a
     // tunnel's client already had its `200`.
     let mut unanswered = None;
+    // How much more of the client's bytes go upstream: a tunnel's all of
+    // them, a plain-HTTP request's only its body.
+    let mut room = None;
     let mut first = match request {
         Request::Connect { .. } => {
             let mut client = client;
@@ -447,8 +450,10 @@ fn forward(
             path,
             version,
             headers,
+            body,
             ..
         } => {
+            room = Some(body);
             let dest = destination(&event.host, event.port);
             unanswered = Some(response(
                 "504 Gateway Timeout",
@@ -459,13 +464,23 @@ fn forward(
             origin_head(&method, &path, &version, &headers, &event.host, event.port).into_bytes()
         }
     };
+    let early = match &mut room {
+        Some(room) => {
+            let body = early
+                .len()
+                .min(usize::try_from(*room).unwrap_or(usize::MAX));
+            *room -= body as u64;
+            &early[..body]
+        }
+        None => early,
+    };
     first.extend_from_slice(early);
     let mut writer = upstream;
     if writer.write_all(&first).is_err() {
         return;
     }
     event.bytes_up += first.len() as u64;
-    let relayed = relay(client, upstream, limit, unanswered.as_deref());
+    let relayed = relay(client, upstream, limit, unanswered.as_deref(), room);
     event.bytes_up += relayed.up;
     event.bytes_down += relayed.down;
     if relayed.went_idle {
@@ -521,17 +536,19 @@ impl Activity {
 /// Copies bytes both ways. When the client is done, the server is told so
 /// and may still answer; when the server is done, the connection ends; when
 /// it hits the idle limit, both sides are closed, and a client that got no
-/// byte back is first sent `unanswered`, when given.
+/// byte back is first sent `unanswered`, when given. At most `room` bytes
+/// go up, when given.
 fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     limit: Duration,
     unanswered: Option<&str>,
+    room: Option<u64>,
 ) -> Relayed {
     let activity = Activity::new();
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            let moved = copy(client, upstream, &activity, limit);
+            let moved = copy(client, upstream, &activity, limit, room);
             let how = if activity.went_idle() {
                 Shutdown::Both
             } else {
@@ -541,7 +558,7 @@ fn relay(
             moved
         });
         let down = match up {
-            Ok(_) => copy(upstream, client, &activity, limit),
+            Ok(_) => copy(upstream, client, &activity, limit, None),
             Err(_) => 0,
         };
         // Nothing went down yet, so the client's send buffer is empty and
@@ -567,7 +584,17 @@ fn relay(
 /// the idle limit: nothing moved either way for `limit`, or `to` read
 /// nothing for that long. Returns the bytes that reached `to`, also when an
 /// error, such as a reset, ended it.
-fn copy(mut from: &TcpStream, to: &TcpStream, activity: &Activity, limit: Duration) -> u64 {
+///
+/// With `room`, only that many bytes reach `to`. What `from` sends after
+/// them is read and dropped, and is no activity: a plain-HTTP client's
+/// second request, which could name another site on the same address.
+fn copy(
+    mut from: &TcpStream,
+    to: &TcpStream,
+    activity: &Activity,
+    limit: Duration,
+    mut room: Option<u64>,
+) -> u64 {
     let mut buf = [0u8; 16 * 1024];
     let mut moved = 0;
     loop {
@@ -584,6 +611,17 @@ fn copy(mut from: &TcpStream, to: &TcpStream, activity: &Activity, limit: Durati
         match from.read(&mut buf) {
             Ok(0) => return moved,
             Ok(n) => {
+                let n = match &mut room {
+                    Some(room) => {
+                        let n = n.min(usize::try_from(*room).unwrap_or(usize::MAX));
+                        *room -= n as u64;
+                        n
+                    }
+                    None => n,
+                };
+                if n == 0 {
+                    continue;
+                }
                 activity.moved();
                 if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
                     // A write times out after the limit: `to` stopped reading.
@@ -640,7 +678,7 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
         ),
         (_, Reason::BadRequest) => (
             "400 Bad Request",
-            "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL.\n".to_owned(),
+            "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL and, for a body, a Content-Length.\n".to_owned(),
         ),
         (_, Reason::PolicyUnreadable) => {
             let sandbox = &event.sandbox;
