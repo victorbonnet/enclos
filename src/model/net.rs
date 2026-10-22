@@ -59,13 +59,13 @@ impl Reason {
     /// so a new one has to decide.
     pub fn nothing_to_allow(self) -> bool {
         match self {
-            Reason::PolicyUnreadable => true,
+            // A bad request is refused whatever the policy says.
+            Reason::PolicyUnreadable | Reason::BadRequest => true,
             Reason::NotAllowed
             | Reason::BlockedAddress
             | Reason::PrivateAddress
             | Reason::ResolveFailed
             | Reason::ConnectFailed
-            | Reason::BadRequest
             | Reason::Idle => false,
         }
     }

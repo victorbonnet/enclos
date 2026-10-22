@@ -108,6 +108,12 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
             "Allow what you trust with `enclos policy allow {sandbox} <destination>`.\n"
         ));
     }
+    if denied.iter().any(|d| d.reason == Reason::BadRequest) {
+        out.push_str(&format!(
+            "{}: the request was malformed or framed in a way the proxy does not forward, whatever the destination; there is nothing to allow.\n",
+            Reason::BadRequest
+        ));
+    }
     if denied.iter().any(|d| d.reason == Reason::PolicyUnreadable) {
         out.push_str(&format!(
             "{}: the proxy could not read the sandbox's policy at those times, so it refused every destination; there is nothing to allow. See why with `enclos logs {sandbox}`.\n",
@@ -120,6 +126,19 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_request_is_nothing_to_allow() {
+        let shown = denied_text(
+            &"home".parse().unwrap(),
+            &[refused("plain.example.com", Reason::BadRequest)],
+        );
+        assert!(!shown.contains("enclos policy allow"), "{shown}");
+        assert!(
+            shown.contains("bad-request: the request was malformed"),
+            "{shown}"
+        );
+    }
 
     fn refused(host: &str, reason: Reason) -> DeniedDestination {
         let at = "2026-10-20T12:00:00Z".parse().unwrap();

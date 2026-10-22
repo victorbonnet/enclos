@@ -202,6 +202,10 @@ impl Proxy {
         if !allowed(&policy, &dest) {
             return Err(Reason::NotAllowed);
         }
+        // Refused once the destination is known, so the refusal is recorded.
+        if let Request::Http { body: None, .. } = request {
+            return Err(Reason::BadRequest);
+        }
         // From here on the policy allows the destination: a failure to reach
         // it is not a refusal.
         event.verdict = Verdict::Allowed;
@@ -431,6 +435,10 @@ fn forward(
     // A plain-HTTP client closed on before any answer is told why; a
     // tunnel's client already had its `200`.
     let mut unanswered = None;
+    // How much more of the client's bytes go upstream: a tunnel's all of
+    // them, a plain-HTTP request's only its body, which `open` made sure
+    // the head gives.
+    let mut room = None;
     let mut first = match request {
         Request::Connect { .. } => {
             let mut client = client;
@@ -447,8 +455,10 @@ fn forward(
             path,
             version,
             headers,
+            body,
             ..
         } => {
+            room = Some(body.unwrap_or(0));
             let dest = destination(&event.host, event.port);
             unanswered = Some(response(
                 "504 Gateway Timeout",
@@ -456,8 +466,30 @@ fn forward(
                     "enclos: {dest} sent no answer within the proxy's idle limit, so the proxy closed the connection (idle).\n"
                 ),
             ));
-            origin_head(&method, &path, &version, &headers, &event.host, event.port).into_bytes()
+            let body = body.unwrap_or(0);
+            origin_head(
+                &method,
+                &path,
+                &version,
+                &headers,
+                &event.host,
+                event.port,
+                body,
+            )
+            .into_bytes()
         }
+    };
+    // Sent with the head, past the body: the client is done already.
+    let done = room.is_some_and(|room| early.len() as u64 > room);
+    let early = match &mut room {
+        Some(room) => {
+            let body = early
+                .len()
+                .min(usize::try_from(*room).unwrap_or(usize::MAX));
+            *room -= body as u64;
+            &early[..body]
+        }
+        None => early,
     };
     first.extend_from_slice(early);
     let mut writer = upstream;
@@ -465,7 +497,10 @@ fn forward(
         return;
     }
     event.bytes_up += first.len() as u64;
-    let relayed = relay(client, upstream, limit, unanswered.as_deref());
+    if done {
+        let _ = upstream.shutdown(Shutdown::Write);
+    }
+    let relayed = relay(client, upstream, limit, unanswered.as_deref(), room);
     event.bytes_up += relayed.up;
     event.bytes_down += relayed.down;
     if relayed.went_idle {
@@ -521,17 +556,19 @@ impl Activity {
 /// Copies bytes both ways. When the client is done, the server is told so
 /// and may still answer; when the server is done, the connection ends; when
 /// it hits the idle limit, both sides are closed, and a client that got no
-/// byte back is first sent `unanswered`, when given.
+/// byte back is first sent `unanswered`, when given. At most `room` bytes
+/// go up, when given.
 fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     limit: Duration,
     unanswered: Option<&str>,
+    room: Option<u64>,
 ) -> Relayed {
     let activity = Activity::new();
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            let moved = copy(client, upstream, &activity, limit);
+            let moved = copy(client, upstream, &activity, limit, room);
             let how = if activity.went_idle() {
                 Shutdown::Both
             } else {
@@ -541,7 +578,7 @@ fn relay(
             moved
         });
         let down = match up {
-            Ok(_) => copy(upstream, client, &activity, limit),
+            Ok(_) => copy(upstream, client, &activity, limit, None),
             Err(_) => 0,
         };
         // Nothing went down yet, so the client's send buffer is empty and
@@ -567,9 +604,24 @@ fn relay(
 /// the idle limit: nothing moved either way for `limit`, or `to` read
 /// nothing for that long. Returns the bytes that reached `to`, also when an
 /// error, such as a reset, ended it.
-fn copy(mut from: &TcpStream, to: &TcpStream, activity: &Activity, limit: Duration) -> u64 {
+///
+/// With `room`, only that many bytes reach `to`. Once `from` sends more, a
+/// plain-HTTP client's second request, which could name another site on the
+/// same address, `to` is told the client is done, and still answers the
+/// first; what `from` sends from then on is read and dropped, and is no
+/// activity. Read, so that closing `from` later does not reset it and lose
+/// the answer on its way.
+fn copy(
+    mut from: &TcpStream,
+    to: &TcpStream,
+    activity: &Activity,
+    limit: Duration,
+    mut room: Option<u64>,
+) -> u64 {
     let mut buf = [0u8; 16 * 1024];
     let mut moved = 0;
+    // Whether `to` was told the client is done.
+    let mut told = false;
     loop {
         let quiet = activity.quiet();
         if quiet >= limit {
@@ -578,19 +630,38 @@ fn copy(mut from: &TcpStream, to: &TcpStream, activity: &Activity, limit: Durati
         }
         // Waits at most until the connection would turn idle; if the other
         // copy moved bytes meanwhile, the next turn of the loop waits again.
-        if from.set_read_timeout(Some(limit - quiet)).is_err() {
+        // macOS refuses the option once the connection is closed both ways
+        // (EINVAL), while what it received can still be read, and a read
+        // then cannot wait: stopping here would lose a server's answer.
+        if let Err(e) = from.set_read_timeout(Some(limit - quiet))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
             return moved;
         }
         match from.read(&mut buf) {
             Ok(0) => return moved,
-            Ok(n) => {
-                activity.moved();
-                if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
-                    // A write times out after the limit: `to` stopped reading.
-                    if timed_out(&e) {
-                        activity.close_idle();
+            Ok(read) => {
+                let n = match &mut room {
+                    Some(room) => {
+                        let n = read.min(usize::try_from(*room).unwrap_or(usize::MAX));
+                        *room -= n as u64;
+                        n
                     }
-                    return moved;
+                    None => read,
+                };
+                if n > 0 {
+                    activity.moved();
+                    if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
+                        // A write times out after the limit: `to` stopped reading.
+                        if timed_out(&e) {
+                            activity.close_idle();
+                        }
+                        return moved;
+                    }
+                }
+                if n < read && !told {
+                    let _ = to.shutdown(Shutdown::Write);
+                    told = true;
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted || timed_out(&e) => {}
@@ -640,7 +711,7 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
         ),
         (_, Reason::BadRequest) => (
             "400 Bad Request",
-            "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL.\n".to_owned(),
+            "enclos: the proxy cannot serve this request. It serves CONNECT host:port, and plain-HTTP requests with an absolute URL, header lines of the form `Name: value` and, for a body, one Content-Length (no Transfer-Encoding).\n".to_owned(),
         ),
         (_, Reason::PolicyUnreadable) => {
             let sandbox = &event.sandbox;
@@ -672,6 +743,39 @@ fn response(status: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::loggable_host;
+
+    /// A server that answered and closed after the proxy told it the client
+    /// was done: its connection is closed both ways, and its answer is
+    /// still copied.
+    #[test]
+    fn an_answer_from_a_connection_closed_both_ways_is_copied() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::time::Duration;
+
+        let pair = || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (far, _) = listener.accept().unwrap();
+            (near, far)
+        };
+        let (upstream, mut server) = pair();
+        let (client, mut reader) = pair();
+        upstream.shutdown(Shutdown::Write).unwrap();
+        server.write_all(b"answer").unwrap();
+        drop(server);
+        // Time for the server's end to arrive: on macOS, the socket then
+        // refuses a read timeout.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let activity = super::Activity::new();
+        let moved = super::copy(&upstream, &client, &activity, Duration::from_secs(5), None);
+        assert_eq!(moved, 6);
+        drop(client);
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"answer");
+    }
 
     #[test]
     fn a_bad_host_keeps_only_what_can_be_a_host() {
