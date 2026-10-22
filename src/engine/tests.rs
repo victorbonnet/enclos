@@ -2910,7 +2910,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             // The audit entry cannot be written: no restart is asked.
             mode(0o400).unwrap();
             std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            // Room for the attempt, 5 to 9 s after the write, on a slow host.
+            std::thread::sleep(std::time::Duration::from_secs(20));
             mode(0o600).unwrap();
             // The next change is asked for.
             std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=y\n").unwrap();

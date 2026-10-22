@@ -26,9 +26,10 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// reason, however it changes.
 const MAX_SETTINGS: u64 = 1024 * 1024;
 /// How long after a restart that was not sent it is asked again, when the
-/// files do not change meanwhile: a failure that lasts does not fill the
-/// audit log.
+/// files do not change meanwhile, doubled after each failure up to
+/// `RETRY_MAX`: a failure that lasts does not fill the audit log.
 const RETRY: Duration = Duration::from_secs(60);
+const RETRY_MAX: Duration = Duration::from_secs(64 * 60);
 
 /// One file as read: its text, `None` when it is not there, or why it
 /// could not be read.
@@ -46,6 +47,8 @@ pub(super) struct SettingsWatch {
     /// When the change is asked for again, after a restart that was not
     /// sent.
     retry_at: Option<Instant>,
+    /// How long the next failure waits.
+    retry: Duration,
 }
 
 impl SettingsWatch {
@@ -62,6 +65,7 @@ impl SettingsWatch {
             changed: None,
             read_at: None,
             retry_at: None,
+            retry: RETRY,
         })
     }
 
@@ -69,7 +73,8 @@ impl SettingsWatch {
     /// read the same for `SETTLE`; `None` until then. Reads them at most
     /// every `READ_EVERY`. A file changed and changed back counts as not
     /// changed. After [`SettingsWatch::failed`], the same change is
-    /// answered again only after `RETRY`; a new one, once it has settled.
+    /// answered again only after the retry delay; a new one, once it has
+    /// settled.
     pub(super) fn settled(&mut self, now: Instant) -> Option<Vec<HomePath>> {
         if self
             .read_at
@@ -108,7 +113,8 @@ impl SettingsWatch {
 
     /// The restart `settled` answered was not sent at `now`.
     pub(super) fn failed(&mut self, now: Instant) {
-        self.retry_at = Some(now + RETRY);
+        self.retry_at = Some(now + self.retry);
+        self.retry = (self.retry * 2).min(RETRY_MAX);
     }
 }
 
@@ -272,10 +278,15 @@ mod tests {
         // The same change: not before `RETRY`.
         assert_eq!(watch.settled(first + READ_EVERY), None);
         assert_eq!(watch.settled(first + RETRY), Some(vec![rel("b")]));
-        watch.failed(first + RETRY);
+        // Failing again waits twice as long.
+        let second = first + RETRY;
+        watch.failed(second);
+        assert_eq!(watch.settled(second + RETRY), None);
+        assert_eq!(watch.settled(second + 2 * RETRY), Some(vec![rel("b")]));
+        watch.failed(second + 2 * RETRY);
         // A new change: once it has settled.
         std::fs::write(home.path().join("b"), "token2").unwrap();
-        let later = first + RETRY + READ_EVERY;
+        let later = second + 2 * RETRY + READ_EVERY;
         assert_eq!(watch.settled(later), None);
         assert_eq!(watch.settled(later + SETTLE), Some(vec![rel("b")]));
     }
