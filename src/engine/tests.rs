@@ -2963,6 +2963,82 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(left.is_empty(), "markers left: {left:?}");
     }
 
+    /// A member whose TERM handler forks a child and exits leaves an orphan
+    /// that neither its group nor its parent proves the session's. It holds
+    /// the marker, so the look after the first stop proves it, and it is
+    /// stopped too instead of surviving (ADR 0030).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_forked_while_stopping_is_stopped_through_its_marker() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        let forked = lab.home.join("forked");
+        let script = format!(
+            "trap '(/bin/sleep 600 & echo $! > \"{}\") ; exit 0' TERM; while :; do /bin/sleep 0.1; done",
+            forked.display()
+        );
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let marker = lab.engine.new_marker(&lab.name).unwrap();
+        let (mut child, marked) = marker.spawn(&mut command).unwrap();
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        lab.engine.name_marker(&lab.name, marked, &root).unwrap();
+        let session = crate::model::session::SessionRecord {
+            id: crate::model::session::SessionId(0),
+            sandbox: lab.name.clone(),
+            kind: crate::model::session::SessionKind::Interactive,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            pgid: Some(child.id()),
+            root,
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+
+        let stopped = lab
+            .engine
+            .stop_marked(
+                &session,
+                Duration::from_millis(500),
+                crate::lifecycle::stop::stop,
+            )
+            .unwrap();
+        let _ = child.wait();
+        let start = Instant::now();
+        while !forked.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid: u32 = std::fs::read_to_string(&forked)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = crate::lifecycle::process::reference(pid).unwrap().is_some();
+        if alive {
+            // The test's own child, by the pid it wrote: never left running.
+            let _ = std::process::Command::new("/bin/kill")
+                .arg(pid.to_string())
+                .status();
+        }
+        assert!(!alive, "the forked child survived: {stopped:?}");
+        assert!(
+            matches!(stopped, crate::lifecycle::stop::Stopped::Clean),
+            "{stopped:?}"
+        );
+    }
+
     /// A process holding one session's marker is that session's member,
     /// never another's (ADR 0030).
     #[test]

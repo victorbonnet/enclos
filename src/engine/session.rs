@@ -635,26 +635,30 @@ impl Engine {
     }
 
     /// Stops `session`'s members, with what holds its marker (ADR 0030),
-    /// then looks at the marker again: a process that gained it meanwhile,
-    /// such as one a member detached during the grace period, is stopped
-    /// too, and one that survives is a survivor, so the session stays open.
+    /// then, whatever came of it, looks at the marker again: a process that
+    /// gained it meanwhile, such as one a member detached during the grace
+    /// period or a child its TERM handler forked, is stopped too, and one
+    /// that survives that is a survivor, so the session stays open.
     pub(super) fn stop_marked(
         &self,
         session: &SessionRecord,
         grace: Duration,
         stop: super::StopMembers,
     ) -> Result<Stopped> {
-        let first = stop(&self.marked(session)?, grace)?;
-        if matches!(first, Stopped::Survivors(_)) {
-            return Ok(first);
-        }
+        let marked = self.marked(session)?;
+        let first = stop(&marked, grace)?;
+        // Looked at again whatever came of it, survivors included: a child
+        // a member's TERM handler forked before it exited is an orphan only
+        // the marker proves the session's, so it is reported as not
+        // signalled until it is.
         let again = self.marked(session)?;
-        if again.tracked.len() == session.tracked.len() {
+        if again.tracked.iter().all(|r| marked.tracked.contains(r)) {
             return Ok(first);
         }
-        Ok(match stop(&again, grace)? {
-            Stopped::Gone => first,
-            other => other,
+        Ok(match (stop(&again, grace)?, first) {
+            (Stopped::Gone, Stopped::Gone) => Stopped::Gone,
+            (Stopped::Gone, _) => Stopped::Clean,
+            (second, _) => second,
         })
     }
 
