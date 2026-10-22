@@ -162,7 +162,7 @@ pub enum Error {
     PendingChanged { sandbox: String },
     /// `policy.toml` changed since the edit of a copy of it began.
     #[error(
-        "{} changed since your edit of sandbox `{sandbox}` began, so the edit was not applied: it would undo that change. Your edit stays in policy.toml.edit beside it: compare the two, put what you want in your edit, then remove policy.toml.edit.base and run `enclos policy edit {sandbox}`, which opens your edit again; or remove both to start over",
+        "{} changed since your edit of sandbox `{sandbox}` began, so the edit was not applied: it would undo that change. Your edit stays in policy.toml.edit beside it: compare the two and put what you want in your edit, then copy policy.toml over policy.toml.edit.base and run `enclos policy edit {sandbox}`, which opens your edit again; or `enclos policy discard {sandbox}` drops it",
         file.display()
     )]
     PolicyFileChanged { sandbox: String, file: PathBuf },

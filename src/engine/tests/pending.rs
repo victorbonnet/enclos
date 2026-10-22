@@ -845,3 +845,37 @@ fn a_session_gone_after_a_crash_does_not_hold_a_change_back() {
     );
     assert!(pending_of(&applied).is_none(), "{applied:?}");
 }
+
+#[test]
+fn a_restart_with_yes_whose_start_fails_says_the_change_is_in_force_not_pending() {
+    let (dir, engine, fake, name) = with_services();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (work, before, after) = grant_work(&dir, &engine);
+    *fake.refuse.borrow_mut() = Some("proxy".into());
+    let err = engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(!text.contains("as the pending policy"), "{text}");
+    assert!(text.contains("policy v2 active"), "{text}");
+    assert!(engine.policy(&name).unwrap().pending.is_none());
+    assert!(writes(&engine, &name, &work));
+}
+
+#[test]
+fn what_allow_lists_is_what_goes_in_force_when_the_file_no_longer_waits() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    // A change mixing a write grant and a destination waits as a whole.
+    let mixed = after.replace("allow_add = []", "allow_add = [\"b.example.com\"]");
+    make_pending(&engine, &name, &before, &mixed);
+    // The grant is taken out by hand: what is left goes in force at once,
+    // the destination included, so it is listed against the active policy.
+    let by_hand = before.replace("allow_add = []", "allow_add = [\"b.example.com\"]");
+    engine.layout.write_policy("home", &by_hand).unwrap();
+    let err = engine
+        .policy_allow(&alice(), &name, "c.example.com", Confirm::Ask)
+        .unwrap_err();
+    assert!(err.to_string().contains("allow b.example.com"), "{err}");
+}

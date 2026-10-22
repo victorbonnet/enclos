@@ -497,7 +497,34 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
             .contains("c.example.com")
     );
     assert!(kept.exists());
-    home.run(&["policy", "discard", "home"]).ok();
+
+    // Kept, then refused once the file changed; copied over its base, as
+    // the error says, it opens again and applies.
+    home.run(&["policy", "allow", "home", "d.example.com"]).ok();
+    let out = edit("true");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("copy policy.toml over"),
+        "{}",
+        out.stderr()
+    );
+    std::fs::copy(
+        &file,
+        home.root.join("sandboxes/home/policy.toml.edit.base"),
+    )
+    .unwrap();
+    let out = edit("true");
+    assert!(
+        out.ok().stdout().contains("Continuing the edit kept"),
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("c.example.com")
+    );
+    assert!(!kept.exists());
 
     let out = home.run(&["policy", "discard", "home"]);
     assert!(

@@ -204,7 +204,9 @@ impl Engine {
         // What else goes in force with it is told against the active
         // policy; while sessions keep a change waiting, against that change,
         // which stays pending with this one.
-        let waits = view.pending.is_some() && !self.sessions_under_rules(name)?.is_empty();
+        // The same test `propose` makes.
+        let waits = !snapshot.policy.same_at_launch(&view.snapshot.policy)
+            && !self.sessions_under_rules(name)?.is_empty();
         let base = match waits {
             true => view.latest(),
             false => &view.snapshot,

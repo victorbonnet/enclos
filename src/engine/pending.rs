@@ -330,16 +330,25 @@ impl Engine {
         if confirm != Confirm::Yes || !recorded.restarts {
             return Ok(applied);
         }
-        let restarted =
-            self.restart_into(by, name, pending)
-                .map_err(|error| Error::FailedAfter {
+        let restarted = self.restart_into(by, name, pending).map_err(|error| {
+            // Said only while the change still waits: a restart can fail
+            // after the change went in force, when its services start.
+            let waits = matches!(
+                self.state.pending_policy(name),
+                Ok(Some((p, _))) if p.snapshot == pending.snapshot
+            );
+            match waits {
+                true => Error::FailedAfter {
                     error: Box::new(error),
                     done: format!(
                         "saving the change as the pending policy of sandbox {name} (snapshot {}), with policy v{} in force",
                         pending.snapshot.short(),
                         applied.version.version
                     ),
-                })?;
+                },
+                false => error,
+            }
+        })?;
         applied.version = restarted.version.clone();
         applied.changed = true;
         applied.outcome = ChangeOutcome::Restarted(restarted);
