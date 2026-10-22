@@ -3668,6 +3668,79 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(err.to_string().contains("$TOKEN"), "{err}");
     }
 
+    /// The sandbox's bot is set up with the runtime's own commands, once its
+    /// token is one of the sandbox's secrets the policy grants; the value
+    /// goes into no command.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
+        use crate::model::channel::{Channel, ChannelUser};
+        use crate::model::secret::{SecretRef, SecretValue};
+        use crate::secrets::InMemory;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let store = std::rc::Rc::new(InMemory::default());
+        let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+        assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+        let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        let users: Vec<ChannelUser> = vec!["111".parse().unwrap(), "222".parse().unwrap()];
+        let configure = |users: &[ChannelUser], confirm| {
+            lab.engine.configure_channel(
+                &alice(),
+                &lab.name,
+                Channel::Telegram,
+                None,
+                users,
+                confirm,
+            )
+        };
+
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(
+            err.to_string().contains("enclos secret set home/telegram"),
+            "{err}"
+        );
+        let err = configure(&[], Confirm::Yes).unwrap_err();
+        assert!(err.to_string().contains("--allow-user"), "{err}");
+        assert!(!calls().contains("config set"), "{}", calls());
+
+        let token: SecretRef = "home/telegram".parse().unwrap();
+        let value = SecretValue::new("123:tok".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!(
+            "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
+        );
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+
+        let Planned::DryRun(plan) = configure(&users, Confirm::DryRun).unwrap() else {
+            panic!("a dry run configured the channel");
+        };
+        assert_eq!(plan.changes.len(), 3, "{plan:?}");
+        assert!(!calls().contains("config set"), "{}", calls());
+
+        let set = done(configure(&users, Confirm::Yes).unwrap());
+        assert_eq!(set.token, "TELEGRAM_BOT_TOKEN");
+        assert!(
+            set.reachable,
+            "the assistant template reaches the public web"
+        );
+        assert!(
+            calls().ends_with(
+                "-p default config set platforms.telegram.enabled true\n-p default config set platforms.telegram.token ${TELEGRAM_BOT_TOKEN}\n-p default config set TELEGRAM_ALLOWED_USERS 111,222\n"
+            ),
+            "{}",
+            calls()
+        );
+        assert!(!calls().contains("123:tok"));
+        assert!(lab.audit().contains("runtime configure"), "{}", lab.audit());
+    }
+
     /// A session is given the port its gateway listens on, and says why when
     /// it is given none; the gateway's own launch is given none (ADR 0028).
     #[cfg(target_os = "macos")]

@@ -43,7 +43,7 @@ enum Command {
     Exec(cli::connect::ExecArgs),
     /// Set, list or remove a sandbox's secrets, kept in the Keychain.
     Secret(cli::secret::SecretArgs),
-    /// Install a runtime in a sandbox.
+    /// Install a runtime in a sandbox, or configure its bot on a messaging channel.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),

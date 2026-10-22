@@ -17,6 +17,7 @@ use super::{
     Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
+use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
 
 pub struct Hermes;
@@ -136,6 +137,36 @@ impl RuntimeAdapter for Hermes {
 
     fn agent_files(&self, name: &AgentName) -> String {
         format!("~/.hermes/profiles/{name}")
+    }
+
+    fn channel(
+        &self,
+        channel: Channel,
+        token: &str,
+        answers: &[ChannelUser],
+    ) -> Option<Vec<SandboxCommand>> {
+        // The default profile's bot. Under Hermes's gateway, which serves
+        // every profile in one process, only that profile reads the
+        // gateway's environment; another takes a token only from a file in
+        // its own folder (`agent/secret_scope.py`, Hermes 0.22.4), which
+        // enclos never writes (ADR 0022).
+        let profile = DEFAULT_PROFILE.as_str();
+        let set = |key: &str, value: &str| {
+            SandboxCommand::from_words(&[HERMES, "-p", profile, "config", "set", key, value])
+        };
+        let users: Vec<&str> = answers.iter().map(ChannelUser::as_str).collect();
+        match channel {
+            Channel::Telegram => Some(vec![
+                set("platforms.telegram.enabled", "true"),
+                // Resolved from the environment as the gateway loads its
+                // settings (`hermes_cli/config.py`), so the value never
+                // reaches the home.
+                set("platforms.telegram.token", &format!("${{{token}}}")),
+                // Not a secret: who may talk to the bot, in the profile's
+                // `.env`, where Hermes keeps it.
+                set("TELEGRAM_ALLOWED_USERS", &users.join(",")),
+            ]),
+        }
     }
 
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
@@ -399,6 +430,25 @@ mod tests {
                 "~/.hermes/.env",
                 "~/.hermes/profiles/main/config.yaml",
                 "~/.hermes/profiles/main/.env",
+            ]
+        );
+    }
+
+    #[test]
+    fn telegram_is_the_default_profiles_with_its_token_read_from_the_environment() {
+        let users = ["111".parse().unwrap(), "222".parse().unwrap()];
+        let shown: Vec<String> = Hermes
+            .channel(Channel::Telegram, "TELEGRAM_BOT_TOKEN_MAIN", &users)
+            .unwrap()
+            .iter()
+            .map(SandboxCommand::shown)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "hermes -p default config set platforms.telegram.enabled true",
+                "hermes -p default config set platforms.telegram.token ${TELEGRAM_BOT_TOKEN_MAIN}",
+                "hermes -p default config set TELEGRAM_ALLOWED_USERS 111,222",
             ]
         );
     }

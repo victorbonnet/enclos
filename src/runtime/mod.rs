@@ -13,6 +13,7 @@ use std::path::Path;
 
 pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
+use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
 pub use home::HomePath;
 
@@ -222,6 +223,19 @@ pub trait RuntimeAdapter {
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
+        None
+    }
+    /// The runtime's own commands that set up the sandbox's bot on
+    /// `channel`, run in the sandbox by `enclos runtime configure`: its
+    /// token read from the variable `token`, which the sandbox's policy
+    /// grants as a secret, so no value is written in the home (ADR 0022),
+    /// and the people it answers. `None`: the runtime has no such channel.
+    fn channel(
+        &self,
+        _channel: Channel,
+        _token: &str,
+        _answers: &[ChannelUser],
+    ) -> Option<Vec<SandboxCommand>> {
         None
     }
 
