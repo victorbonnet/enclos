@@ -21,13 +21,10 @@ use crate::model::runtime::RuntimeKind;
 
 pub struct Hermes;
 
-/// The installer the official docs and README point to. The script is
-/// pinned: a changed one is refused until enclos is updated to it. The Hermes
-/// version it installs is not: it is whatever the stable channel serves at
-/// install time.
+/// The installer the official docs and README point to, as it is served at
+/// install time, and the Hermes version it installs, whatever the stable
+/// channel serves then (ADR 0029).
 pub const INSTALLER_URL: &str = "https://hermes-agent.nousresearch.com/install.sh";
-pub const INSTALLER_SHA256: &str =
-    "20f44240ebada354a468104a6a6724d037afcb8883d4d09ddeb4815622c52d8b";
 
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
@@ -97,7 +94,6 @@ impl RuntimeAdapter for Hermes {
     fn installer(&self) -> Installer {
         Installer {
             url: INSTALLER_URL.to_owned(),
-            sha256: INSTALLER_SHA256.to_owned(),
             // No setup and no `gateway install` (no launchd job of its own),
             // and no computer-use driver.
             args: vec!["--non-interactive".into(), "--skip-computer-use".into()],
@@ -590,7 +586,6 @@ mod tests {
                 "main"
             ]))
         );
-        assert_eq!(Hermes.installer().sha256.len(), 64);
         assert!(
             Hermes
                 .home_files()

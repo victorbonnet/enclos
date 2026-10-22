@@ -15,12 +15,11 @@ use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 pub use home::HomePath;
 
-/// An installer enclos downloads on the host and runs only if its content
-/// is the one reviewed.
+/// An installer enclos downloads on the host and runs inside the sandbox,
+/// whatever version the runtime serves (ADR 0029).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installer {
     pub url: String,
-    pub sha256: String,
     /// The arguments it runs with, after the downloaded file.
     pub args: Vec<String>,
 }

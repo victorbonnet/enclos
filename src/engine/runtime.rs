@@ -145,7 +145,7 @@ struct InstallPlan {
     proxy_runs: bool,
 }
 
-/// An installer larger than this is not the script enclos reviewed.
+/// An installer larger than this is not an install script: refused.
 const INSTALLER_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// The agents a runtime has in a sandbox, checked against the ones enclos
@@ -301,9 +301,9 @@ impl Engine {
     }
 
     /// Installs `kind` in the sandbox (ADR 0020): its destinations join the
-    /// policy, its installer is downloaded on the host and run only if it is
-    /// the reviewed one, inside the sandbox, through the proxy, in this
-    /// terminal. The runtime is recorded as installed only when the
+    /// policy, its installer is downloaded on the host, as the runtime serves
+    /// it then (ADR 0029), and run inside the sandbox, through the proxy, in
+    /// this terminal. The audit entry names the installer's SHA-256. The runtime is recorded as installed only when the
     /// installer exits 0; otherwise the record keeps the runtime it had and
     /// the policy is resolved again from `policy.toml` with that runtime's
     /// destinations. Files written in the home stay either way.
@@ -337,13 +337,13 @@ impl Engine {
         }
         // Outside the lock: a download takes long and changes no state. The
         // installer lands beside the home, where the sandbox cannot write.
-        let command = self.stage_install(name, runtime)?;
+        let (command, sha256) = self.stage_install(name, runtime)?;
         let target = format!("{name} {kind}");
         let version = self.write(
             by,
             "runtime install",
             Some(target.clone()),
-            |v: &PolicyVersion| format!("policy v{}", v.version),
+            |v: &PolicyVersion| format!("policy v{}, installer sha256 {sha256}", v.version),
             |lock| {
                 // Checked again under the lock: the policy may have changed.
                 let plan = self.plan_install(name, runtime)?;
@@ -486,12 +486,13 @@ impl Engine {
     /// (Seatbelt tests), which is what keeps the host's plain writes from
     /// following a link the sandbox planted. Returns the command that
     /// installs: it copies the adapter's files into the home from inside the
-    /// sandbox, under its policy, then runs the installer.
+    /// sandbox, under its policy, then runs the installer, with the
+    /// installer's SHA-256.
     fn stage_install(
         &self,
         name: &SandboxName,
         runtime: &dyn RuntimeAdapter,
-    ) -> Result<SandboxCommand> {
+    ) -> Result<(SandboxCommand, String)> {
         let dir = self.layout.sandbox_dir(name.as_str()).join("installers");
         let io = |path: &Path| {
             let path = path.to_owned();
@@ -514,7 +515,7 @@ impl Engine {
             std::fs::write(&path, file.contents).map_err(io(&path))?;
             staged.push((path, file));
         }
-        let installer = self.download_installer(&dir, runtime)?;
+        let (installer, sha256) = self.download_installer(&dir, runtime)?;
         let mut script = home_files_script(&staged);
         script.push_str("exec /bin/bash \"$0\" \"$@\"\n");
         let mut words: Vec<OsString> = vec![
@@ -524,16 +525,22 @@ impl Engine {
             installer.into_os_string(),
         ];
         words.extend(runtime.installer().args.iter().map(Into::into));
-        Ok(SandboxCommand::new(words))
+        Ok((SandboxCommand::new(words), sha256))
     }
 
     /// Downloads the runtime's installer on the host into `dir`, outside the
-    /// sandbox home, and keeps it only if its SHA-256 is the reviewed one. It
-    /// is downloaded under a name of its own and moved into place once
-    /// checked, so an install already reading the file keeps what it opened.
-    fn download_installer(&self, dir: &Path, runtime: &dyn RuntimeAdapter) -> Result<PathBuf> {
+    /// sandbox home, with its SHA-256, which the audit entry names. Any
+    /// version is run (ADR 0029), so the file is named after its hash: an
+    /// install running at the same time that got another version moves its
+    /// own to another path, and the bytes this install runs are the ones its
+    /// entry names. It is downloaded under a name of its own and moved into
+    /// place once read.
+    fn download_installer(
+        &self,
+        dir: &Path,
+        runtime: &dyn RuntimeAdapter,
+    ) -> Result<(PathBuf, String)> {
         let installer = runtime.installer();
-        let path = dir.join(format!("{}-install.sh", runtime.kind()));
         let part = dir.join(format!(
             "{}-install.{}.part",
             runtime.kind(),
@@ -561,23 +568,15 @@ impl Engine {
         }
         let bytes = std::fs::read(&part)
             .map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
-        let got = hex(&Sha256::digest(&bytes));
-        if got != installer.sha256 {
-            let _ = std::fs::remove_file(&part);
-            return Err(failed(format!(
-                "the {} installer at {} changed (sha256 {got}); enclos runs only the version it was reviewed against ({}). Update enclos",
-                runtime.kind(),
-                installer.url,
-                installer.sha256
-            )));
-        }
+        let sha256 = hex(&Sha256::digest(&bytes));
+        let path = dir.join(format!("{}-install-{sha256}.sh", runtime.kind()));
         std::fs::rename(&part, &path).map_err(|e| {
             failed(format!(
                 "cannot move the installer into place at {}: {e}",
                 path.display()
             ))
         })?;
-        Ok(path)
+        Ok((path, sha256))
     }
 
     /// Adds an agent: the runtime creates it inside the sandbox, and enclos
@@ -959,7 +958,7 @@ impl InstallPlan {
         }
         changes.extend(self.also.iter().map(|c| format!("also {c}")));
         changes.push(format!(
-            "download the {kind} installer from {} on this Mac and check its SHA-256 against the reviewed one",
+            "download the {kind} installer from {} on this Mac, as it is served now (ADR 0029), and record its SHA-256",
             runtime.installer().url
         ));
         if !self.proxy_runs {
