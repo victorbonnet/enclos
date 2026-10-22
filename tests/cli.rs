@@ -446,9 +446,9 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     // `policy edit`, which opens it again.
     let out = edit(r#"sed -i '' 's/write_add = \[\]/write_add = ["~"]/' "$1""#);
     assert_eq!(out.code(), 2, "{}", out.stderr());
-    let draft = home.root.join("sandboxes/home/policy.toml.edit");
+    let kept = home.root.join("sandboxes/home/policy.toml.edit");
     assert!(
-        out.stderr().contains(&draft.display().to_string()),
+        out.stderr().contains(&kept.display().to_string()),
         "{}",
         out.stderr()
     );
@@ -459,8 +459,45 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
         "{}",
         out.stdout()
     );
-    std::fs::remove_file(&draft).unwrap();
+    std::fs::remove_file(&kept).unwrap();
     assert!(edit("true").ok().stdout().contains("No change"));
+
+    // A kept edit is never applied over a change made since it began: it
+    // would undo that change.
+    let out = edit(r#"sed -i '' 's/write_add = \[\]/write_add = ["~"]/' "$1""#);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    home.run(&["policy", "allow", "home", "b.example.com"]).ok();
+    let out = edit("true");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("changed since your edit"),
+        "{}",
+        out.stderr()
+    );
+    let file = home.root.join("sandboxes/home/policy.toml");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("b.example.com")
+    );
+    home.run(&["policy", "discard", "home"]).ok();
+    assert!(!kept.exists());
+
+    // An editor that fails applies nothing and keeps the edit.
+    let out = edit(r#"sed -i '' 's/allow_add = \[/allow_add = ["c.example.com", /' "$1"; exit 1"#);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("did not exit cleanly"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        !std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("c.example.com")
+    );
+    assert!(kept.exists());
+    home.run(&["policy", "discard", "home"]).ok();
 
     let out = home.run(&["policy", "discard", "home"]);
     assert!(

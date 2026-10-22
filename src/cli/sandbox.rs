@@ -205,7 +205,7 @@ fn print_show(v: &SandboxView) {
     }
     if let Some(p) = &v.pending {
         println!(
-            "  pending policy (snapshot {}), waiting for a restart: `enclos policy apply {}` applies it, `enclos policy show {} --pending` shows it",
+            "  pending policy (snapshot {}), waiting for `enclos policy apply {}`, which restarts the sandbox into it; `enclos policy show {} --pending` shows it",
             p.snapshot.short(),
             r.name,
             r.name

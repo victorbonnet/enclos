@@ -6,7 +6,9 @@ use std::path::Path;
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Discarded, Engine, PolicyApplied, PolicyView, Restarted, TestReport};
+use enclos::engine::{
+    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyView, Restarted, TestReport,
+};
 use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
 use enclos::model::audit::Actor;
@@ -133,7 +135,7 @@ fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
     match &view.pending {
         Some((p, pending)) => {
             println!(
-                "\nPending (snapshot {}, by {}@{} at {}): it waits for a restart, as sessions run under rules it changes:",
+                "\nPending (snapshot {}, by {}@{} at {}): saved while sessions ran under rules it changes, it waits for `enclos policy apply`:",
                 p.snapshot.short(),
                 p.by.user,
                 p.by.host,
@@ -213,16 +215,16 @@ fn print_allowed(
         Planned::Done(applied) => applied,
     };
     let version = applied.version.version;
-    match (applied.changed, &applied.pending) {
-        (false, None) => {
-            println!("Sandbox {sandbox} already allows {destination} (policy v{version}).")
-        }
-        (false, Some(_)) => println!(
-            "Sandbox {sandbox} already allows {destination} (policy v{version}), and so does its pending change."
-        ),
+    match (applied.changed, &applied.outcome) {
         (true, _) => println!(
             "Sandbox {sandbox} now allows {destination}: policy v{version}, in force at once."
         ),
+        (false, ChangeOutcome::Pending(_)) => println!(
+            "Sandbox {sandbox} does not allow {destination} yet: the change waits with its pending policy, and policy v{version} stays in force."
+        ),
+        (false, _) => {
+            println!("Sandbox {sandbox} already allows {destination} (policy v{version}).")
+        }
     }
     if !applied.also.is_empty() {
         println!("The change also does this:");
@@ -236,18 +238,26 @@ fn print_allowed(
 /// Says whether a change waits as the pending policy, or how the restart
 /// that applied it went.
 fn print_outcome(engine: &Engine, sandbox: &SandboxName, applied: &PolicyApplied) -> Result<u8> {
-    if let Some(p) = &applied.pending {
-        println!(
-            "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
-            p.snapshot.short()
-        );
-        println!(
-            "`enclos policy apply {sandbox}` restarts the sandbox into it; `enclos policy discard {sandbox}` drops it."
-        );
-    }
-    match &applied.restarted {
-        Some(restarted) => print_restarted(engine, sandbox, restarted),
-        None => Ok(exit::OK),
+    match &applied.outcome {
+        ChangeOutcome::InForce { dropped: Some(p) } => {
+            println!(
+                "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
+                p.snapshot.short()
+            );
+            Ok(exit::OK)
+        }
+        ChangeOutcome::InForce { dropped: None } => Ok(exit::OK),
+        ChangeOutcome::Pending(p) => {
+            println!(
+                "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
+                p.snapshot.short()
+            );
+            println!(
+                "`enclos policy apply {sandbox}` restarts the sandbox into it; `enclos policy discard {sandbox}` drops it."
+            );
+            Ok(exit::OK)
+        }
+        ChangeOutcome::Restarted(restarted) => print_restarted(engine, sandbox, restarted),
     }
 }
 
@@ -255,17 +265,14 @@ fn print_outcome(engine: &Engine, sandbox: &SandboxName, applied: &PolicyApplied
 /// now in force, and the services started again.
 fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Result<u8> {
     if let Some(stopped) = &r.stopped {
-        let code = super::sandbox::print_stop(sandbox, stopped);
-        if code != exit::OK {
-            return Ok(code);
-        }
+        super::sandbox::print_stop(sandbox, stopped);
     }
     println!(
         "Sandbox {sandbox} runs under policy v{} from now on.",
         r.version.version
     );
     if r.stopped.as_ref().is_some_and(|s| !s.stopped.is_empty()) {
-        println!("Sessions it ended can connect again with `enclos connect {sandbox}`.");
+        println!("To use it in a terminal again: `enclos connect {sandbox}`.");
     }
     match r.started.is_empty() {
         true => Ok(exit::OK),
@@ -282,61 +289,73 @@ fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
         Planned::Done(d) => d,
     };
     let version = discarded.version.version;
-    match (&discarded.pending, &discarded.kept) {
-        (None, None) => println!(
+    match (&discarded.pending, &discarded.kept, &discarded.edit) {
+        (None, None, None) => println!(
             "Sandbox {sandbox} has nothing pending: its policy.toml is policy v{version}'s."
         ),
-        (Some(p), _) => println!(
+        (Some(p), ..) => println!(
             "Dropped the pending policy of sandbox {sandbox} (snapshot {}); policy v{version} stays in force.",
             p.snapshot.short()
         ),
-        (None, Some(_)) => println!(
+        (None, Some(_), _) => println!(
             "Put back the policy.toml of policy v{version} in sandbox {sandbox}, dropping the edits not applied."
         ),
+        (None, None, Some(_)) => {
+            println!("Dropped the edit `policy edit` kept for sandbox {sandbox}.")
+        }
     }
     if let Some(kept) = &discarded.kept {
         println!("What policy.toml held is kept in {}.", kept.display());
     }
+    if let Some(edit) = &discarded.edit {
+        println!(
+            "The edit `policy edit` kept is moved to {}.",
+            edit.display()
+        );
+    }
 }
 
-/// `policy edit`: a draft of `policy.toml` beside it, opened in the user's
-/// editor, then applied. A draft an earlier edit left, because the policy
-/// it held was not accepted, is opened again instead.
+/// `policy edit`: a copy of `policy.toml` beside it, opened in the user's
+/// editor, then applied. An edit kept by an earlier `policy edit` (one not
+/// applied: refused, cut short, or a dry run) is opened again instead, as
+/// long as `policy.toml` is still the file it started from.
 fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) -> Result<u8> {
     let file = engine.policy(sandbox)?.file;
+    let files = engine.edit_files(sandbox);
     let io = |path: &Path| {
         let path = path.to_owned();
         move |source| Error::Layout(LayoutError::Io { path, source })
     };
-    let before = std::fs::read_to_string(&file).map_err(io(&file))?;
-    let draft = file.with_file_name("policy.toml.edit");
-    let start = match std::fs::read_to_string(&draft) {
+    let current = std::fs::read_to_string(&file).map_err(io(&file))?;
+    let (before, start) = match std::fs::read_to_string(&files.copy) {
         Ok(kept) => {
-            println!("Continuing the edit kept in {}.", draft.display());
-            kept
+            let base = match std::fs::read_to_string(&files.base) {
+                Ok(base) => Some(base),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(io(&files.base)(source)),
+            };
+            // Without the file it started from, or with another one, the
+            // kept edit would undo what changed since.
+            if base.as_deref() != Some(current.as_str()) {
+                return Err(Error::PolicyFileChanged {
+                    sandbox: sandbox.to_string(),
+                    file,
+                });
+            }
+            println!("Continuing the edit kept in {}.", files.copy.display());
+            (current, kept)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => before.clone(),
-        Err(source) => return Err(io(&draft)(source)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_private(&files.base, &current).map_err(io(&files.base))?;
+            (current.clone(), current)
+        }
+        Err(source) => return Err(io(&files.copy)(source)),
     };
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&draft)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, start.as_bytes()))
-        .map_err(io(&draft))?;
-    run_editor(&draft)?;
-    let after = std::fs::read_to_string(&draft).map_err(io(&draft))?;
-    let kept = |error: Error| Error::WithContext {
-        what: format!(
-            "{error}\nYour edit is kept in {}; `enclos policy edit {sandbox}` opens it again, and `rm` it to start over.",
-            draft.display()
-        ),
-        error: Box::new(error),
-    };
+    write_private(&files.copy, &start).map_err(io(&files.copy))?;
+    run_editor(&files.copy)?;
+    let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
     if after == before {
-        let _ = std::fs::remove_file(&draft);
+        forget_edit(&files);
         println!("No change to the policy of sandbox {sandbox}.");
         return Ok(exit::OK);
     }
@@ -345,29 +364,71 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
             plan.changes.iter().for_each(|c| println!("Would {c}."));
             println!(
                 "Your edit is kept in {}; `enclos policy edit {sandbox}` opens it again.",
-                draft.display()
+                files.copy.display()
             );
             return Ok(exit::OK);
         }
         Ok(Planned::Done(applied)) => applied,
-        Err(e) => return Err(kept(e)),
+        // Recorded before it failed (a restart with --yes, say): the edit
+        // is the file now, and keeping it would only open it again.
+        Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
+            forget_edit(&files);
+            return Err(e);
+        }
+        Err(e @ Error::PolicyFileChanged { .. }) => return Err(e),
+        Err(error) => {
+            return Err(Error::WithContext {
+                what: format!(
+                    "{error}\nYour edit is kept in {}; `enclos policy edit {sandbox}` opens it again, and `enclos policy discard {sandbox}` drops it.",
+                    files.copy.display()
+                ),
+                error: Box::new(error),
+            });
+        }
     };
-    let _ = std::fs::remove_file(&draft);
-    match (&applied.pending, applied.changed) {
-        (None, false) => println!("No change to the policy of sandbox {sandbox}."),
-        (None, true) => println!(
-            "Sandbox {sandbox} has policy v{}, in force at once for the network and for sessions started from now on.",
-            applied.version.version
+    forget_edit(&files);
+    let version = applied.version.version;
+    match (&applied.outcome, applied.changed) {
+        (ChangeOutcome::Pending(_), true) => println!(
+            "Sandbox {sandbox} has policy v{version}, with the network part of the edit in force at once."
         ),
-        (Some(_), _) => println!(
-            "Sandbox {sandbox} keeps policy v{} for now.",
-            applied.version.version
+        (ChangeOutcome::Pending(_), false) => {
+            println!("Sandbox {sandbox} keeps policy v{version} for now.")
+        }
+        (_, true) => println!(
+            "Sandbox {sandbox} has policy v{version}, in force at once for the network and for sessions started from now on."
         ),
+        (_, false) => println!("Sandbox {sandbox} keeps policy v{version}."),
     }
     for change in &applied.also {
         println!("  {change}");
     }
     print_outcome(engine, sandbox, &applied)
+}
+
+/// Removes the copy `policy edit` edited and its base, saying so when it
+/// cannot: the next `policy edit` would open it again.
+fn forget_edit(files: &EditFiles) {
+    for path in [&files.copy, &files.base] {
+        if let Err(e) = std::fs::remove_file(path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "enclos: could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
+                path.display()
+            );
+        }
+    }
+}
+
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, contents.as_bytes()))
 }
 
 /// Opens `path` in `$VISUAL`, else `$EDITOR`, else `vi`, through `sh` so
@@ -385,7 +446,10 @@ fn run_editor(path: &Path) -> Result<()> {
         .arg(path)
         .status()
         .map_err(|e| Error::Session {
-            what: format!("cannot run the editor `{editor}`: {e}"),
+            what: format!(
+                "cannot run the editor `{editor}`: {e}. Your edit is kept in {}",
+                path.display()
+            ),
         })?;
     if !status.success() {
         return Err(Error::Session {

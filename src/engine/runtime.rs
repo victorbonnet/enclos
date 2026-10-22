@@ -478,11 +478,9 @@ impl Engine {
                 let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
-                let overrides = self.layout.read_policy(name.as_str())?;
-                Ok((
-                    self.save_policy(lock, by, name, &overrides)?,
-                    record.runtime,
-                ))
+                // A change saved as pending while the installer ran stays
+                // pending.
+                Ok((self.resolve_again(lock, by, name)?, record.runtime))
             },
         )?;
         Ok((version.version, recorded))

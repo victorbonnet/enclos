@@ -157,15 +157,15 @@ pub enum Error {
     NoPendingPolicy { sandbox: String },
     /// The pending policy changed between reading it and applying it.
     #[error(
-        "the pending policy of sandbox `{sandbox}` changed while it was being applied. Look at it with `enclos policy show {sandbox} --pending`, then run `enclos policy apply {sandbox}` again"
+        "the pending policy of sandbox `{sandbox}` changed or was dropped while it was being applied. `enclos policy show {sandbox}` shows what waits now"
     )]
     PendingChanged { sandbox: String },
-    /// `policy.toml` changed while the user edited a copy of it.
+    /// `policy.toml` changed since the edit of a copy of it began.
     #[error(
-        "{} changed while you edited it, so your edit was not applied. Run `enclos policy edit` again: it starts from the file as it is now",
+        "{} changed since your edit of sandbox `{sandbox}` began, so the edit was not applied: it would undo that change. Your edit stays in policy.toml.edit beside it: compare the two, put what you want in your edit, then remove policy.toml.edit.base and run `enclos policy edit {sandbox}`, which opens your edit again; or remove both to start over",
         file.display()
     )]
-    PolicyFileChanged { file: PathBuf },
+    PolicyFileChanged { sandbox: String, file: PathBuf },
     /// The active snapshot's stored `policy.toml` is not the text its
     /// inputs name, so enclos cannot write it back.
     #[error(
