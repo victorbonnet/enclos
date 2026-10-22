@@ -22,7 +22,7 @@ use crate::layout::LayoutError;
 use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{Proc, group_of, is_same, processes, reference_of_child};
-use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
+use crate::lifecycle::stop::{GRACE, Stopped, Survivor, Why, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -651,15 +651,31 @@ impl Engine {
         // a member's TERM handler forked before it exited is an orphan only
         // the marker proves the session's, so it is reported as not
         // signalled until it is.
-        let again = self.marked(session)?;
+        let mut again = self.marked(session)?;
         if again.tracked.iter().all(|r| marked.tracked.contains(r)) {
             return Ok(first);
         }
-        Ok(match (stop(&again, grace)?, first) {
-            (Stopped::Gone, Stopped::Gone) => Stopped::Gone,
-            (Stopped::Gone, _) => Stopped::Clean,
-            (second, _) => second,
-        })
+        // What the first stop knew stays known: the first look's holders,
+        // and the members it signalled that survived, which may since have
+        // closed the marker or lost their parent.
+        let earlier: Vec<Survivor> = match &first {
+            Stopped::Survivors(left) => left.clone(),
+            Stopped::Clean | Stopped::Gone => Vec::new(),
+        };
+        let signalled = earlier
+            .iter()
+            .filter(|s| !matches!(s.why, Why::NotSignalled))
+            .map(|s| ProcessRef {
+                pid: s.member.pid,
+                started: s.member.started.clone(),
+            });
+        for known in marked.tracked.iter().cloned().chain(signalled) {
+            if !again.tracked.contains(&known) {
+                again.tracked.push(known);
+            }
+        }
+        let second = stop(&again, grace)?;
+        Ok(merged(first, second, is_same)?)
     }
 
     /// What `connect` would start, without starting anything.
@@ -943,6 +959,38 @@ impl Drop for KeepWaiting {
             signal_hook::low_level::unregister(id);
         }
     }
+}
+
+/// What two stops of a session came to, the second after the marker gained
+/// holders: the second's survivors, and each survivor of the first that
+/// `runs` still and the second did not report, as one only counted, which
+/// is never signalled for it but never dropped either. `Gone` only when
+/// both found nothing.
+pub(super) fn merged(
+    first: Stopped,
+    second: Stopped,
+    runs: impl Fn(&ProcessRef) -> std::result::Result<bool, crate::lifecycle::process::PsError>,
+) -> std::result::Result<Stopped, crate::lifecycle::process::PsError> {
+    let mut left = match &second {
+        Stopped::Survivors(left) => left.clone(),
+        Stopped::Clean | Stopped::Gone => Vec::new(),
+    };
+    if let Stopped::Survivors(earlier) = &first {
+        for s in earlier {
+            let process = ProcessRef {
+                pid: s.member.pid,
+                started: s.member.started.clone(),
+            };
+            if !left.iter().any(|l| l.member.pid == s.member.pid) && runs(&process)? {
+                left.push(s.clone());
+            }
+        }
+    }
+    Ok(match (left.is_empty(), second, first) {
+        (false, ..) => Stopped::Survivors(left),
+        (true, Stopped::Gone, Stopped::Gone) => Stopped::Gone,
+        (true, ..) => Stopped::Clean,
+    })
 }
 
 /// The processes holding each marker of a sandbox, by marker file name.

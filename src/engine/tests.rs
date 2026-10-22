@@ -2947,10 +2947,11 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         );
         let survived = crate::lifecycle::process::is_same(&escaped).unwrap();
         if survived {
-            // The test's own process, by the pid it wrote: never left running.
-            let _ = std::process::Command::new("/bin/kill")
-                .arg(pid.to_string())
-                .status();
+            // The test's own process, checked by pid and start time.
+            let _ = crate::lifecycle::process::signal_process(
+                &escaped,
+                crate::lifecycle::process::Signal::Kill,
+            );
         }
         assert!(!survived, "the double-forked process survived the stop");
         assert!(report.survivors.is_empty(), "{:?}", report.survivors);
@@ -3025,18 +3026,64 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .trim()
             .parse()
             .unwrap();
-        let alive = crate::lifecycle::process::reference(pid).unwrap().is_some();
-        if alive {
-            // The test's own child, by the pid it wrote: never left running.
-            let _ = std::process::Command::new("/bin/kill")
-                .arg(pid.to_string())
-                .status();
+        let child_ref = crate::lifecycle::process::reference(pid).unwrap();
+        let alive = child_ref.is_some();
+        if let Some(child_ref) = child_ref {
+            // The test's own child, checked by pid and start time.
+            let _ = crate::lifecycle::process::signal_process(
+                &child_ref,
+                crate::lifecycle::process::Signal::Kill,
+            );
         }
         assert!(!alive, "the forked child survived: {stopped:?}");
         assert!(
             matches!(stopped, crate::lifecycle::stop::Stopped::Clean),
             "{stopped:?}"
         );
+    }
+
+    /// Two stops of a session together: the first's survivors that still
+    /// run and that the second did not report stay reported (ADR 0030).
+    #[test]
+    fn two_stops_keep_a_survivor_of_the_first_that_still_runs() {
+        use crate::lifecycle::stop::{Stopped, Survivor, Why};
+        use crate::model::session::Member;
+
+        let survivor = |pid: u32, why: Why| Survivor {
+            member: Member {
+                pid,
+                started: format!("start {pid}"),
+                command: "sleep".into(),
+            },
+            why,
+        };
+        let runs = |p: &crate::model::session::ProcessRef| Ok(p.pid == 1 || p.pid == 2);
+        let merged = |first, second| super::session::merged(first, second, runs).unwrap();
+        // One still running that the second stop could not see is kept.
+        let first =
+            Stopped::Survivors(vec![survivor(1, Why::Survived), survivor(3, Why::Survived)]);
+        let Stopped::Survivors(left) = merged(first, Stopped::Clean) else {
+            panic!("a survivor of the first stop was dropped");
+        };
+        assert_eq!(left, [survivor(1, Why::Survived)]);
+        // The second's own report wins for one both saw.
+        let first = Stopped::Survivors(vec![survivor(2, Why::NotSignalled)]);
+        let second = Stopped::Survivors(vec![survivor(2, Why::Survived)]);
+        let Stopped::Survivors(left) = merged(first, second) else {
+            panic!("no survivor");
+        };
+        assert_eq!(left, [survivor(2, Why::Survived)]);
+        // Gone only when both found nothing; a survivor since gone is not kept.
+        assert!(matches!(
+            merged(Stopped::Gone, Stopped::Gone),
+            Stopped::Gone
+        ));
+        assert!(matches!(
+            merged(Stopped::Clean, Stopped::Gone),
+            Stopped::Clean
+        ));
+        let first = Stopped::Survivors(vec![survivor(3, Why::NotSignalled)]);
+        assert!(matches!(merged(first, Stopped::Gone), Stopped::Clean));
     }
 
     /// A process holding one session's marker is that session's member,
