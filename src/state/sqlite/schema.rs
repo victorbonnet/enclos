@@ -86,6 +86,15 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;",
     // 7: the version a pending rollback restores (design §7)
     "ALTER TABLE pending_policies ADD COLUMN restores INTEGER;",
+    // 8: the secrets each sandbox has; their values are only in the secret
+    // store (ADR 0022)
+    "CREATE TABLE secrets (
+        sandbox    TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (sandbox, name)
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.

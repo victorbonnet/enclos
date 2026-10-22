@@ -588,6 +588,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         other_terminal: None,
         target: None,
         tag: 7,
+        keychain_item: None,
     };
     let output = |mut command: Command| {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -743,6 +744,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         other_terminal: None,
         target: None,
         tag: 7,
+        keychain_item: None,
     };
     let folders: Vec<_> = crate::probes::probes(&inputs)
         .into_iter()

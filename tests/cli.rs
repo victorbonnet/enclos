@@ -417,6 +417,108 @@ fn editor(home: &Home, script: &str) -> String {
     path.display().to_string()
 }
 
+/// A keychain file of the test's own, unlocked, which `security` does not
+/// add to the user's search list; deleted when dropped.
+#[cfg(target_os = "macos")]
+struct TestKeychain(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl TestKeychain {
+    fn new(home: &Home) -> TestKeychain {
+        let file = home._dir.path().join("test.keychain-db");
+        let path = file.to_str().unwrap();
+        for args in [
+            &["create-keychain", "-p", "test", path][..],
+            &["unlock-keychain", "-p", "test", path],
+        ] {
+            assert!(
+                Command::new("/usr/bin/security")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        TestKeychain(file)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TestKeychain {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/security")
+            .arg("delete-keychain")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
+    use std::io::Write;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut cmd = home.command(args);
+        cmd.env("ENCLOS_KEYCHAIN", &keychain.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if let Some(input) = input {
+            stdin.write_all(input).unwrap();
+        }
+        drop(stdin);
+        Run(child.wait_with_output().unwrap())
+    };
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let out = run(&["secret", "set", "home/telegram"], Some(b"tok-123:abc\n"));
+    assert!(
+        out.ok().stdout().contains("Stored secret home/telegram"),
+        "{}",
+        out.stdout()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(out.ok().stdout().contains("telegram"), "{}", out.stdout());
+    assert!(!out.stdout().contains("tok-123"), "{}", out.stdout());
+
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(
+                &home,
+                r#"printf '\n[secrets]\nenv = { TOKEN = "secret:home/telegram" }\n' >> "$1""#,
+            ),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(
+        &["exec", "home", "--", "/bin/sh", "-c", "echo \"$TOKEN\""],
+        None,
+    );
+    assert_eq!(out.ok().stdout(), "tok-123:abc\n");
+
+    // Granted, it cannot go; neither the audit log nor the files hold it.
+    let out = run(&["--yes", "secret", "rm", "home/telegram"], None);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("granted as TOKEN"),
+        "{}",
+        out.stderr()
+    );
+    for file in ["audit.jsonl", "sandboxes/home/policy.toml"] {
+        let text = std::fs::read_to_string(home.root.join(file)).unwrap();
+        assert!(!text.contains("tok-123"), "{file}");
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {

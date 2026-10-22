@@ -133,7 +133,14 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-                Planned::Done(()) => println!("Removed sandbox {name}."),
+                Planned::Done(left) => {
+                    println!("Removed sandbox {name}.");
+                    for secret in left {
+                        eprintln!(
+                            "warning: secret {secret} stays in the Keychain; remove it with Keychain Access"
+                        );
+                    }
+                }
             }
         }
     }

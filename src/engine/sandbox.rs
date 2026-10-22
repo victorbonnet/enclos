@@ -467,7 +467,7 @@ impl Engine {
         name: &SandboxName,
         keep_data: bool,
         confirm: Confirm,
-    ) -> Result<Planned<()>> {
+    ) -> Result<Planned<Vec<String>>> {
         let gone = self.require_stopped(name)?;
         let dir = self.layout.sandbox_dir(name.as_str());
         let what = if keep_data {
@@ -494,28 +494,41 @@ impl Engine {
             }
             _ => {}
         }
-        self.write(
+        let (_, secrets_left) = self.write(
             by,
             "sandbox rm",
             Some(name.to_string()),
-            |gone: &Vec<SessionId>| format!("{what}{}", ended_gone(gone)),
+            |(gone, left): &(Vec<SessionId>, Vec<String>)| {
+                let left = match left.as_slice() {
+                    [] => String::new(),
+                    left => format!(
+                        "; could not remove from the secret store: {}",
+                        left.join(", ")
+                    ),
+                };
+                format!("{what}{}{left}", ended_gone(gone))
+            },
             |lock| {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
                 let gone = self.require_stopped(name)?;
+                // Its secrets go with it, kept data or not: their record goes
+                // with the sandbox's.
+                let secrets = self.state.secrets(name)?;
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
+                let left = self.forget_secrets(&secrets);
                 if !keep_data && dir.exists() {
                     std::fs::remove_dir_all(&dir).map_err(|source| LayoutError::Io {
                         path: dir.clone(),
                         source,
                     })?;
                 }
-                Ok(gone)
+                Ok((gone, left))
             },
         )?;
-        Ok(Planned::Done(()))
+        Ok(Planned::Done(secrets_left))
     }
 
     /// Refuses a sandbox with services installed or sessions running, saying

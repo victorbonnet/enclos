@@ -14,9 +14,10 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
+use crate::model::secret::POLICY_PREFIX as SECRET_PREFIX;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
-use crate::policy::validate::{ValidationContext, validate};
+use crate::policy::validate::{ValidationContext, validate, validate_secrets};
 use crate::policy::{self, AdapterLayer, PolicyError, Problem};
 use crate::state::StateLock;
 
@@ -259,6 +260,8 @@ impl Engine {
     ) -> Result<PolicySnapshot> {
         let snapshot = policy::resolve(overrides, adapter.as_ref())?;
         validate(&snapshot.policy, &self.validation_context(name))?;
+        validate_secrets(&snapshot.policy, name)?;
+        self.check_secrets_set(name, &snapshot.policy)?;
         Ok(snapshot)
     }
 
@@ -414,6 +417,19 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
     }
     if old.net.listen != new.net.listen {
         found.push(listen_change(new.net.listen));
+    }
+    for (variable, grant) in &new.secrets {
+        if old.secrets.get(variable) != Some(grant) {
+            let secret = grant.strip_prefix(SECRET_PREFIX).unwrap_or(grant);
+            found.push(format!(
+                "give it secret {secret} as ${variable} (sessions started from now on)"
+            ));
+        }
+    }
+    for variable in old.secrets.keys().filter(|v| !new.secrets.contains_key(*v)) {
+        found.push(format!(
+            "stop giving it ${variable} (sessions started from now on)"
+        ));
     }
     found
 }

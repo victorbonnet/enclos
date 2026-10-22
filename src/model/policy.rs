@@ -1,7 +1,7 @@
 //! Policy models: what a sandbox may do (design §7, ADRs 0008, 0015, 0018).
 //!
-//! The filesystem and network sections so far. `[exec]`, `[resources]` and
-//! `[secrets]` arrive with the work that enforces them.
+//! The filesystem, network and secrets sections so far. `[exec]` and
+//! `[resources]` arrive with the work that enforces them.
 
 use std::fmt;
 use std::str::FromStr;
@@ -16,6 +16,12 @@ use super::audit::Actor;
 pub struct Policy {
     pub fs: FsPolicy,
     pub net: NetPolicy,
+    /// Secrets every session and service of the sandbox receives, by the
+    /// environment variable each is set as: `secret:<sandbox>/<name>`
+    /// (ADR 0022). Left out of the snapshot when empty, so a policy without
+    /// any resolves as it did before secrets existed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secrets: std::collections::BTreeMap<String, String>,
 }
 
 /// Paths as written in policy files: absolute, `~/…`, or starting with the
@@ -201,10 +207,11 @@ impl PolicySnapshot {
 
 impl Policy {
     /// Whether `self` and `other` have the same rules a session keeps from
-    /// its start: files and listening, which its compiled policy holds
-    /// (design §7). The rest is the proxy's, which applies it live.
+    /// its start: files and listening, which its compiled policy holds, and
+    /// the secrets it is given (design §7). The rest is the proxy's, which
+    /// applies it live.
     pub fn same_at_launch(&self, other: &Policy) -> bool {
-        self.fs == other.fs && self.net.listen == other.net.listen
+        self.fs == other.fs && self.net.listen == other.net.listen && self.secrets == other.secrets
     }
 }
 

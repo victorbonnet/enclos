@@ -190,8 +190,22 @@ pub const NOT_PROBED: &[&str] = &[
     "posting synthetic input events",
     "writing the pasteboard",
     "typing into the terminal (TIOCSTI)",
-    "reading a keychain item",
 ];
+
+/// A Keychain item the host stores for the probe that tries to read one from
+/// inside the sandbox, and removes after. Its value is
+/// [`KEYCHAIN_PROBE_VALUE`], which `security` prints as
+/// [`KEYCHAIN_PROBE_HEX`], since enclos stores values as hex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeychainItem {
+    pub service: String,
+    pub account: String,
+    /// The keychain file, when it is not the user's default one.
+    pub file: Option<PathBuf>,
+}
+
+pub const KEYCHAIN_PROBE_VALUE: &str = "enclos-probe";
+const KEYCHAIN_PROBE_HEX: &str = "656e636c6f732d70726f6265";
 
 /// What the probes are built from.
 #[derive(Debug, Clone)]
@@ -232,6 +246,10 @@ pub struct ProbeInputs {
     pub other_terminal: Option<PathBuf>,
     /// Makes names of things a probe might create unique.
     pub tag: u32,
+    /// The item the host stored for the keychain item probe; none on a dry
+    /// run, or where nothing could be stored, and then that probe is not
+    /// run.
+    pub keychain_item: Option<KeychainItem>,
 }
 
 /// A path as one shell word.
@@ -757,6 +775,28 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
+    if let Some(item) = &i.keychain_item {
+        // Through `security` and the security daemon, as a program in the
+        // sandbox would read a secret: closed when the value does not come
+        // back. The control reads it on the host.
+        let file = item
+            .file
+            .as_ref()
+            .map(|f| format!(" {}", sh_quote(f)))
+            .unwrap_or_default();
+        let read = format!(
+            "/usr/bin/security find-generic-password -s {} -a {} -w{file} 2>/dev/null",
+            sh_quote(Path::new(&item.service)),
+            sh_quote(Path::new(&item.account)),
+        );
+        list.push(probe(
+            "keychain",
+            "read a keychain item",
+            read.clone(),
+            Expect::OutputLacks(KEYCHAIN_PROBE_HEX),
+            format!("{read} | /usr/bin/grep -q {KEYCHAIN_PROBE_HEX}"),
+        ));
+    }
     list.push(same_outside(
         "pasteboard",
         "read the pasteboard",
@@ -825,6 +865,11 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
     }
     if !launch_agents(i).is_dir() {
         absent.push("launch agents (no ~/Library/LaunchAgents here)".to_owned());
+    }
+    if i.keychain_item.is_none() {
+        absent.push(
+            "keychain items (enclos could not store a test item in a keychain here)".to_owned(),
+        );
     }
     absent
 }
@@ -1079,6 +1124,7 @@ mod tests {
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
+            keychain_item: None,
         }
     }
 
@@ -1448,13 +1494,47 @@ mod tests {
             "synthetic input",
             "writing the pasteboard",
             "TIOCSTI",
-            "keychain item",
         ] {
             assert!(
                 NOT_PROBED.iter().any(|r| r.contains(route)),
                 "{route} is missing from {NOT_PROBED:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_keychain_item_is_probed_when_one_was_stored_and_said_missing_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = inputs(dir.path());
+        assert!(!probes(&i).iter().any(|p| p.name == "read a keychain item"));
+        assert!(not_here(&i).iter().any(|a| a.starts_with("keychain items")));
+        i.keychain_item = Some(KeychainItem {
+            service: "enclos.abc.probe".into(),
+            account: "home/probe".into(),
+            file: None,
+        });
+        let list = probes(&i);
+        let probe = list
+            .iter()
+            .find(|p| p.name == "read a keychain item")
+            .unwrap();
+        assert!(
+            probe
+                .script
+                .contains("find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w"),
+            "{}",
+            probe.script
+        );
+        assert!(
+            matches!(&probe.proof, Proof::Control { expect: Expect::OutputLacks(hex), .. } if *hex == KEYCHAIN_PROBE_HEX)
+        );
+        assert!(!not_here(&i).iter().any(|a| a.starts_with("keychain items")));
+        // The value enclos stores, as `security` prints it back.
+        let hex: String = KEYCHAIN_PROBE_VALUE
+            .bytes()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, KEYCHAIN_PROBE_HEX);
     }
 
     #[test]

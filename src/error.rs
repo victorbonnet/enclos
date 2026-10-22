@@ -209,6 +209,25 @@ pub enum Error {
         "sandbox `{sandbox}` has a pending policy change, which needs a restart. Apply it first with `enclos policy apply {sandbox}`, or drop it with `enclos policy discard {sandbox}`"
     )]
     PolicyPending { sandbox: String },
+    #[error(transparent)]
+    Secret(#[from] crate::secrets::SecretError),
+    #[error(
+        "sandbox `{}` has no secret `{}`: set it first with `enclos secret set {secret}`",
+        secret.split_once('/').map_or(secret.as_str(), |(s, _)| s),
+        secret.split_once('/').map_or(secret.as_str(), |(_, n)| n)
+    )]
+    NoSuchSecret { secret: String },
+    /// A secret the active or pending policy grants, which a session would
+    /// then not find.
+    #[error(
+        "secret {secret} is granted as {variables} by the sandbox's policy; take the grant out with `enclos policy edit` first"
+    )]
+    SecretGranted { secret: String, variables: String },
+    /// A secret the policy grants, which the secret store does not hold.
+    #[error(
+        "the policy gives secret {secret} as ${variable}, but the Keychain has no value for it; set it with `enclos secret set {secret}`"
+    )]
+    SecretMissing { secret: String, variable: String },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -306,6 +325,10 @@ impl Error {
             | Error::NoSuchPolicyVersion { .. }
             | Error::PolicyFileEdited { .. }
             | Error::PolicyChangedMeanwhile { .. }
+            | Error::Secret(_)
+            | Error::NoSuchSecret { .. }
+            | Error::SecretGranted { .. }
+            | Error::SecretMissing { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

@@ -18,11 +18,14 @@ use crate::layout::LayoutError;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
+use crate::model::secret::SecretRef;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
-    HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, Run, host_service_probes,
-    missing_workspaces, not_here, outcome, probes, sandboxed_script,
+    HostCheck, KEYCHAIN_PROBE_VALUE, KeychainItem, Outcome, Probe, ProbeInputs, ProbeResult, Proof,
+    Run, host_service_probes, missing_workspaces, not_here, outcome, probes, sandboxed_script,
 };
+use crate::secrets::SecretStore;
+use crate::secrets::keychain::Keychain;
 
 /// What `enclos policy test` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +117,44 @@ impl Drop for Target {
     }
 }
 
+/// A throwaway item the keychain item probe tries to read from inside the
+/// sandbox: stored under a service of its own, `enclos.<install>.probe`, so
+/// it never stands for a secret, and removed when the test ends. None where
+/// no keychain takes it (no login keychain, Linux): the report says the
+/// probe did not run.
+struct KeychainProbe {
+    store: Keychain,
+    secret: SecretRef,
+    item: KeychainItem,
+}
+
+impl KeychainProbe {
+    fn store(layout: &crate::layout::Layout, name: &SandboxName) -> Option<KeychainProbe> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let service = format!("enclos.{}.probe", layout.install_id().ok()?);
+        let store = Keychain::from_env(service.clone());
+        let secret: SecretRef = format!("{name}/probe").parse().ok()?;
+        store.set(&secret, KEYCHAIN_PROBE_VALUE).ok()?;
+        Some(KeychainProbe {
+            item: KeychainItem {
+                service,
+                account: secret.to_string(),
+                file: store.file().map(ToOwned::to_owned),
+            },
+            store,
+            secret,
+        })
+    }
+}
+
+impl Drop for KeychainProbe {
+    fn drop(&mut self) {
+        let _ = self.store.remove(&self.secret);
+    }
+}
+
 /// The terminal the terminal probes try to open: opened by this command,
 /// as a terminal app opens one for each tab, and closed when the test ends.
 struct OtherTerminal {
@@ -186,8 +227,10 @@ impl Engine {
 
             let mut target = Target::start()?;
             let terminal = OtherTerminal::open()?;
-            let inputs =
+            let keychain = KeychainProbe::store(&self.layout, name);
+            let mut inputs =
                 self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
+            inputs.keychain_item = keychain.as_ref().map(|k| k.item.clone());
             let mut list = probes(&inputs);
             if host_services {
                 list.extend(host_service_probes(&inputs));
@@ -277,6 +320,7 @@ impl Engine {
             target,
             other_terminal,
             tag: std::process::id(),
+            keychain_item: None,
         })
     }
 
@@ -289,7 +333,13 @@ impl Engine {
         let ctx = self.sandbox_context(name, record.proxy_port);
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
-        let inputs = self.probe_inputs(name, &ctx, Some(0), Some(PathBuf::from("/dev/ttys0")))?;
+        let mut inputs =
+            self.probe_inputs(name, &ctx, Some(0), Some(PathBuf::from("/dev/ttys0")))?;
+        inputs.keychain_item = cfg!(target_os = "macos").then(|| KeychainItem {
+            service: "enclos.probe".into(),
+            account: format!("{name}/probe"),
+            file: None,
+        });
         let mut count = probes(&inputs).len();
         if host_services {
             count += host_service_probes(&inputs).len();
@@ -579,6 +629,7 @@ mod tests {
             target: Some(target),
             other_terminal: None,
             tag: 7,
+            keychain_item: None,
         }
     }
 

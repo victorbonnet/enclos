@@ -16,6 +16,7 @@ mod probe;
 mod restart;
 mod runtime;
 mod sandbox;
+mod secrets;
 mod service;
 mod session;
 mod status;
@@ -32,6 +33,7 @@ pub use probe::TestReport;
 pub(crate) use runtime::home_files_script;
 pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
+pub use secrets::{SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 pub use status::{
@@ -68,6 +70,8 @@ pub struct Engine {
     /// The enclos program, to start the proxy and services with.
     exe: Option<std::path::PathBuf>,
     services: Box<dyn crate::service::ServiceManager>,
+    /// Where secrets' values are kept (ADR 0022).
+    secrets: Box<dyn crate::secrets::SecretStore>,
     /// How a session's members are stopped when `enclos launch` is told to
     /// end, and when it or `sandbox start` stops the sessions a new one
     /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
@@ -117,6 +121,12 @@ impl Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
         let services = crate::service::host(layout.user_home());
+        let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
+            Ok(install) => crate::secrets::host(format!("enclos.{install}")),
+            Err(_) => Box::new(crate::secrets::Unavailable {
+                why: "enclos cannot tell this install apart from others: its data folder cannot be resolved",
+            }),
+        };
         Engine::new(
             layout,
             Box::new(state),
@@ -124,6 +134,7 @@ impl Engine {
             backend::registered(),
         )
         .with_services(services)
+        .with_secrets(secrets)
     }
 
     pub fn new(
@@ -142,7 +153,16 @@ impl Engine {
                 why: "this engine has no service manager",
             }),
             stop_members: crate::lifecycle::stop::stop,
+            secrets: Box::new(crate::secrets::Unavailable {
+                why: "this engine has no secret store",
+            }),
         }
+    }
+
+    /// The same engine with another secret store.
+    pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::SecretStore>) -> Engine {
+        self.secrets = secrets;
+        self
     }
 
     /// The same engine with another service manager.

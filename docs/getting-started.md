@@ -155,7 +155,7 @@ enclos sandbox rm lab        # the sandbox and its home, with Hermes and its log
 ## What does not work yet
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.
-- **Messaging and secrets:** Telegram and secrets from the Keychain come in milestone 2.
+- **Messaging:** Telegram comes in milestone 2. Secrets work already: `enclos secret set lab/<name>` stores one in the Keychain, and `[secrets] env = { NAME = "secret:lab/<name>" }` in `policy.toml` gives it to every session of the sandbox.
 
 ## If you used an earlier build
 
