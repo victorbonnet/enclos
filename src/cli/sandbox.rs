@@ -34,12 +34,21 @@ enum SandboxVerb {
     List,
     /// Show a sandbox: its state, policy version, sessions and their processes.
     Show { name: SandboxName },
-    /// Run the sandbox's proxy and its runtime's services in the background, now and at each login.
-    Start { name: SandboxName },
-    /// Stop every service, session and process of a sandbox.
-    Stop { name: SandboxName },
-    /// Stop the sandbox, then start its services again under the active policy.
-    Restart { name: SandboxName },
+    /// Run each sandbox's proxy and its runtime's services in the background, now and at each login.
+    Start {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
+    /// Stop every service, session and process of each sandbox.
+    Stop {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
+    /// Stop each sandbox, then start its services again under the active policy.
+    Restart {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
     /// Remove a stopped sandbox, and its home unless --keep-data.
     Rm {
         name: SandboxName,
@@ -100,29 +109,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 }
             }
         }
-        SandboxVerb::Start { name } if confirm == Confirm::DryRun => {
-            print_would_start(&name, &engine.service_labels(&name)?)
+        SandboxVerb::Start { names } => {
+            return each(engine, &names, |name| start(engine, by, name, confirm));
         }
-        SandboxVerb::Start { name } => {
-            return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
+        SandboxVerb::Stop { names } => {
+            return each(engine, &names, |name| stop(engine, by, name, confirm));
         }
-        SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
-            Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-            Planned::Done(report) => return Ok(print_stop(&name, &report)),
-        },
-        SandboxVerb::Restart { name } => match engine.stop_sandbox(by, &name, confirm)? {
-            Planned::DryRun(plan) => {
-                plan.changes.iter().for_each(|c| println!("Would {c}."));
-                print_would_start(&name, &engine.service_labels(&name)?);
-            }
-            Planned::Done(report) => {
-                let code = print_stop(&name, &report);
-                if code != exit::OK {
-                    return Ok(code);
-                }
-                return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
-            }
-        },
+        SandboxVerb::Restart { names } => {
+            return each(engine, &names, |name| restart(engine, by, name, confirm));
+        }
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
@@ -244,6 +239,61 @@ fn print_show(v: &SandboxView) {
         for m in &view.members {
             println!("    pid {:<7} {}", m.pid, m.command);
         }
+    }
+}
+
+/// Runs `verb` on each sandbox named, in order, once every name is known
+/// to be a sandbox, so a mistyped name changes nothing. A sandbox named
+/// twice is done once. The exit code is the worst of theirs; an error ends
+/// it at once, after the sandboxes before it were done.
+fn each(
+    engine: &Engine,
+    names: &[SandboxName],
+    mut verb: impl FnMut(&SandboxName) -> Result<u8>,
+) -> Result<u8> {
+    let mut seen = Vec::new();
+    for name in names {
+        if !seen.contains(&name) {
+            engine.show_sandbox(name)?;
+            seen.push(name);
+        }
+    }
+    let mut code = exit::OK;
+    for name in seen {
+        code = code.max(verb(name)?);
+    }
+    Ok(code)
+}
+
+fn start(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    if confirm == Confirm::DryRun {
+        print_would_start(name, &engine.service_labels(name)?);
+        return Ok(exit::OK);
+    }
+    print_started(engine, name, &engine.start_sandbox(by, name)?)
+}
+
+fn stop(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    Ok(match engine.stop_sandbox(by, name, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            exit::OK
+        }
+        Planned::Done(report) => print_stop(name, &report),
+    })
+}
+
+fn restart(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    match engine.stop_sandbox(by, name, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            print_would_start(name, &engine.service_labels(name)?);
+            Ok(exit::OK)
+        }
+        Planned::Done(report) => match print_stop(name, &report) {
+            exit::OK => print_started(engine, name, &engine.start_sandbox(by, name)?),
+            code => Ok(code),
+        },
     }
 }
 

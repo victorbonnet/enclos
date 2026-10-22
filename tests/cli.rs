@@ -1342,6 +1342,49 @@ fn logs_show_what_the_services_printed_escaped() {
     assert!(!out.stdout().contains('\x1b'), "{}", out.stdout());
 }
 
+/// §10's flow starts and stops two sandboxes in one command; a name that is
+/// not a sandbox changes nothing, even after a good one.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_and_stop_take_several_sandboxes() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "lab"]).ok();
+
+    let out = home.run(&["sandbox", "start", "home", "lab", "--dry-run"]);
+    out.ok();
+    for name in ["home", "lab"] {
+        assert!(
+            out.stdout()
+                .contains(&format!(".{name}.proxy of sandbox {name}")),
+            "{}",
+            out.stdout()
+        );
+    }
+
+    let before = home.audit_lines().len();
+    let out = home.run(&["sandbox", "stop", "home", "nope"]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stdout().is_empty(), "{}", out.stdout());
+    assert_eq!(home.audit_lines().len(), before);
+
+    let out = home.run(&["sandbox", "stop", "home", "lab", "home"]);
+    out.ok();
+    assert_eq!(
+        out.stdout().matches("Stopped sandbox").count(),
+        2,
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        out.stdout().contains("Stopped sandbox home")
+            && out.stdout().contains("Stopped sandbox lab"),
+        "{}",
+        out.stdout()
+    );
+}
+
 /// Records Hermes as the runtime of sandbox `name` without installing it,
 /// and gives back a way to make a Hermes profile in the sandbox home as
 /// `hermes profile create` would, so the agent commands have something to

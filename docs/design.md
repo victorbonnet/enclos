@@ -475,7 +475,8 @@ enclos init | doctor
 enclos backend list | probe <name>
 
 enclos sandbox create <name> --backend seatbelt --template assistant [--workspace ~/dev/x]
-enclos sandbox list | show <name> | start | stop | restart    show: sessions, members, active and pending policy
+enclos sandbox list | show <name>                            show: sessions, members, active and pending policy
+enclos sandbox start | stop | restart <name>...              one or more sandboxes, in order
 enclos sandbox rm <name> [--keep-data]
 enclos connect <name> [-- <command...>]       a shell, or a command such as the runtime's own, in the sandbox
 enclos exec <name> -- <cmd...>
