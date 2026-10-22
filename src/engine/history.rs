@@ -3,7 +3,7 @@
 //! against the current templates and adapters.
 
 use super::Engine;
-use super::pending::{Change, Recorded};
+use super::pending::{Change, Recorded, change_summary};
 use super::policy::{ChangeOutcome, PolicyApplied, differences};
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
@@ -16,14 +16,20 @@ use crate::policy::validate::validate;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyHistory {
     pub sandbox: SandboxName,
-    /// Oldest first.
+    /// Oldest first. The last one is in force: every new active version,
+    /// a rollback's included, is appended.
     pub versions: Vec<PolicyVersion>,
-    /// The version in force.
-    pub active: u32,
     pub pending: Option<PendingPolicy>,
 }
 
-/// One side of a `policy diff`.
+impl PolicyHistory {
+    /// The version in force.
+    pub fn active(&self) -> Option<&PolicyVersion> {
+        self.versions.last()
+    }
+}
+
+/// What a `policy diff` compares a version to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Version(u32),
@@ -39,10 +45,11 @@ impl std::fmt::Display for Side {
     }
 }
 
-/// What one policy changes from another.
+/// What a policy changes from a version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDiff {
-    pub from: Side,
+    /// The version compared from.
+    pub from: u32,
     pub to: Side,
     /// What `to` grants differently, one sentence each.
     pub changes: Vec<String>,
@@ -58,15 +65,15 @@ impl Engine {
         Ok(PolicyHistory {
             sandbox: name.clone(),
             versions: self.state.policy_history(name)?,
-            active: view.version.version,
             pending: view.pending.map(|(p, _)| p),
         })
     }
 
-    /// What `to` changes from `from`. Without `to`, the pending policy if
-    /// there is one, else the active version; without `from`, the active
-    /// version when `to` is the pending policy, else the version before
-    /// `to`.
+    /// What `to` changes from `from`. Without `to`: the pending policy,
+    /// when there is one and `from` is not given or is the active version;
+    /// else the active version. Without `from`: the active version when
+    /// `to` is the pending policy, else the version before `to` (v1 for
+    /// v1).
     pub fn policy_diff(
         &self,
         name: &SandboxName,
@@ -74,25 +81,20 @@ impl Engine {
         to: Option<u32>,
     ) -> Result<PolicyDiff> {
         let view = self.policy(name)?;
-        let to = match (to, &view.pending) {
-            (Some(n), _) => Side::Version(n),
-            (None, Some(_)) if from.is_none() || from == Some(view.version.version) => {
-                Side::Pending
+        let active = view.version.version;
+        let (to, new) = match (to, view.pending) {
+            (Some(n), _) => (Side::Version(n), self.version_snapshot(name, n)?),
+            (None, Some((_, pending))) if from.is_none_or(|n| n == active) => {
+                (Side::Pending, pending)
             }
-            (None, _) => Side::Version(view.version.version),
+            (None, _) => (Side::Version(active), view.snapshot),
         };
         let from = match (from, to) {
-            (Some(n), _) => Side::Version(n),
-            (None, Side::Pending) => Side::Version(view.version.version),
-            (None, Side::Version(n)) => Side::Version(n.saturating_sub(1).max(1)),
+            (Some(n), _) => n,
+            (None, Side::Pending) => active,
+            (None, Side::Version(n)) => n.saturating_sub(1).max(1),
         };
-        let snapshot = |side: Side| -> Result<PolicySnapshot> {
-            match side {
-                Side::Pending => Ok(view.pending.as_ref().expect("chosen above").1.clone()),
-                Side::Version(n) => self.version_snapshot(name, n),
-            }
-        };
-        let (old, new) = (snapshot(from)?, snapshot(to)?);
+        let old = self.version_snapshot(name, from)?;
         Ok(PolicyDiff {
             from,
             to,
@@ -102,9 +104,10 @@ impl Engine {
     }
 
     /// Makes version `to`'s policy the sandbox's policy again, as a new
-    /// version recording what it restores, and puts back its `policy.toml`
-    /// so later edits start from it. It follows the restart rules of any
-    /// change; a change pending is replaced, after asking (design §7).
+    /// version recording what it restores (none when it is the policy in
+    /// force), and puts back its `policy.toml` so later edits start from it.
+    /// It follows the restart rules of any change; a change pending is
+    /// replaced, after asking (design §7).
     pub fn policy_rollback(
         &self,
         by: &Actor,
@@ -112,6 +115,7 @@ impl Engine {
         to: u32,
         confirm: Confirm,
     ) -> Result<Planned<PolicyApplied>> {
+        self.require_sandbox(name)?;
         let target = self.version_snapshot(name, to)?;
         let text = target
             .overrides_text()
@@ -122,7 +126,15 @@ impl Engine {
             })?
             .to_owned();
         // Its paths are checked again as they are now, as any policy stored.
-        validate(&target.policy, &self.validation_context(name))?;
+        validate(&target.policy, &self.validation_context(name)).map_err(|e| {
+            let error = Error::from(e);
+            Error::WithContext {
+                what: format!(
+                    "v{to} of sandbox {name} cannot be restored on the paths as they are now: {error}"
+                ),
+                error: Box::new(error),
+            }
+        })?;
         let replacement = Replacement {
             command: "policy rollback",
             target_name: format!("{name} v{to}"),
@@ -137,8 +149,8 @@ impl Engine {
 
     /// Resolves the active policy's `policy.toml` again against this enclos's
     /// templates, built-in defaults and the runtime's adapter, and turns any
-    /// difference in what it grants into a change, asked first: a new enclos
-    /// version never changes grants on its own (design §7).
+    /// difference in what it resolves to into a change, asked first: a new
+    /// enclos version never changes the policy on its own (design §7).
     pub fn policy_refresh(
         &self,
         by: &Actor,
@@ -155,7 +167,13 @@ impl Engine {
                 file: view.file.clone(),
             })?
             .to_owned();
-        let fresh = self.checked_policy(name, &text)?;
+        let fresh = self.checked_policy(name, &text).map_err(|error| Error::WithContext {
+            what: format!(
+                "policy v{} of sandbox {name}, resolved against this enclos's templates and the runtime's adapter, is not accepted: {error}",
+                view.version.version
+            ),
+            error: Box::new(error),
+        })?;
         if fresh.policy == view.snapshot.policy && view.pending.is_none() {
             return Ok(Planned::Done(PolicyApplied {
                 version: view.version,
@@ -164,7 +182,7 @@ impl Engine {
                 outcome: ChangeOutcome::InForce { dropped: None },
             }));
         }
-        // The same grants resolved from newer inputs are no change: the
+        // The same policy resolved from newer inputs is no change: the
         // active snapshot stays, and with it what it was resolved from.
         let target = match fresh.policy == view.snapshot.policy {
             true => view.snapshot.clone(),
@@ -199,9 +217,10 @@ impl Engine {
     }
 
     /// Makes the replacement's snapshot the sandbox's policy, as rollback
-    /// and refresh do: listing what it changes and asking first, and
-    /// replacing a change pending. `policy.toml` holding an edit not applied
-    /// is refused rather than overwritten.
+    /// and refresh do: listing what it changes, asking first as the command
+    /// does, and replacing a change pending. `policy.toml` holding an edit
+    /// not applied is refused rather than overwritten, and so is a policy
+    /// that changed between this plan and the lock.
     fn replace_policy(
         &self,
         by: &Actor,
@@ -221,21 +240,30 @@ impl Engine {
         let view = self.policy(name)?;
         let changes = differences(&view.snapshot.policy, &target.policy, &[]);
         let dropped: Vec<String> = match &view.pending {
-            Some((p, pending)) => std::iter::once(format!(
+            Some((p, pending)) if pending.id != target.id => std::iter::once(format!(
                 "drop the pending policy (snapshot {}), which would {}",
                 p.snapshot.short(),
                 summarize(&differences(&view.snapshot.policy, &pending.policy, &[]))
             ))
             .collect(),
-            None => Vec::new(),
+            _ => Vec::new(),
         };
-        self.refuse_unapplied_edit(name, view.latest())?;
+        self.refuse_unapplied_edit(name, view.latest(), command)?;
         match confirm {
             Confirm::DryRun => {
-                let mut plan: Vec<String> = vec![match changes.is_empty() {
-                    true => format!("{what}: it grants the same as v{}", view.version.version),
-                    false => format!("{what}, as a new policy version"),
-                }];
+                let running = !self.sessions_under_rules(name)?.is_empty();
+                let waits = running && !target.policy.same_at_launch(&view.snapshot.policy);
+                let first = match (target.id == view.snapshot.id, waits) {
+                    (true, _) => format!(
+                        "{what}: it is the policy in force, v{}",
+                        view.version.version
+                    ),
+                    (false, false) => format!("{what}, as a new policy version in force at once"),
+                    (false, true) => format!(
+                        "{what} as the pending policy, since sessions run under rules it changes; with --yes, restart the sandbox to apply it"
+                    ),
+                };
+                let mut plan = vec![first];
                 plan.extend(changes.iter().map(|c| format!("  {c}")));
                 plan.extend(dropped);
                 return Ok(Planned::DryRun(Plan {
@@ -252,22 +280,29 @@ impl Engine {
             }
             _ => {}
         }
+        let planned_with = (
+            view.version.version,
+            view.pending.as_ref().map(|(p, _)| p.snapshot.clone()),
+        );
         let recorded = self.write(
             by,
             command,
             Some(target_name),
-            |r: &Recorded| match &r.applied.outcome {
-                ChangeOutcome::Pending(p) => format!(
-                    "pending snapshot {}, as sessions run under rules it changes",
-                    p.snapshot.short()
-                ),
-                _ if r.applied.changed => format!("policy v{}", r.applied.version.version),
-                _ => "nothing changed".to_owned(),
-            },
+            |r: &Recorded| change_summary(&r.applied),
             |lock| {
-                // Again under the lock: the file may have changed since.
+                // Again under the lock: what was listed and asked must still
+                // be what changes.
                 let latest = self.policy(name)?;
-                self.refuse_unapplied_edit(name, latest.latest())?;
+                let now = (
+                    latest.version.version,
+                    latest.pending.as_ref().map(|(p, _)| p.snapshot.clone()),
+                );
+                if now != planned_with {
+                    return Err(Error::PolicyChangedMeanwhile {
+                        sandbox: name.to_string(),
+                    });
+                }
+                self.refuse_unapplied_edit(name, latest.latest(), command)?;
                 let mut recorded = self.propose(
                     lock,
                     by,
@@ -291,23 +326,23 @@ impl Engine {
     /// applied, which putting back another file would lose. Without that
     /// text (a snapshot stored before snapshots kept it), nothing tells an
     /// edit apart, and nothing is refused.
-    fn refuse_unapplied_edit(&self, name: &SandboxName, latest: &PolicySnapshot) -> Result<()> {
+    fn refuse_unapplied_edit(
+        &self,
+        name: &SandboxName,
+        latest: &PolicySnapshot,
+        command: &str,
+    ) -> Result<()> {
         let Some(expected) = latest.overrides_text() else {
             return Ok(());
         };
-        match self.layout.read_policy(name.as_str()) {
-            Ok(current) if current == expected => Ok(()),
-            Err(crate::layout::LayoutError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e.into()),
-            Ok(_) => Err(Error::PolicyFileEdited {
-                sandbox: name.to_string(),
-                file: self.layout.policy_file(name.as_str()),
-            }),
+        if self.layout.read_policy(name.as_str())? == expected {
+            return Ok(());
         }
+        Err(Error::PolicyFileEdited {
+            sandbox: name.to_string(),
+            file: self.layout.policy_file(name.as_str()),
+            command: command.to_owned(),
+        })
     }
 }
 
@@ -315,6 +350,7 @@ impl Engine {
 struct Replacement<'a> {
     /// The audited command.
     command: &'static str,
+    /// The audited target.
     target_name: String,
     /// The change, as plans and questions say it.
     what: String,
@@ -337,7 +373,10 @@ fn input_differences(old: &PolicyInputs, new: &PolicyInputs) -> Vec<String> {
             new.template, old.template
         ));
     } else if old.template_hash != new.template_hash {
-        found.push(format!("built on a newer `{}` template", new.template));
+        found.push(format!(
+            "built on another version of the `{}` template",
+            new.template
+        ));
     }
     if old.defaults != new.defaults {
         found.push("built on other built-in defaults".to_owned());
@@ -345,9 +384,15 @@ fn input_differences(old: &PolicyInputs, new: &PolicyInputs) -> Vec<String> {
     match (&old.adapter, &new.adapter) {
         (None, Some(a)) => found.push(format!("with the {} adapter's destinations", a.runtime)),
         (Some(a), None) => found.push(format!("without the {} adapter's destinations", a.runtime)),
-        (Some(a), Some(b)) if a != b => found.push(format!(
-            "with the {} adapter {} instead of {} {}",
-            b.runtime, b.version, a.runtime, a.version
+        (Some(a), Some(b)) if (&a.runtime, &a.version) != (&b.runtime, &b.version) => {
+            found.push(format!(
+                "with the {} adapter {} instead of {} {}",
+                b.runtime, b.version, a.runtime, a.version
+            ))
+        }
+        (Some(a), Some(b)) if a.hash != b.hash => found.push(format!(
+            "with other destinations from the {} adapter {}",
+            b.runtime, b.version
         )),
         _ => {}
     }
@@ -384,25 +429,59 @@ mod tests {
         }
     }
 
+    fn adapter(version: &str, hash: &str) -> Option<AdapterInput> {
+        Some(AdapterInput {
+            runtime: "hermes".into(),
+            version: version.into(),
+            hash: hash.into(),
+        })
+    }
+
     #[test]
     fn inputs_that_differ_are_each_named() {
         let old = inputs();
         assert!(input_differences(&old, &old).is_empty());
         let mut new = old.clone();
         new.template_hash = "t2".into();
-        new.adapter = Some(AdapterInput {
-            runtime: "hermes".into(),
-            version: "2".into(),
-            hash: "h".into(),
-        });
+        new.adapter = adapter("2", "h");
         new.enclos_version = "0.2.0".into();
         assert_eq!(
             input_differences(&old, &new),
             [
-                "built on a newer `assistant` template",
+                "built on another version of the `assistant` template",
                 "with the hermes adapter's destinations",
                 "resolved by enclos 0.2.0 instead of 0.1.0",
             ]
+        );
+        let mut other = old.clone();
+        other.template = "minimal".parse().unwrap();
+        other.defaults = "d2".into();
+        assert_eq!(
+            input_differences(&old, &other),
+            [
+                "built on the `minimal` template instead of `assistant`",
+                "built on other built-in defaults",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_adapter_change_names_its_version_or_its_destinations() {
+        let (mut a, mut b) = (inputs(), inputs());
+        a.adapter = adapter("1", "h");
+        b.adapter = adapter("2", "h");
+        assert_eq!(
+            input_differences(&a, &b),
+            ["with the hermes adapter 2 instead of hermes 1"]
+        );
+        b.adapter = adapter("1", "h2");
+        assert_eq!(
+            input_differences(&a, &b),
+            ["with other destinations from the hermes adapter 1"]
+        );
+        assert_eq!(
+            input_differences(&a, &inputs()),
+            ["without the hermes adapter's destinations"]
         );
     }
 }

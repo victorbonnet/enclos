@@ -427,12 +427,18 @@ fn policy_history_diff_rollback_and_refresh() {
     home.run(&["policy", "allow", "home", "b.example.com"]).ok();
 
     let history = home.run(&["policy", "history", "home"]).ok().stdout();
-    let lines: Vec<&str> = history.lines().collect();
-    assert_eq!(lines.len(), 5, "{history}");
+    let row = |v: &str| {
+        history
+            .lines()
+            .find(|l| l.trim_start().starts_with(v))
+            .unwrap_or_default()
+            .to_owned()
+    };
     assert!(
-        lines[4].trim_start().starts_with("v3") && lines[4].ends_with("in force"),
+        !row("v1").is_empty() && !row("v2").contains("in force"),
         "{history}"
     );
+    assert!(row("v3").ends_with("in force"), "{history}");
     let diff = home.run(&["policy", "diff", "home"]).ok().stdout();
     assert!(diff.contains("what v3 changes from v2"), "{diff}");
     assert!(diff.contains("allow b.example.com"), "{diff}");
@@ -458,6 +464,29 @@ fn policy_history_diff_rollback_and_refresh() {
     let out = home.run(&["policy", "rollback", "home", "--to", "9"]);
     assert_eq!(out.code(), 1);
     assert!(out.stderr().contains("no policy v9"), "{}", out.stderr());
+
+    // An edit of policy.toml by hand stops a rollback, and `policy edit`
+    // closed as it is applies it, as the refusal says.
+    let file = home.root.join("sandboxes/home/policy.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        text.replace("allow_add = []", "allow_add = [\"d.example.com\"]"),
+    )
+    .unwrap();
+    let out = home.run(&["policy", "rollback", "home", "--to", "2"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("holds an edit not applied"),
+        "{}",
+        out.stderr()
+    );
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL")
+        .env("EDITOR", editor(&home, "true"));
+    let out = Run(edit.output().unwrap());
+    assert!(out.ok().stdout().contains("policy v5"), "{}", out.stdout());
+    home.run(&["policy", "rollback", "home", "--to", "2"]).ok();
 }
 
 #[cfg(target_os = "macos")]

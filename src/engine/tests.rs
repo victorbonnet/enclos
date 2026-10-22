@@ -727,7 +727,7 @@ mod sandbox {
     /// Runs `work` while another command holds the state lock: `work`
     /// passes its checks and waits, then `meanwhile` changes the state
     /// before the lock is released.
-    fn while_waiting<T>(
+    pub(super) fn while_waiting<T>(
         engine: &Engine,
         work: impl FnOnce() -> T,
         meanwhile: impl FnOnce(&Engine, &crate::state::StateLock) + Send,

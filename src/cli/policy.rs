@@ -1,5 +1,6 @@
 //! `enclos policy`: show a sandbox's policy, allow a destination, edit
-//! `policy.toml`, apply or discard the pending change, or test the policy.
+//! `policy.toml`, apply or discard the pending change, list, compare, roll
+//! back or refresh its versions, or test the policy.
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -51,8 +52,13 @@ enum PolicyVerb {
     /// pending policy from the active one, or the active one from the one before.
     Diff {
         sandbox: SandboxName,
+        /// The version compared from: by default the active one when the
+        /// pending policy is compared, else the one before --to.
         #[arg(long, value_name = "VERSION")]
         from: Option<u32>,
+        /// The version compared: by default the pending policy, when there
+        /// is one and --from is not given or is the active version; else
+        /// the active version.
         #[arg(long, value_name = "VERSION")]
         to: Option<u32>,
     },
@@ -62,8 +68,9 @@ enum PolicyVerb {
         #[arg(long, value_name = "VERSION")]
         to: u32,
     },
-    /// Resolve the policy again against this enclos's templates and the
-    /// runtime's adapter, and apply what changed once you accept it.
+    /// Resolve the active policy's policy.toml again against this enclos's
+    /// templates, built-in defaults and the runtime's adapter; with --yes,
+    /// apply what that changes, in place of a pending change.
     Refresh { sandbox: SandboxName },
     /// Try each way out of the sandbox from inside it; every probe must fail.
     Test {
@@ -126,7 +133,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
         }
         PolicyVerb::Refresh { sandbox } => {
             let planned = engine.policy_refresh(by, &sandbox, confirm)?;
-            return print_replaced(engine, &sandbox, "this enclos's templates", planned);
+            return print_replaced(engine, &sandbox, "a refresh", planned);
         }
     }
     Ok(exit::OK)
@@ -319,7 +326,8 @@ fn print_history(history: &PolicyHistory) {
         .versions
         .iter()
         .map(|v| {
-            let note = match (v.version == history.active, v.restores) {
+            let active = history.active().map(|a| a.version);
+            let note = match (Some(v.version) == active, v.restores) {
                 (true, Some(r)) => format!("in force; restores v{r}"),
                 (true, None) => "in force".to_owned(),
                 (false, Some(r)) => format!("restores v{r}"),
@@ -356,7 +364,7 @@ fn print_history(history: &PolicyHistory) {
             p.snapshot.short(),
             p.by.user,
             p.by.host,
-            p.at.strftime("%Y-%m-%d %H:%M:%S"),
+            p.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
             history.sandbox
         );
     }
@@ -365,13 +373,13 @@ fn print_history(history: &PolicyHistory) {
 fn print_diff(sandbox: &SandboxName, diff: &PolicyDiff) {
     if diff.changes.is_empty() && diff.inputs.is_empty() {
         println!(
-            "Sandbox {sandbox}: {} grants the same as {}.",
+            "Sandbox {sandbox}: {} grants the same as v{}.",
             diff.to, diff.from
         );
         return;
     }
     println!(
-        "Sandbox {sandbox}: what {} changes from {}:",
+        "Sandbox {sandbox}: what {} changes from v{}:",
         diff.to, diff.from
     );
     if diff.changes.is_empty() {
@@ -402,7 +410,10 @@ fn print_replaced(
     };
     let version = applied.version.version;
     match (&applied.outcome, applied.changed) {
-        (ChangeOutcome::Pending(_), _) => {
+        (ChangeOutcome::Pending(_), true) => println!(
+            "Sandbox {sandbox} has policy v{version}: the network part of {from} is in force at once."
+        ),
+        (ChangeOutcome::Pending(_), false) => {
             println!("Sandbox {sandbox} keeps policy v{version} for now.")
         }
         (ChangeOutcome::InForce { dropped: None }, false) => {
@@ -410,6 +421,9 @@ fn print_replaced(
         }
         (_, false) => println!("Sandbox {sandbox} keeps policy v{version}."),
         (_, true) => println!("Sandbox {sandbox} has policy v{version}, from {from}."),
+    }
+    if !applied.also.is_empty() {
+        println!("What it changes from the policy that was in force:");
     }
     for change in &applied.also {
         println!("  {change}");
@@ -457,7 +471,12 @@ fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
 /// applied: refused, cut short, or a dry run) is opened again instead, as
 /// long as `policy.toml` is still the file it started from.
 fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) -> Result<u8> {
-    let file = engine.policy(sandbox)?.file;
+    let view = engine.policy(sandbox)?;
+    // The text the latest policy was resolved from: a file that holds
+    // anything else holds an edit not applied, which closing the editor
+    // applies.
+    let recorded = view.latest().overrides_text().map(str::to_owned);
+    let file = view.file;
     let files = engine.edit_files(sandbox);
     let io = |path: &Path| {
         let path = path.to_owned();
@@ -491,7 +510,7 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     write_private(&files.copy, &start).map_err(io(&files.copy))?;
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
-    if after == before {
+    if after == before && recorded.as_deref().is_none_or(|r| r == after) {
         forget_edit(&files);
         println!("No change to the policy of sandbox {sandbox}.");
         return Ok(exit::OK);
