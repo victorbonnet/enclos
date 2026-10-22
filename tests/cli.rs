@@ -2287,20 +2287,27 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
         let child = cmd.spawn().unwrap();
         std::thread::sleep(Duration::from_millis(300));
         // From a thread: a paste longer than the terminal's queue waits for
-        // enclos to read it.
+        // enclos to read it. A 0xff byte, never typed, stands for a pause
+        // longer than enclos waits for a quiet input.
         let keys = keys.to_vec();
         let writer = master.try_clone().unwrap();
         let typing = std::thread::spawn(move || {
-            let mut keys = &keys[..];
-            while !keys.is_empty() {
-                match rustix::io::write(&writer, keys) {
-                    Ok(n) => keys = &keys[n..],
-                    Err(_) => break,
+            for part in keys.split(|b| *b == 0xff) {
+                let mut part = part;
+                while !part.is_empty() {
+                    match rustix::io::write(&writer, part) {
+                        Ok(n) => part = &part[n..],
+                        Err(_) => return,
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(800));
             }
         });
         let out = Run(child.wait_with_output().unwrap());
-        typing.join().unwrap();
+        // Not joined: a writer still blocked means enclos stopped reading,
+        // which the bytes left below show, rather than a test that hangs.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(typing);
         let echo = tcgetattr(&slave)
             .unwrap()
             .local_modes
@@ -2349,6 +2356,26 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
         out.stderr()
     );
     assert!(echo);
+    // A paste whose second half comes after a pause, as over a slow link:
+    // its end is known from the marks a terminal puts around a paste.
+    let (out, echo) = at_terminal(
+        "slow",
+        b"\x1b[200~first-line\rsecond\xff\rthird-line\x1b[201~",
+    );
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    // A pasted value with its line ending, then Return: one line.
+    let (out, _) = at_terminal("whole", b"\x1b[200~tok-123\r\x1b[201~");
+    assert!(
+        out.ok().stdout().contains("Stored secret home/whole"),
+        "{}",
+        out.stdout()
+    );
     let (out, echo) = at_terminal("cancel", b"abc\x03");
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(out.stderr().contains("cancelled"), "{}", out.stderr());

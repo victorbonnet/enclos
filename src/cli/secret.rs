@@ -88,12 +88,14 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
             }
         }));
         // Everything that came after the line, such as more pasted lines or
-        // the rest of a value too long, is read and dropped until the input
-        // stays quiet, before echo comes back, so the shell never reads it.
-        let after = quiet.drain();
+        // the rest of a value too long, is read and dropped before echo
+        // comes back, so the shell never reads it: up to the end of a paste
+        // the line ended in, then until the input stays quiet.
+        let paste_open = matches!(typed, Ok((_, true)));
+        let after = quiet.drain(paste_open);
         quiet.restore();
         eprintln!();
-        let typed = typed.map_err(io)?;
+        let (typed, _) = typed.map_err(io)?;
         let after = after.map_err(|e| {
             refused(&format!(
                 "what came after the line could not all be dropped, and may reach the shell: {e}"
@@ -105,7 +107,11 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
                     what: format!("cancelled: secret {secret} was not set"),
                 });
             }
-            Typed::Ended => return Err(refused("the input ended before Return")),
+            Typed::Ended => {
+                return Err(refused(
+                    "nothing was typed, or the input ended before Return",
+                ));
+            }
             Typed::TooLong => {
                 return Err(refused(&format!(
                     "a value typed at a terminal is at most {MAX_TYPED} bytes; pipe a longer one in"
@@ -117,7 +123,7 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
                     key_name(key)
                 )));
             }
-            Typed::Line(_) if after > 0 => {
+            Typed::Line(_) if after => {
                 return Err(refused(
                     "more came after the line, and was dropped: at a terminal a value is one line; pipe in one of several lines",
                 ));
@@ -162,15 +168,35 @@ enum Typed {
 /// no limit of its own: Return ends it, and so does Ctrl-D after some
 /// text; Backspace erases a character, Ctrl-W a word and Ctrl-U the line;
 /// the keys that would signal cancel it at once, and any other control key
-/// is refused rather than taken into the value unseen.
-fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<Typed> {
+/// is refused rather than taken into the value unseen. The marks a terminal
+/// puts around a paste (bracketed paste) are taken out; the second value
+/// says whether the line ended inside a paste, of which more then follows.
+fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<(Typed, bool)> {
     let mut line = Vec::new();
-    for key in keys {
+    let mut pasting = false;
+    let typed = loop {
+        let Some(key) = keys.next() else {
+            break Typed::Ended;
+        };
         match key? {
-            b'\r' | b'\n' => return Ok(Typed::Line(line)),
-            0x04 if line.is_empty() => return Ok(Typed::Ended),
-            0x04 => return Ok(Typed::Line(line)),
-            0x03 | 0x1a | 0x1c => return Ok(Typed::Cancelled),
+            b'\r' | b'\n' => break Typed::Line(line),
+            0x04 if line.is_empty() => break Typed::Ended,
+            0x04 => break Typed::Line(line),
+            0x03 | 0x1a | 0x1c => break Typed::Cancelled,
+            0x1b => {
+                let mut mark = [0u8; 5];
+                for byte in &mut mark {
+                    match keys.next().transpose()? {
+                        Some(next) => *byte = next,
+                        None => break,
+                    }
+                }
+                match &mark {
+                    PASTE_STARTS => pasting = true,
+                    PASTE_ENDS => pasting = false,
+                    _ => break Typed::Control(0x1b),
+                }
+            }
             // A character's last byte, and any continuation bytes before it.
             0x7f | 0x08 => {
                 while let Some(byte) = line.pop() {
@@ -188,12 +214,37 @@ fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Resul
                 }
             }
             0x15 => line.clear(),
-            key @ (0x00..=0x08 | 0x0a..=0x1f) => return Ok(Typed::Control(key)),
-            _ if line.len() == MAX_TYPED => return Ok(Typed::TooLong),
+            key @ (0x00..=0x08 | 0x0a..=0x1f) => break Typed::Control(key),
+            _ if line.len() == MAX_TYPED => break Typed::TooLong,
             byte => line.push(byte),
         }
+    };
+    Ok((typed, pasting))
+}
+
+/// What a terminal in bracketed paste mode sends before a paste, after
+/// Escape, and after it.
+const PASTE_STARTS: &[u8; 5] = b"[200~";
+const PASTE_ENDS: &[u8; 5] = b"[201~";
+
+/// Whether `drained`, what came after the line, holds anything but the
+/// marks around a paste and line endings.
+fn holds_more(drained: &[u8]) -> bool {
+    let mut rest = drained;
+    while !rest.is_empty() {
+        if let Some(after) = rest
+            .strip_prefix(b"\x1b")
+            .and_then(|r| r.strip_prefix(PASTE_STARTS).or(r.strip_prefix(PASTE_ENDS)))
+        {
+            rest = after;
+            continue;
+        }
+        if !matches!(rest[0], b'\r' | b'\n') {
+            return true;
+        }
+        rest = &rest[1..];
     }
-    Ok(Typed::Ended)
+    false
 }
 
 /// How a control key is named to the user.
@@ -211,6 +262,9 @@ fn key_name(key: u8) -> String {
 struct Quiet<'a> {
     stdin: &'a std::io::Stdin,
     before: Option<rustix::termios::Termios>,
+    /// The terminal, to turn bracketed paste on and off; none when it
+    /// cannot be opened, and then the end of a paste is not known.
+    tty: Option<std::fs::File>,
 }
 
 impl<'a> Quiet<'a> {
@@ -227,37 +281,71 @@ impl<'a> Quiet<'a> {
         quiet.special_codes[SpecialCodeIndex::VMIN] = 1;
         quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
         tcsetattr(stdin, OptionalActions::Now, &quiet)?;
+        // Bracketed paste, so a paste's end is known whatever pauses its
+        // bytes come with (ssh on a slow link, a slow paste).
+        let tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+            .filter(|mut tty| tty.write_all(b"\x1b[?2004h").is_ok());
         Ok(Quiet {
             stdin,
             before: Some(before),
+            tty,
         })
     }
 
-    /// Reads and drops what is waiting, until nothing more comes for 0.2
-    /// s, and flushes the rest; returns how much there was. A paste longer
-    /// than the terminal's queue keeps refilling it, so one flush is not
-    /// enough.
-    fn drain(&self) -> std::io::Result<usize> {
-        use rustix::termios::{
-            OptionalActions, QueueSelector, SpecialCodeIndex, tcflush, tcgetattr, tcsetattr,
-        };
+    /// Reads and drops what is waiting: up to the end of the paste when
+    /// `paste_open`, then until nothing more comes for half a second, and
+    /// flushes the rest. A paste longer than the terminal's queue keeps
+    /// refilling it, so one flush is not enough. Returns whether anything
+    /// but the end of a paste came.
+    fn drain(&self, paste_open: bool) -> std::io::Result<bool> {
+        use rustix::termios::{OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr};
         let mut waiting = tcgetattr(self.stdin)?;
         waiting.special_codes[SpecialCodeIndex::VMIN] = 0;
-        waiting.special_codes[SpecialCodeIndex::VTIME] = 2;
+        waiting.special_codes[SpecialCodeIndex::VTIME] = 5;
         tcsetattr(self.stdin, OptionalActions::Now, &waiting)?;
+        let drained = self.drained(paste_open);
+        // Flushed whatever happened, so as little as can be reaches the
+        // shell when it went wrong.
+        let flushed = rustix::termios::tcflush(self.stdin, rustix::termios::QueueSelector::IFlush);
+        let drained = drained?;
+        flushed?;
+        Ok(holds_more(&drained))
+    }
+
+    /// What `drain` reads, at most [`MAX_INPUT`] bytes, and for a paste
+    /// still open, at most half a minute.
+    fn drained(&self, mut paste_open: bool) -> std::io::Result<Vec<u8>> {
+        let started = std::time::Instant::now();
         let mut buf = [0u8; 4096];
-        let mut drained = 0;
+        let mut drained = Vec::new();
         loop {
-            match rustix::io::read(self.stdin, &mut buf[..])? {
-                0 => break,
-                read => drained += read,
+            let read = rustix::io::read(self.stdin, &mut buf[..])?;
+            if read == 0 && !paste_open {
+                return Ok(drained);
             }
-            if drained > MAX_INPUT {
+            drained.extend_from_slice(&buf[..read]);
+            // Where the last mark is says whether a paste is still open.
+            let tail = &drained[drained.len().saturating_sub(read + 5)..];
+            let last = |mark: &[u8]| {
+                tail.windows(6)
+                    .rposition(|w| w[0] == 0x1b && &w[1..] == mark)
+            };
+            match (last(PASTE_STARTS), last(PASTE_ENDS)) {
+                (Some(start), Some(end)) => paste_open = start > end,
+                (Some(_), None) => paste_open = true,
+                (None, Some(_)) => paste_open = false,
+                (None, None) => {}
+            }
+            if drained.len() > MAX_INPUT {
                 return Err(std::io::Error::other("the input does not stop"));
             }
+            if paste_open && started.elapsed() > std::time::Duration::from_secs(30) {
+                return Err(std::io::Error::other("a paste did not end"));
+            }
         }
-        tcflush(self.stdin, QueueSelector::IFlush)?;
-        Ok(drained)
     }
 
     /// Puts the terminal back as it was, saying so when it cannot.
@@ -266,6 +354,9 @@ impl<'a> Quiet<'a> {
     }
 
     fn put_back(&mut self) {
+        if let Some(mut tty) = self.tty.take() {
+            let _ = tty.write_all(b"\x1b[?2004l");
+        }
         if let Some(before) = self.before.take()
             && let Err(e) = rustix::termios::tcsetattr(
                 self.stdin,
@@ -356,7 +447,24 @@ mod tests {
     use super::*;
 
     fn keys(bytes: &[u8]) -> std::io::Result<Typed> {
-        typed(&mut bytes.iter().map(|b| Ok(*b)))
+        typed(&mut bytes.iter().map(|b| Ok(*b))).map(|(typed, _)| typed)
+    }
+
+    #[test]
+    fn the_marks_around_a_paste_are_taken_out_and_say_whether_it_goes_on() {
+        let pasted = |bytes: &[u8]| typed(&mut bytes.iter().map(|b| Ok(*b))).unwrap();
+        assert_eq!(
+            pasted(b"\x1b[200~tok\x1b[201~\r"),
+            (Typed::Line(b"tok".to_vec()), false)
+        );
+        assert_eq!(
+            pasted(b"\x1b[200~tok\rsecond"),
+            (Typed::Line(b"tok".to_vec()), true)
+        );
+        assert!(!holds_more(b"\x1b[201~"));
+        assert!(!holds_more(b"\n\x1b[201~\r"));
+        assert!(holds_more(b"second\x1b[201~"));
+        assert!(holds_more(b"\x1b[D"));
     }
 
     #[test]
