@@ -3734,6 +3734,24 @@ mod services {
 
     /// A start that fails removes every service it replaced: the session is
     /// told that the proxy service is gone too, and how to get it back.
+    /// A start that fails before the proxy service is removed says nothing
+    /// of it: it is still there.
+    #[test]
+    fn a_failed_start_that_kept_the_proxy_service_does_not_say_it_is_gone() {
+        let (_dir, engine, fake, name) = only_the_proxy_installed();
+        *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
+        let (waited, _) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started, "{waited:?}");
+        let late = waited.late.unwrap();
+        assert!(late.starts_with("its services could not start:"), "{late}");
+        assert!(!late.contains("proxy service was removed"), "{late}");
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            installed.iter().any(|l| l.ends_with(".proxy")),
+            "{installed:?}"
+        );
+    }
+
     #[test]
     fn a_failed_start_says_the_proxy_service_it_replaced_is_gone() {
         let (_dir, engine, fake, name) = only_the_proxy_installed();

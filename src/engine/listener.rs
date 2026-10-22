@@ -301,10 +301,12 @@ impl Engine {
                 say(format!(
                     "starting the services of sandbox {name}, since its runtime's clients need its {service}. They start again at each login until `enclos sandbox stop {name}`.{cut}"
                 ));
-                // A start that fails removes every service it replaced.
+                // A start that fails after removing the services it replaces
+                // leaves none: said when the proxy service was among them.
                 let had_proxy = self.unit_installed(name, Unit::Proxy)?;
                 if let Err(e) = self.start_sandbox(by, name) {
-                    let lost = match had_proxy {
+                    let gone = had_proxy && !self.unit_installed(name, Unit::Proxy).unwrap_or(true);
+                    let lost = match gone {
                         true => format!(
                             "; its proxy service was removed with them and no longer starts at login, until `enclos sandbox start {name}`"
                         ),
