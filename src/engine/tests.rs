@@ -3732,8 +3732,6 @@ mod services {
         );
     }
 
-    /// A start that fails removes every service it replaced: the session is
-    /// told that the proxy service is gone too, and how to get it back.
     /// A start that fails before the proxy service is removed says nothing
     /// of it: it is still there.
     #[test]
@@ -3752,6 +3750,8 @@ mod services {
         );
     }
 
+    /// A start that fails removes every service it replaced: the session is
+    /// told that the proxy service is gone too, and how to get it back.
     #[test]
     fn a_failed_start_says_the_proxy_service_it_replaced_is_gone() {
         let (_dir, engine, fake, name) = only_the_proxy_installed();
