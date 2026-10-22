@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A runtime may listen in its sandbox, and the sandbox's sessions reach its service's port
