@@ -10,7 +10,7 @@
 
 mod printable;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{CString, OsStr};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
@@ -22,20 +22,25 @@ use rustix::io::Errno;
 use serde::{Serialize, Serializer};
 
 use super::Engine;
+use super::listener::{NoPort, outside_proxy_range, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
-use crate::lifecycle::members::is_gone;
-use crate::lifecycle::process::processes;
+use crate::lifecycle::listeners::tcp_listeners_of;
+use crate::lifecycle::members::{find, is_gone};
+use crate::lifecycle::process::{Proc, is_same, processes};
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
 use crate::model::now;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::session::{SessionKind, SessionRecord};
+use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 use crate::runtime::home::{self, is_dot, wide};
-use crate::runtime::{DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, ValueAt, adapter};
+use crate::runtime::{
+    DiskPart, HomePath, RuntimeAdapter, RuntimeAgentName, RuntimeListener, ValueAt, adapter,
+};
 use crate::service::ServiceStatus;
+use crate::state::StateStore;
 use printable::printable;
 
 /// Past this, a sandbox nobody used is worth a suggestion.
@@ -154,6 +159,26 @@ pub struct SandboxStatus {
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,
+    /// The address of the page the runtime's service serves on the host,
+    /// such as Hermes's dashboard (ADR 0028), at the port sessions are
+    /// given: absent while no session of the service runs, "cannot tell"
+    /// while it holds no such port or one that cannot be trusted, not
+    /// provided for a runtime with no such page.
+    pub dashboard: Fact<String>,
+    /// Members listening on an address beyond loopback, which the host's
+    /// network can reach: nothing narrows a sandbox's listener to loopback
+    /// (ADR 0028).
+    pub network_listeners: Fact<Vec<NetworkListener>>,
+}
+
+/// A member listening where the host's network can reach it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NetworkListener {
+    pub pid: u32,
+    /// Its command, escaped: the sandbox names it.
+    pub command: String,
+    /// `*:8000` for every address, or the address it names.
+    pub address: String,
 }
 
 impl SandboxStatus {
@@ -570,6 +595,11 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
+        let network_listeners = network_listeners(&procs, &running);
+        let dashboard = match runtime.and_then(|rt| rt.listener()) {
+            Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
+            None => Fact::NotProvided,
+        };
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -616,6 +646,8 @@ impl Engine {
             policy_unreadable_at,
             agents,
             disk,
+            dashboard,
+            network_listeners,
             name,
         })
     }
@@ -1213,9 +1245,151 @@ fn count(usage: &mut Usage, linked: &mut HashMap<(i128, i128), Linked>, slot: &S
     *usage.by_slot.entry(slot.clone()).or_default() += bytes;
 }
 
+/// The address of the page `listener`'s service serves on the host, at the
+/// port sessions are given (ADR 0028), found the same way.
+fn dashboard(
+    store: &dyn StateStore,
+    name: &SandboxName,
+    listener: &RuntimeListener,
+    running: &[SessionRecord],
+) -> Fact<String> {
+    let Some(page) = listener.page else {
+        return Fact::NotProvided;
+    };
+    let service = listener.service.as_str();
+    let runs = running
+        .iter()
+        .any(|s| s.kind == SessionKind::Service && s.service.as_deref() == Some(service));
+    if !runs {
+        return Fact::Absent;
+    }
+    match service_listener(store, name, service).and_then(outside_proxy_range) {
+        Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
+        Err(NoPort::NotRunning(_)) => Fact::Absent,
+        Err(why) => Fact::CannotTell(why.to_string()),
+    }
+}
+
+/// Members of the `running` sessions that run in the sandbox (the proxy runs
+/// outside it) listening beyond loopback, which the host's network can
+/// reach: nothing narrows a sandbox's listener to loopback (ADR 0028). Each
+/// pid and address once, a listener on every address (`0.0.0.0` or `[::]`)
+/// shown as `*:<port>`. A pid is named only while it is still the member
+/// `procs` listed, checked after `lsof` looked, so a pid reused meanwhile
+/// is not.
+fn network_listeners(procs: &[Proc], running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
+    let mut members: BTreeMap<u32, (ProcessRef, String)> = BTreeMap::new();
+    for session in running.iter().filter(|s| s.kind != SessionKind::Proxy) {
+        for found in find(procs, session, &session.tracked) {
+            let member = found.member;
+            let at = ProcessRef {
+                pid: member.pid,
+                started: member.started,
+            };
+            members.insert(member.pid, (at, member.command));
+        }
+    }
+    let pids: Vec<u32> = members.keys().copied().collect();
+    let held = match tcp_listeners_of(&pids) {
+        Ok(held) => held,
+        Err(e) => return Fact::CannotTell(e.to_string()),
+    };
+    let mut shown: BTreeSet<(u32, String)> = BTreeSet::new();
+    for (pid, addr) in held {
+        // A v4-mapped address is the IPv4 one (`::ffff:127.0.0.1`).
+        let ip = addr.ip().to_canonical();
+        if ip.is_loopback() {
+            continue;
+        }
+        let address = match ip.is_unspecified() {
+            true => format!("*:{}", addr.port()),
+            false => addr.to_string(),
+        };
+        shown.insert((pid, address));
+    }
+    let mut found = Vec::new();
+    for (pid, address) in shown {
+        let Some((at, command)) = members.get(&pid) else {
+            return Fact::CannotTell(format!("lsof answered for pid {pid}, which was not asked"));
+        };
+        match is_same(at) {
+            Ok(true) => found.push(NetworkListener {
+                pid,
+                command: printable(command),
+                address,
+            }),
+            // Gone, or another process now: not the member's listener.
+            Ok(false) => {}
+            Err(e) => return Fact::CannotTell(e.to_string()),
+        }
+    }
+    Fact::Known(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A running session of `kind` whose root is `root`.
+    #[cfg(target_os = "macos")]
+    fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
+        SessionRecord {
+            id: crate::model::session::SessionId(1),
+            sandbox: "home".parse().unwrap(),
+            kind,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            root,
+            pgid: None,
+            tracked: Vec::new(),
+            started_at: now(),
+            ended_at: None,
+        }
+    }
+
+    /// Listens on every address and on loopback, and says both ports. Perl,
+    /// which macOS signs, so the firewall asks nothing of whoever runs the
+    /// tests.
+    #[cfg(target_os = "macos")]
+    const LISTENS: &str = "use Socket; for my $a (INADDR_ANY, INADDR_LOOPBACK) { socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, $a)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); } $| = 1; STDOUT->flush; sleep 30";
+
+    // `lsof` at /usr/sbin is macOS's, where sandboxes listen (ADR 0028).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new("/usr/bin/perl")
+            .args(["-e", LISTENS])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut port = || lines.next().unwrap().unwrap();
+        let (wide, narrow) = (port(), port());
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        let procs = processes().unwrap();
+        let running = [session_of(SessionKind::Interactive, root.clone())];
+        let found = network_listeners(&procs, &running);
+        // The proxy runs on the host, not in the sandbox: never counted.
+        let proxy = network_listeners(&procs, &[session_of(SessionKind::Proxy, root)]);
+        let _ = child.kill();
+        let _ = child.wait();
+        let Fact::Known(found) = found else {
+            panic!("lsof could not look: {found:?}");
+        };
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].pid, child.id());
+        assert_eq!(found[0].address, format!("*:{wide}"));
+        assert!(found[0].command.ends_with("perl"), "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|l| l.address.ends_with(&format!(":{narrow}")))
+        );
+        assert_eq!(proxy, Fact::Known(Vec::new()));
+    }
 
     fn file(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

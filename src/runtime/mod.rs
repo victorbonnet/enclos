@@ -333,6 +333,11 @@ pub struct RuntimeService {
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
+    /// The path of the page the service serves on its listener for a
+    /// browser on the host, such as `/` for Hermes's dashboard. `enclos
+    /// status` shows it at the port sessions are given, while the service
+    /// has one.
+    pub page: Option<&'static str>,
 }
 
 /// A runtime's name for one of its services, stable across versions, as it

@@ -5218,6 +5218,9 @@ mod status {
         assert_eq!(default["model"], "absent");
         assert!(s["disk"]["total"].is_u64());
         assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
+        // The gateway is not running, and nothing in the sandbox listens.
+        assert_eq!(s["dashboard"], "absent");
+        assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
         assert_eq!(json["complete"], true);
         assert_eq!(json["idle_days"], 30);
         assert!(json["bytes"].is_u64());
@@ -5455,6 +5458,57 @@ mod listener {
             matches!(&why, NoPort::Refused(why) if why.contains("also listens at 127.0.0.1")),
             "{why:?}"
         );
+    }
+
+    fn status_of(engine: &Engine, name: &SandboxName) -> crate::engine::SandboxStatus {
+        let mut view = engine.status(Some(name)).unwrap();
+        view.sandboxes.remove(0)
+    }
+
+    /// Status shows the dashboard at the port sessions are given, nothing
+    /// once the gateway is gone, and why when the port cannot be trusted.
+    #[test]
+    fn status_shows_the_dashboard_at_the_gateways_port() {
+        use crate::engine::Fact;
+        let (_dir, engine, name) = with_sandbox();
+        let (child, port) = gateway(&engine, &name, 1);
+        let up = status_of(&engine, &name);
+        end(child);
+        assert_eq!(
+            up.dashboard,
+            Fact::Known(format!("http://127.0.0.1:{port}/"))
+        );
+        // On loopback alone: nothing the host's network reaches.
+        assert_eq!(up.network_listeners, Fact::Known(Vec::new()));
+        assert_eq!(status_of(&engine, &name).dashboard, Fact::Absent);
+
+        let (_dir, engine, name) = with_sandbox();
+        let (child, _) = gateway(&engine, &name, 2);
+        let several = status_of(&engine, &name);
+        end(child);
+        let Fact::CannotTell(why) = several.dashboard else {
+            panic!("{:?}", several.dashboard);
+        };
+        assert!(why.contains("listens on 2 ephemeral ports"), "{why}");
+
+        // On every address: no dashboard, and the gateway is named as what
+        // the host's network reaches.
+        let (_dir, engine, name) = with_sandbox();
+        let (child, held) = perl(&listening(1, "0.0.0.0"), 1);
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        record_gateway(&engine, &name, root);
+        let wide = status_of(&engine, &name);
+        end(child);
+        assert!(
+            matches!(wide.dashboard, Fact::CannotTell(_)),
+            "{:?}",
+            wide.dashboard
+        );
+        let Fact::Known(reached) = wide.network_listeners else {
+            panic!("{:?}", wide.network_listeners);
+        };
+        assert_eq!(reached.len(), 1, "{reached:?}");
+        assert_eq!(reached[0].address, format!("*:{}", held[0]));
     }
 
     #[test]
