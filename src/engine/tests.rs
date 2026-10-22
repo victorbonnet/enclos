@@ -3623,6 +3623,154 @@ mod services {
         assert_eq!(fake.stopped.borrow().len(), stopped);
     }
 
+    /// A sandbox started before its runtime was installed: its proxy
+    /// service and no gateway service.
+    fn only_the_proxy_installed() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+        let (dir, engine, fake, name) = sandbox_with_services(None);
+        engine.start_sandbox(&alice(), &name).unwrap();
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let mut record = engine.state.get(&name)?.unwrap();
+                    record.runtime = Some(RuntimeKind::Hermes);
+                    Ok(engine.state.put(lock, &record)?)
+                },
+            )
+            .unwrap();
+        let home = engine.layout.sandbox_home(name.as_str());
+        std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            installed.iter().any(|l| l.ends_with(".proxy"))
+                && !installed.iter().any(|l| l.ends_with(".gateway")),
+            "{installed:?}"
+        );
+        (dir, engine, fake, name)
+    }
+
+    /// A sleep stands in for the proxy service's job, recorded as the
+    /// sandbox's running proxy; stopping the service ends it.
+    fn proxy_service_running(engine: &Engine, fake: &FakeServices, name: &SandboxName) {
+        let label = engine.label(name, Unit::Proxy).unwrap();
+        let job = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let root = crate::lifecycle::process::reference(job.id())
+            .unwrap()
+            .unwrap();
+        fake.jobs.borrow_mut().push((label, job));
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| {
+                    let (version, snapshot) = engine.state.active_policy(name)?.unwrap();
+                    let session = crate::model::session::SessionRecord {
+                        id: crate::model::session::SessionId(0),
+                        sandbox: name.clone(),
+                        kind: SessionKind::Proxy,
+                        service: None,
+                        version: version.version,
+                        snapshot: snapshot.id,
+                        compiled: None,
+                        pgid: None,
+                        root: root.clone(),
+                        tracked: Vec::new(),
+                        started_at: crate::model::now(),
+                        ended_at: None,
+                    };
+                    Ok(engine.state.put_session(lock, &session)?)
+                },
+            )
+            .unwrap();
+    }
+
+    /// Nothing would ever start the gateway of a sandbox with only its proxy
+    /// service, so `connect` starts the services, says beforehand that its
+    /// running proxy starts again and cuts the open sessions' connections,
+    /// and installs the gateway's service.
+    #[test]
+    fn connect_starts_the_services_when_only_the_proxy_is_installed() {
+        let (_dir, engine, fake, name) = only_the_proxy_installed();
+        proxy_service_running(&engine, &fake, &name);
+
+        let plan = dry_run(&engine, &name);
+        assert!(
+            plan[0].starts_with("start the services of sandbox home"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1].contains("cuts the connections of its open sessions"),
+            "{plan:?}"
+        );
+        let (waited, said) = wait_for_gateway(&engine, &name);
+        assert!(waited.started, "{waited:?}");
+        assert!(
+            said[0].starts_with("starting the services of sandbox home")
+                && said[0].contains("the connections of its open sessions are cut"),
+            "{said:?}"
+        );
+        let proxy = engine.label(&name, Unit::Proxy).unwrap();
+        assert!(fake.stopped.borrow().contains(&proxy));
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            installed.iter().any(|l| l.ends_with(".gateway")),
+            "{installed:?}"
+        );
+        assert!(
+            fake.started
+                .borrow()
+                .iter()
+                .any(|u| u.label.as_str().ends_with(".gateway"))
+        );
+    }
+
+    /// A start that fails before the proxy service is removed says nothing
+    /// of it: it is still there.
+    #[test]
+    fn a_failed_start_that_kept_the_proxy_service_does_not_say_it_is_gone() {
+        let (_dir, engine, fake, name) = only_the_proxy_installed();
+        *fake.refuse_stop.borrow_mut() = Some(".proxy".to_owned());
+        let (waited, _) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started, "{waited:?}");
+        let late = waited.late.unwrap();
+        assert!(late.starts_with("its services could not start:"), "{late}");
+        assert!(!late.contains("proxy service was removed"), "{late}");
+        let installed = labels_of(&engine.service_status(&name).unwrap());
+        assert!(
+            installed.iter().any(|l| l.ends_with(".proxy")),
+            "{installed:?}"
+        );
+    }
+
+    /// A start that fails removes every service it replaced: the session is
+    /// told that the proxy service is gone too, and how to get it back.
+    #[test]
+    fn a_failed_start_says_the_proxy_service_it_replaced_is_gone() {
+        let (_dir, engine, fake, name) = only_the_proxy_installed();
+        *fake.refuse.borrow_mut() = Some(".gateway".to_owned());
+        let (waited, _) = wait_for_gateway(&engine, &name);
+        assert!(!waited.started, "{waited:?}");
+        let late = waited.late.unwrap();
+        assert!(late.starts_with("its services could not start:"), "{late}");
+        assert!(
+            late.contains("its proxy service was removed with them")
+                && late.contains("`enclos sandbox start home`"),
+            "{late}"
+        );
+        assert!(
+            labels_of(&engine.service_status(&name).unwrap()).is_empty(),
+            "the proxy service is still installed"
+        );
+    }
+
     /// A start that fails is no reason not to connect: it is said, and the
     /// session goes ahead.
     #[test]

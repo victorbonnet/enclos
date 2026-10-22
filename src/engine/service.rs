@@ -328,6 +328,12 @@ impl Engine {
         Ok(!self.installed_labels(name)?.is_empty())
     }
 
+    /// Whether the sandbox's service `unit` is installed, running or not.
+    pub(super) fn unit_installed(&self, name: &SandboxName, unit: Unit) -> Result<bool> {
+        let label = self.label(name, unit)?;
+        Ok(self.installed_labels(name)?.contains(&label))
+    }
+
     /// Each installed service of the sandbox and whether it runs.
     pub fn service_status(&self, name: &SandboxName) -> Result<Vec<(ServiceLabel, ServiceStatus)>> {
         self.installed_labels(name)?
