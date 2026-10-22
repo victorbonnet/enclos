@@ -83,11 +83,12 @@ fn main() -> ExitCode {
         Err(err) => {
             let _ = err.print();
             // Help and version go to stdout and succeed; usage errors are
-            // errors (exit 1), since exit 2 means refused by policy.
-            return ExitCode::from(if err.use_stderr() {
-                exit::ERROR
-            } else {
-                exit::OK
+            // errors (exit 1), since exit 2 means refused by policy, or 125
+            // for `exec`, whose 1 is its command's.
+            return ExitCode::from(match err.use_stderr() {
+                false => exit::OK,
+                true if names_exec(std::env::args_os().skip(1)) => exit::EXEC_FAILED,
+                true => exit::ERROR,
             });
         }
     };
@@ -159,6 +160,14 @@ fn ends_on_closed_output(command: &Command) -> bool {
             | Command::Net(_)
             | Command::Status(_)
     )
+}
+
+/// Whether `args`, the command line after the program, run `exec`: its
+/// first word that is not a flag, as the only flags before a command are
+/// `--yes` and `--dry-run`.
+fn names_exec(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "exec")
 }
 
 /// The user and host recorded in audit entries.
@@ -330,6 +339,22 @@ mod tests {
         about
             .split(|c: char| !c.is_alphanumeric() && c != '-')
             .any(|w| w == word)
+    }
+
+    #[test]
+    fn a_usage_error_of_exec_is_told_from_other_commands() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(super::names_exec(args(&["exec", "lab"]).into_iter()));
+        assert!(super::names_exec(args(&["--yes", "exec"]).into_iter()));
+        assert!(!super::names_exec(
+            args(&["connect", "lab", "--", "exec"]).into_iter()
+        ));
+        assert!(!super::names_exec(args(&[]).into_iter()));
     }
 
     #[test]

@@ -499,7 +499,10 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
     // usage error record nothing.
     let lines = home.audit_lines().len();
     let out = home.run(&["exec", "home"]);
-    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    let out = home.run(&["exec", "Bad_Name", "--", "/bin/ls"]);
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert_eq!(home.run(&["exec", "--help"]).code(), 0);
     let out = home.run(&["--dry-run", "exec", "home", "--", "/bin/ls"]);
     assert!(
         out.ok().stdout().contains("Would run `/bin/ls`"),
