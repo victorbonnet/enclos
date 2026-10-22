@@ -37,7 +37,7 @@ enclos runtime install hermes --sandbox lab    # Hermes's own installer, run ins
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider and its login, then a model
 ```
 
-`enclos runtime install` downloads Hermes's installer on your Mac and runs it only if it is the version enclos was reviewed against. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
+`enclos runtime install` downloads Hermes's installer on your Mac, as Hermes serves it, and records its SHA-256 in the audit log. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
 `enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 

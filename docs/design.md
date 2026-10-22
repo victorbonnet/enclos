@@ -371,7 +371,7 @@ pub trait RuntimeAdapter {
     fn kind(&self) -> RuntimeKind;
     fn supports_multiple_agents(&self) -> bool;                                 // Hermes: yes; Claude Code, Codex: no
     fn endpoints(&self) -> &str;  fn version(&self) -> &str;                    // the destinations it needs, as a layer that adds nothing else; versioned, recorded in snapshot inputs
-    fn installer(&self) -> Installer;                                           // downloaded on the host over HTTPS only, pinned by SHA-256, run inside the sandbox (milestone 1, ADR 0020)
+    fn installer(&self) -> Installer;                                           // downloaded on the host over HTTPS only, as the runtime serves it, its SHA-256 in the audit entry, run inside the sandbox (milestone 1, ADR 0020, ADR 0029)
     fn home_files(&self) -> Vec<HomeFile>;                                      // files enclos stages beside the home; copied in from inside the sandbox
     fn login(&self) -> String;                                                  // the runtime's own login and setup, shown as `connect <sandbox> -- <this>`, never run by enclos
 

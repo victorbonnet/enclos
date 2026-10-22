@@ -1526,8 +1526,8 @@ mod runtime {
 
     #[cfg(target_os = "macos")]
     /// Hermes's adapter with an installer of the test's own: `url` is a
-    /// `file://` URL to it and `sha256` its real hash, unless the test says
-    /// otherwise.
+    /// `file://` URL to it and `sha256` its hash, which the audit entry should
+    /// name.
     struct TestRuntime {
         url: String,
         sha256: String,
@@ -1561,7 +1561,6 @@ mod runtime {
         fn installer(&self) -> Installer {
             Installer {
                 url: self.url.clone(),
-                sha256: self.sha256.clone(),
                 args: vec!["--non-interactive".into()],
             }
         }
@@ -1819,31 +1818,31 @@ echo \"installed $*\" > \"$HOME/installed\"
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_changed_installer_is_refused_before_anything_changes() {
+    fn any_installer_runs_and_the_audit_names_its_hash() {
+        // Whatever version the runtime serves (ADR 0029): the entry names
+        // what ran.
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let lab = Lab::new();
-        let mut runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
-        runtime.sha256 = "0".repeat(64);
-        let err = lab
+        let runtime = TestRuntime::new(lab._dir.path(), INSTALLS);
+        let Planned::Done(end) = lab
             .engine
             .install_runtime_with(&alice(), &lab.name, &runtime, Confirm::Yes)
-            .unwrap_err();
-        let text = err.to_string();
+            .unwrap()
+        else {
+            panic!("a dry run");
+        };
+        assert!(end.installed, "{end:?}");
+        let audit = lab.audit();
         assert!(
-            text.contains("changed") && text.contains(&"0".repeat(64)),
-            "{text}"
+            audit.contains(&format!("installer sha256 {}", runtime.sha256)),
+            "{audit}"
         );
-        assert_eq!(lab.runtime(), None);
-        assert!(!lab.allows("chatgpt.com"));
-        assert_eq!(lab.engine.policy(&lab.name).unwrap().version.version, 1);
         let installers = lab.engine.layout.sandbox_dir("home").join("installers");
-        assert!(!installers.join("hermes-install.sh").exists());
         assert!(
             std::fs::read_dir(&installers)
                 .unwrap()
                 .all(|e| { !e.unwrap().file_name().to_string_lossy().ends_with(".part") })
         );
-        assert!(!lab.audit().contains("runtime install"), "{}", lab.audit());
     }
 
     #[cfg(target_os = "macos")]
@@ -4589,7 +4588,6 @@ mod status {
         fn installer(&self) -> Installer {
             Installer {
                 url: String::new(),
-                sha256: String::new(),
                 args: Vec::new(),
             }
         }
