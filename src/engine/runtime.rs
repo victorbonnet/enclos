@@ -401,6 +401,13 @@ impl Engine {
     ) -> Result<InstallPlan> {
         let kind = runtime.kind();
         let active = self.policy(name)?;
+        // The install resolves `policy.toml`, which holds the pending
+        // change: it would be in force without the restart it needs.
+        if active.pending.is_some() {
+            return Err(Error::PolicyPending {
+                sandbox: name.to_string(),
+            });
+        }
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;

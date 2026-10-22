@@ -1,15 +1,17 @@
-//! The engine's policy calls: show the active policy and allow a
-//! destination (design §7, ADR 0018).
+//! The engine's policy calls: show the active and pending policies and
+//! allow a destination (design §7, ADR 0018). Changes that may need a
+//! restart go through `pending.rs`.
 
 use std::path::PathBuf;
 
 use toml_edit::{Array, DocumentMut, Item, Table};
 
 use super::Engine;
+use super::pending::{Proposed, Restarted};
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{NetMode, Policy, PolicySnapshot, PolicyVersion};
+use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
@@ -18,14 +20,25 @@ use crate::policy::validate::{ValidationContext, validate};
 use crate::policy::{self, AdapterLayer, PolicyError, Problem};
 use crate::state::StateLock;
 
-/// A sandbox's active policy, as `enclos policy show` prints it.
+/// A sandbox's active policy, and its pending one, as `enclos policy show`
+/// prints them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyView {
     pub sandbox: SandboxName,
     pub version: PolicyVersion,
     pub snapshot: PolicySnapshot,
+    /// The change saved because the user declined the restart it needs.
+    pub pending: Option<(PendingPolicy, PolicySnapshot)>,
     /// The sandbox's `policy.toml`.
     pub file: PathBuf,
+}
+
+impl PolicyView {
+    /// The policy the next change starts from: the pending one if there is
+    /// one, since `policy.toml` holds it, else the active one.
+    pub fn latest(&self) -> &PolicySnapshot {
+        self.pending.as_ref().map_or(&self.snapshot, |(_, s)| s)
+    }
 }
 
 /// What a policy change did.
@@ -33,40 +46,48 @@ pub struct PolicyView {
 pub struct PolicyApplied {
     /// The active version after the change.
     pub version: PolicyVersion,
-    /// False when the policy already allowed it.
+    /// False when the policy already was what was asked.
     pub changed: bool,
-    /// What the new version changes besides the entry asked for, one
-    /// sentence each: edits to `policy.toml` not applied yet, or a newer
-    /// template or built-in defaults.
+    /// What the change does besides the entry asked for, one sentence each:
+    /// edits to `policy.toml` not applied yet, or a newer template or
+    /// built-in defaults. For `policy edit`, everything it changes.
     pub also: Vec<String>,
+    /// Set when the change waits as the pending policy: sessions run under
+    /// rules it changes, and only a restart applies it.
+    pub pending: Option<PendingPolicy>,
+    /// The restart that applied it, with `--yes`.
+    pub restarted: Option<Restarted>,
 }
 
 /// What `policy allow` would do, worked out without changing anything.
 struct AllowPlan {
-    active: PolicyView,
-    /// The file to write and what it resolves to; `None` when the active
-    /// policy already allows the entry.
+    view: PolicyView,
+    /// The file to write and what it resolves to; `None` when the policy
+    /// already allows the entry.
     change: Option<(String, PolicySnapshot)>,
     also: Vec<String>,
 }
 
 impl Engine {
-    /// The sandbox's active policy.
+    /// The sandbox's active policy, and its pending one.
     pub fn policy(&self, name: &SandboxName) -> Result<PolicyView> {
         let (version, snapshot) = self.active_policy(name)?;
         Ok(PolicyView {
             sandbox: name.clone(),
             version,
             snapshot,
+            pending: self.state.pending_policy(name)?,
             file: self.layout.policy_file(name.as_str()),
         })
     }
 
     /// Allows the sandbox to reach `destination` (`host`, `host:port` or
     /// `*.domain`). A network change applies at once: the proxy enforces it,
-    /// so nothing restarts. The new version is what `policy.toml` resolves
-    /// to, so when it changes more than this entry (edits not applied yet, a
-    /// newer template or built-in defaults), it asks first.
+    /// so nothing restarts, and a change pending gets it too. The new
+    /// version is what `policy.toml` resolves to, so when it changes more
+    /// than this entry (edits not applied yet, a newer template or built-in
+    /// defaults), it asks first; with `--yes`, a part that needs a restart
+    /// restarts the sandbox (design §7).
     pub fn policy_allow(
         &self,
         by: &Actor,
@@ -86,10 +107,26 @@ impl Engine {
                     None => vec![format!(
                         "change nothing: sandbox {name} already allows {entry}"
                     )],
-                    Some(_) => {
-                        std::iter::once(format!("allow {entry} in sandbox {name}; applies at once"))
-                            .chain(plan.also.iter().map(|c| format!("also {c}")))
-                            .collect()
+                    Some((_, ref snapshot)) => {
+                        let mut changes: Vec<String> = std::iter::once(format!(
+                            "allow {entry} in sandbox {name}; applies at once"
+                        ))
+                        .chain(plan.also.iter().map(|c| format!("also {c}")))
+                        .collect();
+                        let latest = &plan.view.latest().policy;
+                        if !snapshot.policy.same_at_launch(&plan.view.snapshot.policy)
+                            && !self.sessions_under_rules(name)?.is_empty()
+                        {
+                            changes.push(match snapshot.policy.same_at_launch(latest) {
+                                true => format!(
+                                    "keep the rest of the change pending in sandbox {name} until `enclos policy apply {name}`"
+                                ),
+                                false => format!(
+                                    "save the rest as the pending policy of sandbox {name}, since sessions run under rules it changes; with --yes, restart the sandbox to apply it"
+                                ),
+                            });
+                        }
+                        changes
                     }
                 };
                 return Ok(Planned::DryRun(Plan {
@@ -102,49 +139,44 @@ impl Engine {
             }
             _ => {}
         }
-        let summary = |applied: &PolicyApplied| match (applied.changed, applied.also.len()) {
-            (false, _) => "already allowed; nothing changed".to_owned(),
-            (true, 0) => format!("policy v{}", applied.version.version),
-            (true, n) => format!(
-                "policy v{}, with {n} other changes: {}",
-                applied.version.version,
-                applied.also.join("; ")
-            ),
-        };
         let applied = self.write(
             by,
             "policy allow",
             Some(format!("{name} {entry}")),
-            summary,
+            |applied: &(PolicyApplied, bool)| allow_summary(&applied.0),
             |lock| {
                 // Again under the lock: the policy may have changed since.
                 let plan = self.plan_allow(name, &entry)?;
                 let Some((overrides, snapshot)) = plan.change else {
-                    return Ok(PolicyApplied {
-                        version: plan.active.version,
-                        changed: false,
-                        also: Vec::new(),
-                    });
+                    return Ok((
+                        PolicyApplied {
+                            version: plan.view.version,
+                            changed: false,
+                            also: Vec::new(),
+                            pending: plan.view.pending.map(|(p, _)| p),
+                            restarted: None,
+                        },
+                        false,
+                    ));
                 };
                 if confirm == Confirm::Ask && !plan.also.is_empty() {
                     return Err(needs_confirmation(&entry, &plan.also));
                 }
-                let version = self.store_policy(lock, by, name, &overrides, &snapshot)?;
-                Ok(PolicyApplied {
-                    version,
-                    changed: true,
-                    also: plan.also,
-                })
+                let proposed = self.propose(lock, by, name, &overrides, &snapshot, Some(&entry))?;
+                Ok(applied(proposed, plan.also))
             },
         )?;
-        Ok(Planned::Done(applied))
+        Ok(Planned::Done(
+            self.restart_if_asked(by, name, confirm, applied)?,
+        ))
     }
 
     fn plan_allow(&self, name: &SandboxName, entry: &str) -> Result<AllowPlan> {
-        let active = self.policy(name)?;
-        if active.snapshot.policy.net.allow.iter().any(|a| a == entry) {
+        let view = self.policy(name)?;
+        let allows = |s: &PolicySnapshot| s.policy.net.allow.iter().any(|a| a == entry);
+        if allows(&view.snapshot) && allows(view.latest()) {
             return Ok(AllowPlan {
-                active,
+                view,
                 change: None,
                 also: Vec::new(),
             });
@@ -154,12 +186,34 @@ impl Engine {
         let current = self.layout.read_policy(name.as_str())?;
         let overrides = with_allowed(&current, entry)?.unwrap_or(current);
         let snapshot = self.checked_policy(name, &overrides)?;
-        let also = differences(&active.snapshot.policy, &snapshot.policy, &[entry]);
+        let also = differences(&view.latest().policy, &snapshot.policy, &[entry]);
         Ok(AllowPlan {
-            active,
+            view,
             change: Some((overrides, snapshot)),
             also,
         })
+    }
+
+    /// With `--yes`, restarts the sandbox to apply a change that waits for
+    /// a restart, when the change itself brought what needs it: one already
+    /// pending before stays pending, for `policy apply`.
+    pub(super) fn restart_if_asked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+        (mut applied, fresh): (PolicyApplied, bool),
+    ) -> Result<PolicyApplied> {
+        if confirm != Confirm::Yes || !fresh {
+            return Ok(applied);
+        }
+        let Some(pending) = applied.pending.take() else {
+            return Ok(applied);
+        };
+        let restarted = self.restart_into(by, name, &pending)?;
+        applied.version = restarted.version.clone();
+        applied.restarted = Some(restarted);
+        Ok(applied)
     }
 
     /// Resolves and checks `overrides`, writes them to `policy.toml`, then
@@ -214,7 +268,7 @@ impl Engine {
     /// Writes the file first, so the active version never runs ahead of it:
     /// if recording the version fails, the file goes back to what it was, and
     /// if that fails too, the next change applies what the file lists.
-    fn store_policy(
+    pub(super) fn store_policy(
         &self,
         lock: &StateLock,
         by: &Actor,
@@ -272,6 +326,54 @@ pub(super) fn adapter_layer(kind: RuntimeKind) -> AdapterLayer {
     }
 }
 
+/// What a change did, with whether it brought rules a running session
+/// keeps from its start, which with `--yes` restart the sandbox.
+pub(super) fn applied(proposed: Proposed, also: Vec<String>) -> (PolicyApplied, bool) {
+    match proposed {
+        Proposed::Active { version, changed } => (
+            PolicyApplied {
+                version,
+                changed,
+                also,
+                pending: None,
+                restarted: None,
+            },
+            false,
+        ),
+        Proposed::Pending {
+            version,
+            pending,
+            changed,
+            fresh,
+        } => (
+            PolicyApplied {
+                version,
+                changed,
+                also,
+                pending: Some(pending),
+                restarted: None,
+            },
+            fresh,
+        ),
+    }
+}
+
+fn allow_summary(applied: &PolicyApplied) -> String {
+    let version = applied.version.version;
+    let others = match applied.also.len() {
+        0 => String::new(),
+        n => format!(", with {n} other changes: {}", applied.also.join("; ")),
+    };
+    match (&applied.pending, applied.changed) {
+        (None, false) => "already allowed; nothing changed".to_owned(),
+        (None, true) => format!("policy v{version}{others}"),
+        (Some(p), _) => format!(
+            "policy v{version} in force; pending snapshot {}{others}",
+            p.snapshot.short()
+        ),
+    }
+}
+
 fn needs_confirmation(entry: &str, also: &[String]) -> Error {
     Error::NeedsConfirmation {
         what: format!(
@@ -280,6 +382,11 @@ fn needs_confirmation(entry: &str, also: &[String]) -> Error {
             also.join("; ")
         ),
     }
+}
+
+/// What `new` grants differently from `old`, one sentence each.
+pub fn policy_differences(old: &Policy, new: &Policy) -> Vec<String> {
+    differences(old, new, &[])
 }
 
 /// What `new` grants differently from `old`, besides allowing `expected`.
@@ -345,7 +452,7 @@ pub(super) fn listen_change(listen: bool) -> String {
 
 /// `policy.toml` with `entry` added to `[network] allow_add`, keeping the
 /// user's comments and layout; `None` when the file already allows it.
-fn with_allowed(text: &str, entry: &str) -> Result<Option<String>> {
+pub(super) fn with_allowed(text: &str, entry: &str) -> Result<Option<String>> {
     let mut doc: DocumentMut =
         text.parse()
             .map_err(|e: toml_edit::TomlError| PolicyError::Parse {

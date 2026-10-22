@@ -115,7 +115,7 @@ pub enum Error {
     /// The active policy's write checks, run again on the paths as they are
     /// when it is compiled, no longer pass.
     #[error(
-        "the active policy of sandbox `{sandbox}` no longer passes enclos's write checks on the paths as they are now, so enclos will not compile it. If a link on the way changed, point it back; or edit {} and apply it with `enclos policy allow {sandbox} <destination>`, which applies the edit too. {source}",
+        "the active policy of sandbox `{sandbox}` no longer passes enclos's write checks on the paths as they are now, so enclos will not compile it. If a link on the way changed, point it back; or change {} with `enclos policy edit {sandbox}`. {source}",
         policy_file.display()
     )]
     ActivePolicyInvalid {
@@ -151,6 +151,39 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
+    #[error(
+        "sandbox `{sandbox}` has no pending policy: changes that need no restart are in force already. `enclos policy show {sandbox}` shows its policy"
+    )]
+    NoPendingPolicy { sandbox: String },
+    /// The pending policy changed between reading it and applying it.
+    #[error(
+        "the pending policy of sandbox `{sandbox}` changed while it was being applied. Look at it with `enclos policy show {sandbox} --pending`, then run `enclos policy apply {sandbox}` again"
+    )]
+    PendingChanged { sandbox: String },
+    /// `policy.toml` changed while the user edited a copy of it.
+    #[error(
+        "{} changed while you edited it, so your edit was not applied. Run `enclos policy edit` again: it starts from the file as it is now",
+        file.display()
+    )]
+    PolicyFileChanged { file: PathBuf },
+    /// The active snapshot's stored `policy.toml` is not the text its
+    /// inputs name, so enclos cannot write it back.
+    #[error(
+        "enclos does not have the policy.toml that policy v{version} of sandbox `{sandbox}` was resolved from, so it cannot put it back. Edit {} to what you want with `enclos policy edit {sandbox}`",
+        file.display()
+    )]
+    PolicyTextUnknown {
+        sandbox: String,
+        version: u32,
+        file: PathBuf,
+    },
+    /// A command that resolves `policy.toml` on its own, refused while a
+    /// change waits: it would put the pending change in force without the
+    /// restart it needs.
+    #[error(
+        "sandbox `{sandbox}` has a pending policy change, which needs a restart. Apply it first with `enclos policy apply {sandbox}`, or drop it with `enclos policy discard {sandbox}`"
+    )]
+    PolicyPending { sandbox: String },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -236,6 +269,11 @@ impl Error {
             | Error::Service(_)
             | Error::Processes(_)
             | Error::Markers(_)
+            | Error::NoPendingPolicy { .. }
+            | Error::PendingChanged { .. }
+            | Error::PolicyFileChanged { .. }
+            | Error::PolicyTextUnknown { .. }
+            | Error::PolicyPending { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

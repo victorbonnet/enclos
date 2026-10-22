@@ -43,7 +43,7 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
-    /// Show, widen or test a sandbox's policy.
+    /// Show, widen, edit, apply, discard or test a sandbox's policy.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
     Net(cli::net::NetArgs),

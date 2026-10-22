@@ -183,6 +183,56 @@ fn policy_versions_append_and_identical_snapshots_are_stored_once() {
 }
 
 #[test]
+fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
+    let v1 = resolve("extends = \"assistant\"\n");
+    let pending = resolve("[filesystem]\nwrite_add = [\"~/work\"]\n");
+    let live = resolve("[network]\nallow_add = [\"a.example.com\"]\n");
+    store.save_policy(&lock, &name, &v1, &by, None).unwrap();
+
+    // A network change applies at once beside the pending one.
+    let (version, saved) = store
+        .save_pending(&lock, &name, &pending, Some(&live), &by)
+        .unwrap();
+    assert_eq!(version.unwrap().version, 2);
+    let (shown, stored) = store.pending_policy(&name).unwrap().unwrap();
+    assert_eq!((&shown, &stored), (&saved, &pending));
+    assert_eq!(stored.overrides_text(), Some(pending.overrides.as_str()));
+    assert_eq!(store.active_policy(&name).unwrap().unwrap().1, live);
+
+    // Applied only while it is still the one asked for.
+    assert_eq!(
+        store.apply_pending(&lock, &name, &live.id, &by).unwrap(),
+        None
+    );
+    let applied = store
+        .apply_pending(&lock, &name, &pending.id, &by)
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.version, 3);
+    assert!(store.pending_policy(&name).unwrap().is_none());
+    assert_eq!(store.active_policy(&name).unwrap().unwrap().1, pending);
+
+    // Dropped, or replaced by a new active version.
+    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    assert!(store.discard_pending(&lock, &name).unwrap());
+    assert!(!store.discard_pending(&lock, &name).unwrap());
+    store.save_pending(&lock, &name, &v1, None, &by).unwrap();
+    store.save_policy(&lock, &name, &live, &by, None).unwrap();
+    assert!(store.pending_policy(&name).unwrap().is_none());
+}
+
+#[test]
 fn a_new_sandbox_and_its_first_policy_are_recorded_together_or_not_at_all() {
     use crate::model::audit::Actor;
     let (_dir, store) = store();

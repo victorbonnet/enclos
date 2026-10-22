@@ -203,6 +203,14 @@ fn print_show(v: &SandboxView) {
             p.snapshot.short()
         );
     }
+    if let Some(p) = &v.pending {
+        println!(
+            "  pending policy (snapshot {}), waiting for a restart: `enclos policy apply {}` applies it, `enclos policy show {} --pending` shows it",
+            p.snapshot.short(),
+            r.name,
+            r.name
+        );
+    }
     if let Some(why) = &v.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
@@ -316,7 +324,7 @@ fn restart(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) ->
     }
 }
 
-fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
+pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
     let gone = match report.gone.len() {
         0 => String::new(),
         n => format!(", {n} found gone and recorded"),
@@ -357,7 +365,11 @@ fn print_would_start(name: &SandboxName, labels: &[ServiceLabel]) {
 
 /// Reports the services installed, once the proxy runs: the services start
 /// on their own, and a proxy whose port is taken never does.
-fn print_started(engine: &Engine, name: &SandboxName, labels: &[ServiceLabel]) -> Result<u8> {
+pub(super) fn print_started(
+    engine: &Engine,
+    name: &SandboxName,
+    labels: &[ServiceLabel],
+) -> Result<u8> {
     let labels = labels
         .iter()
         .map(ToString::to_string)

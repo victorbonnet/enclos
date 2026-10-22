@@ -23,7 +23,7 @@ use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
-use crate::model::policy::{PolicySnapshot, PolicyVersion};
+use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
@@ -376,6 +376,42 @@ impl StateStore for SqliteStateStore {
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>> {
         let conn = self.open()?;
         policy::history(&conn, name).map_err(|e| self.read_err(e))
+    }
+
+    fn save_pending(
+        &self,
+        _lock: &StateLock,
+        name: &SandboxName,
+        pending: &PolicySnapshot,
+        active: Option<&PolicySnapshot>,
+        by: &Actor,
+    ) -> Result<(Option<PolicyVersion>, PendingPolicy)> {
+        let mut conn = self.open()?;
+        policy::save_pending(&mut conn, name, pending, active, by, now()).map_err(self.sqlite_err())
+    }
+
+    fn pending_policy(
+        &self,
+        name: &SandboxName,
+    ) -> Result<Option<(PendingPolicy, PolicySnapshot)>> {
+        let conn = self.open()?;
+        policy::pending(&conn, name).map_err(|e| self.read_err(e))
+    }
+
+    fn discard_pending(&self, _lock: &StateLock, name: &SandboxName) -> Result<bool> {
+        let conn = self.open()?;
+        policy::discard_pending(&conn, name).map_err(self.sqlite_err())
+    }
+
+    fn apply_pending(
+        &self,
+        _lock: &StateLock,
+        name: &SandboxName,
+        expected: &SnapshotId,
+        by: &Actor,
+    ) -> Result<Option<PolicyVersion>> {
+        let mut conn = self.open()?;
+        policy::apply_pending(&mut conn, name, expected, by, now()).map_err(self.sqlite_err())
     }
 
     fn put_session(&self, _lock: &StateLock, session: &SessionRecord) -> Result<SessionId> {

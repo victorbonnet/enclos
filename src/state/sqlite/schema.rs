@@ -74,6 +74,16 @@ pub const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL,
         PRIMARY KEY (sandbox, name)
     ) STRICT;",
+    // 6: the `policy.toml` each snapshot was resolved from, and each
+    // sandbox's pending policy (design §7)
+    "ALTER TABLE policy_snapshots ADD COLUMN overrides TEXT NOT NULL DEFAULT '';
+    CREATE TABLE pending_policies (
+        sandbox  TEXT PRIMARY KEY REFERENCES sandboxes (name) ON DELETE CASCADE,
+        snapshot TEXT NOT NULL REFERENCES policy_snapshots (id),
+        by_user  TEXT NOT NULL,
+        by_host  TEXT NOT NULL,
+        at       TEXT NOT NULL
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.

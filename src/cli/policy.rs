@@ -1,12 +1,17 @@
-//! `enclos policy`: show a sandbox's policy, allow a destination, or test it.
+//! `enclos policy`: show a sandbox's policy, allow a destination, edit
+//! `policy.toml`, apply or discard the pending change, or test the policy.
+
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use clap::{Args, Subcommand};
 
-use enclos::engine::{Engine, PolicyApplied, PolicyView, TestReport};
-use enclos::error::{Result, exit};
+use enclos::engine::{Discarded, Engine, PolicyApplied, PolicyView, Restarted, TestReport};
+use enclos::error::{Error, Result, exit};
+use enclos::layout::LayoutError;
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
-use enclos::model::policy::NetMode;
+use enclos::model::policy::{NetMode, Policy};
 use enclos::model::sandbox::SandboxName;
 use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
 
@@ -18,13 +23,25 @@ pub struct PolicyArgs {
 
 #[derive(Subcommand)]
 enum PolicyVerb {
-    /// Show the sandbox's active policy.
-    Show { sandbox: SandboxName },
+    /// Show the sandbox's active policy, and the change pending if there is one.
+    Show {
+        sandbox: SandboxName,
+        /// Show the pending policy in full instead.
+        #[arg(long)]
+        pending: bool,
+    },
     /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once.
     Allow {
         sandbox: SandboxName,
         destination: String,
     },
+    /// Edit the sandbox's policy.toml in $VISUAL or $EDITOR, then apply it:
+    /// at once, or pending while sessions run under rules it changes.
+    Edit { sandbox: SandboxName },
+    /// Restart the sandbox into its pending policy.
+    Apply { sandbox: SandboxName },
+    /// Drop the pending policy, and any edit of policy.toml not applied.
+    Discard { sandbox: SandboxName },
     /// Try each way out of the sandbox from inside it; every probe must fail.
     Test {
         sandbox: SandboxName,
@@ -51,22 +68,57 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 },
             );
         }
-        PolicyVerb::Show { sandbox } => print_policy(&engine.policy(&sandbox)?),
+        PolicyVerb::Show { sandbox, pending } => print_policy(&engine.policy(&sandbox)?, pending)?,
         PolicyVerb::Allow {
             sandbox,
             destination,
-        } => print_allowed(
-            &sandbox,
-            &destination,
-            engine.policy_allow(by, &sandbox, &destination, confirm)?,
-        ),
+        } => {
+            return print_allowed(
+                engine,
+                &sandbox,
+                &destination,
+                engine.policy_allow(by, &sandbox, &destination, confirm)?,
+            );
+        }
+        PolicyVerb::Edit { sandbox } => return edit(engine, by, &sandbox, confirm),
+        PolicyVerb::Apply { sandbox } => {
+            return match engine.policy_apply(by, &sandbox, confirm)? {
+                Planned::DryRun(plan) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    Ok(exit::OK)
+                }
+                Planned::Done(restarted) => print_restarted(engine, &sandbox, &restarted),
+            };
+        }
+        PolicyVerb::Discard { sandbox } => {
+            print_discarded(&sandbox, engine.policy_discard(by, &sandbox, confirm)?)
+        }
     }
     Ok(exit::OK)
 }
 
-fn print_policy(view: &PolicyView) {
+fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
     let (version, snap) = (&view.version, &view.snapshot);
-    let policy = &snap.policy;
+    if pending {
+        let Some((p, pending)) = &view.pending else {
+            return Err(Error::NoPendingPolicy {
+                sandbox: view.sandbox.to_string(),
+            });
+        };
+        println!(
+            "Sandbox {}: pending policy (snapshot {}), template {}, by {}@{} at {}; v{} is in force until `enclos policy apply {}`",
+            view.sandbox,
+            p.snapshot.short(),
+            pending.inputs.template,
+            p.by.user,
+            p.by.host,
+            p.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            version.version,
+            view.sandbox,
+        );
+        print_rules(&pending.policy);
+        return Ok(());
+    }
     println!(
         "Sandbox {}: policy v{} (snapshot {}), template {}, by {}@{} at {}",
         view.sandbox,
@@ -77,6 +129,34 @@ fn print_policy(view: &PolicyView) {
         version.by.host,
         version.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
     );
+    print_rules(&snap.policy);
+    match &view.pending {
+        Some((p, pending)) => {
+            println!(
+                "\nPending (snapshot {}, by {}@{} at {}): it waits for a restart, as sessions run under rules it changes:",
+                p.snapshot.short(),
+                p.by.user,
+                p.by.host,
+                p.at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            );
+            for change in enclos::engine::policy_differences(&snap.policy, &pending.policy) {
+                println!("  {change}");
+            }
+            println!(
+                "`enclos policy apply {0}` restarts the sandbox into it; `enclos policy discard {0}` drops it. `enclos policy show {0} --pending` shows it in full.",
+                view.sandbox
+            );
+        }
+        None => println!(
+            "\nChange it with `enclos policy edit {}` (it edits {}).",
+            view.sandbox,
+            view.file.display()
+        ),
+    }
+    Ok(())
+}
+
+fn print_rules(policy: &Policy) {
     println!("\nFiles (everything else is readable)");
     println!("  writable:   {}", policy.fs.write.join(", "));
     println!(
@@ -115,39 +195,207 @@ fn print_policy(view: &PolicyView) {
             "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
         );
     }
-    println!("\nEdit {} to change it.", view.file.display());
 }
 
-fn print_allowed(sandbox: &SandboxName, destination: &str, planned: Planned<PolicyApplied>) {
-    match planned {
+fn print_allowed(
+    engine: &Engine,
+    sandbox: &SandboxName,
+    destination: &str,
+    planned: Planned<PolicyApplied>,
+) -> Result<u8> {
+    let applied = match planned {
         Planned::DryRun(plan) => {
             for change in plan.changes {
                 println!("Would {change}.");
             }
+            return Ok(exit::OK);
         }
-        Planned::Done(PolicyApplied {
-            changed: false,
-            version,
-            ..
-        }) => {
-            println!(
-                "Sandbox {sandbox} already allows {destination} (policy v{}).",
-                version.version
-            );
+        Planned::Done(applied) => applied,
+    };
+    let version = applied.version.version;
+    match (applied.changed, &applied.pending) {
+        (false, None) => {
+            println!("Sandbox {sandbox} already allows {destination} (policy v{version}).")
         }
-        Planned::Done(PolicyApplied { version, also, .. }) => {
-            println!(
-                "Sandbox {sandbox} now allows {destination}: policy v{}, in force at once.",
-                version.version
-            );
-            if !also.is_empty() {
-                println!("Policy v{} also changes this:", version.version);
-                for change in also {
-                    println!("  {change}");
-                }
-            }
+        (false, Some(_)) => println!(
+            "Sandbox {sandbox} already allows {destination} (policy v{version}), and so does its pending change."
+        ),
+        (true, _) => println!(
+            "Sandbox {sandbox} now allows {destination}: policy v{version}, in force at once."
+        ),
+    }
+    if !applied.also.is_empty() {
+        println!("The change also does this:");
+        for change in &applied.also {
+            println!("  {change}");
         }
     }
+    print_outcome(engine, sandbox, &applied)
+}
+
+/// Says whether a change waits as the pending policy, or how the restart
+/// that applied it went.
+fn print_outcome(engine: &Engine, sandbox: &SandboxName, applied: &PolicyApplied) -> Result<u8> {
+    if let Some(p) = &applied.pending {
+        println!(
+            "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
+            p.snapshot.short()
+        );
+        println!(
+            "`enclos policy apply {sandbox}` restarts the sandbox into it; `enclos policy discard {sandbox}` drops it."
+        );
+    }
+    match &applied.restarted {
+        Some(restarted) => print_restarted(engine, sandbox, restarted),
+        None => Ok(exit::OK),
+    }
+}
+
+/// How a restart into the pending policy went: what stopped, the version
+/// now in force, and the services started again.
+fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Result<u8> {
+    if let Some(stopped) = &r.stopped {
+        let code = super::sandbox::print_stop(sandbox, stopped);
+        if code != exit::OK {
+            return Ok(code);
+        }
+    }
+    println!(
+        "Sandbox {sandbox} runs under policy v{} from now on.",
+        r.version.version
+    );
+    if r.stopped.as_ref().is_some_and(|s| !s.stopped.is_empty()) {
+        println!("Sessions it ended can connect again with `enclos connect {sandbox}`.");
+    }
+    match r.started.is_empty() {
+        true => Ok(exit::OK),
+        false => super::sandbox::print_started(engine, sandbox, &r.started),
+    }
+}
+
+fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
+    let discarded = match planned {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            return;
+        }
+        Planned::Done(d) => d,
+    };
+    let version = discarded.version.version;
+    match (&discarded.pending, &discarded.kept) {
+        (None, None) => println!(
+            "Sandbox {sandbox} has nothing pending: its policy.toml is policy v{version}'s."
+        ),
+        (Some(p), _) => println!(
+            "Dropped the pending policy of sandbox {sandbox} (snapshot {}); policy v{version} stays in force.",
+            p.snapshot.short()
+        ),
+        (None, Some(_)) => println!(
+            "Put back the policy.toml of policy v{version} in sandbox {sandbox}, dropping the edits not applied."
+        ),
+    }
+    if let Some(kept) = &discarded.kept {
+        println!("What policy.toml held is kept in {}.", kept.display());
+    }
+}
+
+/// `policy edit`: a draft of `policy.toml` beside it, opened in the user's
+/// editor, then applied. A draft an earlier edit left, because the policy
+/// it held was not accepted, is opened again instead.
+fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) -> Result<u8> {
+    let file = engine.policy(sandbox)?.file;
+    let io = |path: &Path| {
+        let path = path.to_owned();
+        move |source| Error::Layout(LayoutError::Io { path, source })
+    };
+    let before = std::fs::read_to_string(&file).map_err(io(&file))?;
+    let draft = file.with_file_name("policy.toml.edit");
+    let start = match std::fs::read_to_string(&draft) {
+        Ok(kept) => {
+            println!("Continuing the edit kept in {}.", draft.display());
+            kept
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => before.clone(),
+        Err(source) => return Err(io(&draft)(source)),
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&draft)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, start.as_bytes()))
+        .map_err(io(&draft))?;
+    run_editor(&draft)?;
+    let after = std::fs::read_to_string(&draft).map_err(io(&draft))?;
+    let kept = |error: Error| Error::WithContext {
+        what: format!(
+            "{error}\nYour edit is kept in {}; `enclos policy edit {sandbox}` opens it again, and `rm` it to start over.",
+            draft.display()
+        ),
+        error: Box::new(error),
+    };
+    if after == before {
+        let _ = std::fs::remove_file(&draft);
+        println!("No change to the policy of sandbox {sandbox}.");
+        return Ok(exit::OK);
+    }
+    let applied = match engine.policy_edit(by, sandbox, &before, &after, confirm) {
+        Ok(Planned::DryRun(plan)) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            println!(
+                "Your edit is kept in {}; `enclos policy edit {sandbox}` opens it again.",
+                draft.display()
+            );
+            return Ok(exit::OK);
+        }
+        Ok(Planned::Done(applied)) => applied,
+        Err(e) => return Err(kept(e)),
+    };
+    let _ = std::fs::remove_file(&draft);
+    match (&applied.pending, applied.changed) {
+        (None, false) => println!("No change to the policy of sandbox {sandbox}."),
+        (None, true) => println!(
+            "Sandbox {sandbox} has policy v{}, in force at once for the network and for sessions started from now on.",
+            applied.version.version
+        ),
+        (Some(_), _) => println!(
+            "Sandbox {sandbox} keeps policy v{} for now.",
+            applied.version.version
+        ),
+    }
+    for change in &applied.also {
+        println!("  {change}");
+    }
+    print_outcome(engine, sandbox, &applied)
+}
+
+/// Opens `path` in `$VISUAL`, else `$EDITOR`, else `vi`, through `sh` so
+/// that an editor given with its options (`code --wait`) works.
+fn run_editor(path: &Path) -> Result<()> {
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .find(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_owned());
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .map_err(|e| Error::Session {
+            what: format!("cannot run the editor `{editor}`: {e}"),
+        })?;
+    if !status.success() {
+        return Err(Error::Session {
+            what: format!(
+                "the editor `{editor}` did not exit cleanly ({status}), so nothing was applied. Your edit is kept in {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
