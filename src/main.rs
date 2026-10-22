@@ -4,6 +4,8 @@
 mod cli;
 
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use clap::{Args, Parser, Subcommand};
 
@@ -87,6 +89,14 @@ fn main() -> ExitCode {
             });
         }
     };
+    if ends_on_closed_output(&cli.command) {
+        // Without it, the print after the reader left panics. Should the
+        // handler not install, that is still what happens.
+        let _ = signal_hook::flag::register_conditional_default(
+            signal_hook::consts::SIGPIPE,
+            Arc::new(AtomicBool::new(true)),
+        );
+    }
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
@@ -123,6 +133,23 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Status(args) => cli::status::run(&engine, args),
     }
+}
+
+/// Whether a reader that left early, as `head` does, ends `command` as it
+/// ends any Unix tool, by SIGPIPE, not by a panic on the next print. Not for
+/// those that run the user's or a runtime's programs (`connect`, `runtime`,
+/// `agent`), keep running (`proxy`, `launch`), or handle a closed output
+/// themselves (`logs`).
+fn ends_on_closed_output(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Init
+            | Command::Audit(_)
+            | Command::Sandbox(_)
+            | Command::Policy(_)
+            | Command::Net(_)
+            | Command::Status(_)
+    )
 }
 
 /// The user and host recorded in audit entries.
