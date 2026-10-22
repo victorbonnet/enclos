@@ -129,12 +129,17 @@ impl Keychain {
                 }
             }
         };
-        match file.exists() {
-            true => Ok(()),
-            false => Err(self.fail(
+        match file.try_exists() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(self.fail(
                 "store",
                 secret,
                 format!("the keychain {} does not exist", file.display()),
+            )),
+            Err(e) => Err(self.fail(
+                "store",
+                secret,
+                format!("cannot look at the keychain {} ({e})", file.display()),
             )),
         }
     }
