@@ -161,7 +161,9 @@ fn split_host_port(authority: &str, default: Option<u16>) -> Option<(String, u16
 /// The head to send upstream for a plain-HTTP request: origin-form, without
 /// the proxy's own headers, and closed after one exchange. `Host` is made
 /// from the authorized `host` and `port`, never taken from the client: a
-/// different one could reach another site on the same address.
+/// different one could reach another site on the same address. A
+/// `Content-Length` is sent as the one number `body` the proxy read from
+/// the client's, so the server cannot read it another way.
 pub fn origin_head(
     method: &str,
     path: &str,
@@ -169,6 +171,7 @@ pub fn origin_head(
     headers: &[String],
     host: &str,
     port: u16,
+    body: u64,
 ) -> String {
     let mut head = format!("{method} {path} {version}\r\n");
     let host = if host.contains(':') {
@@ -180,6 +183,7 @@ pub fn origin_head(
         80 => head.push_str(&format!("Host: {host}\r\n")),
         port => head.push_str(&format!("Host: {host}:{port}\r\n")),
     }
+    let mut sent_length = false;
     for line in headers {
         let name = line
             .split(':')
@@ -191,6 +195,13 @@ pub fn origin_head(
             name.as_str(),
             "host" | "proxy-connection" | "proxy-authorization" | "connection" | "keep-alive"
         ) {
+            continue;
+        }
+        if name == "content-length" {
+            if !sent_length {
+                head.push_str(&format!("Content-Length: {body}\r\n"));
+                sent_length = true;
+            }
             continue;
         }
         head.push_str(line);
@@ -321,10 +332,32 @@ mod tests {
             ],
             "example.com",
             80,
+            0,
         );
         assert_eq!(
             head,
             "GET /x HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn the_forwarded_length_is_the_one_the_proxy_read() {
+        let head = origin_head(
+            "POST",
+            "/",
+            "HTTP/1.1",
+            &[
+                "Content-Length:\t005 ".into(),
+                "Accept: */*".into(),
+                "content-length: 5, 5".into(),
+            ],
+            "example.com",
+            80,
+            5,
+        );
+        assert_eq!(
+            head,
+            "POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
     }
 
@@ -337,12 +370,13 @@ mod tests {
             &["Host: blocked.example.net".into(), "host:x".into()],
             "allowed.example.com",
             8080,
+            0,
         );
         assert_eq!(
             head,
             "GET /private HTTP/1.1\r\nHost: allowed.example.com:8080\r\nConnection: close\r\n\r\n"
         );
-        let v6 = origin_head("GET", "/", "HTTP/1.1", &[], "fd00::1", 80);
+        let v6 = origin_head("GET", "/", "HTTP/1.1", &[], "fd00::1", 80, 0);
         assert!(v6.contains("Host: [fd00::1]\r\n"), "{v6}");
     }
 }

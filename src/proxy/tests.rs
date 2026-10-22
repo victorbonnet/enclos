@@ -436,7 +436,7 @@ fn a_second_request_sent_with_the_head_is_dropped() {
         ),
     ];
     for (first, ends) in cases {
-        let (all, reply) = plain_http_exchange(&[&format!("{first}{SECOND}")], true);
+        let (all, reply) = plain_http_exchange(&[&format!("{first}{SECOND}")], false);
         assert!(all.ends_with(ends), "{first}: {all}");
         assert!(!all.contains("other.example.net"), "{first}: {all}");
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "{first}: {reply}");

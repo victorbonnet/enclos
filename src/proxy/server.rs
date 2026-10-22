@@ -466,9 +466,21 @@ fn forward(
                     "enclos: {dest} sent no answer within the proxy's idle limit, so the proxy closed the connection (idle).\n"
                 ),
             ));
-            origin_head(&method, &path, &version, &headers, &event.host, event.port).into_bytes()
+            let body = body.unwrap_or(0);
+            origin_head(
+                &method,
+                &path,
+                &version,
+                &headers,
+                &event.host,
+                event.port,
+                body,
+            )
+            .into_bytes()
         }
     };
+    // Sent with the head, past the body: the client is done already.
+    let done = room.is_some_and(|room| early.len() as u64 > room);
     let early = match &mut room {
         Some(room) => {
             let body = early
@@ -485,6 +497,9 @@ fn forward(
         return;
     }
     event.bytes_up += first.len() as u64;
+    if done {
+        let _ = upstream.shutdown(Shutdown::Write);
+    }
     let relayed = relay(client, upstream, limit, unanswered.as_deref(), room);
     event.bytes_up += relayed.up;
     event.bytes_down += relayed.down;
