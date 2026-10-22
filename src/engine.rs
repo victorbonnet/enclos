@@ -32,7 +32,7 @@ pub use session::{Left, SessionEnd};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
     RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted,
-    human_bytes,
+    human_bytes, printable_line,
 };
 
 use std::path::PathBuf;

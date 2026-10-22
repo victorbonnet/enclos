@@ -62,8 +62,19 @@ enum End {
 /// Everything else is shown as it is, blank-looking characters such as
 /// U+3000 and U+2800 too.
 pub(super) fn printable(text: &str) -> String {
+    escaped(text, MAX_FACT_TEXT)
+}
+
+/// One line the sandbox wrote to a service's log, escaped as `printable`
+/// escapes, but not cut: `enclos logs` shows it whole.
+pub fn printable_line(line: &str) -> String {
+    escaped(line, usize::MAX)
+}
+
+/// `text` escaped, then cut to at most `max` characters.
+fn escaped(text: &str, max: usize) -> String {
     let mut out = String::new();
-    let mut shown = 0;
+    let mut shown: usize = 0;
     let mut end = End::Nothing;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -76,7 +87,7 @@ pub(super) fn printable(text: &str) -> String {
         let n = piece.chars().count();
         // A joiner is shown only with the emoji after it, one character.
         let needs = if matches!(now, End::Joiner) { n + 1 } else { n };
-        if shown + needs > MAX_FACT_TEXT {
+        if shown.saturating_add(needs) > max {
             break;
         }
         out.push_str(&piece);
@@ -169,6 +180,18 @@ mod tests {
         let escaped = printable(&"\u{1b}".repeat(100));
         assert!(escaped.chars().count() <= MAX_FACT_TEXT);
         assert!(escaped.ends_with("\\u{1b}"), "{escaped}");
+    }
+
+    #[test]
+    fn a_log_line_is_escaped_but_not_cut() {
+        let line = format!("{}\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J", "x".repeat(500));
+        let shown = printable_line(&line);
+        assert!(shown.starts_with(&"x".repeat(500)), "{shown}");
+        assert!(
+            shown.ends_with("\\u{1b}]52;c;cHduZWQ=\\u{7}\\u{1b}[2J"),
+            "{shown}"
+        );
+        assert!(!shown.chars().any(char::is_control), "{shown}");
     }
 
     #[test]

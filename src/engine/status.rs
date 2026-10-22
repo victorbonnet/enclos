@@ -42,6 +42,7 @@ use crate::runtime::{
 use crate::service::ServiceStatus;
 use crate::state::StateStore;
 use printable::printable;
+pub use printable::printable_line;
 
 /// Past this, a sandbox nobody used is worth a suggestion.
 pub const IDLE_DAYS: i64 = 30;
