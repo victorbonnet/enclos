@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A service restarts when its runtime's settings change
