@@ -99,7 +99,15 @@ impl Engine {
                     true => 0,
                     false => self.sessions_under_rules(&secret.sandbox)?.len(),
                 };
-                self.secrets.set(secret, value)?;
+                if let Err(error) = self.secrets.set(secret, value) {
+                    // A store can fail after it wrote, as when reading the
+                    // value back does not answer: a new value it may have
+                    // left goes again, as no record would lead to it.
+                    return Err(match known {
+                        true => error.into(),
+                        false => self.unrecorded_value(secret, false, error.into()),
+                    });
+                }
                 if let Err(error) = self.state.put_secret(lock, secret) {
                     return Err(self.unrecorded_value(secret, known, error.into()));
                 }
@@ -114,7 +122,7 @@ impl Engine {
         Ok(Planned::Done(set))
     }
 
-    /// The error of a `secret set` whose value was stored but could not be
+    /// The error of a `secret set` whose value may be stored but is not
     /// recorded: a new value is removed again, since no enclos command
     /// would reach it without its record; a replaced one stays, recorded.
     fn unrecorded_value(&self, secret: &SecretRef, known: bool, error: Error) -> Error {

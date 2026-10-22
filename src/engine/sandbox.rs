@@ -546,18 +546,22 @@ impl Engine {
                         path: dir.clone(),
                         source,
                     });
-                    return Err(match left.as_slice() {
-                        [] => error,
-                        left => Error::FailedAfter {
-                            error: Box::new(error),
-                            done: format!(
-                                "removing the record of sandbox {name}, though not these secrets: {}",
-                                left.iter()
-                                    .map(|l| l.why.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("; ")
-                            ),
-                        },
+                    let removed = secrets.len() - left.len();
+                    let not = match left.as_slice() {
+                        [] => String::new(),
+                        left => format!(
+                            ", though not these: {}",
+                            left.iter()
+                                .map(|l| l.why.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    };
+                    return Err(Error::FailedAfter {
+                        error: Box::new(error),
+                        done: format!(
+                            "removing the record of sandbox {name} and {removed} of its secret(s){not}"
+                        ),
                     });
                 }
                 Ok((gone, left))

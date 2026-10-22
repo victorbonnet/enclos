@@ -383,3 +383,49 @@ fn a_dry_run_of_set_stores_nothing() {
     assert!(matches!(planned, Planned::DryRun(_)), "{planned:?}");
     assert_eq!(store.get(&telegram).unwrap(), None);
 }
+
+/// A store whose `set` writes, then fails, as a Keychain whose read back
+/// does not answer.
+struct WritesThenFails(Rc<InMemory>);
+
+impl SecretStore for WritesThenFails {
+    fn set(
+        &self,
+        secret: &SecretRef,
+        value: &SecretValue,
+    ) -> std::result::Result<(), crate::secrets::SecretError> {
+        self.0.set(secret, value)?;
+        Err(crate::secrets::SecretError {
+            what: "the read back did not answer".into(),
+        })
+    }
+    fn get(
+        &self,
+        secret: &SecretRef,
+    ) -> std::result::Result<Option<SecretValue>, crate::secrets::SecretError> {
+        self.0.get(secret)
+    }
+    fn remove(&self, secret: &SecretRef) -> std::result::Result<bool, crate::secrets::SecretError> {
+        self.0.remove(secret)
+    }
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        self.0.whereabouts(secret)
+    }
+}
+
+#[test]
+fn a_new_value_a_failed_store_left_goes_again() {
+    let (_dir, engine, store, name) = with_store();
+    let engine = engine.with_secrets(Box::new(WritesThenFails(Rc::clone(&store))));
+    let err = engine
+        .secret_set(
+            &alice(),
+            &secret("home/telegram"),
+            Some(&value(VALUE)),
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("did not answer"), "{err}");
+    assert!(store.0.borrow().is_empty(), "a value stays");
+    assert!(engine.secret_list(&name).unwrap().is_empty());
+}

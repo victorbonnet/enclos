@@ -150,8 +150,14 @@ impl KeychainProbe {
         if let Err(e) = store.set(&secret, &value) {
             // A store that went through but did not read back leaves an
             // item: it goes too.
-            let _ = store.remove(&secret);
-            return Err(format!("enclos could not store a test item: {e}"));
+            let left = match store.remove(&secret) {
+                Ok(_) => String::new(),
+                Err(gone) => format!(
+                    "; removing what it may have left failed too ({gone}): it is {}",
+                    store.whereabouts(&secret)
+                ),
+            };
+            return Err(format!("enclos could not store a test item: {e}{left}"));
         }
         Ok(KeychainProbe {
             item: KeychainItem {

@@ -2256,3 +2256,67 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
         "Removed the record of agent home/gone, which Hermes no longer had.\n"
     );
 }
+
+/// `secret set` at a terminal: a line longer than the terminal's own limit
+/// comes whole, a pasted second line is refused, Ctrl-C cancels at once,
+/// and echo is back on after each.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use rustix::termios::{LocalModes, tcgetattr};
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let at_terminal = |name: &str, keys: &[u8]| {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let path = ptsname(&master, Vec::new()).unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.to_str().unwrap())
+            .unwrap();
+        let mut cmd = home.command(&["secret", "set", &format!("home/{name}")]);
+        cmd.env("ENCLOS_KEYCHAIN", &keychain.0)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        rustix::io::write(&master, keys).unwrap();
+        let out = Run(child.wait_with_output().unwrap());
+        let echo = tcgetattr(&slave)
+            .unwrap()
+            .local_modes
+            .contains(LocalModes::ECHO);
+        (out, echo)
+    };
+    let (out, echo) = at_terminal("long", &[b"k".repeat(1500), b"\r".to_vec()].concat());
+    assert!(
+        out.ok().stdout().contains("Stored secret home/long"),
+        "{}",
+        out.stdout()
+    );
+    assert!(echo);
+    let (out, echo) = at_terminal("pasted", b"first-line\rsecond-part");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    let (out, echo) = at_terminal("cancel", b"abc\x03");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("cancelled"), "{}", out.stderr());
+    assert!(echo);
+    let listed = home.run(&["secret", "list", "home"]);
+    let listed = listed.ok().stdout();
+    assert!(
+        listed.contains("long") && !listed.contains("pasted"),
+        "{listed}"
+    );
+}

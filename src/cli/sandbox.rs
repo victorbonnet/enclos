@@ -137,11 +137,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(left) => {
                     println!("Removed sandbox {name}.");
-                    for left in left {
+                    for left in &left {
                         eprintln!(
-                            "warning: secret {} stays, and no enclos command reaches it any more: {}",
+                            "error: secret {} stays, and no enclos command reaches it any more: {}",
                             left.secret, left.why
                         );
+                    }
+                    // Removed, but not all of it: a script must see that.
+                    if !left.is_empty() {
+                        return Ok(exit::ERROR);
                     }
                 }
             }

@@ -2,7 +2,7 @@
 //! ADR 0022). A value is read from the input, never from the command line,
 //! which other processes can list.
 
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Write};
 
 use clap::{Args, Subcommand};
 
@@ -59,7 +59,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
 }
 
 /// The most read from a pipe: far more than the Keychain takes.
-const MAX_INPUT: u64 = 1 << 20;
+const MAX_INPUT: usize = 1 << 20;
+
+/// The most typed at a terminal: a longer value is piped in.
+const MAX_TYPED: usize = 4096;
 
 /// The value from the input. At a terminal it asks for one line, with echo
 /// off, so the value never shows on screen; piped in, it is all the input,
@@ -69,52 +72,107 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
     let io = |e: std::io::Error| Error::Session {
         what: format!("cannot read the value of secret {secret}: {e}"),
     };
-    let text = if stdin.is_terminal() {
+    let refused = |why: &str| Error::Session {
+        what: format!("secret {secret} was not set: {why}"),
+    };
+    let bytes = if stdin.is_terminal() {
         eprint!("Value of secret {secret} (not shown): ");
         let _ = std::io::stderr().flush();
         let quiet = Quiet::new(&stdin).map_err(io)?;
-        let mut line = String::new();
-        let read = stdin.lock().read_line(&mut line);
-        // What was pasted past the first line is dropped before echo comes
-        // back, so the shell never reads it as commands.
-        let more = rustix::io::ioctl_fionread(&stdin).unwrap_or(0) > 0;
-        let _ = rustix::termios::tcflush(&stdin, rustix::termios::QueueSelector::IFlush);
+        let typed = typed(&mut std::iter::from_fn(|| {
+            let mut key = [0u8; 1];
+            match rustix::io::read(&stdin, &mut key) {
+                Ok(0) => None,
+                Ok(_) => Some(Ok(key[0])),
+                Err(e) => Some(Err(std::io::Error::from(e))),
+            }
+        }));
+        // What came past the line, such as more pasted lines, is dropped
+        // before echo comes back, so the shell never reads it as commands.
+        // Either call failing counts as more having come.
+        let more = rustix::io::ioctl_fionread(&stdin).map_or(true, |n| n > 0);
+        let flushed =
+            rustix::termios::tcflush(&stdin, rustix::termios::QueueSelector::IFlush).is_ok();
         quiet.restore();
         eprintln!();
-        read.map_err(io)?;
-        if line.contains(['\u{3}', '\u{1a}']) {
-            return Err(Error::Session {
-                what: format!("cancelled: secret {secret} was not set"),
-            });
+        match typed.map_err(io)? {
+            Typed::Cancelled => {
+                return Err(Error::Session {
+                    what: format!("cancelled: secret {secret} was not set"),
+                });
+            }
+            Typed::TooLong => {
+                return Err(refused(&format!(
+                    "a value typed at a terminal is at most {MAX_TYPED} bytes; pipe a longer one in"
+                )));
+            }
+            Typed::Line(_) if more || !flushed => {
+                return Err(refused(
+                    "more came after the line, and was dropped: at a terminal a value is one line; pipe in one of several lines",
+                ));
+            }
+            Typed::Line(line) => line,
         }
-        if more {
-            return Err(Error::Session {
-                what: format!(
-                    "the value of secret {secret} came with more lines, which were dropped: at a terminal a value is one line; pipe in one of several lines"
-                ),
-            });
-        }
-        line
     } else {
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         stdin
             .lock()
-            .take(MAX_INPUT)
-            .read_to_string(&mut text)
+            .take(MAX_INPUT as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(io)?;
-        text
+        if bytes.len() > MAX_INPUT {
+            return Err(refused("the input is more than 1 MiB"));
+        }
+        bytes
     };
+    let text = String::from_utf8(bytes).map_err(|_| refused("the value is not UTF-8 text"))?;
     let value = text
         .strip_suffix('\n')
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
         .unwrap_or(&text);
-    SecretValue::new(value.to_owned()).map_err(|e| Error::Session {
-        what: format!("secret {secret} was not set: {e}"),
-    })
+    SecretValue::new(value.to_owned()).map_err(|e| refused(&e.to_string()))
 }
 
-/// The terminal with echo and its signal keys off while it lives: Ctrl-C
-/// then ends the line rather than enclos, which would leave echo off.
+/// What was typed at the prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum Typed {
+    Line(Vec<u8>),
+    /// Ctrl-C, Ctrl-Z or Ctrl-\.
+    Cancelled,
+    /// More than [`MAX_TYPED`] bytes.
+    TooLong,
+}
+
+/// A line from `keys`, as a terminal in line mode would make it, but with
+/// no limit of its own: Return or Ctrl-D ends it, Backspace erases a
+/// character and Ctrl-U the line, and the keys that would signal cancel it
+/// at once.
+fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<Typed> {
+    let mut line = Vec::new();
+    for key in keys {
+        match key? {
+            b'\r' | b'\n' | 0x04 => return Ok(Typed::Line(line)),
+            0x03 | 0x1a | 0x1c => return Ok(Typed::Cancelled),
+            // A character's last byte, and any continuation bytes before it.
+            0x7f | 0x08 => {
+                while let Some(byte) = line.pop() {
+                    if byte & 0xc0 != 0x80 {
+                        break;
+                    }
+                }
+            }
+            0x15 => line.clear(),
+            _ if line.len() == MAX_TYPED => return Ok(Typed::TooLong),
+            byte => line.push(byte),
+        }
+    }
+    Ok(Typed::Line(line))
+}
+
+/// The terminal with echo, line mode and its signal keys off while it
+/// lives: [`typed`] makes the line, so the terminal's own line limit does
+/// not apply, and Ctrl-C ends the read at once rather than enclos, which
+/// would leave echo off.
 struct Quiet<'a> {
     stdin: &'a std::io::Stdin,
     before: Option<rustix::termios::Termios>,
@@ -122,12 +180,17 @@ struct Quiet<'a> {
 
 impl<'a> Quiet<'a> {
     fn new(stdin: &'a std::io::Stdin) -> std::io::Result<Self> {
-        use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+        use rustix::termios::{
+            LocalModes, OptionalActions, SpecialCodeIndex, tcgetattr, tcsetattr,
+        };
         let before = tcgetattr(stdin)?;
         let mut quiet = before.clone();
         quiet
             .local_modes
-            .remove(LocalModes::ECHO | LocalModes::ISIG);
+            .remove(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG);
+        // Each key as it comes.
+        quiet.special_codes[SpecialCodeIndex::VMIN] = 1;
+        quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
         tcsetattr(stdin, OptionalActions::Now, &quiet)?;
         Ok(Quiet {
             stdin,
@@ -223,5 +286,46 @@ fn print_list(sandbox: &SandboxName, secrets: &[SecretView]) {
             shown(&s.granted_as),
             s.record.updated_at.strftime("%Y-%m-%d %H:%M UTC"),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(bytes: &[u8]) -> std::io::Result<Typed> {
+        typed(&mut bytes.iter().map(|b| Ok(*b)))
+    }
+
+    #[test]
+    fn a_typed_line_ends_at_return_and_is_edited_as_in_line_mode() {
+        assert_eq!(keys(b"tok\r").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"tok\n").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"tok\x04").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"tok").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"tox\x7fk\r").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"bad\x15tok\r").unwrap(), Typed::Line(b"tok".to_vec()));
+        // Backspace erases a whole character, not one of its bytes.
+        assert_eq!(
+            keys("té\x7f\r".as_bytes()).unwrap(),
+            Typed::Line(b"t".to_vec())
+        );
+        assert_eq!(keys(b"\x7f\x7fok\r").unwrap(), Typed::Line(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn the_keys_that_would_signal_cancel_at_once() {
+        for key in [0x03, 0x1a, 0x1c] {
+            assert_eq!(keys(&[b't', key, b'x']).unwrap(), Typed::Cancelled);
+        }
+    }
+
+    #[test]
+    fn a_line_past_the_terminal_limit_is_read_whole_up_to_its_own() {
+        let mut long = vec![b'k'; 1500];
+        long.push(b'\r');
+        assert_eq!(keys(&long).unwrap(), Typed::Line(vec![b'k'; 1500]));
+        let too_long = vec![b'k'; MAX_TYPED + 1];
+        assert_eq!(keys(&too_long).unwrap(), Typed::TooLong);
     }
 }

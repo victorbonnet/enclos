@@ -23,7 +23,7 @@
 //! is written, since writing would ask where to create one, and every call
 //! is ended after [`ANSWER_WAIT`].
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -62,7 +62,16 @@ impl Keychain {
         let file = std::env::var_os(KEYCHAIN_VAR)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .map(|f| std::path::absolute(&f).unwrap_or(f));
+            .map(|f| match std::path::absolute(&f) {
+                Ok(absolute) => absolute,
+                Err(e) => {
+                    eprintln!(
+                        "warning: cannot tell where {KEYCHAIN_VAR}={} is from here ({e}); services enclos installs may not find it",
+                        f.display()
+                    );
+                    f
+                }
+            });
         Keychain::new(service, file)
     }
 
@@ -78,6 +87,22 @@ impl Keychain {
     fn fail(&self, what: &str, secret: &SecretRef, why: impl std::fmt::Display) -> SecretError {
         SecretError {
             what: format!("cannot {what} secret {secret} in the Keychain: {why}"),
+        }
+    }
+
+    /// Refuses a keychain file that is not there, which `security` would
+    /// answer as it answers an item that is not there.
+    fn require_file(&self, what: &str, secret: &SecretRef) -> Result<(), SecretError> {
+        match &self.file {
+            Some(file) if !file.exists() => Err(self.fail(
+                what,
+                secret,
+                format!(
+                    "the keychain {} ({KEYCHAIN_VAR}) does not exist",
+                    file.display()
+                ),
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -143,7 +168,7 @@ impl Keychain {
         );
         let length = head.len() + 2 * value.len() + file.len() + 1;
         if length > MAX_LINE {
-            let most = (MAX_LINE - head.len() - file.len() - 1) / 2;
+            let most = MAX_LINE.saturating_sub(head.len() + file.len() + 1) / 2;
             return Err(self.fail(
                 "store",
                 secret,
@@ -164,8 +189,11 @@ impl SecretStore for Keychain {
         let out = run(Command::new(SECURITY).arg("-i"), Some(line.as_bytes()))
             .map_err(|e| self.fail("store", secret, e))?;
         // What `security -i` prints may repeat its input, the value with
-        // it: only its words are kept, never a run of hex.
-        let why = scrub(&stderr(&out.stderr, out.status));
+        // it: only its words are kept, never a run of the value's hex.
+        let why = scrub(
+            &stderr(&out.stderr, out.status),
+            &hex(value.expose().as_bytes()),
+        );
         if !out.status.success() {
             return Err(self.fail("store", secret, why));
         }
@@ -185,6 +213,7 @@ impl SecretStore for Keychain {
     }
 
     fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
+        self.require_file("read", secret)?;
         let out = run(
             Command::new(SECURITY)
                 .args(["find-generic-password", "-s", &self.service, "-a"])
@@ -211,6 +240,7 @@ impl SecretStore for Keychain {
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
+        self.require_file("remove", secret)?;
         let out = run(
             Command::new(SECURITY)
                 .args(["delete-generic-password", "-s", &self.service, "-a"])
@@ -285,9 +315,9 @@ fn run_for(command: &mut Command, input: Option<&[u8]>, wait: Duration) -> Resul
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+                pipe.read_to_end(&mut bytes)?;
             }
-            bytes
+            Ok::<_, io::Error>(bytes)
         })
     };
     let stdout = drain(
@@ -308,12 +338,22 @@ fn run_for(command: &mut Command, input: Option<&[u8]>, wait: Duration) -> Resul
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
+    let joined = |drain: std::thread::JoinHandle<io::Result<Vec<u8>>>| match drain.join() {
+        Ok(read) => read.map_err(|e| format!("cannot read what {SECURITY} answered: {e}")),
+        Err(_) => Err(format!("lost what {SECURITY} answered")),
+    };
+    let (stdout, stderr) = (joined(stdout), joined(stderr));
+    // Why it failed, as `security` said it, when it said anything.
+    let status = status.map_err(|e| match &stderr {
+        Ok(said) if !said.is_empty() => {
+            format!("{e} ({})", scrub(String::from_utf8_lossy(said).trim(), ""))
+        }
+        _ => e,
+    })?;
     Ok(Output {
-        status: status?,
-        stdout,
-        stderr,
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
     })
 }
 
@@ -350,9 +390,10 @@ fn stderr(bytes: &[u8], status: ExitStatus) -> String {
     }
 }
 
-/// `text` with every run of 16 or more hex digits left out: what a value,
-/// hex-encoded, would look like in it.
-fn scrub(text: &str) -> String {
+/// `text` with every run of hex digits that could be part of a value left
+/// out: one of 16 or more digits, and one of 4 or more found in `value`,
+/// the hex-encoded value.
+fn scrub(text: &str, value: &str) -> String {
     let mut out = String::new();
     let mut run = String::new();
     for c in text.chars().chain(std::iter::once(' ')) {
@@ -360,7 +401,8 @@ fn scrub(text: &str) -> String {
             run.push(c);
             continue;
         }
-        match run.len() >= 16 {
+        let of_value = run.len() >= 4 && value.contains(&run.to_ascii_lowercase());
+        match run.len() >= 16 || of_value {
             true => out.push('…'),
             false => out.push_str(&run),
         }
@@ -409,10 +451,15 @@ mod tests {
             hex(b"a long secret value")
         );
         assert_eq!(
-            scrub(&printed),
+            scrub(&printed, ""),
             "security: unknown command \"…\"\nenclos.1a2b3c4d: returned 1"
         );
-        assert_eq!(scrub(""), "");
+        assert_eq!(scrub("", ""), "");
+        // A short value, cut anywhere, is left out too.
+        assert_eq!(
+            scrub("unknown command \"6b2d31\"", &hex(b"tok-1")),
+            "unknown command \"…\""
+        );
     }
 
     #[test]
@@ -575,6 +622,19 @@ mod tests {
         );
         let err = gone.set(&secret, &v("x")).unwrap_err();
         assert!(err.what.contains("does not exist"), "{err}");
+        // Nor is it taken for one with no item.
+        assert!(
+            gone.get(&secret)
+                .unwrap_err()
+                .what
+                .contains("does not exist")
+        );
+        assert!(
+            gone.remove(&secret)
+                .unwrap_err()
+                .what
+                .contains("does not exist")
+        );
         // A file that is no keychain takes nothing: the read back shows it.
         let plain = keychain.file.with_file_name("plain.txt");
         std::fs::write(&plain, "not a keychain").unwrap();
