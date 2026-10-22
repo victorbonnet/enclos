@@ -1,10 +1,10 @@
 //! Messaging channels (design §12): where a runtime's agents answer people,
-//! such as a Telegram bot, served by the runtime's gateway.
+//! such as a Telegram bot, served by the runtime's own service.
 
 use std::fmt;
 use std::str::FromStr;
 
-/// The channels enclos can set up. Milestone 2 has Telegram.
+/// The channels enclos can set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     Telegram,
@@ -33,7 +33,8 @@ impl Channel {
         }
     }
 
-    /// The host its bot reaches, which the policy must allow.
+    /// The host its bot reaches, which the policy must allow for the bot
+    /// to work.
     pub fn host(self) -> &'static str {
         match self {
             Channel::Telegram => "api.telegram.org",

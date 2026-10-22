@@ -55,6 +55,19 @@ impl HomeFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommand(Vec<OsString>);
 
+/// `word` as a shell reads it back: quoted when it holds anything a shell
+/// would read otherwise, such as `${VAR}`, which it would expand.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
+    match plain {
+        true => word.to_owned(),
+        false => format!("'{}'", word.replace('\'', "'\\''")),
+    }
+}
+
 impl SandboxCommand {
     pub fn new(words: Vec<OsString>) -> SandboxCommand {
         SandboxCommand(words)
@@ -72,7 +85,7 @@ impl SandboxCommand {
     pub fn shown(&self) -> String {
         self.0
             .iter()
-            .map(|w| w.to_string_lossy())
+            .map(|w| shell_word(&w.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -228,8 +241,11 @@ pub trait RuntimeAdapter {
     /// The runtime's own commands that set up the sandbox's bot on
     /// `channel`, run in the sandbox by `enclos runtime configure`: its
     /// token read from the variable `token`, which the sandbox's policy
-    /// grants as a secret, so no value is written in the home (ADR 0022),
-    /// and the people it answers. `None`: the runtime has no such channel.
+    /// grants as a secret, so that enclos hands the runtime the variable's
+    /// name, never its value (ADR 0022), and the people it answers. The
+    /// people it answers come first and the channel is turned on last, so
+    /// a command that fails leaves no bot answering more than it was.
+    /// `None`: the runtime has no such channel.
     fn channel(
         &self,
         _channel: Channel,

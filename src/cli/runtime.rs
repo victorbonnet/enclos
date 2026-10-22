@@ -7,6 +7,9 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
+use std::str::FromStr;
+
+use enclos::model::agent::AgentName;
 use enclos::model::channel::{Channel, ChannelUser};
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::runtime::RuntimeKind;
@@ -31,7 +34,7 @@ enum RuntimeVerb {
     Configure {
         /// The sandbox, such as `home`. A bot of one agent's own
         /// (`home/main`) is not possible with Hermes's gateway yet.
-        target: String,
+        target: ChannelTarget,
         #[arg(long)]
         channel: Channel,
         /// The variable the policy grants the bot's token as; the
@@ -54,15 +57,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             token_env,
             allow_user,
         } => {
-            return configure(
-                engine,
-                by,
-                confirm,
-                &target,
-                channel,
-                token_env,
-                &allow_user,
-            );
+            return configure(engine, by, confirm, target, channel, token_env, &allow_user);
         }
     };
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
@@ -100,27 +95,53 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     Ok(exit::OK)
 }
 
+/// What `runtime configure` sets up: a sandbox's bot, or one an agent of
+/// it would have of its own, which is refused (ADR 0032, proposed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChannelTarget {
+    sandbox: SandboxName,
+    agent: Option<AgentName>,
+}
+
+impl FromStr for ChannelTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (sandbox, agent) = match s.split_once('/') {
+            Some((sandbox, agent)) => (sandbox, Some(agent)),
+            None => (s, None),
+        };
+        let sandbox = sandbox
+            .parse()
+            .map_err(|e| format!("{e}; name the sandbox, such as `home`"))?;
+        let agent = agent
+            .map(|a| a.parse().map_err(|e| format!("{e}")))
+            .transpose()?;
+        Ok(ChannelTarget { sandbox, agent })
+    }
+}
+
 fn configure(
     engine: &Engine,
     by: &Actor,
     confirm: Confirm,
-    target: &str,
+    target: ChannelTarget,
     channel: Channel,
     token: Option<String>,
     answers: &[ChannelUser],
 ) -> Result<u8> {
-    let (sandbox, agent) = match target.split_once('/') {
-        Some((sandbox, agent)) => (sandbox, Some(agent)),
-        None => (target, None),
-    };
-    let sandbox: SandboxName = sandbox.parse().map_err(|e| Error::Session {
-        what: format!("{e}"),
-    })?;
+    let ChannelTarget { sandbox, agent } = target;
     if let Some(agent) = agent {
+        let builtin = engine.builtin_agent(&sandbox)?;
         return Err(Error::Session {
-            what: format!(
-                "a bot of agent {agent}'s own is not possible yet: Hermes's gateway gives a named agent a token only from a file in its folder, and enclos keeps secrets out of the sandbox home (ADR 0022). Set up the sandbox's bot with `enclos runtime configure {sandbox} --channel {channel} ...`; see ADR 0032 (proposed)"
-            ),
+            what: match builtin.is_some_and(|b| b.as_str() == agent.as_str()) {
+                true => format!(
+                    "the sandbox's bot is agent {agent}'s already: set it up with `enclos runtime configure {sandbox} --channel {channel} ...`"
+                ),
+                false => format!(
+                    "enclos does not set up a bot of agent {agent}'s own: Hermes's gateway gives an agent other than the built-in one no token from its environment by the means it meant for tokens, and enclos keeps secrets out of the sandbox home (ADR 0022). Set up the sandbox's bot with `enclos runtime configure {sandbox} --channel {channel} ...`; see ADR 0032 (proposed)"
+                ),
+            },
         });
     }
     let set = match engine.configure_channel(by, &sandbox, channel, token, answers, confirm)? {
@@ -132,17 +153,34 @@ fn configure(
     };
     let shown = channel.display_name();
     println!(
-        "Sandbox {sandbox}'s {shown} bot is set up: its token is read from ${} as the gateway starts, and it answers {} user(s). A running gateway restarts with it.",
+        "Sandbox {sandbox}'s {shown} bot is set up: its token is read from ${} as its service starts, and it answers {} user(s). A running service restarts with it.",
         set.token,
-        answers.len()
+        set.answers.len()
     );
     if !set.reachable {
         println!(
-            "Its policy does not let it reach {}: `enclos policy allow {sandbox} {}`.",
-            channel.host(),
-            channel.host()
+            "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
+            host = channel.host(),
         );
     }
-    println!("Start it with `enclos sandbox start {sandbox}`, then send the bot a message.");
+    println!(
+        "If the sandbox is not started, start it with `enclos sandbox start {sandbox}`; then send the bot a message."
+    );
     Ok(exit::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_target_is_a_sandbox_or_one_of_its_agents() {
+        let target: ChannelTarget = "home".parse().unwrap();
+        assert_eq!((target.sandbox.as_str(), target.agent), ("home", None));
+        let target: ChannelTarget = "home/main".parse().unwrap();
+        assert_eq!(target.agent.unwrap().as_str(), "main");
+        for bad in ["home/", "/main", "home/main/x", "Home"] {
+            assert!(bad.parse::<ChannelTarget>().is_err(), "{bad}");
+        }
+    }
 }

@@ -76,6 +76,10 @@ _Avoid_: stale session, zombie session
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key
 
+**Channel**:
+A messaging service through which a sandbox's bot answers people, such as Telegram, set up on the runtime with a secret of the sandbox as the bot's token.
+_Avoid_: platform, integration
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
