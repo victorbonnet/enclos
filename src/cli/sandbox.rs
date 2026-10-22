@@ -112,21 +112,21 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::Start { names } => {
             return each(
                 &names,
-                |n| engine.show_sandbox(n).map(drop),
+                |n| engine.require_sandbox(n),
                 |name| start(engine, by, name, confirm),
             );
         }
         SandboxVerb::Stop { names } => {
             return each(
                 &names,
-                |n| engine.show_sandbox(n).map(drop),
+                |n| engine.require_sandbox(n),
                 |name| stop(engine, by, name, confirm),
             );
         }
         SandboxVerb::Restart { names } => {
             return each(
                 &names,
-                |n| engine.show_sandbox(n).map(drop),
+                |n| engine.require_sandbox(n),
                 |name| restart(engine, by, name, confirm),
             );
         }

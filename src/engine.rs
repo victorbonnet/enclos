@@ -190,8 +190,9 @@ impl Engine {
         Ok(self.audit.verify()?)
     }
 
-    /// Fails with the sandbox's name when it does not exist.
-    fn require_sandbox(&self, name: &SandboxName) -> Result<()> {
+    /// Fails with the sandbox's name when it does not exist. Reads its record
+    /// only: no lock, no process listing.
+    pub fn require_sandbox(&self, name: &SandboxName) -> Result<()> {
         match self.state.get(name)? {
             Some(_) => Ok(()),
             None => Err(Error::NoSuchSandbox {
