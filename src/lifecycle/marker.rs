@@ -1,12 +1,14 @@
-//! Markers: proof that a process is a session's, also after a double fork
-//! (ADR 0030), with no `unsafe` code (ADR 0012).
+//! Markers: evidence that a process is a session's, also after a double
+//! fork (ADR 0030), with no `unsafe` code (ADR 0012).
 //!
 //! enclos starts each sandboxed program holding an open descriptor to a
 //! marker file of its own, which every process the program starts inherits,
 //! one that leaves its group or loses its parent included. The file is made
-//! with no permissions, so no other process of the user can open it later,
-//! and enclos keeps no copy open: the processes holding it are the program
-//! and what it started, unless one of them closed it. `lsof` names them.
+//! with no permissions in enclos's folder, where a sandbox cannot write, so
+//! no sandboxed process can open it or change its mode, and enclos keeps no
+//! copy open: the processes holding it are the program and what it started,
+//! unless one closed it or passed it on, or a process outside the sandbox
+//! changed its mode and opened it. `lsof` names them.
 //!
 //! A marker is made in the sandbox's `members/` folder before the program
 //! starts, and named after the session's root process (its pid and start
@@ -53,38 +55,48 @@ impl Marker {
     /// Starts `command` holding the marker. The descriptor it inherits is a
     /// copy made without close-on-exec just before, and enclos closes both
     /// its copies once the program runs. Another thread of enclos starting
-    /// a program at that moment would inherit it too: the commands that
-    /// start sandboxed programs start nothing else meanwhile.
+    /// a program at that moment would inherit it too: the CLI starts nothing
+    /// else meanwhile; tests running in parallel threads may.
     pub fn spawn(self, command: &mut Command) -> io::Result<(Child, Started)> {
+        let started = Started {
+            path: Some(self.path),
+        };
         let inherited = rustix::io::dup(&self.file)?;
         let child = command.spawn();
         drop(inherited);
         drop(self.file);
-        match child {
-            Ok(child) => Ok((child, Started { path: self.path })),
-            Err(e) => {
-                let _ = std::fs::remove_file(&self.path);
-                Err(e)
-            }
-        }
+        Ok((child?, started))
     }
 }
 
 /// The marker of a program that started, before its session is recorded.
+/// Dropped unnamed, as when the program did not start or its session could
+/// not be recorded, it is removed.
 pub struct Started {
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 impl Started {
     /// Names the marker after the session's root process, so that its
     /// holders are found as the session's. On failure the marker is removed.
-    pub fn name(self, root: &ProcessRef) -> io::Result<()> {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
-        let named = std::fs::rename(&self.path, dir.join(name_of(root)));
+    pub fn name(mut self, root: &ProcessRef) -> io::Result<()> {
+        let Some(path) = self.path.take() else {
+            return Ok(());
+        };
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let named = std::fs::rename(&path, dir.join(name_of(root)));
         if named.is_err() {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&path);
         }
         named
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -108,14 +120,19 @@ pub fn remove(dir: &Path, root: &ProcessRef) -> io::Result<()> {
 }
 
 /// The processes holding each named marker in `dir`, by file name, of those
-/// `lsof` can see (the user's: no other process of the user can open one).
+/// `lsof` can see (the user's; root's are not listed).
 pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
-    if !dir.is_dir() {
-        return Ok(BTreeMap::new());
+    // No folder yet is no marker; a folder that cannot be read is not.
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(MarkerError(format!("{}: {e}", dir.display()))),
+        Ok(_) => {}
     }
+    // `-w`: a warning about another file system (an unreachable network
+    // mount) is not a failure to look at this folder.
     let out = Command::new("/usr/sbin/lsof")
         .env("LC_ALL", "C")
-        .args(["-nP", "-Fpn", "+d"])
+        .args(["-nP", "-w", "-Fpn", "+d"])
         .arg(dir)
         .stdin(Stdio::null())
         .output()
@@ -184,6 +201,27 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_pid_gets_another_marker() {
+        let at = |started: &str| ProcessRef {
+            pid: 42,
+            started: started.to_owned(),
+        };
+        assert_ne!(
+            name_of(&at("Wed Oct 22 12:00:00 2026")),
+            name_of(&at("Wed Oct 22 12:00:01 2026"))
+        );
+    }
+
+    #[test]
+    fn a_program_that_does_not_start_leaves_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = Marker::new(dir.path()).unwrap();
+        let mut command = Command::new("/nonexistent/program");
+        assert!(marker.spawn(&mut command).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn nothing_held_is_no_holder_and_a_failure_is_an_error() {
         assert!(parse(&output(1, "", "")).unwrap().is_empty());
         assert!(parse(&output(1, "", "lsof: status error")).is_err());
@@ -197,9 +235,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let members = dir.path().join("members");
         let marker = Marker::new(&members).unwrap();
+        let pid_file = dir.path().join("pid");
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "(sleep 30 &) ; exit 0"])
+            .args(["-c", "(sleep 30 & echo $! > \"$0\") ; exit 0"])
+            .arg(&pid_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -216,13 +256,19 @@ mod tests {
             format!("root-{}-Wed_Oct_22_12_00_00_2026", child.id())
         );
         assert!(File::open(&path).is_err(), "the marker can be opened again");
+        let sleep: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let held = holders(&members).unwrap();
         let pids = held.get(&name_of(&root)).cloned().unwrap_or_default();
-        assert_eq!(pids.len(), 1, "{held:?}");
+        // Other tests' programs started meanwhile may hold it too (see
+        // `Marker::spawn`): the sleep must, enclos must not.
+        let found = pids.contains(&sleep);
+        let _ = Command::new("/bin/kill").arg(sleep.to_string()).status();
+        assert!(found, "{held:?}");
         assert!(!pids.contains(&std::process::id()), "enclos holds it");
-        // The test's own sleep, found through the marker, is ended.
-        let pid = *pids.iter().next().unwrap();
-        let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
         remove(&members, &root).unwrap();
         assert!(!path.exists());
     }

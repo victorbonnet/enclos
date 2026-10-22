@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{Proc, PsError, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::process::{Proc, group_of, is_same, processes, reference_of_child};
 use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -60,8 +60,9 @@ pub enum Left {
 /// A session's program, waited for.
 pub(super) struct Waited {
     pub status: ExitStatus,
-    /// The members it left running, or why they could not be listed.
-    pub left: std::result::Result<Vec<Found>, PsError>,
+    /// The members it left running, or why they could not be listed (its
+    /// processes, or who holds its marker).
+    pub left: Result<Vec<Found>>,
     /// The sure members last seen, recorded when `left` could not be listed.
     pub known: Vec<ProcessRef>,
     pub notes: Vec<String>,
@@ -460,17 +461,14 @@ impl Engine {
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it,
         // what holds its marker included (ADR 0030).
-        let held = match self.held(&session.sandbox) {
-            Ok(held) => held,
-            Err(e) => {
-                note(&mut notes, format!("could not look at its marker: {e}"));
-                Held::new()
-            }
-        };
-        let left = processes().map(|procs| {
+        let left = (|| -> Result<Vec<Found>> {
+            let procs = processes()?;
+            // After the listing (see `Engine::marked`). Without the marker,
+            // what is left cannot be told, so the session stays open.
+            let held = self.held(&session.sandbox)?;
             known = marked_in(session, &known, &procs, &held);
-            find(&procs, session, &known)
-        });
+            Ok(find(&procs, session, &known))
+        })();
         Ok(Waited {
             status,
             left,
@@ -495,7 +493,9 @@ impl Engine {
                 format!("could not stop what it left running: {e}"),
             );
         }
-        waited.left = processes().map(|procs| find(&procs, session, &waited.known));
+        waited.left = processes()
+            .map(|procs| find(&procs, session, &waited.known))
+            .map_err(Error::from);
     }
 
     /// Ends the session, or, while it left members running or enclos could
@@ -533,25 +533,16 @@ impl Engine {
         refused: &str,
         ended: &mut Vec<SessionId>,
     ) -> Result<()> {
-        let open: Vec<SessionRecord> = self
-            .state
-            .sessions(name, true)?
-            .into_iter()
-            .filter(&which)
-            .collect();
-        let held = match open.is_empty() {
-            true => Held::new(),
-            false => self.held(name)?,
-        };
-        for session in open {
-            let marked = self.marked(&session, &held)?;
+        for session in self.state.sessions(name, true)?.into_iter().filter(&which) {
             let label = match &session.service {
                 Some(service) => format!("the {service} service session {}", session.id),
                 None => format!("the {} session {}", session.kind.as_str(), session.id),
             };
-            let stopped = (self.stop_members)(&marked, GRACE).map_err(|e| Error::Session {
-                what: format!("could not stop {label} of sandbox {name}: {e}"),
-            })?;
+            let stopped = self
+                .stop_marked(&session, GRACE, self.stop_members)
+                .map_err(|e| Error::Session {
+                    what: format!("could not stop {label} of sandbox {name}: {e}"),
+                })?;
             match stopped {
                 Stopped::Clean | Stopped::Gone => {
                     self.state.end_session(lock, session.id)?;
@@ -599,10 +590,17 @@ impl Engine {
         })
     }
 
-    /// Removes an ended session's marker. One left behind is an empty file
-    /// nothing holds, so failing to remove it changes nothing.
+    /// Removes an ended session's marker, once a fresh look shows nothing
+    /// holds it: removed, a marker a member still holds would hide that
+    /// member for good. One left behind is an empty file, which a later
+    /// session cannot take for its own (its name has the root's start time).
     pub(super) fn forget_marker(&self, session: &SessionRecord) {
-        let _ = marker::remove(&self.markers(&session.sandbox), &session.root);
+        let dir = self.markers(&session.sandbox);
+        if let Ok(held) = marker::holders(&dir)
+            && !held.contains_key(&marker::name_of(&session.root))
+        {
+            let _ = marker::remove(&dir, &session.root);
+        }
     }
 
     /// The processes holding each marker of sandbox `name`, by marker.
@@ -611,14 +609,40 @@ impl Engine {
     }
 
     /// `session`, with the processes holding its marker added to those it
-    /// tracked: each is shown to be its member (ADR 0030). Lists the
-    /// processes only when something holds the marker.
-    pub(super) fn marked(&self, session: &SessionRecord, held: &Held) -> Result<SessionRecord> {
+    /// tracked (ADR 0030). The processes are listed before `lsof` looks: a
+    /// holder that exits in between, its pid reused, is then listed with
+    /// its own start time and fails the same-process check before a signal,
+    /// where the other order would name the process that reused the pid.
+    pub(super) fn marked(&self, session: &SessionRecord) -> Result<SessionRecord> {
+        let procs = processes()?;
+        let held = self.held(&session.sandbox)?;
         let mut marked = session.clone();
-        if held.contains_key(&marker::name_of(&session.root)) {
-            marked.tracked = marked_in(session, &session.tracked, &processes()?, held);
-        }
+        marked.tracked = marked_in(session, &session.tracked, &procs, &held);
         Ok(marked)
+    }
+
+    /// Stops `session`'s members, with what holds its marker (ADR 0030),
+    /// then looks at the marker again: a process that gained it meanwhile,
+    /// such as one a member detached during the grace period, is stopped
+    /// too, and one that survives is a survivor, so the session stays open.
+    pub(super) fn stop_marked(
+        &self,
+        session: &SessionRecord,
+        grace: Duration,
+        stop: super::StopMembers,
+    ) -> Result<Stopped> {
+        let first = stop(&self.marked(session)?, grace)?;
+        if matches!(first, Stopped::Survivors(_)) {
+            return Ok(first);
+        }
+        let again = self.marked(session)?;
+        if again.tracked.len() == session.tracked.len() {
+            return Ok(first);
+        }
+        Ok(match stop(&again, grace)? {
+            Stopped::Gone => first,
+            other => other,
+        })
     }
 
     /// What `connect` would start, without starting anything.

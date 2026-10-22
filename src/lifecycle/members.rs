@@ -15,7 +15,7 @@
 //! counted but never signalled.
 //!
 //! A process holding the session's marker (ADR 0030) is a sure member too:
-//! the engine adds it to `tracked`, so a double fork is found.
+//! the engine adds it to `tracked`, so a double fork is found and stopped.
 //!
 //! Known gap: a process that closes its marker's descriptor and leaves its
 //! group and parent is seen only by the rules above. It keeps its Seatbelt

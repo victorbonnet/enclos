@@ -2873,8 +2873,11 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// A process the session's program double-forks, in a group of its own
-    /// and with no parent, still holds the session's marker, so `sandbox
-    /// stop` ends it (ADR 0030); before markers it was not even seen.
+    /// and with no parent, still holds the session's marker (ADR 0030).
+    /// With what the session recorded forgotten, so that only the marker
+    /// can tell: `show` lists it, `status` counts the session as running,
+    /// and `sandbox stop` ends it and removes the marker. Before markers it
+    /// was not even seen.
     #[cfg(target_os = "macos")]
     #[test]
     fn stop_ends_a_process_that_left_its_session_by_a_double_fork() {
@@ -2906,11 +2909,36 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .parse()
             .unwrap();
         let escaped = crate::lifecycle::process::reference(pid).unwrap().unwrap();
+
+        let session = lab
+            .engine
+            .state
+            .sessions(&lab.name, true)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == crate::model::session::SessionKind::Interactive)
+            .unwrap();
         assert_ne!(
             crate::lifecycle::process::group_of(pid).unwrap(),
-            Some(std::process::id()),
-            "the process did not leave the test's group"
+            session.pgid,
+            "the process did not leave the session's group"
         );
+        lab.engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| Ok(lab.engine.state.track(lock, session.id, &[])?),
+            )
+            .unwrap();
+        let view = lab.engine.show_sandbox(&lab.name).unwrap();
+        let listed = view
+            .sessions
+            .iter()
+            .any(|v| v.session.id == session.id && v.members.iter().any(|m| m.pid == pid));
+        let status = lab.engine.status(Some(&lab.name)).unwrap();
+        let gone = status.sandboxes[0].gone_sessions;
 
         let report = done(
             lab.engine
@@ -2926,6 +2954,61 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         }
         assert!(!survived, "the double-forked process survived the stop");
         assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+        assert!(listed, "show did not list the process holding the marker");
+        assert_eq!(gone, 0, "status found the session gone");
+        let left: Vec<_> = std::fs::read_dir(lab.engine.markers(&lab.name))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "markers left: {left:?}");
+    }
+
+    /// A process holding one session's marker is that session's member,
+    /// never another's (ADR 0030).
+    #[test]
+    fn a_marker_holder_is_its_own_sessions_member_only() {
+        use crate::lifecycle::marker::name_of;
+        use crate::lifecycle::process::Proc;
+
+        let root = |pid: u32| crate::model::session::ProcessRef {
+            pid,
+            started: format!("start {pid}"),
+        };
+        let session = |id: i64, pid: u32| crate::model::session::SessionRecord {
+            id: crate::model::session::SessionId(id),
+            sandbox: "home".parse().unwrap(),
+            kind: crate::model::session::SessionKind::Interactive,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            pgid: None,
+            root: root(pid),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        let proc_ = |pid: u32| Proc {
+            pid,
+            ppid: 1,
+            pgid: pid,
+            started: format!("start {pid}"),
+            command: "sleep".into(),
+        };
+        let (a, b) = (session(1, 10), session(2, 20));
+        let held = super::session::Held::from([(
+            name_of(&a.root),
+            std::collections::BTreeSet::from([11, 12]),
+        )]);
+        let procs = [proc_(11), proc_(12), proc_(21)];
+        let of_a = super::session::marked_in(&a, &a.tracked, &procs, &held);
+        assert_eq!(of_a, [root(11), root(12)]);
+        assert!(super::session::marked_in(&b, &b.tracked, &procs, &held).is_empty());
+        // A holder no longer listed is not added.
+        assert_eq!(
+            super::session::marked_in(&a, &a.tracked, &procs[..1], &held),
+            [root(11)]
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2943,8 +3026,10 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         // TERM to this process, as the service manager's stop sends it to
         // `enclos launch`, once the runtime runs: `launch` must catch it,
         // not die of it.
+        let markers = lab.engine.markers(&lab.name);
         let teller = {
             let pids_file = pids_file.clone();
+            let markers = markers.clone();
             std::thread::spawn(move || {
                 let start = Instant::now();
                 while !pids_file.exists() {
@@ -2954,11 +3039,28 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                     );
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                // Who holds the service's marker while it runs (ADR 0030),
+                // looked at before TERM and checked after the join.
+                let held = crate::lifecycle::marker::holders(&markers);
                 signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+                held
             })
         };
         let end = lab.engine.launch(&alice(), &lab.name, "gateway").unwrap();
-        teller.join().unwrap();
+        let held = teller.join().unwrap().unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let holders = held.values().next().unwrap();
+        for pid in pids_in(&pids_file) {
+            assert!(
+                holders.contains(&pid),
+                "pid {pid} holds no marker: {held:?}"
+            );
+        }
+        assert!(
+            !holders.contains(&std::process::id()),
+            "launch holds the marker"
+        );
+        assert_eq!(std::fs::read_dir(&markers).unwrap().count(), 0);
         // TERM ends `sleep` within the first grace period: KILL would show
         // as signal 9, after `STOP_GRACE`.
         assert_eq!(end.signal, Some(15), "{end:?}");

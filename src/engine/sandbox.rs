@@ -268,15 +268,12 @@ impl Engine {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
-        let open = self.state.sessions(&record.name, true)?;
-        let held = match open.is_empty() {
-            true => Held::new(),
-            false => self.held(&record.name)?,
-        };
-        let sessions = open
+        let sessions = self
+            .state
+            .sessions(&record.name, true)?
             .into_iter()
             .map(|session| {
-                let members = members(&self.marked(&session, &held)?)?;
+                let members = members(&self.marked(&session)?)?;
                 let needs_restart = needs_restart(&session, active);
                 Ok(SessionView {
                     session,
@@ -353,22 +350,23 @@ impl Engine {
         // that fails tells none apart, so none is said to be gone; the stop
         // below looks again, and fails on its own if it still cannot.
         let open = self.state.sessions(name, true)?;
-        // What holds a marker is a member too (ADR 0030). Looked at once,
-        // before anything is stopped: a marker cannot be gained later.
-        let held = match open.is_empty() {
-            true => Held::new(),
-            false => self.held(name)?,
-        };
         let ran: Vec<SessionId> = match processes() {
-            Ok(procs) => open
-                .iter()
-                .filter(|s| {
-                    let mut marked = (*s).clone();
-                    marked.tracked = marked_in(s, &s.tracked, &procs, &held);
-                    !is_gone(&procs, &marked)
-                })
-                .map(|s| s.id)
-                .collect(),
+            Ok(procs) => {
+                // What holds a marker is a member too (ADR 0030), looked at
+                // after the listing (see `Engine::marked`).
+                let held = match open.is_empty() {
+                    true => Held::new(),
+                    false => self.held(name)?,
+                };
+                open.iter()
+                    .filter(|s| {
+                        let mut marked = (*s).clone();
+                        marked.tracked = marked_in(s, &s.tracked, &procs, &held);
+                        !is_gone(&procs, &marked)
+                    })
+                    .map(|s| s.id)
+                    .collect()
+            }
             Err(_) => open.iter().map(|s| s.id).collect(),
         };
         // The services first, so the service manager does not restart what
@@ -394,21 +392,12 @@ impl Engine {
                     gone: Vec::new(),
                     survivors: Vec::new(),
                 };
-                let mut cannot_look = None;
+                let mut cannot_look: Option<Error> = None;
                 let sessions = self.state.sessions(name, true)?;
                 for session in &sessions {
-                    let marked = match processes() {
-                        Ok(procs) => {
-                            let mut marked = session.clone();
-                            marked.tracked = marked_in(session, &session.tracked, &procs, &held);
-                            marked
-                        }
-                        Err(e) => {
-                            cannot_look = Some(e);
-                            break;
-                        }
-                    };
-                    match stop(&marked, GRACE) {
+                    // Its marker looked at here, after the services are
+                    // removed, and again once it stopped.
+                    match self.stop_marked(session, GRACE, stop) {
                         // Nothing of it ran before this stop either: it ended
                         // with nothing to record its end (a crash, a restart
                         // of the Mac, `enclos` killed), which the audit entry
@@ -448,9 +437,9 @@ impl Engine {
                         }
                         Ok(report)
                     }
-                    (Some(e), Ok(())) => Err(e.into()),
+                    (Some(e), Ok(())) => Err(e),
                     (Some(e), Err(saved)) => Err(Error::CleanupFailed {
-                        error: Box::new(e.into()),
+                        error: Box::new(e),
                         left: format!(
                             "sandbox {name} not marked failed, and the end of sessions {} not recorded ({saved})",
                             join_ids(&report.ended())

@@ -544,9 +544,16 @@ impl Engine {
         kind: SessionKind,
     ) -> Result<()> {
         for session in self.state.sessions(name, true)? {
-            if session.kind == kind && !is_same(&session.root)? {
-                self.state.end_session(lock, session.id)?;
+            if session.kind != kind || is_same(&session.root)? {
+                continue;
             }
+            // What holds its marker still runs (ADR 0030): the session stays
+            // open, for a stop to end it.
+            if self.marked(&session)?.tracked.len() > session.tracked.len() {
+                continue;
+            }
+            self.state.end_session(lock, session.id)?;
+            self.forget_marker(&session);
         }
         Ok(())
     }
