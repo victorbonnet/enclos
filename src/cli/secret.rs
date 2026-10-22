@@ -2,7 +2,7 @@
 //! ADR 0022). A value is read from the input, never from the command line,
 //! which other processes can list.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 
 use clap::{Args, Subcommand};
 
@@ -11,7 +11,7 @@ use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
-use enclos::model::secret::SecretRef;
+use enclos::model::secret::{SecretRef, SecretValue};
 
 #[derive(Args)]
 pub struct SecretArgs {
@@ -22,7 +22,8 @@ pub struct SecretArgs {
 #[derive(Subcommand)]
 enum SecretVerb {
     /// Store a secret of a sandbox in the Keychain, reading its value from
-    /// the input (typed without echo at a terminal).
+    /// the input: one line typed without echo at a terminal, or all of what
+    /// is piped in, its final line ending left out.
     Set {
         /// `<sandbox>/<name>`, such as `home/telegram`.
         secret: SecretRef,
@@ -40,10 +41,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
             engine.require_sandbox(&secret.sandbox)?;
             let value = match confirm {
                 // A dry run reads nothing: nothing would be stored.
-                Confirm::DryRun => "-".to_owned(),
-                _ => read_value(&secret)?,
+                Confirm::DryRun => None,
+                _ => Some(read_value(&secret)?),
             };
-            match engine.secret_set(by, &secret, &value, confirm)? {
+            match engine.secret_set(by, &secret, value.as_ref(), confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(set) => print_set(&secret, &set),
             }
@@ -57,56 +58,104 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
     Ok(exit::OK)
 }
 
-/// The value from the input: one line, its line ending left out. At a
-/// terminal it asks, with echo off, so the value never shows on screen.
-fn read_value(secret: &SecretRef) -> Result<String> {
+/// The most read from a pipe: far more than the Keychain takes.
+const MAX_INPUT: u64 = 1 << 20;
+
+/// The value from the input. At a terminal it asks for one line, with echo
+/// off, so the value never shows on screen; piped in, it is all the input,
+/// so a value of several lines (a PEM file) comes whole.
+fn read_value(secret: &SecretRef) -> Result<SecretValue> {
     let stdin = std::io::stdin();
     let io = |e: std::io::Error| Error::Session {
         what: format!("cannot read the value of secret {secret}: {e}"),
     };
-    let mut line = String::new();
-    if stdin.is_terminal() {
+    let text = if stdin.is_terminal() {
         eprint!("Value of secret {secret} (not shown): ");
         let _ = std::io::stderr().flush();
-        let echo = EchoOff::new(&stdin).map_err(io)?;
+        let quiet = Quiet::new(&stdin).map_err(io)?;
+        let mut line = String::new();
         let read = stdin.lock().read_line(&mut line);
-        drop(echo);
+        // What was pasted past the first line is dropped before echo comes
+        // back, so the shell never reads it as commands.
+        let more = rustix::io::ioctl_fionread(&stdin).unwrap_or(0) > 0;
+        let _ = rustix::termios::tcflush(&stdin, rustix::termios::QueueSelector::IFlush);
+        quiet.restore();
         eprintln!();
         read.map_err(io)?;
+        if line.contains(['\u{3}', '\u{1a}']) {
+            return Err(Error::Session {
+                what: format!("cancelled: secret {secret} was not set"),
+            });
+        }
+        if more {
+            return Err(Error::Session {
+                what: format!(
+                    "the value of secret {secret} came with more lines, which were dropped: at a terminal a value is one line; pipe in one of several lines"
+                ),
+            });
+        }
+        line
     } else {
-        stdin.lock().read_line(&mut line).map_err(io)?;
-    }
-    let value = line
+        let mut text = String::new();
+        stdin
+            .lock()
+            .take(MAX_INPUT)
+            .read_to_string(&mut text)
+            .map_err(io)?;
+        text
+    };
+    let value = text
         .strip_suffix('\n')
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .unwrap_or(&line);
-    Ok(value.to_owned())
+        .unwrap_or(&text);
+    SecretValue::new(value.to_owned()).map_err(|e| Error::Session {
+        what: format!("secret {secret} was not set: {e}"),
+    })
 }
 
-/// The terminal's echo turned off while it lives.
-struct EchoOff<'a> {
+/// The terminal with echo and its signal keys off while it lives: Ctrl-C
+/// then ends the line rather than enclos, which would leave echo off.
+struct Quiet<'a> {
     stdin: &'a std::io::Stdin,
-    before: rustix::termios::Termios,
+    before: Option<rustix::termios::Termios>,
 }
 
-impl<'a> EchoOff<'a> {
+impl<'a> Quiet<'a> {
     fn new(stdin: &'a std::io::Stdin) -> std::io::Result<Self> {
         use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
         let before = tcgetattr(stdin)?;
         let mut quiet = before.clone();
-        quiet.local_modes.remove(LocalModes::ECHO);
+        quiet
+            .local_modes
+            .remove(LocalModes::ECHO | LocalModes::ISIG);
         tcsetattr(stdin, OptionalActions::Now, &quiet)?;
-        Ok(EchoOff { stdin, before })
+        Ok(Quiet {
+            stdin,
+            before: Some(before),
+        })
+    }
+
+    /// Puts the terminal back as it was, saying so when it cannot.
+    fn restore(mut self) {
+        self.put_back();
+    }
+
+    fn put_back(&mut self) {
+        if let Some(before) = self.before.take()
+            && let Err(e) = rustix::termios::tcsetattr(
+                self.stdin,
+                rustix::termios::OptionalActions::Now,
+                &before,
+            )
+        {
+            eprintln!("\nwarning: cannot turn the terminal's echo back on ({e}); run `stty sane`");
+        }
     }
 }
 
-impl Drop for EchoOff<'_> {
+impl Drop for Quiet<'_> {
     fn drop(&mut self) {
-        let _ = rustix::termios::tcsetattr(
-            self.stdin,
-            rustix::termios::OptionalActions::Now,
-            &self.before,
-        );
+        self.put_back();
     }
 }
 
@@ -116,16 +165,26 @@ fn print_set(secret: &SecretRef, set: &SecretSet) {
         false => println!("Replaced the value of secret {secret} in the Keychain."),
     }
     let sandbox = &secret.sandbox;
+    let shown = |variables: &[String]| {
+        variables
+            .iter()
+            .map(|v| format!("${v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match set.granted_as.as_slice() {
+        [] if !set.pending_as.is_empty() => println!(
+            "The pending policy gives it as {}, from `enclos policy apply {sandbox}`.",
+            shown(&set.pending_as)
+        ),
         [] => println!(
             "No session gets it until the policy grants it: `enclos policy edit {sandbox}`, under [secrets], as `env = {{ NAME = \"{}\" }}`.",
             secret.in_policy()
         ),
         variables => {
-            let shown: Vec<String> = variables.iter().map(|v| format!("${v}")).collect();
             println!(
                 "Sessions started from now on get it as {}.",
-                shown.join(", ")
+                shown(variables)
             );
             if set.running > 0 {
                 println!(

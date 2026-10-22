@@ -4,16 +4,24 @@
 
 pub mod keychain;
 
-use crate::model::secret::SecretRef;
+use crate::model::secret::{SecretRef, SecretValue};
 
 /// Keeps secrets' values, outside every sandbox.
 pub trait SecretStore {
     /// Stores `value` for `secret`, in place of any value it had.
-    fn set(&self, secret: &SecretRef, value: &str) -> Result<(), SecretError>;
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError>;
     /// The value of `secret`; `None` when the store has none.
-    fn get(&self, secret: &SecretRef) -> Result<Option<String>, SecretError>;
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError>;
     /// Removes `secret`'s value; false when the store had none.
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError>;
+    /// Where the store keeps `secret`, and how to remove it without enclos:
+    /// for a secret enclos could not remove.
+    fn whereabouts(&self, secret: &SecretRef) -> String;
+    /// The variables with which another enclos process, such as a service,
+    /// reaches this same store.
+    fn env(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -29,34 +37,38 @@ pub fn host(service: String) -> Box<dyn SecretStore> {
     match cfg!(target_os = "macos") {
         true => Box::new(keychain::Keychain::from_env(service)),
         false => Box::new(Unavailable {
-            why: "secrets need the macOS Keychain on this build; libsecret and a 0600 file come with Linux (milestone 3)",
+            why: "secrets need the macOS Keychain on this build; libsecret and a 0600 file come with Linux (milestone 3)".to_owned(),
         }),
     }
 }
 
 /// No store: every call fails, saying why.
 pub struct Unavailable {
-    pub why: &'static str,
+    pub why: String,
 }
 
 impl SecretStore for Unavailable {
-    fn set(&self, _: &SecretRef, _: &str) -> Result<(), SecretError> {
+    fn set(&self, _: &SecretRef, _: &SecretValue) -> Result<(), SecretError> {
         Err(self.error())
     }
 
-    fn get(&self, _: &SecretRef) -> Result<Option<String>, SecretError> {
+    fn get(&self, _: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         Err(self.error())
     }
 
     fn remove(&self, _: &SecretRef) -> Result<bool, SecretError> {
         Err(self.error())
     }
+
+    fn whereabouts(&self, _: &SecretRef) -> String {
+        format!("no secret store enclos can reach ({})", self.why)
+    }
 }
 
 impl Unavailable {
     fn error(&self) -> SecretError {
         SecretError {
-            what: self.why.to_owned(),
+            what: self.why.clone(),
         }
     }
 }
@@ -64,35 +76,47 @@ impl Unavailable {
 /// A store in memory, for tests of other components.
 #[cfg(test)]
 #[derive(Default)]
-pub struct InMemory(pub std::cell::RefCell<std::collections::BTreeMap<SecretRef, String>>);
+pub struct InMemory(pub std::cell::RefCell<std::collections::BTreeMap<SecretRef, SecretValue>>);
 
 #[cfg(test)]
 impl SecretStore for InMemory {
-    fn set(&self, secret: &SecretRef, value: &str) -> Result<(), SecretError> {
-        self.0.borrow_mut().insert(secret.clone(), value.to_owned());
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
+        self.0.borrow_mut().insert(secret.clone(), value.clone());
         Ok(())
     }
 
-    fn get(&self, secret: &SecretRef) -> Result<Option<String>, SecretError> {
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         Ok(self.0.borrow().get(secret).cloned())
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
         Ok(self.0.borrow_mut().remove(secret).is_some())
     }
+
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        format!("{secret} in memory")
+    }
 }
 
 #[cfg(test)]
-impl SecretStore for std::rc::Rc<InMemory> {
-    fn set(&self, secret: &SecretRef, value: &str) -> Result<(), SecretError> {
+impl<T: SecretStore> SecretStore for std::rc::Rc<T> {
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
         (**self).set(secret, value)
     }
 
-    fn get(&self, secret: &SecretRef) -> Result<Option<String>, SecretError> {
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         (**self).get(secret)
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
         (**self).remove(secret)
+    }
+
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        (**self).whereabouts(secret)
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        (**self).env()
     }
 }

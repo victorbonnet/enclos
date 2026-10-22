@@ -13,19 +13,23 @@
 //! A value goes to `security -i` on its input, never as an argument, which
 //! other processes could list; and as hex, which reads back the same, since
 //! `security` prints a value that is not plain ASCII as hex of its own.
+//! `security -i` reads a line in pieces of at most [`MAX_LINE`] bytes and
+//! runs each piece as a command, so a longer line is refused before it is
+//! sent: its tail would run as a command of its own, which `security` then
+//! prints back.
 //!
 //! Nothing here may ask anything: a service has nobody to answer. A user
 //! with no default keychain (a throwaway `HOME`) is refused before anything
 //! is written, since writing would ask where to create one, and every call
 //! is ended after [`ANSWER_WAIT`].
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use super::{SecretError, SecretStore};
-use crate::model::secret::SecretRef;
+use crate::model::secret::{SecretRef, SecretValue};
 
 const SECURITY: &str = "/usr/bin/security";
 /// What `security` exits with when no such item exists.
@@ -33,6 +37,11 @@ const NOT_FOUND: i32 = 44;
 /// How long a call to `security` may take: long past any answer, short of
 /// a wait on a dialog nobody sees.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// The longest line `security -i` reads as one command, its line ending
+/// included (macOS 26.5.2: a longer one runs as two).
+const MAX_LINE: usize = 4095;
+/// Names a keychain file to use in place of the default one.
+const KEYCHAIN_VAR: &str = "ENCLOS_KEYCHAIN";
 
 pub struct Keychain {
     /// The service of every item: `enclos.<install>`.
@@ -46,11 +55,14 @@ impl Keychain {
         Keychain { service, file }
     }
 
-    /// The default keychain, or the file `ENCLOS_KEYCHAIN` names.
+    /// The default keychain, or the file `ENCLOS_KEYCHAIN` names, taken
+    /// from the current folder when relative, so every call names the same
+    /// file.
     pub fn from_env(service: String) -> Keychain {
-        let file = std::env::var_os("ENCLOS_KEYCHAIN")
+        let file = std::env::var_os(KEYCHAIN_VAR)
             .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
+            .map(PathBuf::from)
+            .map(|f| std::path::absolute(&f).unwrap_or(f));
         Keychain::new(service, file)
     }
 
@@ -80,16 +92,9 @@ impl Keychain {
                     None,
                 )
                 .map_err(|e| self.fail("store", secret, e))?;
-                let text = String::from_utf8_lossy(&out.stdout);
-                match (out.status.success(), text.trim().trim_matches('"')) {
-                    (true, path) if !path.is_empty() => PathBuf::from(path),
-                    _ => {
-                        return Err(self.fail(
-                            "store",
-                            secret,
-                            "this user has no default keychain; set ENCLOS_KEYCHAIN to a keychain file to use one",
-                        ));
-                    }
+                match default_keychain(&out) {
+                    Ok(path) => path,
+                    Err(why) => return Err(self.fail("store", secret, why)),
                 }
             }
         };
@@ -102,11 +107,22 @@ impl Keychain {
             )),
         }
     }
-}
 
-impl SecretStore for Keychain {
-    fn set(&self, secret: &SecretRef, value: &str) -> Result<(), SecretError> {
-        self.require_keychain(secret)?;
+    /// The line that stores `value` for `secret`, for `security -i`.
+    fn store_line(&self, secret: &SecretRef, value: &str) -> Result<String, SecretError> {
+        // Every word but the value goes into the line unquoted: the service
+        // is enclos's own, and a secret's name holds no space or quote.
+        if !self
+            .service
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        {
+            return Err(self.fail(
+                "store",
+                secret,
+                format!("the service name {:?} is not plain", self.service),
+            ));
+        }
         let file = match &self.file {
             Some(file) => {
                 let file = file.display().to_string();
@@ -114,39 +130,61 @@ impl SecretStore for Keychain {
                     return Err(self.fail(
                         "store",
                         secret,
-                        "the keychain file's path holds a quote",
+                        "the keychain file's path holds a quote, a backslash or a line break",
                     ));
                 }
                 format!(" \"{file}\"")
             }
             None => String::new(),
         };
-        let line = format!(
-            "add-generic-password -U -s {} -a {secret} -l \"enclos secret {secret}\" -w {}{file}\n",
-            self.service,
-            hex(value.as_bytes())
+        let head = format!(
+            "add-generic-password -U -s {} -a {secret} -l \"enclos secret {secret}\" -w ",
+            self.service
         );
+        let length = head.len() + 2 * value.len() + file.len() + 1;
+        if length > MAX_LINE {
+            let most = (MAX_LINE - head.len() - file.len() - 1) / 2;
+            return Err(self.fail(
+                "store",
+                secret,
+                format!(
+                    "its value is {} bytes; the Keychain takes at most {most} through `security`",
+                    value.len()
+                ),
+            ));
+        }
+        Ok(format!("{head}{}{file}\n", hex(value.as_bytes())))
+    }
+}
+
+impl SecretStore for Keychain {
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
+        let line = self.store_line(secret, value.expose())?;
+        self.require_keychain(secret)?;
         let out = run(Command::new(SECURITY).arg("-i"), Some(line.as_bytes()))
             .map_err(|e| self.fail("store", secret, e))?;
+        // What `security -i` prints may repeat its input, the value with
+        // it: only its words are kept, never a run of hex.
+        let why = scrub(&stderr(&out.stderr, out.status));
         if !out.status.success() {
-            return Err(self.fail("store", secret, stderr(&out.stderr, out.status)));
+            return Err(self.fail("store", secret, why));
         }
-        // `security -i` exits 0 whatever its command did: only reading the
-        // value back shows it was stored.
+        // `security -i` can exit 0 though its command failed: only reading
+        // the value back shows it was stored.
         match self.get(secret)? {
-            Some(stored) if stored == value => Ok(()),
+            Some(stored) if stored == *value => Ok(()),
             _ => Err(self.fail(
                 "store",
                 secret,
-                match stderr(&out.stderr, out.status).as_str() {
-                    "" => "the Keychain refused it".to_owned(),
-                    why => why.to_owned(),
+                match why.as_str() {
+                    "" => "the Keychain refused it",
+                    why => why,
                 },
             )),
         }
     }
 
-    fn get(&self, secret: &SecretRef) -> Result<Option<String>, SecretError> {
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         let out = run(
             Command::new(SECURITY)
                 .args(["find-generic-password", "-s", &self.service, "-a"])
@@ -165,9 +203,11 @@ impl SecretStore for Keychain {
         let text = String::from_utf8_lossy(&out.stdout);
         let bytes = unhex(text.trim_end_matches('\n'))
             .ok_or_else(|| self.fail("read", secret, "its value was not stored by enclos"))?;
-        String::from_utf8(bytes)
+        let text = String::from_utf8(bytes)
+            .map_err(|_| self.fail("read", secret, "its value is not text"))?;
+        SecretValue::new(text)
             .map(Some)
-            .map_err(|_| self.fail("read", secret, "its value is not text"))
+            .map_err(|e| self.fail("read", secret, e))
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
@@ -184,6 +224,43 @@ impl SecretStore for Keychain {
             Some(NOT_FOUND) => Ok(false),
             _ => Err(self.fail("remove", secret, stderr(&out.stderr, out.status))),
         }
+    }
+
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        let file = self
+            .file
+            .as_ref()
+            .map(|f| format!(" {}", crate::probes::sh_quote(f)))
+            .unwrap_or_default();
+        format!(
+            "the Keychain item of service {} and account {secret}; remove it with `security delete-generic-password -s {} -a {secret}{file}`",
+            self.service, self.service
+        )
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        self.file
+            .iter()
+            .map(|f| (KEYCHAIN_VAR.to_owned(), f.display().to_string()))
+            .collect()
+    }
+}
+
+/// The user's default keychain, from what `security default-keychain -d
+/// user` printed.
+fn default_keychain(out: &Output) -> Result<PathBuf, String> {
+    let path = String::from_utf8_lossy(&out.stdout);
+    let path = path.trim().trim_matches('"');
+    match (out.status.success(), path.is_empty()) {
+        (true, false) => Ok(PathBuf::from(path)),
+        (true, true) => Err(
+            "this user has no default keychain; set ENCLOS_KEYCHAIN to a keychain file to use one"
+                .to_owned(),
+        ),
+        (false, _) => Err(format!(
+            "cannot find this user's default keychain ({}); set ENCLOS_KEYCHAIN to a keychain file to use one",
+            stderr(&out.stderr, out.status)
+        )),
     }
 }
 
@@ -203,23 +280,58 @@ fn run_for(command: &mut Command, input: Option<&[u8]>, wait: Duration) -> Resul
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run {SECURITY}: {e}"))?;
+    // Read as it writes, so a long answer never fills a pipe and stalls it.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let status = wait_for(&mut child, input, wait);
+    if status.is_err() {
+        // The child this call started, and nothing else.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+/// Gives `child` its input, which fits in a pipe's buffer (a line of at
+/// most [`MAX_LINE`] bytes), and waits for it to end, for at most `wait`.
+fn wait_for(child: &mut Child, input: Option<&[u8]>, wait: Duration) -> Result<ExitStatus, String> {
     if let Some(input) = input {
-        let wrote = child.stdin.take().expect("piped").write_all(input);
-        if let Err(e) = wrote {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("cannot give {SECURITY} its input: {e}"));
-        }
+        let mut stdin = child.stdin.take().expect("piped");
+        stdin
+            .write_all(input)
+            .map_err(|e| format!("cannot give {SECURITY} its input: {e}"))?;
     }
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                // The child this call started, and nothing else.
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(format!(
                     "{SECURITY} did not answer within {} seconds, as if it waited on a dialog; it was ended",
                     wait.as_secs()
@@ -228,17 +340,35 @@ fn run_for(command: &mut Command, input: Option<&[u8]>, wait: Duration) -> Resul
             Err(e) => return Err(format!("lost {SECURITY}: {e}")),
         }
     }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("lost {SECURITY}: {e}"))
 }
 
-fn stderr(bytes: &[u8], status: std::process::ExitStatus) -> String {
+fn stderr(bytes: &[u8], status: ExitStatus) -> String {
     match String::from_utf8_lossy(bytes).trim() {
         "" if status.success() => String::new(),
         "" => status.to_string(),
         why => why.to_owned(),
     }
+}
+
+/// `text` with every run of 16 or more hex digits left out: what a value,
+/// hex-encoded, would look like in it.
+fn scrub(text: &str) -> String {
+    let mut out = String::new();
+    let mut run = String::new();
+    for c in text.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_hexdigit() {
+            run.push(c);
+            continue;
+        }
+        match run.len() >= 16 {
+            true => out.push('…'),
+            false => out.push_str(&run),
+        }
+        run.clear();
+        out.push(c);
+    }
+    out.pop();
+    out
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -259,6 +389,10 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn v(text: &str) -> SecretValue {
+        SecretValue::new(text.to_owned()).unwrap()
+    }
+
     #[test]
     fn values_go_as_hex_and_come_back_whole() {
         let value = "tok:en \"quoted\" é\n";
@@ -266,6 +400,68 @@ mod tests {
         assert_eq!(unhex("abc"), None);
         assert_eq!(unhex("zz"), None);
         assert_eq!(unhex(""), Some(Vec::new()));
+    }
+
+    #[test]
+    fn what_security_prints_back_never_holds_a_value() {
+        let printed = format!(
+            "security: unknown command \"{}\"\nenclos.1a2b3c4d: returned 1",
+            hex(b"a long secret value")
+        );
+        assert_eq!(
+            scrub(&printed),
+            "security: unknown command \"…\"\nenclos.1a2b3c4d: returned 1"
+        );
+        assert_eq!(scrub(""), "");
+    }
+
+    #[test]
+    fn a_value_too_long_for_one_line_is_refused_before_anything_runs() {
+        let store = Keychain::new("enclos.1a2b3c4d".into(), Some("/nowhere/k.db".into()));
+        let secret: SecretRef = "home/key".parse().unwrap();
+        let fits = store.store_line(&secret, &"x".repeat(1900)).unwrap();
+        assert!(fits.len() <= MAX_LINE && fits.ends_with("\"/nowhere/k.db\"\n"));
+        let err = store.store_line(&secret, &"x".repeat(2100)).unwrap_err();
+        assert!(err.what.contains("its value is 2100 bytes"), "{err}");
+        assert!(!err.what.contains("7878"), "{err}");
+        // `set` refuses it before it looks for the keychain.
+        let err = store.set(&secret, &v(&"x".repeat(2100))).unwrap_err();
+        assert!(err.what.contains("at most"), "{err}");
+        let odd = Keychain::new("enclos x".into(), None);
+        assert!(odd.store_line(&secret, "v").is_err());
+        let quoted = Keychain::new("enclos.t".into(), Some("/a\"b/k.db".into()));
+        let err = quoted.store_line(&secret, "v").unwrap_err();
+        assert!(err.what.contains("holds a quote"), "{err}");
+    }
+
+    #[test]
+    fn the_default_keychain_is_read_from_what_security_prints() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str, stderr: &str| Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            default_keychain(&out(
+                0,
+                "    \"/Users/a/Library/Keychains/login.keychain-db\"\n",
+                ""
+            )),
+            Ok(PathBuf::from(
+                "/Users/a/Library/Keychains/login.keychain-db"
+            ))
+        );
+        assert!(
+            default_keychain(&out(0, "", ""))
+                .unwrap_err()
+                .contains("no default keychain")
+        );
+        assert!(
+            default_keychain(&out(1, "", "SecKeychainCopyDefault: failed"))
+                .unwrap_err()
+                .contains("SecKeychainCopyDefault: failed")
+        );
     }
 
     #[test]
@@ -283,42 +479,107 @@ mod tests {
         assert!(begun.elapsed() < Duration::from_secs(5));
     }
 
-    /// A keychain file in a folder of this test's own, which `security`
-    /// does not add to the user's search list, removed at the end.
+    #[test]
+    fn a_long_answer_does_not_stall_the_call() {
+        let out = run_for(
+            Command::new("/bin/sh").args(["-c", "head -c 300000 /dev/zero"]),
+            None,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(out.stdout.len(), 300_000);
+    }
+
+    /// A keychain file in a folder of this test's own. `create-keychain`
+    /// adds it to the user's search list; `delete-keychain`, run even when
+    /// the test fails, takes it out again.
+    #[cfg(target_os = "macos")]
+    struct ThrowawayKeychain {
+        _dir: tempfile::TempDir,
+        file: PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ThrowawayKeychain {
+        fn new() -> ThrowawayKeychain {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("test.keychain-db");
+            let path = file.to_str().unwrap();
+            for args in [
+                &["create-keychain", "-p", "test", path][..],
+                &["unlock-keychain", "-p", "test", path][..],
+            ] {
+                assert!(
+                    Command::new(SECURITY)
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            ThrowawayKeychain { _dir: dir, file }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ThrowawayKeychain {
+        fn drop(&mut self) {
+            let _ = Command::new(SECURITY)
+                .arg("delete-keychain")
+                .arg(&self.file)
+                .status();
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_secret_is_stored_read_replaced_and_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("test.keychain-db");
-        let ok = |args: &[&str]| {
-            assert!(
-                Command::new(SECURITY)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            )
-        };
-        let path = file.to_str().unwrap();
-        ok(&["create-keychain", "-p", "test", path]);
-        ok(&["unlock-keychain", "-p", "test", path]);
-        let store = Keychain::new("enclos.test".into(), Some(file.clone()));
+        let keychain = ThrowawayKeychain::new();
+        let store = Keychain::new("enclos.test".into(), Some(keychain.file.clone()));
         let secret: SecretRef = "home/telegram".parse().unwrap();
         assert_eq!(store.get(&secret).unwrap(), None);
-        store.set(&secret, "123:abc \"é\"").unwrap();
-        assert_eq!(
-            store.get(&secret).unwrap().as_deref(),
-            Some("123:abc \"é\"")
-        );
-        store.set(&secret, "456").unwrap();
-        assert_eq!(store.get(&secret).unwrap().as_deref(), Some("456"));
+        store.set(&secret, &v("123:abc \"é\"")).unwrap();
+        assert_eq!(store.get(&secret).unwrap(), Some(v("123:abc \"é\"")));
+        store.set(&secret, &v("456")).unwrap();
+        assert_eq!(store.get(&secret).unwrap(), Some(v("456")));
+        // The longest value one line takes, stored whole.
+        let long = v(&"k".repeat(1900));
+        store.set(&secret, &long).unwrap();
+        assert_eq!(store.get(&secret).unwrap(), Some(long));
         assert!(store.remove(&secret).unwrap());
         assert!(!store.remove(&secret).unwrap());
         assert_eq!(store.get(&secret).unwrap(), None);
+        // An item enclos did not store is not taken for a value.
+        let raw: SecretRef = "home/raw".parse().unwrap();
+        let file = keychain.file.to_str().unwrap();
+        assert!(
+            Command::new(SECURITY)
+                .args([
+                    "add-generic-password",
+                    "-s",
+                    "enclos.test",
+                    "-a",
+                    "home/raw"
+                ])
+                .args(["-w", "plain", file])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let err = store.get(&raw).unwrap_err();
+        assert!(err.what.contains("not stored by enclos"), "{err}");
         // A keychain that is not there is refused before anything runs.
-        let gone = Keychain::new("enclos.test".into(), Some(dir.path().join("none")));
-        let err = gone.set(&secret, "x").unwrap_err();
+        let gone = Keychain::new(
+            "enclos.test".into(),
+            Some(keychain.file.with_extension("x")),
+        );
+        let err = gone.set(&secret, &v("x")).unwrap_err();
         assert!(err.what.contains("does not exist"), "{err}");
-        ok(&["delete-keychain", path]);
+        // A file that is no keychain takes nothing: the read back shows it.
+        let plain = keychain.file.with_file_name("plain.txt");
+        std::fs::write(&plain, "not a keychain").unwrap();
+        let wrong = Keychain::new("enclos.test".into(), Some(plain));
+        assert!(wrong.set(&secret, &v("x")).is_err());
+        assert!(!matches!(wrong.get(&secret), Ok(Some(_))));
     }
 }

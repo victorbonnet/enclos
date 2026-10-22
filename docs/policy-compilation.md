@@ -63,8 +63,9 @@ The compiled policy does not hold the network allowlist. It only sends every con
 **How a layer applies** (`PolicyFile::apply`):
 
 - A list written `name = [...]` replaces what the layers below set; `name_add = [...]` adds to it. If one layer writes both, the replacement comes first, then the additions. The lists are `filesystem.write`, `filesystem.read_deny`, `network.allow` and `network.private`.
+- `secrets.env` replaces the secrets the layers below grant, and `secrets.env_add` adds to them, by variable. An adapter's layer may not grant any. Each grant must read `secret:<sandbox>/<name>`, or the file is refused as it is read.
 - A single value (`network.mode`, `network.log`, `network.listen`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`.
-- Unknown keys and sections are errors (`deny_unknown_fields`). That is how milestone 1 refuses `[exec]`, `[resources]` and `[secrets]`, which it cannot enforce yet ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), and how it catches a misspelling such as `alow`.
+- Unknown keys and sections are errors (`deny_unknown_fields`). That is how enclos refuses `[exec]` and `[resources]`, which it cannot enforce yet ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), and how it catches a misspelling such as `alow`.
 
 **Normalizing.** After the last layer, `normalize` puts the policy in one canonical form, so the same grants always give the same snapshot: each `network.allow` entry is rewritten in its canonical form (lowercase, default port dropped), each `network.private` entry the same way, and the four lists are sorted with repeats removed.
 

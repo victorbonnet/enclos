@@ -417,8 +417,9 @@ fn editor(home: &Home, script: &str) -> String {
     path.display().to_string()
 }
 
-/// A keychain file of the test's own, unlocked, which `security` does not
-/// add to the user's search list; deleted when dropped.
+/// A keychain file of the test's own, unlocked. `create-keychain` adds it
+/// to the user's search list; `delete-keychain`, when dropped, takes it out
+/// again.
 #[cfg(target_os = "macos")]
 struct TestKeychain(PathBuf);
 
@@ -509,7 +510,7 @@ fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
     let out = run(&["--yes", "secret", "rm", "home/telegram"], None);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(
-        out.stderr().contains("granted as TOKEN"),
+        out.stderr().contains("granted as $TOKEN"),
         "{}",
         out.stderr()
     );
@@ -517,6 +518,94 @@ fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
         let text = std::fs::read_to_string(home.root.join(file)).unwrap();
         assert!(!text.contains("tok-123"), "{file}");
     }
+
+    // Taken out of the policy, it goes, after asking.
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(&home, r#"sed -i '' '/secrets/d; /TOKEN/d' "$1""#),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(&["secret", "rm", "home/telegram"], None);
+    assert_eq!(out.code(), 3, "{}", out.stderr());
+    let out = run(&["--yes", "secret", "rm", "home/telegram"], None);
+    assert!(
+        out.ok().stdout().contains("Removed secret home/telegram"),
+        "{}",
+        out.stdout()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(
+        out.ok().stdout().contains("has no secrets"),
+        "{}",
+        out.stdout()
+    );
+
+    // A value of several lines, piped in, comes whole; nothing is not one.
+    let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+    run(&["secret", "set", "home/pem"], Some(pem.as_bytes())).ok();
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(
+                &home,
+                r#"printf '\n[secrets]\nenv = { PEM = "secret:home/pem" }\n' >> "$1""#,
+            ),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(
+        &[
+            "exec",
+            "home",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$PEM\"",
+        ],
+        None,
+    );
+    assert_eq!(out.ok().stdout(), pem.trim_end_matches('\n'));
+    let out = run(&["secret", "set", "home/empty"], Some(b""));
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("the value is empty"),
+        "{}",
+        out.stderr()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(!out.ok().stdout().contains("empty"), "{}", out.stdout());
+}
+
+/// With no keychain to write to, a secret is refused before anything is
+/// written, rather than waiting on a dialog nobody sees.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_with_no_keychain_to_hold_it_is_refused() {
+    use std::io::Write;
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let missing = home._dir.path().join("none.keychain-db");
+    let mut cmd = home.command(&["secret", "set", "home/telegram"]);
+    cmd.env("ENCLOS_KEYCHAIN", &missing)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"tok\n").unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("does not exist"), "{}", out.stderr());
+    let out = home.run(&["secret", "list", "home"]);
+    assert!(
+        out.ok().stdout().contains("has no secrets"),
+        "{}",
+        out.stdout()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1014,7 +1103,25 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     if host_services {
         args.push("--host-services");
     }
-    let out = home.run(&args);
+    // A keychain of the test's own, holding a secret of the sandbox, so the
+    // keychain item probe runs, and is seen not to touch that secret.
+    let keychain = TestKeychain::new(&home);
+    let mut set = home.command(&["secret", "set", "home/keep"]);
+    set.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"kept\n").unwrap();
+    }
+    Run(child.wait_with_output().unwrap()).ok();
+    let out = Run(home
+        .command(&args)
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .output()
+        .unwrap());
     assert_eq!(
         out.code(),
         0,
@@ -1095,6 +1202,22 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         let agents = "write in ~/Library/LaunchAgents";
         assert!(closed(agents), "{agents} is not shown closed:\n{report}");
     }
+    assert!(closed("read a keychain item"), "{report}");
+    assert!(!report.contains("keychain items ("), "{report}");
+    let items = Command::new("/usr/bin/security")
+        .arg("dump-keychain")
+        .arg(&keychain.0)
+        .output()
+        .unwrap();
+    let items = String::from_utf8_lossy(&items.stdout);
+    assert!(
+        !items.contains("home/probe"),
+        "the probe's item stays:\n{items}"
+    );
+    assert!(
+        items.contains("home/keep"),
+        "the sandbox's secret went:\n{items}"
+    );
     assert!(!report.contains("denied paths exists here"), "{report}");
     assert!(
         !report.contains("no ~/Library/LaunchAgents here"),

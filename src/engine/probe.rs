@@ -18,7 +18,7 @@ use crate::layout::LayoutError;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::SecretRef;
+use crate::model::secret::{SecretRef, SecretValue};
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     HostCheck, KEYCHAIN_PROBE_VALUE, KeychainItem, Outcome, Probe, ProbeInputs, ProbeResult, Proof,
@@ -117,11 +117,13 @@ impl Drop for Target {
     }
 }
 
-/// A throwaway item the keychain item probe tries to read from inside the
-/// sandbox: stored under a service of its own, `enclos.<install>.probe`, so
-/// it never stands for a secret, and removed when the test ends. None where
-/// no keychain takes it (no login keychain, Linux): the report says the
-/// probe did not run.
+/// A throwaway item the "read a keychain item" probe tries to read from
+/// inside the sandbox: stored in the default keychain, or the one
+/// `ENCLOS_KEYCHAIN` names, under a service of its own,
+/// `enclos.<install>.probe`, so it never stands for a secret, and removed
+/// when the test ends. Where none can be stored (Linux, no default
+/// keychain, a store that failed or did not answer), the report says why
+/// the probe did not run.
 struct KeychainProbe {
     store: Keychain,
     secret: SecretRef,
@@ -129,15 +131,29 @@ struct KeychainProbe {
 }
 
 impl KeychainProbe {
-    fn store(layout: &crate::layout::Layout, name: &SandboxName) -> Option<KeychainProbe> {
+    fn store(
+        layout: &crate::layout::Layout,
+        name: &SandboxName,
+    ) -> std::result::Result<KeychainProbe, String> {
         if !cfg!(target_os = "macos") {
-            return None;
+            return Err("the Keychain is macOS's".to_owned());
         }
-        let service = format!("enclos.{}.probe", layout.install_id().ok()?);
+        let install = layout
+            .install_id()
+            .map_err(|e| format!("enclos cannot tell its install apart: {e}"))?;
+        let service = format!("enclos.{install}.probe");
         let store = Keychain::from_env(service.clone());
-        let secret: SecretRef = format!("{name}/probe").parse().ok()?;
-        store.set(&secret, KEYCHAIN_PROBE_VALUE).ok()?;
-        Some(KeychainProbe {
+        let secret: SecretRef = format!("{name}/probe")
+            .parse()
+            .map_err(|e| format!("{e}"))?;
+        let value = SecretValue::new(KEYCHAIN_PROBE_VALUE.to_owned()).expect("not empty");
+        if let Err(e) = store.set(&secret, &value) {
+            // A store that went through but did not read back leaves an
+            // item: it goes too.
+            let _ = store.remove(&secret);
+            return Err(format!("enclos could not store a test item: {e}"));
+        }
+        Ok(KeychainProbe {
             item: KeychainItem {
                 service,
                 account: secret.to_string(),
@@ -151,7 +167,12 @@ impl KeychainProbe {
 
 impl Drop for KeychainProbe {
     fn drop(&mut self) {
-        let _ = self.store.remove(&self.secret);
+        if let Err(e) = self.store.remove(&self.secret) {
+            eprintln!(
+                "warning: the keychain item probe's test item stays: {e}; it is {}",
+                self.store.whereabouts(&self.secret)
+            );
+        }
     }
 }
 
@@ -230,7 +251,10 @@ impl Engine {
             let keychain = KeychainProbe::store(&self.layout, name);
             let mut inputs =
                 self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
-            inputs.keychain_item = keychain.as_ref().map(|k| k.item.clone());
+            inputs.keychain_item = keychain
+                .as_ref()
+                .map(|k| k.item.clone())
+                .map_err(Clone::clone);
             let mut list = probes(&inputs);
             if host_services {
                 list.extend(host_service_probes(&inputs));
@@ -320,7 +344,7 @@ impl Engine {
             target,
             other_terminal,
             tag: std::process::id(),
-            keychain_item: None,
+            keychain_item: Err("not probed here".into()),
         })
     }
 
@@ -335,11 +359,14 @@ impl Engine {
         // stand for them, only to count the probes that use them.
         let mut inputs =
             self.probe_inputs(name, &ctx, Some(0), Some(PathBuf::from("/dev/ttys0")))?;
-        inputs.keychain_item = cfg!(target_os = "macos").then(|| KeychainItem {
-            service: "enclos.probe".into(),
-            account: format!("{name}/probe"),
-            file: None,
-        });
+        inputs.keychain_item = match cfg!(target_os = "macos") {
+            true => Ok(KeychainItem {
+                service: "enclos.probe".into(),
+                account: format!("{name}/probe"),
+                file: None,
+            }),
+            false => Err("the Keychain is macOS's".to_owned()),
+        };
         let mut count = probes(&inputs).len();
         if host_services {
             count += host_service_probes(&inputs).len();
@@ -629,7 +656,7 @@ mod tests {
             target: Some(target),
             other_terminal: None,
             tag: 7,
-            keychain_item: None,
+            keychain_item: Err("not probed here".into()),
         }
     }
 

@@ -16,7 +16,7 @@ use super::paths::{PathContext, is_within, links_on_the_way, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::{SecretRef, is_variable_name, reserved_variable};
+use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::net::addr::{AddrClass, classify};
 use crate::net::host::{AllowEntry, HostPattern, canonical_private, listed_host};
 
@@ -48,9 +48,10 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
 }
 
 /// Checks the secrets a policy grants `sandbox` (ADR 0022): each is set as
-/// a variable a shell reads and enclos does not set itself, and is one of
-/// that sandbox's own, since secrets are granted per sandbox. Whether each
-/// is stored is the engine's to check, as the store holds the values.
+/// a variable a shell reads and enclos neither sets nor passes on itself,
+/// and is one of that sandbox's own, since secrets are granted per sandbox.
+/// Whether each is stored is the engine's to check, as the store holds the
+/// values.
 pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), PolicyError> {
     let mut problems = Vec::new();
     for (variable, grant) in &policy.secrets {
@@ -60,18 +61,14 @@ pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), Po
             )));
         } else if reserved_variable(variable) {
             problems.push(Problem::Refused(format!(
-                "secrets.env: `{variable}` is a variable enclos sets itself, or that changes how the sandbox runs; name the secret's variable otherwise"
+                "secrets.env: `{variable}` is a variable enclos sets or passes on itself, or that changes how the sandbox runs; name the secret's variable otherwise"
             )));
         }
-        match SecretRef::parse_policy(grant) {
-            Err(_) => problems.push(Problem::Malformed(format!(
-                "secrets.env.{variable}: `{grant}` is not a secret: write `secret:<sandbox>/<name>`, such as `secret:{sandbox}/telegram`"
-            ))),
-            Ok(secret) if secret.sandbox != *sandbox => problems.push(Problem::Refused(format!(
+        if grant.0.sandbox != *sandbox {
+            problems.push(Problem::Refused(format!(
                 "secrets.env.{variable}: `{grant}` is a secret of sandbox {}; a sandbox is granted only its own (ADR 0022)",
-                secret.sandbox
-            ))),
-            Ok(_) => {}
+                grant.0.sandbox
+            )));
         }
     }
     invalid_if_any(problems)
@@ -292,7 +289,7 @@ mod tests {
         let grant = |pairs: &[(&str, &str)]| {
             let mut policy = Policy::default();
             for (k, v) in pairs {
-                policy.secrets.insert((*k).into(), (*v).into());
+                policy.secrets.insert((*k).into(), v.parse().unwrap());
             }
             validate_secrets(&policy, &home)
         };
@@ -302,14 +299,8 @@ mod tests {
         assert!(other.to_string().contains("sandbox lab"), "{other}");
         let reserved = grant(&[("HOME", "secret:home/xy")]).unwrap_err();
         assert!(reserved.is_refused(), "{reserved}");
-        for malformed in [
-            grant(&[("1X", "secret:home/xy")]),
-            grant(&[("X", "home/xy")]),
-            grant(&[("X", "secret:home/Bad")]),
-        ] {
-            let err = malformed.unwrap_err();
-            assert!(!err.is_refused(), "{err}");
-        }
+        let malformed = grant(&[("1X", "secret:home/xy")]).unwrap_err();
+        assert!(!malformed.is_refused(), "{malformed}");
     }
 
     struct Fixture {

@@ -33,7 +33,7 @@ pub use probe::TestReport;
 pub(crate) use runtime::home_files_script;
 pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
-pub use secrets::{SecretSet, SecretView};
+pub use secrets::{SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 pub use status::{
@@ -123,8 +123,8 @@ impl Engine {
         let services = crate::service::host(layout.user_home());
         let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
             Ok(install) => crate::secrets::host(format!("enclos.{install}")),
-            Err(_) => Box::new(crate::secrets::Unavailable {
-                why: "enclos cannot tell this install apart from others: its data folder cannot be resolved",
+            Err(e) => Box::new(crate::secrets::Unavailable {
+                why: format!("enclos cannot tell this install apart from others: {e}"),
             }),
         };
         Engine::new(
@@ -154,7 +154,7 @@ impl Engine {
             }),
             stop_members: crate::lifecycle::stop::stop,
             secrets: Box::new(crate::secrets::Unavailable {
-                why: "this engine has no secret store",
+                why: "this engine has no secret store".to_owned(),
             }),
         }
     }

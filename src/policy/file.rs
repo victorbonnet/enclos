@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use super::PolicyError;
 use crate::model::policy::{NetLog, NetMode, Policy, TemplateName};
+use crate::model::secret::SecretGrant;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,8 +29,8 @@ pub struct PolicyFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SecretsLayer {
-    pub env: Option<std::collections::BTreeMap<String, String>>,
-    pub env_add: std::collections::BTreeMap<String, String>,
+    pub env: Option<std::collections::BTreeMap<String, SecretGrant>>,
+    pub env_add: std::collections::BTreeMap<String, SecretGrant>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -213,22 +214,25 @@ mod tests {
         let mut policy = Policy::default();
         PolicyFile::parse(
             "a",
-            "[secrets]\nenv = { A = \"secret:home/a\", B = \"secret:home/b\" }",
+            "[secrets]\nenv = { A = \"secret:home/aa\", B = \"secret:home/bb\" }",
         )
         .unwrap()
         .apply(&mut policy);
-        PolicyFile::parse("b", "[secrets]\nenv_add = { B = \"secret:home/c\" }")
+        PolicyFile::parse("b", "[secrets]\nenv_add = { B = \"secret:home/cc\" }")
             .unwrap()
             .apply(&mut policy);
-        assert_eq!(policy.secrets["A"], "secret:home/a");
-        assert_eq!(policy.secrets["B"], "secret:home/c");
+        assert_eq!(policy.secrets["A"].to_string(), "secret:home/aa");
+        assert_eq!(policy.secrets["B"].to_string(), "secret:home/cc");
         PolicyFile::parse("c", "[secrets]\nenv = {}")
             .unwrap()
             .apply(&mut policy);
         assert!(policy.secrets.is_empty());
-        let layer =
-            PolicyFile::parse("adapter", "[secrets]\nenv_add = { X = \"secret:home/x\" }").unwrap();
+        let layer = PolicyFile::parse("adapter", "[secrets]\nenv_add = { X = \"secret:home/xx\" }")
+            .unwrap();
         assert_eq!(layer.beyond_destinations(), ["secrets"]);
+        // A grant that names no secret is refused as the file is read.
+        let err = PolicyFile::parse("d", "[secrets]\nenv = { X = \"home/x\" }").unwrap_err();
+        assert!(err.to_string().contains("secret:<sandbox>/<name>"), "{err}");
     }
 
     #[test]

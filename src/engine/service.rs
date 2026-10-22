@@ -223,7 +223,12 @@ impl Engine {
                                     ],
                                 },
                                 log: self.log_file(name, unit),
-                                env: self.layout.env(),
+                                env: self
+                                    .layout
+                                    .env()
+                                    .into_iter()
+                                    .chain(self.secrets.env())
+                                    .collect(),
                                 stop_timeout: STOP_TIMEOUT,
                             })
                         })

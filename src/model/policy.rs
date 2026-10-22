@@ -17,11 +17,11 @@ pub struct Policy {
     pub fs: FsPolicy,
     pub net: NetPolicy,
     /// Secrets every session and service of the sandbox receives, by the
-    /// environment variable each is set as: `secret:<sandbox>/<name>`
-    /// (ADR 0022). Left out of the snapshot when empty, so a policy without
-    /// any resolves as it did before secrets existed.
+    /// environment variable each is set as (ADR 0022). Left out of the
+    /// snapshot when empty, so a policy without any resolves as it did
+    /// before secrets existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub secrets: std::collections::BTreeMap<String, String>,
+    pub secrets: std::collections::BTreeMap<String, super::secret::SecretGrant>,
 }
 
 /// Paths as written in policy files: absolute, `~/…`, or starting with the

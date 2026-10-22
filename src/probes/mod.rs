@@ -246,10 +246,11 @@ pub struct ProbeInputs {
     pub other_terminal: Option<PathBuf>,
     /// Makes names of things a probe might create unique.
     pub tag: u32,
-    /// The item the host stored for the keychain item probe; none on a dry
-    /// run, or where nothing could be stored, and then that probe is not
-    /// run.
-    pub keychain_item: Option<KeychainItem>,
+    /// The item the host stored for the "read a keychain item" probe, or
+    /// why none could be stored (Linux, no default keychain, a store that
+    /// failed), and then that probe is not run. A dry run on macOS gets a
+    /// placeholder, only to count it.
+    pub keychain_item: Result<KeychainItem, String>,
 }
 
 /// A path as one shell word.
@@ -775,7 +776,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
-    if let Some(item) = &i.keychain_item {
+    if let Ok(item) = &i.keychain_item {
         // Through `security` and the security daemon, as a program in the
         // sandbox would read a secret: closed when the value does not come
         // back. The control reads it on the host.
@@ -866,10 +867,8 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
     if !launch_agents(i).is_dir() {
         absent.push("launch agents (no ~/Library/LaunchAgents here)".to_owned());
     }
-    if i.keychain_item.is_none() {
-        absent.push(
-            "keychain items (enclos could not store a test item in a keychain here)".to_owned(),
-        );
+    if let Err(why) = &i.keychain_item {
+        absent.push(format!("keychain items ({why})"));
     }
     absent
 }
@@ -1124,7 +1123,7 @@ mod tests {
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
-            keychain_item: None,
+            keychain_item: Err("no test item".into()),
         }
     }
 
@@ -1508,7 +1507,7 @@ mod tests {
         let mut i = inputs(dir.path());
         assert!(!probes(&i).iter().any(|p| p.name == "read a keychain item"));
         assert!(not_here(&i).iter().any(|a| a.starts_with("keychain items")));
-        i.keychain_item = Some(KeychainItem {
+        i.keychain_item = Ok(KeychainItem {
             service: "enclos.abc.probe".into(),
             account: "home/probe".into(),
             file: None,

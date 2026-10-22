@@ -14,7 +14,6 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::POLICY_PREFIX as SECRET_PREFIX;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate, validate_secrets};
@@ -259,10 +258,17 @@ impl Engine {
         adapter: Option<AdapterLayer>,
     ) -> Result<PolicySnapshot> {
         let snapshot = policy::resolve(overrides, adapter.as_ref())?;
-        validate(&snapshot.policy, &self.validation_context(name))?;
-        validate_secrets(&snapshot.policy, name)?;
-        self.check_secrets_set(name, &snapshot.policy)?;
+        self.check_policy(name, &snapshot.policy)?;
         Ok(snapshot)
+    }
+
+    /// Every check a policy passes before it is stored, whichever command
+    /// stores it: its paths as they are now, the secrets it grants, and
+    /// that each of those is set.
+    pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+        validate(policy, &self.validation_context(name))?;
+        validate_secrets(policy, name)?;
+        self.check_secrets_set(name, policy)
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
@@ -420,9 +426,9 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
     }
     for (variable, grant) in &new.secrets {
         if old.secrets.get(variable) != Some(grant) {
-            let secret = grant.strip_prefix(SECRET_PREFIX).unwrap_or(grant);
             found.push(format!(
-                "give it secret {secret} as ${variable} (sessions started from now on)"
+                "give it secret {} as ${variable} (sessions started from now on)",
+                grant.0
             ));
         }
     }

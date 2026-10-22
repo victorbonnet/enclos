@@ -76,6 +76,12 @@ pub(super) fn wrap_in(
         .arg(&launch.program)
         .args(&launch.args);
     command.env_clear();
+    // The secrets the policy grants first: what enclos sets or passes on
+    // comes after them and so is never one of theirs, whatever the
+    // validation of the policy let through.
+    for (name, value) in &launch.env {
+        command.env(name, value.expose());
+    }
     for name in PASSED_THROUGH {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
@@ -96,9 +102,6 @@ pub(super) fn wrap_in(
         command.env("TERM", FALLBACK_TERM);
     }
     for (name, value) in environment(ctx) {
-        command.env(name, value);
-    }
-    for (name, value) in &launch.env {
         command.env(name, value);
     }
     command.current_dir(&ctx.home);
@@ -226,6 +229,18 @@ mod tests {
         assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
         assert!(env["PATH"].starts_with("/Users/alice/.enclos/sandboxes/home/home/.local/bin:"));
         assert!(env["PATH"].contains(":/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn no_secret_is_given_as_a_variable_enclos_sets_or_passes_on() {
+        let set = environment(&ctx()).into_iter().map(|(name, _)| name);
+        for name in set.chain(PASSED_THROUGH.iter().map(|n| (*n).to_owned())) {
+            assert!(
+                crate::model::secret::reserved_variable(&name),
+                "{name} is not reserved"
+            );
+        }
+        assert!(crate::model::secret::reserved_variable("LC_CTYPE"));
     }
 
     #[test]

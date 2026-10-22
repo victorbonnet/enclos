@@ -49,10 +49,12 @@ enum SandboxVerb {
         #[arg(required = true)]
         names: Vec<SandboxName>,
     },
-    /// Remove a stopped sandbox, and its home unless --keep-data.
+    /// Remove a stopped sandbox and its secrets, and its home unless
+    /// --keep-data.
     Rm {
         name: SandboxName,
-        /// Keep the sandbox's folder and home on disk.
+        /// Keep the sandbox's folder and home on disk; its secrets go
+        /// still.
         #[arg(long)]
         keep_data: bool,
     },
@@ -135,9 +137,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(left) => {
                     println!("Removed sandbox {name}.");
-                    for secret in left {
+                    for left in left {
                         eprintln!(
-                            "warning: secret {secret} stays in the Keychain; remove it with Keychain Access"
+                            "warning: secret {} stays, and no enclos command reaches it any more: {}",
+                            left.secret, left.why
                         );
                     }
                 }
