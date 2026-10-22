@@ -226,19 +226,6 @@ impl Engine {
         })
     }
 
-    /// Resolves and checks `overrides`, writes them to `policy.toml`, then
-    /// records the snapshot as the active version.
-    pub(super) fn save_policy(
-        &self,
-        lock: &StateLock,
-        by: &Actor,
-        name: &SandboxName,
-        overrides: &str,
-    ) -> Result<PolicyVersion> {
-        let snapshot = self.checked_policy(name, overrides)?;
-        self.store_policy(lock, by, name, overrides, &snapshot, None)
-    }
-
     /// Resolves and checks `overrides` with `runtime`'s endpoints instead of
     /// the installed runtime's, writes them to `policy.toml`, then records
     /// the snapshot as the active version: while a runtime installs, before

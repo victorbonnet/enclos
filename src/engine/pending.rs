@@ -549,40 +549,23 @@ impl Engine {
     }
 
     /// After a failed `runtime install`, resolves the sandbox's policy again
-    /// with the runtime its record has, keeping a change that became pending
-    /// while the installer ran pending: the active policy is resolved from
-    /// its own `policy.toml`, and the pending one from the file.
+    /// with the runtime its record has, as [`Engine::resolve_with_runtime`]
+    /// does: a change that became pending while the installer ran stays
+    /// pending, and an edit of the file not applied stays as it is.
+    /// Returns the version in force.
     pub(super) fn resolve_again(
         &self,
         lock: &StateLock,
         by: &Actor,
         name: &SandboxName,
     ) -> Result<PolicyVersion> {
-        let overrides = self.layout.read_policy(name.as_str())?;
-        let Some((before, _)) = self.state.pending_policy(name)? else {
-            return self.save_policy(lock, by, name, &overrides);
-        };
-        let (version, active) = self.active_policy(name)?;
-        let text = active
-            .overrides_text()
-            .ok_or_else(|| Error::PolicyTextUnknown {
-                sandbox: name.to_string(),
-                version: version.version,
-                file: self.layout.policy_file(name.as_str()),
-            })?;
-        let now = self.checked_policy(name, text)?;
-        let pending = self.checked_policy(name, &overrides)?;
-        let active = (now.id != active.id).then_some(&now);
-        // A pending rollback stays one.
-        let (made, _) =
-            self.state
-                .save_pending(lock, name, &pending, active, by, before.restores)?;
-        Ok(made.unwrap_or(version))
+        self.resolve_with_runtime(lock, by, name)?;
+        Ok(self.active_policy(name)?.0)
     }
 
-    /// Once a runtime is recorded as installed, resolves again what a change
-    /// made while its installer ran resolved without its destinations: the
-    /// active policy and a pending one, each from its own `policy.toml`
+    /// Once a runtime is recorded as installed, or after an install failed,
+    /// resolves again what was resolved with another runtime's destinations:
+    /// the active policy and a pending one, each from its own `policy.toml`
     /// (the file's when that text is not known). A pending rollback keeps
     /// what it restores. An edit of the file not applied stays as it is.
     pub(super) fn resolve_with_runtime(
@@ -591,19 +574,18 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
     ) -> Result<()> {
+        let own_text = |snapshot: &PolicySnapshot| -> Result<String> {
+            match snapshot.overrides_text() {
+                Some(text) => Ok(text.to_owned()),
+                None => Ok(self.layout.read_policy(name.as_str())?),
+            }
+        };
         let (_, active) = self.active_policy(name)?;
-        let now = match active.overrides_text() {
-            Some(text) => Some(self.checked_policy(name, text)?),
-            None => None,
-        }
-        .filter(|now| now.id != active.id && now.policy != active.policy);
+        let now = self.checked_policy(name, &own_text(&active)?)?;
+        let now = (now.id != active.id && now.policy != active.policy).then_some(now);
         match self.state.pending_policy(name)? {
             Some((p, pending)) => {
-                let overrides = match pending.overrides_text() {
-                    Some(text) => text.to_owned(),
-                    None => self.layout.read_policy(name.as_str())?,
-                };
-                let again = self.checked_policy(name, &overrides)?;
+                let again = self.checked_policy(name, &own_text(&pending)?)?;
                 if again.id != pending.id || now.is_some() {
                     self.state
                         .save_pending(lock, name, &again, now.as_ref(), by, p.restores)?;

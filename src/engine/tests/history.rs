@@ -487,6 +487,65 @@ fn a_pending_rollback_stays_one_when_a_destination_joins_it_or_an_install_fails(
 }
 
 #[test]
+fn resolving_again_after_a_failed_install_leaves_an_edit_not_applied_as_it_is() {
+    let (dir, engine, name) = with_sandbox();
+    grant_v2(&dir, &engine, &name, "work");
+    let resolve_again = || {
+        engine
+            .write(
+                &alice(),
+                "test",
+                None,
+                |_| String::new(),
+                |lock| engine.resolve_again(lock, &alice(), &name),
+            )
+            .unwrap()
+    };
+    let by_hand = |engine: &Engine| {
+        let text = engine.layout.read_policy("home").unwrap();
+        let edited = text.replace("allow_add = []", "allow_add = [\"hand.example.com\"]");
+        engine.layout.write_policy("home", &edited).unwrap();
+        edited
+    };
+    // Nothing pending: the active policy stays, and so does the edit.
+    let edited = by_hand(&engine);
+    assert_eq!(resolve_again().version, 2);
+    assert_eq!(engine.layout.read_policy("home").unwrap(), edited);
+    assert!(
+        engine
+            .policy(&name)
+            .unwrap()
+            .snapshot
+            .policy
+            .net
+            .allow
+            .is_empty()
+    );
+    engine
+        .layout
+        .write_policy("home", &edited.replace("\"hand.example.com\"", ""))
+        .unwrap();
+
+    // A pending rollback is resolved from its own text, not the edit.
+    let _sleeping = running(&engine, &name);
+    done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Ask)
+            .unwrap(),
+    );
+    let edited = by_hand(&engine);
+    resolve_again();
+    let (p, pending) = engine.policy(&name).unwrap().pending.unwrap();
+    assert_eq!(p.restores, Some(1));
+    assert!(
+        pending.policy.net.allow.is_empty(),
+        "{:?}",
+        pending.policy.net
+    );
+    assert_eq!(engine.layout.read_policy("home").unwrap(), edited);
+}
+
+#[test]
 fn a_rollback_or_refresh_over_an_edit_not_applied_beside_a_pending_change_is_refused() {
     let (dir, engine, name) = with_sandbox();
     let work = grant_v2(&dir, &engine, &name, "work");
