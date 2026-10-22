@@ -14,11 +14,12 @@
 //! their parent, since the rest of that group is the caller's. Those are
 //! counted but never signalled.
 //!
-//! Known gaps (milestone 1): a process that leaves its group and loses its
-//! parent before the next look (a daemon's double fork), and one that
-//! loses its parent after the program exited, when enclos no longer looks,
-//! are not seen. They keep their Seatbelt restrictions, so this is a
-//! lifecycle bug, not a way out of the sandbox.
+//! A process holding the session's marker (ADR 0030) is a sure member too:
+//! the engine adds it to `tracked`, so a double fork is found and stopped.
+//!
+//! Known gap: a process that closes its marker's descriptor and leaves its
+//! group and parent is seen only by the rules above. It keeps its Seatbelt
+//! restrictions, so this is a lifecycle bug, not a way out of the sandbox.
 
 use std::collections::BTreeSet;
 

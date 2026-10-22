@@ -19,9 +19,10 @@ use super::service::{PROXY_WAIT, STOP_GRACE};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{PsError, group_of, is_same, processes, reference_of_child};
-use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
+use crate::lifecycle::process::{Proc, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::stop::{GRACE, Stopped, Survivor, Why, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -59,8 +60,9 @@ pub enum Left {
 /// A session's program, waited for.
 pub(super) struct Waited {
     pub status: ExitStatus,
-    /// The members it left running, or why they could not be listed.
-    pub left: std::result::Result<Vec<Found>, PsError>,
+    /// The members it left running, or why they could not be listed (its
+    /// processes, or who holds its marker).
+    pub left: Result<Vec<Found>>,
     /// The sure members last seen, recorded when `left` could not be listed.
     pub known: Vec<ProcessRef>,
     pub notes: Vec<String>,
@@ -177,7 +179,8 @@ impl Engine {
         if own_group {
             wrapped.process_group(0);
         }
-        let child = wrapped.spawn().map_err(|e| Error::Session {
+        let marker = self.new_marker(name)?;
+        let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
             what: format!(
                 "could not start {} in {name}: {e}",
                 launch.program.to_string_lossy()
@@ -187,6 +190,8 @@ impl Engine {
             // Before the session is recorded, so that a failure here leaves
             // no session open for a program that is ended.
             let keep_waiting = KeepWaiting::new()?;
+            let root = reference_of_child(&child)?;
+            self.name_marker(name, marked, &root)?;
             let me = std::process::id();
             let mut session = SessionRecord {
                 id: SessionId(0),
@@ -198,7 +203,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 // Read even if the program already exited: it is still a
                 // session, with an exit status to report.
-                root: reference_of_child(&child)?,
+                root,
                 pgid: match (own_group, leads_group) {
                     (true, _) => Some(child.id()),
                     (false, true) => Some(me),
@@ -454,8 +459,16 @@ impl Engine {
             Some(Err(_)) => note(&mut notes, "stopping its members failed".to_owned()),
         }
         // The program's exit is not the session's end: what it left running
-        // keeps the session open, so `show`, `stop` and `rm` still see it.
-        let left = processes().map(|procs| find(&procs, session, &known));
+        // keeps the session open, so `show`, `stop` and `rm` still see it,
+        // what holds its marker included (ADR 0030).
+        let left = (|| -> Result<Vec<Found>> {
+            let procs = processes()?;
+            // After the listing (see `Engine::marked`). Without the marker,
+            // what is left cannot be told, so the session stays open.
+            let held = self.held(&session.sandbox)?;
+            known = marked_in(session, &known, &procs, &held);
+            Ok(find(&procs, session, &known))
+        })();
         Ok(Waited {
             status,
             left,
@@ -474,13 +487,18 @@ impl Engine {
         let mut members = session.clone();
         members.tracked = waited.known.clone();
         members.tracked.extend(sure);
-        if let Err(e) = stop(&members, STOP_GRACE) {
+        // With what holds its marker, looked at again once stopped.
+        if let Err(e) = self.stop_marked(&members, STOP_GRACE, stop) {
             note(
                 &mut waited.notes,
                 format!("could not stop what it left running: {e}"),
             );
         }
-        waited.left = processes().map(|procs| find(&procs, session, &waited.known));
+        let mut known = session.clone();
+        known.tracked = waited.known.clone();
+        waited.left = self
+            .marked_listed(&known)
+            .map(|(procs, marked)| find(&procs, session, &marked.tracked));
     }
 
     /// Ends the session, or, while it left members running or enclos could
@@ -492,7 +510,10 @@ impl Engine {
         waited: &Waited,
     ) -> Result<()> {
         match &waited.left {
-            Ok(left) if left.is_empty() => self.state.end_session(lock, session.id)?,
+            Ok(left) if left.is_empty() => {
+                self.state.end_session(lock, session.id)?;
+                self.forget_marker(session);
+            }
             Ok(left) => {
                 let sure: Vec<ProcessRef> = left.iter().filter_map(Found::sure_ref).collect();
                 self.state.track(lock, session.id, &sure)?;
@@ -520,12 +541,15 @@ impl Engine {
                 Some(service) => format!("the {service} service session {}", session.id),
                 None => format!("the {} session {}", session.kind.as_str(), session.id),
             };
-            let stopped = (self.stop_members)(&session, GRACE).map_err(|e| Error::Session {
-                what: format!("could not stop {label} of sandbox {name}: {e}"),
-            })?;
+            let stopped = self
+                .stop_marked(&session, GRACE, self.stop_members)
+                .map_err(|e| Error::Session {
+                    what: format!("could not stop {label} of sandbox {name}: {e}"),
+                })?;
             match stopped {
                 Stopped::Clean | Stopped::Gone => {
                     self.state.end_session(lock, session.id)?;
+                    self.forget_marker(&session);
                     ended.push(session.id);
                 }
                 Stopped::Survivors(left) => {
@@ -539,6 +563,119 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The folder of the sandbox's markers (ADR 0030).
+    pub(super) fn markers(&self, name: &SandboxName) -> std::path::PathBuf {
+        self.layout.sandbox_dir(name.as_str()).join("members")
+    }
+
+    /// A new marker for a program about to start in sandbox `name`.
+    pub(super) fn new_marker(&self, name: &SandboxName) -> Result<Marker> {
+        let dir = self.markers(name);
+        Marker::new(&dir).map_err(|source| LayoutError::Io { path: dir, source }.into())
+    }
+
+    /// Names a started program's marker after its session's `root`, before
+    /// the session is recorded.
+    pub(super) fn name_marker(
+        &self,
+        name: &SandboxName,
+        marked: marker::Started,
+        root: &ProcessRef,
+    ) -> Result<()> {
+        marked.name(root).map_err(|source| {
+            LayoutError::Io {
+                path: self.markers(name),
+                source,
+            }
+            .into()
+        })
+    }
+
+    /// Removes an ended session's marker, once a fresh look shows nothing
+    /// holds it. A session ends only once nothing of it runs, its marker's
+    /// holders included; this second look keeps the file for one that
+    /// gained the marker since. One left behind is an empty file, which a
+    /// later session cannot take for its own (its name has the root's start
+    /// time).
+    pub(super) fn forget_marker(&self, session: &SessionRecord) {
+        let dir = self.markers(&session.sandbox);
+        if let Ok(held) = marker::holders(&dir)
+            && !held.contains_key(&marker::name_of(&session.root))
+        {
+            let _ = marker::remove(&dir, &session.root);
+        }
+    }
+
+    /// The processes holding each marker of sandbox `name`, by marker.
+    pub(super) fn held(&self, name: &SandboxName) -> Result<Held> {
+        Ok(marker::holders(&self.markers(name))?)
+    }
+
+    /// `session`, with the processes holding its marker added to those it
+    /// tracked (ADR 0030). The processes are listed before `lsof` looks: a
+    /// holder that exits in between, its pid reused, is then listed with
+    /// its own start time and fails the same-process check before a signal,
+    /// where the other order would name the process that reused the pid.
+    pub(super) fn marked(&self, session: &SessionRecord) -> Result<SessionRecord> {
+        Ok(self.marked_listed(session)?.1)
+    }
+
+    /// `marked`, with the listing it was made from, to look at it again.
+    pub(super) fn marked_listed(
+        &self,
+        session: &SessionRecord,
+    ) -> Result<(Vec<Proc>, SessionRecord)> {
+        let procs = processes()?;
+        let held = self.held(&session.sandbox)?;
+        let mut marked = session.clone();
+        marked.tracked = marked_in(session, &session.tracked, &procs, &held);
+        Ok((procs, marked))
+    }
+
+    /// Stops `session`'s members, with what holds its marker (ADR 0030),
+    /// then, whatever came of it, looks at the marker again: a process that
+    /// gained it meanwhile, such as one a member detached during the grace
+    /// period or a child its TERM handler forked, is stopped too, and one
+    /// that survives that is a survivor, so the session stays open.
+    pub(super) fn stop_marked(
+        &self,
+        session: &SessionRecord,
+        grace: Duration,
+        stop: super::StopMembers,
+    ) -> Result<Stopped> {
+        let marked = self.marked(session)?;
+        let first = stop(&marked, grace)?;
+        // Looked at again whatever came of it, survivors included: a child
+        // a member's TERM handler forked before it exited is an orphan only
+        // the marker proves the session's, so it is reported as not
+        // signalled until it is.
+        let mut again = self.marked(session)?;
+        if again.tracked.iter().all(|r| marked.tracked.contains(r)) {
+            return Ok(first);
+        }
+        // What the first stop knew stays known: the first look's holders,
+        // and the members it signalled that survived, which may since have
+        // closed the marker or lost their parent.
+        let earlier: Vec<Survivor> = match &first {
+            Stopped::Survivors(left) => left.clone(),
+            Stopped::Clean | Stopped::Gone => Vec::new(),
+        };
+        let signalled = earlier
+            .iter()
+            .filter(|s| !matches!(s.why, Why::NotSignalled))
+            .map(|s| ProcessRef {
+                pid: s.member.pid,
+                started: s.member.started.clone(),
+            });
+        for known in marked.tracked.iter().cloned().chain(signalled) {
+            if !again.tracked.contains(&known) {
+                again.tracked.push(known);
+            }
+        }
+        let second = stop(&again, grace)?;
+        Ok(merged(first, second, is_same)?)
     }
 
     /// What `connect` would start, without starting anything.
@@ -822,4 +959,62 @@ impl Drop for KeepWaiting {
             signal_hook::low_level::unregister(id);
         }
     }
+}
+
+/// What two stops of a session came to, the second after the marker gained
+/// holders: the second's survivors, and each survivor of the first that
+/// `runs` still and the second did not report, as one only counted, which
+/// is never signalled for it but never dropped either. `Gone` only when
+/// both found nothing.
+pub(super) fn merged(
+    first: Stopped,
+    second: Stopped,
+    runs: impl Fn(&ProcessRef) -> std::result::Result<bool, crate::lifecycle::process::PsError>,
+) -> std::result::Result<Stopped, crate::lifecycle::process::PsError> {
+    let mut left = match &second {
+        Stopped::Survivors(left) => left.clone(),
+        Stopped::Clean | Stopped::Gone => Vec::new(),
+    };
+    if let Stopped::Survivors(earlier) = &first {
+        for s in earlier {
+            let process = ProcessRef {
+                pid: s.member.pid,
+                started: s.member.started.clone(),
+            };
+            if !left.iter().any(|l| l.member.pid == s.member.pid) && runs(&process)? {
+                left.push(s.clone());
+            }
+        }
+    }
+    Ok(match (left.is_empty(), second, first) {
+        (false, ..) => Stopped::Survivors(left),
+        (true, Stopped::Gone, Stopped::Gone) => Stopped::Gone,
+        (true, ..) => Stopped::Clean,
+    })
+}
+
+/// The processes holding each marker of a sandbox, by marker file name.
+pub(super) type Held = std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>;
+
+/// `tracked`, with the processes in `procs` that hold `session`'s marker
+/// (ADR 0030).
+pub(super) fn marked_in(
+    session: &SessionRecord,
+    tracked: &[ProcessRef],
+    procs: &[Proc],
+    held: &Held,
+) -> Vec<ProcessRef> {
+    let mut tracked = tracked.to_vec();
+    if let Some(pids) = held.get(&marker::name_of(&session.root)) {
+        for p in procs.iter().filter(|p| pids.contains(&p.pid)) {
+            let holder = ProcessRef {
+                pid: p.pid,
+                started: p.started.clone(),
+            };
+            if !tracked.contains(&holder) {
+                tracked.push(holder);
+            }
+        }
+    }
+    tracked
 }

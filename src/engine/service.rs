@@ -499,13 +499,16 @@ impl Engine {
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
-        let child = wrapped
-            .process_group(0)
-            .spawn()
-            .map_err(|e| Error::Session {
-                what: format!("could not start the {kind} {service} service: {e}"),
-            })?;
+        let marker = self.new_marker(name)?;
+        let (child, marked) =
+            marker
+                .spawn(wrapped.process_group(0))
+                .map_err(|e| Error::Session {
+                    what: format!("could not start the {kind} {service} service: {e}"),
+                })?;
         let recorded = (|| -> Result<SessionRecord> {
+            let root = reference_of_child(&child)?;
+            self.name_marker(name, marked, &root)?;
             let mut session = SessionRecord {
                 id: SessionId(0),
                 sandbox: name.clone(),
@@ -516,7 +519,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 // In a group made for it, which it leads.
                 pgid: Some(child.id()),
-                root: reference_of_child(&child)?,
+                root,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,
@@ -541,9 +544,21 @@ impl Engine {
         kind: SessionKind,
     ) -> Result<()> {
         for session in self.state.sessions(name, true)? {
-            if session.kind == kind && !is_same(&session.root)? {
-                self.state.end_session(lock, session.id)?;
+            if session.kind != kind || is_same(&session.root)? {
+                continue;
             }
+            // What it tracked, or what holds its marker (ADR 0030), still
+            // runs: the session stays open, for a stop to end it.
+            // One that cannot be looked at stays open too, rather than
+            // keep the new service from starting.
+            let Ok((procs, marked)) = self.marked_listed(&session) else {
+                continue;
+            };
+            if !crate::lifecycle::members::is_gone(&procs, &marked) {
+                continue;
+            }
+            self.state.end_session(lock, session.id)?;
+            self.forget_marker(&session);
         }
         Ok(())
     }
