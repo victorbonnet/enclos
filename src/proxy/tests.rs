@@ -375,8 +375,12 @@ fn upstream_reading_all(reply: &'static [u8]) -> (u16, std::sync::mpsc::Receiver
     (port, rx)
 }
 
-#[test]
-fn a_plain_http_connection_carries_one_request_and_its_body() {
+const SECOND: &str = "GET /second HTTP/1.1\r\nHost: other.example.net\r\n\r\n";
+
+/// Sends `writes` to the proxy one after the other, for an allowed host
+/// whose server reads until the proxy is done sending; returns what that
+/// server read, and what the client read back.
+fn plain_http_exchange(writes: &[&str], then_close: bool) -> (String, String) {
     let (port, received) = upstream_reading_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let proxy = start(
         &[format!("plain.example.com:{port}")],
@@ -384,39 +388,104 @@ fn a_plain_http_connection_carries_one_request_and_its_body() {
         loopback_is_global,
     );
     let mut conn = TcpStream::connect(proxy.addr).unwrap();
-    // The second request, in the same write and in a later one, would reach
-    // the same address with another `Host`.
-    let second = "GET /second HTTP/1.1\r\nHost: other.example.net\r\n\r\n";
-    let writes = [
-        format!(
-            "POST http://plain.example.com:{port}/form HTTP/1.1\r\nContent-Length: 9\r\n\r\nname=ca"
-        ),
-        format!("li{second}"),
-        second.to_owned(),
-    ];
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     for write in writes {
-        conn.write_all(write.as_bytes()).unwrap();
+        let write = write.replace("{port}", &port.to_string());
+        // Once the proxy is done with the client, a later write may fail.
+        let _ = conn.write_all(write.as_bytes());
         std::thread::sleep(Duration::from_millis(100));
     }
-    conn.shutdown(std::net::Shutdown::Write).unwrap();
-    let all = String::from_utf8(received.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    if then_close {
+        let _ = conn.shutdown(std::net::Shutdown::Write);
+    }
+    let all = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let mut reply = Vec::new();
+    let _ = conn.read_to_end(&mut reply);
+    (
+        String::from_utf8(all).unwrap(),
+        String::from_utf8_lossy(&reply).into_owned(),
+    )
+}
+
+#[test]
+fn a_plain_http_connection_carries_one_request_and_its_body() {
+    // The body comes in two writes; the second request after it, in the
+    // same write and in a later one, would reach the same address with
+    // another `Host`. The client never closes: sending past the body is
+    // enough for the server to be told the client is done.
+    let head = "POST http://plain.example.com:{port}/form HTTP/1.1\r\nContent-Length: 9\r\n\r\n";
+    let (all, reply) = plain_http_exchange(
+        &[&format!("{head}name=ca"), &format!("li{SECOND}"), SECOND],
+        false,
+    );
     assert!(all.starts_with("POST /form HTTP/1.1\r\n"), "{all}");
     assert!(all.ends_with("\r\n\r\nname=cali"), "{all}");
-    assert!(!all.contains("other.example.net"), "{all}");
-    let mut reply = String::new();
-    conn.read_to_string(&mut reply).unwrap();
     assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
 }
 
 #[test]
-fn a_plain_http_body_of_unknown_length_is_refused() {
-    let proxy = start(&[], LOCAL, loopback_is_global);
-    let (_conn, reply) = send(
-        proxy.addr,
-        "POST http://plain.example.com/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n",
+fn a_second_request_sent_with_the_head_is_dropped() {
+    let cases = [
+        (
+            "GET http://plain.example.com:{port}/ HTTP/1.1\r\n\r\n",
+            "\r\n\r\n",
+        ),
+        (
+            "POST http://plain.example.com:{port}/ HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+            "\r\n\r\nbody",
+        ),
+    ];
+    for (first, ends) in cases {
+        let (all, reply) = plain_http_exchange(&[&format!("{first}{SECOND}")], true);
+        assert!(all.ends_with(ends), "{first}: {all}");
+        assert!(!all.contains("other.example.net"), "{first}: {all}");
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{first}: {reply}");
+    }
+}
+
+#[test]
+fn a_tunnel_keeps_what_the_client_sent_with_its_connect() {
+    let (port, received) = upstream_reading_all(b"");
+    let proxy = start(
+        &[format!("tunnel.example.com:{port}")],
+        LOCAL,
+        loopback_is_global,
     );
-    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
-    assert!(reply.contains("Content-Length"), "{reply}");
+    let mut conn = TcpStream::connect(proxy.addr).unwrap();
+    conn.write_all(
+        format!("CONNECT tunnel.example.com:{port} HTTP/1.1\r\n\r\nhello, early").as_bytes(),
+    )
+    .unwrap();
+    conn.shutdown(std::net::Shutdown::Write).unwrap();
+    let all = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(all, b"hello, early");
+}
+
+#[test]
+fn a_plain_http_head_a_server_could_split_otherwise_is_refused_and_recorded() {
+    let (port, received) = upstream_reading_all(b"");
+    let proxy = start(
+        &[format!("plain.example.com:{port}")],
+        LOCAL,
+        loopback_is_global,
+    );
+    let heads = [
+        "POST http://plain.example.com:{port}/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nbody\r\n0\r\n\r\n",
+        "GET http://plain.example.com:{port}/ HTTP/1.1\r\nX: a\n\nGET /admin HTTP/1.1\nHost: other.example.net\nY: z\r\n\r\n",
+    ];
+    for (i, head) in heads.iter().enumerate() {
+        let head = head.replace("{port}", &port.to_string());
+        let (_conn, reply) = send(proxy.addr, &head);
+        assert!(reply.starts_with("HTTP/1.1 400"), "{head}: {reply}");
+        assert!(reply.contains("Transfer-Encoding"), "{reply}");
+        let events = proxy.log.wait_for(i + 1);
+        assert_eq!(events[i].host, "plain.example.com", "{head}");
+        assert_eq!(events[i].reason, Some(Reason::BadRequest), "{head}");
+    }
+    assert!(
+        received.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the server was reached"
+    );
 }
 
 #[test]

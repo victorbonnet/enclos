@@ -202,6 +202,10 @@ impl Proxy {
         if !allowed(&policy, &dest) {
             return Err(Reason::NotAllowed);
         }
+        // Refused once the destination is known, so the refusal is recorded.
+        if let Request::Http { body: None, .. } = request {
+            return Err(Reason::BadRequest);
+        }
         // From here on the policy allows the destination: a failure to reach
         // it is not a refusal.
         event.verdict = Verdict::Allowed;
@@ -432,7 +436,8 @@ fn forward(
     // tunnel's client already had its `200`.
     let mut unanswered = None;
     // How much more of the client's bytes go upstream: a tunnel's all of
-    // them, a plain-HTTP request's only its body.
+    // them, a plain-HTTP request's only its body, which `open` made sure
+    // the head gives.
     let mut room = None;
     let mut first = match request {
         Request::Connect { .. } => {
@@ -453,7 +458,7 @@ fn forward(
             body,
             ..
         } => {
-            room = Some(body);
+            room = Some(body.unwrap_or(0));
             let dest = destination(&event.host, event.port);
             unanswered = Some(response(
                 "504 Gateway Timeout",
@@ -585,9 +590,10 @@ fn relay(
 /// nothing for that long. Returns the bytes that reached `to`, also when an
 /// error, such as a reset, ended it.
 ///
-/// With `room`, only that many bytes reach `to`. What `from` sends after
-/// them is read and dropped, and is no activity: a plain-HTTP client's
-/// second request, which could name another site on the same address.
+/// With `room`, only that many bytes reach `to`, and the copy ends once
+/// `from` sends more, dropping it: a plain-HTTP client's second request,
+/// which could name another site on the same address. `to` is then told the
+/// client is done, and still answers the first.
 fn copy(
     mut from: &TcpStream,
     to: &TcpStream,
@@ -610,24 +616,24 @@ fn copy(
         }
         match from.read(&mut buf) {
             Ok(0) => return moved,
-            Ok(n) => {
+            Ok(read) => {
                 let n = match &mut room {
                     Some(room) => {
-                        let n = n.min(usize::try_from(*room).unwrap_or(usize::MAX));
+                        let n = read.min(usize::try_from(*room).unwrap_or(usize::MAX));
                         *room -= n as u64;
                         n
                     }
-                    None => n,
+                    None => read,
                 };
-                if n == 0 {
-                    continue;
-                }
                 activity.moved();
                 if let Err(e) = write_counted(to, &buf[..n], activity, &mut moved) {
                     // A write times out after the limit: `to` stopped reading.
                     if timed_out(&e) {
                         activity.close_idle();
                     }
+                    return moved;
+                }
+                if n < read {
                     return moved;
                 }
             }
@@ -678,7 +684,7 @@ fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Resul
         ),
         (_, Reason::BadRequest) => (
             "400 Bad Request",
-            "enclos: the proxy cannot serve this request: send CONNECT host:port, or a plain-HTTP request with an absolute URL and, for a body, a Content-Length.\n".to_owned(),
+            "enclos: the proxy cannot serve this request. It serves CONNECT host:port, and plain-HTTP requests with an absolute URL, header lines of the form `Name: value` and, for a body, one Content-Length (no Transfer-Encoding).\n".to_owned(),
         ),
         (_, Reason::PolicyUnreadable) => {
             let sandbox = &event.sandbox;
