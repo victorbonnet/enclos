@@ -1,4 +1,5 @@
-//! `enclos connect`: a shell, or a command, inside a sandbox, in this terminal.
+//! `enclos connect`: a shell, or a command, inside a sandbox, in this
+//! terminal; and `enclos exec`: one command, for a script or a program.
 
 use std::ffi::OsString;
 
@@ -20,24 +21,16 @@ pub struct ConnectArgs {
     command: Vec<OsString>,
 }
 
+#[derive(Args)]
+pub struct ExecArgs {
+    sandbox: SandboxName,
+    /// The command to run, after `--`: `enclos exec lab -- hermes -p scout chat -q "hello"`.
+    #[arg(last = true, required = true)]
+    command: Vec<OsString>,
+}
+
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> Result<u8> {
-    // The runtime's own clients need its service, and a session reaches it
-    // only on the port it holds when the session starts (ADR 0028), so it
-    // is started first. On stderr, so a command's output stays clean.
-    if confirm != Confirm::DryRun {
-        let sandbox = &args.sandbox;
-        let mut say = |what: String| eprintln!("enclos: {what}");
-        if let Some(ServiceWait {
-            service,
-            late: Some(why),
-            ..
-        }) = engine.start_listener_service(by, sandbox, &mut say)?
-        {
-            eprintln!(
-                "enclos: connecting while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
-            );
-        }
-    }
+    start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.connect(by, &args.sandbox, args.command, confirm)? {
         Planned::DryRun(plan) => {
             plan.changes.iter().for_each(|c| println!("Would {c}."));
@@ -45,11 +38,55 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
         }
         Planned::Done(end) => end,
     };
-    report_end(&args.sandbox, &end);
+    finish(engine, &args.sandbox, &end)
+}
+
+/// `enclos exec`: one command in the sandbox, which exits with its code.
+pub fn exec(engine: &Engine, by: &Actor, confirm: Confirm, args: ExecArgs) -> Result<u8> {
+    start_service_first(engine, by, &args.sandbox, confirm)?;
+    let end = match engine.exec(by, &args.sandbox, args.command, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            return Ok(exit::OK);
+        }
+        Planned::Done(end) => end,
+    };
+    finish(engine, &args.sandbox, &end)
+}
+
+/// The runtime's own clients need its service, and a session reaches it
+/// only on the port it holds when the session starts (ADR 0028), so it is
+/// started first. On stderr, so a command's output stays clean.
+fn start_service_first(
+    engine: &Engine,
+    by: &Actor,
+    sandbox: &SandboxName,
+    confirm: Confirm,
+) -> Result<()> {
+    if confirm == Confirm::DryRun {
+        return Ok(());
+    }
+    let mut say = |what: String| eprintln!("enclos: {what}");
+    if let Some(ServiceWait {
+        service,
+        late: Some(why),
+        ..
+    }) = engine.start_listener_service(by, sandbox, &mut say)?
+    {
+        eprintln!(
+            "enclos: starting the session while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
+        );
+    }
+    Ok(())
+}
+
+/// Reports the session's end and returns the command's exit code.
+fn finish(engine: &Engine, sandbox: &SandboxName, end: &SessionEnd) -> Result<u8> {
+    report_end(sandbox, end);
     // Agents made or deleted in the session with the runtime's own commands.
     // On stderr, so a command's output stays clean; the session's exit code
     // stays the command's.
-    match super::agent::check_notes(engine, &args.sandbox, false) {
+    match super::agent::check_notes(engine, sandbox, false) {
         Ok(notes) => notes.iter().for_each(|note| eprintln!("enclos: {note}")),
         Err(e) => eprintln!("enclos: could not check the sandbox's agents: {e}"),
     }

@@ -39,6 +39,8 @@ enum Command {
     Sandbox(cli::sandbox::SandboxArgs),
     /// Open a shell, or run a command, inside a sandbox.
     Connect(cli::connect::ConnectArgs),
+    /// Run one command inside a sandbox, for a script or another program; exits with its code.
+    Exec(cli::connect::ExecArgs),
     /// Install a runtime in a sandbox.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
@@ -124,6 +126,7 @@ fn run(cli: Cli) -> Result<u8> {
         }) => Ok(print_verify(&engine.verify_audit()?)),
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
+        Command::Exec(args) => cli::connect::exec(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),

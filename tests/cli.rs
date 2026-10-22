@@ -419,6 +419,49 @@ fn editor(home: &Home, script: &str) -> String {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
+    use std::io::Write;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "echo out; exit 7"]);
+    assert_eq!(out.code(), 7, "stderr: {}", out.stderr());
+    assert_eq!(out.stdout(), "out\n");
+    // Its input is the caller's: a script can pipe into it.
+    let mut child = home
+        .command(&["exec", "home", "--", "/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped in\n")
+        .unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.ok().stdout(), "piped in\n");
+
+    // Each is a session of its own, recorded as an exec and audited.
+    let audit = home.run(&["audit"]).ok().stdout();
+    assert_eq!(audit.matches("exec home").count(), 2, "{audit}");
+    let out = home.run(&["exec", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    let out = home.run(&["--dry-run", "exec", "home", "--", "/bin/ls"]);
+    assert!(
+        out.ok().stdout().contains("Would run `/bin/ls`"),
+        "{}",
+        out.stdout()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn policy_history_diff_rollback_and_refresh() {
     let home = Home::new();
     home.init(1);

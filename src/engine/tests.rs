@@ -6211,5 +6211,6 @@ mod listener {
     }
 }
 
+mod exec;
 mod history;
 mod pending;

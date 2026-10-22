@@ -67,7 +67,7 @@ enclos connect lab -- hermes -p scout    # the same agent, without the wrapper
 enclos connect lab                       # a shell in the sandbox, for anything else
 ```
 
-enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
+enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it. From a script, or anything else that is not you at a terminal, use `enclos exec lab -- <command>`: it runs one command as a session of its own, with the input and output it is given, and exits with the command's code.
 
 Until you run the sandbox (below), only what you run in `connect` runs: the Hermes gateway, which serves scheduled jobs and messaging for every agent, is not running yet.
 

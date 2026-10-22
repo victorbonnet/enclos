@@ -22,6 +22,8 @@ impl fmt::Display for SessionId {
 pub enum SessionKind {
     /// `enclos connect`, in the user's terminal.
     Interactive,
+    /// `enclos exec`: one command, for a script or another program.
+    Exec,
     /// One of the runtime's background services, run by `enclos launch`
     /// for the service manager.
     Service,
@@ -33,6 +35,7 @@ impl SessionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SessionKind::Interactive => "interactive",
+            SessionKind::Exec => "exec",
             SessionKind::Service => "service",
             SessionKind::Proxy => "proxy",
         }
@@ -45,6 +48,7 @@ impl FromStr for SessionKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         [
             SessionKind::Interactive,
+            SessionKind::Exec,
             SessionKind::Service,
             SessionKind::Proxy,
         ]

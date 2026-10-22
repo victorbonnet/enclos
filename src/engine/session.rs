@@ -104,6 +104,37 @@ impl Engine {
             .map(Planned::Done)
     }
 
+    /// Runs one command in the sandbox as an exec session, with this
+    /// process's input and output, and returns when it exits: for a script
+    /// or another program, as `connect` is for a person. A connect session
+    /// holds back a runtime's settings restart (ADR 0031); an exec session
+    /// does not.
+    pub fn exec(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: Vec<OsString>,
+        confirm: Confirm,
+    ) -> Result<Planned<SessionEnd>> {
+        if command.is_empty() {
+            return Err(Error::Session {
+                what: "no command to run: give one after `--`, such as `enclos exec lab -- ls`"
+                    .into(),
+            });
+        }
+        if confirm == Confirm::DryRun {
+            return self.plan_connect(name, &command).map(Planned::DryRun);
+        }
+        self.run_in_sandbox_as(
+            by,
+            name,
+            SandboxCommand::new(command),
+            "exec",
+            SessionKind::Exec,
+        )
+        .map(Planned::Done)
+    }
+
     /// Runs `command` in the sandbox, in this terminal, as a recorded
     /// session (design §8 steps 1-6), and returns when it exits.
     pub(super) fn run_in_sandbox(
@@ -112,6 +143,18 @@ impl Engine {
         name: &SandboxName,
         command: SandboxCommand,
         audit_name: &str,
+    ) -> Result<SessionEnd> {
+        self.run_in_sandbox_as(by, name, command, audit_name, SessionKind::Interactive)
+    }
+
+    /// [`Engine::run_in_sandbox`], recording a session of `kind`.
+    fn run_in_sandbox_as(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        kind: SessionKind,
     ) -> Result<SessionEnd> {
         let command = command.into_words();
         let summary = |(session, ..): &(SessionRecord, _, _, _)| format!("session {}", session.id);
@@ -129,7 +172,8 @@ impl Engine {
         self.wait_service_proxy(name)?;
         let (session, mut child, _keep_waiting, unreachable) =
             self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
-                let started = self.start_in_sandbox(lock, name, &command, own_group, leads_group);
+                let started =
+                    self.start_in_sandbox(lock, name, &command, own_group, leads_group, kind);
                 self.failed_on_error(lock, name, audit_name, started)
             })?;
 
@@ -150,6 +194,7 @@ impl Engine {
         command: &[OsString],
         own_group: bool,
         leads_group: bool,
+        kind: SessionKind,
     ) -> Result<(SessionRecord, Child, KeepWaiting, Option<String>)> {
         let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
@@ -199,7 +244,7 @@ impl Engine {
             let mut session = SessionRecord {
                 id: SessionId(0),
                 sandbox: name.clone(),
-                kind: SessionKind::Interactive,
+                kind,
                 service: None,
                 version: version.version,
                 snapshot: snapshot.id,
