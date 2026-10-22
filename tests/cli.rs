@@ -1367,6 +1367,11 @@ fn start_and_stop_take_several_sandboxes() {
     let out = home.run(&["sandbox", "stop", "home", "nope"]);
     assert_eq!(out.code(), 1);
     assert!(out.stdout().is_empty(), "{}", out.stdout());
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
+    );
     assert_eq!(home.audit_lines().len(), before);
 
     let out = home.run(&["sandbox", "stop", "home", "lab", "home"]);

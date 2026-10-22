@@ -110,13 +110,25 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             }
         }
         SandboxVerb::Start { names } => {
-            return each(engine, &names, |name| start(engine, by, name, confirm));
+            return each(
+                &names,
+                |n| engine.show_sandbox(n).map(drop),
+                |name| start(engine, by, name, confirm),
+            );
         }
         SandboxVerb::Stop { names } => {
-            return each(engine, &names, |name| stop(engine, by, name, confirm));
+            return each(
+                &names,
+                |n| engine.show_sandbox(n).map(drop),
+                |name| stop(engine, by, name, confirm),
+            );
         }
         SandboxVerb::Restart { names } => {
-            return each(engine, &names, |name| restart(engine, by, name, confirm));
+            return each(
+                &names,
+                |n| engine.show_sandbox(n).map(drop),
+                |name| restart(engine, by, name, confirm),
+            );
         }
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
@@ -242,25 +254,32 @@ fn print_show(v: &SandboxView) {
     }
 }
 
-/// Runs `verb` on each sandbox named, in order, once every name is known
-/// to be a sandbox, so a mistyped name changes nothing. A sandbox named
-/// twice is done once. The exit code is the worst of theirs; an error ends
-/// it at once, after the sandboxes before it were done.
+/// Runs `verb` on each sandbox named, in order, once `known` accepted every
+/// name, so a mistyped name changes nothing. A sandbox named twice is done
+/// once. A sandbox that fails is said, as for a single one, and the next
+/// one is still done: one that cannot stop does not keep the others
+/// running. The exit code is the highest of theirs.
 fn each(
-    engine: &Engine,
     names: &[SandboxName],
+    known: impl Fn(&SandboxName) -> Result<()>,
     mut verb: impl FnMut(&SandboxName) -> Result<u8>,
 ) -> Result<u8> {
     let mut seen = Vec::new();
     for name in names {
         if !seen.contains(&name) {
-            engine.show_sandbox(name)?;
+            known(name)?;
             seen.push(name);
         }
     }
     let mut code = exit::OK;
     for name in seen {
-        code = code.max(verb(name)?);
+        code = code.max(match verb(name) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                e.exit_code()
+            }
+        });
     }
     Ok(code)
 }
@@ -357,4 +376,62 @@ fn print_started(engine: &Engine, name: &SandboxName, labels: &[ServiceLabel]) -
         PROXY_WAIT.as_secs()
     );
     Ok(exit::ERROR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclos::error::Error;
+
+    fn names(list: &[&str]) -> Vec<SandboxName> {
+        list.iter().map(|n| n.parse().unwrap()).collect()
+    }
+
+    fn known(name: &SandboxName) -> Result<()> {
+        match name.as_str() {
+            "nope" => Err(Error::NoSuchSandbox {
+                name: name.to_string(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn each_sandbox_is_done_once_in_order() {
+        let mut done = Vec::new();
+        let code = each(&names(&["home", "lab", "home"]), known, |n| {
+            done.push(n.to_string());
+            Ok(exit::OK)
+        });
+        assert_eq!(code.unwrap(), exit::OK);
+        assert_eq!(done, ["home", "lab"]);
+    }
+
+    #[test]
+    fn a_name_that_is_no_sandbox_does_nothing() {
+        let mut done = Vec::new();
+        let got = each(&names(&["home", "nope"]), known, |n| {
+            done.push(n.to_string());
+            Ok(exit::OK)
+        });
+        assert!(matches!(got, Err(Error::NoSuchSandbox { .. })), "{got:?}");
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    #[test]
+    fn one_that_fails_does_not_stop_the_others_and_sets_the_code() {
+        let mut done = Vec::new();
+        let code = each(&names(&["home", "lab", "work"]), known, |n| {
+            done.push(n.to_string());
+            match n.as_str() {
+                "home" => Err(Error::NoSuchSandbox {
+                    name: n.to_string(),
+                }),
+                "lab" => Ok(exit::ERROR),
+                _ => Ok(exit::OK),
+            }
+        });
+        assert_eq!(code.unwrap(), exit::ERROR);
+        assert_eq!(done, ["home", "lab", "work"]);
+    }
 }
