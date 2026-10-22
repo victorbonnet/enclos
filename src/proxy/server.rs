@@ -773,7 +773,11 @@ fn check_name(
     loop {
         if held.len() >= needed {
             let hello = match hello::parse(&held) {
-                FirstBytes::Incomplete { .. } if held.len() >= hello::MAX_HELLO => {
+                // One that would need more than the most held is unreadable
+                // now, not once that much came.
+                FirstBytes::Incomplete { needed }
+                    if needed > hello::MAX_HELLO || held.len() >= hello::MAX_HELLO =>
+                {
                     FirstBytes::Unreadable
                 }
                 FirstBytes::Incomplete { needed: more } => {

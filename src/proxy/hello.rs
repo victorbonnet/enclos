@@ -10,8 +10,8 @@
 //! is unreadable.
 
 /// The most of a client's first bytes held to find its hello: a ClientHello
-/// with post-quantum key shares stays well under this. Once this much has
-/// arrived without a whole hello, it is unreadable.
+/// with post-quantum key shares stays well under this. A hello that is not
+/// whole within it is unreadable, as soon as its records say it cannot be.
 pub const MAX_HELLO: usize = 64 * 1024;
 
 /// What a client's first bytes say about the name it asks for.

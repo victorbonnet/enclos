@@ -1306,6 +1306,24 @@ fn a_tunnel_whose_tls_does_not_read_as_one_hello_is_closed() {
 }
 
 #[test]
+fn a_hello_that_says_it_is_longer_than_the_cap_is_closed_at_once() {
+    let (port, received) = upstream(b"pong");
+    let proxy = api(port);
+    let mut conn = tunnel(&proxy, "api.example.com", port);
+    // A first record of 65,535 bytes holding a handshake of 16 MiB: it
+    // could never be whole within the cap, so nothing more is waited for.
+    conn.write_all(&[0x16, 3, 1, 0xff, 0xff, 0x01, 0xff, 0xff, 0xff])
+        .unwrap();
+    closed_soon(&mut conn);
+    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    let e = closed(&proxy);
+    assert_eq!(
+        (e.verdict, e.reason, e.bytes_up),
+        (Verdict::Denied, Some(Reason::HelloUnreadable), 0)
+    );
+}
+
+#[test]
 fn a_hello_that_never_ends_is_closed_at_the_cap() {
     let (port, received) = upstream(b"pong");
     let proxy = api(port);
