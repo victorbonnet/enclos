@@ -1390,6 +1390,31 @@ fn start_and_stop_take_several_sandboxes() {
     );
 }
 
+/// A reader that leaves before `enclos` prints, as `| head -0` does, ends
+/// it by SIGPIPE, as any Unix tool, not by a panic.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reader_that_left_ends_a_listing_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home = Home::new();
+    home.init(1);
+    for name in ["home", "lab"] {
+        home.run(&["sandbox", "create", name]).ok();
+    }
+    let mut child = home
+        .command(&["sandbox", "list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.signal(), Some(13), "{:?} {stderr}", out.status);
+}
+
 /// Records Hermes as the runtime of sandbox `name` without installing it,
 /// and gives back a way to make a Hermes profile in the sandbox home as
 /// `hermes profile create` would, so the agent commands have something to
