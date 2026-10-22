@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
 
@@ -13,6 +14,14 @@ pub struct Launchd {
 
 /// `launchctl print` of a service the domain does not have.
 const NOT_FOUND: i32 = 113;
+/// `launchctl bootout` of a job launchd is still ending.
+const IN_PROGRESS: i32 = 36;
+/// How long a job may take to leave launchd after `bootout`: longer than
+/// any unit's `ExitTimeOut` (`STOP_TIMEOUT`, 95 s), after which launchd
+/// kills it.
+const UNLOAD_WAIT: Duration = Duration::from_secs(150);
+/// How often launchd is asked whether the job is gone meanwhile.
+const UNLOAD_POLL: Duration = Duration::from_millis(100);
 
 impl Launchd {
     pub fn for_user(user_home: &Path) -> Launchd {
@@ -50,22 +59,47 @@ impl Launchd {
         Ok(format!("{}/{label}", Self::domain()?))
     }
 
-    /// Unloads the job, which ends its process; nothing to do when launchd
-    /// has no such job.
+    /// Unloads the job, which ends its process, and waits until launchd no
+    /// longer has it: `bootout` can return while launchd is still ending
+    /// the job (about 0.7 s for a Hermes gateway on macOS 26.5), and loading
+    /// the same label meanwhile fails with `Bootstrap failed: 5`. Nothing to
+    /// do when launchd has no such job.
     fn bootout(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
         if self.status(label)? == ServiceStatus::NotLoaded {
             return Ok(());
         }
         let out = launchctl(&["bootout", &Self::target(label)?])?;
-        if !out.status.success() && self.status(label)? != ServiceStatus::NotLoaded {
+        let ending = out.status.success() || out.status.code() == Some(IN_PROGRESS);
+        let wait = if ending { UNLOAD_WAIT } else { Duration::ZERO };
+        if !until_unloaded(|| self.status(label), wait, UNLOAD_POLL)? {
+            let why = match ending {
+                true => format!("it was still loaded after {} s", UNLOAD_WAIT.as_secs()),
+                false => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            };
             return Err(ServiceError {
-                what: format!(
-                    "launchd did not stop {label}: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
+                what: format!("launchd did not stop {label}: {why}"),
             });
         }
         Ok(())
+    }
+}
+
+/// Whether `status` says the job is unloaded within `wait`, asking every
+/// `poll`; asked once with no wait.
+fn until_unloaded(
+    status: impl Fn() -> Result<ServiceStatus, ServiceError>,
+    wait: Duration,
+    poll: Duration,
+) -> Result<bool, ServiceError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if status()? == ServiceStatus::NotLoaded {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(poll);
     }
 }
 
@@ -315,5 +349,39 @@ mod tests {
     #[test]
     fn markup_in_values_is_escaped() {
         assert_eq!(escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+    }
+
+    #[test]
+    fn a_job_launchd_is_still_ending_is_waited_for() {
+        let asked = std::cell::Cell::new(0);
+        let status = || {
+            asked.set(asked.get() + 1);
+            Ok(match asked.get() {
+                1..=3 => ServiceStatus::Running { pid: 1 },
+                _ => ServiceStatus::NotLoaded,
+            })
+        };
+        let poll = Duration::from_millis(1);
+        assert!(until_unloaded(status, Duration::from_secs(5), poll).unwrap());
+        assert_eq!(asked.get(), 4);
+    }
+
+    #[test]
+    fn a_job_still_loaded_at_the_deadline_is_not_unloaded() {
+        let asked = std::cell::Cell::new(0);
+        let status = || {
+            asked.set(asked.get() + 1);
+            Ok(ServiceStatus::Loaded)
+        };
+        let poll = Duration::from_millis(1);
+        assert!(!until_unloaded(status, Duration::ZERO, poll).unwrap());
+        assert_eq!(asked.get(), 1, "no wait asks once");
+        assert!(!until_unloaded(status, Duration::from_millis(20), poll).unwrap());
+        let failing = || {
+            Err(ServiceError {
+                what: "no domain".into(),
+            })
+        };
+        assert!(until_unloaded(failing, Duration::from_secs(5), poll).is_err());
     }
 }
