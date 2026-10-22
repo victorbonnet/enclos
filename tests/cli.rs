@@ -690,10 +690,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         .find(|l| l.contains("list the `at` queue"))
         .unwrap();
     assert!(at.contains("Seatbelt itself refuses"), "{at}");
-    assert!(
-        report.contains("by Seatbelt itself rather than"),
-        "{report}"
-    );
+    assert!(report.contains("(1 by Seatbelt itself)"), "{report}");
     // Each fake file's deny entry: the folder, or the file itself.
     for entry in [
         "/.ssh",
@@ -711,7 +708,14 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         });
         assert!(closed, "no closed probe reads {entry}:\n{report}");
     }
-    assert!(report.contains("probes were shown closed"), "{report}");
+    assert!(
+        report
+            .trim_end()
+            .lines()
+            .last()
+            .is_some_and(|l| l.starts_with("READY: no probe got out of sandbox ")),
+        "{report}"
+    );
     // `.env`, LaunchAgents and the sandbox's policy keep what the test put
     // there; any other file a probe left would show as OPEN above.
     assert_eq!(
@@ -759,7 +763,9 @@ fn a_route_that_gets_through_fails_the_policy_test() {
         .any(|l| l.trim_start().starts_with("OPEN") && l.contains(" network "));
     assert!(open, "{}", out.stdout());
     assert!(
-        out.stderr().contains("probes got through"),
+        out.stderr().starts_with("NOT READY: sandbox home: ")
+            && out.stderr().contains("probes got out")
+            && out.stderr().contains("Do not use it until this is fixed."),
         "{}",
         out.stderr()
     );

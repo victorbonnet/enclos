@@ -108,7 +108,7 @@ Its cron jobs come along and start acting as soon as the sandbox's gateway runs,
 enclos policy test lab
 ```
 
-This runs escape probes from inside the sandbox: reading `~/.ssh` and other sensitive files, writing outside its home, reaching an unlisted site, connecting around the proxy, signalling a process outside, reading the pasteboard, and more. Every probe must fail. On your Mac it runs only probes that cannot change anything if a rule did not hold; CI runs the rest (`--host-services`).
+This runs escape probes from inside the sandbox: reading `~/.ssh` and other sensitive files, writing outside its home, reaching an unlisted site, connecting around the proxy, signalling a process outside, reading the pasteboard, and more. Every probe must fail. On your Mac it runs only probes that cannot change anything if a rule did not hold; CI runs the rest (`--host-services`). The last line says whether the sandbox is ready: `READY` when no probe got out, or `NOT READY` with why. A probe marked `inconclusive` could not be checked on your Mac, as when macOS keeps your terminal itself out of a folder such as `~/Library/Mail`; it does not stop the sandbox being ready.
 
 ## Run it
 

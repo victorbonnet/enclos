@@ -196,38 +196,60 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
             report.inconclusive()
         );
     }
-    if report.open() > 0 {
-        eprintln!(
-            "error: {} probes got through. Do not use this sandbox until this is fixed.",
-            report.open()
-        );
-    }
-    if report.not_run() > 0 {
-        eprintln!(
-            "error: {} probes could not run or be checked, so their routes were not tested.",
-            report.not_run()
-        );
-    }
-    if report.open() == 0 && report.not_run() == 0 && report.closed_by_enclos() == 0 {
-        eprintln!(
-            "error: no probe was shown closed by an enclos rule, so this test showed nothing about the policy."
-        );
-    }
+    // Last, after a blank line, so it is what the user reads.
+    println!();
     match report.passed() {
         true => {
-            let platform = match report.closed_by_platform() {
-                0 => String::new(),
-                n => format!(", {n} of them by Seatbelt itself rather than by an enclos rule"),
-            };
-            println!(
-                "{} of {} probes were shown closed{platform}.",
-                report.closed(),
-                report.results.len()
-            );
+            println!("{}", verdict(sandbox, report));
             exit::OK
         }
-        false => exit::ERROR,
+        false => {
+            eprintln!("{}", verdict(sandbox, report));
+            exit::ERROR
+        }
     }
+}
+
+/// Whether the sandbox is ready, in one line: READY when the test passed,
+/// with what it showed, or NOT READY with every reason it did not.
+fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
+    let total = report.results.len();
+    if report.passed() {
+        let platform = match report.closed_by_platform() {
+            0 => String::new(),
+            n => format!(" ({n} by Seatbelt itself)"),
+        };
+        let shown = match report.closed() == total {
+            true => format!("all {total} shown closed{platform}"),
+            false => format!(
+                "{} of {total} shown closed{platform}, {} could not be checked on this Mac (inconclusive above), none open",
+                report.closed(),
+                report.inconclusive()
+            ),
+        };
+        return format!("READY: no probe got out of sandbox {sandbox}: {shown}.");
+    }
+    let mut why = Vec::new();
+    if report.open() > 0 {
+        why.push(format!(
+            "{} of {total} probes got out (OPEN above)",
+            report.open()
+        ));
+    }
+    if report.not_run() > 0 {
+        why.push(format!(
+            "{} could not run or be checked, so their routes were not tested (NOT RUN above)",
+            report.not_run()
+        ));
+    }
+    if report.open() == 0 && report.not_run() == 0 {
+        why.push("no probe was shown closed by an enclos rule, so the test showed nothing about the policy".to_owned());
+    }
+    let stop = match report.open() > 0 {
+        true => " Do not use it until this is fixed.",
+        false => "",
+    };
+    format!("NOT READY: sandbox {sandbox}: {}.{stop}", why.join("; "))
 }
 
 #[cfg(test)]
@@ -236,17 +258,56 @@ mod tests {
     use enclos::probes::ProbeResult;
 
     fn report(outcome: Outcome) -> TestReport {
+        reports(vec![outcome])
+    }
+
+    fn reports(outcomes: Vec<Outcome>) -> TestReport {
         TestReport {
-            results: vec![ProbeResult {
-                route: "writes",
-                name: "write outside the home".into(),
-                outcome,
-                closed_by_platform: None,
-            }],
+            results: outcomes
+                .into_iter()
+                .map(|outcome| ProbeResult {
+                    route: "writes",
+                    name: "write outside the home".into(),
+                    outcome,
+                    closed_by_platform: None,
+                })
+                .collect(),
             host_services: false,
             not_here: Vec::new(),
             listens: false,
         }
+    }
+
+    #[test]
+    fn the_test_ends_saying_whether_the_sandbox_is_ready() {
+        let lab: SandboxName = "lab".parse().unwrap();
+        let closed = || Outcome::Closed;
+        assert_eq!(
+            verdict(&lab, &reports(vec![closed(), closed()])),
+            "READY: no probe got out of sandbox lab: all 2 shown closed."
+        );
+        assert_eq!(
+            verdict(
+                &lab,
+                &reports(vec![closed(), closed(), Outcome::Inconclusive("x".into())])
+            ),
+            "READY: no probe got out of sandbox lab: 2 of 3 shown closed, 1 could not be checked on this Mac (inconclusive above), none open."
+        );
+        assert_eq!(
+            verdict(
+                &lab,
+                &reports(vec![
+                    closed(),
+                    Outcome::Open("x".into()),
+                    Outcome::NotRun("y".into())
+                ])
+            ),
+            "NOT READY: sandbox lab: 1 of 3 probes got out (OPEN above); 1 could not run or be checked, so their routes were not tested (NOT RUN above). Do not use it until this is fixed."
+        );
+        assert_eq!(
+            verdict(&lab, &report(Outcome::Inconclusive("x".into()))),
+            "NOT READY: sandbox lab: no probe was shown closed by an enclos rule, so the test showed nothing about the policy."
+        );
     }
 
     #[test]
