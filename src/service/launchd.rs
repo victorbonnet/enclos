@@ -16,10 +16,17 @@ pub struct Launchd {
 const NOT_FOUND: i32 = 113;
 /// `launchctl bootout` of a job launchd is still ending.
 const IN_PROGRESS: i32 = 36;
-/// How long a job may take to leave launchd after `bootout`: longer than
-/// any unit's `ExitTimeOut` (`STOP_TIMEOUT`, 95 s), after which launchd
-/// kills it.
-const UNLOAD_WAIT: Duration = Duration::from_secs(150);
+/// How long `stop` waits for a job to leave launchd after `bootout`: well
+/// past any unit's `ExitTimeOut` (the engine's `STOP_TIMEOUT`, 190 s), after
+/// which launchd kills it; a bound only for a launchd that never lets go.
+pub(crate) const UNLOAD_WAIT: Duration = Duration::from_secs(600);
+/// How long `start` waits for a job of the same label to leave launchd
+/// before loading its own. `start` runs under enclos's state lock, which a
+/// runtime service being ended needs to record its end, so it does not
+/// wait long: the engine removes a sandbox's services before it starts
+/// them, outside the lock, so a job still loaded here was started by
+/// another command meanwhile.
+const REPLACE_WAIT: Duration = Duration::from_secs(10);
 /// How often launchd is asked whether the job is gone meanwhile.
 const UNLOAD_POLL: Duration = Duration::from_millis(100);
 
@@ -64,23 +71,32 @@ impl Launchd {
     /// the job (about 0.7 s for a Hermes gateway on macOS 26.5), and loading
     /// the same label meanwhile fails with `Bootstrap failed: 5`. Nothing to
     /// do when launchd has no such job.
-    fn bootout(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+    fn bootout(&self, label: &ServiceLabel, wait: Duration) -> Result<(), ServiceError> {
         if self.status(label)? == ServiceStatus::NotLoaded {
             return Ok(());
         }
         let out = launchctl(&["bootout", &Self::target(label)?])?;
-        let ending = out.status.success() || out.status.code() == Some(IN_PROGRESS);
-        let wait = if ending { UNLOAD_WAIT } else { Duration::ZERO };
+        let wait = wait_after_bootout(out.status.success(), out.status.code(), wait);
         if !until_unloaded(|| self.status(label), wait, UNLOAD_POLL)? {
-            let why = match ending {
-                true => format!("it was still loaded after {} s", UNLOAD_WAIT.as_secs()),
-                false => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            let why = match wait.is_zero() {
+                true => String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                false => format!("it was still loaded after {} s", wait.as_secs()),
             };
             return Err(ServiceError {
                 what: format!("launchd did not stop {label}: {why}"),
             });
         }
         Ok(())
+    }
+}
+
+/// How long to wait for a job to leave launchd after `bootout` exited as
+/// given: up to `wait` when launchd took the request (exit 0, or 36 while
+/// it is still ending the job), not at all when it refused it.
+fn wait_after_bootout(success: bool, code: Option<i32>, wait: Duration) -> Duration {
+    match success || code == Some(IN_PROGRESS) {
+        true => wait,
+        false => Duration::ZERO,
     }
 }
 
@@ -203,7 +219,12 @@ impl ServiceManager for Launchd {
         std::fs::write(&path, plist(unit))
             .map_err(|e| failed(format!("cannot write {}: {e}", path.display())))?;
         // Replace a previous load of the same unit.
-        self.bootout(&unit.label)?;
+        self.bootout(&unit.label, REPLACE_WAIT).map_err(|e| ServiceError {
+            what: format!(
+                "{}; another enclos command may be starting or stopping this sandbox's services",
+                e.what
+            ),
+        })?;
         let out = launchctl(&["bootstrap", &Self::domain()?, &path.display().to_string()])?;
         if !out.status.success() {
             return Err(failed(format!(
@@ -216,7 +237,7 @@ impl ServiceManager for Launchd {
     }
 
     fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
-        self.bootout(label)?;
+        self.bootout(label, UNLOAD_WAIT)?;
         let path = self.plist_path(label);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| ServiceError {
@@ -383,5 +404,14 @@ mod tests {
             })
         };
         assert!(until_unloaded(failing, Duration::from_secs(5), poll).is_err());
+    }
+
+    #[test]
+    fn only_a_bootout_launchd_took_is_waited_for() {
+        let wait = Duration::from_secs(7);
+        assert_eq!(wait_after_bootout(true, Some(0), wait), wait);
+        assert_eq!(wait_after_bootout(false, Some(IN_PROGRESS), wait), wait);
+        assert_eq!(wait_after_bootout(false, Some(5), wait), Duration::ZERO);
+        assert_eq!(wait_after_bootout(false, None, wait), Duration::ZERO);
     }
 }
