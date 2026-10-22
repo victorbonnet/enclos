@@ -744,6 +744,14 @@ mod tests {
         assert!(STOP_TIMEOUT > 2 * STOP_GRACE + END_WAIT);
     }
 
+    /// launchd kills a runtime service's job at its `ExitTimeOut`, the stop
+    /// timeout; `stop` waits for it to be gone at least that long.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_waits_for_a_stop_longer_than_the_stop_timeout() {
+        assert!(crate::service::launchd::UNLOAD_WAIT > STOP_TIMEOUT);
+    }
+
     #[test]
     fn end_on_sets_the_flag_on_term_and_the_process_lives() {
         let _term = TERM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
