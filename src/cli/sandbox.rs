@@ -34,12 +34,21 @@ enum SandboxVerb {
     List,
     /// Show a sandbox: its state, policy version, sessions and their processes.
     Show { name: SandboxName },
-    /// Run the sandbox's proxy and its runtime's services in the background, now and at each login.
-    Start { name: SandboxName },
-    /// Stop every service, session and process of a sandbox.
-    Stop { name: SandboxName },
-    /// Stop the sandbox, then start its services again under the active policy.
-    Restart { name: SandboxName },
+    /// Run each sandbox's proxy and its runtime's services in the background, now and at each login.
+    Start {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
+    /// Stop every service, session and process of each sandbox.
+    Stop {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
+    /// Stop each sandbox, then start its services again under the active policy.
+    Restart {
+        #[arg(required = true)]
+        names: Vec<SandboxName>,
+    },
     /// Remove a stopped sandbox, and its home unless --keep-data.
     Rm {
         name: SandboxName,
@@ -100,29 +109,27 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 }
             }
         }
-        SandboxVerb::Start { name } if confirm == Confirm::DryRun => {
-            print_would_start(&name, &engine.service_labels(&name)?)
+        SandboxVerb::Start { names } => {
+            return each(
+                &names,
+                |n| engine.require_sandbox(n),
+                |name| start(engine, by, name, confirm),
+            );
         }
-        SandboxVerb::Start { name } => {
-            return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
+        SandboxVerb::Stop { names } => {
+            return each(
+                &names,
+                |n| engine.require_sandbox(n),
+                |name| stop(engine, by, name, confirm),
+            );
         }
-        SandboxVerb::Stop { name } => match engine.stop_sandbox(by, &name, confirm)? {
-            Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-            Planned::Done(report) => return Ok(print_stop(&name, &report)),
-        },
-        SandboxVerb::Restart { name } => match engine.stop_sandbox(by, &name, confirm)? {
-            Planned::DryRun(plan) => {
-                plan.changes.iter().for_each(|c| println!("Would {c}."));
-                print_would_start(&name, &engine.service_labels(&name)?);
-            }
-            Planned::Done(report) => {
-                let code = print_stop(&name, &report);
-                if code != exit::OK {
-                    return Ok(code);
-                }
-                return print_started(engine, &name, &engine.start_sandbox(by, &name)?);
-            }
-        },
+        SandboxVerb::Restart { names } => {
+            return each(
+                &names,
+                |n| engine.require_sandbox(n),
+                |name| restart(engine, by, name, confirm),
+            );
+        }
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
@@ -247,6 +254,68 @@ fn print_show(v: &SandboxView) {
     }
 }
 
+/// Runs `verb` on each sandbox named, in order, once `known` accepted every
+/// name, so a mistyped name changes nothing. A sandbox named twice is done
+/// once. A sandbox that fails is said, as for a single one, and the next
+/// one is still done: one that cannot stop does not keep the others
+/// running. The exit code is the highest of theirs.
+fn each(
+    names: &[SandboxName],
+    known: impl Fn(&SandboxName) -> Result<()>,
+    mut verb: impl FnMut(&SandboxName) -> Result<u8>,
+) -> Result<u8> {
+    let mut seen = Vec::new();
+    for name in names {
+        if !seen.contains(&name) {
+            known(name)?;
+            seen.push(name);
+        }
+    }
+    let mut code = exit::OK;
+    for name in seen {
+        code = code.max(match verb(name) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                e.exit_code()
+            }
+        });
+    }
+    Ok(code)
+}
+
+fn start(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    if confirm == Confirm::DryRun {
+        print_would_start(name, &engine.service_labels(name)?);
+        return Ok(exit::OK);
+    }
+    print_started(engine, name, &engine.start_sandbox(by, name)?)
+}
+
+fn stop(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    Ok(match engine.stop_sandbox(by, name, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            exit::OK
+        }
+        Planned::Done(report) => print_stop(name, &report),
+    })
+}
+
+fn restart(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    match engine.stop_sandbox(by, name, confirm)? {
+        Planned::DryRun(plan) => {
+            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            print_would_start(name, &engine.service_labels(name)?);
+            Ok(exit::OK)
+        }
+        Planned::Done(report) => match print_stop(name, &report) {
+            exit::OK => print_started(engine, name, &engine.start_sandbox(by, name)?),
+            code => Ok(code),
+        },
+    }
+}
+
 fn print_stop(name: &SandboxName, report: &StopReport) -> u8 {
     let gone = match report.gone.len() {
         0 => String::new(),
@@ -307,4 +376,62 @@ fn print_started(engine: &Engine, name: &SandboxName, labels: &[ServiceLabel]) -
         PROXY_WAIT.as_secs()
     );
     Ok(exit::ERROR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclos::error::Error;
+
+    fn names(list: &[&str]) -> Vec<SandboxName> {
+        list.iter().map(|n| n.parse().unwrap()).collect()
+    }
+
+    fn known(name: &SandboxName) -> Result<()> {
+        match name.as_str() {
+            "nope" => Err(Error::NoSuchSandbox {
+                name: name.to_string(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    #[test]
+    fn each_sandbox_is_done_once_in_order() {
+        let mut done = Vec::new();
+        let code = each(&names(&["home", "lab", "home"]), known, |n| {
+            done.push(n.to_string());
+            Ok(exit::OK)
+        });
+        assert_eq!(code.unwrap(), exit::OK);
+        assert_eq!(done, ["home", "lab"]);
+    }
+
+    #[test]
+    fn a_name_that_is_no_sandbox_does_nothing() {
+        let mut done = Vec::new();
+        let got = each(&names(&["home", "nope"]), known, |n| {
+            done.push(n.to_string());
+            Ok(exit::OK)
+        });
+        assert!(matches!(got, Err(Error::NoSuchSandbox { .. })), "{got:?}");
+        assert!(done.is_empty(), "{done:?}");
+    }
+
+    #[test]
+    fn one_that_fails_does_not_stop_the_others_and_sets_the_code() {
+        let mut done = Vec::new();
+        let code = each(&names(&["home", "lab", "work"]), known, |n| {
+            done.push(n.to_string());
+            match n.as_str() {
+                "home" => Err(Error::NoSuchSandbox {
+                    name: n.to_string(),
+                }),
+                "lab" => Ok(exit::ERROR),
+                _ => Ok(exit::OK),
+            }
+        });
+        assert_eq!(code.unwrap(), exit::ERROR);
+        assert_eq!(done, ["home", "lab", "work"]);
+    }
 }
