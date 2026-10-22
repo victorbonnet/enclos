@@ -74,7 +74,7 @@ Each sandbox has a proxy service, `enclos.<install>.<sandbox>.proxy`, and one se
 
 ## 5. Isolation backends
 
-The table says what each backend is designed to enforce. Only Seatbelt is implemented, in milestone 1; bubblewrap comes in milestone 3.3, OpenShell and a microVM in 3.5. A Seatbelt cell that starts with "planned" is not in milestone 1, which refuses a policy that sets it.
+The table says what each backend is designed to enforce. Only Seatbelt is implemented, in milestone 1; bubblewrap comes in milestone 3, OpenShell and a microVM in 4.4. A Seatbelt cell that starts with "planned" is not in milestone 1, which refuses a policy that sets it.
 
 | Policy field | Seatbelt (macOS) | bubblewrap (Linux) | OpenShell | MicroVM (libkrun, Firecracker) |
 | --- | --- | --- | --- | --- |
@@ -158,7 +158,7 @@ The proxy connects only to addresses that passed, by address. Falling back from 
 
 **What the proxy can and cannot promise.** enclos constrains the connections the sandbox makes, not what the services it reaches do. A remote browser, a search service, an MCP server, or the model provider's own tools (a hosted web search, for example) can fetch other sites on the agent's behalf. Allowing such a service grants that capability: the policy and `enclos policy show` describe it as "remote fetching through <service>", not as network isolation. The same applies to any allowed destination that relays data.
 
-**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: no host-service forward before milestone 3.1, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15).
+**Host services.** Services on the host's loopback interface or local network are unreachable: there is no loopback exception. Reaching one (a local MCP server, for example) needs a host-service forward: a narrowly scoped mechanism that exposes one named host address and port to one sandbox through its own listener, logged and audited. Decided: no host-service forward before milestone 4.1, and then only one named host port to one sandbox per grant; the exact mechanism is still open (§15).
 
 **The runtime's own service** (proposed, [ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), issue #64; the listening, the service's port, `connect` starting the service, and `status` showing the dashboard and naming listeners are in this build). Hermes 0.22.3's chat reaches its gateway only over a WebSocket on a loopback port the gateway picks at start: each client finds the gateway, gets a ticket for its own agent over the gateway's Unix socket in the home, and dials the port the gateway gives. So a runtime adapter can declare its listening service (Hermes: `gateway`). Such a sandbox may listen (§5), and a session started while that service listens is given its port: `wrap` passes `-D ENCLOS_SERVICE=localhost:<port>`, and the compiled policy, the same for every session, allows outbound TCP to that port on 127.0.0.1 alone. enclos takes the port from its records of the service's session, never from a file the sandbox writes: the one TCP port at 127.0.0.1 (not every address, where another program of the user could hold 127.0.0.1 at that port) in the system's ephemeral range that the program it started for the service holds, and no other process holds 127.0.0.1 at that port (a socket sharing it with `SO_REUSEPORT` would get the session's connections) (a bind on port 0 lands there; a port the runtime binds by number, such as Hermes's API server or webhooks, does not), checked to be the same process before and after reading its ports, so a reused PID is not taken for it, and none when there is none or several. Hermes then works as it does outside enclos, each agent and client as itself. `connect` makes sure the service listens first, since a session reaches it only on the port it held when the session started. When the service itself is not installed (nothing of the sandbox is, or only its proxy, as when it was started before its runtime was installed), it installs the sandbox's services as `sandbox start` does, so they start again at each login until `sandbox stop`, and says so on stderr, along with the open sessions' connections being cut when its proxy runs (one an earlier `connect` started, or the proxy service), since the new proxy service replaces it; `--dry-run` says both. A start that fails after removing the services it replaces leaves none; when the proxy service was among them, the session is told so, with `enclos sandbox start` to get them back. When the service is installed, or a session of it is open but not listening yet (one still starting), it only waits: installing the sandbox's services again would stop that service and the proxy. It waits up to 60 seconds for the service to listen, gives up after 15 seconds while no session of it is open, as when it exits at once, and at once for what waiting does not fix (several ports, a port another process shares); a start that fails ends the wait too, and in each case it says why and connects anyway. One `connect` of a sandbox at a time decides and waits, under a lock file in enclos's `run` folder. It starts nothing when the runtime's files are gone from the home (the path its adapter names for `status`), since the service could not run, nor when whether they are there cannot be told, which it says. `policy show` and `policy test` say that such a sandbox's listening is open, and `status` names what in it listens beyond loopback. This is not a loopback exception: a session reaches its own proxy and the port its own sandbox's service held when it started, and nothing else on the host's loopback, until the service restarts, when whatever then holds that port at 127.0.0.1 is reachable from it ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), Consequences).
 
@@ -542,7 +542,7 @@ enclos net denied home                          # what was refused; allow what y
 enclos sandbox stop home lab                    # every member, services and sessions alike
 ```
 
-**Later** (milestones 2 and 3): agents that answer on Telegram with the sandbox's secrets, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
+**Later** (milestones 2 and 4): agents that answer on Telegram with the sandbox's secrets, a dev sandbox writing to a project folder, and a community sandbox whose agents reach their data through a remote MCP server.
 
 ```bash
 enclos secret set home/telegram-main
@@ -591,7 +591,7 @@ There is no command to repair a damaged audit log yet. To go on, keep `audit.jso
 
 ## 13. Milestones
 
-Each milestone holds only what its goal needs; everything else waits for a later one.
+Each milestone holds only what its goal needs; everything else waits for a later one. Milestones 1 and 2 make Hermes on macOS solid enough for enclos's first release, milestone 3 brings Hermes to Linux, and everything else comes after.
 
 1. **Hermes sandboxes on a Mac** — goal: several Hermes sandboxes on the user's Mac, each with several agents running as background services, safe enough to start testing. In scope:
    - a prototype first, which settles the milestone 1 items in §14 before the code depends on them;
@@ -604,12 +604,12 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - launchd agents for each sandbox's proxy and its runtime's services while the user is logged in, `sandbox start`, `stop`, `restart`, and `logs`;
    - sessions and member tracking, with stop over every member;
    - `policy test` with the escape probes listed in the acceptance scenario;
-   - releases: a tagged build of the Apple silicon binary with its checksum and provenance, and an installer that always installs the latest release, which the acceptance scenario does not cover.
+   - releases: a tagged build of the Apple silicon binary with its checksum and provenance, and an installer that always installs the latest release, which the acceptance scenario does not cover; the first release is made once milestone 2 is done.
 
    Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the runtime's own login in the sandbox home.
 
    Done when the acceptance scenario for milestone 1 below passes.
-2. **Policy lifecycle, messaging and hardening** — goal: Hermes agents that answer on Telegram from a running sandbox, with their secrets and every policy change managed from the host, and the Seatbelt baseline chosen on evidence. In scope:
+2. **Policy lifecycle, messaging and hardening** — goal: Hermes on macOS solid enough for enclos's first release: agents that answer on Telegram from a running sandbox, with their secrets and every policy change managed from the host, and the Seatbelt baseline chosen on evidence. In scope:
    - the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback` (§7);
    - secrets granted per sandbox ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)), stored in the Keychain with `secret set`, `list` and `rm`, and set up on the host when a session starts (`connect`, `exec` and `enclos launch`);
    - Hermes messaging, Telegram first;
@@ -620,13 +620,22 @@ Each milestone holds only what its goal needs; everything else waits for a later
    - the `minimal` and `mcp-only` templates;
    - the evidence ADR 0006 asks for, and its decision.
 
-   Done when the acceptance scenario for milestone 2 below passes.
-3. **Breadth**, in this order unless needs change:
+   Done when the acceptance scenario for milestone 2 below passes; the first release follows.
+3. **Hermes on Linux** — goal: the same Hermes sandboxes on Linux, on x86_64 and on arm64 including a Raspberry Pi ([ADR 0013](adr/0013-supported-platforms.md)), from the same `policy.toml` as on the Mac. In scope:
+   - checking first that Landlock is enabled on Raspberry Pi OS ([ADR 0004](adr/0004-linux-bubblewrap-and-landlock.md));
+   - the bubblewrap backend with Landlock, seccomp and cgroups through `systemd-run --user`, with the host's sockets masked (§5);
+   - systemd user units for each sandbox's proxy and its runtime's services ([ADR 0002](adr/0002-no-daemon.md));
+   - members as the processes in the sandbox's cgroup (§8);
+   - secrets in libsecret, or a `0600` file on a headless machine (§12);
+   - `doctor` naming what keeps the backend from running, such as Landlock turned off or AppArmor blocking bubblewrap on Ubuntu 24.04 and later;
+   - releases for Linux on x86_64 and arm64, and the escape probes in CI on both.
+
+   Done when the acceptance scenarios of milestones 1 and 2 pass on Linux on x86_64 and on a Raspberry Pi, with systemd in place of launchd, libsecret or the `0600` file in place of the Keychain, and the same `policy.toml` as on the Mac; the steps about macOS alone (a code signature, the Seatbelt baseline) are left out.
+4. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
    2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
-   3. Linux: the bubblewrap backend with Landlock, seccomp and cgroups; the same policy file runs on Mac and Pi.
-   4. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
-   5. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
+   3. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
+   4. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
 
 **Acceptance scenario (milestone 1).** On a Mac, with the user logged in and an existing ChatGPT subscription:
 
@@ -719,4 +728,4 @@ Decided since the first draft: Rust as the language; a domain-level CONNECT prox
 | Where denials are read (§5) | The persisted log lacks file-write denials, so a live, bounded stream consumer is needed. Open: which process runs it, given there is no daemon. Recommendation: the sandbox's proxy unit, which already runs whenever the sandbox does. On a non-admin account `log stream` is refused (§14), so that consumer gets nothing there. |
 | Writes to Foundation's temp directory (§5) | Chrome for Testing, and possibly other Cocoa programs, write in the per-user `/var/folders/…/T`, which ignores `TMPDIR`. Options: grant writes there (shared with every host process of the user), or do without such programs in the sandbox. Chrome for Testing fails while its writes in that folder and under `~/Library` (its crash database) are denied (§14, the VM run); whether granting them is enough is not shown. |
 | Network log completeness and retention (§6) | A connection whose record cannot be written goes ahead today, and records are never removed while the sandbox exists. Recommendation: refuse such connections ([ADR 0027](adr/0027-network-log-completeness-and-retention.md), proposed). How to bound the log is still open; ADR 0027 lists options. |
-| Host-service forward mechanism | Decided: milestone 3.1, one named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |
+| Host-service forward mechanism | Decided: milestone 4.1, one named host port to one sandbox per grant, never a loopback range. Open: how it is exposed. Recommendation: its own listener (a Unix socket on Linux, a dedicated localhost port on macOS), logged per connection and audited when granted. |

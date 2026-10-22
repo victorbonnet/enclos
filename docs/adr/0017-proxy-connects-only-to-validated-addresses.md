@@ -12,4 +12,4 @@ Always blocked: every entry of the IANA IPv4 and IPv6 special-purpose address re
 
 - A DNS answer that changes between check and connect (DNS rebinding) cannot reach a blocked address.
 - Each network log record includes the address actually connected to.
-- Local services on the host are unreachable by design. Access to one will come in milestone 3.1 through a host-service forward that exposes one named host port to one sandbox, never a loopback exception.
+- Local services on the host are unreachable by design. Access to one will come in milestone 4.1 through a host-service forward that exposes one named host port to one sandbox, never a loopback exception.
