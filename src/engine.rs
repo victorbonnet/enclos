@@ -11,6 +11,7 @@ mod listener;
 mod net;
 mod policy;
 mod probe;
+mod restart;
 mod runtime;
 mod sandbox;
 mod service;

@@ -2831,6 +2831,244 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
+    /// A gateway that exits 75 on USR1, as Hermes's does.
+    #[cfg(target_os = "macos")]
+    const RESTARTS: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\" \"$HOME/.hermes\"
+printf 'model: a\\n' > \"$HOME/.hermes/config.yaml\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+[ \"$1\" = gateway ] || exit 0
+trap 'exit 75' USR1
+: > \"$HOME/gateway-up\"
+i=0
+while [ $i -lt 600 ]; do /bin/sleep 0.1; i=$((i+1)); done
+exit 0
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_service_restarts_once_its_runtime_settings_change() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
+        let home = lab.home.clone();
+        let edit = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !home.join("gateway-up").exists() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "no gateway"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
+        });
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        edit.join().unwrap();
+        assert_eq!(end.exit, 75, "{end:?}");
+        assert!(end.restarting, "{end:?}");
+        assert_eq!(
+            end.notes,
+            ["~/.hermes/.env changed: asked the gateway service to restart"],
+            "{end:?}"
+        );
+        let audit = lab.audit();
+        assert!(audit.contains("service restart"), "{audit}");
+        assert!(open_service_sessions(&lab).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_settings_restart_that_could_not_be_recorded_is_asked_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
+        let home = lab.home.clone();
+        let audit = lab.engine.layout.audit_log();
+        let edit = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !home.join("gateway-up").exists() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "no gateway"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let mode = |m| std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(m));
+            mode(0o400).unwrap();
+            std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
+            // The failed attempt comes 5 to 9 s after the write.
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            mode(0o600).unwrap();
+            std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=y\n").unwrap();
+        });
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        edit.join().unwrap();
+        assert_eq!(end.exit, 75, "{end:?}");
+        assert!(end.restarting, "{end:?}");
+        assert!(
+            end.notes.iter().any(|n| n.starts_with(
+                "~/.hermes/.env changed, but the gateway service was not asked to restart"
+            )),
+            "{end:?}"
+        );
+        assert!(
+            end.notes.contains(
+                &"~/.hermes/.env changed: asked the gateway service to restart".to_owned()
+            ),
+            "{end:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
+        use std::os::unix::process::CommandExt;
+        let lab = Lab::new();
+        let sleep = || {
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
+            id: crate::model::session::SessionId(0),
+            sandbox: lab.name.clone(),
+            kind,
+            service: None,
+            version: 1,
+            snapshot: crate::model::policy::SnapshotId("s".into()),
+            compiled: None,
+            pgid: Some(child.id()),
+            root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+            tracked: Vec::new(),
+            started_at: crate::model::now(),
+            ended_at: None,
+        };
+        // Stands for the service's program: USR1 ends a `sleep`.
+        let mut service = sleep();
+        let service_session = record(&service, crate::model::session::SessionKind::Service);
+        let mut connected = sleep();
+        {
+            let lock = lab.engine.state.lock().unwrap();
+            let sandbox = lab.engine.state.get(&lab.name).unwrap().unwrap();
+            let session = record(&connected, crate::model::session::SessionKind::Interactive);
+            lab.engine
+                .state
+                .start_session(&lock, &session, &sandbox)
+                .unwrap();
+        }
+        let env = [crate::runtime::HomePath::new(".hermes/.env").unwrap()];
+        let asked = lab
+            .engine
+            .ask_restart(
+                &alice(),
+                &service_session,
+                crate::runtime::Signal::Usr1,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(asked, None);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(service.try_wait().unwrap().is_none(), "signalled");
+        assert!(!lab.audit().contains("service restart"), "{}", lab.audit());
+
+        connected.kill().unwrap();
+        connected.wait().unwrap();
+        let asked = lab
+            .engine
+            .ask_restart(
+                &alice(),
+                &service_session,
+                crate::runtime::Signal::Usr1,
+                &env,
+            )
+            .unwrap();
+        assert_eq!(asked, Some(Ok(())));
+        let status = service.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(30)
+        );
+        assert!(lab.audit().contains("service restart"), "{}", lab.audit());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_settings_restart_waits_until_no_one_is_connected() {
+        use std::os::unix::process::CommandExt;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
+        let mut setup = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        {
+            let lock = lab.engine.state.lock().unwrap();
+            let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
+            let session = crate::model::session::SessionRecord {
+                id: crate::model::session::SessionId(0),
+                sandbox: lab.name.clone(),
+                kind: crate::model::session::SessionKind::Interactive,
+                service: None,
+                version: 1,
+                snapshot: crate::model::policy::SnapshotId("s".into()),
+                compiled: None,
+                pgid: Some(setup.id()),
+                root: crate::lifecycle::process::reference_of_child(&setup).unwrap(),
+                tracked: Vec::new(),
+                started_at: crate::model::now(),
+                ended_at: None,
+            };
+            lab.engine
+                .state
+                .start_session(&lock, &session, &record)
+                .unwrap();
+        }
+        // Connected for longer than `SETTLE` after the change.
+        let home = lab.home.clone();
+        let edit = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !home.join("gateway-up").exists() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "no gateway"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            std::fs::write(home.join(".hermes/.env"), "TELEGRAM_BOT_TOKEN=x\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            setup.kill().unwrap();
+            setup.wait().unwrap();
+            std::time::Instant::now()
+        });
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        let returned = std::time::Instant::now();
+        let left = edit.join().unwrap();
+        assert!(returned > left, "restarted while someone was connected");
+        assert_eq!(end.exit, 75, "{end:?}");
+        assert!(end.restarting, "{end:?}");
+    }
+
     /// A runtime whose gateway records whether it was launched in enclos's
     /// terminal, and exits.
     #[cfg(target_os = "macos")]

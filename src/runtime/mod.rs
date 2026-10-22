@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 
+pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
 pub use home::HomePath;
@@ -189,6 +190,11 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
+    /// Files in the home the services read only as they start, for the
+    /// built-in agent and `agents` (ADR 0031).
+    fn settings_files(&self, _agents: &[RuntimeAgentName]) -> Vec<HomePath> {
+        Vec::new()
+    }
     /// The names of the agents the runtime has in this sandbox home, as it
     /// would list them, sorted, read on the host without running anything.
     /// The sandbox writes its home, so implementations never follow a link,
@@ -324,6 +330,9 @@ impl fmt::Display for Unreadable {
 pub struct RuntimeService {
     pub name: ServiceName,
     pub command: SandboxCommand,
+    /// Sent once [`RuntimeAdapter::settings_files`] change (ADR 0031); `TERM`
+    /// without a graceful restart, `None` to never restart.
+    pub restart: Option<Signal>,
 }
 
 /// A runtime service that listens in its sandbox, on a loopback port it

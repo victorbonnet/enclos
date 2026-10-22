@@ -202,6 +202,17 @@ pub fn processes() -> Result<Vec<Proc>, PsError> {
 pub enum Signal {
     Term,
     Kill,
+    Usr1,
+}
+
+impl Signal {
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Term => "TERM",
+            Signal::Kill => "KILL",
+            Signal::Usr1 => "USR1",
+        }
+    }
 }
 
 /// What became of a signal enclos meant to send.
@@ -251,12 +262,8 @@ fn kill(signal: Signal, target: i64) -> Signalled {
     if never_signalled(target) {
         return Signalled::Failed(format!("enclos never signals {target}"));
     }
-    let name = match signal {
-        Signal::Term => "TERM",
-        Signal::Kill => "KILL",
-    };
     match Command::new("/bin/kill")
-        .args(["-s", name, "--", &target.to_string()])
+        .args(["-s", signal.name(), "--", &target.to_string()])
         .stdin(Stdio::null())
         .output()
     {

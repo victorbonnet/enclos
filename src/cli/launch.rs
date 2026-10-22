@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-use enclos::engine::{Engine, printable_line};
+use enclos::engine::{Engine, SessionEnd, printable_line};
 use enclos::error::{Error, Result};
 use enclos::model::audit::Actor;
 use enclos::model::sandbox::SandboxName;
@@ -23,8 +23,22 @@ pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
     let end = engine.launch(by, &args.sandbox, &args.service)?;
     // Into the service's log, which `enclos logs` shows.
     super::connect::report_end(&args.sandbox, &end);
-    Ok(u8::try_from(end.exit).unwrap_or(1))
+    Ok(service_exit(&end))
 }
+
+/// A service asked to restart exits non-zero, so the service manager starts
+/// it again, even when its program exits 0 (ADR 0031).
+fn service_exit(end: &SessionEnd) -> u8 {
+    let exit = if end.restarting && end.exit == 0 {
+        EX_TEMPFAIL
+    } else {
+        end.exit
+    };
+    u8::try_from(exit).unwrap_or(1)
+}
+
+/// `sysexits.h`, as Hermes exits to be restarted.
+const EX_TEMPFAIL: i32 = 75;
 
 #[derive(Args)]
 pub struct LogsArgs {
@@ -204,5 +218,22 @@ mod tests {
             matches!(e, Failed::Write(ref e) if e.kind() == io::ErrorKind::BrokenPipe),
             "{e:?}"
         );
+    }
+
+    #[test]
+    fn a_service_asked_to_restart_never_exits_0() {
+        let end = |exit, restarting| SessionEnd {
+            session: enclos::model::session::SessionId(1),
+            exit,
+            signal: None,
+            left: enclos::engine::Left::Nothing,
+            notes: Vec::new(),
+            restarting,
+        };
+        assert_eq!(service_exit(&end(0, true)), 75);
+        assert_eq!(service_exit(&end(75, true)), 75);
+        assert_eq!(service_exit(&end(143, true)), 143);
+        assert_eq!(service_exit(&end(0, false)), 0);
+        assert_eq!(service_exit(&end(3, false)), 3);
     }
 }
