@@ -608,8 +608,19 @@ Each milestone holds only what its goal needs; everything else waits for a later
 
    Deliberately not yet, with the behavior milestone 1 has instead: a change that needs a restart asks first, and if the user declines nothing changes (the pending policy comes in milestone 2); network changes apply live; there are no secrets, since the only credential is the runtime's own login in the sandbox home.
 
-   Done when the acceptance scenario below passes.
-2. **Policy lifecycle, messaging and hardening** — the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback`; the TLS server-name check; secrets granted per sandbox, stored in the Keychain and set up on the host when a session starts (`connect`, `exec` and `enclos launch`); Hermes messaging (Telegram first); `state check` and `repair`; `doctor`; `--json` output for every command, and JSON when piped, errors included; `exec`; resource limits; the `minimal` and `mcp-only` templates; the evidence ADR 0006 asks for, and its decision.
+   Done when the acceptance scenario for milestone 1 below passes.
+2. **Policy lifecycle, messaging and hardening** — goal: Hermes agents that answer on Telegram from a running sandbox, with their secrets and every policy change managed from the host, and the Seatbelt baseline chosen on evidence. In scope:
+   - the pending policy with `policy apply` and `discard`; `policy refresh`, `diff`, `history` and `rollback` (§7);
+   - secrets granted per sandbox ([ADR 0022](adr/0022-secrets-granted-per-sandbox.md)), stored in the Keychain with `secret set`, `list` and `rm`, and set up on the host when a session starts (`connect`, `exec` and `enclos launch`);
+   - Hermes messaging, Telegram first;
+   - the TLS server-name check (§6);
+   - resource limits, as far as the Seatbelt backend can enforce them (§5);
+   - `state check` and `repair`; `doctor`;
+   - `exec`; `--json` output for every command, and JSON when piped, errors included;
+   - the `minimal` and `mcp-only` templates;
+   - the evidence ADR 0006 asks for, and its decision.
+
+   Done when the acceptance scenario for milestone 2 below passes.
 3. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
    2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
@@ -638,6 +649,21 @@ Each milestone holds only what its goal needs; everything else waits for a later
 6. `policy test` was READY on both: 71 of 81 probes closed (one by Seatbelt itself, which tests no enclos rule), 10 inconclusive (privacy-protected folders and the crontab, which fail outside the sandbox too), none open. The host-service routes, probed only with `--host-services` since they could act on the host, were not run on this Mac: on the same code, CI's macOS 15 and 26 runners ran them in `every_escape_probe_fails_in_a_new_sandbox`, which requires LaunchServices, Apple Events, launchd, preferences and launch agents closed, and it passed. Re-running them in a VM with probes for the routes no probe tries yet is listed in §14.
 7. `sandbox stop m1a m1b`, run while `m1a` had an interactive session with background processes (before the weather task), ended every member, and `sandbox show` reported none; a last stop after the weather task left none either.
 8. `audit verify` passed (177 entries, hash chain verified), with an entry for each state-changing command. It warned of one entry never finished: a `proxy start m1a` whose service the cleanup of a `sandbox start` that failed on #76 booted out before it recorded its end.
+
+**Acceptance scenario (milestone 2).** On a Mac where milestone 1's scenario passes, with an existing ChatGPT subscription and two Telegram bots:
+
+1. **Pending policy.** With a session open in a sandbox, a change that needs a restart (a workspace grant, a resource limit or a secret), declined at its prompt, becomes the pending policy: `policy show` and `sandbox show` display it beside the active one, and the open session and new sessions keep the active snapshot. `policy discard` drops it. Made again, `policy apply` restarts the sandbox and makes it active. A network change made while a change is pending takes effect at once and is folded into a new pending snapshot (§7).
+2. **History.** `policy history` lists every version with who made it and when, `policy diff` shows what one version changes from another, and `policy rollback --to <version>` makes a new version recording what it restores, follows the restart rules of step 1, and restores the overrides, so the next `policy edit` starts from them.
+3. **Refresh.** After an upgrade to an enclos build with a changed template or adapter, new sessions keep the stored snapshot until `policy refresh` lists the difference and the user accepts it; declined, nothing changes.
+4. **Secrets.** `secret set` stores the two bot tokens in the Keychain, and the sandbox's policy grants them under `[secrets]` (§10, Later). Every session and the gateway service receive them as environment variables, and the other sandbox receives neither. enclos writes no value to a launchd plist, its own files, the audit log or the sandbox home. A `policy test` probe that reads a keychain item from inside the sandbox fails. `enclos launch`, started by launchd, reads them without a Keychain prompt, also after the binary is replaced by a build with another code signature. These settle the milestone 2 items in §14 on secrets.
+5. **Telegram.** Two agents of the sandbox each answer a message sent to their own bot, served by the gateway under launchd with no terminal open, and `net log` shows `api.telegram.org`. This settles the §14 item on per-agent tokens.
+6. **Server name check.** Through a host the policy allows, a tunnel whose ClientHello names another host is closed with the reason `name-mismatch`, and `net log` records the name seen. A tunnel with no visible name is allowed, and its record says no name was seen.
+7. **Resources.** A `[resources]` section is accepted for each limit the Seatbelt backend enforces, and a probe that exceeds it is stopped or refused. A limit it cannot enforce is refused when the policy is stored ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), never stored and ignored. `policy test` lists each limit and what its probe showed.
+8. **State.** After a sandbox's launchd job is removed by hand, a session is left recorded open with no process, and a process escapes member tracking (in a VM, §14), `state check` reports each and changes nothing. `state repair` fixes what it can, names what it cannot, and records an audit entry. `doctor` reports whether the host can run each backend and, after an upgrade, which compiled policies changed (§7).
+9. **`exec` and JSON.** `exec` runs one command in a sandbox as a session with its own record and members, and exits with the command's code. Every command prints JSON with `--json` and when piped, errors and refusals included, with the exit codes of §10.
+10. **Templates.** In a sandbox made from `minimal`, Hermes installs and answers, reaching only the model provider and its adapter's endpoints. In one made from `mcp-only`, an agent also reaches a listed remote MCP endpoint (§10's community flow), and nothing else. `policy test` is READY on both.
+11. **Seatbelt baseline.** ADR 0006 is decided by its own rule, on the evidence it lists: the allowances Hermes, its installers and its browser need under `(deny default)`, and every escape probe run under both baselines. The compiled policy follows the decision, and the probes of milestone 1's step 6 still fail.
+12. `enclos audit verify` passes, and the audit log holds an entry for every state-changing command in the scenario, `secret set` and `state repair` included.
 
 ## 14. Awaiting prototype verification
 
