@@ -20,6 +20,7 @@ mod status;
 mod tests;
 
 pub use import::{Archive, LeftCopy};
+pub use listener::ServiceWait;
 pub use policy::{PolicyApplied, PolicyView};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]

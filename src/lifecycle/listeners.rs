@@ -151,7 +151,7 @@ pub fn ephemeral_ports() -> Result<RangeInclusive<u16>, String> {
 /// taken for it: on every address, another process of the user could hold
 /// 127.0.0.1 at that port, and a session would reach that one. None or
 /// several such ports is never a guess.
-pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<u16, String> {
+pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<u16, NotOnePort> {
     let mut ports: Vec<u16> = held
         .iter()
         .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
@@ -161,13 +161,13 @@ pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<
     ports.sort_unstable();
     ports.dedup();
     match ports.as_slice() {
-        [] => Err(format!(
+        [] => Err(NotOnePort::None(format!(
             "it holds no TCP listener at 127.0.0.1 in the ephemeral ports, {} to {}",
             ephemeral.start(),
             ephemeral.end()
-        )),
+        ))),
         [port] => Ok(*port),
-        several => Err(format!(
+        several => Err(NotOnePort::Several(format!(
             "it listens on {} ephemeral ports at 127.0.0.1 ({}), so which is its own cannot be told",
             several.len(),
             several
@@ -175,8 +175,19 @@ pub fn one_port(held: &[SocketAddr], ephemeral: &RangeInclusive<u16>) -> Result<
                 .map(u16::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
-        )),
+        ))),
     }
+}
+
+/// Why [`one_port`] gave no port.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotOnePort {
+    /// It holds none such yet, as a service still starting.
+    #[error("{0}")]
+    None(String),
+    /// It holds several, and which is its own cannot be told.
+    #[error("{0}")]
+    Several(String),
 }
 
 #[cfg(test)]
@@ -207,10 +218,16 @@ mod tests {
         assert!(one_port(&[a("127.0.0.1:8642")], &ephemeral).is_err());
         assert!(one_port(&[], &ephemeral).is_err());
         let err = one_port(&[a("127.0.0.1:50001"), a("127.0.0.1:50002")], &ephemeral).unwrap_err();
+        assert!(matches!(err, NotOnePort::Several(_)), "{err}");
         assert!(
-            err.contains("2 ephemeral ports at 127.0.0.1 (50001, 50002)"),
+            err.to_string()
+                .contains("2 ephemeral ports at 127.0.0.1 (50001, 50002)"),
             "{err}"
         );
+        assert!(matches!(
+            one_port(&[], &ephemeral),
+            Err(NotOnePort::None(_))
+        ));
     }
 
     fn out(code: i32, stdout: &str, stderr: &str) -> Output {
