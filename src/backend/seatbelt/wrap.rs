@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::super::{Launch, SandboxContext};
-use super::compile::TERMINAL_PARAM;
+use super::compile::{SERVICE_PARAM, TERMINAL_PARAM};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -62,6 +62,13 @@ pub(super) fn wrap_in(
         let mut param = OsString::from(format!("{TERMINAL_PARAM}="));
         param.push(terminal);
         command.arg("-D").arg(param);
+    }
+    // A parameter, not a rule of its own, so every session of the sandbox
+    // runs under the same compiled policy.
+    if let Some(port) = launch.service_port {
+        command
+            .arg("-D")
+            .arg(format!("{SERVICE_PARAM}=localhost:{port}"));
     }
     command
         .arg("-f")
@@ -253,6 +260,7 @@ mod tests {
             args: vec![],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, None);
         let names: Vec<_> = command
@@ -273,12 +281,42 @@ mod tests {
     }
 
     #[test]
+    fn a_session_names_its_runtime_service_port_to_the_policy() {
+        let mut launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec![],
+            env: vec![],
+            in_terminal: false,
+            service_port: Some(61374),
+        };
+        let args = |launch: &Launch| -> Vec<String> {
+            wrap_in(Path::new("/x.sb"), &ctx(), launch, None)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            args(&launch),
+            [
+                "-D",
+                "ENCLOS_SERVICE=localhost:61374",
+                "-f",
+                "/x.sb",
+                "/bin/sh"
+            ]
+        );
+        launch.service_port = None;
+        assert_eq!(args(&launch), ["-f", "/x.sb", "/bin/sh"]);
+    }
+
+    #[test]
     fn a_session_names_its_own_terminal_to_the_policy() {
         let launch = Launch {
             program: "/bin/sh".into(),
             args: vec![],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         let terminal = Path::new("/dev/ttys004");
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, Some(terminal));
@@ -331,6 +369,7 @@ mod tests {
             args: vec![],
             env: vec![],
             in_terminal: false,
+            service_port: None,
         };
         let command = wrap(Path::new("/x.sb"), &ctx(), &launch);
         let args: Vec<_> = command

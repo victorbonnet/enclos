@@ -14,6 +14,10 @@ use crate::model::sandbox::BackendKind;
 /// in enclos's terminal (`Launch::in_terminal`): `true` or `false`.
 pub const IN_TERMINAL: &str = "ENCLOS_FAKE_IN_TERMINAL";
 
+/// The variable that tells a program the fake runs which runtime service
+/// port it was given (`Launch::service_port`, ADR 0028): the port, or `none`.
+pub const SERVICE_PORT: &str = "ENCLOS_FAKE_SERVICE_PORT";
+
 pub struct FakeBackend {
     kind: BackendKind,
     probe: Probe,
@@ -77,7 +81,7 @@ impl Backend for FakeBackend {
     /// sandbox's environment (its home, PATH and TMPDIR), so that a test's
     /// program never touches the developer's own home. It also gets
     /// [`IN_TERMINAL`], so a test sees whether the program was to run in
-    /// enclos's terminal.
+    /// enclos's terminal, and [`SERVICE_PORT`], the service port it was given.
     fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
@@ -89,6 +93,12 @@ impl Backend for FakeBackend {
             command.env(name, value);
         }
         command.env(IN_TERMINAL, launch.in_terminal.to_string());
+        command.env(
+            SERVICE_PORT,
+            launch
+                .service_port
+                .map_or_else(|| "none".to_owned(), |p| p.to_string()),
+        );
         command.current_dir(&ctx.home);
         command
     }

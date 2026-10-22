@@ -13,8 +13,8 @@ use rustix::fs::{Dir, FileType};
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeFacts, RuntimeService, SandboxCommand, ServiceName, Unreadable,
-    ValueAt,
+    RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService, SandboxCommand, ServiceName,
+    Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::runtime::RuntimeKind;
@@ -238,6 +238,16 @@ impl RuntimeAdapter for Hermes {
         }]
     }
 
+    fn listener(&self) -> Option<RuntimeListener> {
+        // Hermes 0.22.3's chat (CLI, TUI, stream-json) cannot run without the
+        // gateway: it finds it, gets a ticket for its own agent (a Hermes
+        // profile) over
+        // `gateway.sock` in the home, and dials the WebSocket the gateway
+        // serves on 127.0.0.1:0 (`gateway/run_api.py`,
+        // `hermes_cli/gateway_client.py`).
+        Some(RuntimeListener { service: GATEWAY })
+    }
+
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable> {
         // Hermes lists a named profile when its folder under
         // `~/.hermes/profiles/` has a valid id, is not `default` (the Hermes
@@ -357,6 +367,13 @@ mod tests {
         // Hermes 0.22.3's gateway binds its own listener (ADR 0028).
         let layer = PolicyFile::parse("hermes adapter", Hermes.endpoints()).unwrap();
         assert_eq!(layer.network.listen, Some(true));
+    }
+
+    #[test]
+    fn the_listening_service_is_one_of_its_services() {
+        let listener = Hermes.listener().unwrap();
+        assert_eq!(listener.service.as_str(), "gateway");
+        assert!(Hermes.services().iter().any(|s| s.name == listener.service));
     }
 
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {
