@@ -149,13 +149,16 @@ impl KeychainProbe {
         let value = SecretValue::new(KEYCHAIN_PROBE_VALUE.to_owned()).expect("not empty");
         if let Err(e) = store.set(&secret, &value) {
             // A store that went through but did not read back leaves an
-            // item: it goes too.
-            let left = match store.remove(&secret) {
-                Ok(_) => String::new(),
-                Err(gone) => format!(
-                    "; removing what it may have left failed too ({gone}): it is {}",
-                    store.whereabouts(&secret)
-                ),
+            // item: it goes too. One refused before anything ran left none.
+            let left = match e.untouched {
+                true => String::new(),
+                false => match store.remove(&secret) {
+                    Ok(_) => String::new(),
+                    Err(gone) => format!(
+                        "; removing what it may have left failed too ({gone}): it is {}",
+                        store.whereabouts(&secret)
+                    ),
+                },
             };
             return Err(format!("enclos could not store a test item: {e}{left}"));
         }

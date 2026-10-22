@@ -28,6 +28,9 @@ pub trait SecretStore {
 #[error("{what}")]
 pub struct SecretError {
     pub what: String,
+    /// The store refused before it changed anything: there is nothing to
+    /// clean up after it.
+    pub untouched: bool,
 }
 
 /// The store of this host: the user's Keychain on macOS, or the keychain
@@ -69,6 +72,7 @@ impl Unavailable {
     fn error(&self) -> SecretError {
         SecretError {
             what: self.why.clone(),
+            untouched: true,
         }
     }
 }

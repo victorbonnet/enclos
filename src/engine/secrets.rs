@@ -103,7 +103,7 @@ impl Engine {
                     // A store can fail after it wrote, as when reading the
                     // value back does not answer: a new value it may have
                     // left goes again, as no record would lead to it.
-                    return Err(match known {
+                    return Err(match known || error.untouched {
                         true => error.into(),
                         false => self.unrecorded_value(secret, false, error.into()),
                     });

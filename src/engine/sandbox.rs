@@ -560,7 +560,8 @@ impl Engine {
                     return Err(Error::FailedAfter {
                         error: Box::new(error),
                         done: format!(
-                            "removing the record of sandbox {name} and {removed} of its secret(s){not}"
+                            "removing the record of sandbox {name} and {removed} of its secret(s){not}{}",
+                            ended_gone(&gone)
                         ),
                     });
                 }

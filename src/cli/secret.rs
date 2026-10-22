@@ -87,26 +87,37 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
                 Err(e) => Some(Err(std::io::Error::from(e))),
             }
         }));
-        // What came past the line, such as more pasted lines, is dropped
-        // before echo comes back, so the shell never reads it as commands.
-        // Either call failing counts as more having come.
-        let more = rustix::io::ioctl_fionread(&stdin).map_or(true, |n| n > 0);
-        let flushed =
-            rustix::termios::tcflush(&stdin, rustix::termios::QueueSelector::IFlush).is_ok();
+        // Everything that came after the line, such as more pasted lines or
+        // the rest of a value too long, is read and dropped until the input
+        // stays quiet, before echo comes back, so the shell never reads it.
+        let after = quiet.drain();
         quiet.restore();
         eprintln!();
-        match typed.map_err(io)? {
+        let typed = typed.map_err(io)?;
+        let after = after.map_err(|e| {
+            refused(&format!(
+                "what came after the line could not all be dropped, and may reach the shell: {e}"
+            ))
+        })?;
+        match typed {
             Typed::Cancelled => {
                 return Err(Error::Session {
                     what: format!("cancelled: secret {secret} was not set"),
                 });
             }
+            Typed::Ended => return Err(refused("the input ended before Return")),
             Typed::TooLong => {
                 return Err(refused(&format!(
                     "a value typed at a terminal is at most {MAX_TYPED} bytes; pipe a longer one in"
                 )));
             }
-            Typed::Line(_) if more || !flushed => {
+            Typed::Control(key) => {
+                return Err(refused(&format!(
+                    "{} is no part of a value, and nothing was stored; type it again, or pipe it in",
+                    key_name(key)
+                )));
+            }
+            Typed::Line(_) if after > 0 => {
                 return Err(refused(
                     "more came after the line, and was dropped: at a terminal a value is one line; pipe in one of several lines",
                 ));
@@ -139,19 +150,26 @@ enum Typed {
     Line(Vec<u8>),
     /// Ctrl-C, Ctrl-Z or Ctrl-\.
     Cancelled,
+    /// The input ended before Return, or Ctrl-D on an empty line.
+    Ended,
     /// More than [`MAX_TYPED`] bytes.
     TooLong,
+    /// A control key that edits nothing here, such as Escape or an arrow.
+    Control(u8),
 }
 
 /// A line from `keys`, as a terminal in line mode would make it, but with
-/// no limit of its own: Return or Ctrl-D ends it, Backspace erases a
-/// character and Ctrl-U the line, and the keys that would signal cancel it
-/// at once.
+/// no limit of its own: Return ends it, and so does Ctrl-D after some
+/// text; Backspace erases a character, Ctrl-W a word and Ctrl-U the line;
+/// the keys that would signal cancel it at once, and any other control key
+/// is refused rather than taken into the value unseen.
 fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<Typed> {
     let mut line = Vec::new();
     for key in keys {
         match key? {
-            b'\r' | b'\n' | 0x04 => return Ok(Typed::Line(line)),
+            b'\r' | b'\n' => return Ok(Typed::Line(line)),
+            0x04 if line.is_empty() => return Ok(Typed::Ended),
+            0x04 => return Ok(Typed::Line(line)),
             0x03 | 0x1a | 0x1c => return Ok(Typed::Cancelled),
             // A character's last byte, and any continuation bytes before it.
             0x7f | 0x08 => {
@@ -161,12 +179,29 @@ fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Resul
                     }
                 }
             }
+            0x17 => {
+                while line.last().is_some_and(u8::is_ascii_whitespace) {
+                    line.pop();
+                }
+                while line.last().is_some_and(|b| !b.is_ascii_whitespace()) {
+                    line.pop();
+                }
+            }
             0x15 => line.clear(),
+            key @ (0x00..=0x08 | 0x0a..=0x1f) => return Ok(Typed::Control(key)),
             _ if line.len() == MAX_TYPED => return Ok(Typed::TooLong),
             byte => line.push(byte),
         }
     }
-    Ok(Typed::Line(line))
+    Ok(Typed::Ended)
+}
+
+/// How a control key is named to the user.
+fn key_name(key: u8) -> String {
+    match key {
+        0x1b => "Escape, or an arrow key,".to_owned(),
+        key => format!("Ctrl-{}", char::from(key + 0x40)),
+    }
 }
 
 /// The terminal with echo, line mode and its signal keys off while it
@@ -196,6 +231,33 @@ impl<'a> Quiet<'a> {
             stdin,
             before: Some(before),
         })
+    }
+
+    /// Reads and drops what is waiting, until nothing more comes for 0.2
+    /// s, and flushes the rest; returns how much there was. A paste longer
+    /// than the terminal's queue keeps refilling it, so one flush is not
+    /// enough.
+    fn drain(&self) -> std::io::Result<usize> {
+        use rustix::termios::{
+            OptionalActions, QueueSelector, SpecialCodeIndex, tcflush, tcgetattr, tcsetattr,
+        };
+        let mut waiting = tcgetattr(self.stdin)?;
+        waiting.special_codes[SpecialCodeIndex::VMIN] = 0;
+        waiting.special_codes[SpecialCodeIndex::VTIME] = 2;
+        tcsetattr(self.stdin, OptionalActions::Now, &waiting)?;
+        let mut buf = [0u8; 4096];
+        let mut drained = 0;
+        loop {
+            match rustix::io::read(self.stdin, &mut buf[..])? {
+                0 => break,
+                read => drained += read,
+            }
+            if drained > MAX_INPUT {
+                return Err(std::io::Error::other("the input does not stop"));
+            }
+        }
+        tcflush(self.stdin, QueueSelector::IFlush)?;
+        Ok(drained)
     }
 
     /// Puts the terminal back as it was, saying so when it cannot.
@@ -302,7 +364,13 @@ mod tests {
         assert_eq!(keys(b"tok\r").unwrap(), Typed::Line(b"tok".to_vec()));
         assert_eq!(keys(b"tok\n").unwrap(), Typed::Line(b"tok".to_vec()));
         assert_eq!(keys(b"tok\x04").unwrap(), Typed::Line(b"tok".to_vec()));
-        assert_eq!(keys(b"tok").unwrap(), Typed::Line(b"tok".to_vec()));
+        assert_eq!(keys(b"\x04").unwrap(), Typed::Ended);
+        assert_eq!(keys(b"tok").unwrap(), Typed::Ended);
+        assert_eq!(
+            keys(b"tok one\x17two\r").unwrap(),
+            Typed::Line(b"tok two".to_vec())
+        );
+        assert_eq!(keys(b"tok\t2\r").unwrap(), Typed::Line(b"tok\t2".to_vec()));
         assert_eq!(keys(b"tox\x7fk\r").unwrap(), Typed::Line(b"tok".to_vec()));
         assert_eq!(keys(b"bad\x15tok\r").unwrap(), Typed::Line(b"tok".to_vec()));
         // Backspace erases a whole character, not one of its bytes.
@@ -318,6 +386,14 @@ mod tests {
         for key in [0x03, 0x1a, 0x1c] {
             assert_eq!(keys(&[b't', key, b'x']).unwrap(), Typed::Cancelled);
         }
+    }
+
+    #[test]
+    fn a_control_key_that_edits_nothing_is_refused_not_taken_in() {
+        assert_eq!(keys(b"tok\x1b[D\r").unwrap(), Typed::Control(0x1b));
+        assert_eq!(keys(b"tok\x12\r").unwrap(), Typed::Control(0x12));
+        assert_eq!(key_name(0x12), "Ctrl-R");
+        assert!(key_name(0x1b).contains("arrow"));
     }
 
     #[test]
