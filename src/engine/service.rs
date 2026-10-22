@@ -549,7 +549,11 @@ impl Engine {
             }
             // What it tracked, or what holds its marker (ADR 0030), still
             // runs: the session stays open, for a stop to end it.
-            let (procs, marked) = self.marked_listed(&session)?;
+            // One that cannot be looked at stays open too, rather than
+            // keep the new service from starting.
+            let Ok((procs, marked)) = self.marked_listed(&session) else {
+                continue;
+            };
             if !crate::lifecycle::members::is_gone(&procs, &marked) {
                 continue;
             }
