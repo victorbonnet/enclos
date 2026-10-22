@@ -188,7 +188,14 @@ fn typed(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Resul
                 Mark::Starts => pasting = true,
                 Mark::Ends => pasting = false,
                 Mark::Cancelled => break Typed::Cancelled,
-                Mark::Not => break Typed::Control(0x1b),
+                Mark::Not { then } => {
+                    // A mark right after the Escape still says where a
+                    // paste stands, so its end is not waited for in vain.
+                    if let Some(open) = then {
+                        pasting = open;
+                    }
+                    break Typed::Control(0x1b);
+                }
             },
             // A character's last byte, and any continuation bytes before it.
             0x7f | 0x08 => {
@@ -226,30 +233,42 @@ enum Mark {
     Ends,
     /// A key that would signal: the read is cancelled at once.
     Cancelled,
-    /// Anything else: an Escape or an arrow key, refused.
-    Not,
+    /// Anything else: an Escape or an arrow key, refused; `then` is whether
+    /// a paste is open after a mark that followed at once, if one did.
+    Not {
+        then: Option<bool>,
+    },
 }
 
 /// Reads what follows an Escape as far as it can be a paste's mark, and no
 /// further: the first byte that cannot continue one ends it, so a lone
-/// Escape or an arrow key takes no more keys than its own.
+/// Escape or an arrow key takes no more keys than its own. Another Escape
+/// starts a mark again: it may be a paste's end.
 fn paste_mark(keys: &mut impl Iterator<Item = std::io::Result<u8>>) -> std::io::Result<Mark> {
     let mut read = Vec::new();
+    let mut lone = false;
     while read.len() < PASTE_STARTS.len() {
         let Some(byte) = keys.next().transpose()? else {
-            return Ok(Mark::Not);
+            return Ok(Mark::Not { then: None });
         };
         if matches!(byte, 0x03 | 0x1a | 0x1c) {
             return Ok(Mark::Cancelled);
         }
+        if byte == 0x1b {
+            read.clear();
+            lone = true;
+            continue;
+        }
         read.push(byte);
         if !PASTE_STARTS.starts_with(&read) && !PASTE_ENDS.starts_with(&read) {
-            return Ok(Mark::Not);
+            return Ok(Mark::Not { then: None });
         }
     }
-    Ok(match read.as_slice() == PASTE_STARTS {
-        true => Mark::Starts,
-        false => Mark::Ends,
+    let open = read.as_slice() == PASTE_STARTS;
+    Ok(match (lone, open) {
+        (true, open) => Mark::Not { then: Some(open) },
+        (false, true) => Mark::Starts,
+        (false, false) => Mark::Ends,
     })
 }
 
@@ -546,6 +565,12 @@ mod tests {
         assert_eq!(typed(&mut rest).unwrap(), (Typed::Control(0x1b), true));
         assert_eq!(rest.map(|b| b.unwrap()).collect::<Vec<_>>(), b"\x1b[201~");
         assert_eq!(pasted(b"\x1bx"), (Typed::Control(0x1b), false));
+        // A lone Escape, or a mark cut short, right before the paste's end
+        // does not eat the end's own Escape.
+        for cut in [&b""[..], b"[", b"[20", b"[201"] {
+            let bytes = [&b"\x1b[200~a\x1b"[..], cut, b"\x1b[201~"].concat();
+            assert_eq!(pasted(&bytes), (Typed::Control(0x1b), false), "{cut:?}");
+        }
     }
 
     #[test]
