@@ -37,7 +37,7 @@ impl FakeBackend {
 
     /// A fake that stands in for `kind`, is there, and refuses to run a
     /// program for `reason`, as Seatbelt does in a process already in a
-    /// sandbox.
+    /// sandbox whose policy has a rule.
     pub fn refuses_to_run(kind: BackendKind, reason: &str) -> Self {
         FakeBackend {
             kind,

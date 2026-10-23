@@ -2918,7 +2918,8 @@ fn doctor_and_state_check_in_json() {
     let (code, doctor) = home.json(&["doctor"]);
     assert_eq!(code, 0, "{doctor}");
     assert_eq!(doctor["records"]["initialized"], false, "{doctor}");
-    assert_eq!(doctor["backends"][0]["runs"]["ok"], true, "{doctor}");
+    assert_eq!(doctor["backends"][0]["state"], "runs", "{doctor}");
+    assert!(doctor["backends"][0]["reason"].is_null(), "{doctor}");
     assert!(doctor.get("error").is_none(), "{doctor}");
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();

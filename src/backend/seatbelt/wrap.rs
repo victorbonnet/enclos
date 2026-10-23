@@ -43,8 +43,10 @@ const FALLBACK_TERM: &str = "xterm-256color";
 /// Whether `sandbox-exec` runs `/usr/bin/true` under a Seatbelt policy that
 /// allows everything, with no variable of the user's, within
 /// [`TRY_RUN_WAIT`]. macOS 26.5.2 refuses it, `sandbox_apply: Operation not
-/// permitted`, to a process in a sandbox whose policy has any rule, as every
-/// enclos sandbox's has; in one that allows everything it runs.
+/// permitted` (exit 71), to a process in a sandbox whose policy has a deny
+/// rule, as every enclos sandbox's has (a test runs doctor in one); in one
+/// whose policy only allows everything it runs, exit 0 (by hand, macOS
+/// 26.5.2).
 pub fn try_run() -> Probe {
     let started = Command::new(SANDBOX_EXEC)
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])

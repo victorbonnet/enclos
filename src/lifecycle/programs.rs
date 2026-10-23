@@ -1,8 +1,9 @@
-//! The program files each process runs, as `lsof` names them: its
-//! executable and the libraries it mapped (`txt`). The command `ps` lists
-//! is the process's argv[0] on macOS, which it chooses and which names no
-//! path when it was started through `PATH`; these are the files the kernel
-//! mapped, by their real paths (macOS 26.5.2).
+//! The files each process has mapped, as `lsof` names them (`txt`): its
+//! executable, the libraries it loaded, and any other file it maps. The
+//! command `ps` lists (`comm`) is the process's argv[0] on macOS, which it
+//! chooses and which names no path when it was started through `PATH`;
+//! these are the files the kernel mapped, by their real paths (macOS
+//! 26.5.2).
 
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
@@ -32,10 +33,10 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
 
 /// `path` as `lsof` writes a file name in the C locale (macOS 26.5.2): a
 /// backslash doubled, tab, newline and the like as `\t`, `\n`, other control
-/// characters as `^A`, and DEL and bytes past ASCII as `\x7f`, `\xc3`. A name holding `^`
-/// followed by a capital is written as a control character would be, so
-/// two names can read the same: matched this way, such a name may be taken
-/// for another, never missed.
+/// characters as `^A`, and DEL and bytes past ASCII as `\x7f`, `\xc3`. A
+/// name holding `^` followed by a capital or one of `@[\]^_` is written as a
+/// control character would be, so two names can read the same: matched this
+/// way, such a name may be taken for another, never missed.
 pub fn lsof_name(path: &Path) -> String {
     let mut name = String::new();
     for &b in path.as_os_str().as_bytes() {
@@ -66,6 +67,9 @@ fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
         (Some(0), false, _) | (Some(1), false, true) => {}
+        _ if why.is_empty() => {
+            return Err(ProgramsError(format!("{}, with no output", out.status)));
+        }
         _ => return Err(ProgramsError(format!("{}: {why}", out.status))),
     }
     let mut files: BTreeMap<u32, Vec<String>> = BTreeMap::new();
@@ -94,8 +98,9 @@ pub(crate) mod tests {
     pub(crate) const SLEEP: &str = "ENCLOS_TEST_SLEEP";
 
     /// A program run from `dir` that sleeps: a copy of this test program,
-    /// running only [`sleeps_when_asked`], started by a relative path, as
-    /// `PATH` would, so that `ps` lists it as `./sleeper`. A copy of
+    /// running only [`sleeps_when_asked`], started by a relative path, which,
+    /// like a start through `PATH`, names no real path, so that `ps` lists it
+    /// as `./sleeper`. A copy of
     /// `/bin/sleep` would not do: macOS kills a copied platform program as
     /// it runs. Ended and reaped when dropped; the test's own child.
     pub(crate) struct Sleeper(std::process::Child);
@@ -168,7 +173,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_listing_that_did_not_run_is_an_error() {
-        assert!(parse(&output(1, "", "")).is_err());
+        let empty = parse(&output(1, "", "")).unwrap_err().to_string();
+        assert!(empty.contains("with no output"), "{empty}");
         assert!(parse(&output(1, "p1\nn/x\n", "lsof: status error")).is_err());
         assert!(parse(&output(0, "pnot-a-pid\n", "")).is_err());
         assert!(parse(&output(1, "p1\nn/x\n", "")).is_ok());

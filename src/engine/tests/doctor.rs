@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, gone_process, put, session_of};
 use super::*;
-use crate::backend::Probe;
-use crate::engine::{Doctor, Drift, LineChange, NextSession, SandboxCheck, Sandboxes};
+use crate::engine::{
+    BackendState, Doctor, Drift, LineChange, Lines, NextSession, Running, SandboxCheck, Sandboxes,
+};
 use crate::model::sandbox::SandboxName;
 use crate::model::session::SessionRecord;
 
@@ -85,7 +86,7 @@ fn before_init_the_backends_are_still_checked() {
         BackendKind::Seatbelt,
     ))]);
     let doctor = engine.doctor();
-    assert_eq!(doctor.backends[0].found, Probe::Available);
+    assert_eq!(doctor.backends[0].state, BackendState::Runs);
     assert!(doctor.backends[0].runs_here());
     assert_eq!(doctor.sandboxes, Sandboxes::NotInitialized);
     assert!(!doctor.has_problems());
@@ -98,12 +99,17 @@ fn a_backend_not_on_this_host_is_not_tried() {
         "not on this host",
     ))]);
     let doctor = engine.doctor();
-    assert_eq!(doctor.backends[0].runs, None);
+    assert_eq!(
+        doctor.backends[0].state,
+        BackendState::NotFound {
+            reason: "not on this host".into()
+        }
+    );
     assert!(doctor.has_problems());
 }
 
 /// A backend that is there and refuses to run a program, as Seatbelt does
-/// in a process already in a sandbox, runs no sandbox: nothing is compiled
+/// in a process already in a sandbox whose policy has a rule, runs no sandbox: nothing is compiled
 /// for its sandboxes, and that is said once.
 #[test]
 fn a_backend_that_refuses_to_run_is_a_problem_and_nothing_is_compiled() {
@@ -113,13 +119,13 @@ fn a_backend_that_refuses_to_run_is_a_problem_and_nothing_is_compiled() {
     ));
     let doctor = engine.doctor();
     assert_eq!(
-        doctor.backends[0].runs,
-        Some(Probe::Unavailable {
+        doctor.backends[0].state,
+        BackendState::Refuses {
             reason: "sandbox_apply: Operation not permitted".into()
-        })
+        }
     );
     let check = check_of(&doctor, &name);
-    assert!(!check.backend_runs);
+    assert!(!check.backend_runs());
     assert_eq!(check.next, NextSession::NotChecked);
     assert!(check.unreadable.is_empty(), "{check:?}");
     assert!(doctor.has_problems());
@@ -183,9 +189,15 @@ fn a_policy_enclos_now_compiles_differently_is_shown_with_its_lines() {
     assert!(!change.edited);
     assert_eq!(
         change.lines,
-        Some(vec![LineChange::Removed("a rule enclos dropped".into())])
+        Lines::Changed(vec![LineChange::Removed("a rule enclos dropped".into())])
     );
-    assert_eq!(change.running, 1);
+    assert_eq!(
+        change.running,
+        Running {
+            count: 1,
+            unsure: false
+        }
+    );
     // A drift is shown, not a problem.
     assert!(!doctor.has_problems());
 
@@ -195,8 +207,8 @@ fn a_policy_enclos_now_compiles_differently_is_shown_with_its_lines() {
     let [change] = changed(&check_of(&engine.doctor(), &name))
         .try_into()
         .unwrap();
-    assert_eq!(change.lines, None);
-    assert_eq!(change.running, 0);
+    assert_eq!(change.lines, Lines::FileGone);
+    assert_eq!(change.running, Running::default());
 }
 
 /// A file whose name, its digest, no longer matches what it holds was
@@ -214,7 +226,7 @@ fn a_compiled_file_changed_after_it_was_written_is_named_as_such() {
     assert!(change.edited);
     assert_eq!(
         change.lines,
-        Some(vec![LineChange::Removed("(allow default)".into())])
+        Lines::Changed(vec![LineChange::Removed("(allow default)".into())])
     );
 }
 
@@ -265,7 +277,7 @@ fn a_running_session_under_an_earlier_file_is_shown_after_a_later_one() {
         .try_into()
         .unwrap();
     assert_eq!(change.ran, earlier);
-    assert_eq!(change.running, 1);
+    assert_eq!(change.running.count, 1);
 
     // A gone session is not one that keeps its rules: once nothing of it
     // runs, the later session is the one compared.
@@ -273,9 +285,14 @@ fn a_running_session_under_an_earlier_file_is_shown_after_a_later_one() {
     assert!(check_of(&engine.doctor(), &name).drift.is_empty());
 }
 
+/// A version a session ran under that is not recorded is said, with what
+/// was looked at, and the other files are still compared.
 #[test]
 fn a_session_whose_policy_version_is_not_recorded_is_a_problem() {
     let (_dir, engine, name) = with_sandbox();
+    let earlier = compiled_earlier(&engine, &name);
+    let sleeping = Sleeping::new();
+    ran_under(&engine, &name, sleeping.process(), &earlier);
     let file = compiled_now(&engine, &name);
     let mut session = session_of(&engine, &name, gone_process());
     session.version = 99;
@@ -283,14 +300,94 @@ fn a_session_whose_policy_version_is_not_recorded_is_a_problem() {
     put(&engine, &session);
     let doctor = engine.doctor();
     let check = check_of(&doctor, &name);
+    let not_compared = format!(
+        "policy v99, which a session ran under ({}), was not compared: it is not recorded",
+        file.display()
+    );
     assert!(
         check
             .unreadable
             .iter()
-            .any(|u| u.contains("policy version 99")),
+            .any(|u| u.starts_with(&not_compared)),
         "{check:?}"
     );
+    let [change] = changed(&check).try_into().unwrap();
+    assert_eq!(change.ran, earlier);
     assert!(matches!(check.next, NextSession::Compiles { .. }));
+    assert!(doctor.has_problems());
+}
+
+/// Records that cannot be read are said, and the backends still checked.
+#[test]
+fn records_that_cannot_be_read_are_a_problem() {
+    let (_dir, engine, _name) = with_sandbox();
+    std::fs::write(engine.layout.state_db(), "not a database").unwrap();
+    let doctor = engine.doctor();
+    assert!(
+        matches!(doctor.sandboxes, Sandboxes::Unreadable { .. }),
+        "{doctor:?}"
+    );
+    assert!(doctor.backends[0].runs_here());
+    assert!(doctor.has_problems());
+}
+
+/// A home gone is the next session's to say: an earlier version is then
+/// not compared, rather than said to no longer compile.
+#[test]
+fn a_home_gone_is_not_an_earlier_version_that_no_longer_compiles() {
+    let (_dir, engine, name) = with_sandbox();
+    let file = compiled_now(&engine, &name);
+    ran_under(&engine, &name, gone_process(), &file);
+    std::fs::remove_dir_all(engine.layout.sandbox_home(name.as_str())).unwrap();
+    let check = check_of(&engine.doctor(), &name);
+    assert!(matches!(check.next, NextSession::Fails { .. }), "{check:?}");
+    assert!(check.drift.is_empty(), "{check:?}");
+    assert!(
+        check
+            .unreadable
+            .iter()
+            .any(|u| u.starts_with("policy v1, which a session ran under")
+                && u.contains("was not compared")),
+        "{check:?}"
+    );
+}
+
+/// When enclos cannot tell which sessions run, each one recorded open
+/// counts, and the count is said to be unsure; with none open, nothing
+/// needed that answer.
+#[test]
+fn sessions_enclos_cannot_tell_are_counted_as_unsure() {
+    let (_dir, engine, name) = with_sandbox();
+    // A marker folder that cannot be looked at: a link to itself.
+    let markers = engine.layout.sandbox_dir(name.as_str()).join("members");
+    let _ = std::fs::remove_dir_all(&markers);
+    std::os::unix::fs::symlink(&markers, &markers).unwrap();
+    let file = compiled_now(&engine, &name);
+    ran_under(&engine, &name, gone_process(), &file);
+    ended(&engine, &name);
+    let check = check_of(&engine.doctor(), &name);
+    assert!(check.unreadable.is_empty(), "{check:?}");
+
+    let earlier = compiled_earlier(&engine, &name);
+    ran_under(&engine, &name, gone_process(), &earlier);
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(
+        check
+            .unreadable
+            .iter()
+            .any(|u| u.starts_with("cannot tell which of its sessions run")),
+        "{check:?}"
+    );
+    let [change] = changed(&check).try_into().unwrap();
+    assert_eq!(change.ran, earlier);
+    assert_eq!(
+        change.running,
+        Running {
+            count: 1,
+            unsure: true
+        }
+    );
     assert!(doctor.has_problems());
 }
 
@@ -304,7 +401,7 @@ fn a_sandbox_whose_backend_cannot_run_here_is_a_problem() {
     drop(lock);
     let doctor = engine.doctor();
     let check = check_of(&doctor, &name);
-    assert!(!check.backend_runs);
+    assert!(!check.backend_runs());
     assert_eq!(check.next, NextSession::NotChecked);
     assert!(doctor.has_problems());
 }

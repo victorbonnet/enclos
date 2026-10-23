@@ -55,7 +55,7 @@ impl Backend for Seatbelt {
                     .to_owned(),
             },
             members: Enforcement::Partial {
-                note: "markers its processes hold, and process groups (ADR 0030); one that closes its marker and leaves its group is not found"
+                note: "markers its processes hold, the parent chain and process groups (ADR 0030); one that closes its marker and leaves its group and parent is not found"
                     .to_owned(),
             },
         }
