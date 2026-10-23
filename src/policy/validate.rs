@@ -93,10 +93,10 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
             )));
         }
     }
-    // A value past these is no limit macOS keeps (its "infinity" among
-    // them, which `ulimit` reads as `unlimited`), or one it refuses to set,
-    // which would stop every session; too few files and `sandbox-exec`
-    // cannot open its profile.
+    // enclos's own bounds: too few files and `sandbox-exec` cannot open its
+    // profile; far past the most, a value is no limit at all (macOS's
+    // "infinity", which `ulimit` reads as `unlimited`) or a size macOS
+    // refuses to set, which would stop every session.
     for (name, value, least, most) in [
         ("open_files", r.open_files, 16, 1 << 20),
         ("cpu_seconds", r.cpu_seconds, 1, 10 * 365 * 24 * 3600),
