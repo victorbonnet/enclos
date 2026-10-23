@@ -1624,6 +1624,22 @@ echo \"installed $*\" > \"$HOME/installed\"
     /// with every other test run of this user too.
     static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
 
+    /// `ask` again while it is `None`, the lock busy, as a service's wait
+    /// loop asks again: another test's child, forked while this test held
+    /// the state lock, holds a copy of its descriptor until it execs, and so
+    /// the lock, a moment after this test dropped it.
+    #[cfg(target_os = "macos")]
+    fn answered<T>(mut ask: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let asked = ask();
+            if asked.is_some() || std::time::Instant::now() > deadline {
+                return asked;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     /// A sandbox whose proxy is a listener this test stands in (`nc`), so
     /// that sessions can run through the fake backend; stopped when dropped,
@@ -3011,15 +3027,16 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
         connected.kill().unwrap();
         connected.wait().unwrap();
-        let asked = lab
-            .engine
-            .ask_restart(
-                &alice(),
-                &service_session,
-                crate::runtime::Signal::Usr1,
-                &env,
-            )
-            .unwrap();
+        let asked = answered(|| {
+            lab.engine
+                .ask_restart(
+                    &alice(),
+                    &service_session,
+                    crate::runtime::Signal::Usr1,
+                    &env,
+                )
+                .unwrap()
+        });
         assert_eq!(asked, Some(Ok(())));
         let status = service.wait().unwrap();
         assert_eq!(
@@ -3069,15 +3086,16 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 .unwrap();
         }
         let env = [crate::runtime::HomePath::new(".hermes/.env").unwrap()];
-        let asked = lab
-            .engine
-            .ask_restart(
-                &alice(),
-                &service_session,
-                crate::runtime::Signal::Usr1,
-                &env,
-            )
-            .unwrap();
+        let asked = answered(|| {
+            lab.engine
+                .ask_restart(
+                    &alice(),
+                    &service_session,
+                    crate::runtime::Signal::Usr1,
+                    &env,
+                )
+                .unwrap()
+        });
         assert_eq!(asked, Some(Ok(())));
         let status = service.wait().unwrap();
         assert_eq!(
