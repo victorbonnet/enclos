@@ -115,6 +115,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port,
+            limits: Default::default(),
         };
         let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);
         command.stdout(Stdio::null()).stderr(Stdio::null());
@@ -130,6 +131,7 @@ impl World {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let out = Seatbelt
             .wrap(&self.compiled, &self.ctx, &launch)
@@ -283,6 +285,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     env: vec![],
                     in_terminal: false,
                     service_port: None,
+                    limits: Default::default(),
                 };
                 let out = Seatbelt
                     .wrap(&w.compiled, &w.ctx, &launch)
@@ -589,6 +592,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         target: None,
         tag: 7,
         keychain_item: Err("not probed here".into()),
+        limits: Default::default(),
     };
     let output = |mut command: Command| {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -605,6 +609,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 env: vec![],
                 in_terminal: false,
                 service_port: None,
+                limits: Default::default(),
             };
             let (ok, stdout, stderr) = output(Seatbelt.wrap(compiled, &w.ctx, &launch));
             let Proof::Control { control, .. } = &p.proof else {
@@ -745,6 +750,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         target: None,
         tag: 7,
         keychain_item: Err("not probed here".into()),
+        limits: Default::default(),
     };
     let folders: Vec<_> = crate::probes::probes(&inputs)
         .into_iter()
@@ -906,6 +912,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
             .stdout(Stdio::null())
@@ -956,6 +963,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())

@@ -85,6 +85,7 @@ impl Backend for FakeBackend {
     fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
+        let mut command = super::under_limits(command, &launch.limits);
         command.env_clear();
         for (name, value) in &launch.env {
             command.env(name, value.expose());

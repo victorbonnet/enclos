@@ -645,6 +645,7 @@ mod compile {
             env: Vec::new(),
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let ctx = engine.sandbox_context(&name, 41001);
         let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();

@@ -15,7 +15,7 @@ use super::file::PolicyFile;
 use super::paths::{PathContext, is_within, links_on_the_way, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::net::addr::{AddrClass, classify};
 use crate::net::host::{AllowEntry, HostPattern, canonical_private, listed_host};
@@ -70,6 +70,52 @@ pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), Po
                 grant.0.sandbox
             )));
         }
+    }
+    invalid_if_any(problems)
+}
+
+/// Checks the limits a policy sets against what `backend` enforces (ADR
+/// 0009): one it cannot enforce is refused, never stored and ignored.
+/// Seatbelt holds a process to the limits macOS keeps for each process,
+/// open files, file size and CPU time, and macOS refuses a memory limit.
+pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), PolicyError> {
+    let r = &policy.resources;
+    let mut problems = Vec::new();
+    for (name, value) in [
+        ("open_files", r.open_files),
+        ("file_size", r.file_size.map(|s| s.0)),
+        ("cpu_seconds", r.cpu_seconds),
+    ] {
+        if value == Some(0) {
+            problems.push(Problem::Malformed(format!(
+                "resources.{name}: 0 would stop every program; set at least 1, or leave it out"
+            )));
+        }
+    }
+    // `ulimit -f` counts in KiB: a smaller limit would be none at all.
+    if r.file_size.is_some_and(|s| (1..1024).contains(&s.0)) {
+        problems.push(Problem::Malformed(
+            "resources.file_size: set at least 1K".to_owned(),
+        ));
+    }
+    match backend {
+        BackendKind::Seatbelt => {
+            if let Some(memory) = &r.memory {
+                problems.push(Problem::Refused(format!(
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process (shown on macOS 26.5.2); leave it out. Linux's backend will hold one"
+                )));
+            }
+            if let Some(cpu) = &r.cpu {
+                problems.push(Problem::Refused(format!(
+                    "resources.cpu = {cpu}: the Seatbelt backend cannot hold a sandbox to a share of the CPU, which macOS has no means for; `cpu_seconds` limits each process's CPU time instead"
+                )));
+            }
+        }
+        // No other backend is built yet: none enforces a limit.
+        other if !r.is_unset() => problems.push(Problem::Refused(format!(
+            "resources: the {other} backend enforces no limit yet; leave [resources] out"
+        ))),
+        _ => {}
     }
     invalid_if_any(problems)
 }
@@ -282,6 +328,26 @@ fn check_network(policy: &Policy, problems: &mut Vec<Problem>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_seatbelt_cannot_enforce_is_refused() {
+        let mut policy = Policy::default();
+        policy.resources.open_files = Some(256);
+        policy.resources.file_size = Some("1G".parse().unwrap());
+        policy.resources.cpu_seconds = Some(3600);
+        assert!(validate_resources(&policy, BackendKind::Seatbelt).is_ok());
+        policy.resources.open_files = Some(0);
+        let zero = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+        assert!(!zero.is_refused(), "{zero}");
+        policy.resources.open_files = None;
+        for (memory, cpu) in [(Some("2G"), None), (None, Some("2.0"))] {
+            policy.resources.memory = memory.map(str::to_owned);
+            policy.resources.cpu = cpu.map(str::to_owned);
+            let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+            assert!(err.is_refused(), "{err}");
+            assert!(err.to_string().contains("Seatbelt"), "{err}");
+        }
+    }
 
     #[test]
     fn a_sandbox_is_granted_only_its_own_secrets_as_plain_variables() {

@@ -251,6 +251,9 @@ pub struct ProbeInputs {
     /// failed), and then that probe is not run. A dry run on macOS gets a
     /// placeholder, only to count it.
     pub keychain_item: Result<KeychainItem, String>,
+    /// The limits the sandbox's processes run under, each of which gets a
+    /// probe.
+    pub limits: crate::model::policy::Resources,
 }
 
 /// A path as one shell word.
@@ -776,6 +779,29 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
+    // Each limit as a process sees it, hard: closed when it is no higher
+    // than the policy's, which no process can raise. The control, on the
+    // host, finds no such limit.
+    for (what, flag, limit) in [
+        ("hold more than {} files open", "-Hn", i.limits.open_files),
+        (
+            "write a file past {} KiB",
+            "-Hf",
+            i.limits.file_size.map(|s| s.0 / 1024),
+        ),
+        ("use more than {} s of CPU", "-Ht", i.limits.cpu_seconds),
+    ] {
+        if let Some(limit) = limit {
+            let script = format!(
+                "test \"$(ulimit {flag})\" = unlimited || test \"$(ulimit {flag})\" -gt {limit}"
+            );
+            list.push(same_outside(
+                "resources",
+                what.replace("{}", &limit.to_string()),
+                &script,
+            ));
+        }
+    }
     if let Ok(item) = &i.keychain_item {
         // Through `security` and the security daemon, as a program in the
         // sandbox would read a secret: closed when the value does not come
@@ -1124,6 +1150,7 @@ mod tests {
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
             keychain_item: Err("no test item".into()),
+            limits: Default::default(),
         }
     }
 
@@ -1499,6 +1526,39 @@ mod tests {
                 "{route} is missing from {NOT_PROBED:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_limit_set_is_probed_as_a_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = inputs(dir.path());
+        assert!(!probes(&i).iter().any(|p| p.route == "resources"));
+        i.limits.open_files = Some(256);
+        i.limits.file_size = Some("1M".parse().unwrap());
+        i.limits.cpu_seconds = Some(60);
+        let list = probes(&i);
+        let limits: Vec<(&str, &str)> = list
+            .iter()
+            .filter(|p| p.route == "resources")
+            .map(|p| (p.name.as_str(), p.script.as_str()))
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                (
+                    "hold more than 256 files open",
+                    "test \"$(ulimit -Hn)\" = unlimited || test \"$(ulimit -Hn)\" -gt 256"
+                ),
+                (
+                    "write a file past 1024 KiB",
+                    "test \"$(ulimit -Hf)\" = unlimited || test \"$(ulimit -Hf)\" -gt 1024"
+                ),
+                (
+                    "use more than 60 s of CPU",
+                    "test \"$(ulimit -Ht)\" = unlimited || test \"$(ulimit -Ht)\" -gt 60"
+                ),
+            ]
+        );
     }
 
     #[test]

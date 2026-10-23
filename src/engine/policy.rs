@@ -16,7 +16,7 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
-use crate::policy::validate::{ValidationContext, validate, validate_secrets};
+use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
 use crate::policy::{self, AdapterLayer, PolicyError, Problem};
 use crate::state::StateLock;
 
@@ -268,6 +268,9 @@ impl Engine {
     pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
+        if let Some(record) = self.state.get(name)? {
+            validate_resources(policy, record.backend)?;
+        }
         self.check_secrets_set(name, policy)
     }
 
@@ -436,6 +439,31 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
         found.push(format!(
             "stop giving it ${variable} (sessions started from now on)"
         ));
+    }
+    let (was, now) = (&old.resources, &new.resources);
+    for (what, before, after) in [
+        (
+            "the files a process holds open",
+            was.open_files.map(|n| n.to_string()),
+            now.open_files.map(|n| n.to_string()),
+        ),
+        (
+            "the size of a file a process writes",
+            was.file_size.map(|s| s.to_string()),
+            now.file_size.map(|s| s.to_string()),
+        ),
+        (
+            "a process's CPU time",
+            was.cpu_seconds.map(|s| format!("{s} s")),
+            now.cpu_seconds.map(|s| format!("{s} s")),
+        ),
+    ] {
+        if before != after {
+            found.push(match after {
+                Some(limit) => format!("limit {what} to {limit} (sessions started from now on)"),
+                None => format!("stop limiting {what} (sessions started from now on)"),
+            });
+        }
     }
     found
 }

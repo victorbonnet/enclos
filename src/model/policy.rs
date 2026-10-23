@@ -1,7 +1,7 @@
 //! Policy models: what a sandbox may do (design §7, ADRs 0008, 0015, 0018).
 //!
-//! The filesystem, network and secrets sections so far. `[exec]` and
-//! `[resources]` arrive with the work that enforces them.
+//! The filesystem, network, secrets and resources sections so far. `[exec]`
+//! arrives with the work that enforces it.
 
 use std::fmt;
 use std::str::FromStr;
@@ -22,6 +22,103 @@ pub struct Policy {
     /// before secrets existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secrets: std::collections::BTreeMap<String, super::secret::SecretGrant>,
+    /// Limits on each process of the sandbox, fixed when it starts. Left
+    /// out of the snapshot when none is set, as secrets are.
+    #[serde(default, skip_serializing_if = "Resources::is_unset")]
+    pub resources: Resources,
+}
+
+/// Limits on each process of a sandbox (design §7). The Seatbelt backend
+/// enforces `open_files`, `file_size` and `cpu_seconds`, through the
+/// process limits macOS keeps; `memory` and `cpu` are kept as written only
+/// for the validation to refuse them where they cannot be enforced (ADR
+/// 0009), so a stored policy never holds one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resources {
+    /// The most files a process holds open at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_files: Option<u64>,
+    /// The largest file a process writes, in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<ByteSize>,
+    /// The most CPU time a process uses, in seconds, after which it is
+    /// stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<u64>,
+    /// A memory limit, as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// A share of CPU cores, as written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+}
+
+impl Resources {
+    pub fn is_unset(&self) -> bool {
+        *self == Resources::default()
+    }
+}
+
+/// A size in bytes, written `1048576`, `512K`, `100M` or `2G` (powers of
+/// 1024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ByteSize(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("`{0}` is not a size: write a number of bytes, or one ending in K, M or G, such as `512M`")]
+pub struct InvalidByteSize(pub String);
+
+impl FromStr for ByteSize {
+    type Err = InvalidByteSize;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidByteSize(s.to_owned());
+        let (number, unit) = match s.char_indices().last() {
+            Some((at, unit @ ('K' | 'M' | 'G'))) => (&s[..at], unit),
+            _ => (s, 'B'),
+        };
+        let shift = match unit {
+            'K' => 10,
+            'M' => 20,
+            'G' => 30,
+            _ => 0,
+        };
+        if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let n: u64 = number.parse().map_err(|_| invalid())?;
+        n.checked_mul(1 << shift).map(ByteSize).ok_or_else(invalid)
+    }
+}
+
+impl TryFrom<String> for ByteSize {
+    type Error = InvalidByteSize;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<ByteSize> for String {
+    fn from(size: ByteSize) -> String {
+        size.to_string()
+    }
+}
+
+impl fmt::Display for ByteSize {
+    /// The largest unit that writes it whole.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bytes = self.0;
+        let text = match bytes {
+            0 => "0".to_owned(),
+            b if b.is_multiple_of(1 << 30) => format!("{}G", b >> 30),
+            b if b.is_multiple_of(1 << 20) => format!("{}M", b >> 20),
+            b if b.is_multiple_of(1 << 10) => format!("{}K", b >> 10),
+            b => b.to_string(),
+        };
+        f.pad(&text)
+    }
 }
 
 /// Paths as written in policy files: absolute, `~/…`, or starting with the
@@ -207,11 +304,14 @@ impl PolicySnapshot {
 
 impl Policy {
     /// Whether `self` and `other` have the same rules a session keeps from
-    /// its start: files and listening, which its compiled policy holds, and
-    /// the secrets it is given (design §7). The rest is the proxy's, which
-    /// applies it live.
+    /// its start: files and listening, which its compiled policy holds, the
+    /// secrets it is given and the limits it starts under (design §7). The
+    /// rest is the proxy's, which applies it live.
     pub fn same_at_launch(&self, other: &Policy) -> bool {
-        self.fs == other.fs && self.net.listen == other.net.listen && self.secrets == other.secrets
+        self.fs == other.fs
+            && self.net.listen == other.net.listen
+            && self.secrets == other.secrets
+            && self.resources == other.resources
     }
 }
 

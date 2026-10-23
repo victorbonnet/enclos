@@ -2399,3 +2399,87 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
         "{listed}"
     );
 }
+
+/// A `[resources]` section holds every process of the sandbox to its
+/// limits, which none can raise, and `policy test` shows each; a limit
+/// Seatbelt cannot enforce is refused.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_runs_under_the_limits_its_policy_sets() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let edit = |line: &str| {
+        let mut edit = home.command(&["policy", "edit", "home"]);
+        edit.env_remove("VISUAL").env(
+            "EDITOR",
+            editor(
+                &home,
+                &format!("printf '\\n[resources]\\n{line}\\n' >> \"$1\""),
+            ),
+        );
+        Run(edit.output().unwrap())
+    };
+    let out = edit("memory = \\\"2G\\\"");
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(out.stderr().contains("memory"), "{}", out.stderr());
+    // policy edit keeps the refused file: put the template's back.
+    home.run(&["policy", "discard", "home"]);
+    let policy = home.root.join("sandboxes/home/policy.toml");
+    let kept = std::fs::read_to_string(&policy).unwrap();
+    let clean = kept.split("\n[resources]").next().unwrap().to_owned();
+    std::fs::write(&policy, clean).unwrap();
+    let out = edit("open_files = 64\\nfile_size = \\\"1M\\\"\\ncpu_seconds = 600");
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("limit the files a process holds open to 64"),
+        "{}",
+        out.stdout()
+    );
+
+    let out = home.run(&[
+        "exec",
+        "home",
+        "--",
+        "/bin/sh",
+        "-c",
+        "ulimit -Hn; ulimit -Hf; ulimit -Ht",
+    ]);
+    assert_eq!(out.ok().stdout(), "64\n1024\n600\n");
+    // Past the size: refused. And no process can raise a limit.
+    let out = home.run(&[
+        "exec",
+        "home",
+        "--",
+        "/bin/sh",
+        "-c",
+        "dd if=/dev/zero of=\"$TMPDIR/big\" bs=1024 count=2048 2>&1; ulimit -n 65 && echo raised",
+    ]);
+    // dd is stopped by the signal the limit sends, or told its write is too
+    // large when it ignores it.
+    let said = format!("{}{}", out.stdout(), out.stderr());
+    assert!(
+        said.contains("Filesize limit exceeded") || said.contains("File too large"),
+        "{said}"
+    );
+    assert!(!said.contains("raised"), "{said}");
+    assert!(said.contains("cannot modify limit"), "{said}");
+
+    let out = home.run(&["policy", "test", "home"]);
+    let report = out.stdout();
+    for probe in [
+        "hold more than 64 files open",
+        "write a file past 1024 KiB",
+        "use more than 600 s of CPU",
+    ] {
+        assert!(
+            report
+                .lines()
+                .any(|l| l.trim_start().starts_with("closed ") && l.contains(probe)),
+            "{probe} is not shown closed:\n{report}"
+        );
+    }
+}

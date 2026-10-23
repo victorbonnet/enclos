@@ -108,6 +108,38 @@ pub struct Launch {
     /// listens; none for the service itself, a probe, a sandbox whose
     /// runtime has no such service, or one whose service does not listen.
     pub service_port: Option<u16>,
+    /// The limits each of its processes runs under (design §7): those its
+    /// policy sets, which the validation let through for this backend.
+    pub limits: crate::model::policy::Resources,
+}
+
+/// `command` run under `limits`, which every process it starts inherits:
+/// `/bin/sh` sets them with `ulimit`, hard and soft alike, so nothing in the
+/// sandbox can raise them, then becomes the program. As it is when no limit
+/// is set.
+pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) -> Command {
+    let mut set = Vec::new();
+    if let Some(files) = limits.open_files {
+        set.push(format!("ulimit -n {files}"));
+    }
+    // In KiB, the unit of /bin/sh's `ulimit -f` (shown on macOS 26.5.2).
+    if let Some(size) = limits.file_size {
+        set.push(format!("ulimit -f {}", size.0 / 1024));
+    }
+    if let Some(seconds) = limits.cpu_seconds {
+        set.push(format!("ulimit -t {seconds}"));
+    }
+    if set.is_empty() {
+        return command;
+    }
+    set.push("exec \"$0\" \"$@\"".to_owned());
+    let mut limited = Command::new("/bin/sh");
+    limited
+        .arg("-c")
+        .arg(set.join(" && "))
+        .arg(command.get_program())
+        .args(command.get_args());
+    limited
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -137,4 +169,38 @@ pub trait Backend {
 /// This is the one explicit list of implementations.
 pub fn registered() -> Vec<Box<dyn Backend>> {
     vec![Box::new(seatbelt::Seatbelt)]
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::*;
+
+    #[test]
+    fn limits_are_set_by_the_shell_that_becomes_the_program() {
+        let plain = Command::new("/usr/bin/true");
+        let none = under_limits(plain, &crate::model::policy::Resources::default());
+        assert_eq!(none.get_program(), "/usr/bin/true");
+        let mut program = Command::new("/usr/bin/sandbox-exec");
+        program.args(["-f", "x.sb", "/bin/zsh"]);
+        let limits = crate::model::policy::Resources {
+            open_files: Some(256),
+            file_size: Some("1M".parse().unwrap()),
+            cpu_seconds: Some(60),
+            ..Default::default()
+        };
+        let limited = under_limits(program, &limits);
+        assert_eq!(limited.get_program(), "/bin/sh");
+        let args: Vec<_> = limited.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "ulimit -n 256 && ulimit -f 1024 && ulimit -t 60 && exec \"$0\" \"$@\"",
+                "/usr/bin/sandbox-exec",
+                "-f",
+                "x.sb",
+                "/bin/zsh"
+            ]
+        );
+    }
 }

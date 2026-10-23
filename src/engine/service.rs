@@ -524,6 +524,7 @@ impl Engine {
             // service outlives it.
             in_terminal: false,
             service_port: None,
+            limits: snapshot.policy.resources.clone(),
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);

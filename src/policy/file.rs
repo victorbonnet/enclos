@@ -7,7 +7,7 @@
 use serde::Deserialize;
 
 use super::PolicyError;
-use crate::model::policy::{NetLog, NetMode, Policy, TemplateName};
+use crate::model::policy::{ByteSize, NetLog, NetMode, Policy, TemplateName};
 use crate::model::secret::SecretGrant;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -22,6 +22,32 @@ pub struct PolicyFile {
     pub network: NetLayer,
     #[serde(default)]
     pub secrets: SecretsLayer,
+    #[serde(default)]
+    pub resources: ResourcesLayer,
+}
+
+/// The limits a layer sets on each process, each replacing the one the
+/// layers below set. `memory` and `cpu` are read as text, whatever their
+/// form, only for the validation to refuse them where they cannot be
+/// enforced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ResourcesLayer {
+    pub open_files: Option<u64>,
+    pub file_size: Option<ByteSize>,
+    pub cpu_seconds: Option<u64>,
+    #[serde(deserialize_with = "as_text")]
+    pub memory: Option<String>,
+    #[serde(deserialize_with = "as_text")]
+    pub cpu: Option<String>,
+}
+
+/// A value of any form, as text.
+fn as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<toml::Value>::deserialize(d)?.map(|v| match v {
+        toml::Value::String(s) => s,
+        other => other.to_string(),
+    }))
 }
 
 /// The secrets a layer grants, by environment variable: `env` replaces what
@@ -78,6 +104,9 @@ impl PolicyFile {
         if self.network.log.is_some() {
             found.push("network.log");
         }
+        if self.resources != ResourcesLayer::default() {
+            found.push("resources");
+        }
         if self.secrets != SecretsLayer::default() {
             found.push("secrets");
         }
@@ -133,6 +162,22 @@ impl PolicyFile {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
+        let (limits, layer) = (&mut policy.resources, &self.resources);
+        if layer.open_files.is_some() {
+            limits.open_files = layer.open_files;
+        }
+        if layer.file_size.is_some() {
+            limits.file_size = layer.file_size;
+        }
+        if layer.cpu_seconds.is_some() {
+            limits.cpu_seconds = layer.cpu_seconds;
+        }
+        if layer.memory.is_some() {
+            limits.memory.clone_from(&layer.memory);
+        }
+        if layer.cpu.is_some() {
+            limits.cpu.clone_from(&layer.cpu);
+        }
     }
 }
 
@@ -233,6 +278,32 @@ mod tests {
         // A grant that names no secret is refused as the file is read.
         let err = PolicyFile::parse("d", "[secrets]\nenv = { X = \"home/x\" }").unwrap_err();
         assert!(err.to_string().contains("secret:<sandbox>/<name>"), "{err}");
+    }
+
+    #[test]
+    fn limits_are_set_by_the_last_layer_that_names_each() {
+        let mut policy = Policy::default();
+        PolicyFile::parse(
+            "a",
+            "[resources]\nopen_files = 256\nfile_size = \"1G\"\ncpu = 2.0\nmemory = \"2G\"",
+        )
+        .unwrap()
+        .apply(&mut policy);
+        PolicyFile::parse("b", "[resources]\nopen_files = 512\ncpu_seconds = 60")
+            .unwrap()
+            .apply(&mut policy);
+        let r = &policy.resources;
+        assert_eq!(r.open_files, Some(512));
+        assert_eq!(r.file_size, Some(ByteSize(1 << 30)));
+        assert_eq!(r.cpu_seconds, Some(60));
+        assert_eq!(
+            (r.cpu.as_deref(), r.memory.as_deref()),
+            (Some("2.0"), Some("2G"))
+        );
+        let layer = PolicyFile::parse("adapter", "[resources]\nopen_files = 1").unwrap();
+        assert_eq!(layer.beyond_destinations(), ["resources"]);
+        assert!(PolicyFile::parse("c", "[resources]\nfile_size = \"1T\"").is_err());
+        assert!(PolicyFile::parse("c", "[resources]\nthreads = 4").is_err());
     }
 
     #[test]

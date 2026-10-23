@@ -246,6 +246,9 @@ impl Engine {
                 name: name.to_string(),
             })?;
             let compiled = self.compile_policy(name, record.proxy_port)?;
+            // The limits the sandbox's processes run under, which the
+            // resource probes show.
+            let limits = self.active_policy(name)?.1.policy.resources;
             self.ensure_proxy(lock, &record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             // TMPDIR inside the sandbox (the policy denies /tmp): without it,
@@ -279,6 +282,7 @@ impl Engine {
                         // more than a service does.
                         in_terminal: false,
                         service_port: None,
+                        limits: limits.clone(),
                     };
                     backend
                         .wrap(&compiled, &ctx, &launch)
@@ -354,6 +358,7 @@ impl Engine {
             other_terminal,
             tag: std::process::id(),
             keychain_item: Err("not probed here".into()),
+            limits: policy.resources.clone(),
         })
     }
 
@@ -666,6 +671,7 @@ mod tests {
             other_terminal: None,
             tag: 7,
             keychain_item: Err("not probed here".into()),
+            limits: Default::default(),
         }
     }
 
