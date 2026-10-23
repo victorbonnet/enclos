@@ -28,8 +28,8 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from.
-        #[arg(long, default_value = "assistant")]
+        /// The policy it starts from: minimal, mcp-only or assistant (design §7).
+        #[arg(long, default_value = enclos::policy::DEFAULT_TEMPLATE)]
         template: TemplateName,
     },
     /// List sandboxes.
@@ -263,7 +263,7 @@ fn list_json(v: &SandboxView) -> Value {
     json!({
         "name": v.record.name.to_string(),
         "backend": v.record.backend.to_string(),
-        "template": v.record.template.to_string(),
+        "template": v.template.to_string(),
         "policy_version": v.policy.as_ref().map(|p| p.version),
         "state": state_json(&v.record.state),
         "sessions_running": running,
@@ -277,7 +277,7 @@ fn show_json(v: &SandboxView) -> Value {
         "name": r.name.to_string(),
         "state": state_json(&r.state),
         "backend": r.backend.to_string(),
-        "template": r.template.to_string(),
+        "template": v.template.to_string(),
         "proxy_port": r.proxy_port,
         "active_policy": v.policy.as_ref().map(|p| json!({
             "version": p.version,
@@ -312,7 +312,7 @@ fn print_list(views: &[SandboxView]) {
             .fold(header.len(), usize::max)
     };
     let name = widest("NAME", |v| v.record.name.as_str());
-    let template = widest("TEMPLATE", |v| v.record.template.as_str());
+    let template = widest("TEMPLATE", |v| v.template.as_str());
     println!(
         "{:<name$}  {:<10}  {:<template$}  {:<8}  STATE",
         "NAME", "BACKEND", "TEMPLATE", "POLICY"
@@ -333,7 +333,7 @@ fn print_list(views: &[SandboxView]) {
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
             v.record.name,
             v.record.backend,
-            v.record.template,
+            v.template,
             policy,
             state(&v.record.state)
         );
@@ -345,7 +345,7 @@ fn print_show(v: &SandboxView) {
     println!("Sandbox {}: {}", r.name, state(&r.state));
     println!(
         "  backend {}, template {}, proxy port {}",
-        r.backend, r.template, r.proxy_port
+        r.backend, v.template, r.proxy_port
     );
     if let Some(p) = &v.policy {
         println!(

@@ -1067,6 +1067,49 @@ mod sandbox {
         drop(sleeping);
     }
 
+    /// A dry run refuses the template a create would refuse, and writes
+    /// nothing.
+    #[test]
+    fn a_dry_run_create_refuses_an_unknown_template() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let mut bad = spec("lab");
+        bad.template = "does-not-exist".parse().unwrap();
+        let err = engine
+            .create_sandbox(&alice(), bad, Confirm::DryRun)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown template"), "{err}");
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+        let planned = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap();
+        assert!(matches!(planned, Planned::DryRun(_)), "{planned:?}");
+        assert!(!engine.layout.sandbox_dir("lab").exists());
+    }
+
+    /// `sandbox list` and `show` name the template the active policy is
+    /// built on, once `policy.toml` names another than the sandbox was
+    /// created from.
+    #[test]
+    fn a_sandbox_is_shown_with_the_template_its_active_policy_is_built_on() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let file = engine.layout.policy_file(name.as_str());
+        let before = std::fs::read_to_string(&file).unwrap();
+        let after = before.replace("extends = \"assistant\"", "extends = \"minimal\"");
+        assert_ne!(before, after);
+        done(
+            engine
+                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+                .unwrap(),
+        );
+        let view = engine.show_sandbox(&name).unwrap();
+        assert_eq!(view.record.template.as_str(), "assistant");
+        assert_eq!(view.template.as_str(), "minimal");
+        assert_eq!(
+            engine.list_sandboxes().unwrap()[0].template.as_str(),
+            "minimal"
+        );
+    }
+
     #[test]
     fn a_create_with_an_unknown_template_leaves_nothing() {
         let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));

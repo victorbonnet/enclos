@@ -248,7 +248,7 @@ impl Engine {
             let compiled = self.compile_policy(name, record.proxy_port)?;
             // The limits the sandbox's processes run under, which the
             // resource probes show.
-            let limits = self.active_policy(name)?.1.policy.resources;
+            let limits = self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
             self.ensure_proxy(lock, &record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             // TMPDIR inside the sandbox (the policy denies /tmp): without it,

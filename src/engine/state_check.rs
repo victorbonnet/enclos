@@ -342,11 +342,17 @@ impl Engine {
                                 what,
                                 Remedy::Repairs(Repair(Fix::WritePolicy { text, pending })),
                             ),
+                            // The template the active policy is built on,
+                            // which `policy.toml` may have changed since the
+                            // sandbox was created.
                             None => push(
                                 what,
                                 Remedy::Manual(format!(
                                     "enclos does not keep the text it came from: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
-                                    record.template
+                                    self.state.active_policy(name)?.map_or_else(
+                                        || record.template.clone(),
+                                        |(_, snapshot)| snapshot.inputs.template
+                                    )
                                 )),
                             ),
                         }
