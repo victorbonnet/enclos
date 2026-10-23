@@ -4,12 +4,14 @@
 ;; macOS 26 is noted beside it (prototype #5); escape probes (#13) check them.
 
 ;; LaunchServices: `open`, opening apps, documents and URLs. Shown: `open -g
-;; <url>` fails with -54 under this rule; denying the coreservicesd lookups
-;; alone did not stop it.
+;; <url>` fails with -54 under this rule on (allow default); denying the
+;; coreservicesd lookups alone did not stop it. On (deny default) the
+;; baseline refuses the lookup first (-10661).
 (deny lsopen (with message "{tag}"))
 
 ;; Apple Events (osascript, scripting Terminal or any app). Shown: either rule
-;; alone makes an event to Finder fail with -600.
+;; alone makes an event to Finder fail with -600 on (allow default). On (deny
+;; default) the baseline refuses the lookup of Finder first (-1728).
 (deny appleevent-send (with message "{tag}"))
 (deny mach-lookup (with message "{tag}")
   (global-name "com.apple.coreservices.appleevents"))

@@ -21,8 +21,9 @@ use crate::model::sandbox::SandboxName;
 use crate::model::secret::{SecretRef, SecretValue};
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
-    HostCheck, KEYCHAIN_PROBE_VALUE, KeychainItem, Outcome, Probe, ProbeInputs, ProbeResult, Proof,
-    Run, host_service_probes, missing_workspaces, not_here, outcome, probes, sandboxed_script,
+    ClosedBy, HostCheck, KEYCHAIN_PROBE_VALUE, KeychainItem, Outcome, Probe, ProbeInputs,
+    ProbeResult, Proof, Run, host_service_probes, missing_workspaces, not_here, outcome, probes,
+    sandboxed_script,
 };
 use crate::secrets::SecretStore;
 use crate::secrets::keychain::Keychain;
@@ -38,6 +39,9 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
+    /// Whether the probes ran on the `(allow default)` baseline, which only
+    /// a comparison asks for (ADR 0006): the report says so.
+    pub allow_default: bool,
 }
 
 impl TestReport {
@@ -49,15 +53,39 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
+    /// Closed probes whose route the `(deny default)` baseline closes before
+    /// the rule the probe tests is reached.
+    pub fn closed_by_baseline(&self) -> usize {
+        self.count_closed(|r| r.closed_by == Some(ClosedBy::Baseline))
+    }
+
+    /// The closed probes that show something other than their route's
+    /// rule, as the report says them: ` (1 by Seatbelt itself, 2 by the
+    /// (deny default) baseline)`, or nothing.
+    pub fn closed_apart(&self) -> String {
+        let said: Vec<String> = [
+            (self.closed_by_platform(), "by Seatbelt itself"),
+            (self.closed_by_baseline(), "by the (deny default) baseline"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, by)| format!("{n} {by}"))
+        .collect();
+        match said.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", said.join(", ")),
+        }
+    }
+
     /// Closed probes whose route Seatbelt itself closes, whatever the
     /// compiled policy says: they show no rule enclos adds.
     pub fn closed_by_platform(&self) -> usize {
-        self.count_closed(|r| r.closed_by_platform.is_some())
+        self.count_closed(|r| r.closed_by == Some(ClosedBy::Seatbelt))
     }
 
     /// Closed probes that show a rule enclos adds.
     pub fn closed_by_enclos(&self) -> usize {
-        self.count_closed(|r| r.closed_by_platform.is_none())
+        self.count_closed(|r| r.closed_by != Some(ClosedBy::Seatbelt))
     }
 
     fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
@@ -227,12 +255,13 @@ impl Engine {
             return self.plan_test(name, host_services).map(Planned::DryRun);
         }
         let summary = |r: &TestReport| {
-            let platform = match r.closed_by_platform() {
-                0 => String::new(),
-                n => format!(" ({n} by Seatbelt itself)"),
+            let platform = r.closed_apart();
+            let baseline = match r.allow_default {
+                true => ", on the (allow default) comparison baseline",
+                false => "",
             };
             format!(
-                "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run",
+                "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run{baseline}",
                 r.results.len(),
                 r.closed(),
                 r.open(),
@@ -263,6 +292,14 @@ impl Engine {
             let keychain = KeychainProbe::store(&self.layout, name);
             let mut inputs =
                 self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
+            // The baseline's refused lookups count as closed only on
+            // `(deny default)`, as the file compiled for these probes says.
+            let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
+                path: compiled.clone(),
+                source,
+            })?;
+            inputs.lookups_refused = text.contains("\n(deny default ");
+            let allow_default = text.lines().any(|l| l == "(allow default)");
             inputs.keychain_item = keychain
                 .as_ref()
                 .map(|k| k.item.clone())
@@ -298,6 +335,7 @@ impl Engine {
                 host_services,
                 not_here: not_here(&inputs),
                 listens: inputs.listen,
+                allow_default,
             })
         })
         .map(Planned::Done)
@@ -354,6 +392,7 @@ impl Engine {
             host_sockets: host_sockets(&ctx.user_home),
             proxy_port: ctx.proxy_port,
             listen: policy.net.listen,
+            lookups_refused: false,
             target,
             other_terminal,
             tag: std::process::id(),
@@ -603,12 +642,13 @@ mod tests {
                     route: "r",
                     name: "n".into(),
                     outcome,
-                    closed_by_platform: None,
+                    closed_by: None,
                 })
                 .collect(),
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            allow_default: false,
         }
     }
 
@@ -634,7 +674,7 @@ mod tests {
         // Seatbelt's own refusal of setuid programs shows no enclos rule.
         let mut platform = report(vec![Outcome::Closed, Outcome::Inconclusive("x".into())]);
         for r in &mut platform.results {
-            r.closed_by_platform = Some("Seatbelt itself");
+            r.closed_by = Some(ClosedBy::Seatbelt);
         }
         assert!(!platform.passed());
         assert_eq!(platform.closed_by_platform(), 1);
@@ -667,6 +707,7 @@ mod tests {
             host_sockets: Vec::new(),
             proxy_port: 41001,
             listen: false,
+            lookups_refused: false,
             target: Some(target),
             other_terminal: None,
             tag: 7,

@@ -20,6 +20,15 @@ pub struct LaunchArgs {
 
 /// Runs one of the runtime's services in the sandbox until it exits.
 pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
+    use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
+    // A service runs only on `(deny default)` (ADR 0006): the job file never
+    // carries the comparison baseline, and one the service manager's own
+    // environment carries, or a hand-run `launch`, is refused here.
+    if Baseline::from_env() != Ok(Baseline::DenyDefault) {
+        return Err(failed(format!(
+            "{BASELINE_VAR} is set: a service runs only on (deny default); unset it (`launchctl unsetenv {BASELINE_VAR}` for the service manager's environment)"
+        )));
+    }
     let end = engine.launch(by, &args.sandbox, &args.service)?;
     // Into the service's log, which `enclos logs` shows.
     super::connect::report_end(&args.sandbox, &end);

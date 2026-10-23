@@ -29,7 +29,10 @@ impl Home {
         cmd.arg("--text")
             .args(args)
             .env("ENCLOS_HOME", &self.root)
-            .env("HOME", self._dir.path());
+            .env("HOME", self._dir.path())
+            // The baseline enclos ships, whatever the shell running the
+            // tests exported; a test that compares sets it itself.
+            .env_remove("ENCLOS_SEATBELT_BASELINE");
         cmd
     }
 
@@ -42,7 +45,8 @@ impl Home {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
         cmd.args(args)
             .env("ENCLOS_HOME", &self.root)
-            .env("HOME", self._dir.path());
+            .env("HOME", self._dir.path())
+            .env_remove("ENCLOS_SEATBELT_BASELINE");
         cmd
     }
 
@@ -1179,7 +1183,7 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     let policy = std::fs::read_to_string(&policy_file).unwrap();
     // The host-service probes act on the host if a rule fails: only where
     // CI asks for them by name, never because some tool set `CI`.
-    let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    let host_services = host_service_probes_asked();
     // CI runs them: a workflow that lost the variable must not pass quietly.
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
         assert!(
@@ -1230,6 +1234,13 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     let report = out.stdout();
     assert!(!report.contains("OPEN"), "{report}");
     assert!(!report.contains("NOT RUN"), "{report}");
+    // Nothing says it ran on the comparison baseline.
+    assert!(
+        !out.stderr().contains("(allow default)"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!report.contains("comparison baseline"), "{report}");
     let mut routes = vec![
         "sensitive files",
         "enclos files",
@@ -3338,7 +3349,7 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     let _stop = StopOnDrop(&home, "home");
     // The folder the launch agents probe writes in, as a Mac has it.
     std::fs::create_dir_all(home._dir.path().join("Library/LaunchAgents")).unwrap();
-    let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    let host_services = host_service_probes_asked();
     // CI runs them: a workflow that lost the variable must not pass quietly.
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
         assert!(
@@ -3357,6 +3368,16 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
         .unwrap());
     let report = out.stdout();
     assert_eq!(out.code(), 0, "stdout: {report}\nstderr: {}", out.stderr());
+    // Said, on stderr and in the verdict: no sandbox runs on it.
+    assert!(
+        out.stderr().contains("compiled from (allow default)"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        report.contains("On the (allow default) comparison baseline"),
+        "{report}"
+    );
     let compiled = std::fs::read_dir(home.root.join("sandboxes/home/compiled"))
         .unwrap()
         .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
@@ -3369,6 +3390,8 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     assert!(!report.contains("NOT RUN"), "{report}");
     // The routes a new sandbox has; those that need files on the deny list
     // or a second sandbox are in `every_escape_probe_fails_in_a_new_sandbox`.
+    // On this baseline LaunchServices and Apple Events close only on the
+    // rules' own refusals (-54, -600): the rules are what is shown.
     let mut routes = vec![
         "enclos files",
         "writes",
@@ -3397,25 +3420,92 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
             "no closed {route} probe:\n{report}"
         );
     }
-    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code}' http://example.com/";
+
+    // ADR 0006's comparison: every probe closed on the earlier baseline is
+    // closed on the one enclos ships.
+    let closed = |baseline: &str| {
+        let mut args = vec!["--json"];
+        args.extend(&args_for_json(host_services));
+        let out = Run(home
+            .piped(&args)
+            .env("ENCLOS_SEATBELT_BASELINE", baseline)
+            .output()
+            .unwrap());
+        let doc: serde_json::Value = serde_json::from_str(&out.stdout())
+            .unwrap_or_else(|e| panic!("{baseline}: {e}: {}", out.stderr()));
+        assert_eq!(doc["baseline"], baseline.replace('-', "_"), "{doc}");
+        doc["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|p| p["outcome"] == "closed")
+            .map(|p| format!("{}: {}", p["route"], p["name"]))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = closed("allow-default");
+    let now = closed("deny-default");
+    let lost: Vec<_> = before.difference(&now).collect();
+    assert!(lost.is_empty(), "closed only on (allow default): {lost:?}");
+
+    // Programs run, and TLS goes through, on either baseline: a page the
+    // policy allows answers 200 over HTTP and HTTPS through the proxy.
+    home.run(&["policy", "allow", "home", "example.com", "--yes"])
+        .ok();
+    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' http://example.com/ && /usr/bin/curl -sS -o /dev/null -w '%{http_code}' https://example.com/";
     for baseline in ["allow-default", "deny-default"] {
         let out = Run(home
             .command(&["exec", "home", "--", "/bin/sh", "-c", script])
             .env("ENCLOS_SEATBELT_BASELINE", baseline)
             .output()
             .unwrap());
-        // A 200 is the policy allowing the host; a 403 is the proxy refusing
-        // it: either is an answer through the proxy.
-        assert!(
-            out.stdout().starts_with("hi\n2\n"),
-            "{baseline}: stdout: {}\nstderr: {}",
+        assert_eq!(
             out.stdout(),
+            "hi\n2\n200 200",
+            "{baseline}: stderr: {}",
             out.stderr()
         );
-        assert!(
-            out.stdout().ends_with("200") || out.stdout().ends_with("403"),
+        assert_eq!(
+            out.stderr().contains("compiled from (allow default)"),
+            baseline == "allow-default",
             "{baseline}: {}",
-            out.stdout()
+            out.stderr()
         );
     }
+    // Any other value is neither baseline: refused, before anything runs.
+    for value in ["1", "", "Allow-Default"] {
+        let out = Run(home
+            .command(&["exec", "home", "--", "/bin/echo", "ran"])
+            .env("ENCLOS_SEATBELT_BASELINE", value)
+            .output()
+            .unwrap());
+        assert_eq!(out.code(), 125, "{value:?}: {}", out.stdout());
+        assert!(!out.stdout().contains("ran"), "{value:?}");
+        assert!(
+            out.stderr().contains("ENCLOS_SEATBELT_BASELINE is"),
+            "{value:?}: {}",
+            out.stderr()
+        );
+    }
+}
+
+/// `policy test home`, with the host-service probes where CI asks for them.
+#[cfg(target_os = "macos")]
+fn args_for_json(host_services: bool) -> Vec<&'static str> {
+    let mut args = vec!["policy", "test", "home"];
+    if host_services {
+        args.push("--host-services");
+    }
+    args
+}
+
+/// Whether the host-service probes run here: only where CI asks for them
+/// by name. Said on stderr when they do not, so a run elsewhere is not
+/// read as having shown them.
+#[cfg(target_os = "macos")]
+fn host_service_probes_asked() -> bool {
+    let asked = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    if !asked {
+        eprintln!("host-service probes not run: set ENCLOS_HOST_SERVICE_PROBES=1 (CI does)");
+    }
+    asked
 }

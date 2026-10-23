@@ -1,19 +1,25 @@
 ;; ---- Deny by default (ADR 0006): what a sandbox may do
 ;; Everything not allowed here or by a rule after this block is refused,
 ;; with the sandbox's tag. Allowed broadly here, and narrowed by no rule
-;; after: running and forking programs, `sysctl` reads, pseudo-terminals.
-;; Allowed broadly here, and narrowed after: reads, by the deny list and the
-;; other sandboxes' folders; `ioctl`, by the TIOCSTI rule. Granted only by
+;; after: running and forking programs, `sysctl` reads, opening a
+;; pseudo-terminal through /dev/ptmx (which `/dev/ttys` devices it may then
+;; read or write is the terminal rules' business). Allowed broadly here, and
+;; narrowed after: reads, by the deny list, other terminals, enclos's own
+;; files and the other sandboxes' folders; `ioctl`, by the TIOCSTI rule.
+;; Allowed only for its own sandbox: process information. Granted only by
 ;; the rules after: writes, terminals, the network and signals. Named here
 ;; one by one: Mach services and shared memory.
 
-;; Running programs, and reading: reads are broad (ADR 0015); the deny list
-;; and the other sandboxes' folders after this take away what they name.
+;; Running programs, and reading: reads are broad (ADR 0015); the deny list,
+;; other terminals, enclos's own files and the other sandboxes' folders
+;; after this take away what they name.
 (allow process-fork)
 (allow process-exec*)
 (allow file-read*)
 
-;; What a program reads of the kernel about itself and the host.
+;; What a program reads of the kernel about itself and the host, and what
+;; it may learn or set of its own sandbox's processes (`process-info*`, the
+;; same sandbox only).
 (allow sysctl-read)
 (allow process-info* (target same-sandbox))
 
@@ -28,7 +34,7 @@
 (allow pseudo-tty)
 
 ;; Host services the workloads looked up (a shell, Python, git, curl, Node
-;; and Hermes's installer, design §14's ADR 0006 run): notifications,
+;; and Hermes's installer; prototype/adr-0006/README.md): notifications,
 ;; logging, user and group records, the per-user temporary folder, the
 ;; network settings, and certificate trust.
 (allow mach-lookup
@@ -39,7 +45,7 @@
   (global-name "com.apple.diagnosticd")
   (global-name "com.apple.bsd.dirhelper")
   (global-name "com.apple.SystemConfiguration.configd")
-  ;; Certificate trust, for TLS through the Security framework: Python's
-  ;; downloads fail with OSStatus -26276 without it.
+  ;; Certificate trust, for TLS through the Security framework: the Hermes
+  ;; installer's downloads failed with OSStatus -26276 without it.
   (global-name "com.apple.trustd.agent"))
 (allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))

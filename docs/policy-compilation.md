@@ -56,7 +56,7 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos; milestone 1 ships `assistant` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `assistant`, `minimal` and `mcp-only` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
 | 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, `assistant` when left out |
 
@@ -141,7 +141,7 @@ Since the file is named by its content, a new file appears whenever any input to
 
 | # | Section | Rules | From the policy? |
 | --- | --- | --- | --- |
-| 1 | Header | `(version 1)`, `(deny default)` with the sandbox's tag, then `deny-default.sb`: what a sandbox may do on that baseline, each rule one a workload or a test needed ([ADR 0006](adr/0006-seatbelt-deny-by-default.md)). Every section below narrows or grants as it did on milestone 1's `(allow default)`, which `ENCLOS_SEATBELT_BASELINE=allow-default` still compiles, only for tests that compare the two. | no |
+| 1 | Header | `(version 1)`, `(deny default)` with the sandbox's tag, then `deny-default.sb`: what a sandbox may do on that baseline, each rule one a workload or a test needed or looked up ([ADR 0006](adr/0006-seatbelt-deny-by-default.md); its README says which failed without it). Every section below narrows or grants as it did on milestone 1's `(allow default)`, which `ENCLOS_SEATBELT_BASELINE=allow-default` still compiles, only for tests that compare the two. | no |
 | 2 | Writes | `(deny file-write*)`, then allow the sandbox home, each `filesystem.write` path, and the device files every runtime writes (`/dev/null`, `/dev/tty`, `/dev/fd/N`, …). | `filesystem.write` |
 | 3 | Terminals | Deny every `/dev/ttysN`, then allow back only the session's own (the `ENCLOS_TERMINAL` parameter) and those the sandbox opens itself through `/dev/ptmx`; the sandbox may not issue itself the pty extension for another one. Then allow reading the home. | no |
 | 4 | Sensitive paths | `(deny file-read* file-write*)` on every `filesystem.read_deny` path, after every allow above, so no write grant reopens one. An entry that holds the home (such as `~`) leaves the home out. | `filesystem.read_deny` |
@@ -259,7 +259,7 @@ A change to the filesystem rules or `listen` reaches running sessions only throu
 
 | Message starts with | Stage | Cause |
 | --- | --- | --- |
-| `cannot read the <layer> policy` | resolve | TOML that does not parse, an unknown key, or a section milestone 1 does not enforce |
+| `cannot read the <layer> policy` | resolve | TOML that does not parse, an unknown key, or a section this build does not enforce |
 | `unknown template` | resolve | `extends` names a template this build does not ship |
 | `a template cannot extend another` | resolve | a template layer sets `extends` |
 | `the <runtime> adapter's layer may only add network destinations` | resolve | an adapter's layer sets more than `allow_add` and `listen` |

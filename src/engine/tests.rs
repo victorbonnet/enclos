@@ -623,7 +623,7 @@ mod compile {
         use crate::backend::Launch;
         use crate::backend::seatbelt::Seatbelt;
 
-        let (dir, engine) = engine_with(vec![Box::new(Seatbelt)]);
+        let (dir, engine) = engine_with(vec![Box::new(Seatbelt::default())]);
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "home".parse().unwrap();
         let spec = crate::engine::SandboxSpec {
@@ -648,7 +648,10 @@ mod compile {
             limits: Default::default(),
         };
         let ctx = engine.sandbox_context(&name, 41001);
-        let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
+        let out = Seatbelt::default()
+            .wrap(&compiled, &ctx, &launch)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success());
         assert!(stderr.contains("Operation not permitted"), "{stderr}");
@@ -4902,7 +4905,13 @@ mod services {
         let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
         engine.start_sandbox(&alice(), &name).unwrap();
         for unit in fake.started.borrow().iter() {
+            // That alone: never the comparison baseline (ADR 0006).
             assert_eq!(unit.env, engine.layout.env(), "{}", unit.label);
+            assert!(
+                unit.env
+                    .iter()
+                    .all(|(k, _)| k != crate::backend::seatbelt::BASELINE_VAR)
+            );
         }
     }
 

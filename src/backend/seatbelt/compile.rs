@@ -23,18 +23,47 @@ use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
 const HOST_SERVICES: &str = include_str!("host-services.sb");
 
 /// What a sandbox may do under `(deny default)` (ADR 0006).
-const DENY_DEFAULT: &str = include_str!("deny-default.sb");
+pub(super) const DENY_DEFAULT: &str = include_str!("deny-default.sb");
 
 /// The variable that compiles a policy from `(allow default)` instead, as
 /// before ADR 0006 was accepted: `allow-default`. Only so tests can compare
-/// the two baselines, not a setting: read as each policy is compiled, said
-/// on stderr when it is used, and never passed to a service.
+/// the two baselines, not a setting: see [`Baseline::from_env`].
 pub const BASELINE_VAR: &str = "ENCLOS_SEATBELT_BASELINE";
 
-/// Whether [`BASELINE_VAR`] asks for the earlier, allow-by-default
-/// baseline.
-fn allow_by_default() -> bool {
-    std::env::var(BASELINE_VAR).is_ok_and(|v| v == "allow-default")
+/// What a compiled policy does with an operation none of its rules names
+/// (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Baseline {
+    /// `(deny default)`, then the reviewed allowances of `deny-default.sb`.
+    #[default]
+    DenyDefault,
+    /// `(allow default)`, as before ADR 0006: only for comparing the two.
+    AllowDefault,
+}
+
+impl Baseline {
+    /// What [`BASELINE_VAR`] asks for. Unset is `(deny default)`, and
+    /// `deny-default` or `allow-default` names one; any other value is an
+    /// error, so a mistyped one is taken for neither. Only a build with
+    /// debug assertions, as tests run, takes `allow-default`: a release
+    /// refuses it. A service never runs on it: `enclos launch` refuses to
+    /// start one while it is asked for.
+    pub fn from_env() -> Result<Baseline, String> {
+        match std::env::var(BASELINE_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(Baseline::DenyDefault),
+            Ok(v) if v == "deny-default" => Ok(Baseline::DenyDefault),
+            Ok(v) if v == "allow-default" && cfg!(debug_assertions) => Ok(Baseline::AllowDefault),
+            Ok(v) if v == "allow-default" => Err(format!(
+                "{BASELINE_VAR}=allow-default is only for comparing the baselines in a test build of enclos; unset it"
+            )),
+            Ok(v) => Err(format!(
+                "{BASELINE_VAR} is {v:?}: it takes `deny-default` or `allow-default`, or is unset"
+            )),
+            Err(std::env::VarError::NotUnicode(v)) => Err(format!(
+                "{BASELINE_VAR} is {v:?}: it takes `deny-default` or `allow-default`, or is unset"
+            )),
+        }
+    }
 }
 
 /// Device files every runtime writes to (shown by the prototype: shells,
@@ -76,7 +105,11 @@ pub fn tag(ctx: &SandboxContext) -> String {
     format!("enclos:{}", ctx.name)
 }
 
-pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
+pub fn compile(
+    policy: &Policy,
+    ctx: &SandboxContext,
+    baseline: Baseline,
+) -> Result<Compiled, CompileError> {
     let tag = tag(ctx);
     let paths = PathContext {
         user_home: ctx.user_home.clone(),
@@ -99,15 +132,9 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         ctx.name
     ));
     line("(version 1)".into());
-    match allow_by_default() {
-        true => {
-            eprintln!(
-                "enclos: sandbox {}'s policy compiles from (allow default), as {BASELINE_VAR} asks: that baseline is only for comparing the two (ADR 0006)",
-                ctx.name
-            );
-            line("(allow default)".into())
-        }
-        false => {
+    match baseline {
+        Baseline::AllowDefault => line("(allow default)".into()),
+        Baseline::DenyDefault => {
             line(format!("(deny default (with message \"{tag}\"))"));
             line(DENY_DEFAULT.trim_end().to_owned());
         }
@@ -126,10 +153,11 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     line(format!(
         "(deny file-read* file-write* (with message \"{tag}\") {TERMINALS})"
     ));
-    // `(deny default)` refuses a sandbox to issue extensions, as Apple's
-    // `application.sb` does; this rule keeps it from granting itself this one
-    // for another terminal under `(allow default)` too, which the tests'
-    // comparison still compiles. A backend test shows both.
+    // Under `(deny default)` a sandbox cannot issue extensions, since
+    // nothing allows `file-issue-extension` (as in Apple's `application.sb`);
+    // this rule keeps it from granting itself this one for another terminal
+    // under `(allow default)` too, which the tests' comparison still
+    // compiles. A backend test shows both.
     line(format!(
         "(deny file-issue-extension (with message \"{tag}\") (extension-class \"{PTY_EXTENSION}\"))"
     ));
@@ -382,7 +410,9 @@ mod tests {
     fn a_proxy_port_outside_the_range_is_refused() {
         let layout = Layout::at(Path::new("/nonexistent-enclos-test/alice/.enclos"));
         let ctx = SandboxContext::new(&layout, &"home".parse().unwrap(), 45000);
-        let err = compile(&policy(), &ctx).unwrap_err().to_string();
+        let err = compile(&policy(), &ctx, Baseline::DenyDefault)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("proxy port 45000, outside"), "{err}");
         assert!(err.contains("enclos sandbox rm home"), "{err}");
     }
@@ -390,7 +420,9 @@ mod tests {
     #[test]
     fn a_policy_that_does_not_listen_binds_only_unix_sockets_in_the_home() {
         let base = Path::new("/nonexistent-enclos-test");
-        let text = compile(&policy(), &ctx(base)).unwrap().text;
+        let text = compile(&policy(), &ctx(base), Baseline::DenyDefault)
+            .unwrap()
+            .text;
         assert_eq!(text.matches("(local tcp").count(), 0, "{text}");
         assert_eq!(text.matches("(allow network-bind").count(), 1, "{text}");
         assert!(text.contains("(allow network-bind network-inbound (local unix-socket"));
@@ -403,7 +435,7 @@ mod tests {
         let base = Path::new("/nonexistent-enclos-test");
         let mut p = policy();
         p.net.listen = true;
-        let text = compile(&p, &ctx(base)).unwrap().text;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         // A parameter, so every session runs under the same file.
         assert!(text.contains(
             "(if (param \"ENCLOS_SERVICE\")\n  (allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\"))))"
@@ -416,7 +448,7 @@ mod tests {
         let base = Path::new("/nonexistent-enclos-test");
         let mut p = policy();
         p.net.listen = true;
-        let text = compile(&p, &ctx(base)).unwrap().text;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
@@ -441,7 +473,9 @@ mod tests {
     #[test]
     fn the_compiled_policy_has_every_section_in_order() {
         let base = Path::new("/nonexistent-enclos-test");
-        let text = compile(&policy(), &ctx(base)).unwrap().text;
+        let text = compile(&policy(), &ctx(base), Baseline::DenyDefault)
+            .unwrap()
+            .text;
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
@@ -450,11 +484,9 @@ mod tests {
             at("\n(deny default (with message \"enclos:home\"))\n")
                 < at("(deny file-write* (with message \"enclos:home\"))")
         );
-        // No rule allows everything; comments may name that baseline.
-        assert!(
-            !text.lines().any(|l| l.trim() == "(allow default)"),
-            "{text}"
-        );
+        // No rule allows everything, however it is written; comments may
+        // name that baseline.
+        assert!(!allows_everything(&text), "{text}");
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/work\")"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/.ssh\")"));
         // One rule, `tcp`: not `ip`, which lets UDP through, nor `ip4`,
@@ -494,7 +526,7 @@ mod tests {
         let mut p = policy();
         p.fs.read_deny.push("{home}/private".into());
         p.fs.read_deny.push("~".into());
-        let text = compile(&p, &ctx(base)).unwrap().text;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         let sensitive = text
             .find(";; ---- Sensitive paths")
             .unwrap_or_else(|| panic!("no sensitive paths:\n{text}"));
@@ -520,7 +552,9 @@ mod tests {
     #[test]
     fn the_home_and_each_workspace_cannot_be_removed_renamed_or_created() {
         let base = Path::new("/nonexistent-enclos-test");
-        let text = compile(&policy(), &ctx(base)).unwrap().text;
+        let text = compile(&policy(), &ctx(base), Baseline::DenyDefault)
+            .unwrap()
+            .text;
         let rule = text
             .find("(deny file-write-unlink file-write-create")
             .unwrap_or_else(|| panic!("no rule for the folders themselves:\n{text}"));
@@ -541,7 +575,7 @@ mod tests {
         // keeps the home in place too.
         let mut p = policy();
         p.fs.write = vec!["~/work".into()];
-        let text = compile(&p, &ctx(base)).unwrap().text;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         let rule = text
             .find("(deny file-write-unlink file-write-create")
             .unwrap();
@@ -555,7 +589,7 @@ mod tests {
         let mut p = policy();
         p.fs.read_deny.push("~/work/project/private".into());
         p.fs.read_deny.push("{home}/a/private".into());
-        let text = compile(&p, &ctx(base)).unwrap().text;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         let rule = text
             .find("(deny file-write-unlink")
             .unwrap_or_else(|| panic!("no unmovable folders:\n{text}"));
@@ -595,7 +629,9 @@ mod tests {
 
     #[test]
     fn terminal_devices_are_open_only_for_the_session_and_ptys_the_sandbox_makes() {
-        let text = compile(&policy(), &ctx(Path::new("/x"))).unwrap().text;
+        let text = compile(&policy(), &ctx(Path::new("/x")), Baseline::DenyDefault)
+            .unwrap()
+            .text;
         // No rule allows every terminal device: each allow narrows it.
         let ttys = "(regex #\"^/dev/ttys[0-9]+$\")";
         let allowed = text
@@ -669,26 +705,130 @@ mod tests {
             ]
         );
         // Each broad allow comes before the denies that narrow it.
-        let text = compile(&policy(), &ctx(Path::new("/nonexistent-enclos-test")))
-            .unwrap()
-            .text;
+        let text = compile(
+            &policy(),
+            &ctx(Path::new("/nonexistent-enclos-test")),
+            Baseline::DenyDefault,
+        )
+        .unwrap()
+        .text;
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
         };
         assert!(at("(allow file-ioctl)") < at("(deny file-ioctl"));
+        // Reads, before the first sensitive path denied and before the
+        // other sandboxes' folders.
+        let reads = at("(allow file-read*)\n");
+        assert!(reads < at("(subpath \"/nonexistent-enclos-test/alice/.ssh\")"));
+        assert!(reads < at("(require-not (subpath"));
+        // Lookups: the allowed ones before every lookup denied, and none of
+        // them among those the host-service rules deny.
+        let lookups = at("(allow mach-lookup");
         assert!(
-            at("(allow pseudo-tty)")
-                < at("(deny file-read* file-write* (with message \"enclos:home\") (regex")
+            text.match_indices("(deny mach-lookup")
+                .all(|(i, _)| lookups < i),
+            "{text}"
         );
-        assert!(at("(allow file-read*)\n") < at(";; ---- Sensitive paths"));
+        let allowed = global_names(DENY_DEFAULT);
+        let denied = global_names(HOST_SERVICES);
+        assert_eq!(allowed.len(), 8);
+        assert!(!denied.is_empty());
+        assert!(
+            allowed.iter().all(|name| !denied.contains(name)),
+            "{allowed:?} {denied:?}"
+        );
     }
+
+    /// Whether a compiled text, its comments left out, allows everything.
+    fn allows_everything(text: &str) -> bool {
+        text.lines()
+            .map(|l| l.split(";;").next().unwrap_or(""))
+            .map(|l| l.split_whitespace().collect::<String>())
+            .any(|l| l.contains("(allowdefault)"))
+    }
+
+    /// The Mach service names a policy text names.
+    fn global_names(text: &str) -> Vec<&str> {
+        text.split("(global-name \"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    #[test]
+    fn an_allowance_written_another_way_is_still_seen() {
+        assert!(allows_everything("(version 1)(allow default)"));
+        assert!(allows_everything("(allow   default )"));
+        assert!(!allows_everything(";; (allow default) was the baseline"));
+    }
+
+    /// The comparison baseline is the deny-default text with its header and
+    /// block replaced by `(allow default)`, and nothing else changed.
+    #[test]
+    fn allow_default_differs_only_in_its_baseline() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let deny = compile(&policy(), &ctx(base), Baseline::DenyDefault)
+            .unwrap()
+            .text;
+        let allow = compile(&policy(), &ctx(base), Baseline::AllowDefault)
+            .unwrap()
+            .text;
+        let block = format!(
+            "(deny default (with message \"enclos:home\"))\n{}\n",
+            DENY_DEFAULT.trim_end()
+        );
+        assert!(deny.contains(&block));
+        assert_eq!(allow, deny.replace(&block, "(allow default)\n"));
+    }
+
+    /// Every allowance a policy using every feature compiles to, by its
+    /// first line: one added anywhere in the compiled text, not only in
+    /// `deny-default.sb`, is a change to this list.
+    #[test]
+    fn every_allowance_of_a_compiled_policy_is_reviewed() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.net.listen = true;
+        let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
+        let allows: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with(";;") && l.contains("(allow "))
+            .collect();
+        assert_eq!(allows, REVIEWED_ALLOWANCES, "{text}");
+    }
+
+    /// The deny-default block, then writes, terminals, the home's reads,
+    /// the network, a listening runtime's ports, and signals to its own
+    /// processes.
+    const REVIEWED_ALLOWANCES: &[&str] = &[
+        "(allow process-fork)",
+        "(allow process-exec*)",
+        "(allow file-read*)",
+        "(allow sysctl-read)",
+        "(allow process-info* (target same-sandbox))",
+        "(allow file-ioctl)",
+        "(allow pseudo-tty)",
+        "(allow mach-lookup",
+        "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
+        "(allow file-write*",
+        "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))",
+        "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (literal (param \"ENCLOS_TERMINAL\")))))",
+        "(allow file-read* (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\"))",
+        "(allow network-outbound (remote tcp \"localhost:41001\"))",
+        "(allow network-bind network-inbound (local unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
+        "(allow network-outbound (remote unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
+        "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
+        "(allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\"))))",
+        "(allow signal (target same-sandbox))",
+    ];
 
     #[test]
     fn paths_that_would_change_a_rule_are_refused() {
         let mut p = policy();
         p.fs.write.push("/tmp/evil\") (allow default".into());
-        let err = compile(&p, &ctx(Path::new("/x"))).unwrap_err();
+        let err = compile(&p, &ctx(Path::new("/x")), Baseline::DenyDefault).unwrap_err();
         assert!(err.to_string().contains("quote"), "{err}");
     }
 }

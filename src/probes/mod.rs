@@ -20,8 +20,11 @@
 //!
 //! A few routes are closed by Seatbelt itself, whatever the compiled policy
 //! says: it refuses to run setuid programs such as `crontab` and `at`, even
-//! under a bare `(allow default)`. Those probes carry a note saying so, which the report
-//! repeats, so that their being closed is not read as proof of a rule enclos
+//! under a bare `(allow default)`. Others are closed under `(deny default)`
+//! by the baseline before the rule they test is reached: LaunchServices and
+//! Apple Events, whose lookups the baseline refuses. Those probes carry a
+//! note saying so ([`ClosedBy`]), which the report repeats, so that their
+//! being closed is not read as proof of a rule enclos
 //! adds.
 //!
 //! The probes of [`probes`] are harmless even when a rule does not hold. The
@@ -30,8 +33,10 @@
 //! write, a file in `~/Library/LaunchAgents`): they run only with
 //! `--host-services`, which CI's macOS runners ask for. A launchd job,
 //! preferences domain or file they leave is checked from the host and
-//! removed; LaunchServices and the Apple Event leave nothing to
-//! check, so they count as closed only with the refusal the rule gives.
+//! removed; LaunchServices and the Apple Event leave nothing to check, so
+//! they count as closed only with a refusal Seatbelt gives: the rule's own
+//! (-54, -600), or, when the compiled policy is on `(deny default)`, what a
+//! refused lookup makes the tool say (-10661, -1728).
 
 use std::path::{Path, PathBuf};
 
@@ -42,10 +47,11 @@ use crate::policy::paths::is_within;
 pub enum Expect {
     /// Closed when the script fails.
     Fails,
-    /// Closed when it fails with this text in its output: the refusal
-    /// Seatbelt was shown to give, a rule's, or the platform's own for
-    /// setuid programs. Any other failure is inconclusive.
-    FailsWith(&'static str),
+    /// Closed when it fails with one of these texts in its output: a
+    /// refusal Seatbelt was shown to give, a rule's, the platform's own for
+    /// setuid programs, or what a lookup the baseline refuses makes a tool
+    /// say. Any other failure is inconclusive.
+    FailsWith(&'static [&'static str]),
     /// Closed when the output does not contain this text.
     OutputLacks(&'static str),
     /// A folder renamed or cloned into itself, which the filesystem refuses
@@ -58,18 +64,48 @@ pub enum Expect {
     IntoItself,
     /// An Apple Event to Finder. An answer, a refusal by TCC (-1743) or a
     /// wait on Finder (-1712) all mean the event left the sandbox: open
-    /// (ADR 0016). Closed on the refusal Seatbelt gives: -600 from the
-    /// policy's rule, or -1728 ("Can't get application") when the
-    /// `(deny default)` baseline (ADR 0006) already keeps `osascript` from
-    /// looking Finder up. Any other failure is inconclusive.
-    AppleEventBlocked,
-    /// `open` through LaunchServices. Closed on the refusal Seatbelt gives:
-    /// -54 from the policy's `lsopen` rule, or -10661 ("No application knows
-    /// how to open") when the `(deny default)` baseline already keeps the
-    /// sandbox from looking LaunchServices up. Any other failure is
-    /// inconclusive.
-    LaunchServicesBlocked,
+    /// (ADR 0016). Closed when the output has one of these texts: the
+    /// policy rule's refusal ([`AE_REFUSED`]), and on `(deny default)` what
+    /// `osascript` says when the baseline refuses its lookup of Finder
+    /// ([`AE_LOOKUP_REFUSED`]). Any other failure is inconclusive.
+    AppleEventBlocked(&'static [&'static str]),
 }
+
+/// What `osascript` says when the policy's rule refuses the event.
+pub const AE_REFUSED: &str = "(-600)";
+/// What `osascript` says when it cannot look Finder up, as the `(deny
+/// default)` baseline refuses (macOS 15 and 26, CI): `Can’t get application
+/// "Finder". (-1728)`. Finder's own -1728, `Finder got an error: Can’t get
+/// …`, means the event reached it, and does not match.
+pub const AE_LOOKUP_REFUSED: &str = "application \"Finder\". (-1728)";
+/// What `open` says when the policy's `lsopen` rule refuses it.
+pub const LS_REFUSED: &str = "error -54 ";
+/// What `open` says when it cannot look LaunchServices up, as the `(deny
+/// default)` baseline refuses (macOS 15 and 26, CI).
+pub const LS_LOOKUP_REFUSED: &str = "Code=-10661";
+
+/// Why a closed probe shows no rule of its route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedBy {
+    /// Seatbelt itself, whatever the compiled policy says.
+    Seatbelt,
+    /// The `(deny default)` baseline, which refuses a lookup before the
+    /// operation the route's rule refuses is tried.
+    Baseline,
+}
+
+impl ClosedBy {
+    /// What the report says of it.
+    pub fn why(self) -> &'static str {
+        match self {
+            ClosedBy::Seatbelt => SETUID_REFUSED,
+            ClosedBy::Baseline => LOOKUP_REFUSED,
+        }
+    }
+}
+
+/// Under `(deny default)`, the baseline refuses the lookup first.
+const LOOKUP_REFUSED: &str = "the (deny default) baseline refuses the lookup first; the policy's own rule is shown on (allow default)";
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
 /// module makes one, and each is harmless whatever the policy says.
@@ -125,9 +161,9 @@ pub struct Probe {
     pub script: String,
     pub proof: Proof,
     pub host: Option<HostCheck>,
-    /// What closes the route when no rule enclos adds does: Seatbelt itself,
-    /// whatever the compiled policy says.
-    pub closed_by_platform: Option<&'static str>,
+    /// What closes the route when the rule it tests does not: Seatbelt
+    /// itself, or the baseline.
+    pub closed_by: Option<ClosedBy>,
 }
 
 /// Seatbelt refuses to run a setuid program whatever the compiled policy
@@ -159,22 +195,22 @@ pub struct ProbeResult {
     pub route: &'static str,
     pub name: String,
     pub outcome: Outcome,
-    /// The probe's [`Probe::closed_by_platform`], set only when the probe
+    /// The probe's [`Probe::closed_by`], set only when the probe
     /// was closed.
-    pub closed_by_platform: Option<&'static str>,
+    pub closed_by: Option<ClosedBy>,
 }
 
 impl ProbeResult {
     pub fn of(probe: Probe, outcome: Outcome) -> ProbeResult {
-        let closed_by_platform = match outcome {
-            Outcome::Closed => probe.closed_by_platform,
+        let closed_by = match outcome {
+            Outcome::Closed => probe.closed_by,
             _ => None,
         };
         ProbeResult {
             route: probe.route,
             name: probe.name,
             outcome,
-            closed_by_platform,
+            closed_by,
         }
     }
 }
@@ -245,6 +281,9 @@ pub struct ProbeInputs {
     pub proxy_port: u16,
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028).
     pub listen: bool,
+    /// Whether the compiled policy is on `(deny default)`, whose baseline
+    /// refuses every lookup it does not allow.
+    pub lookups_refused: bool,
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
@@ -285,7 +324,7 @@ fn probe(
             control: HostScript::new(control),
         },
         host: None,
-        closed_by_platform: None,
+        closed_by: None,
     }
 }
 
@@ -411,7 +450,7 @@ pub(crate) fn listen_probes(listen: bool, proxy_port: u16) -> Vec<Probe> {
                 "network",
                 name,
                 bind_script(at, port),
-                Expect::FailsWith(BIND_REFUSED),
+                Expect::FailsWith(&[BIND_REFUSED]),
                 bind_script(at, 0),
             )
         })
@@ -448,11 +487,11 @@ fn setuid_probe(
     name: &str,
     program: &str,
     args: &str,
-    refusal: &'static str,
+    refusal: &'static [&'static str],
 ) -> Probe {
     let script = format!("{program} {args}");
     let mut setuid = probe(route, name, &script, Expect::FailsWith(refusal), &script);
-    setuid.closed_by_platform = Some(SETUID_REFUSED);
+    setuid.closed_by = Some(ClosedBy::Seatbelt);
     setuid
 }
 
@@ -486,7 +525,7 @@ fn folder_probe(name: impl Into<String>, prepare: Option<String>, change: String
         "writable folders",
         name,
         format!("{prepare}{refused}; echo \"the policy let it through: $out\""),
-        Expect::FailsWith(NOT_PERMITTED),
+        Expect::FailsWith(&[NOT_PERMITTED]),
         format!("{prepare}{refused}"),
     )
 }
@@ -532,7 +571,7 @@ pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
                 "it is not a folder yet, and the sandbox may not create it: create it on the host"
                     .into(),
             ),
-            closed_by_platform: None,
+            closed_by: None,
         })
         .collect()
 }
@@ -593,7 +632,7 @@ fn proxy_probe(name: &str, url: &str) -> Probe {
         script: curl_through_proxy(url),
         proof: Proof::ProxyRefuses,
         host: None,
-        closed_by_platform: None,
+        closed_by: None,
     }
 }
 
@@ -616,7 +655,7 @@ fn ipv6_loopback_probe(port: u16) -> Probe {
             control: HostScript::new(script),
         },
         host: None,
-        closed_by_platform: None,
+        closed_by: None,
     }
 }
 
@@ -769,7 +808,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
                 "terminals",
                 name,
                 open.clone(),
-                Expect::FailsWith(REFUSED),
+                Expect::FailsWith(&[REFUSED]),
                 open,
             ));
         }
@@ -851,14 +890,14 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "read the crontab",
         "/usr/bin/crontab",
         "-l >/dev/null",
-        "/usr/bin/crontab: Operation not permitted",
+        &["/usr/bin/crontab: Operation not permitted"],
     ));
     list.push(setuid_probe(
         "at",
         "list the `at` queue",
         "/usr/bin/atq",
         ">/dev/null",
-        "/usr/bin/atq: Operation not permitted",
+        &["/usr/bin/atq: Operation not permitted"],
     ));
     list
 }
@@ -922,24 +961,36 @@ pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
     // A session with Finder, which LaunchServices and Apple Events need.
     let finder = "/usr/bin/pgrep -x Finder >/dev/null";
     let mut list = vec![
-        // `open <folder>` reports the refusal (-54, design §5). Not `open
+        // `open <folder>` reports the rule's refusal (-54, design §5), or on
+        // `(deny default)` the baseline's refused lookup (-10661). Not `open
         // -R`: inside the sandbox it exits 0 although Finder reveals nothing,
         // so its exit code says nothing (ADR 0016).
         probe(
             "launchservices",
             "open a folder through LaunchServices",
             "/usr/bin/open -g /System",
-            Expect::LaunchServicesBlocked,
+            Expect::FailsWith(match i.lookups_refused {
+                true => &[LS_REFUSED, LS_LOOKUP_REFUSED],
+                false => &[LS_REFUSED],
+            }),
             finder,
         ),
         probe(
             "apple events",
             "send an Apple Event to Finder",
             "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
-            Expect::AppleEventBlocked,
+            Expect::AppleEventBlocked(match i.lookups_refused {
+                true => &[AE_REFUSED, AE_LOOKUP_REFUSED],
+                false => &[AE_REFUSED],
+            }),
             finder,
         ),
     ];
+    if i.lookups_refused {
+        for p in &mut list {
+            p.closed_by = Some(ClosedBy::Baseline);
+        }
+    }
     let label = format!("org.enclos.probe.{}", i.tag);
     let mut job = probe(
         "launchd",
@@ -1091,9 +1142,12 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             Outcome::Open(format!("it succeeded: {}", last_line(output)))
         }
         Expect::Fails => Outcome::Closed,
-        Expect::FailsWith(refusal) if output.contains(refusal) => Outcome::Closed,
-        Expect::FailsWith(refusal) => Outcome::Inconclusive(format!(
-            "it failed, but not with the expected refusal ({refusal}): {}",
+        Expect::FailsWith(refusals) if refusals.iter().any(|r| output.contains(r)) => {
+            Outcome::Closed
+        }
+        Expect::FailsWith(refusals) => Outcome::Inconclusive(format!(
+            "it failed, but not with the expected refusal ({}): {}",
+            refusals.join(" or "),
             last_line(output)
         )),
         Expect::OutputLacks(text) if output.contains(text) => {
@@ -1113,32 +1167,21 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             "it failed, but not with the policy's refusal (Operation not permitted): {}",
             last_line(output)
         )),
-        Expect::AppleEventBlocked if succeeded => {
+        Expect::AppleEventBlocked(_) if succeeded => {
             Outcome::Open(format!("Finder answered: {}", last_line(output)))
         }
-        Expect::AppleEventBlocked if output.contains("-1743") => Outcome::Open(
+        Expect::AppleEventBlocked(_) if output.contains("(-1743)") => Outcome::Open(
             "the event reached macOS's privacy check (TCC refused it, -1743), so Seatbelt did not block it".into(),
         ),
-        Expect::AppleEventBlocked if output.contains("-1712") => Outcome::Open(
+        Expect::AppleEventBlocked(_) if output.contains("(-1712)") => Outcome::Open(
             "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
         ),
-        Expect::AppleEventBlocked if output.contains("-600") || output.contains("(-1728)") => {
+        Expect::AppleEventBlocked(refusals) if refusals.iter().any(|r| output.contains(r)) => {
             Outcome::Closed
         }
-        Expect::AppleEventBlocked => Outcome::Inconclusive(format!(
-            "the event failed, but not with a refusal Seatbelt gives (-600, or -1728 under deny by default): {}",
-            last_line(output)
-        )),
-        Expect::LaunchServicesBlocked if succeeded => {
-            Outcome::Open(format!("it succeeded: {}", last_line(output)))
-        }
-        Expect::LaunchServicesBlocked
-            if output.contains("error -54 ") || output.contains("Code=-10661") =>
-        {
-            Outcome::Closed
-        }
-        Expect::LaunchServicesBlocked => Outcome::Inconclusive(format!(
-            "it failed, but not with a refusal Seatbelt gives (-54, or -10661 under deny by default): {}",
+        Expect::AppleEventBlocked(refusals) => Outcome::Inconclusive(format!(
+            "the event failed, but not with a refusal Seatbelt gives ({}): {}",
+            refusals.join(" or "),
             last_line(output)
         )),
     }
@@ -1176,6 +1219,7 @@ mod tests {
             host_sockets: vec![dir.join("agent.sock")],
             proxy_port: 41001,
             listen: false,
+            lookups_refused: true,
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
@@ -1504,19 +1548,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for p in all(dir.path()) {
             let setuid = matches!(p.route, "crontab" | "at");
-            assert_eq!(
-                p.closed_by_platform.is_some(),
-                setuid,
-                "{}: {:?}",
-                p.name,
-                p.closed_by_platform
-            );
+            // On `(deny default)`, as these inputs say, the host services
+            // the baseline refuses to look up are the baseline's.
+            let by = match p.route {
+                "crontab" | "at" => Some(ClosedBy::Seatbelt),
+                "launchservices" | "apple events" => Some(ClosedBy::Baseline),
+                _ => None,
+            };
+            assert_eq!(p.closed_by, by, "{}", p.name);
             if setuid {
                 let result = ProbeResult::of(p.clone(), Outcome::Closed);
-                assert_eq!(result.closed_by_platform, Some(SETUID_REFUSED));
+                assert_eq!(result.closed_by, Some(ClosedBy::Seatbelt));
                 // Only a closed probe carries the note.
                 let other = ProbeResult::of(p.clone(), Outcome::Inconclusive("x".into()));
-                assert_eq!(other.closed_by_platform, None);
+                assert_eq!(other.closed_by, None);
                 // Closed only on the shell's refusal to run the program, as
                 // `/bin/sh` prints it; a program that ran and failed is not.
                 let program = p.script.split(' ').next().unwrap();
@@ -1940,6 +1985,50 @@ mod tests {
             proven(ae, ran(false, broken)),
             Outcome::Inconclusive(_)
         ));
+        // Finder's own -1728 means the event reached it.
+        let answered = "execution error: Finder got an error: Can’t get window 1. (-1728)";
+        assert!(!matches!(proven(ae, ran(false, answered)), Outcome::Closed));
+        // A failed control, or a success, outweighs the codes.
+        for (probe, text) in [(open, unreachable_ls()), (ae, unreachable)] {
+            assert!(matches!(
+                outcome(probe, ran(false, text), Ok(None), Some((false, ""))),
+                Outcome::Inconclusive(_)
+            ));
+            assert!(matches!(proven(probe, ran(true, text)), Outcome::Open(_)));
+            // Under deny default, a route closed so is the baseline's.
+            assert_eq!(probe.closed_by, Some(ClosedBy::Baseline));
+        }
+    }
+
+    fn unreachable_ls() -> &'static str {
+        "No application knows how to open URL file:///System/ (Error Domain=NSOSStatusErrorDomain Code=-10661 \"kLSApplicationNotFoundErr: E.g. no application claims the file\")"
+    }
+
+    /// On `(allow default)` only the rules' own refusals close these routes:
+    /// what a refused lookup says is inconclusive there, so the comparison
+    /// shows the rules.
+    #[test]
+    fn on_allow_default_only_the_rules_refusals_close_the_host_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = inputs(dir.path());
+        i.lookups_refused = false;
+        let list = host_service_probes(&i);
+        let open = find(&list, "launchservices");
+        let ae = find(&list, "apple events");
+        assert!(matches!(
+            proven(open, ran(false, unreachable_ls())),
+            Outcome::Inconclusive(_)
+        ));
+        let lookup = "55:68: execution error: Can’t get application \"Finder\". (-1728)";
+        assert!(matches!(
+            proven(ae, ran(false, lookup)),
+            Outcome::Inconclusive(_)
+        ));
+        let refused = "LSOpenURLsWithRole() failed with error -54 for the file /System.";
+        assert_eq!(proven(open, ran(false, refused)), Outcome::Closed);
+        let blocked = "execution error: Finder got an error: Application isn't running. (-600)";
+        assert_eq!(proven(ae, ran(false, blocked)), Outcome::Closed);
+        assert!(list.iter().all(|p| p.closed_by.is_none()));
     }
 
     #[test]

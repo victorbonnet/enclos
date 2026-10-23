@@ -281,13 +281,17 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
                 "name": r.name,
                 "outcome": outcome,
                 "why": why,
-                "closed_by_platform": r.closed_by_platform,
+                "closed_by": r.closed_by.map(enclos::probes::ClosedBy::why),
             })
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,
         "not_here": report.not_here,
         "not_probed": NOT_PROBED,
         "listens": report.listens,
+        "baseline": match report.allow_default {
+            true => "allow_default",
+            false => "deny_default",
+        },
     })
 }
 
@@ -908,8 +912,8 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
         let (mark, detail) = match &r.outcome {
             Outcome::Closed => (
                 "closed      ",
-                r.closed_by_platform
-                    .map(|why| format!("  ({why})"))
+                r.closed_by
+                    .map(|by| format!("  ({})", by.why()))
                     .unwrap_or_default(),
             ),
             Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
@@ -967,10 +971,7 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
 fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
     let total = report.results.len();
     if report.passed() {
-        let platform = match report.closed_by_platform() {
-            0 => String::new(),
-            n => format!(" ({n} by Seatbelt itself)"),
-        };
+        let platform = report.closed_apart();
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
@@ -979,7 +980,11 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
                 report.inconclusive()
             ),
         };
-        return format!("READY: no probe got out of sandbox {sandbox}: {shown}.");
+        let baseline = match report.allow_default {
+            true => " On the (allow default) comparison baseline, which no sandbox runs on.",
+            false => "",
+        };
+        return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
     let mut why = Vec::new();
     if report.open() > 0 {
@@ -1021,12 +1026,13 @@ mod tests {
                     route: "writes",
                     name: "write outside the home".into(),
                     outcome,
-                    closed_by_platform: None,
+                    closed_by: None,
                 })
                 .collect(),
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            allow_default: false,
         }
     }
 
