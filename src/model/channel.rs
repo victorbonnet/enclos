@@ -26,14 +26,14 @@ impl Channel {
         }
     }
 
-    /// The variable its bot's token is read from unless another is named.
-    /// Not Hermes's own `TELEGRAM_BOT_TOKEN`: set in its environment alone,
-    /// that turns its Telegram bot on as its gateway starts, before
-    /// `runtime configure` has said who it answers (read in Hermes 0.22.4's
-    /// `plugins/platforms/telegram/gateway_env.py`).
+    /// The variable its bot's token is read from unless another is named:
+    /// Hermes's own, which it keeps out of the commands its agents run
+    /// (read in Hermes 0.22.4's `tools/environments/local_env_policy.py`).
+    /// In the gateway's environment, it turns the bot on as the gateway
+    /// starts, even before `runtime configure` says who it answers.
     pub fn token_variable(self) -> &'static str {
         match self {
-            Channel::Telegram => "TELEGRAM_TOKEN",
+            Channel::Telegram => "TELEGRAM_BOT_TOKEN",
         }
     }
 

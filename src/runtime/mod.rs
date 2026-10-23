@@ -244,7 +244,8 @@ pub trait RuntimeAdapter {
     /// grants as a secret, so that enclos hands the runtime the variable's
     /// name, never its value (ADR 0022), and the people it answers. The
     /// people it answers come first and the channel is turned on last, so
-    /// a bot that was off is not turned on by a run that fails.
+    /// a run that fails turns no bot on (one whose token alone turns it on,
+    /// such as Hermes's `TELEGRAM_BOT_TOKEN`, is on already).
     /// `None`: the runtime has no such channel.
     fn channel(
         &self,
