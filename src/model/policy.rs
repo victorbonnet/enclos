@@ -362,8 +362,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_file_rules_and_listening_are_kept_from_a_sessions_start() {
+    fn sizes_read_back_as_they_were_written() {
+        for bytes in [0, 1, 1023, 1024, 1536, 1 << 20, 3 << 30, u64::MAX] {
+            let size = ByteSize(bytes);
+            assert_eq!(size.to_string().parse::<ByteSize>(), Ok(size), "{bytes}");
+        }
+        assert_eq!("512K".parse::<ByteSize>(), Ok(ByteSize(512 << 10)));
+        for bad in [
+            "",
+            "K",
+            "1m",
+            "1.5G",
+            " 1G",
+            "1KB",
+            "-1",
+            "17179869184G",
+            "18446744073709551616",
+        ] {
+            assert!(bad.parse::<ByteSize>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_rules_a_session_keeps_from_its_start_are_its_files_listening_secrets_and_limits() {
         let old = Policy::default();
+        let mut limits = old.clone();
+        limits.resources.cpu_seconds = Some(60);
+        assert!(!old.same_at_launch(&limits));
         let mut net = old.clone();
         net.net.allow.push("a.example.com".into());
         net.net.mode = NetMode::Public;

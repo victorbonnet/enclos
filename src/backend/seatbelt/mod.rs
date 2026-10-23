@@ -46,9 +46,8 @@ impl Backend for Seatbelt {
             network: Enforcement::Enforced,
             exec: Enforcement::Unsupported,
             resources: Enforcement::Partial {
-                note:
-                    "per process: open files, file size and CPU time; no memory limit or CPU share"
-                        .to_owned(),
+                note: "per process: open files and CPU time; no memory, file size or CPU share"
+                    .to_owned(),
             },
             members: Enforcement::Partial {
                 note: "process groups, until the milestone 1 tracking issue settles the method"

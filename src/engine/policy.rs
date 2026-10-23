@@ -557,6 +557,37 @@ mod tests {
     }
 
     #[test]
+    fn a_change_of_limits_says_what_each_becomes() {
+        let none = Policy::default();
+        let mut set = none.clone();
+        set.resources.open_files = Some(64);
+        set.resources.file_size = Some("1M".parse().unwrap());
+        set.resources.cpu_seconds = Some(600);
+        assert_eq!(
+            differences(&none, &set, &[]),
+            [
+                "limit the files a process holds open to 64 (sessions started from now on)",
+                "limit the size of a file a process writes to 1M (sessions started from now on)",
+                "limit a process's CPU time to 600 s (sessions started from now on)",
+            ]
+        );
+        let mut changed = set.clone();
+        changed.resources.open_files = Some(128);
+        assert_eq!(
+            differences(&set, &changed, &[]),
+            ["limit the files a process holds open to 128 (sessions started from now on)"]
+        );
+        assert_eq!(
+            differences(&set, &none, &[]),
+            [
+                "stop limiting the files a process holds open (sessions started from now on)",
+                "stop limiting the size of a file a process writes (sessions started from now on)",
+                "stop limiting a process's CPU time (sessions started from now on)",
+            ]
+        );
+    }
+
+    #[test]
     fn differences_leave_out_the_entry_asked_for() {
         let mut old = Policy::default();
         old.fs.read_deny = vec!["~/.ssh".into(), "~/dev/work".into()];

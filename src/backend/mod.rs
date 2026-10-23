@@ -115,9 +115,13 @@ pub struct Launch {
 
 /// `command` run under `limits`, which every process it starts inherits:
 /// `/bin/bash` sets them with `ulimit`, hard and soft alike, so nothing in
-/// the sandbox can raise them, then becomes the program. Bash, not
+/// the sandbox can raise them, then becomes the program; one it cannot set
+/// stops the chain, so no program runs without its limits. Bash, not
 /// `/bin/sh`, which macOS lets an administrator point at dash, whose
-/// `ulimit -f` counts in another unit. As it is when no limit is set.
+/// `ulimit -f` counts in another unit; in privileged mode (`-p`), as it
+/// runs on the host with the sandbox's variables: it then reads no
+/// `BASH_ENV` or `ENV` file, no `SHELLOPTS` and no function from them. As it
+/// is when no limit is set.
 pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) -> Command {
     let mut set = Vec::new();
     if let Some(files) = limits.open_files {
@@ -137,6 +141,7 @@ pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) 
     set.push("exec \"$0\" \"$@\"".to_owned());
     let mut limited = Command::new("/bin/bash");
     limited
+        .arg("-p")
         .arg("-c")
         .arg(set.join(" && "))
         .arg(command.get_program())
@@ -196,6 +201,7 @@ mod limits_tests {
         assert_eq!(
             args,
             [
+                "-p",
                 "-c",
                 "ulimit -n 256 && ulimit -f 1024 && ulimit -t 60 && exec \"$0\" \"$@\"",
                 "/usr/bin/sandbox-exec",
@@ -204,5 +210,72 @@ mod limits_tests {
                 "/bin/zsh"
             ]
         );
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_set_runs_no_program() {
+        let mut echo = Command::new("/bin/echo");
+        echo.arg("ran");
+        let limits = crate::model::policy::Resources {
+            file_size: Some(crate::model::policy::ByteSize(u64::MAX)),
+            ..Default::default()
+        };
+        let out = under_limits(echo, &limits).output().unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("ran"));
+    }
+
+    #[test]
+    fn the_shell_reads_no_startup_file_or_option_from_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let startup = dir.path().join("startup.sh");
+        let touched = dir.path().join("touched");
+        std::fs::write(&startup, format!("touch {}\n", touched.display())).unwrap();
+        let mut echo = Command::new("/bin/echo");
+        echo.arg("ran");
+        let limits = crate::model::policy::Resources {
+            open_files: Some(256),
+            ..Default::default()
+        };
+        let mut limited = under_limits(echo, &limits);
+        limited
+            .env_clear()
+            .env("BASH_ENV", &startup)
+            .env("ENV", &startup)
+            .env("SHELLOPTS", "xtrace");
+        let out = limited.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+        assert!(!touched.exists(), "the shell ran a startup file");
+        assert!(
+            out.stderr.is_empty(),
+            "xtrace: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Each probe's script, run under the limit it checks, is closed (it
+    /// fails); under one higher, open.
+    #[test]
+    fn a_probe_is_closed_under_its_limit_and_open_above_it() {
+        let probe = |flag: &str, limit: u64, under: crate::model::policy::Resources| {
+            let mut sh = Command::new("/bin/sh");
+            sh.arg("-c").arg(format!(
+                "test \"$(ulimit {flag})\" = unlimited || test \"$(ulimit {flag})\" -gt {limit}"
+            ));
+            under_limits(sh, &under).status().unwrap().success()
+        };
+        let files = |n| crate::model::policy::Resources {
+            open_files: Some(n),
+            ..Default::default()
+        };
+        assert!(!probe("-Hn", 64, files(64)), "closed at the limit");
+        assert!(probe("-Hn", 63, files(64)), "open above it");
+        let cpu = |n| crate::model::policy::Resources {
+            cpu_seconds: Some(n),
+            ..Default::default()
+        };
+        assert!(!probe("-Ht", 600, cpu(600)));
+        assert!(probe("-Ht", 599, cpu(600)));
     }
 }

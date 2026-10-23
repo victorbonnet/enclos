@@ -906,3 +906,18 @@ fn what_allow_lists_is_what_goes_in_force_when_the_file_no_longer_waits() {
         .unwrap_err();
     assert!(err.to_string().contains("allow b.example.com"), "{err}");
 }
+
+/// A change of limits, made while a session runs, waits as the pending
+/// policy: the session keeps the limits it started with.
+#[test]
+fn a_change_of_limits_while_a_session_runs_waits_for_the_restart() {
+    let (_dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = format!("{before}\n[resources]\nopen_files = 64\n");
+    make_pending(&engine, &name, &before, &after);
+    let view = engine.policy(&name).unwrap();
+    let (_, pending) = view.pending.as_ref().expect("pending");
+    assert_eq!(pending.policy.resources.open_files, Some(64));
+    assert!(view.snapshot.policy.resources.is_unset(), "{view:?}");
+}
