@@ -27,7 +27,9 @@ mod status;
 mod tests;
 
 pub use channel::ChannelSet;
-pub use doctor::{BackendCheck, CompiledCheck, Doctor, LineChanges, SandboxCheck};
+pub use doctor::{
+    BackendCheck, CompiledChange, Doctor, Drift, LineChange, NextSession, SandboxCheck, Sandboxes,
+};
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;

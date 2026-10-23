@@ -40,28 +40,74 @@ const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
 /// understand it.
 const FALLBACK_TERM: &str = "xterm-256color";
 
-/// Whether `sandbox-exec` runs `/usr/bin/true` under a profile that allows
-/// everything: it fails, with "Operation not permitted", where macOS will
-/// not apply a sandbox, as in a process already in one.
+/// Whether `sandbox-exec` runs `/usr/bin/true` under a Seatbelt policy that
+/// allows everything, with no variable of the user's, within
+/// [`TRY_RUN_WAIT`]. macOS 26.5.2 refuses it, `sandbox_apply: Operation not
+/// permitted`, to a process in a sandbox whose policy has any rule, as every
+/// enclos sandbox's has; in one that allows everything it runs.
 pub fn try_run() -> Probe {
-    let out = Command::new(SANDBOX_EXEC)
+    let started = Command::new(SANDBOX_EXEC)
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .env_clear()
         .stdin(Stdio::null())
-        .output();
-    match out {
-        Ok(out) if out.status.success() => Probe::Available,
-        Ok(out) => Probe::Unavailable {
-            reason: format!(
-                "{SANDBOX_EXEC} could not run /usr/bin/true under a profile that allows everything ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match started {
+        Ok(child) => child,
+        Err(e) => {
+            return Probe::Unavailable {
+                reason: format!("cannot run {SANDBOX_EXEC}: {e}"),
+            };
+        }
+    };
+    let deadline = std::time::Instant::now() + TRY_RUN_WAIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                // Its own child: stopped and reaped.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Probe::Unavailable {
+                    reason: format!(
+                        "{SANDBOX_EXEC} did not run /usr/bin/true within {} s",
+                        TRY_RUN_WAIT.as_secs()
+                    ),
+                };
+            }
+            Err(e) => {
+                return Probe::Unavailable {
+                    reason: format!("cannot wait for {SANDBOX_EXEC}: {e}"),
+                };
+            }
+        }
+    };
+    if status.success() {
+        return Probe::Available;
+    }
+    let mut said = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+    }
+    let said = said.trim();
+    Probe::Unavailable {
+        reason: match said.is_empty() {
+            true => format!(
+                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status})"
             ),
-        },
-        Err(e) => Probe::Unavailable {
-            reason: format!("cannot run {SANDBOX_EXEC}: {e}"),
+            false => format!(
+                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status}): {said}"
+            ),
         },
     }
 }
+
+/// How long [`try_run`] waits for `/usr/bin/true`, which takes milliseconds.
+const TRY_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     let terminal = match launch.in_terminal {

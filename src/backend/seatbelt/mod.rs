@@ -41,10 +41,7 @@ impl Backend for Seatbelt {
     }
 
     fn try_run(&self) -> Probe {
-        match self.probe() {
-            Probe::Available => wrap::try_run(),
-            refused => refused,
-        }
+        wrap::try_run()
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -57,7 +54,7 @@ impl Backend for Seatbelt {
                     .to_owned(),
             },
             members: Enforcement::Partial {
-                note: "process groups, until the milestone 1 tracking issue settles the method"
+                note: "markers its processes hold, and process groups (ADR 0030); one that closes its marker and leaves its group is not found"
                     .to_owned(),
             },
         }

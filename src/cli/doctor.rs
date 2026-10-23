@@ -2,12 +2,14 @@
 //! compiled policies enclos now writes differently (design §10).
 
 use enclos::backend::{Enforcement, Probe};
-use enclos::engine::{CompiledCheck, Doctor, Engine};
+use enclos::engine::{
+    BackendCheck, Doctor, Drift, Engine, LineChange, NextSession, SandboxCheck, Sandboxes,
+};
 use enclos::error::{Result, exit};
 
 pub fn run(engine: &Engine) -> Result<u8> {
-    let doctor = engine.doctor()?;
-    print(&doctor);
+    let doctor = engine.doctor();
+    print!("{}", shown(&doctor));
     Ok(if doctor.has_problems() {
         exit::ERROR
     } else {
@@ -15,89 +17,137 @@ pub fn run(engine: &Engine) -> Result<u8> {
     })
 }
 
-fn print(doctor: &Doctor) {
-    println!("Backends");
+/// The report as text, one line per fact.
+pub fn shown(doctor: &Doctor) -> String {
+    let mut out = String::from("Backends\n");
     for b in &doctor.backends {
-        match &b.runs {
-            Probe::Available => println!("  {}: runs here", b.kind),
-            Probe::Unavailable { reason } => println!("  {}: cannot run here: {reason}", b.kind),
-        }
-        let c = &b.capabilities;
-        println!(
-            "    files {}; network {}; programs {}; limits {}; members {}",
-            enforced(&c.fs),
-            enforced(&c.network),
-            enforced(&c.exec),
-            enforced(&c.resources),
-            enforced(&c.members)
-        );
+        out += &backend(b);
     }
-    println!();
-    println!("Sandboxes");
-    let Some(sandboxes) = &doctor.sandboxes else {
-        println!("  none: enclos is not initialized; `enclos init` sets it up");
-        return;
-    };
-    if sandboxes.is_empty() {
-        println!("  none");
-    }
-    for s in sandboxes {
-        let backend_runs = doctor
-            .backends
-            .iter()
-            .any(|b| b.kind == s.backend && b.runs == Probe::Available);
-        if !backend_runs {
-            println!(
-                "  {}: its backend {} cannot run here, so no session of it can start",
-                s.name, s.backend
-            );
+    out += "\nSandboxes\n";
+    match &doctor.sandboxes {
+        Sandboxes::NotInitialized => {
+            out += "  none: enclos is not initialized; `enclos init` sets it up\n";
         }
-        match &s.compiled {
-            CompiledCheck::NeverRun => println!(
-                "  {}: no session has run yet, so there is no compiled policy to compare",
-                s.name
-            ),
-            CompiledCheck::Same { version } => println!(
-                "  {}: policy v{version} compiles as it did for its last session",
-                s.name
-            ),
-            CompiledCheck::Fails { error } => println!(
-                "  {}: its policy cannot be compiled, so its next session cannot start: {error}",
-                s.name
-            ),
-            CompiledCheck::Changed {
-                version,
-                ran,
-                now,
-                lines,
-                open,
-            } => {
-                println!(
-                    "  {}: policy v{version} compiles differently from the file its last session ran under: enclos's own rules changed, as an upgrade changes them",
-                    s.name
-                );
-                println!("    ran under: {}", ran.display());
-                println!("    next session: {}", now.display());
-                match lines {
-                    Some(lines) => {
-                        for l in &lines.removed {
-                            println!("    - {l}");
-                        }
-                        for l in &lines.added {
-                            println!("    + {l}");
-                        }
-                    }
-                    None => println!("    the file it ran under is no longer there to compare"),
-                }
-                if *open > 0 {
-                    println!(
-                        "    {open} open session(s) keep the earlier rules until restarted (`enclos sandbox restart {}`)",
-                        s.name
-                    );
-                }
+        Sandboxes::Unreadable { error } => {
+            out += &format!("  enclos cannot read its records: {error}\n");
+        }
+        Sandboxes::Listed(sandboxes) if sandboxes.is_empty() => out += "  none\n",
+        Sandboxes::Listed(sandboxes) => {
+            for s in sandboxes {
+                out += &sandbox(s);
             }
         }
     }
+    out
+}
+
+fn backend(b: &BackendCheck) -> String {
+    let state = match (&b.found, &b.runs) {
+        (Probe::Unavailable { reason }, _) => format!("not on this host: {reason}"),
+        (Probe::Available, Some(Probe::Available)) => "runs here".to_owned(),
+        (Probe::Available, Some(Probe::Unavailable { reason })) => {
+            format!("on this host, and it refused to run a program: {reason}")
+        }
+        (Probe::Available, None) => "on this host; not tried".to_owned(),
+    };
+    let c = &b.capabilities;
+    format!(
+        "  {}: {state}\n    files {}; network {}; programs {}; limits {}; members {}\n",
+        b.kind,
+        enforced(&c.fs),
+        enforced(&c.network),
+        enforced(&c.exec),
+        enforced(&c.resources),
+        enforced(&c.members)
+    )
+}
+
+fn sandbox(s: &SandboxCheck) -> String {
+    let name = &s.name;
+    let mut out = String::new();
+    match &s.next {
+        NextSession::NotChecked => {
+            out += &format!(
+                "  {name}: its backend {} does not run here, so no session of it can start\n",
+                s.backend
+            );
+        }
+        NextSession::Fails { error, .. } => {
+            out += &format!(
+                "  {name}: its active policy cannot be compiled, so its next session cannot start: {error}\n"
+            );
+        }
+        NextSession::Compiles { version, .. } => {
+            out += &format!("  {name}: its next session compiles policy v{version}\n");
+        }
+    }
+    if s.backend_runs {
+        match (s.last_version, s.drift.is_empty()) {
+            (None, _) => out += "    no session has run under a compiled policy yet\n",
+            (Some(v), true) => {
+                out += &format!("    policy v{v} compiles as it did for its last session\n");
+            }
+            (Some(_), false) => {}
+        }
+    }
+    for drift in &s.drift {
+        out += &drift_lines(name.as_str(), drift);
+    }
+    for what in &s.unreadable {
+        out += &format!("    enclos could not look: {what}\n");
+    }
+    out
+}
+
+fn drift_lines(name: &str, drift: &Drift) -> String {
+    let mut out = String::new();
+    match drift {
+        Drift::NoLongerCompiles {
+            version,
+            ran,
+            error,
+        } => {
+            out += &format!(
+                "    policy v{version}, which a session ran under ({}), no longer compiles: {error}\n",
+                ran.display()
+            );
+        }
+        Drift::Changed(c) if c.edited => {
+            out += &format!(
+                "    {} no longer holds what policy v{} compiled to: it was changed after it was written\n",
+                c.ran.display(),
+                c.version
+            );
+        }
+        Drift::Changed(c) => {
+            out += &format!(
+                "    policy v{} compiles differently from the file a session ran under: enclos's own rules changed, as an upgrade changes them, or a path the policy names resolves elsewhere now\n      ran under: {}\n      compiles now to: {}\n",
+                c.version,
+                c.ran.display(),
+                c.now.display()
+            );
+        }
+    }
+    if let Drift::Changed(c) = drift {
+        match &c.lines {
+            Some(lines) => {
+                for line in lines {
+                    out += &match line {
+                        LineChange::Removed(l) => format!("      - {l}\n"),
+                        LineChange::Added(l) => format!("      + {l}\n"),
+                    };
+                }
+            }
+            None => out += "      the file it ran under is no longer there to compare\n",
+        }
+        if c.running > 0 {
+            out += &format!(
+                "      {} running session(s) keep its rules until restarted (`enclos sandbox restart {name}`)\n",
+                c.running
+            );
+        }
+    }
+    out
 }
 
 fn enforced(e: &Enforcement) -> String {

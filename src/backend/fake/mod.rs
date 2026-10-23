@@ -21,6 +21,8 @@ pub const SERVICE_PORT: &str = "ENCLOS_FAKE_SERVICE_PORT";
 pub struct FakeBackend {
     kind: BackendKind,
     probe: Probe,
+    /// What `try_run` answers.
+    runs: Probe,
 }
 
 impl FakeBackend {
@@ -29,6 +31,20 @@ impl FakeBackend {
         FakeBackend {
             kind,
             probe: Probe::Available,
+            runs: Probe::Available,
+        }
+    }
+
+    /// A fake that stands in for `kind`, is there, and refuses to run a
+    /// program for `reason`, as Seatbelt does in a process already in a
+    /// sandbox.
+    pub fn refuses_to_run(kind: BackendKind, reason: &str) -> Self {
+        FakeBackend {
+            kind,
+            probe: Probe::Available,
+            runs: Probe::Unavailable {
+                reason: reason.to_owned(),
+            },
         }
     }
 
@@ -37,6 +53,9 @@ impl FakeBackend {
         FakeBackend {
             kind,
             probe: Probe::Unavailable {
+                reason: reason.to_owned(),
+            },
+            runs: Probe::Unavailable {
                 reason: reason.to_owned(),
             },
         }
@@ -50,6 +69,10 @@ impl Backend for FakeBackend {
 
     fn probe(&self) -> Probe {
         self.probe.clone()
+    }
+
+    fn try_run(&self) -> Probe {
+        self.runs.clone()
     }
 
     fn capabilities(&self) -> Capabilities {
