@@ -1,10 +1,11 @@
 ;; ---- Deny by default (ADR 0006): what a sandbox may do
 ;; Everything not allowed here or by a rule after this block is refused,
-;; with the sandbox's tag. This block allows broadly only what the rules
-;; after it narrow with a deny of their own: running programs, reading, and
-;; `ioctl`. Writes, terminals and the network are granted by the allows
-;; that follow, and signals by the host-service rules; Mach services and
-;; shared memory are named here one by one.
+;; with the sandbox's tag. Allowed broadly here, and narrowed by no rule
+;; after: running and forking programs, `sysctl` reads, pseudo-terminals.
+;; Allowed broadly here, and narrowed after: reads, by the deny list and the
+;; other sandboxes' folders; `ioctl`, by the TIOCSTI rule. Granted only by
+;; the rules after: writes, terminals, the network and signals. Named here
+;; one by one: Mach services and shared memory.
 
 ;; Running programs, and reading: reads are broad (ADR 0015); the deny list
 ;; and the other sandboxes' folders after this take away what they name.

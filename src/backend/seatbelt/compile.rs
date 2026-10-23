@@ -640,10 +640,11 @@ mod tests {
     /// change to review.
     #[test]
     fn the_deny_by_default_block_is_the_reviewed_list() {
+        // Every line that is not a comment, so nothing can widen it unseen.
         let rules: Vec<&str> = DENY_DEFAULT
             .lines()
             .map(str::trim)
-            .filter(|l| l.starts_with("(allow"))
+            .filter(|l| !l.is_empty() && !l.starts_with(";;"))
             .collect();
         assert_eq!(
             rules,
@@ -656,25 +657,15 @@ mod tests {
                 "(allow file-ioctl)",
                 "(allow pseudo-tty)",
                 "(allow mach-lookup",
+                "(global-name \"com.apple.system.notification_center\")",
+                "(global-name \"com.apple.system.opendirectoryd.membership\")",
+                "(global-name \"com.apple.system.opendirectoryd.libinfo\")",
+                "(global-name \"com.apple.logd\")",
+                "(global-name \"com.apple.diagnosticd\")",
+                "(global-name \"com.apple.bsd.dirhelper\")",
+                "(global-name \"com.apple.SystemConfiguration.configd\")",
+                "(global-name \"com.apple.trustd.agent\"))",
                 "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
-            ]
-        );
-        let names: Vec<&str> = DENY_DEFAULT
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("(global-name \""))
-            .map(|l| l.trim_end_matches([')', '"']))
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "com.apple.system.notification_center",
-                "com.apple.system.opendirectoryd.membership",
-                "com.apple.system.opendirectoryd.libinfo",
-                "com.apple.logd",
-                "com.apple.diagnosticd",
-                "com.apple.bsd.dirhelper",
-                "com.apple.SystemConfiguration.configd",
-                "com.apple.trustd.agent",
             ]
         );
         // Each broad allow comes before the denies that narrow it.

@@ -875,8 +875,8 @@ fn the_sandbox_cannot_type_into_its_terminal() {
     assert!(out.contains("REFUSED"), "{out}");
     assert!(!out.contains("INJECTED"), "{out}");
 
-    // Each rule holds alone, on either baseline; and the control: with
-    // neither, the byte goes in (into `script`'s own terminal only).
+    // On either baseline, each rule holds alone, and with neither the byte
+    // goes in: the control (into `script`'s own terminal only).
     let run = |text: &str, name: &str| {
         let file = w.base.join(name);
         std::fs::write(&file, text).unwrap();
@@ -917,6 +917,15 @@ fn the_sandbox_cannot_type_into_its_terminal() {
         allow_default.replace(hid_rule, "")
     );
     assert!(run(&allow_ioctl_alone, "allow-ioctl-alone.sb").contains("REFUSED"));
+    let hid_alone = text.replace(ioctl_rule, "");
+    assert!(run(&hid_alone, "hid-alone.sb").contains("REFUSED"));
+    let allow_hid_alone = allow_default.replace(ioctl_rule, "");
+    assert!(run(&allow_hid_alone, "allow-hid-alone.sb").contains("REFUSED"));
+    let allow_neither = allow_default.replace(ioctl_rule, "").replace(hid_rule, "");
+    assert!(
+        run(&allow_neither, "allow-neither.sb").contains("INJECTED"),
+        "the control under (allow default)"
+    );
 }
 
 /// The sandbox still signals its own processes, as job control, timeouts
@@ -1067,8 +1076,20 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
         .map(|l| format!("{l}\n"))
         .collect();
     let file = w.base.join("deny-default-without-the-rule.sb");
-    std::fs::write(&file, baseline_alone).unwrap();
+    std::fs::write(&file, &baseline_alone).unwrap();
     assert!(!run(&file), "(deny default) does not close it alone");
+    // The control on that baseline: allowed to issue the extension, the
+    // sandbox opens `other`, so what closes it there is the baseline.
+    let issued = format!(
+        "{baseline_alone}(allow file-issue-extension (extension-class \"{}\"))\n",
+        "com.apple.sandbox.pty"
+    );
+    let file = w.base.join("deny-default-allowed-to-issue.sb");
+    std::fs::write(&file, issued).unwrap();
+    assert!(
+        run(&file),
+        "the route is gone under (deny default): nothing to test"
+    );
 }
 
 #[test]

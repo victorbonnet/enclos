@@ -3073,6 +3073,8 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
+    // The folder the launch agents probe writes in, as a Mac has it.
+    std::fs::create_dir_all(home._dir.path().join("Library/LaunchAgents")).unwrap();
     let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
     // CI runs them: a workflow that lost the variable must not pass quietly.
     if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {

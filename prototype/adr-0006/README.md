@@ -18,6 +18,8 @@ The evidence [ADR 0006](../../docs/adr/0006-seatbelt-deny-by-default.md) asked f
 | `hermes --version`, `profile list`, `config get model`, `doctor` | the same output | the same output |
 | `enclos agent add <sandbox>/main` (`hermes profile create`) | made | made |
 | The gateway, started by launchd | runs, no error in its log | runs, no error in its log |
+
+The gateway's `(allow default)` run used a build that passed `ENCLOS_SEATBELT_BASELINE` to the services it installs. enclos no longer does, so that run cannot be repeated with this switch: a service now always compiles `(deny default)`.
 | `agent-browser open https://example.com` | Chrome cannot create its socket folder | Chrome exits before it starts |
 | `enclos policy test` | READY: 72 closed, 10 inconclusive | READY: 72 closed, 10 inconclusive |
 | Every test of enclos (real Seatbelt sessions, services, probes, limits) | passed before | passes, once pseudo-terminals and `ioctl` are allowed |

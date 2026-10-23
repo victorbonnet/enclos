@@ -58,9 +58,17 @@ pub enum Expect {
     IntoItself,
     /// An Apple Event to Finder. An answer, a refusal by TCC (-1743) or a
     /// wait on Finder (-1712) all mean the event left the sandbox: open
-    /// (ADR 0016). Closed on the refusal Seatbelt gives (-600); any other
-    /// failure is inconclusive.
+    /// (ADR 0016). Closed on the refusal Seatbelt gives: -600 from the
+    /// policy's rule, or -1728 ("Can't get application") when the
+    /// `(deny default)` baseline (ADR 0006) already keeps `osascript` from
+    /// looking Finder up. Any other failure is inconclusive.
     AppleEventBlocked,
+    /// `open` through LaunchServices. Closed on the refusal Seatbelt gives:
+    /// -54 from the policy's `lsopen` rule, or -10661 ("No application knows
+    /// how to open") when the `(deny default)` baseline already keeps the
+    /// sandbox from looking LaunchServices up. Any other failure is
+    /// inconclusive.
+    LaunchServicesBlocked,
 }
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
@@ -921,7 +929,7 @@ pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
             "launchservices",
             "open a folder through LaunchServices",
             "/usr/bin/open -g /System",
-            Expect::FailsWith("-54"),
+            Expect::LaunchServicesBlocked,
             finder,
         ),
         probe(
@@ -1114,9 +1122,23 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         Expect::AppleEventBlocked if output.contains("-1712") => Outcome::Open(
             "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
         ),
-        Expect::AppleEventBlocked if output.contains("-600") => Outcome::Closed,
+        Expect::AppleEventBlocked if output.contains("-600") || output.contains("(-1728)") => {
+            Outcome::Closed
+        }
         Expect::AppleEventBlocked => Outcome::Inconclusive(format!(
-            "the event failed, but not with the policy's refusal (-600): {}",
+            "the event failed, but not with a refusal Seatbelt gives (-600, or -1728 under deny by default): {}",
+            last_line(output)
+        )),
+        Expect::LaunchServicesBlocked if succeeded => {
+            Outcome::Open(format!("it succeeded: {}", last_line(output)))
+        }
+        Expect::LaunchServicesBlocked
+            if output.contains("error -54 ") || output.contains("Code=-10661") =>
+        {
+            Outcome::Closed
+        }
+        Expect::LaunchServicesBlocked => Outcome::Inconclusive(format!(
+            "it failed, but not with a refusal Seatbelt gives (-54, or -10661 under deny by default): {}",
             last_line(output)
         )),
     }
@@ -1892,6 +1914,11 @@ mod tests {
             proven(open, ran(false, other)),
             Outcome::Inconclusive(_)
         ));
+        // Under (deny default) the lookup itself is refused (CI, macOS 15
+        // and 26).
+        let unreachable = "No application knows how to open URL file:///System/ (Error Domain=NSOSStatusErrorDomain Code=-10661 \"kLSApplicationNotFoundErr: E.g. no application claims the file\")";
+        assert_eq!(proven(open, ran(false, unreachable)), Outcome::Closed);
+        assert!(matches!(proven(open, ran(true, "")), Outcome::Open(_)));
 
         let ae = find(&list, "apple events");
         assert!(matches!(proven(ae, ran(true, "3")), Outcome::Open(_)));
@@ -1906,6 +1933,8 @@ mod tests {
             outcome(ae, ran(false, blocked), Ok(None), Some((false, ""))),
             Outcome::Inconclusive(_)
         ));
+        let unreachable = "55:68: execution error: Can’t get application \"Finder\". (-1728)";
+        assert_eq!(proven(ae, ran(false, unreachable)), Outcome::Closed);
         let broken = "execution error: An error of type -10004 has occurred. (-10004)";
         assert!(matches!(
             proven(ae, ran(false, broken)),
