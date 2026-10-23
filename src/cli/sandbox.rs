@@ -107,6 +107,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         }
         SandboxVerb::Show { name } => {
             let view = engine.show_sandbox(&name)?;
+            if !output::json() {
+                // The view first: what follows can fail, and the view is
+                // what is read when state is broken.
+                print_show(&view);
+            }
             let services = engine.service_status(&name)?;
             // Agents are the runtime's: nothing to list without one.
             let agents = match engine.runtime(&name)?.is_some() {
@@ -140,7 +145,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 output::emit(&shown);
                 return Ok(exit::OK);
             }
-            print_show(&view);
             for (label, status) in services {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
@@ -191,14 +195,27 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(left) => {
                     if output::json() {
-                        output::emit(&json!({
-                            "sandbox": name.to_string(),
-                            "removed": true,
-                            "secrets_left": left.iter().map(|l| json!({
-                                "secret": l.secret.to_string(),
-                                "why": l.why,
-                            })).collect::<Vec<_>>(),
-                        }));
+                        let code = match left.is_empty() {
+                            true => exit::OK,
+                            false => exit::ERROR,
+                        };
+                        output::emit(&output::with_error(
+                            json!({
+                                "sandbox": name.to_string(),
+                                "removed": true,
+                                "secrets_left": left.iter().map(|l| json!({
+                                    "secret": l.secret.to_string(),
+                                    "why": l.why,
+                                })).collect::<Vec<_>>(),
+                            }),
+                            code,
+                            || {
+                                format!(
+                                    "sandbox {name} is removed, but {} of its secrets stay, and no enclos command reaches them any more",
+                                    left.len()
+                                )
+                            },
+                        ));
                     } else {
                         println!("Removed sandbox {name}.");
                         for left in &left {
@@ -483,10 +500,24 @@ fn restart(
         }
         Planned::Done(report) => match print_stop(name, &report) {
             (exit::OK, stopped) => {
-                let (code, mut started) =
-                    print_started(engine, name, &engine.start_sandbox(by, name)?)?;
-                started["stopped"] = stopped;
-                Ok((code, started))
+                let started = engine
+                    .start_sandbox(by, name)
+                    .and_then(|labels| print_started(engine, name, &labels));
+                match started {
+                    Ok((code, mut started)) => {
+                        started["stop"] = stopped;
+                        Ok((code, started))
+                    }
+                    // Stopped, then not started: in JSON, both are said.
+                    Err(e) if output::json() => {
+                        let code = e.exit_code();
+                        let mut failed = output::error(&e, code);
+                        failed["sandbox"] = json!(name.to_string());
+                        failed["stop"] = stopped;
+                        Ok((code, failed))
+                    }
+                    Err(e) => Err(e),
+                }
             }
             failed => Ok(failed),
         },
@@ -516,7 +547,15 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
         }).collect::<Vec<_>>(),
     });
     if output::json() {
-        return (code, value);
+        let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
+        return (
+            code,
+            output::with_error(value, code, || {
+                format!(
+                    "sandbox {name} is marked failed: {survivors} processes survived stop; end them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses"
+                )
+            }),
+        );
     }
     let gone = match report.gone.len() {
         0 => String::new(),
@@ -585,7 +624,15 @@ pub(super) fn print_started(
         false => exit::ERROR,
     };
     if output::json() {
-        return Ok((code, value));
+        return Ok((
+            code,
+            output::with_error(value, code, || {
+                format!(
+                    "the proxy of sandbox {name} has not started after {} seconds; see `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`",
+                    PROXY_WAIT.as_secs()
+                )
+            }),
+        ));
     }
     let labels = labels
         .iter()

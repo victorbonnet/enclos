@@ -50,9 +50,9 @@ pub struct LogsArgs {
 
 pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     let files = engine.log_files(&args.sandbox)?;
-    // With --json, JSON Lines: one `{"line": …}` per line, the escaping
-    // JSON's own. Which file a line is from is left out: tail's headers are
-    // lines a sandbox could write too.
+    // With --json, JSON Lines: one `{"line": …}` per line, escaped as
+    // every document is. Which file a line is from is left out: tail's
+    // headers are lines a sandbox could write too.
     let json = super::output::json();
     if files.is_empty() {
         let none = format!(
@@ -79,8 +79,8 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
         .spawn()
         .map_err(|e| failed(format!("cannot run tail: {e}")))?;
     let out = tail.stdout.take().expect("tail's output is piped");
-    // What the services print comes from the sandbox: shown escaped, so it
-    // cannot drive the terminal (design §4).
+    // What the services print comes from the sandbox: shown escaped, in
+    // text and in JSON, so it cannot drive the terminal (design §4).
     let shown = show_lines(out, &mut io::stdout().lock(), json);
     if let Err(e) = shown {
         // tail would otherwise wait for a service's next line to learn that
@@ -118,15 +118,16 @@ enum Failed {
     Write(io::Error),
 }
 
-/// Shows `from` on `to` line by line, each line escaped and without its
-/// line ending (`\n` or `\r\n`). Bytes that are not UTF-8 show as U+FFFD,
-/// and a line longer than `MAX_LINE` bytes is shown in pieces.
+/// `show_lines` in text, as the tests use it.
 #[cfg(test)]
 fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(), Failed> {
     show_lines(from, to, false)
 }
 
-/// As `show_escaped`, or with `json` each line as `{"line": …}`.
+/// Shows `from` on `to` line by line, each line escaped and without its
+/// line ending (`\n` or `\r\n`); with `json`, each as `{"line": …}`, with
+/// `"cut": true` on a piece of a longer line. Bytes that are not UTF-8 show
+/// as U+FFFD, and a line longer than `MAX_LINE` bytes is shown in pieces.
 fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
@@ -151,9 +152,18 @@ fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::
             .strip_suffix("\r\n")
             .or_else(|| text.strip_suffix('\n'))
             .unwrap_or(&text);
-        let written = match json {
-            true => writeln!(to, "{}", serde_json::json!({ "line": text })),
-            false => writeln!(to, "{}", printable_line(text)),
+        let written = match (json, ended) {
+            (true, true) => writeln!(
+                to,
+                "{}",
+                super::output::line(&serde_json::json!({ "line": text }))
+            ),
+            (true, false) => writeln!(
+                to,
+                "{}",
+                super::output::line(&serde_json::json!({ "line": text, "cut": true }))
+            ),
+            (false, _) => writeln!(to, "{}", printable_line(text)),
         };
         written.and_then(|()| to.flush()).map_err(Failed::Write)?;
     }

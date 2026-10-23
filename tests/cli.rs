@@ -25,7 +25,7 @@ impl Home {
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
         // Text, though the output is piped: the tests below read what a
-        // person reads, and ask for JSON with --json.
+        // person reads, and get JSON by piping without it (`run_piped`).
         cmd.arg("--text")
             .args(args)
             .env("ENCLOS_HOME", &self.root)
@@ -2665,6 +2665,8 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
         "{}",
         out.stdout()
     );
+    // `exec` starts the proxy: stopped when the test ends.
+    let _stop = StopOnDrop(&home, "home");
     home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
     let out = home.run(&["doctor"]);
     assert!(
@@ -2798,6 +2800,7 @@ fn exec_output_stays_its_commands_when_piped() {
     let home = Home::new();
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
     let out = home.run_piped(&["exec", "home", "--", "/bin/echo", "hi"]);
     assert_eq!(out.stdout(), "hi\n");
     let out = home.run_piped(&["--json", "exec", "nosuch", "--", "/bin/echo", "hi"]);
@@ -2805,4 +2808,237 @@ fn exec_output_stays_its_commands_when_piped() {
     assert_eq!(out.stdout(), "");
     let doc: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
     assert_eq!(doc["error"]["exit_code"], 125, "{doc}");
+    assert_eq!(doc["error"]["kind"], "error", "{doc}");
+    // A usage error of its own, too, is JSON on stderr, not on its stdout.
+    let out = home.run_piped(&["--json", "exec", "home"]);
+    assert_eq!(out.code(), 125);
+    assert_eq!(out.stdout(), "");
+    let doc: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    assert_eq!(doc["error"]["exit_code"], 125, "{doc}");
+    // Without --json, piped, it stays text.
+    let out = home.run_piped(&["exec", "home"]);
+    assert_eq!(out.code(), 125);
+    assert!(out.stderr().contains("Usage"), "{}", out.stderr());
+}
+
+/// Several sandboxes give one document, one element each, in order; a dry
+/// run's elements say what would start; a name that is no sandbox is one
+/// error document.
+#[cfg(target_os = "macos")]
+#[test]
+fn several_sandboxes_give_one_document_with_an_element_each() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let (code, stopped) = home.json(&["sandbox", "stop", "home", "lab", "home"]);
+    assert_eq!(code, 0, "{stopped}");
+    let elements = stopped["sandboxes"].as_array().unwrap();
+    assert_eq!(elements.len(), 2, "{stopped}");
+    assert_eq!(elements[0]["sandbox"], "home");
+    assert_eq!(elements[1]["sandbox"], "lab");
+    assert!(elements.iter().all(|e| e["stopped"] == true), "{stopped}");
+    for verb in ["start", "restart"] {
+        let (code, planned) = home.json(&["--dry-run", "sandbox", verb, "home", "lab"]);
+        assert_eq!(code, 0, "{planned}");
+        for (element, name) in planned["sandboxes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(["home", "lab"])
+        {
+            assert_eq!(element["dry_run"], true, "{planned}");
+            assert!(
+                element["would_start"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.as_str().unwrap().ends_with(&format!(".{name}.proxy"))),
+                "{planned}"
+            );
+        }
+    }
+    let out = home.run_piped(&["sandbox", "stop", "home", "nope"]);
+    assert_eq!(out.code(), 1);
+    let doc: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(doc["error"]["kind"], "error", "{doc}");
+}
+
+/// A broken audit log, in JSON: the result, and an error beside it, exit 1.
+#[test]
+fn audit_and_verify_in_json() {
+    let home = Home::new();
+    home.init(3);
+    let (_, audit) = home.json(&["audit"]);
+    assert_eq!(audit["entries"].as_array().unwrap().len(), 3, "{audit}");
+    assert_eq!(audit["entries"][0]["command"], "init");
+    assert_eq!(audit["entries"][0]["finished"]["result"], "ok");
+    let (code, verified) = home.json(&["audit", "verify"]);
+    assert_eq!(code, 0);
+    assert_eq!(verified["intact"], true);
+    let mut lines = home.audit_lines();
+    lines[2] = lines[2].replace("\"command\":\"init\"", "\"command\":\"oops\"");
+    home.write_audit_lines(&lines);
+    let (code, verified) = home.json(&["audit", "verify"]);
+    assert_eq!(code, 1);
+    assert_eq!(verified["intact"], false, "{verified}");
+    assert_eq!(verified["broken"]["line"], 3, "{verified}");
+    assert!(
+        verified["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("audit.jsonl.damaged"),
+        "{verified}"
+    );
+}
+
+/// `doctor` and `state check` in JSON: a result, with an error beside it
+/// when the command fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_and_state_check_in_json() {
+    let home = Home::new();
+    let (code, doctor) = home.json(&["doctor"]);
+    assert_eq!(code, 0, "{doctor}");
+    assert_eq!(doctor["records"]["initialized"], false, "{doctor}");
+    assert_eq!(doctor["backends"][0]["runs"]["ok"], true, "{doctor}");
+    assert!(doctor.get("error").is_none(), "{doctor}");
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let (code, check) = home.json(&["state", "check"]);
+    assert_eq!(code, 0);
+    assert_eq!(check["match"], true, "{check}");
+    std::fs::remove_file(home.root.join("sandboxes/home/policy.toml")).unwrap();
+    let (code, check) = home.json(&["state", "check"]);
+    assert_eq!(code, 1);
+    assert_eq!(check["findings"][0]["remedy"]["kind"], "repair", "{check}");
+    assert_eq!(check["error"]["exit_code"], 1, "{check}");
+    let (code, planned) = home.json(&["--dry-run", "state", "repair"]);
+    assert_eq!(code, 0, "{planned}");
+    assert_eq!(planned["dry_run"], true, "{planned}");
+    std::fs::remove_dir_all(home.root.join("sandboxes/home/home")).unwrap();
+    let (code, doctor) = home.json(&["doctor"]);
+    assert_eq!(code, 1, "{doctor}");
+    assert_eq!(
+        doctor["records"]["sandboxes"][0]["next_session"]["state"], "fails",
+        "{doctor}"
+    );
+    assert_eq!(doctor["error"]["exit_code"], 1, "{doctor}");
+}
+
+/// `logs --json` writes JSON Lines, every line of every log and no tail
+/// header; piped without it, the logs stay text; with none, nothing is on
+/// stdout and the hint is on stderr.
+#[cfg(target_os = "macos")]
+#[test]
+fn logs_in_json_are_json_lines() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let out = home.run_piped(&["--json", "logs", "home"]);
+    assert_eq!(out.code(), 0);
+    assert_eq!(out.stdout(), "");
+    assert!(
+        out.stderr().contains("no service logs yet"),
+        "{}",
+        out.stderr()
+    );
+    let logs = home.root.join("sandboxes/home/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("gateway.log"), "one\n\x1b[2Jtwo\n").unwrap();
+    std::fs::write(logs.join("proxy.log"), "three\n").unwrap();
+    let out = home.run_piped(&["--json", "logs", "home"]);
+    assert_eq!(out.code(), 0, "{}", out.stderr());
+    let lines: Vec<String> = out
+        .stdout()
+        .lines()
+        .map(|l| {
+            let doc: serde_json::Value = serde_json::from_str(l).unwrap();
+            doc["line"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert!(!lines.iter().any(|l| l.contains("==>")), "{lines:?}");
+    for want in ["one", "\x1b[2Jtwo", "three"] {
+        assert!(lines.iter().any(|l| l == want), "{want:?} in {lines:?}");
+    }
+    assert!(!out.stdout().contains('\x1b'));
+    let out = home.run_piped(&["logs", "home"]);
+    assert!(
+        out.ok().stdout().contains("\\u{1b}[2Jtwo"),
+        "{}",
+        out.stdout()
+    );
+}
+
+/// A JSON command that starts the proxy ends, and its reader sees the end
+/// of the document: no program it starts holds the stdout it was given.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_piped_command_that_starts_the_proxy_ends_its_document() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
+    cmd.args(["policy", "test", "home"])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().unwrap();
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    let out = wait
+        .recv_timeout(std::time::Duration::from_secs(300))
+        .expect("the document's reader still waits: a program enclos started holds its stdout")
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["sandbox"], "home", "{doc}");
+    assert!(
+        doc["probes"].as_array().is_some_and(|p| !p.is_empty()),
+        "{doc}"
+    );
+}
+
+/// A secret's value is never in a document.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_set_in_json_shows_no_value() {
+    use std::io::Write;
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
+    cmd.args(["secret", "set", "home/telegram"])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"tok-123:abc\n")
+        .unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    let doc: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(doc["secret"], "home/telegram", "{doc}");
+    assert_eq!(doc["new"], true);
+    assert!(!out.stdout().contains("tok-123"), "{}", out.stdout());
+    let mut list = Command::new(env!("CARGO_BIN_EXE_enclos"));
+    list.args(["secret", "list", "home"])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .env("ENCLOS_KEYCHAIN", &keychain.0);
+    let out = Run(list.output().unwrap());
+    let doc: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(doc["secrets"][0]["name"], "telegram", "{doc}");
+    assert!(!out.stdout().contains("tok-123"));
 }

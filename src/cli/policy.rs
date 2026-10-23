@@ -98,8 +98,13 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                         exit::OK
                     }
                     Planned::Done(report) if output::json() => {
-                        output::emit(&test_json(&sandbox, &report));
-                        test_code(&report)
+                        let code = test_code(&report);
+                        output::emit(&output::with_error(
+                            test_json(&sandbox, &report),
+                            code,
+                            || verdict(&sandbox, &report),
+                        ));
+                        code
                     }
                     Planned::Done(report) => print_test(&sandbox, &report),
                 },
@@ -201,7 +206,7 @@ fn pending_json(p: &PendingPolicy) -> Value {
     })
 }
 
-/// The policy in force, or with `pending` the pending one, as its rules.
+/// The policy in force, or with `pending` the pending one, field by field.
 fn show_json(view: &PolicyView, pending: bool) -> Result<Value> {
     let snap = &view.snapshot;
     if pending {
@@ -214,7 +219,7 @@ fn show_json(view: &PolicyView, pending: bool) -> Result<Value> {
             "sandbox": view.sandbox.to_string(),
             "pending": pending_json(p),
             "template": pending.inputs.template.to_string(),
-            "in_force": view.version.version,
+            "active_version": view.version.version,
             "policy": serde_json::to_value(&pending.policy).expect("a policy serializes"),
         }));
     }
@@ -727,9 +732,13 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
     if after == before && recorded.as_deref().is_none_or(|r| r == after) {
-        forget_edit(&files);
+        let left = forget_edit(&files);
         match output::json() {
-            true => output::emit(&json!({"sandbox": sandbox.to_string(), "changed": false})),
+            true => output::emit(&json!({
+                "sandbox": sandbox.to_string(),
+                "changed": false,
+                "edit_left": left,
+            })),
             false => println!("No change to the policy of sandbox {sandbox}."),
         }
         return Ok(exit::OK);
@@ -753,7 +762,11 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         // Recorded before it failed (a restart with --yes, say): the edit
         // is the file now, and keeping it would only open it again.
         Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
-            forget_edit(&files);
+            for said in forget_edit(&files) {
+                if output::json() {
+                    eprintln!("{}", output::line(&json!({ "note": said })));
+                }
+            }
             return Err(e);
         }
         Err(e @ Error::PolicyFileChanged { .. }) => return Err(e),
@@ -767,10 +780,12 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
             });
         }
     };
-    forget_edit(&files);
+    let left = forget_edit(&files);
     if output::json() {
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
-        output::emit(&applied_json(sandbox, &applied, outcome));
+        let mut shown = applied_json(sandbox, &applied, outcome);
+        shown["edit_left"] = json!(left);
+        output::emit(&shown);
         return Ok(code);
     }
     let version = applied.version.version;
@@ -793,18 +808,25 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
 }
 
 /// Removes the copy `policy edit` edited and its base, saying so when it
-/// cannot: the next `policy edit` would open it again.
-fn forget_edit(files: &EditFiles) {
+/// cannot, in text: the next `policy edit` would open it again. Returns
+/// what it said, for JSON to carry.
+fn forget_edit(files: &EditFiles) -> Vec<String> {
+    let mut left = Vec::new();
     for path in [&files.copy, &files.base] {
         if let Err(e) = std::fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
-                "enclos: could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
+            let said = format!(
+                "could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
                 path.display()
             );
+            if !output::json() {
+                eprintln!("enclos: {said}");
+            }
+            left.push(said);
         }
     }
+    left
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {

@@ -16,9 +16,7 @@ use enclos::model::{Timestamp, now};
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Only this sandbox. In JSON, sizes are in bytes, times in RFC 3339,
-    /// and each fact read from a sandbox is `{"known": …}`, `"absent"`,
-    /// `{"cannot_tell": why}` or `"not_provided"`.
+    /// Only this sandbox.
     sandbox: Option<SandboxName>,
 }
 

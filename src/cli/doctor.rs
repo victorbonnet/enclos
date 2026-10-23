@@ -9,15 +9,17 @@ use enclos::error::{Result, exit};
 
 pub fn run(engine: &Engine) -> Result<u8> {
     let doctor = engine.doctor();
+    let code = match doctor.has_problems() {
+        true => exit::ERROR,
+        false => exit::OK,
+    };
     match super::output::json() {
-        true => super::output::emit(&json(&doctor)),
+        true => super::output::emit(&super::output::with_error(json(&doctor), code, || {
+            "something keeps enclos, or one of its sandboxes, from running here".to_owned()
+        })),
         false => print!("{}", shown(&doctor)),
     }
-    Ok(if doctor.has_problems() {
-        exit::ERROR
-    } else {
-        exit::OK
-    })
+    Ok(code)
 }
 
 /// The report as JSON.

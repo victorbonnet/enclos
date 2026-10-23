@@ -44,11 +44,16 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
         StateVerb::Check { sandbox } => {
             let found = engine.state_check(sandbox.as_ref())?;
             if output::json() {
-                output::emit(&findings_json(&found, false));
-                return Ok(match found.is_empty() {
+                let code = match found.is_empty() {
                     true => exit::OK,
                     false => exit::ERROR,
-                });
+                };
+                output::emit(&output::with_error(
+                    findings_json(&found, false),
+                    code,
+                    || "enclos's records and the host differ".to_owned(),
+                ));
+                return Ok(code);
             }
             if found.is_empty() {
                 println!("enclos's records match the host.");
@@ -75,8 +80,13 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
             };
             let left = found.iter().any(|f| f.remedy.is_left());
             if output::json() {
-                output::emit(&findings_json(&found, confirm == Confirm::DryRun));
-                return Ok(if left { exit::ERROR } else { exit::OK });
+                let code = if left { exit::ERROR } else { exit::OK };
+                output::emit(&output::with_error(
+                    findings_json(&found, confirm == Confirm::DryRun),
+                    code,
+                    || "something is left for you to do".to_owned(),
+                ));
+                return Ok(code);
             }
             if found.is_empty() {
                 println!("enclos's records match the host: nothing to repair.");

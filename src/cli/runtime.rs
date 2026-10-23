@@ -73,23 +73,33 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         }
         Planned::Done(end) => end,
     };
-    super::connect::report_end(&sandbox, &end.end);
     let shown = runtime.display_name();
     if output::json() {
-        output::emit(&json!({
-            "sandbox": sandbox.to_string(),
-            "runtime": runtime.to_string(),
-            "installed": end.installed,
-            "installer_exit": end.end.exit,
-            "recorded": end.recorded.map(|k| k.to_string()),
-            "policy_version": end.policy,
-            "login": format!("enclos connect {sandbox} -- {}", enclos::runtime::adapter(runtime).login()),
-        }));
-        return Ok(match end.installed {
+        let code = match end.installed {
             true => exit::OK,
             false => exit::ERROR,
-        });
+        };
+        output::emit(&output::with_error(
+            json!({
+                "sandbox": sandbox.to_string(),
+                "runtime": runtime.to_string(),
+                "installed": end.installed,
+                "session": output::session(&end.end),
+                "recorded": end.recorded.map(|k| k.to_string()),
+                "policy_version": end.policy,
+                "login": format!("enclos connect {sandbox} -- {}", enclos::runtime::adapter(runtime).login()),
+            }),
+            code,
+            || {
+                format!(
+                    "the {shown} installer exited with {} in sandbox {sandbox}; fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again",
+                    end.end.exit
+                )
+            },
+        ));
+        return Ok(code);
     }
+    super::connect::report_end(&sandbox, &end.end);
     if !end.installed {
         let after = match end.recorded {
             Some(kept) => format!(

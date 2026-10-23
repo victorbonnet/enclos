@@ -23,7 +23,8 @@ struct Cli {
     #[arg(long, global = true)]
     yes: bool,
     /// Print JSON, the result or the error, also in a terminal; the default
-    /// when the output is piped.
+    /// when the output is piped, but for `connect`, `exec` and `logs`, whose
+    /// output is their program's.
     #[arg(long, global = true)]
     json: bool,
     /// Print readable text, also when the output is piped; --json wins.
@@ -65,6 +66,10 @@ enum Command {
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
     /// What is on this host, what it costs on disk, and what you could do.
+    ///
+    /// In JSON, sizes are in bytes, times in RFC 3339, and each fact read
+    /// from a sandbox is `{"known": …}`, `"absent"`, `{"cannot_tell": why}`
+    /// or `"not_provided"`.
     Status(cli::status::StatusArgs),
     /// Run one of a sandbox's runtime services; started by the service manager.
     #[command(hide = true)]
@@ -102,14 +107,15 @@ fn main() -> ExitCode {
                 true if names_exec(std::env::args_os().skip(1)) => exit::EXEC_FAILED,
                 true => exit::ERROR,
             };
-            match code != exit::OK && usage_is_json(std::env::args_os().skip(1).collect()) {
-                true => cli::output::emit(&cli::output::error_text(
-                    err.render().to_string().trim(),
-                    code,
-                )),
-                false => {
+            let words = words(std::env::args_os().skip(1));
+            use std::io::IsTerminal;
+            let error = || cli::output::error_text(err.render().to_string().trim(), code);
+            match (code, usage_as(&words, std::io::stdout().is_terminal())) {
+                (exit::OK, _) | (_, Usage::Text) => {
                     let _ = err.print();
                 }
+                (_, Usage::JsonOnStdout) => cli::output::emit(&error()),
+                (_, Usage::JsonOnStderr) => eprintln!("{}", cli::output::line(&error())),
             }
             return ExitCode::from(code);
         }
@@ -131,8 +137,8 @@ fn main() -> ExitCode {
     // `exec` exits with its command's code, so its own failures take one
     // no command gives them by convention (design §10).
     let exec = matches!(cli.command, Command::Exec(_));
-    match run(cli) {
-        Ok(code) => ExitCode::from(code),
+    let code = match run(cli) {
+        Ok(code) => code,
         Err(err) => {
             let code = match exec {
                 true => exit::EXEC_FAILED,
@@ -142,15 +148,18 @@ fn main() -> ExitCode {
                 (false, _) => eprintln!("error: {err}"),
                 (true, false) => cli::output::emit(&cli::output::error(&err, code)),
                 // Its stdout is the program's: enclos's words go to stderr.
-                (true, true) => eprintln!(
-                    "{}",
-                    serde_json::to_string(&cli::output::error(&err, code))
-                        .expect("a JSON value serializes")
-                ),
+                (true, true) => eprintln!("{}", cli::output::line(&cli::output::error(&err, code))),
             }
-            ExitCode::from(code)
+            code
         }
+    };
+    // A document that could not be written is a failure, whatever the
+    // command did.
+    if let Some(e) = cli::output::write_failure() {
+        eprintln!("error: cannot write the JSON document: {e}");
+        return ExitCode::from(code.max(exit::ERROR));
     }
+    ExitCode::from(code)
 }
 
 fn run(cli: Cli) -> Result<u8> {
@@ -183,11 +192,21 @@ fn run(cli: Cli) -> Result<u8> {
             let report = engine.verify_audit()?;
             match cli::output::json() {
                 true => {
-                    cli::output::emit(&verify_json(&report));
-                    Ok(match report.broken {
+                    let code = match report.broken {
                         Some(_) => exit::ERROR,
                         None => exit::OK,
-                    })
+                    };
+                    cli::output::emit(&cli::output::with_error(verify_json(&report), code, || {
+                        format!(
+                            "the audit log is broken: {}; no state-changing command runs until it is repaired: keep audit.jsonl under a name that starts with audit.jsonl, such as audit.jsonl.damaged",
+                            report
+                                .broken
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_default()
+                        )
+                    }));
+                    Ok(code)
                 }
                 false => Ok(print_verify(&report)),
             }
@@ -229,7 +248,8 @@ fn ends_on_closed_output(command: &Command) -> bool {
 }
 
 /// Whether `command` runs a program whose output is its own, so that its
-/// stdout is never enclos's JSON (design §10).
+/// stdout is the program's: not JSON when piped, and with `--json` only a
+/// dry run's plan is enclos's JSON there (design §10).
 fn runs_a_program(command: &Command) -> bool {
     matches!(
         command,
@@ -241,23 +261,38 @@ fn runs_a_program(command: &Command) -> bool {
     )
 }
 
-/// Whether a usage error is told as JSON: `--json` is asked, or the output
-/// is piped and neither `--text` is asked nor the command runs a program,
-/// as [`runs_a_program`] says, taken from its first word. Only the words
-/// before a `--` count.
-fn usage_is_json(args: Vec<std::ffi::OsString>) -> bool {
-    let words: Vec<String> = args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
+/// How a usage error is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Usage {
+    Text,
+    JsonOnStdout,
+    JsonOnStderr,
+}
+
+/// The words of a command line before its `--`, as text: only those can be
+/// enclos's own.
+fn words(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<String> {
+    args.map(|a| a.to_string_lossy().into_owned())
         .take_while(|a| a != "--")
-        .collect();
+        .collect()
+}
+
+/// How a usage error of the command line `words` is told, as a parsed one
+/// would print (design §10): JSON with `--json`, or piped without `--text`;
+/// for a command that runs a program, as [`runs_a_program`] says, of its
+/// first word that is not a flag, JSON only with `--json`, and on stderr.
+fn usage_as(words: &[String], stdout_is_terminal: bool) -> Usage {
     let flag = |f: &str| words.iter().any(|w| w == f);
     let runs = words
         .iter()
         .find(|w| !w.starts_with('-'))
         .is_some_and(|w| matches!(w.as_str(), "connect" | "exec" | "logs" | "launch" | "proxy"));
-    use std::io::IsTerminal;
-    flag("--json") || (!flag("--text") && !runs && !std::io::stdout().is_terminal())
+    match (runs, flag("--json"), flag("--text") || stdout_is_terminal) {
+        (true, true, _) => Usage::JsonOnStderr,
+        (true, false, _) => Usage::Text,
+        (false, true, _) | (false, false, false) => Usage::JsonOnStdout,
+        (false, false, true) => Usage::Text,
+    }
 }
 
 fn init_json(planned: &Planned<InitReport>) -> serde_json::Value {
@@ -295,8 +330,8 @@ fn verify_json(report: &VerifyReport) -> serde_json::Value {
 }
 
 /// Whether `args`, the command line after the program, run `exec`: its
-/// first word that is not a flag, as the only flags before a command are
-/// `--yes` and `--dry-run`.
+/// first word that is not a flag, as no flag before a command takes a
+/// value.
 fn names_exec(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     args.find(|a| !a.to_string_lossy().starts_with('-'))
         .is_some_and(|a| a == "exec")
@@ -487,6 +522,40 @@ mod tests {
             args(&["connect", "lab", "--", "exec"]).into_iter()
         ));
         assert!(!super::names_exec(args(&[]).into_iter()));
+    }
+
+    #[test]
+    fn a_usage_error_is_told_as_the_command_would_print() {
+        use super::{Usage, usage_as};
+        let w = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(usage_as(&w(&["sandbox", "x"]), false), Usage::JsonOnStdout);
+        assert_eq!(usage_as(&w(&["sandbox", "x"]), true), Usage::Text);
+        assert_eq!(
+            usage_as(&w(&["--json", "sandbox"]), true),
+            Usage::JsonOnStdout
+        );
+        assert_eq!(usage_as(&w(&["--text", "sandbox"]), false), Usage::Text);
+        assert_eq!(
+            usage_as(&w(&["--text", "--json", "x"]), false),
+            Usage::JsonOnStdout
+        );
+        // A command whose output is its program's: JSON only when asked,
+        // and on stderr.
+        assert_eq!(usage_as(&w(&["exec", "lab"]), false), Usage::Text);
+        assert_eq!(usage_as(&w(&["--yes", "exec"]), false), Usage::Text);
+        assert_eq!(
+            usage_as(&w(&["--json", "logs"]), false),
+            Usage::JsonOnStderr
+        );
+        // What follows `--` is the command's, not enclos's.
+        assert_eq!(
+            super::words(
+                ["exec", "lab", "--", "--json"]
+                    .iter()
+                    .map(std::ffi::OsString::from)
+            ),
+            ["exec", "lab"]
+        );
     }
 
     #[test]

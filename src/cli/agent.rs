@@ -88,32 +88,28 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             let runtime = enclos::runtime::adapter(added.kind);
             let kind = added.kind.display_name();
             if output::json() {
-                let (how, archive, copy_left) = match &added.how {
-                    Added::Adopted => ("adopted", None, None),
-                    Added::Created(end) => {
-                        super::connect::report_end(&sandbox, end);
-                        ("created", None, None)
-                    }
+                let (how, session, archive, copy_left) = match &added.how {
+                    Added::Adopted => ("adopted", None, None, None),
+                    Added::Created(end) => ("created", Some(output::session(end)), None, None),
                     Added::Imported {
                         end,
                         archive,
                         copy_left,
-                    } => {
-                        super::connect::report_end(&sandbox, end);
-                        (
-                            "imported",
-                            Some(json!({
-                                "path": output::path(&archive.path),
-                                "sha256": archive.sha256,
-                            })),
-                            copy_left.as_ref().map(ToString::to_string),
-                        )
-                    }
+                    } => (
+                        "imported",
+                        Some(output::session(end)),
+                        Some(json!({
+                            "path": output::path(&archive.path),
+                            "sha256": archive.sha256,
+                        })),
+                        copy_left.as_ref().map(ToString::to_string),
+                    ),
                 };
                 output::emit(&json!({
                     "agent": format!("{sandbox}/{name}"),
-                    "runtime": kind,
+                    "runtime": added.kind.to_string(),
                     "how": how,
+                    "session": session,
                     "archive": archive,
                     "copy_left": copy_left,
                     "talk": format!("enclos connect {sandbox} -- {}", runtime.talk(name)),
