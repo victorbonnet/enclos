@@ -26,10 +26,10 @@ pub struct PolicyFile {
     pub resources: ResourcesLayer,
 }
 
-/// The limits a layer sets on each process, each replacing the one the
-/// layers below set. `memory` and `cpu` are read as text, whatever their
-/// form, only for the validation to refuse them where they cannot be
-/// enforced.
+/// The limits a layer sets, each replacing the one the layers below set.
+/// `memory` and `cpu` are read as text, whatever their form: kept as
+/// written, for the validation to refuse them where they cannot be
+/// enforced, and for a backend that enforces them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ResourcesLayer {
@@ -162,21 +162,29 @@ impl PolicyFile {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
-        let (limits, layer) = (&mut policy.resources, &self.resources);
-        if layer.open_files.is_some() {
-            limits.open_files = layer.open_files;
+        // Every field named, so one added to the layer is not dropped here.
+        let ResourcesLayer {
+            open_files,
+            file_size,
+            cpu_seconds,
+            memory,
+            cpu,
+        } = &self.resources;
+        let limits = &mut policy.resources;
+        if open_files.is_some() {
+            limits.open_files = *open_files;
         }
-        if layer.file_size.is_some() {
-            limits.file_size = layer.file_size;
+        if file_size.is_some() {
+            limits.file_size = *file_size;
         }
-        if layer.cpu_seconds.is_some() {
-            limits.cpu_seconds = layer.cpu_seconds;
+        if cpu_seconds.is_some() {
+            limits.cpu_seconds = *cpu_seconds;
         }
-        if layer.memory.is_some() {
-            limits.memory.clone_from(&layer.memory);
+        if memory.is_some() {
+            limits.memory.clone_from(memory);
         }
-        if layer.cpu.is_some() {
-            limits.cpu.clone_from(&layer.cpu);
+        if cpu.is_some() {
+            limits.cpu.clone_from(cpu);
         }
     }
 }
@@ -191,6 +199,21 @@ fn layer(list: &mut Vec<String>, replace: &Option<Vec<String>>, add: &[String]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A limit written as the wrong kind of value is refused with what is
+    /// expected, never an internal type's name.
+    #[test]
+    fn a_limit_of_the_wrong_kind_says_what_is_expected() {
+        for bad in ["file_size = -1", "file_size = 1.5", "file_size = true"] {
+            let err = PolicyFile::parse("policy.toml", &format!("[resources]\n{bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("a size"), "{bad}: {err}");
+            assert!(!err.contains("SizeText"), "{bad}: {err}");
+        }
+        assert!(PolicyFile::parse("policy.toml", "[resources]\nopen_files = -1\n").is_err());
+        assert!(PolicyFile::parse("policy.toml", "[resources]\nopen_files = \"64\"\n").is_err());
+    }
 
     #[test]
     fn a_list_replaces_and_an_add_list_extends() {

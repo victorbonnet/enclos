@@ -141,8 +141,8 @@ impl Engine {
                 let name = spec.name.as_str();
                 self.backend_for(&spec.name, spec.backend)?;
                 let overrides = policy::initial_overrides(name, &spec.template);
-                let snapshot = self.checked_policy_with(&spec.name, &overrides, None)?;
-                crate::policy::validate::validate_resources(&snapshot.policy, spec.backend)?;
+                let snapshot =
+                    self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
                 let record = SandboxRecord {
                     name: spec.name.clone(),
                     backend: spec.backend,
