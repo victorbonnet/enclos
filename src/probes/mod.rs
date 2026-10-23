@@ -253,7 +253,7 @@ pub struct ProbeInputs {
     pub keychain_item: Result<KeychainItem, String>,
     /// The limits the sandbox's processes run under, each of which gets a
     /// probe.
-    pub limits: crate::model::policy::Resources,
+    pub limits: crate::backend::LaunchLimits,
 }
 
 /// A path as one shell word.
@@ -784,7 +784,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
     // can raise). The control, the same check on the host, passes when the
     // host's own hard limit is higher than the policy's, or unlimited. A
     // value that does not read as a number is no proof: it reads open.
-    if let Some(limit) = i.limits.open_files {
+    if let Some(limit) = i.limits.open_files() {
         list.push(same_outside(
             "resources",
             format!("have a hard limit above {limit} open files"),
@@ -1530,10 +1530,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut i = inputs(dir.path());
         assert!(!probes(&i).iter().any(|p| p.route == "resources"));
-        i.limits.open_files = Some(256);
-        // Refused on every backend, so never probed.
-        i.limits.file_size = Some("1M".parse().unwrap());
-        i.limits.cpu_seconds = Some(60);
+        i.limits = crate::backend::LaunchLimits::of_checked(&crate::model::policy::Resources {
+            open_files: Some(256),
+            ..Default::default()
+        });
         let list = probes(&i);
         let limits: Vec<(&str, &str)> = list
             .iter()

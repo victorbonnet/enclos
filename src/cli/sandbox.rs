@@ -89,7 +89,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 })),
                 (Planned::Done(r), false) => println!(
                     "Created sandbox {} ({}, template {}), policy v1, proxy port {}.\nConnect with `enclos connect {}`.",
-                    r.name, r.backend, r.template, r.proxy_port, r.name
+                    r.name, r.backend, r.created_from, r.proxy_port, r.name
                 ),
             }
         }

@@ -350,7 +350,8 @@ mod tests {
 
     #[test]
     fn the_built_in_layers_parse() {
-        PolicyFile::parse("defaults", crate::policy::DEFAULTS).unwrap();
+        let defaults = PolicyFile::parse("defaults", crate::policy::DEFAULTS).unwrap();
+        assert!(defaults.extends.is_none());
         for name in crate::policy::template_names() {
             let text = crate::policy::template(&name.parse().unwrap()).unwrap();
             let layer = PolicyFile::parse(name, text).unwrap();

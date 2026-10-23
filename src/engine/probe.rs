@@ -6,6 +6,8 @@ use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
+
+use crate::backend::LaunchLimits;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -261,8 +263,13 @@ impl Engine {
             let mut target = Target::start()?;
             let terminal = OtherTerminal::open()?;
             let keychain = KeychainProbe::store(&self.layout, name);
-            let mut inputs =
-                self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
+            let mut inputs = self.probe_inputs(
+                name,
+                &ctx,
+                Some(target.0.id()),
+                Some(terminal.path.clone()),
+                limits.clone(),
+            )?;
             inputs.keychain_item = keychain
                 .as_ref()
                 .map(|k| k.item.clone())
@@ -304,14 +311,16 @@ impl Engine {
     }
 
     /// What the probes are built from. `target` is the process the signal
-    /// probe aims at, and `other_terminal` the terminal the terminal probes
-    /// try to open.
+    /// probe aims at, `other_terminal` the terminal the terminal probes try
+    /// to open, and `limits` those the probes run under, which the resource
+    /// probes show.
     pub(super) fn probe_inputs(
         &self,
         name: &SandboxName,
         ctx: &SandboxContext,
         target: Option<u32>,
         other_terminal: Option<PathBuf>,
+        limits: LaunchLimits,
     ) -> Result<ProbeInputs> {
         let policy = self.policy(name)?.snapshot.policy;
         let paths = PathContext {
@@ -358,7 +367,7 @@ impl Engine {
             other_terminal,
             tag: std::process::id(),
             keychain_item: Err("not probed here".into()),
-            limits: policy.resources.clone(),
+            limits,
         })
     }
 
@@ -371,8 +380,14 @@ impl Engine {
         let ctx = self.sandbox_context(name, record.proxy_port);
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
-        let mut inputs =
-            self.probe_inputs(name, &ctx, Some(0), Some(PathBuf::from("/dev/ttys0")))?;
+        let limits = self.launch_limits(&record, &self.policy(name)?.snapshot.policy)?;
+        let mut inputs = self.probe_inputs(
+            name,
+            &ctx,
+            Some(0),
+            Some(PathBuf::from("/dev/ttys0")),
+            limits,
+        )?;
         inputs.keychain_item = match cfg!(target_os = "macos") {
             true => Ok(KeychainItem {
                 service: "enclos.probe".into(),

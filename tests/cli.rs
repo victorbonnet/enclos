@@ -2734,12 +2734,49 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
     }
 }
 
-/// A template this enclos does not ship is refused with the ones it has,
-/// and leaves no folder; `--help` names them all.
+/// Once `policy.toml` names another template, `sandbox list` and `show` name
+/// the one the active policy is built on, not the one the sandbox was
+/// created from.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_is_listed_and_shown_with_its_active_template() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let mut edit = home.command(&["policy", "edit", "lab"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "sed -i \x27\x27 \x27s/^extends = \"assistant\"$/extends = \"minimal\"/\x27 \"$1\"",
+        ),
+    );
+    Run(edit.output().unwrap()).ok();
+    let listed = home.run(&["sandbox", "list"]).ok().stdout();
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("lab ") && l.contains(" minimal ")),
+        "{listed}"
+    );
+    let shown = home.run(&["sandbox", "show", "lab"]).ok().stdout();
+    assert!(shown.contains(", template minimal, "), "{shown}");
+}
+
+/// `--help` names every template; on macOS, where the backend runs and so
+/// the template is the first thing refused, one this enclos does not ship
+/// is refused with the ones it has, and leaves no folder.
 #[test]
 fn an_unknown_template_is_refused_with_the_ones_there_are() {
     let home = Home::new();
     home.init(1);
+    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
+    for name in enclos::policy::template_names() {
+        assert!(help.contains(name), "{name}: {help}");
+    }
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let out = home.run(&["sandbox", "create", "lab", "--template", "coding"]);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(
@@ -2749,10 +2786,6 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
         out.stderr()
     );
     assert!(!home.root.join("sandboxes/lab").exists());
-    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
-    for name in enclos::policy::template_names() {
-        assert!(help.contains(name), "{name}: {help}");
-    }
 }
 
 /// `state check` finds nothing in a new sandbox, names what differs once a
