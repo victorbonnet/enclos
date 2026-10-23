@@ -15,7 +15,7 @@ fn record(name: &str) -> SandboxRecord {
     SandboxRecord {
         name: name.parse().unwrap(),
         backend: BackendKind::Seatbelt,
-        template: "assistant".parse().unwrap(),
+        created_from: "assistant".parse().unwrap(),
         proxy_port: 41000,
         runtime: None,
         state: SandboxState::Created,

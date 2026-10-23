@@ -127,8 +127,9 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
             )));
         }
     }
-    // `ulimit -f` counts in KiB: a size of no whole KiB could only be cut,
-    // and one under 1K would become `ulimit -f 0`, stopping every write.
+    // A whole number of KiB, the unit of `ulimit -f`, for a backend that
+    // sets it that way: a size of no whole KiB could only be cut, and one
+    // under 1K would become `ulimit -f 0`, stopping every write.
     if r.file_size
         .is_some_and(|s| s.0 != 0 && !s.0.is_multiple_of(1024))
     {
