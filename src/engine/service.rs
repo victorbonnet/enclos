@@ -139,6 +139,12 @@ impl Engine {
         // A damaged audit log would refuse the audited install after the
         // removal, leaving the sandbox with nothing.
         self.audit.check()?;
+        // Nor is a service installed that could not start under its limits:
+        // refused here, before anything is removed, rather than at each
+        // start with only the service's log to say why. Each start checks
+        // them again, under the service manager's own hard limit.
+        let record = self.record(name)?;
+        self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
         self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop)?
