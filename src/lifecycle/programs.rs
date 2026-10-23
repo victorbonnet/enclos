@@ -32,7 +32,7 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
 
 /// `path` as `lsof` writes a file name in the C locale (macOS 26.5.2): a
 /// backslash doubled, tab, newline and the like as `\t`, `\n`, other control
-/// characters as `^A`, and bytes past ASCII as `\xc3`. A name holding `^`
+/// characters as `^A`, and DEL and bytes past ASCII as `\x7f`, `\xc3`. A name holding `^`
 /// followed by a capital is written as a control character would be, so
 /// two names can read the same: matched this way, such a name may be taken
 /// for another, never missed.
@@ -50,8 +50,7 @@ pub fn lsof_name(path: &Path) -> String {
                 name.push('^');
                 name.push(char::from(b + 0x40));
             }
-            0x7f => name.push_str("^?"),
-            0x80..=0xff => name.push_str(&format!("\\x{b:02x}")),
+            0x7f..=0xff => name.push_str(&format!("\\x{b:02x}")),
             _ => name.push(char::from(b)),
         }
     }
@@ -180,14 +179,14 @@ pub(crate) mod tests {
     #[test]
     fn a_program_file_is_named_as_lsof_name_writes_it() {
         let dir = tempfile::tempdir().unwrap();
-        let odd = dir.path().join("é \\ \t \x01 dir");
+        let odd = dir.path().join("é \\ \t \x01 \x7f dir");
         std::fs::create_dir(&odd).unwrap();
         let sleeper = Sleeper::in_folder(&odd);
         let listed = program_files().unwrap();
         let real = std::fs::canonicalize(odd.join("sleeper")).unwrap();
         let expected = lsof_name(&real);
         assert!(
-            expected.contains("\\xc3\\xa9 \\\\ \\t ^A dir"),
+            expected.contains("\\xc3\\xa9 \\\\ \\t ^A \\x7f dir"),
             "{expected}"
         );
         assert!(
