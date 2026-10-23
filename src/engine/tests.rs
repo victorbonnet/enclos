@@ -1604,6 +1604,7 @@ cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
 printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
+[ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
 if [ \"$1 $2\" = \"profile delete\" ] && [ ! -f \"$HOME/hermes-keeps\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
 fi
@@ -2238,7 +2239,7 @@ echo \"installed $*\" > \"$HOME/installed\"
                     planned.display()
                 ),
                 format!(
-                    "run `hermes profile import {} --name main` in sandbox home under policy v2: Hermes extracts the archive inside the sandbox",
+                    "run `hermes profile import '{}' --name main` in sandbox home under policy v2: Hermes extracts the archive inside the sandbox",
                     planned.display()
                 ),
                 "record agent home/main as imported from that archive".to_owned(),
@@ -2838,7 +2839,7 @@ echo \"installed $*\" > \"$HOME/installed\"
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 /bin/sleep 600 &
 printf '%s\\n%s\\n' $! $$ > \"$HOME/gateway-pids.part\"
 mv \"$HOME/gateway-pids.part\" \"$HOME/gateway-pids\"
@@ -2855,7 +2856,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 /bin/sleep 600 &
 printf '%s\\n%s\\n' $! $$ > \"$HOME/gateway-pids.part\"
 mv \"$HOME/gateway-pids.part\" \"$HOME/gateway-pids\"
@@ -2872,7 +2873,7 @@ mkdir -p \"$HOME/.local/bin\" \"$HOME/.hermes\"
 printf 'model: a\\n' > \"$HOME/.hermes/config.yaml\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 trap 'exit 75' USR1
 : > \"$HOME/gateway-up\"
 i=0
@@ -3171,7 +3172,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 printf '%s' \"${ENCLOS_FAKE_IN_TERMINAL:-unset}\" > \"$HOME/in-terminal\"
 STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
@@ -3607,7 +3608,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 printf '%s' \"${ENCLOS_FAKE_SERVICE_PORT:-unset}\" > \"$HOME/gateway-port\"
 STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
@@ -3619,7 +3620,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
-[ \"$1\" = gateway ] || exit 0
+[ \"$3\" = gateway ] || exit 0
 printf '%s' \"${TOKEN:-unset}\" > \"$HOME/gateway-token\"
 STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
@@ -3684,6 +3685,225 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap_err();
         assert!(err.to_string().contains("$TOKEN"), "{err}");
+    }
+
+    /// The sandbox's bot is set up with the runtime's own commands, once its
+    /// token is one of the sandbox's secrets the policy grants; the value
+    /// goes into no command.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
+        use crate::model::channel::{Channel, ChannelUser};
+        use crate::model::secret::{SecretRef, SecretValue};
+        use crate::secrets::InMemory;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let store = std::rc::Rc::new(InMemory::default());
+        let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+        assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+        let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        let users: Vec<ChannelUser> = vec!["111".parse().unwrap(), "222".parse().unwrap()];
+        let configure = |users: &[ChannelUser], confirm| {
+            lab.engine.configure_channel(
+                &alice(),
+                &lab.name,
+                Channel::Telegram,
+                None,
+                users,
+                confirm,
+            )
+        };
+
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(
+            err.to_string().contains("enclos secret set home/telegram"),
+            "{err}"
+        );
+        let err = configure(&[], Confirm::Yes).unwrap_err();
+        assert!(err.to_string().contains("--allow-user"), "{err}");
+        assert!(!calls().contains("config set"), "{}", calls());
+
+        let token: SecretRef = "home/telegram".parse().unwrap();
+        let value = SecretValue::new("123:tok".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!(
+            "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
+        );
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+
+        let Planned::DryRun(plan) = configure(&users, Confirm::DryRun).unwrap() else {
+            panic!("a dry run configured the channel");
+        };
+        assert_eq!(plan.changes.len(), 3, "{plan:?}");
+        assert!(
+            plan.changes[1].contains("platforms.telegram.token '${TELEGRAM_BOT_TOKEN}'"),
+            "{plan:?}"
+        );
+        assert!(!calls().contains("config set"), "{}", calls());
+
+        // Each person once.
+        let twice: Vec<ChannelUser> = ["222", "111", "222"]
+            .iter()
+            .map(|u| u.parse().unwrap())
+            .collect();
+        let set = done(configure(&twice, Confirm::Yes).unwrap());
+        assert_eq!(set.token, "TELEGRAM_BOT_TOKEN");
+        assert_eq!(set.answers, users);
+        assert!(
+            set.reachable,
+            "the assistant template reaches the public web"
+        );
+        // Who it answers first, the bot turned on last.
+        assert!(
+            calls().ends_with(
+                "-p default config set TELEGRAM_ALLOWED_USERS 111,222\n-p default config set platforms.telegram.token ${TELEGRAM_BOT_TOKEN}\n-p default config set platforms.telegram.enabled true\n"
+            ),
+            "{}",
+            calls()
+        );
+        assert!(!calls().contains("123:tok"));
+        let configured = |lab: &Lab| {
+            lab.engine
+                .audit(None)
+                .unwrap()
+                .iter()
+                .filter(|e| e.intent.command == "runtime configure")
+                .count()
+        };
+        assert_eq!(configured(&lab), 3, "{}", lab.audit());
+
+        // A variable of another name, granted too; one that cannot hold a
+        // token is refused for what it is.
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = before.replace(
+            "TELEGRAM_BOT_TOKEN = ",
+            "TELEGRAM_BOT_TOKEN_MAIN = \"secret:home/telegram\", TELEGRAM_BOT_TOKEN = ",
+        );
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+        let named = |token: &str| {
+            lab.engine.configure_channel(
+                &alice(),
+                &lab.name,
+                Channel::Telegram,
+                Some(token.to_owned()),
+                &users,
+                Confirm::Yes,
+            )
+        };
+        let set = done(named("TELEGRAM_BOT_TOKEN_MAIN").unwrap());
+        assert_eq!(set.token, "TELEGRAM_BOT_TOKEN_MAIN");
+        assert!(
+            calls().contains("${TELEGRAM_BOT_TOKEN_MAIN}"),
+            "{}",
+            calls()
+        );
+        for bad in ["1BAD", "A}B", "PATH"] {
+            let err = named(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot hold the bot's token"),
+                "{err}"
+            );
+        }
+
+        // A command that fails stops the rest, and a later one names what
+        // ran before it.
+        std::fs::write(lab.home.join("hermes-fails"), "").unwrap();
+        let runs = calls().lines().count();
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(err.to_string().contains("exited with 3"), "{err}");
+        assert!(!matches!(err, Error::FailedAfter { .. }), "{err}");
+        assert_eq!(calls().lines().count(), runs + 1, "{}", calls());
+        std::fs::remove_file(lab.home.join("hermes-fails")).unwrap();
+        std::fs::write(lab.home.join("hermes-token-fails"), "").unwrap();
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(matches!(err, Error::FailedAfter { .. }), "{err}");
+        assert!(err.to_string().contains("TELEGRAM_ALLOWED_USERS"), "{err}");
+        assert!(!calls().ends_with("enabled true\n"), "{}", calls());
+        std::fs::remove_file(lab.home.join("hermes-token-fails")).unwrap();
+
+        // Under an allowlist that leaves Telegram out: set up, and said.
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = before.replace("[network]\n", "[network]\nmode = \"allowlist\"\n");
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+        let Planned::DryRun(plan) = configure(&users, Confirm::DryRun).unwrap() else {
+            panic!("a dry run configured the channel");
+        };
+        assert!(
+            plan.changes
+                .last()
+                .unwrap()
+                .contains("enclos policy allow home api.telegram.org"),
+            "{plan:?}"
+        );
+        assert!(!done(configure(&users, Confirm::Yes).unwrap()).reachable);
+        done(
+            lab.engine
+                .policy_allow(&alice(), &lab.name, "api.telegram.org", Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(done(configure(&users, Confirm::Yes).unwrap()).reachable);
+    }
+
+    /// A token granted only by the pending policy waits for it: nothing
+    /// runs before `policy apply`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_channel_whose_token_is_only_pending_is_refused() {
+        use crate::model::channel::{Channel, ChannelUser};
+        use crate::model::secret::{SecretRef, SecretValue};
+        use crate::secrets::InMemory;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let store = std::rc::Rc::new(InMemory::default());
+        let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+        assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+        let token: SecretRef = "home/telegram".parse().unwrap();
+        let value = SecretValue::new("123:tok".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        // A session under rules the grant changes keeps it pending.
+        let sleeping = super::sandbox::Sleeping::new();
+        let mut session = super::sandbox::session_of(&lab.engine, &lab.name, sleeping.process());
+        session.compiled = Some("/compiled/at-launch.sb".into());
+        super::sandbox::put(&lab.engine, &session);
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!(
+            "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
+        );
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Ask)
+            .unwrap();
+        let users: Vec<ChannelUser> = vec!["111".parse().unwrap()];
+        let err = lab
+            .engine
+            .configure_channel(
+                &alice(),
+                &lab.name,
+                Channel::Telegram,
+                None,
+                &users,
+                Confirm::Yes,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("enclos policy apply home"),
+            "{err}"
+        );
+        let calls = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        assert!(!calls.contains("config set"), "{calls}");
+        drop(sleeping);
     }
 
     /// A session is given the port its gateway listens on, and says why when
