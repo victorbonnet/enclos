@@ -47,24 +47,27 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
             for f in &found {
                 print_finding(f, "repair");
             }
-            if found.iter().any(|f| !f.remedy.is_left()) {
-                println!("`enclos state repair` fixes those marked \"repair:\".");
+            if found.iter().any(|f| f.remedy.repair().is_some()) {
+                let repair = match &sandbox {
+                    Some(name) => format!("enclos state repair {name}"),
+                    None => "enclos state repair".to_owned(),
+                };
+                println!("`{repair}` fixes those marked \"repair:\".");
             }
             Ok(exit::ERROR)
         }
         StateVerb::Repair { sandbox } => {
             // A dry run shows what is left as well as what it would fix,
-            // and exits as the repair would.
-            let (found, label) = if confirm == Confirm::DryRun {
-                (engine.state_check(sandbox.as_ref())?, "would repair")
-            } else {
-                (engine.state_repair(by, sandbox.as_ref())?, "repaired")
+            // and exits as the repair would if each repair it names succeeds.
+            let found = match confirm {
+                Confirm::DryRun => engine.state_check(sandbox.as_ref())?,
+                _ => engine.state_repair(by, sandbox.as_ref())?,
             };
             if found.is_empty() {
                 println!("enclos's records match the host: nothing to repair.");
             }
             for f in &found {
-                print_finding(f, label);
+                print_finding(f, "would repair");
             }
             let left = found.iter().any(|f| f.remedy.is_left());
             Ok(if left { exit::ERROR } else { exit::OK })
@@ -72,11 +75,13 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
     }
 }
 
-/// One finding and what is done about it, `fix` naming a repair.
+/// One finding and what is done about it, `fix` naming a repair still to
+/// make.
 fn print_finding(f: &Finding, fix: &str) {
     println!("{}: {}.", f.subject, f.what);
     match &f.remedy {
         Remedy::Repairs(repair) => println!("  {fix}: {repair}"),
+        Remedy::Repaired(repair) => println!("  repaired: {repair}"),
         Remedy::Failed { repair, error } => println!("  repair failed: {repair}: {error}"),
         Remedy::Manual(what) => println!("  for you: {what}"),
     }

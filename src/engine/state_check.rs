@@ -14,13 +14,14 @@ use super::printable_line;
 use super::session::marked_in;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::marker::MarkerError;
 use crate::lifecycle::members::{find, is_gone};
 use crate::lifecycle::process::{Proc, processes};
 use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionId;
-use crate::state::{StateError, StateLock};
+use crate::state::{StateError, StateLock, UnreadableRecord};
 
 /// Something enclos's records say that the host does not, or the reverse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,16 +35,19 @@ pub struct Finding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
     Sandbox(SandboxName),
-    /// A folder in the sandboxes' folder that no record names, by its name
-    /// escaped for a terminal.
+    /// An entry in the sandboxes' folder that no record names, by its name
+    /// as it is; shown escaped for a terminal.
     Folder(String),
+    /// A sandbox record that does not read, by the name stored in it, which
+    /// may not be a sandbox's; shown escaped for a terminal.
+    Record(String),
 }
 
 impl fmt::Display for Subject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Subject::Sandbox(name) => write!(f, "{name}"),
-            Subject::Folder(folder) => f.write_str(folder),
+            Subject::Folder(name) | Subject::Record(name) => f.write_str(&printable_line(name)),
         }
     }
 }
@@ -51,10 +55,13 @@ impl fmt::Display for Subject {
 /// What is done about a finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remedy {
-    /// What `state repair` does.
+    /// What `state repair` would do, as `state check` finds it.
     Repairs(Repair),
-    /// What `state repair` tried and could not do, and why: no record of
-    /// the sandbox was changed.
+    /// What `state repair` did.
+    Repaired(Repair),
+    /// What `state repair` tried and could not do, and why. Its own step
+    /// changed nothing; the sandbox's other step (its records, or
+    /// `policy.toml`) may still have been made.
     Failed { repair: Repair, error: String },
     /// What a person does: `state repair` leaves it.
     Manual(String),
@@ -63,7 +70,15 @@ pub enum Remedy {
 impl Remedy {
     /// Whether a person still has something to do about it.
     pub fn is_left(&self) -> bool {
-        !matches!(self, Remedy::Repairs(_))
+        matches!(self, Remedy::Failed { .. } | Remedy::Manual(_))
+    }
+
+    /// The repair `state repair` would make, for what `state check` found.
+    pub fn repair(&self) -> Option<&Repair> {
+        match self {
+            Remedy::Repairs(repair) => Some(repair),
+            _ => None,
+        }
     }
 }
 
@@ -97,7 +112,7 @@ impl fmt::Display for Repair {
     }
 }
 
-/// What the host runs, listed once for every sandbox looked at.
+/// What the host runs, listed once and shared by every sandbox looked at.
 struct Host {
     procs: Vec<Proc>,
     /// As `lsof` writes their names: see [`lsof_name`].
@@ -137,9 +152,11 @@ impl Engine {
 
     /// Fixes what `state_check` finds that it can fix, under the lock, with
     /// an audit entry, failed when a repair failed; returns every finding, as
-    /// fixed ([`Remedy::Repairs`]), failed or left. Asks nothing: it changes
-    /// only enclos's own records and `policy.toml`, to agree with the host
-    /// and the snapshots. Its dry run is `state_check`, which finds the same.
+    /// repaired ([`Remedy::Repaired`]), failed or left, never as a repair
+    /// still to make. Asks nothing: it changes only enclos's own records
+    /// (with the marker files of the sessions whose end it records) and
+    /// `policy.toml`, to agree with the host and the snapshots. Its dry run
+    /// is `state_check`, which finds the same.
     pub fn state_repair(&self, by: &Actor, only: Option<&SandboxName>) -> Result<Vec<Finding>> {
         self.write_with_outcome(
             by,
@@ -148,7 +165,7 @@ impl Engine {
             |found: &Vec<Finding>| {
                 let count =
                     |want: fn(&Remedy) -> bool| found.iter().filter(|f| want(&f.remedy)).count();
-                let fixed = count(|r| matches!(r, Remedy::Repairs(_)));
+                let fixed = count(|r| matches!(r, Remedy::Repaired(_)));
                 let failed = count(|r| matches!(r, Remedy::Failed { .. }));
                 let manual = count(|r| matches!(r, Remedy::Manual(_)));
                 match (fixed, failed, manual) {
@@ -168,25 +185,23 @@ impl Engine {
                 let mut found = self.look(only)?;
                 let names: BTreeSet<SandboxName> = found
                     .iter()
-                    .filter_map(|f| match (&f.subject, &f.remedy) {
-                        (Subject::Sandbox(name), Remedy::Repairs(_)) => Some(name.clone()),
+                    .filter_map(|f| match (&f.subject, f.remedy.repair()) {
+                        (Subject::Sandbox(name), Some(_)) => Some(name.clone()),
                         _ => None,
                     })
                     .collect();
                 for name in names {
-                    let mine = |f: &Finding| f.subject == Subject::Sandbox(name.clone());
+                    let mine =
+                        |f: &Finding| matches!(&f.subject, Subject::Sandbox(n) if *n == name);
                     let repairs: Vec<&Repair> = found
                         .iter()
                         .filter(|f| mine(f))
-                        .filter_map(|f| match &f.remedy {
-                            Remedy::Repairs(repair) => Some(repair),
-                            _ => None,
-                        })
+                        .filter_map(|f| f.remedy.repair())
                         .collect();
                     let file = self.repair_file(&name, &repairs).err();
                     let records = self.repair_records(lock, &name, &repairs).err();
                     for f in found.iter_mut().filter(|f| mine(f)) {
-                        let Remedy::Repairs(repair) = &f.remedy else {
+                        let Some(repair) = f.remedy.repair().cloned() else {
                             continue;
                         };
                         // Each repair is told the error of its own step.
@@ -194,12 +209,13 @@ impl Engine {
                             Fix::WritePolicy { .. } => &file,
                             Fix::EndSessions(_) | Fix::RecordStopped => &records,
                         };
-                        if let Some(error) = error {
-                            f.remedy = Remedy::Failed {
-                                repair: repair.clone(),
+                        f.remedy = match error {
+                            Some(error) => Remedy::Failed {
+                                repair,
                                 error: printable_line(&error.to_string()),
-                            };
-                        }
+                            },
+                            None => Remedy::Repaired(repair),
+                        };
                     }
                 }
                 Ok(found)
@@ -259,14 +275,52 @@ impl Engine {
     }
 
     fn look(&self, only: Option<&SandboxName>) -> Result<Vec<Finding>> {
-        let records: Vec<SandboxRecord> = match only {
-            Some(name) => vec![self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-                name: name.to_string(),
-            })?],
-            None => self.state.list()?,
+        // A record that does not read is a finding of its own: it does not
+        // keep the others from being looked at.
+        let listed = match only {
+            Some(name) => match self.state.get(name) {
+                Ok(Some(record)) => vec![Ok(record)],
+                Ok(None) => {
+                    return Err(Error::NoSuchSandbox {
+                        name: name.to_string(),
+                    });
+                }
+                Err(error @ StateError::Corrupt { .. }) => vec![Err(UnreadableRecord {
+                    name: name.to_string(),
+                    error,
+                })],
+                Err(e) => return Err(e.into()),
+            },
+            None => self.state.list_each()?,
         };
-        let host = Host::list(records.len())?;
         let mut found = Vec::new();
+        let mut records = Vec::new();
+        let mut names = Vec::new();
+        for entry in listed {
+            match entry {
+                Ok(record) => {
+                    names.push(record.name.to_string());
+                    records.push(record);
+                }
+                Err(unreadable) => {
+                    found.push(Finding {
+                        subject: match unreadable.name.parse::<SandboxName>() {
+                            Ok(name) => Subject::Sandbox(name),
+                            Err(_) => Subject::Record(unreadable.name.clone()),
+                        },
+                        what: format!(
+                            "its record does not read: {}",
+                            printable_line(&unreadable.error.to_string())
+                        ),
+                        remedy: Remedy::Manual(
+                            "enclos neither uses nor repairs a record it cannot read, which was changed outside it: put back what was there".to_owned(),
+                        ),
+                    });
+                    names.push(unreadable.name);
+                }
+            }
+        }
+        let host = Host::list(records.len())?;
         for record in &records {
             let name = &record.name;
             let dir = self.layout.sandbox_dir(name.as_str());
@@ -287,7 +341,7 @@ impl Engine {
             }
         }
         if only.is_none() {
-            self.look_for_folders(&records, &mut found)?;
+            self.look_for_folders(&names, &mut found)?;
         }
         Ok(found)
     }
@@ -370,8 +424,10 @@ impl Engine {
         }
 
         // Gone sessions: recorded open, and nothing of them runs. Markers are
-        // only looked for in a folder: one gone or replaced holds none.
-        let held = match dir_found.is_some_and(|k| k.is_dir()) {
+        // only looked for in a folder; with it gone or replaced, one may
+        // still be held, open, by a process `lsof` cannot find through it.
+        let markers_found = dir_found.is_some_and(|k| k.is_dir());
+        let held = match markers_found {
             true => self.held(name)?,
             false => Default::default(),
         };
@@ -398,16 +454,19 @@ impl Engine {
                 [id] => format!("session {id} is gone, and recorded open"),
                 ids => format!("sessions {} are gone, and recorded open", ids.join(", ")),
             };
-            push(
-                what,
-                Remedy::Repairs(Repair(Fix::EndSessions(gone.clone()))),
-            );
+            let remedy = match markers_found {
+                true => Remedy::Repairs(Repair(Fix::EndSessions(gone.clone()))),
+                false => Remedy::Manual(format!(
+                    "enclos cannot look for their markers while its folder is gone or not a folder, so a process of theirs may still run: `enclos sandbox stop {name}` records their end"
+                )),
+            };
+            push(what, remedy);
         }
 
-        // A process running a program file from the sandbox's folder that no
-        // session of it tracks, such as one that left its session (design
-        // §8, known gaps). Named, never stopped: enclos cannot show it is
-        // the sandbox's.
+        // A process with a file of the sandbox's folder mapped, its program
+        // or another, that no session of it tracks, such as one that left
+        // its session (design §8, known gaps). Named, never stopped: enclos
+        // cannot show it is the sandbox's.
         let mut escaped = 0;
         let scanned = dir_found.is_some_and(|k| k.is_dir());
         if scanned {
@@ -426,11 +485,11 @@ impl Engine {
                 let Some(listed) = host.procs.iter().find(|p| p.pid == *pid) else {
                     continue;
                 };
-                let command = format!(", listed as {}", printable_line(&listed.command));
                 escaped += 1;
                 push(
                     format!(
-                        "process {pid} runs {}{command}, and no session of it tracks that process",
+                        "process {pid}, listed as {}, has {} mapped, and no session of it tracks that process",
+                        printable_line(&listed.command),
                         printable_line(file)
                     ),
                     Remedy::Manual(format!(
@@ -528,9 +587,10 @@ impl Engine {
             .and_then(|(_, snapshot)| snapshot.overrides_text().map(|t| (t.to_owned(), false))))
     }
 
-    /// Folders in the sandboxes' folder that no record names: left by a
-    /// crash during `sandbox create`, or kept by `sandbox rm --keep-data`.
-    fn look_for_folders(&self, records: &[SandboxRecord], found: &mut Vec<Finding>) -> Result<()> {
+    /// Entries in the sandboxes' folder that no record, by its `names`,
+    /// names: folders left by a crash during `sandbox create` or kept by
+    /// `sandbox rm --keep-data`, and anything else put there.
+    fn look_for_folders(&self, names: &[String], found: &mut Vec<Finding>) -> Result<()> {
         let dir = self.layout.sandboxes_dir();
         let io = |source| {
             Error::Layout(LayoutError::Io {
@@ -545,14 +605,24 @@ impl Engine {
         };
         for entry in entries {
             let entry = entry.map_err(io)?;
-            if !entry.file_type().map_err(io)?.is_dir() {
-                continue;
-            }
             let folder = entry.file_name().to_string_lossy().into_owned();
-            if records.iter().any(|r| r.name.as_str() == folder) {
+            // A sandbox's own entry, whatever it is, is its check's.
+            if names.contains(&folder) {
                 continue;
             }
-            let shown = printable_line(&folder);
+            if !entry.file_type().map_err(io)?.is_dir() {
+                found.push(Finding {
+                    subject: Subject::Folder(folder),
+                    what: format!(
+                        "{} is not a folder and has no record",
+                        printable_line(&entry.path().display().to_string())
+                    ),
+                    remedy: Remedy::Manual(
+                        "enclos keeps only sandbox folders there: move it away".to_owned(),
+                    ),
+                });
+                continue;
+            }
             let remedy = match folder.parse::<SandboxName>() {
                 Ok(name) => format!(
                     "`enclos sandbox create {name}` takes it up again, keeping its home; or remove it yourself"
@@ -560,7 +630,7 @@ impl Engine {
                 Err(_) => "its name is not a sandbox's: remove it yourself".to_owned(),
             };
             found.push(Finding {
-                subject: Subject::Folder(shown),
+                subject: Subject::Folder(folder),
                 what: format!(
                     "folder {} has no record",
                     printable_line(&entry.path().display().to_string())
@@ -573,12 +643,13 @@ impl Engine {
 }
 
 /// Whether `error` is the sandbox's alone: about files in its folder `dir`,
-/// its markers, or a record of its that does not read. What fails for the
-/// host, such as the state database itself or the service manager, is not.
+/// its markers' folder, or a record of its that does not read. What fails
+/// for the host, such as the state database itself, the service manager,
+/// `ps` or `lsof`, is not.
 fn about_this_sandbox(error: &Error, dir: &Path) -> bool {
     match error {
         Error::Layout(LayoutError::Io { path, .. }) => path.starts_with(dir),
-        Error::Markers(_) | Error::State(StateError::Corrupt { .. }) => true,
+        Error::Markers(MarkerError::Folder(_)) | Error::State(StateError::Corrupt { .. }) => true,
         _ => false,
     }
 }
