@@ -49,7 +49,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
                     false => exit::ERROR,
                 };
                 output::emit(&output::with_error(
-                    findings_json(&found, Done::Found),
+                    findings_json(&found, false),
                     code,
                     || "enclos's records and the host differ".to_owned(),
                 ));
@@ -62,28 +62,27 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
             for f in &found {
                 print_finding(f, "repair");
             }
-            if found.iter().any(|f| !f.remedy.is_left()) {
-                println!("`enclos state repair` fixes those marked \"repair:\".");
+            if found.iter().any(|f| f.remedy.repair().is_some()) {
+                let repair = match &sandbox {
+                    Some(name) => format!("enclos state repair {name}"),
+                    None => "enclos state repair".to_owned(),
+                };
+                println!("`{repair}` fixes those marked \"repair:\".");
             }
             Ok(exit::ERROR)
         }
         StateVerb::Repair { sandbox } => {
             // A dry run shows what is left as well as what it would fix,
-            // and exits as the repair would.
-            let (found, label) = if confirm == Confirm::DryRun {
-                (engine.state_check(sandbox.as_ref())?, "would repair")
-            } else {
-                (engine.state_repair(by, sandbox.as_ref())?, "repaired")
+            // and exits as the repair would if each repair it names succeeds.
+            let found = match confirm {
+                Confirm::DryRun => engine.state_check(sandbox.as_ref())?,
+                _ => engine.state_repair(by, sandbox.as_ref())?,
             };
             let left = found.iter().any(|f| f.remedy.is_left());
             if output::json() {
                 let code = if left { exit::ERROR } else { exit::OK };
-                let done = match confirm {
-                    Confirm::DryRun => Done::Planned,
-                    _ => Done::Repaired,
-                };
                 output::emit(&output::with_error(
-                    findings_json(&found, done),
+                    findings_json(&found, confirm == Confirm::DryRun),
                     code,
                     || {
                         let failed = found
@@ -103,42 +102,30 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
                 println!("enclos's records match the host: nothing to repair.");
             }
             for f in &found {
-                print_finding(f, label);
+                print_finding(f, "would repair");
             }
             Ok(if left { exit::ERROR } else { exit::OK })
         }
     }
 }
 
-/// What was done about the findings a document lists.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Done {
-    /// `state check`: a repair is what `state repair` would do.
-    Found,
-    /// `state repair --dry-run`: a repair is what it would do.
-    Planned,
-    /// `state repair`: a repair was made.
-    Repaired,
-}
-
 /// The findings as JSON, each with what is done about it: a remedy of kind
 /// `repair` is one `state repair` would make, of kind `repaired` one it
-/// made; `dry_run` when the repairs are only planned.
-fn findings_json(found: &[Finding], done: Done) -> Value {
-    let repair = match done {
-        Done::Found | Done::Planned => "repair",
-        Done::Repaired => "repaired",
-    };
+/// made; `dry_run` when the repairs are only planned. Names are as they
+/// are: JSON escapes what a terminal would not show.
+fn findings_json(found: &[Finding], dry_run: bool) -> Value {
     json!({
         "match": found.is_empty(),
-        "dry_run": done == Done::Planned,
+        "dry_run": dry_run,
         "findings": found.iter().map(|f| {
             let (kind, name) = match &f.subject {
                 Subject::Sandbox(name) => ("sandbox", name.to_string()),
                 Subject::Folder(folder) => ("folder", folder.clone()),
+                Subject::Record(name) => ("record", name.clone()),
             };
             let remedy = match &f.remedy {
-                Remedy::Repairs(what) => json!({"kind": repair, "what": what.to_string()}),
+                Remedy::Repairs(what) => json!({"kind": "repair", "what": what.to_string()}),
+                Remedy::Repaired(what) => json!({"kind": "repaired", "what": what.to_string()}),
                 Remedy::Failed { repair, error } => json!({
                     "kind": "repair_failed",
                     "what": repair.to_string(),
@@ -155,11 +142,13 @@ fn findings_json(found: &[Finding], done: Done) -> Value {
     })
 }
 
-/// One finding and what is done about it, `fix` naming a repair.
+/// One finding and what is done about it, `fix` naming a repair still to
+/// make.
 fn print_finding(f: &Finding, fix: &str) {
     println!("{}: {}.", f.subject, f.what);
     match &f.remedy {
         Remedy::Repairs(repair) => println!("  {fix}: {repair}"),
+        Remedy::Repaired(repair) => println!("  repaired: {repair}"),
         Remedy::Failed { repair, error } => println!("  repair failed: {repair}: {error}"),
         Remedy::Manual(what) => println!("  for you: {what}"),
     }

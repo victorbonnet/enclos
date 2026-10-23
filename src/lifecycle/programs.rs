@@ -1,5 +1,6 @@
 //! The files each process has mapped, as `lsof` names them (`txt`): its
-//! executable, the libraries it loaded, and any other file it maps. The
+//! executable (shown on macOS 26.5.2), and, as `lsof` documents it, the
+//! libraries it loaded and other files it maps (not shown yet). The
 //! command `ps` lists (`comm`) is the process's argv[0] on macOS, which it
 //! chooses and which names no path when it was started through `PATH`;
 //! these are the files the kernel mapped, by their real paths (macOS
@@ -28,7 +29,16 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
         .stdin(Stdio::null())
         .output()
         .map_err(|e| ProgramsError(e.to_string()))?;
-    parse(&out)
+    let files = parse(&out)?;
+    // With `-w` a failure to read some processes can pass unsaid: a listing
+    // without enclos itself, whose program is mapped, is not complete.
+    if !files.contains_key(&std::process::id()) {
+        return Err(ProgramsError(format!(
+            "{}, and its listing left out this process",
+            out.status
+        )));
+    }
+    Ok(files)
 }
 
 /// `path` as `lsof` writes a file name in the C locale (macOS 26.5.2): a

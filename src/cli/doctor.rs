@@ -3,8 +3,8 @@
 
 use enclos::backend::Enforcement;
 use enclos::engine::{
-    BackendCheck, BackendState, Doctor, Drift, Engine, LineChange, Lines, MAX_LINES, NextSession,
-    SandboxCheck, Sandboxes,
+    BackendCheck, BackendState, Doctor, Drift, DriftKind, Engine, LineChange, Lines, MAX_LINES,
+    NextSession, RanFile, SandboxCheck, Sandboxes,
 };
 use enclos::error::{Result, exit};
 
@@ -68,48 +68,45 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             }),
             NextSession::Fails { error } => json!({"state": "fails", "error": error}),
             NextSession::NotChecked => json!({"state": "not_checked"}),
-            NextSession::Unknown => json!({"state": "unknown"}),
+            NextSession::Unknown { why } => json!({"state": "unknown", "why": why}),
         };
         let drift: Vec<_> = s
             .drift
             .iter()
-            .map(|d| match d {
-                Drift::NoLongerCompiles {
-                    version,
-                    ran,
-                    error,
-                    running,
-                } => json!({
-                    "kind": "no_longer_compiles",
-                    "version": version,
-                    "ran": super::output::path(ran),
-                    "error": error,
-                    "running_sessions": running.count,
-                    "running_unsure": running.unsure,
-                }),
-                Drift::Changed(c) => json!({
-                    "kind": match c.edited {
-                        true => "edited",
-                        false => "changed",
-                    },
-                    "version": c.version,
-                    "ran": super::output::path(&c.ran),
-                    "now": super::output::path(&c.now),
-                    "lines": match &c.lines {
-                        Lines::Changed(lines) => Some(lines.iter().map(|l| match l {
-                            LineChange::Removed(l) => json!({"removed": l}),
-                            LineChange::Added(l) => json!({"added": l}),
-                        }).collect::<Vec<_>>()),
-                        Lines::FileGone | Lines::TooLong => None,
-                    },
-                    "lines_not_shown": match &c.lines {
-                        Lines::Changed(_) => None,
-                        Lines::FileGone => Some("file_gone"),
-                        Lines::TooLong => Some("too_long"),
-                    },
-                    "running_sessions": c.running.count,
-                    "running_unsure": c.running.unsure,
-                }),
+            .map(|d| {
+                let mut found = match &d.kind {
+                    DriftKind::NoLongerCompiles { error } => json!({
+                        "kind": "no_longer_compiles",
+                        "error": error,
+                    }),
+                    DriftKind::Changed { now, ran_file } => {
+                        let (edited, lines) = match ran_file {
+                            RanFile::Gone => (false, None),
+                            RanFile::There { edited, lines } => (*edited, Some(lines)),
+                        };
+                        json!({
+                            "kind": if edited { "edited" } else { "changed" },
+                            "now": super::output::path(now),
+                            "lines": match lines {
+                                Some(Lines::Changed(lines)) => Some(lines.iter().map(|l| match l {
+                                    LineChange::Removed(l) => json!({"removed": l}),
+                                    LineChange::Added(l) => json!({"added": l}),
+                                }).collect::<Vec<_>>()),
+                                Some(Lines::TooLong) | None => None,
+                            },
+                            "lines_not_shown": match lines {
+                                Some(Lines::Changed(_)) => None,
+                                Some(Lines::TooLong) => Some("too_long"),
+                                None => Some("file_gone"),
+                            },
+                        })
+                    }
+                };
+                found["version"] = json!(d.version);
+                found["ran"] = json!(super::output::path(&d.ran));
+                found["running_sessions"] = json!(d.running.count);
+                found["running_unsure"] = json!(d.running.unsure);
+                found
             })
             .collect();
         json!({
@@ -193,8 +190,10 @@ fn sandbox(s: &SandboxCheck) -> String {
                 s.backend
             );
         }
-        NextSession::Unknown => {
-            out += &format!("  {name}: enclos could not tell whether its next session can start\n");
+        NextSession::Unknown { why } => {
+            out += &format!(
+                "  {name}: enclos could not tell whether its next session can start: {why}\n"
+            );
         }
         NextSession::Fails { error } => {
             out += &format!(
@@ -227,43 +226,38 @@ fn sandbox(s: &SandboxCheck) -> String {
 
 fn drift_lines(name: &str, drift: &Drift) -> String {
     let mut out = String::new();
-    let running = match drift {
-        Drift::NoLongerCompiles {
-            version,
-            ran,
-            error,
-            running,
-        } => {
+    let (version, ran) = (drift.version, drift.ran.display());
+    match &drift.kind {
+        DriftKind::NoLongerCompiles { error } => {
             out += &format!(
-                "    policy v{version}, which a session ran under ({}), no longer compiles: {error}\n",
-                ran.display()
+                "    policy v{version}, which a session ran under ({ran}), no longer compiles: {error}\n"
             );
-            running
         }
-        Drift::Changed(c) => {
-            if c.edited {
+        DriftKind::Changed { now, ran_file } => {
+            if let RanFile::There { edited: true, .. } = ran_file {
                 out += &format!(
-                    "    {} no longer holds what policy v{} compiled to: it was changed after it was written\n",
-                    c.ran.display(),
-                    c.version
+                    "    {ran} no longer holds what policy v{version} compiled to: it was changed after it was written\n"
                 );
-                if c.ran.file_name() != c.now.file_name() {
+                if drift.ran.file_name() != now.file_name() {
                     out += &format!(
-                        "      policy v{} also compiles to another file now: {}\n",
-                        c.version,
-                        c.now.display()
+                        "      policy v{version} also compiles to another file now: {}\n",
+                        now.display()
                     );
                 }
             } else {
                 out += &format!(
-                    "    policy v{} compiles differently from the file a session ran under: enclos's own rules changed, as an upgrade changes them, or a path the policy names resolves elsewhere now\n      ran under: {}\n      compiles now to: {}\n",
-                    c.version,
-                    c.ran.display(),
-                    c.now.display()
+                    "    policy v{version} compiles differently from the file a session ran under: what enclos adds when it compiles a policy changed, as an upgrade changes it, or a path the policy names resolves elsewhere now\n      ran under: {ran}\n      compiles now to: {}\n",
+                    now.display()
                 );
             }
-            match &c.lines {
-                Lines::Changed(lines) => {
+            match ran_file {
+                RanFile::Gone => {
+                    out += "      the file it ran under is no longer there to compare\n";
+                }
+                RanFile::There {
+                    lines: Lines::Changed(lines),
+                    ..
+                } => {
                     for line in lines {
                         out += &match line {
                             LineChange::Removed(l) => format!("      - {l}\n"),
@@ -271,18 +265,17 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
                         };
                     }
                 }
-                Lines::FileGone => {
-                    out += "      the file it ran under is no longer there to compare\n";
-                }
-                Lines::TooLong => {
+                RanFile::There {
+                    lines: Lines::TooLong,
+                    ..
+                } => {
                     out +=
                         &format!("      more than {MAX_LINES} lines: not compared line by line\n");
                 }
             }
-            &c.running
         }
-    };
-    match (running.count, running.unsure) {
+    }
+    match (drift.running.count, drift.running.unsure) {
         (0, _) => {}
         (n, false) => {
             out += &format!(
@@ -310,7 +303,7 @@ fn enforced(e: &Enforcement) -> String {
 mod tests {
     use super::*;
     use enclos::backend::{Capabilities, Enforcement};
-    use enclos::engine::{CompiledChange, Running};
+    use enclos::engine::Running;
     use enclos::model::sandbox::BackendKind;
     use std::path::PathBuf;
 
@@ -345,15 +338,16 @@ mod tests {
         }
     }
 
-    fn change(edited: bool, lines: Lines, running: Running) -> Drift {
-        Drift::Changed(CompiledChange {
+    fn change(ran_file: RanFile, running: Running) -> Drift {
+        Drift {
             version: 2,
             ran: PathBuf::from("/c/ran.sb"),
-            now: PathBuf::from("/c/now.sb"),
-            edited,
-            lines,
             running,
-        })
+            kind: DriftKind::Changed {
+                now: PathBuf::from("/c/now.sb"),
+                ran_file,
+            },
+        }
     }
 
     /// What doctor could not look at is said, and nothing it did not
@@ -361,7 +355,9 @@ mod tests {
     #[test]
     fn what_could_not_be_looked_at_is_not_said_to_match() {
         let shown = shown(&doctor(SandboxCheck {
-            next: NextSession::Unknown,
+            next: NextSession::Unknown {
+                why: "cannot read its active policy: the database is busy".into(),
+            },
             last_version: Some(99),
             unreadable: vec![
                 "policy version 99, which a session ran under, is not recorded".into(),
@@ -369,7 +365,7 @@ mod tests {
             ..compiles()
         }));
         assert!(
-            shown.contains("home: enclos could not tell whether its next session can start"),
+            shown.contains("home: enclos could not tell whether its next session can start: cannot read its active policy: the database is busy"),
             "{shown}"
         );
         assert!(!shown.contains("does not run here"), "{shown}");
@@ -386,11 +382,13 @@ mod tests {
     fn a_drift_names_both_files_its_lines_and_who_keeps_it() {
         let shown = shown(&doctor(SandboxCheck {
             drift: vec![change(
-                false,
-                Lines::Changed(vec![
-                    LineChange::Removed("(old)".into()),
-                    LineChange::Added("(new)".into()),
-                ]),
+                RanFile::There {
+                    edited: false,
+                    lines: Lines::Changed(vec![
+                        LineChange::Removed("(old)".into()),
+                        LineChange::Added("(new)".into()),
+                    ]),
+                },
                 Running {
                     count: 2,
                     unsure: false,
@@ -419,8 +417,10 @@ mod tests {
     fn an_edited_file_names_the_file_of_now_and_an_unsure_count_says_so() {
         let shown = shown(&doctor(SandboxCheck {
             drift: vec![change(
-                true,
-                Lines::TooLong,
+                RanFile::There {
+                    edited: true,
+                    lines: Lines::TooLong,
+                },
                 Running {
                     count: 1,
                     unsure: true,
@@ -448,14 +448,16 @@ mod tests {
     fn a_file_no_longer_there_and_a_version_that_no_longer_compiles_are_said() {
         let shown = shown(&doctor(SandboxCheck {
             drift: vec![
-                change(false, Lines::FileGone, Running::default()),
-                Drift::NoLongerCompiles {
+                change(RanFile::Gone, Running::default()),
+                Drift {
                     version: 1,
                     ran: PathBuf::from("/c/one.sb"),
-                    error: "bad rule".into(),
                     running: Running {
                         count: 1,
                         unsure: false,
+                    },
+                    kind: DriftKind::NoLongerCompiles {
+                        error: "bad rule".into(),
                     },
                 },
             ],
@@ -469,5 +471,18 @@ mod tests {
             shown.contains("policy v1, which a session ran under (/c/one.sb), no longer compiles: bad rule\n      1 running session(s) keep that compiled policy"),
             "{shown}"
         );
+    }
+
+    /// A sandbox whose backend does not run here is never said to compile
+    /// as it did: nothing of it was compiled.
+    #[test]
+    fn a_sandbox_whose_backend_does_not_run_is_not_said_to_match() {
+        let shown = shown(&doctor(SandboxCheck {
+            next: NextSession::NotChecked,
+            last_version: Some(2),
+            ..compiles()
+        }));
+        assert!(shown.contains("does not run here"), "{shown}");
+        assert!(!shown.contains("compiles as it did"), "{shown}");
     }
 }
