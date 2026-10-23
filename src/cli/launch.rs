@@ -60,10 +60,7 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
             args.sandbox, args.sandbox
         );
         match json {
-            true => eprintln!(
-                "{}",
-                super::output::line(&serde_json::json!({ "note": none }))
-            ),
+            true => super::output::note(&none),
             false => println!("{none}"),
         }
         return Ok(0);
@@ -102,7 +99,13 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     let status = tail
         .wait()
         .map_err(|e| failed(format!("cannot wait for tail: {e}")))?;
-    Ok(if status.success() { 0 } else { 1 })
+    if !status.success() {
+        return Err(failed(format!(
+            "tail {status} reading the logs of sandbox {}; what it said is above",
+            args.sandbox
+        )));
+    }
+    Ok(0)
 }
 
 fn failed(what: String) -> Error {
@@ -129,58 +132,91 @@ fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(),
 
 /// Shows `from` on `to` line by line, each line escaped and without its
 /// line ending (`\n` or `\r\n`); with `json`, each as `{"line": …}`. Bytes
-/// that are not UTF-8 show as U+FFFD, and a line longer than `MAX_LINE`
-/// bytes is shown in pieces, which JSON numbers: `"piece": 1`, 2, ….
-/// A piece 1 starts a line, so two cut lines in a row are told apart.
+/// that are not UTF-8 show as U+FFFD, and a line of more than `MAX_LINE`
+/// bytes before its end is shown in pieces, cut between characters, which
+/// JSON numbers: `"piece": 1`, 2, …, the last ending the line. A piece 1
+/// starts a line, so two cut lines in a row are told apart.
 fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
-    // Whether the last piece was cut before its line ended.
-    let mut cut = false;
+    // What a cut kept back for the next piece: a character it would split.
+    let mut kept = Vec::new();
+    // Which piece of a cut line comes next, from 1; 0 outside one.
     let mut piece: u32 = 0;
     loop {
         line.clear();
-        let read = (&mut from)
-            .take(MAX_LINE)
+        line.append(&mut kept);
+        let room = MAX_LINE - line.len() as u64;
+        (&mut from)
+            .take(room)
             .read_until(b'\n', &mut line)
             .map_err(Failed::Read)?;
-        if read == 0 {
+        if line.is_empty() {
             return Ok(());
         }
         let ended = line.ends_with(b"\n");
-        let continues = cut;
-        // The end of a line cut right before it is no line of its own.
-        if std::mem::replace(&mut cut, !ended) && line == b"\n" {
-            piece = 0;
-            continue;
-        }
-        // Which piece of a line cut at `MAX_LINE` this is, from 1; 0 for a
-        // line shown whole.
-        piece = match (continues, !ended && read as u64 == MAX_LINE) {
-            (true, _) => piece + 1,
-            (false, true) => 1,
-            (false, false) => 0,
+        // Full before its end: a line exactly as long as the limit is whole
+        // when its end comes next; else it is cut, between characters.
+        let cut = !ended && line.len() as u64 == MAX_LINE && {
+            let next = from.fill_buf().map_err(Failed::Read)?;
+            match next.first() {
+                Some(b'\n') => {
+                    from.consume(1);
+                    line.push(b'\n');
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            }
         };
+        if cut {
+            kept = line.split_off(split_character_at(&line));
+        }
+        let this = match cut || piece > 0 {
+            true => piece + 1,
+            false => 0,
+        };
+        piece = if cut { this } else { 0 };
         let text = String::from_utf8_lossy(&line);
         let text = text
             .strip_suffix("\r\n")
             .or_else(|| text.strip_suffix('\n'))
             .unwrap_or(&text);
-        let written = match (json, piece) {
+        let written = match (json, this) {
             (true, 0) => writeln!(
                 to,
                 "{}",
                 super::output::line(&serde_json::json!({ "line": text }))
             ),
-            (true, piece) => writeln!(
+            (true, this) => writeln!(
                 to,
                 "{}",
-                super::output::line(&serde_json::json!({ "line": text, "piece": piece }))
+                super::output::line(&serde_json::json!({ "line": text, "piece": this }))
             ),
             (false, _) => writeln!(to, "{}", printable_line(text)),
         };
         written.and_then(|()| to.flush()).map_err(Failed::Write)?;
     }
+}
+
+/// Where a cut of `line` goes so as not to split its last character: the
+/// start of a UTF-8 sequence at its end that the cut would leave short, else
+/// its end.
+fn split_character_at(line: &[u8]) -> usize {
+    for back in 1..=3.min(line.len()) {
+        let at = line.len() - back;
+        let byte = line[at];
+        let needs = match byte {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            // A continuation byte: look further back.
+            0x80..=0xbf => continue,
+            _ => return line.len(),
+        };
+        return if needs > back { at } else { line.len() };
+    }
+    line.len()
 }
 
 #[cfg(test)]
@@ -310,5 +346,67 @@ mod tests {
         assert_eq!(service_exit(&end(143, true)), 143);
         assert_eq!(service_exit(&end(0, false)), 0);
         assert_eq!(service_exit(&end(3, false)), 3);
+    }
+
+    fn pieces(written: &[u8]) -> Vec<serde_json::Value> {
+        let mut shown = Vec::new();
+        show_lines(written, &mut shown, true).unwrap();
+        String::from_utf8(shown)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Two cut lines in a row: each starts again at piece 1.
+    #[test]
+    fn two_cut_lines_in_a_row_are_told_apart() {
+        let max = MAX_LINE as usize;
+        let mut written = vec![b'x'; max + 3];
+        written.push(b'\n');
+        written.extend(vec![b'y'; max + 3]);
+        written.push(b'\n');
+        let numbers: Vec<_> = pieces(&written)
+            .iter()
+            .map(|v| v["piece"].clone())
+            .collect();
+        assert_eq!(numbers, [1, 2, 1, 2]);
+    }
+
+    /// A line exactly as long as the limit is one line, not a lone piece,
+    /// whether its end follows or the logs end there.
+    #[test]
+    fn a_line_exactly_as_long_as_the_limit_is_not_cut() {
+        let max = MAX_LINE as usize;
+        let mut written = vec![b'x'; max];
+        written.extend_from_slice(b"\nnext\n");
+        let shown = pieces(&written);
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown.iter().all(|v| v.get("piece").is_none()), "{shown:?}");
+        assert_eq!(shown[0]["line"].as_str().unwrap().len(), max);
+        let shown = pieces(&vec![b'x'; max]);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].get("piece").is_none());
+    }
+
+    /// A cut never splits a character, so joined pieces are the line; one
+    /// that falls between `\r` and `\n` leaves no `\r` in a piece.
+    #[test]
+    fn a_cut_keeps_characters_and_line_endings_whole() {
+        let max = MAX_LINE as usize;
+        let mut written = vec![b'x'; max - 1];
+        written.extend_from_slice("é".as_bytes());
+        written.extend_from_slice(b"z\n");
+        let shown = pieces(&written);
+        let joined: String = shown.iter().map(|v| v["line"].as_str().unwrap()).collect();
+        assert_eq!(joined, format!("{}éz", "x".repeat(max - 1)));
+        assert!(!joined.contains('\u{fffd}'));
+
+        let mut written = vec![b'x'; max - 1];
+        written.extend_from_slice(b"\r\nnext\n");
+        let shown = pieces(&written);
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert_eq!(shown[0]["line"], "x".repeat(max - 1));
+        assert!(shown[0].get("piece").is_none());
     }
 }

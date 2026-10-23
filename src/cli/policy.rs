@@ -195,7 +195,7 @@ fn version_json(v: &PolicyVersion) -> Value {
     json!({
         "version": v.version,
         "snapshot": v.snapshot.0,
-        "by": {"user": v.by.user, "host": v.by.host},
+        "by": output::actor(&v.by),
         "at": v.at.to_string(),
         "restores": v.restores,
     })
@@ -204,9 +204,16 @@ fn version_json(v: &PolicyVersion) -> Value {
 fn pending_json(p: &PendingPolicy) -> Value {
     json!({
         "snapshot": p.snapshot.0,
-        "by": {"user": p.by.user, "host": p.by.host},
+        "by": output::actor(&p.by),
         "at": p.at.to_string(),
         "restores": p.restores,
+    })
+}
+
+fn policy_json(policy: &enclos::model::policy::Policy) -> Result<Value> {
+    serde_json::to_value(policy).map_err(|source| Error::Json {
+        what: "the policy",
+        source,
     })
 }
 
@@ -224,7 +231,7 @@ fn show_json(view: &PolicyView, pending: bool) -> Result<Value> {
             "pending": pending_json(p),
             "template": pending.inputs.template.to_string(),
             "active_version": view.version.version,
-            "policy": serde_json::to_value(&pending.policy).expect("a policy serializes"),
+            "policy": policy_json(&pending.policy)?,
         }));
     }
     Ok(json!({
@@ -232,7 +239,7 @@ fn show_json(view: &PolicyView, pending: bool) -> Result<Value> {
         "version": version_json(&view.version),
         "template": snap.inputs.template.to_string(),
         "file": output::path(&view.file),
-        "policy": serde_json::to_value(&snap.policy).expect("a policy serializes"),
+        "policy": policy_json(&snap.policy)?,
         "pending": view.pending.as_ref().map(|(p, pending)| {
             let mut shown = pending_json(p);
             shown["changes"] = json!(enclos::engine::policy_differences(&snap.policy, &pending.policy));
@@ -285,10 +292,10 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
 }
 
 /// Why a change that restarted the sandbox exits 1: its stop or its start
-/// failed, as `restarted` says.
+/// failed, as its `restarted` field says.
 fn restart_failed(sandbox: &SandboxName) -> String {
     format!(
-        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as `restarted` says; `enclos sandbox show {sandbox}` shows where it is"
+        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as its `restarted` field says; `enclos sandbox show {sandbox}` shows where it is"
     )
 }
 
@@ -506,7 +513,9 @@ fn print_outcome(
 
 /// How a restart into the pending policy went: what stopped, the version
 /// now in force, and the services started again; returns its code and,
-/// for JSON, the restart.
+/// for JSON, the restart. The version is in force once this is reached, so
+/// a start that cannot be checked is said beside it, in JSON, rather than
+/// losing it.
 fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Result<(u8, Value)> {
     let stopped = r
         .stopped
@@ -523,7 +532,14 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
     }
     let (code, started) = match r.started.is_empty() {
         true => (exit::OK, Value::Null),
-        false => super::sandbox::print_started(engine, sandbox, &r.started)?,
+        false => match super::sandbox::print_started(engine, sandbox, &r.started) {
+            Ok(started) => started,
+            Err(e) if output::json() => {
+                let code = e.exit_code();
+                (code, output::error(&e, code))
+            }
+            Err(e) => return Err(e),
+        },
     };
     let code = code.max(stopped.as_ref().map_or(exit::OK, |(c, _)| *c));
     Ok((
@@ -780,7 +796,7 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
             for said in forget_edit(&files) {
                 if output::json() {
-                    eprintln!("{}", output::line(&json!({ "note": said })));
+                    output::note(&said);
                 }
             }
             return Err(e);
@@ -825,7 +841,7 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
 
 /// Removes the copy `policy edit` edited and its base, saying so when it
 /// cannot, in text: the next `policy edit` would open it again. Returns
-/// what it said, for JSON to carry.
+/// what it says, or in JSON would say, for the document to carry.
 fn forget_edit(files: &EditFiles) -> Vec<String> {
     let mut left = Vec::new();
     for path in [&files.copy, &files.base] {

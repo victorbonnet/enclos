@@ -74,6 +74,23 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         Planned::Done(end) => end,
     };
     let shown = runtime.display_name();
+    // How the installer ended, and what that leaves recorded: the same in
+    // text and in JSON, since a policy left wider must be said.
+    let ended = match end.end.signal {
+        Some(signal) => format!("was ended by signal {signal}"),
+        None => format!("exited with {}", end.end.exit),
+    };
+    let after = match end.recorded {
+        Some(kept) => format!(
+            "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
+            kept.display_name(),
+            end.policy
+        ),
+        None => format!(
+            "Nothing is recorded as installed, and policy v{} is without {shown}'s destinations",
+            end.policy
+        ),
+    };
     if output::json() {
         let code = match end.installed {
             true => exit::OK,
@@ -92,8 +109,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             code,
             || {
                 format!(
-                    "the {shown} installer exited with {} in sandbox {sandbox}; fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again",
-                    end.end.exit
+                    "the {shown} installer {ended} in sandbox {sandbox}. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again"
                 )
             },
         ));
@@ -101,20 +117,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     }
     super::connect::report_end(&sandbox, &end.end);
     if !end.installed {
-        let after = match end.recorded {
-            Some(kept) => format!(
-                "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
-                kept.display_name(),
-                end.policy
-            ),
-            None => format!(
-                "Nothing is recorded as installed, and policy v{} is without {shown}'s destinations",
-                end.policy
-            ),
-        };
         eprintln!(
-            "enclos: the {shown} installer exited with {} in sandbox {sandbox}; its output above says why. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again.",
-            end.end.exit
+            "enclos: the {shown} installer {ended} in sandbox {sandbox}; its output above says why. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again."
         );
         return Ok(exit::ERROR);
     }
