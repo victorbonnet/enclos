@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::FileType;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::Engine;
 use super::printable_line;
@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{find, is_gone};
 use crate::lifecycle::process::{Proc, processes};
-use crate::lifecycle::programs::program_files;
+use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -101,7 +101,8 @@ impl fmt::Display for Repair {
 /// What the host runs, listed once for every sandbox looked at.
 struct Host {
     procs: Vec<Proc>,
-    programs: BTreeMap<u32, Vec<PathBuf>>,
+    /// As `lsof` writes their names: see [`lsof_name`].
+    programs: BTreeMap<u32, Vec<String>>,
 }
 
 impl Engine {
@@ -148,12 +149,13 @@ impl Engine {
                     |want: fn(&Remedy) -> bool| found.iter().filter(|f| want(&f.remedy)).count();
                 let fixed = count(|r| matches!(r, Remedy::Repairs(_)));
                 let failed = count(|r| matches!(r, Remedy::Failed { .. }));
-                let left = count(|r| matches!(r, Remedy::Manual(_)));
-                match (fixed, failed, left) {
+                let manual = count(|r| matches!(r, Remedy::Manual(_)));
+                match (fixed, failed, manual) {
                     (0, 0, 0) => "nothing to repair".to_owned(),
-                    (fixed, 0, left) => format!("repaired {fixed}, left {left} for a person"),
-                    (fixed, failed, left) => format!(
-                        "repaired {fixed}, failed to repair {failed}, left {left} for a person"
+                    (fixed, 0, manual) => format!("repaired {fixed}, left {manual} for a person"),
+                    (fixed, failed, manual) => format!(
+                        "repaired {fixed}, failed to repair {failed}, left {} for a person",
+                        failed + manual
                     ),
                 }
             },
@@ -178,15 +180,19 @@ impl Engine {
                             _ => None,
                         })
                         .collect();
-                    if let Err(error) = self.repair(lock, &name, &repairs) {
-                        let error = error.to_string();
+                    if let Err(failed) = self.repair(lock, &name, &repairs) {
+                        let error = printable_line(&failed.error.to_string());
                         for f in found.iter_mut().filter(|f| mine(f)) {
-                            if let Remedy::Repairs(repair) = &f.remedy {
-                                f.remedy = Remedy::Failed {
-                                    repair: repair.clone(),
-                                    error: error.clone(),
-                                };
+                            let Remedy::Repairs(repair) = &f.remedy else {
+                                continue;
+                            };
+                            if failed.written && matches!(repair.0, Fix::WritePolicy { .. }) {
+                                continue;
                             }
+                            f.remedy = Remedy::Failed {
+                                repair: repair.clone(),
+                                error: error.clone(),
+                            };
                         }
                     }
                 }
@@ -197,17 +203,29 @@ impl Engine {
     }
 
     /// Makes one sandbox's repairs. The file first: written from a snapshot,
-    /// it is right whatever follows, and a failure to write it then changes
-    /// no record.
-    fn repair(&self, lock: &StateLock, name: &SandboxName, repairs: &[&Repair]) -> Result<()> {
+    /// it is right whatever follows. Then the records, in one transaction,
+    /// after which nothing can fail: a failure leaves every record as it was.
+    fn repair(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        repairs: &[&Repair],
+    ) -> std::result::Result<(), RepairFailed> {
+        let mut written = false;
+        let failed = |written: bool| {
+            move |error: Error| RepairFailed {
+                written,
+                error: Box::new(error),
+            }
+        };
         for repair in repairs {
             if let Fix::WritePolicy { text, .. } = &repair.0 {
-                self.layout.write_policy(name.as_str(), text)?;
+                self.layout
+                    .write_policy(name.as_str(), text)
+                    .map_err(|e| failed(false)(e.into()))?;
+                written = true;
             }
         }
-        let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-            name: name.to_string(),
-        })?;
         let mut ended = Vec::new();
         let mut stopped = false;
         for repair in repairs {
@@ -217,19 +235,38 @@ impl Engine {
                 Fix::WritePolicy { .. } => {}
             }
         }
+        if ended.is_empty() && !stopped {
+            return Ok(());
+        }
+        let mut record = self
+            .state
+            .get(name)
+            .map_err(|e| failed(written)(e.into()))?
+            .ok_or_else(|| {
+                failed(written)(Error::NoSuchSandbox {
+                    name: name.to_string(),
+                })
+            })?;
         if stopped {
             record.state = SandboxState::Stopped;
         }
-        if !ended.is_empty() {
-            // Saves the record too, in the same transaction.
-            self.state.end_sessions(lock, &ended, &record)?;
-            for session in self.state.sessions(name, false)? {
-                if ended.contains(&session.id) {
-                    self.forget_marker(&session);
-                }
-            }
-        } else if stopped {
-            self.state.put(lock, &record)?;
+        if ended.is_empty() {
+            return self
+                .state
+                .put(lock, &record)
+                .map_err(|e| failed(written)(e.into()));
+        }
+        // Listed before the commit, so that nothing after it can fail.
+        let sessions = self
+            .state
+            .sessions(name, true)
+            .map_err(|e| failed(written)(e.into()))?;
+        // Saves the record too, in the same transaction.
+        self.state
+            .end_sessions(lock, &ended, &record)
+            .map_err(|e| failed(written)(e.into()))?;
+        for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
+            self.forget_marker(session);
         }
         Ok(())
     }
@@ -241,21 +278,32 @@ impl Engine {
             })?],
             None => self.state.list()?,
         };
+        // Program files first: a process listed there and not by `ps` after
+        // is one that started or ended between the two, not one that left
+        // its session, which ran before either.
+        let programs = program_files()?;
         let host = Host {
             procs: processes()?,
-            programs: program_files()?,
+            programs,
         };
         let mut found = Vec::new();
         for record in &records {
             let name = &record.name;
-            if let Err(error) = self.look_at(record, &host, &mut found) {
-                found.push(Finding {
+            let dir = self.layout.sandbox_dir(name.as_str());
+            match self.look_at(record, &host, &mut found) {
+                Ok(()) => {}
+                // What fails for the whole host fails the check, once.
+                Err(error) if !about_files_in(&error, &dir) => return Err(error),
+                Err(error) => found.push(Finding {
                     subject: Subject::Sandbox(name.clone()),
-                    what: format!("enclos cannot look at it: {error}"),
+                    what: format!(
+                        "enclos cannot look at it: {}",
+                        printable_line(&error.to_string())
+                    ),
                     remedy: Remedy::Manual(format!(
                         "fix what keeps enclos from looking, then run `enclos state check {name}` again"
                     )),
-                });
+                }),
             }
         }
         if only.is_none() {
@@ -371,30 +419,29 @@ impl Engine {
         // §8, known gaps). Named, never stopped: enclos cannot show it is
         // the sandbox's.
         let mut escaped = 0;
-        if dir_found.is_some_and(|k| k.is_dir()) {
+        let scanned = dir_found.is_some_and(|k| k.is_dir());
+        if scanned {
             let real = std::fs::canonicalize(&dir).map_err(|source| LayoutError::Io {
                 path: dir.clone(),
                 source,
             })?;
+            let inside = format!("{}/", lsof_name(&real));
             for (pid, files) in &host.programs {
-                let Some(file) = files.iter().find(|f| f.starts_with(&real)) else {
+                let Some(file) = files.iter().find(|f| f.starts_with(&inside)) else {
                     continue;
                 };
                 if members.contains(pid) || *pid == std::process::id() {
                     continue;
                 }
-                let command = host
-                    .procs
-                    .iter()
-                    .find(|p| p.pid == *pid)
-                    .map_or_else(String::new, |p| {
-                        format!(", listed as {}", printable_line(&p.command))
-                    });
+                let Some(listed) = host.procs.iter().find(|p| p.pid == *pid) else {
+                    continue;
+                };
+                let command = format!(", listed as {}", printable_line(&listed.command));
                 escaped += 1;
                 push(
                     format!(
                         "process {pid} runs {}{command}, and no session of it tracks that process",
-                        printable_line(&file.display().to_string())
+                        printable_line(file)
                     ),
                     Remedy::Manual(format!(
                         "enclos stops only what it shows is a sandbox's: look at it (`ps -p {pid}`), and stop it yourself if it is"
@@ -459,15 +506,20 @@ impl Engine {
         let live = open.len() > gone.len();
         // A process found running from its folder keeps it from being
         // recorded stopped: something of it may still run.
-        if matches!(record.state, SandboxState::Running)
-            && !live
-            && installed.is_empty()
-            && escaped == 0
-        {
-            push(
-                "it is recorded running, and nothing of it runs".to_owned(),
-                Remedy::Repairs(Repair(Fix::RecordStopped)),
-            );
+        if matches!(record.state, SandboxState::Running) && !live && installed.is_empty() {
+            match (scanned, escaped) {
+                (true, 0) => push(
+                    "it is recorded running, and nothing of it runs".to_owned(),
+                    Remedy::Repairs(Repair(Fix::RecordStopped)),
+                ),
+                (true, _) => {}
+                (false, _) => push(
+                    "it is recorded running, and no session or service of it runs".to_owned(),
+                    Remedy::Manual(format!(
+                        "enclos cannot look for processes running from its folder while that is not a folder; `enclos sandbox stop {name}` records it stopped"
+                    )),
+                ),
+            }
         }
 
         Ok(())
@@ -527,6 +579,24 @@ impl Engine {
             });
         }
         Ok(())
+    }
+}
+
+/// Why one sandbox's repairs failed, and whether its `policy.toml` was
+/// written before.
+struct RepairFailed {
+    written: bool,
+    error: Box<Error>,
+}
+
+/// Whether `error` is about files in the sandbox folder `dir`, and so the
+/// sandbox's alone: what fails for the host, such as the state database or
+/// the service manager, is not.
+fn about_files_in(error: &Error, dir: &Path) -> bool {
+    match error {
+        Error::Layout(LayoutError::Io { path, .. }) => path.starts_with(dir),
+        Error::Markers(_) => true,
+        _ => false,
     }
 }
 

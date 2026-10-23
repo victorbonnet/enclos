@@ -3,7 +3,6 @@
 //! process it did not start.
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 
 use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, gone_process, put, session_of, while_waiting};
@@ -11,8 +10,8 @@ use super::services::{hermes_with_services, sandbox_with_services};
 use super::*;
 use crate::engine::service::Unit;
 use crate::engine::{Finding, Remedy, Subject};
+use crate::lifecycle::programs::tests::Sleeper;
 use crate::model::sandbox::{SandboxName, SandboxState};
-use crate::model::session::ProcessRef;
 
 fn repairs(found: &[Finding]) -> Vec<String> {
     found
@@ -48,67 +47,6 @@ fn last_summary(engine: &Engine) -> String {
     let last = audit.last().unwrap();
     assert_eq!(last.intent.command, "state repair");
     last.finished.as_ref().unwrap().outcome.message.clone()
-}
-
-/// A program of the sandbox's that sleeps: a copy of this test program in
-/// its home, started from there by a relative path, as `PATH` would, so that
-/// `ps` lists it as `./sleeper`, running only [`sleeps_when_asked`]. A copy
-/// of `/bin/sleep` would not do: macOS kills a copied platform program as
-/// it runs. Ended and reaped when dropped; this test's own child.
-struct FromHome(std::process::Child);
-
-const SLEEP: &str = "ENCLOS_TEST_SLEEP";
-
-impl FromHome {
-    fn new(home: &Path) -> FromHome {
-        std::fs::copy(std::env::current_exe().unwrap(), home.join("sleeper")).unwrap();
-        let child = std::process::Command::new("./sleeper")
-            .args([
-                "--exact",
-                "engine::tests::state_check::sleeps_when_asked",
-                "--test-threads=1",
-            ])
-            .env(SLEEP, "1")
-            .current_dir(home)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut started = FromHome(child);
-        // Running, and past its start: listed with its own program file.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(started.runs(), "the sleeper exited at once");
-        started
-    }
-
-    fn pid(&self) -> u32 {
-        self.0.id()
-    }
-
-    fn process(&self) -> ProcessRef {
-        crate::lifecycle::process::reference(self.pid())
-            .unwrap()
-            .unwrap()
-    }
-
-    fn runs(&mut self) -> bool {
-        self.0.try_wait().unwrap().is_none()
-    }
-}
-
-/// What [`FromHome`] runs: sleeps when asked to, passes at once otherwise.
-#[test]
-fn sleeps_when_asked() {
-    if std::env::var_os(SLEEP).is_some() {
-        std::thread::sleep(std::time::Duration::from_secs(30));
-    }
-}
-
-impl Drop for FromHome {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
 }
 
 #[test]
@@ -390,7 +328,7 @@ fn a_repair_that_fails_changes_no_record() {
     assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [gone]);
     assert_eq!(
         last_summary(&engine),
-        "repaired 0, failed to repair 2, left 0 for a person"
+        "repaired 0, failed to repair 2, left 2 for a person"
     );
 }
 
@@ -461,7 +399,7 @@ fn a_service_enclos_no_longer_runs_is_named_alone() {
 #[test]
 fn a_process_no_session_tracks_is_named_and_never_stopped() {
     let (_dir, engine, name) = with_sandbox();
-    let mut escaped = FromHome::new(&engine.layout.sandbox_home(name.as_str()));
+    let mut escaped = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
     let pid = escaped.pid();
     let found = engine.state_check(None).unwrap();
     let named = about(&found, &format!("process {pid} runs "));
@@ -478,8 +416,17 @@ fn a_process_no_session_tracks_is_named_and_never_stopped() {
 #[test]
 fn a_program_of_the_sandbox_that_a_session_tracks_is_not_named() {
     let (_dir, engine, name) = with_sandbox();
-    let member = FromHome::new(&engine.layout.sandbox_home(name.as_str()));
-    put(&engine, &session_of(&engine, &name, member.process()));
+    let member = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
+    put(
+        &engine,
+        &session_of(
+            &engine,
+            &name,
+            crate::lifecycle::process::reference(member.pid())
+                .unwrap()
+                .unwrap(),
+        ),
+    );
     assert_eq!(engine.state_check(None).unwrap(), []);
 }
 
@@ -488,10 +435,28 @@ fn a_program_of_the_sandbox_that_a_session_tracks_is_not_named() {
 #[test]
 fn a_process_running_from_its_folder_keeps_a_sandbox_from_being_recorded_stopped() {
     let (_dir, engine, name) = with_sandbox();
-    let _escaped = FromHome::new(&engine.layout.sandbox_home(name.as_str()));
+    let _escaped = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
     set_state(&engine, &name, SandboxState::Running);
     let found = engine.state_check(None).unwrap();
     assert!(repairs(&found).is_empty(), "{found:?}");
+    repair(&engine, None);
+    assert_eq!(state_of(&engine, &name), SandboxState::Running);
+}
+
+/// With its folder gone, enclos cannot look for processes running from it,
+/// so it does not record the sandbox stopped itself.
+#[test]
+fn a_sandbox_whose_folder_is_gone_is_not_recorded_stopped_by_repair() {
+    let (_dir, engine, name) = with_sandbox();
+    set_state(&engine, &name, SandboxState::Running);
+    std::fs::remove_dir_all(engine.layout.sandbox_dir(name.as_str())).unwrap();
+    let found = engine.state_check(None).unwrap();
+    assert!(repairs(&found).is_empty(), "{found:?}");
+    assert_eq!(
+        about(&found, "no session or service of it runs").len(),
+        1,
+        "{found:?}"
+    );
     repair(&engine, None);
     assert_eq!(state_of(&engine, &name), SandboxState::Running);
 }

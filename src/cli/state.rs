@@ -18,8 +18,9 @@ pub struct StateArgs {
 #[derive(Subcommand)]
 enum StateVerb {
     /// Say where enclos's records and the host differ; change nothing.
-    /// Exits 1 when they differ, and when it cannot look, then with the
-    /// error on stderr.
+    /// Exits 1 when they differ. A sandbox it cannot look at is named among
+    /// them; a failure that stops the whole check exits 1 with an error on
+    /// stderr.
     Check {
         /// One sandbox; every sandbox, and folders with no record, when
         /// left out.

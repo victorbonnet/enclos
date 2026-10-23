@@ -5,7 +5,8 @@
 //! mapped, by their real paths (macOS 26.5.2).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 /// `lsof` could not say which program files the processes run.
@@ -14,31 +15,61 @@ use std::process::{Command, Output, Stdio};
 pub struct ProgramsError(String);
 
 /// The program files of each process `lsof` can see (the user's; root's
-/// are not listed), by pid.
-pub fn program_files() -> Result<BTreeMap<u32, Vec<PathBuf>>, ProgramsError> {
-    // `-w`: a warning about another file system (an unreachable network
-    // mount) is not a failure to list the processes.
+/// are not listed), by pid, each named as `lsof` writes it: compare one with
+/// a path through [`lsof_name`].
+pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
+    // `-b`: no call that can block, such as on a network mount that does not
+    // answer, which would hold the state lock with it; `-w`: its warnings
+    // about such a mount are not a failure to list the processes.
     let out = Command::new("/usr/sbin/lsof")
         .env("LC_ALL", "C")
-        .args(["-nP", "-w", "-d", "txt", "-Fpn"])
+        .args(["-nP", "-b", "-w", "-d", "txt", "-Fpn"])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| ProgramsError(e.to_string()))?;
     parse(&out)
 }
 
+/// `path` as `lsof` writes a file name in the C locale (macOS 26.5.2): a
+/// backslash doubled, tab, newline and the like as `\t`, `\n`, other control
+/// characters as `^A`, and bytes past ASCII as `\xc3`. A name holding `^`
+/// followed by a capital is written as a control character would be, so
+/// two names can read the same: matched this way, such a name may be taken
+/// for another, never missed.
+pub fn lsof_name(path: &Path) -> String {
+    let mut name = String::new();
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'\\' => name.push_str("\\\\"),
+            b'\t' => name.push_str("\\t"),
+            b'\n' => name.push_str("\\n"),
+            b'\r' => name.push_str("\\r"),
+            0x08 => name.push_str("\\b"),
+            0x0c => name.push_str("\\f"),
+            0x00..=0x1f => {
+                name.push('^');
+                name.push(char::from(b + 0x40));
+            }
+            0x7f => name.push_str("^?"),
+            0x80..=0xff => name.push_str(&format!("\\x{b:02x}")),
+            _ => name.push(char::from(b)),
+        }
+    }
+    name
+}
+
 /// What `lsof -d txt -Fpn` answered: a `p<pid>` line for each process, then
-/// an `n<path>` line for each of its program files. `lsof` itself is always
+/// an `n<name>` line for each of its program files. `lsof` itself is always
 /// listed, so an empty answer is a failure; it exits 1 when a process it
 /// listed went away meanwhile, which is not.
-fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<PathBuf>>, ProgramsError> {
+fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
     let text = String::from_utf8_lossy(&out.stdout);
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
         (Some(0), false, _) | (Some(1), false, true) => {}
         _ => return Err(ProgramsError(format!("{}: {why}", out.status))),
     }
-    let mut files: BTreeMap<u32, Vec<PathBuf>> = BTreeMap::new();
+    let mut files: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut pid = None;
     for line in text.lines() {
         if let Some(p) = line.strip_prefix('p') {
@@ -48,17 +79,73 @@ fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<PathBuf>>, ProgramsError> {
             files.entry(p).or_default();
             pid = Some(p);
         } else if let (Some(name), Some(pid)) = (line.strip_prefix('n'), pid) {
-            files.entry(pid).or_default().push(PathBuf::from(name));
+            files.entry(pid).or_default().push(name.to_owned());
         }
     }
     Ok(files)
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
+
+    /// The variable that has [`sleeps_when_asked`] sleep.
+    pub(crate) const SLEEP: &str = "ENCLOS_TEST_SLEEP";
+
+    /// A program run from `dir` that sleeps: a copy of this test program,
+    /// running only [`sleeps_when_asked`], started by a relative path, as
+    /// `PATH` would, so that `ps` lists it as `./sleeper`. A copy of
+    /// `/bin/sleep` would not do: macOS kills a copied platform program as
+    /// it runs. Ended and reaped when dropped; the test's own child.
+    pub(crate) struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        pub(crate) fn in_folder(dir: &Path) -> Sleeper {
+            std::fs::copy(std::env::current_exe().unwrap(), dir.join("sleeper")).unwrap();
+            let child = Command::new("./sleeper")
+                .args([
+                    "--exact",
+                    "lifecycle::programs::tests::sleeps_when_asked",
+                    "--test-threads=1",
+                ])
+                .env(SLEEP, "1")
+                .current_dir(dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut started = Sleeper(child);
+            // Running, and past its start: listed with its own program file.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(started.runs(), "the sleeper exited at once");
+            started
+        }
+
+        pub(crate) fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        pub(crate) fn runs(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// What [`Sleeper`] runs: sleeps when asked to, passes at once otherwise.
+    #[test]
+    fn sleeps_when_asked() {
+        if std::env::var_os(SLEEP).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
 
     fn output(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {
@@ -76,11 +163,8 @@ mod tests {
             "",
         ))
         .unwrap();
-        assert_eq!(
-            listed[&10],
-            [PathBuf::from("/bin/zsh"), PathBuf::from("/usr/lib/dyld")]
-        );
-        assert_eq!(listed[&11], [PathBuf::from("/a b/c")]);
+        assert_eq!(listed[&10], ["/bin/zsh", "/usr/lib/dyld"]);
+        assert_eq!(listed[&11], ["/a b/c"]);
     }
 
     #[test]
@@ -91,14 +175,25 @@ mod tests {
         assert!(parse(&output(1, "p1\nn/x\n", "")).is_ok());
     }
 
+    /// A program in a folder whose name holds what `lsof` escapes is listed
+    /// as `lsof_name` writes its path.
     #[test]
-    fn this_process_is_listed_with_its_executable() {
+    fn a_program_file_is_named_as_lsof_name_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join("é \\ \t \x01 dir");
+        std::fs::create_dir(&odd).unwrap();
+        let sleeper = Sleeper::in_folder(&odd);
         let listed = program_files().unwrap();
-        let me = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let real = std::fs::canonicalize(odd.join("sleeper")).unwrap();
+        let expected = lsof_name(&real);
         assert!(
-            listed[&std::process::id()].contains(&me),
-            "{:?}",
-            listed.get(&std::process::id())
+            expected.contains("\\xc3\\xa9 \\\\ \\t ^A dir"),
+            "{expected}"
+        );
+        assert!(
+            listed[&sleeper.pid()].contains(&expected),
+            "{expected} not in {:?}",
+            listed.get(&sleeper.pid())
         );
     }
 }
