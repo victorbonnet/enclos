@@ -183,7 +183,6 @@ listen = false                           # TCP listening, any port but the proxy
 
 [resources]                              # fixed at each process's start; Seatbelt enforces only open_files
 open_files = 1024
-cpu_seconds = 36000
 
 [secrets]                                # every session in the sandbox receives these
 env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
