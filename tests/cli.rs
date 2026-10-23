@@ -2592,12 +2592,20 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
     }
 }
 
-/// A template this enclos does not ship is refused with the ones it has,
-/// and leaves no folder; `--help` names them all.
+/// `--help` names every template; on macOS, where the backend runs and so
+/// the template is the first thing refused, one this enclos does not ship
+/// is refused with the ones it has, and leaves no folder.
 #[test]
 fn an_unknown_template_is_refused_with_the_ones_there_are() {
     let home = Home::new();
     home.init(1);
+    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
+    for name in enclos::policy::template_names() {
+        assert!(help.contains(name), "{name}: {help}");
+    }
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let out = home.run(&["sandbox", "create", "lab", "--template", "coding"]);
     assert_eq!(out.code(), 1, "{}", out.stderr());
     assert!(
@@ -2607,8 +2615,4 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
         out.stderr()
     );
     assert!(!home.root.join("sandboxes/lab").exists());
-    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
-    for name in enclos::policy::template_names() {
-        assert!(help.contains(name), "{name}: {help}");
-    }
 }
