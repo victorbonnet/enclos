@@ -108,37 +108,64 @@ pub struct Launch {
     /// listens; none for the service itself, a probe, a sandbox whose
     /// runtime has no such service, or one whose service does not listen.
     pub service_port: Option<u16>,
-    /// The limits each of its processes runs under (design §7): those its
-    /// policy sets, which the validation let through for this backend.
-    pub limits: crate::model::policy::Resources,
+    /// The limits each of its processes runs under (design §7).
+    pub limits: LaunchLimits,
+}
+
+/// The limits a program runs under, as a backend sets them: only those a
+/// backend enforces as written, `open_files` for now (design §7, ADR 0033).
+/// The engine makes them from a policy's `[resources]` once checked for the
+/// sandbox's backend, so a limit nothing enforces never reaches a program.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchLimits {
+    open_files: Option<u64>,
+}
+
+impl LaunchLimits {
+    /// The limits of `resources`, which the caller has checked for the
+    /// backend: one it sets that no backend enforces is the caller's bug.
+    pub(crate) fn of_checked(resources: &crate::model::policy::Resources) -> LaunchLimits {
+        // Every field named, so one added is decided on here.
+        let crate::model::policy::Resources {
+            open_files,
+            file_size,
+            cpu_seconds,
+            memory,
+            cpu,
+        } = resources;
+        debug_assert!(
+            file_size.is_none() && cpu_seconds.is_none() && memory.is_none() && cpu.is_none(),
+            "launched with a limit no backend enforces: {resources:?}"
+        );
+        LaunchLimits {
+            open_files: *open_files,
+        }
+    }
+
+    /// The file descriptors a process may hold, if limited.
+    pub fn open_files(&self) -> Option<u64> {
+        self.open_files
+    }
 }
 
 /// `command` run under `limits`, which every process it starts inherits:
 /// `/bin/bash` sets them with `ulimit`, hard and soft alike, so no process
 /// in the sandbox without root can raise them, then becomes the program;
 /// one it cannot set stops it with exit 125 and the field named, so no
-/// program runs without its limits. Only the limits a backend enforces as
-/// written are set: `open_files` (ADR 0033 refuses the others). In
+/// program runs without its limits. Only `open_files` is set: Seatbelt
+/// refuses the others (ADR 0033), and no other backend is built. In
 /// privileged mode (`-p`), as it runs on the host with the sandbox's
 /// variables: it then reads no `BASH_ENV` or `ENV` file, no `SHELLOPTS` and
 /// no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`
 /// unchanged when no limit is set.
-pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) -> Command {
+pub fn under_limits(command: Command, limits: &LaunchLimits) -> Command {
     debug_assert!(
         command.get_envs().next().is_none() && command.get_current_dir().is_none(),
         "set the environment and folder after the limits"
     );
-    // Every field named, so one added is decided on here.
-    let crate::model::policy::Resources {
-        open_files,
-        file_size: _,
-        cpu_seconds: _,
-        memory: _,
-        cpu: _,
-    } = limits;
     let mut set = Vec::new();
-    if let Some(files) = open_files {
+    if let Some(files) = limits.open_files {
         set.push(format!(
             "ulimit -n {files} || {{ echo \"enclos: cannot set resources.open_files = {files}\" >&2; exit 125; }}"
         ));
@@ -157,18 +184,48 @@ pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) 
     limited
 }
 
-/// Why `limits` cannot be set where enclos runs, if they cannot: a limit
-/// above the hard one enclos itself runs under, which no process without
-/// root can raise, would stop every program with it.
-pub fn unsettable(limits: &crate::model::policy::Resources) -> Option<String> {
+/// Why `limits` cannot be set where enclos runs as written, if they
+/// cannot: a limit above the hard one enclos itself runs under, which no
+/// process without root can raise, would stop every program with it; one
+/// above macOS's own ceiling on the files a process holds would be set, but
+/// hold each process to that ceiling instead.
+pub fn unsettable(limits: &LaunchLimits) -> Option<String> {
     let files = limits.open_files?;
     let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
-    match hard {
-        Some(hard) if files > hard => Some(format!(
+    if let Some(hard) = hard
+        && files > hard
+    {
+        return Some(format!(
             "resources.open_files = {files} is above the hard limit enclos runs under ({hard}): lower it in the policy, or raise the hard limit of the shell or service manager enclos runs from"
-        )),
-        _ => None,
+        ));
     }
+    if let Some(most) = max_files_per_process()
+        && files > most
+    {
+        return Some(format!(
+            "resources.open_files = {files} is above the {most} files macOS lets any process hold (kern.maxfilesperproc), so a process would be stopped there, not where the policy says: lower it to {most} or less"
+        ));
+    }
+    None
+}
+
+/// macOS's ceiling on the files one process holds, `kern.maxfilesperproc`:
+/// `ulimit` sets a limit above it and reads it back, but the kernel stops
+/// every process at it. None elsewhere, or when it cannot be read; the
+/// limit then holds no process to more than the policy says, only maybe to
+/// fewer.
+pub(crate) fn max_files_per_process() -> Option<u64> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.maxfilesperproc"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -204,28 +261,62 @@ pub fn registered() -> Vec<Box<dyn Backend>> {
 mod limits_tests {
     use super::*;
 
-    fn files(n: u64) -> crate::model::policy::Resources {
-        crate::model::policy::Resources {
+    /// Why `unsettable` refuses an `open_files` above `kern.maxfilesperproc`:
+    /// `ulimit` sets it and reads it back, but no process opens more files
+    /// than that.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_process_opens_more_files_than_kern_maxfilesperproc() {
+        let most = max_files_per_process().expect("kern.maxfilesperproc");
+        let over = most + 10_000;
+        let mut read = Command::new("/bin/sh");
+        read.args(["-c", "ulimit -Hn"]);
+        let out = under_limits(read, &files(over)).output().unwrap();
+        if out.status.code() == Some(125) {
+            // Under a hard limit below `over`, as unsettable says first.
+            assert!(
+                unsettable(&files(over))
+                    .unwrap()
+                    .contains("hard limit enclos runs under")
+            );
+            return;
+        }
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{over}\n"));
+        let mut perl = Command::new("/usr/bin/perl");
+        perl.args([
+            "-e",
+            "my @f; my $n = 0; while (open(my $f, '<', '/dev/null')) { push @f, $f; $n++ } print $n",
+        ]);
+        let out = under_limits(perl, &files(over)).output().unwrap();
+        let opened: u64 = String::from_utf8(out.stdout).unwrap().parse().unwrap();
+        assert!(
+            opened < most,
+            "opened {opened} under {over}, with {most} the ceiling"
+        );
+        assert!(
+            opened > most - 100,
+            "opened {opened}, with {most} the ceiling"
+        );
+        let why = unsettable(&files(over)).unwrap();
+        assert!(why.contains("kern.maxfilesperproc"), "{why}");
+        assert_eq!(unsettable(&files(most)), None);
+    }
+
+    fn files(n: u64) -> LaunchLimits {
+        LaunchLimits::of_checked(&crate::model::policy::Resources {
             open_files: Some(n),
             ..Default::default()
-        }
+        })
     }
 
     #[test]
     fn limits_are_set_by_the_shell_that_becomes_the_program() {
         let plain = Command::new("/usr/bin/true");
-        let none = under_limits(plain, &crate::model::policy::Resources::default());
+        let none = under_limits(plain, &LaunchLimits::default());
         assert_eq!(none.get_program(), "/usr/bin/true");
         let mut program = Command::new("/usr/bin/sandbox-exec");
         program.args(["-f", "x.sb", "/bin/zsh"]);
-        // Only what a backend enforces is set; the others are refused
-        // before a policy is stored.
-        let limits = crate::model::policy::Resources {
-            file_size: Some("1M".parse().unwrap()),
-            cpu_seconds: Some(60),
-            ..files(256)
-        };
-        let limited = under_limits(program, &limits);
+        let limited = under_limits(program, &files(256));
         assert_eq!(limited.get_program(), "/bin/bash");
         let args: Vec<_> = limited.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
@@ -306,6 +397,34 @@ mod limits_tests {
         };
         assert!(!probe(64, 64), "closed at the limit");
         assert!(probe(63, 64), "open above it");
+    }
+
+    /// The probe reads closed only on a number no higher than the limit:
+    /// no limit, or a value it cannot read, reads open, never closed. A
+    /// shell function stands in for `ulimit`, so no real limit is needed.
+    #[test]
+    fn a_probe_reads_no_limit_or_an_unreadable_one_as_open() {
+        let probe = |value: &str| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "ulimit() {{ printf '%s\\n' \"$V\"; }}; {}",
+                    crate::probes::limit_script("-Hn", 64)
+                ))
+                .env("V", value)
+                .output()
+                .unwrap()
+        };
+        for value in ["unlimited", "", "abc", "12x", "65"] {
+            assert!(probe(value).status.success(), "{value:?} reads open");
+        }
+        for value in ["abc", ""] {
+            let said = String::from_utf8(probe(value).stdout).unwrap();
+            assert!(said.contains("unreadable limit"), "{value:?}: {said}");
+        }
+        for value in ["64", "16"] {
+            assert!(!probe(value).status.success(), "{value:?} reads closed");
+        }
     }
 
     /// Why Seatbelt refuses `cpu_seconds` (ADR 0033): a process that

@@ -548,7 +548,9 @@ mod compile {
         }
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
-        let inputs = engine.probe_inputs(&name, &ctx, None, None).unwrap();
+        let inputs = engine
+            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
         assert_eq!(
@@ -4626,6 +4628,29 @@ mod services {
         assert_eq!(said, ["waiting for the gateway of sandbox home to listen…"]);
         assert_eq!(fake.started.borrow().len(), installed);
         assert_eq!(fake.stopped.borrow().len(), stopped);
+    }
+
+    /// A limit no program could start under refuses the start before any
+    /// service is removed or installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_under_a_limit_no_program_could_run_under_installs_nothing() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        let most = crate::backend::max_files_per_process().unwrap();
+        if most >= 1 << 20 {
+            return;
+        }
+        let before = engine.layout.read_policy(name.as_str()).unwrap();
+        let after = format!("{before}\n[resources]\nopen_files = {}\n", most + 1);
+        done(
+            engine
+                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+                .unwrap(),
+        );
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(err.to_string().contains("kern.maxfilesperproc"), "{err}");
+        assert!(fake.started.borrow().is_empty());
+        assert!(fake.stopped.borrow().is_empty());
     }
 
     /// A sandbox started before its runtime was installed: its proxy

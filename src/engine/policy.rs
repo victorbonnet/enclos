@@ -8,6 +8,7 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 
 use super::Engine;
 use super::pending::{Change, Recorded, Restarted};
+use crate::backend::LaunchLimits;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -286,29 +287,24 @@ impl Engine {
     /// The backend of sandbox `name`, as recorded, whose limits its policy
     /// is checked against.
     pub(super) fn recorded_backend(&self, name: &SandboxName) -> Result<BackendKind> {
-        Ok(self
-            .state
-            .get(name)?
-            .ok_or_else(|| Error::NoSuchSandbox {
-                name: name.to_string(),
-            })?
-            .backend)
+        Ok(self.record(name)?.backend)
     }
 
     /// The limits `policy`'s programs run under in sandbox `record`: checked
     /// again against its backend, though stored checked, and against the
-    /// hard limits enclos itself runs under, so a program never starts
-    /// without them or fails with only bash's word for why.
+    /// hard limits enclos itself runs under, so a session is refused before
+    /// anything runs, naming the limit and how to raise the hard one.
     pub(super) fn launch_limits(
         &self,
         record: &crate::model::sandbox::SandboxRecord,
         policy: &Policy,
-    ) -> Result<crate::model::policy::Resources> {
+    ) -> Result<LaunchLimits> {
         validate_resources(policy, record.backend)?;
-        if let Some(why) = crate::backend::unsettable(&policy.resources) {
+        let limits = LaunchLimits::of_checked(&policy.resources);
+        if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });
         }
-        Ok(policy.resources.clone())
+        Ok(limits)
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
