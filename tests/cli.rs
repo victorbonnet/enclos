@@ -2574,13 +2574,37 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
     );
     let out = home.run(&["state", "repair", "--dry-run"]);
     assert!(
-        out.ok().stdout().contains("Would write policy.toml again"),
+        out.ok()
+            .stdout()
+            .contains("would repair: write policy.toml again"),
         "{}",
         out.stdout()
     );
     assert!(!policy.exists());
     let out = home.run(&["state", "repair"]);
-    assert!(out.ok().stdout().contains("repaired"), "{}", out.stdout());
+    assert!(
+        out.ok().stdout().contains("home: its ")
+            && out
+                .stdout()
+                .contains("  repaired: write policy.toml again from the text its active policy"),
+        "{}",
+        out.stdout()
+    );
     assert_eq!(std::fs::read_to_string(&policy).unwrap(), text);
     home.run(&["state", "check"]).ok();
+
+    // What is left for a person is named, by a dry run too, and exits 1.
+    std::fs::remove_dir_all(home.root.join("sandboxes/home/home")).unwrap();
+    for args in [&["state", "repair", "--dry-run"][..], &["state", "repair"]] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 1, "{args:?}: {}", out.stdout());
+        assert!(
+            out.stdout().contains("  for you: `mkdir "),
+            "{}",
+            out.stdout()
+        );
+    }
+    let out = home.run(&["state", "check", "nosuch"]);
+    assert_eq!(out.code(), 1);
+    assert!(!out.stdout().contains("match the host"), "{}", out.stdout());
 }

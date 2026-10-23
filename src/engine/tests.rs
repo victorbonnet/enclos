@@ -796,7 +796,7 @@ mod sandbox {
     /// A process this test started and reaped: nothing runs as that process
     /// any more (its pid is free, or used again with another start time), as
     /// a session's after a crash or a restart of the Mac.
-    fn gone_process() -> ProcessRef {
+    pub(super) fn gone_process() -> ProcessRef {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let recorded = crate::lifecycle::process::reference_of_child(&child).unwrap();
         child.wait().unwrap();
@@ -4430,7 +4430,7 @@ mod services {
 
     const GATEWAY: ServiceName = ServiceName::new("gateway");
 
-    fn sandbox_with_services(
+    pub(super) fn sandbox_with_services(
         runtime: Option<RuntimeKind>,
     ) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
         let fake = Rc::new(FakeServices::default());
@@ -4477,7 +4477,7 @@ mod services {
     };
 
     /// A Hermes sandbox whose runtime's files are there.
-    fn hermes_with_services() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+    pub(super) fn hermes_with_services() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
         let (dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
         let home = engine.layout.sandbox_home(name.as_str());
         std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
