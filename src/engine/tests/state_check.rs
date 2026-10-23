@@ -39,7 +39,7 @@ fn state_of(engine: &Engine, name: &SandboxName) -> SandboxState {
 }
 
 fn repair(engine: &Engine, only: Option<&SandboxName>) -> Vec<Finding> {
-    done(engine.state_repair(&alice(), only, Confirm::Yes).unwrap())
+    engine.state_repair(&alice(), only).unwrap()
 }
 
 fn last_summary(engine: &Engine) -> String {
@@ -77,21 +77,9 @@ fn a_gone_session_is_ended_and_the_sandbox_recorded_stopped() {
         about(&found, "recorded running, and nothing of it runs").len(),
         1
     );
-    // A dry run changes nothing and records nothing.
+    // A check, the repair's dry run, changes nothing and records nothing.
     let entries = engine.audit(None).unwrap().len();
-    let Planned::DryRun(plan) = engine
-        .state_repair(&alice(), None, Confirm::DryRun)
-        .unwrap()
-    else {
-        panic!("a dry run repaired");
-    };
-    assert_eq!(
-        plan.changes,
-        [
-            "record its end (sandbox home)",
-            "record it stopped (sandbox home)"
-        ]
-    );
+    assert_eq!(repairs(&found), ["record its end", "record it stopped"]);
     assert_eq!(engine.state_check(None).unwrap(), found);
     assert_eq!(engine.audit(None).unwrap().len(), entries);
 
@@ -307,12 +295,14 @@ fn one_sandbox_is_checked_and_repaired_alone() {
     assert!(matches!(err, Error::NoSuchSandbox { .. }), "{err}");
 }
 
-/// A repair that cannot be made is named with why, and the sandbox's
-/// records are left as they were.
+/// A repair that cannot be made is named with its own error, the audit
+/// entry says it failed, and the sandbox's other repairs are still made:
+/// writing `policy.toml` and recording a session's end do not depend on
+/// each other.
 #[test]
-fn a_repair_that_fails_changes_no_record() {
+fn a_repair_that_fails_is_named_alone_and_the_others_are_made() {
     let (_dir, engine, name) = with_sandbox();
-    let gone = put(&engine, &session_of(&engine, &name, gone_process()));
+    put(&engine, &session_of(&engine, &name, gone_process()));
     let dir = engine.layout.sandbox_dir(name.as_str());
     std::fs::remove_file(engine.layout.policy_file(name.as_str())).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -320,16 +310,114 @@ fn a_repair_that_fails_changes_no_record() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let failed: Vec<_> = repaired
         .iter()
-        .filter(|f| matches!(f.remedy, Remedy::Failed { .. }))
+        .filter_map(|f| match &f.remedy {
+            Remedy::Failed { repair, error } => Some((repair.to_string(), error.clone())),
+            _ => None,
+        })
         .collect();
-    assert_eq!(failed.len(), 2, "{repaired:?}");
-    assert!(failed.iter().all(|f| f.remedy.is_left()));
-    let open = engine.state.sessions(&name, true).unwrap();
-    assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [gone]);
+    assert_eq!(failed.len(), 1, "{repaired:?}");
+    assert!(
+        failed[0].0.starts_with("write policy.toml again"),
+        "{failed:?}"
+    );
+    assert!(failed[0].1.contains("policy.toml"), "{failed:?}");
+    assert_eq!(repairs(&repaired), ["record its end"]);
+    assert!(engine.state.sessions(&name, true).unwrap().is_empty());
     assert_eq!(
         last_summary(&engine),
-        "repaired 0, failed to repair 2, left 2 for a person"
+        "repaired 1, failed to repair 1, left 1 for a person"
     );
+    let audit = engine.audit(None).unwrap();
+    let finished = audit.last().unwrap().finished.as_ref().unwrap();
+    assert_eq!(
+        finished.outcome.result,
+        crate::model::audit::AuditResult::Failed
+    );
+}
+
+/// A session whose root is gone but whose marker a process still holds is
+/// running: repair neither ends it nor records the sandbox stopped (ADR
+/// 0030), though that process runs a program from elsewhere.
+#[test]
+fn a_session_kept_alive_by_its_marker_is_not_ended() {
+    let (_dir, engine, name) = with_sandbox();
+    let marker = engine.new_marker(&name).unwrap();
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("30");
+    let (child, marked) = marker.spawn(&mut command).unwrap();
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _child = Reap(child);
+    let root = gone_process();
+    engine.name_marker(&name, marked, &root).unwrap();
+    let id = put(&engine, &session_of(&engine, &name, root));
+    set_state(&engine, &name, SandboxState::Running);
+    assert_eq!(engine.state_check(None).unwrap(), []);
+    repair(&engine, None);
+    let open: Vec<_> = engine
+        .state
+        .sessions(&name, true)
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(open, [id]);
+    assert_eq!(state_of(&engine, &name), SandboxState::Running);
+}
+
+/// A sandbox whose files enclos cannot look at is one finding, and the
+/// others are still checked and repaired.
+#[test]
+fn a_sandbox_enclos_cannot_look_at_does_not_hide_the_others() {
+    let (_dir, engine, name) = with_sandbox();
+    let lab: SandboxName = "lab".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: lab.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    std::fs::remove_file(engine.layout.policy_file(lab.as_str())).unwrap();
+    let dir = engine.layout.sandbox_dir(name.as_str());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let found = engine.state_check(None);
+    let repaired = repair(&engine, None);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let found = found.unwrap();
+    let cannot = about(&found, "enclos cannot look at it");
+    assert_eq!(cannot.len(), 1, "{found:?}");
+    assert_eq!(cannot[0].subject, Subject::Sandbox(name.clone()));
+    assert!(cannot[0].remedy.is_left());
+    assert!(
+        found
+            .iter()
+            .any(|f| f.subject == Subject::Sandbox(lab.clone()) && !f.remedy.is_left()),
+        "{found:?}"
+    );
+    assert!(
+        repaired
+            .iter()
+            .any(|f| f.subject == Subject::Sandbox(lab.clone()))
+    );
+    assert!(engine.layout.policy_file(lab.as_str()).exists());
+}
+
+/// A sandbox folder replaced by a file is that one finding: no marker
+/// lookup in it blames `lsof`.
+#[test]
+fn a_sandbox_folder_that_is_a_file_is_one_finding() {
+    let (_dir, engine, name) = with_sandbox();
+    let dir = engine.layout.sandbox_dir(name.as_str());
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, "not a folder").unwrap();
+    let found = engine.state_check(None).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].what.contains("is not a folder"), "{found:?}");
 }
 
 #[test]
@@ -394,7 +482,7 @@ fn a_service_enclos_no_longer_runs_is_named_alone() {
 }
 
 /// A program run from the sandbox's folder that no session tracks is named
-/// by the file it runs, though `ps` lists it as `./sleep`, and repair leaves
+/// by the file it runs, though `ps` lists it as `./sleeper`, and repair leaves
 /// it running.
 #[test]
 fn a_process_no_session_tracks_is_named_and_never_stopped() {
