@@ -470,8 +470,9 @@ fn each_into(
         failed += usize::from(one != exit::OK);
         code = code.max(one);
     }
-    let document = output::with_error(json!({ "sandboxes": results }), code, || {
-        format!("{failed} of the {count} sandboxes failed: see each one's error")
+    let document = output::with_error(json!({ "sandboxes": results }), code, || match count {
+        1 => "the sandbox failed: see its error".to_owned(),
+        count => format!("{failed} of the {count} sandboxes failed: see each one's error"),
     });
     Ok((code, document))
 }
@@ -738,6 +739,59 @@ mod tests {
         });
         assert_eq!(code.unwrap(), exit::ERROR);
         assert_eq!(done, ["home", "lab", "work"]);
+    }
+
+    /// A stop that leaves processes running is said in its value whatever
+    /// the output: not stopped, each survivor, and an `error` with code 1.
+    #[test]
+    fn a_stop_that_leaves_processes_says_so_with_an_error() {
+        use enclos::lifecycle::stop::{Survivor, Why};
+        use enclos::model::session::{Member, SessionId};
+        let report = StopReport {
+            services: Vec::new(),
+            stopped: vec![SessionId(3)],
+            gone: Vec::new(),
+            survivors: vec![(
+                SessionId(3),
+                vec![Survivor {
+                    member: Member {
+                        pid: 4242,
+                        started: "x".into(),
+                        command: "sleep".into(),
+                    },
+                    why: Why::Survived,
+                }],
+            )],
+        };
+        let (code, value) = print_stop(&"home".parse().unwrap(), &report);
+        assert_eq!(code, exit::ERROR);
+        assert_eq!(value["stopped"], false);
+        assert_eq!(value["survivors"][0]["pid"], 4242);
+        assert_eq!(value["survivors"][0]["session"], 3);
+        assert_eq!(value["error"]["exit_code"], 1);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1 processes survived stop"),
+            "{value}"
+        );
+    }
+
+    /// One sandbox named: its failure is not counted as one of one.
+    #[test]
+    fn one_sandbox_that_fails_is_said_as_one() {
+        let (_, document) = each_into(
+            &names(&["home"]),
+            known,
+            |_| Ok((exit::ERROR, json!({"sandbox": "home"}))),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            document["error"]["message"],
+            "the sandbox failed: see its error"
+        );
     }
 
     /// In JSON, each one's result or error is an element, in order, and an

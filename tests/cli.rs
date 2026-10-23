@@ -3115,6 +3115,36 @@ fn a_document_that_cannot_be_written_fails_the_command() {
     );
 }
 
+/// `sandbox show` keeps its view when what it reads after fails: in text,
+/// the view first and then the error; in JSON, the view with an `error`
+/// beside it, what could not be read null.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_show_keeps_its_view_beside_an_error() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _make = record_hermes(&home, "home");
+    // An agent record that does not read as an agent's name: the sandbox's
+    // view reads, its agents do not.
+    let broke = Command::new("/usr/bin/sqlite3")
+        .arg(home.root.join("state.db"))
+        .arg("INSERT INTO agents (sandbox, name, created_at) VALUES ('home', 'Not A Name!', 'x');")
+        .status()
+        .unwrap();
+    assert!(broke.success());
+    let out = home.run(&["sandbox", "show", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(out.stdout().starts_with("Sandbox home"), "{}", out.stdout());
+    let (code, shown) = home.json(&["sandbox", "show", "home"]);
+    assert_eq!(code, 1, "{shown}");
+    assert_eq!(shown["name"], "home", "{shown}");
+    assert!(shown["state"].is_object(), "{shown}");
+    assert!(shown["services"].is_array(), "{shown}");
+    assert!(shown["agents"].is_null(), "{shown}");
+    assert_eq!(shown["error"]["exit_code"], 1, "{shown}");
+}
+
 /// Help and the version are text, piped or not, and succeed.
 #[test]
 fn help_and_version_are_text_when_piped() {
