@@ -1,9 +1,10 @@
 //! `enclos doctor`: what keeps enclos from working on this host, and which
 //! compiled policies enclos now writes differently (design §10).
 
-use enclos::backend::{Enforcement, Probe};
+use enclos::backend::Enforcement;
 use enclos::engine::{
-    BackendCheck, Doctor, Drift, Engine, LineChange, NextSession, SandboxCheck, Sandboxes,
+    BackendCheck, BackendState, Doctor, Drift, Engine, LineChange, Lines, MAX_LINES, NextSession,
+    SandboxCheck, Sandboxes,
 };
 use enclos::error::{Result, exit};
 
@@ -42,13 +43,12 @@ pub fn shown(doctor: &Doctor) -> String {
 }
 
 fn backend(b: &BackendCheck) -> String {
-    let state = match (&b.found, &b.runs) {
-        (Probe::Unavailable { reason }, _) => format!("not on this host: {reason}"),
-        (Probe::Available, Some(Probe::Available)) => "runs here".to_owned(),
-        (Probe::Available, Some(Probe::Unavailable { reason })) => {
+    let state = match &b.state {
+        BackendState::NotFound { reason } => format!("not on this host: {reason}"),
+        BackendState::Refuses { reason } => {
             format!("on this host, and it refused to run a program: {reason}")
         }
-        (Probe::Available, None) => "on this host; not tried".to_owned(),
+        BackendState::Runs => "runs here".to_owned(),
     };
     let c = &b.capabilities;
     format!(
@@ -75,7 +75,7 @@ fn sandbox(s: &SandboxCheck) -> String {
         NextSession::Unknown => {
             out += &format!("  {name}: enclos could not tell whether its next session can start\n");
         }
-        NextSession::Fails { error, .. } => {
+        NextSession::Fails { error } => {
             out += &format!(
                 "  {name}: its active policy cannot be compiled, so its next session cannot start: {error}\n"
             );
@@ -84,8 +84,9 @@ fn sandbox(s: &SandboxCheck) -> String {
             out += &format!("  {name}: its next session compiles policy v{version}\n");
         }
     }
-    // Only once everything was looked at: else nothing was compared.
-    if s.backend_runs && s.unreadable.is_empty() {
+    // Only once everything was looked at: else not everything was compared,
+    // so no match can be claimed.
+    if s.backend_runs() && s.unreadable.is_empty() {
         match (s.last_version, s.drift.is_empty()) {
             (None, _) => out += "    no session has run under a compiled policy yet\n",
             (Some(v), true) => {
@@ -105,49 +106,71 @@ fn sandbox(s: &SandboxCheck) -> String {
 
 fn drift_lines(name: &str, drift: &Drift) -> String {
     let mut out = String::new();
-    match drift {
+    let running = match drift {
         Drift::NoLongerCompiles {
             version,
             ran,
             error,
+            running,
         } => {
             out += &format!(
                 "    policy v{version}, which a session ran under ({}), no longer compiles: {error}\n",
                 ran.display()
             );
-        }
-        Drift::Changed(c) if c.edited => {
-            out += &format!(
-                "    {} no longer holds what policy v{} compiled to: it was changed after it was written\n",
-                c.ran.display(),
-                c.version
-            );
+            running
         }
         Drift::Changed(c) => {
-            out += &format!(
-                "    policy v{} compiles differently from the file a session ran under: enclos's own rules changed, as an upgrade changes them, or a path the policy names resolves elsewhere now\n      ran under: {}\n      compiles now to: {}\n",
-                c.version,
-                c.ran.display(),
-                c.now.display()
-            );
-        }
-    }
-    if let Drift::Changed(c) = drift {
-        match &c.lines {
-            Some(lines) => {
-                for line in lines {
-                    out += &match line {
-                        LineChange::Removed(l) => format!("      - {l}\n"),
-                        LineChange::Added(l) => format!("      + {l}\n"),
-                    };
+            if c.edited {
+                out += &format!(
+                    "    {} no longer holds what policy v{} compiled to: it was changed after it was written\n",
+                    c.ran.display(),
+                    c.version
+                );
+                if c.ran.file_name() != c.now.file_name() {
+                    out += &format!(
+                        "      policy v{} also compiles to another file now: {}\n",
+                        c.version,
+                        c.now.display()
+                    );
+                }
+            } else {
+                out += &format!(
+                    "    policy v{} compiles differently from the file a session ran under: enclos's own rules changed, as an upgrade changes them, or a path the policy names resolves elsewhere now\n      ran under: {}\n      compiles now to: {}\n",
+                    c.version,
+                    c.ran.display(),
+                    c.now.display()
+                );
+            }
+            match &c.lines {
+                Lines::Changed(lines) => {
+                    for line in lines {
+                        out += &match line {
+                            LineChange::Removed(l) => format!("      - {l}\n"),
+                            LineChange::Added(l) => format!("      + {l}\n"),
+                        };
+                    }
+                }
+                Lines::FileGone => {
+                    out += "      the file it ran under is no longer there to compare\n";
+                }
+                Lines::TooLong => {
+                    out +=
+                        &format!("      more than {MAX_LINES} lines: not compared line by line\n");
                 }
             }
-            None => out += "      the file it ran under is no longer there to compare\n",
+            &c.running
         }
-        if c.running > 0 {
+    };
+    match (running.count, running.unsure) {
+        (0, _) => {}
+        (n, false) => {
             out += &format!(
-                "      {} running session(s) keep its rules until restarted (`enclos sandbox restart {name}`)\n",
-                c.running
+                "      {n} running session(s) keep that compiled policy until restarted (`enclos sandbox restart {name}`)\n"
+            );
+        }
+        (n, true) => {
+            out += &format!(
+                "      {n} session(s) recorded open may still run under it: enclos could not tell which run\n"
             );
         }
     }
@@ -166,14 +189,15 @@ fn enforced(e: &Enforcement) -> String {
 mod tests {
     use super::*;
     use enclos::backend::{Capabilities, Enforcement};
+    use enclos::engine::{CompiledChange, Running};
     use enclos::model::sandbox::BackendKind;
+    use std::path::PathBuf;
 
     fn doctor(check: SandboxCheck) -> Doctor {
         Doctor {
             backends: vec![BackendCheck {
                 kind: BackendKind::Seatbelt,
-                found: Probe::Available,
-                runs: Some(Probe::Available),
+                state: BackendState::Runs,
                 capabilities: Capabilities {
                     fs: Enforcement::Enforced,
                     network: Enforcement::Enforced,
@@ -186,20 +210,42 @@ mod tests {
         }
     }
 
+    fn compiles() -> SandboxCheck {
+        SandboxCheck {
+            name: "home".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            next: NextSession::Compiles {
+                version: 2,
+                file: PathBuf::from("/c/now.sb"),
+            },
+            last_version: Some(2),
+            drift: Vec::new(),
+            unreadable: Vec::new(),
+        }
+    }
+
+    fn change(edited: bool, lines: Lines, running: Running) -> Drift {
+        Drift::Changed(CompiledChange {
+            version: 2,
+            ran: PathBuf::from("/c/ran.sb"),
+            now: PathBuf::from("/c/now.sb"),
+            edited,
+            lines,
+            running,
+        })
+    }
+
     /// What doctor could not look at is said, and nothing it did not
     /// compare is said to match.
     #[test]
     fn what_could_not_be_looked_at_is_not_said_to_match() {
         let shown = shown(&doctor(SandboxCheck {
-            name: "home".parse().unwrap(),
-            backend: BackendKind::Seatbelt,
-            backend_runs: true,
             next: NextSession::Unknown,
             last_version: Some(99),
-            drift: Vec::new(),
             unreadable: vec![
                 "policy version 99, which a session ran under, is not recorded".into(),
             ],
+            ..compiles()
         }));
         assert!(
             shown.contains("home: enclos could not tell whether its next session can start"),
@@ -209,6 +255,97 @@ mod tests {
         assert!(!shown.contains("compiles as it did"), "{shown}");
         assert!(
             shown.contains("enclos could not look: policy version 99"),
+            "{shown}"
+        );
+    }
+
+    /// A drift names both files, its lines in order, and the sessions
+    /// that keep the earlier file.
+    #[test]
+    fn a_drift_names_both_files_its_lines_and_who_keeps_it() {
+        let shown = shown(&doctor(SandboxCheck {
+            drift: vec![change(
+                false,
+                Lines::Changed(vec![
+                    LineChange::Removed("(old)".into()),
+                    LineChange::Added("(new)".into()),
+                ]),
+                Running {
+                    count: 2,
+                    unsure: false,
+                },
+            )],
+            ..compiles()
+        }));
+        let expected = "    policy v2 compiles differently from the file a session ran under";
+        assert!(shown.contains(expected), "{shown}");
+        assert!(shown.contains("      ran under: /c/ran.sb\n"), "{shown}");
+        assert!(
+            shown.contains("      compiles now to: /c/now.sb\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("      - (old)\n      + (new)\n"), "{shown}");
+        assert!(
+            shown.contains("2 running session(s) keep that compiled policy until restarted (`enclos sandbox restart home`)"),
+            "{shown}"
+        );
+        assert!(!shown.contains("compiles as it did"), "{shown}");
+    }
+
+    /// An edited file that also compiles differently now names the file of
+    /// now as well; a count enclos could not check is not said as a fact.
+    #[test]
+    fn an_edited_file_names_the_file_of_now_and_an_unsure_count_says_so() {
+        let shown = shown(&doctor(SandboxCheck {
+            drift: vec![change(
+                true,
+                Lines::TooLong,
+                Running {
+                    count: 1,
+                    unsure: true,
+                },
+            )],
+            unreadable: vec!["cannot tell which of its sessions run: ps failed".into()],
+            ..compiles()
+        }));
+        assert!(shown.contains("/c/ran.sb no longer holds what policy v2 compiled to: it was changed after it was written"), "{shown}");
+        assert!(
+            shown.contains("policy v2 also compiles to another file now: /c/now.sb"),
+            "{shown}"
+        );
+        assert!(shown.contains("not compared line by line"), "{shown}");
+        assert!(
+            shown.contains(
+                "1 session(s) recorded open may still run under it: enclos could not tell which run"
+            ),
+            "{shown}"
+        );
+        assert!(!shown.contains("keep that compiled policy"), "{shown}");
+    }
+
+    #[test]
+    fn a_file_no_longer_there_and_a_version_that_no_longer_compiles_are_said() {
+        let shown = shown(&doctor(SandboxCheck {
+            drift: vec![
+                change(false, Lines::FileGone, Running::default()),
+                Drift::NoLongerCompiles {
+                    version: 1,
+                    ran: PathBuf::from("/c/one.sb"),
+                    error: "bad rule".into(),
+                    running: Running {
+                        count: 1,
+                        unsure: false,
+                    },
+                },
+            ],
+            ..compiles()
+        }));
+        assert!(
+            shown.contains("the file it ran under is no longer there to compare"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("policy v1, which a session ran under (/c/one.sb), no longer compiles: bad rule\n      1 running session(s) keep that compiled policy"),
             "{shown}"
         );
     }

@@ -28,7 +28,8 @@ mod tests;
 
 pub use channel::ChannelSet;
 pub use doctor::{
-    BackendCheck, CompiledChange, Doctor, Drift, LineChange, NextSession, SandboxCheck, Sandboxes,
+    BackendCheck, BackendState, CompiledChange, Doctor, Drift, LineChange, Lines, MAX_LINES,
+    NextSession, Running, SandboxCheck, Sandboxes,
 };
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
