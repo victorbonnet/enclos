@@ -270,6 +270,12 @@ impl Layout {
         .try_for_each(|dir| create_dir(dir))
     }
 
+    /// The text of `config.toml`.
+    pub fn read_config(&self) -> Result<String, LayoutError> {
+        let path = self.config_file();
+        std::fs::read_to_string(&path).map_err(|source| LayoutError::Io { path, source })
+    }
+
     /// Writes `config.toml` unless it exists. Returns whether it wrote it.
     pub fn write_config(&self, contents: &str) -> Result<bool, LayoutError> {
         let path = self.config_file();

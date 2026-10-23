@@ -328,10 +328,11 @@ fn init_json(planned: &Planned<InitReport>) -> serde_json::Value {
             "created": report.created.iter().map(|p| path(p)).collect::<Vec<_>>(),
             "schema": {"from": report.migration.from, "to": report.migration.to},
             "default_backend": report.default_backend.map(|k| k.to_string()),
-            "unavailable": report.unavailable.iter().map(|(kind, reason)| serde_json::json!({
-                "backend": kind.to_string(),
-                "reason": reason,
+            "unavailable": report.unavailable.iter().map(|u| serde_json::json!({
+                "backend": u.backend.to_string(),
+                "reason": u.reason,
             })).collect::<Vec<_>>(),
+            "config_names_no_backend": report.config_names_no_backend,
         }),
     }
 }
@@ -402,13 +403,17 @@ fn print_init(planned: Planned<InitReport>) {
                 Some(kind) if report.created.contains(&config) => {
                     println!("Default backend: {kind}.");
                 }
+                Some(kind) if report.config_names_no_backend => println!(
+                    "{} names no default backend, though {kind} is available now: it was written while none was. Add `default_backend = \"{kind}\"` to it.",
+                    config.display()
+                ),
                 Some(_) => {}
                 // Said at every run, with why, so that a setting that turned
                 // a backend off is seen at once, not at the first create.
                 None => {
                     println!("No backend is available on this host yet:");
-                    for (kind, reason) in &report.unavailable {
-                        println!("  {kind}: {reason}");
+                    for u in &report.unavailable {
+                        println!("  {}: {}", u.backend, u.reason);
                     }
                 }
             }

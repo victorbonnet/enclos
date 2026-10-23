@@ -92,13 +92,37 @@ fn init_records_the_first_available_backend() {
     assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
     assert_eq!(
         report.unavailable,
-        [(BackendKind::Libkrun, "no VM support".to_owned())]
+        [crate::engine::Unavailable {
+            backend: BackendKind::Libkrun,
+            reason: "no VM support".to_owned(),
+        }]
     );
+    assert!(!report.config_names_no_backend);
     let config = std::fs::read_to_string(engine.layout.config_file()).unwrap();
     assert!(
         config.contains("default_backend = \"seatbelt\""),
         "{config}"
     );
+}
+
+/// A `config.toml` written while no backend was available is said to name
+/// none once one is, and is left as it is.
+#[test]
+fn init_says_when_its_config_names_no_backend_though_one_is_available() {
+    let (_dir, mut engine) = engine_with(vec![Box::new(FakeBackend::unavailable(
+        BackendKind::Seatbelt,
+        "a bad setting",
+    ))]);
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.default_backend, None);
+    assert!(!report.config_names_no_backend);
+    let written = engine.layout.read_config().unwrap();
+    engine.backends = vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))];
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
+    assert!(report.unavailable.is_empty());
+    assert!(report.config_names_no_backend);
+    assert_eq!(engine.layout.read_config().unwrap(), written);
 }
 
 #[test]

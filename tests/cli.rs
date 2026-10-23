@@ -3812,6 +3812,19 @@ fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
         said.contains("No backend is available on this host yet:\n  seatbelt: ENCLOS_SEATBELT_BASELINE is \"1\""),
         "{said}"
     );
+    // Said again at a later run, while the value stays.
+    let out = Run(home
+        .command(&["init"])
+        .env("ENCLOS_SEATBELT_BASELINE", "1")
+        .output()
+        .unwrap());
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("No backend is available on this host yet:\n  seatbelt: ENCLOS_SEATBELT_BASELINE is \"1\""),
+        "{}",
+        out.stdout()
+    );
     let out = home
         .piped(&["init"])
         .env("ENCLOS_SEATBELT_BASELINE", "1")
@@ -3826,6 +3839,14 @@ fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
             .unwrap()
             .contains("it takes `deny-default` or `allow-default`"),
         "{doc}"
+    );
+    // Once the value is gone, Seatbelt is available: init says the
+    // config written meanwhile names no default backend.
+    let said = home.run(&["init"]).ok().stdout();
+    assert!(!said.contains("No backend is available"), "{said}");
+    assert!(
+        said.contains("names no default backend, though seatbelt is available now"),
+        "{said}"
     );
 }
 
