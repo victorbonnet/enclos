@@ -350,7 +350,7 @@ impl Engine {
                                 Remedy::Manual(format!(
                                     "enclos does not keep the text it came from: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
                                     self.state.active_policy(name)?.map_or_else(
-                                        || record.template.clone(),
+                                        || record.created_from.clone(),
                                         |(_, snapshot)| snapshot.inputs.template
                                     )
                                 )),
