@@ -1,8 +1,10 @@
 //! The Seatbelt backend: macOS's sandbox, through `sandbox-exec` (ADR 0005).
-//! Milestone 1 compiles on the `(allow default)` baseline; ADR 0006 decides
-//! between it and `(deny default)` in milestone 2.
+//! Policies compile on the `(deny default)` baseline (ADR 0006); the
+//! `(allow default)` one milestone 1 used is kept only to compare the two on
+//! the escape probes.
 
 mod compile;
+pub use compile::baseline_env;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 mod wrap;

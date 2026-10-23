@@ -973,13 +973,19 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             .unwrap()
             .success()
     };
-    // The control: without the rule that refuses it, the extension opens
-    // `other`, so the route exists and this test can see it closed.
+    // The control: from `(allow default)` and without the rule that refuses
+    // it, the extension opens `other`, so the route exists and this test can
+    // see it closed. `(deny default)` refuses it too, as Apple's own
+    // `application.sb` does: the rule keeps it closed should the baseline
+    // ever be `(allow default)` again (ADR 0006).
     let text = std::fs::read_to_string(&w.compiled).unwrap();
     let without: String = text
         .lines()
         .filter(|l| !l.starts_with("(deny file-issue-extension"))
-        .map(|l| format!("{l}\n"))
+        .map(|l| match l.starts_with("(deny default") {
+            true => "(allow default)\n".to_owned(),
+            false => format!("{l}\n"),
+        })
         .collect();
     assert!(without.len() < text.len(), "no rule to remove");
     let open = w.base.join("without-the-rule.sb");

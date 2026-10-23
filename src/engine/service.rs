@@ -228,6 +228,7 @@ impl Engine {
                                     .env()
                                     .into_iter()
                                     .chain(self.secrets.env())
+                                    .chain(crate::backend::seatbelt::baseline_env())
                                     .collect(),
                                 stop_timeout: STOP_TIMEOUT,
                             })

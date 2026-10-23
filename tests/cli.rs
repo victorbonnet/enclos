@@ -3042,3 +3042,90 @@ fn a_secret_set_in_json_shows_no_value() {
     assert_eq!(doc["secrets"][0]["name"], "telegram", "{doc}");
     assert!(!out.stdout().contains("tok-123"));
 }
+
+/// ADR 0006's comparison: under the allow-by-default baseline enclos used
+/// before, every escape probe is closed as under deny by default, the
+/// host-service ones where CI asks for them, and a session runs a shell,
+/// Python, git and curl through the proxy under either.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_escape_probe_fails_under_allow_by_default_too() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    let mut args = vec!["policy", "test", "home"];
+    if host_services {
+        args.push("--host-services");
+    }
+    let out = Run(home
+        .command(&args)
+        .env("ENCLOS_SEATBELT_BASELINE", "allow-default")
+        .output()
+        .unwrap());
+    let report = out.stdout();
+    assert_eq!(out.code(), 0, "stdout: {report}\nstderr: {}", out.stderr());
+    let compiled = std::fs::read_dir(home.root.join("sandboxes/home/compiled"))
+        .unwrap()
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        compiled.iter().any(|c| c.contains("\n(allow default)\n")),
+        "no allow-by-default policy was compiled"
+    );
+    assert!(!report.contains("OPEN"), "{report}");
+    assert!(!report.contains("NOT RUN"), "{report}");
+    // The routes a new sandbox has; those that need files on the deny list
+    // or a second sandbox are in `every_escape_probe_fails_in_a_new_sandbox`.
+    let mut routes = vec![
+        "enclos files",
+        "writes",
+        "renames",
+        "clones",
+        "network",
+        "dns",
+        "signals",
+        "terminals",
+        "pasteboard",
+    ];
+    if host_services {
+        routes.extend([
+            "launchservices",
+            "apple events",
+            "launchd",
+            "preferences",
+            "launch agents",
+        ]);
+    }
+    for route in routes {
+        assert!(
+            report
+                .lines()
+                .any(|l| l.trim_start().starts_with("closed ") && l.contains(&format!(" {route} "))),
+            "no closed {route} probe:\n{report}"
+        );
+    }
+    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code}' http://example.com/";
+    for baseline in ["allow-default", "deny-default"] {
+        let out = Run(home
+            .command(&["exec", "home", "--", "/bin/sh", "-c", script])
+            .env("ENCLOS_SEATBELT_BASELINE", baseline)
+            .output()
+            .unwrap());
+        // The proxy allows example.com only once it is allowed; its refusal
+        // is a 403 from the proxy, still an answer through it.
+        assert!(
+            out.stdout().starts_with("hi\n2\n"),
+            "{baseline}: stdout: {}\nstderr: {}",
+            out.stdout(),
+            out.stderr()
+        );
+        assert!(
+            out.stdout().ends_with("200") || out.stdout().ends_with("403"),
+            "{baseline}: {}",
+            out.stdout()
+        );
+    }
+}

@@ -1,5 +1,6 @@
-//! Compiling a policy for Seatbelt (design §5): `(allow default)`,
-//! then writes only where granted, no terminal device but the session's own
+//! Compiling a policy for Seatbelt (design §5): `(deny default)` and what
+//! a sandbox may do on that baseline (ADR 0006), then writes only where
+//! granted, no terminal device but the session's own
 //! and those the sandbox opens, reads of the sandbox home, the sensitive
 //! deny list for reads and writes (after those allows, so no grant covers
 //! it), the writable folders that cannot move (so no rename or clone carries
@@ -20,6 +21,26 @@ use crate::model::sandbox::{BackendKind, PORT_FIRST, PORT_LAST};
 use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
 
 const HOST_SERVICES: &str = include_str!("host-services.sb");
+
+/// What a sandbox may do under `(deny default)` (ADR 0006).
+const DENY_DEFAULT: &str = include_str!("deny-default.sb");
+
+/// The variable that compiles every policy from `(allow default)` instead,
+/// as before ADR 0006: `allow-default`. For comparing the two baselines on
+/// the escape probes only, not a setting; read as each policy is compiled.
+pub const BASELINE_VAR: &str = "ENCLOS_SEATBELT_BASELINE";
+
+/// Whether [`BASELINE_VAR`] asks for the earlier, allow-by-default
+/// baseline.
+fn allow_by_default() -> bool {
+    std::env::var(BASELINE_VAR).is_ok_and(|v| v == "allow-default")
+}
+
+/// [`BASELINE_VAR`], when it asks for the allow-by-default baseline, for a
+/// service the service manager starts to compile its policy the same way.
+pub fn baseline_env() -> Option<(String, String)> {
+    allow_by_default().then(|| (BASELINE_VAR.to_owned(), "allow-default".to_owned()))
+}
 
 /// Device files every runtime writes to (shown by the prototype: shells,
 /// Python, Node and Hermes). `/dev/tty` is the terminal a session runs in,
@@ -83,7 +104,13 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
         ctx.name
     ));
     line("(version 1)".into());
-    line("(allow default)".into());
+    match allow_by_default() {
+        true => line("(allow default)".into()),
+        false => {
+            line(format!("(deny default (with message \"{tag}\"))"));
+            line(DENY_DEFAULT.trim_end().to_owned());
+        }
+    }
 
     line("\n;; ---- Writes: the sandbox home, granted workspaces and device files".into());
     line(format!("(deny file-write* (with message \"{tag}\"))"));
@@ -418,7 +445,15 @@ mod tests {
             text.find(needle)
                 .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
         };
-        assert!(at("(allow default)") < at("(deny file-write* (with message \"enclos:home\"))"));
+        assert!(
+            at("\n(deny default (with message \"enclos:home\"))\n")
+                < at("(deny file-write* (with message \"enclos:home\"))")
+        );
+        // No rule allows everything; comments may name that baseline.
+        assert!(
+            !text.lines().any(|l| l.trim() == "(allow default)"),
+            "{text}"
+        );
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/work\")"));
         assert!(text.contains("(subpath \"/nonexistent-enclos-test/alice/.ssh\")"));
         // One rule, `tcp`: not `ip`, which lets UDP through, nor `ip4`,

@@ -1,0 +1,41 @@
+;; ---- Deny by default (ADR 0006): what a sandbox may do
+;; Every rule after this block applies as it did on the earlier baseline:
+;; writes, terminals, the deny list, the network and the host services are
+;; narrowed there, so this block allows each operation broadly where those
+;; rules narrow it, and names each Mach service and shared memory one by one.
+;; Everything else is refused, with the sandbox's tag.
+
+;; Running programs, and reading: reads are broad (ADR 0015); the deny list
+;; below takes away what it names.
+(allow process-fork)
+(allow process-exec*)
+(allow file-read*)
+
+;; What a program asks of the kernel about itself and the host, read only.
+(allow sysctl-read)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+
+;; Controlling what a program has open, such as its terminal's size or
+;; dtrace's helper, which every program opens at start: only what the
+;; rules below let it open.
+(allow file-ioctl)
+
+;; Pseudo-terminals a program opens itself, through /dev/ptmx, as `script`,
+;; tmux or a shell tool does; the terminal rules below say which it may use.
+(allow pseudo-tty)
+
+;; Host services every program asks at start: notifications, logging, user
+;; and group records, the per-user temporary folder, the network settings.
+(allow mach-lookup
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.diagnosticd")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.SystemConfiguration.configd")
+  ;; Certificate trust, for TLS through the Security framework (Python's
+  ;; downloads fail with OSStatus -26276 without it).
+  (global-name "com.apple.trustd.agent"))
+(allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
