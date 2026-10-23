@@ -2640,6 +2640,8 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
         "{}",
         out.stdout()
     );
+    // `exec` starts the proxy: stopped when the test ends.
+    let _stop = StopOnDrop(&home, "home");
     home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
     let out = home.run(&["doctor"]);
     assert!(
