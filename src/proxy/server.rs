@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use super::Proxy;
 use super::decide::{Destination, allowed, validated};
+use super::hello::{self, FirstBytes};
 use super::request::{Request, origin_head, parse, read_head};
-use crate::model::net::{NetEvent, Reason, Verdict, destination};
+use crate::model::net::{NameSeen, NetEvent, Reason, Verdict, destination};
 use crate::model::now;
 
 /// How long a client has to send its whole request head.
@@ -112,6 +113,7 @@ impl Proxy {
             bytes_up: 0,
             bytes_down: 0,
             duration_ms: 0,
+            name_seen: None,
         };
         match self.open(&client, &mut event) {
             Err(reason) => {
@@ -137,9 +139,18 @@ impl Proxy {
                 if let Some(row) = row
                     && let Err(e) = self.log.finish(row, &event)
                 {
+                    // Its record says it was allowed and open: what became
+                    // of it is said here instead.
                     eprintln!(
-                        "enclos proxy: could not log the end of a connection to {}: {e}",
-                        event.host
+                        "enclos proxy: could not log the end of a connection to {}: {e}; it was {}{}, {} up, {} down",
+                        event.host,
+                        match event.verdict {
+                            Verdict::Allowed => "allowed",
+                            Verdict::Denied => "denied",
+                        },
+                        event.reason.map(|r| format!(" ({r})")).unwrap_or_default(),
+                        event.bytes_up,
+                        event.bytes_down,
                     );
                 }
             }
@@ -412,8 +423,10 @@ pub(super) fn interleaved(addrs: &[IpAddr]) -> Vec<IpAddr> {
 
 /// Sends upstream what the client asked for, then relays both ways until
 /// the connection ends or hits the idle limit: no byte moved either way, or
-/// a peer read nothing, for `limit`. Adds the bytes moved to `event`, and
-/// the reason `idle` when the proxy closed it for that.
+/// a peer read nothing, for `limit`. A tunnel's first bytes, those sent with
+/// its request included, are held for the server name check first. Adds to
+/// `event` the bytes moved, the reason `idle` when the proxy closed it for
+/// that, and what the check made of it.
 fn forward(
     client: &TcpStream,
     upstream: &TcpStream,
@@ -439,6 +452,9 @@ fn forward(
     // them, a plain-HTTP request's only its body, which `open` made sure
     // the head gives.
     let mut room = None;
+    // A tunnel's first bytes, held for the server name check: those the
+    // client sent with its request, to which `check_name` adds what follows.
+    let mut held = None;
     let mut first = match request {
         Request::Connect { .. } => {
             let mut client = client;
@@ -448,6 +464,7 @@ fn forward(
             {
                 return;
             }
+            held = Some(early.to_vec());
             Vec::new()
         }
         Request::Http {
@@ -481,17 +498,13 @@ fn forward(
     };
     // Sent with the head, past the body: the client is done already.
     let done = room.is_some_and(|room| early.len() as u64 > room);
-    let early = match &mut room {
-        Some(room) => {
-            let body = early
-                .len()
-                .min(usize::try_from(*room).unwrap_or(usize::MAX));
-            *room -= body as u64;
-            &early[..body]
-        }
-        None => early,
-    };
-    first.extend_from_slice(early);
+    if let Some(room) = &mut room {
+        let body = early
+            .len()
+            .min(usize::try_from(*room).unwrap_or(usize::MAX));
+        *room -= body as u64;
+        first.extend_from_slice(&early[..body]);
+    }
     let mut writer = upstream;
     if writer.write_all(&first).is_err() {
         return;
@@ -500,19 +513,100 @@ fn forward(
     if done {
         let _ = upstream.shutdown(Shutdown::Write);
     }
-    let relayed = relay(client, upstream, limit, unanswered.as_deref(), room);
+    let check = held.map(|held| NameCheck {
+        host: event.host.clone(),
+        held,
+    });
+    let relayed = relay(client, upstream, limit, unanswered.as_deref(), room, check);
     event.bytes_up += relayed.up;
     event.bytes_down += relayed.down;
     if relayed.went_idle {
         event.reason = Some(Reason::Idle);
     }
+    if let Some(checked) = relayed.checked {
+        if let Some(reason) = checked.refused {
+            event.verdict = Verdict::Denied;
+            event.reason = Some(reason);
+            // Said here too, so the proxy's log keeps it should its record
+            // not be written.
+            eprintln!(
+                "enclos proxy: closed a tunnel to {}: {}",
+                destination(&event.host, event.port),
+                match checked.seen.name() {
+                    Some(name) => format!("its TLS hello asks for {name} ({reason})"),
+                    None => format!("its TLS hello cannot be read ({reason})"),
+                }
+            );
+        }
+        event.name_seen = Some(checked.seen);
+    }
 }
 
-/// What a relay moved, and whether the proxy ended it for the idle limit.
+/// What a relay moved, whether the proxy ended it for the idle limit, and
+/// what the server name check made of the tunnel.
 struct Relayed {
     up: u64,
     down: u64,
     went_idle: bool,
+    checked: Option<Checked>,
+}
+
+/// The server name check of a tunnel (design §6): the host it was opened
+/// for, and the client's first bytes so far.
+struct NameCheck {
+    host: String,
+    held: Vec<u8>,
+}
+
+/// What the server name check made of a tunnel's first bytes, and why it
+/// closed the tunnel, when it did.
+struct Checked {
+    seen: NameSeen,
+    refused: Option<Reason>,
+}
+
+impl Checked {
+    /// What `hello`, read from the client's first bytes, says about a
+    /// tunnel opened for `host`; none while it is incomplete.
+    fn of(hello: FirstBytes, host: &str) -> Option<Checked> {
+        let checked = |seen, refused| Some(Checked { seen, refused });
+        match hello {
+            FirstBytes::Incomplete { .. } => None,
+            FirstBytes::NotTls => checked(NameSeen::NotTls, None),
+            FirstBytes::Unreadable => checked(NameSeen::Unreadable, Some(Reason::HelloUnreadable)),
+            // Compared whether or not the hello carries ECH: browsers send
+            // an ECH extension of no use (GREASE) with the name they ask for.
+            FirstBytes::ClientHello {
+                server_name: Some(name),
+                ..
+            } if hello::same_host(&name, host) => {
+                checked(NameSeen::Name(NameSeen::shown(&name)), None)
+            }
+            // Under ECH the name shown is the public name of the server
+            // that decrypts the real one, which is not the host: it is not
+            // compared, so a client that only claims ECH is not checked
+            // either (design §6).
+            FirstBytes::ClientHello {
+                server_name,
+                encrypted: true,
+            } => checked(
+                NameSeen::Encrypted {
+                    public: server_name.as_deref().map(NameSeen::shown),
+                },
+                None,
+            ),
+            FirstBytes::ClientHello {
+                server_name: Some(name),
+                ..
+            } => checked(
+                NameSeen::Name(NameSeen::shown(&name)),
+                Some(Reason::NameMismatch),
+            ),
+            FirstBytes::ClientHello {
+                server_name: None, ..
+            } => checked(NameSeen::NoName, None),
+        }
+    }
 }
 
 /// When bytes last moved through a connection, either way, as both copies
@@ -558,24 +652,63 @@ impl Activity {
 /// it hits the idle limit, both sides are closed, and a client that got no
 /// byte back is first sent `unanswered`, when given. At most `room` bytes
 /// go up, when given.
+///
+/// With `check`, the client's bytes go up only once its first ones show
+/// what server it asks for, and not at all when the check refuses them or
+/// never decides: both sides are then closed. A client done before it sent
+/// anything is as any client done. The server's bytes come down from the
+/// start, so a protocol in which the server speaks first works.
 fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
     limit: Duration,
     unanswered: Option<&str>,
     room: Option<u64>,
+    check: Option<NameCheck>,
 ) -> Relayed {
     let activity = Activity::new();
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            let moved = copy(client, upstream, &activity, limit, room);
-            let how = if activity.went_idle() {
+            // Whether the client's bytes go on up, and whether the client
+            // was done before the check could see anything.
+            let (checked, mut moved, go_on, done) = match check {
+                None => (None, 0, true, false),
+                Some(check) => match check_name(client, upstream, check, &activity, limit) {
+                    Held::Decided {
+                        checked,
+                        sent,
+                        passed,
+                    } => {
+                        let go_on = passed && checked.refused.is_none();
+                        (Some(checked), sent, go_on, false)
+                    }
+                    Held::ClientDone => (None, 0, false, true),
+                    Held::Stopped { held } => {
+                        let checked = held.then_some(Checked {
+                            seen: NameSeen::Incomplete,
+                            refused: None,
+                        });
+                        (checked, 0, false, false)
+                    }
+                },
+            };
+            if go_on {
+                moved += copy(client, upstream, &activity, limit, room);
+            }
+            // The server is told the client is done, and may still answer,
+            // unless the proxy ends the tunnel.
+            let refused = !(go_on || done);
+            let _ = upstream.shutdown(if activity.went_idle() || refused {
                 Shutdown::Both
             } else {
                 Shutdown::Write
-            };
-            let _ = upstream.shutdown(how);
-            moved
+            });
+            if refused {
+                // Ends the copy down too: nothing of this tunnel goes on. An
+                // idle one is ended below, once a plain-HTTP client was told.
+                let _ = client.shutdown(Shutdown::Both);
+            }
+            (moved, checked)
         });
         let down = match up {
             Ok(_) => copy(upstream, client, &activity, limit, None),
@@ -591,13 +724,126 @@ fn relay(
         }
         // Ends the client side too, which also ends the copy reading it.
         let _ = client.shutdown(Shutdown::Both);
-        let up = up.map_or(0, |up| up.join().unwrap_or(0));
+        let (up, checked) = match up {
+            Err(_) => (0, None),
+            Ok(up) => up.join().unwrap_or_else(|_| {
+                eprintln!("enclos proxy: the copy of a tunnel's bytes to its server failed");
+                (0, None)
+            }),
+        };
         Relayed {
             up,
             down,
             went_idle: activity.went_idle(),
+            checked,
         }
     })
+}
+
+/// How the server name check of a tunnel ended.
+enum Held {
+    /// It decided: what it made of the first bytes, how many of them went
+    /// up, and whether all that were to go did.
+    Decided {
+        checked: Checked,
+        sent: u64,
+        passed: bool,
+    },
+    /// The client was done before it sent anything.
+    ClientDone,
+    /// The client stopped, failed or went idle first; `held` says whether
+    /// it had sent anything, none of which went up.
+    Stopped { held: bool },
+}
+
+/// Reads the client's first bytes until they show what server it asks
+/// for, or [`hello::MAX_HELLO`] of them do not, and sends them upstream
+/// unless the check refuses them.
+fn check_name(
+    mut client: &TcpStream,
+    upstream: &TcpStream,
+    check: NameCheck,
+    activity: &Activity,
+    limit: Duration,
+) -> Held {
+    let NameCheck { host, mut held } = check;
+    let mut buf = [0u8; 16 * 1024];
+    // Read again only once as many bytes as it waits for have come.
+    let mut needed = 0;
+    loop {
+        if held.len() >= needed {
+            let hello = match hello::parse(&held) {
+                // One that would need more than the most held is unreadable
+                // now, not once that much came.
+                FirstBytes::Incomplete { needed }
+                    if needed > hello::MAX_HELLO || held.len() >= hello::MAX_HELLO =>
+                {
+                    FirstBytes::Unreadable
+                }
+                FirstBytes::Incomplete { needed: more } => {
+                    needed = more;
+                    FirstBytes::Incomplete { needed: more }
+                }
+                hello => hello,
+            };
+            if let Some(checked) = Checked::of(hello, &host) {
+                let mut sent = 0;
+                let mut passed = true;
+                if checked.refused.is_none()
+                    && let Err(e) = write_counted(upstream, &held, activity, &mut sent)
+                {
+                    // As in `copy`: a write that times out is a server that
+                    // stopped reading.
+                    if timed_out(&e) {
+                        activity.close_idle();
+                    }
+                    passed = false;
+                }
+                return Held::Decided {
+                    checked,
+                    sent,
+                    passed,
+                };
+            }
+        }
+        let stopped = Held::Stopped {
+            held: !held.is_empty(),
+        };
+        let quiet = activity.quiet();
+        if quiet >= limit {
+            activity.close_idle();
+            return stopped;
+        }
+        // As `copy` waits: at most until the connection would turn idle.
+        if let Err(e) = client.set_read_timeout(Some(limit - quiet))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
+            eprintln!("enclos proxy: cannot wait on the client of a tunnel to {host}: {e}");
+            return stopped;
+        }
+        // No more than the most it holds.
+        let room = hello::MAX_HELLO
+            .saturating_sub(held.len())
+            .clamp(1, buf.len());
+        match client.read(&mut buf[..room]) {
+            Ok(0) if held.is_empty() => return Held::ClientDone,
+            Ok(0) => return stopped,
+            Ok(read) => {
+                activity.moved();
+                held.extend_from_slice(&buf[..read]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted || timed_out(&e) => {}
+            Err(e) => {
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) {
+                    eprintln!("enclos proxy: lost the client of a tunnel to {host}: {e}");
+                }
+                return stopped;
+            }
+        }
+    }
 }
 
 /// Copies until the reader ends, either side fails, or the connection hits

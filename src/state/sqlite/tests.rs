@@ -276,6 +276,43 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
 }
 
 #[test]
+fn a_tunnel_closed_for_the_name_it_asks_for_is_denied_with_that_name() {
+    use crate::model::net::{NameSeen, NetEvent, Reason, Verdict};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let opened = NetEvent {
+        at: "2026-01-01T10:00:00Z".parse().unwrap(),
+        sandbox: name.clone(),
+        host: "api.example.com".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: Some("93.184.216.34".into()),
+        verdict: Verdict::Allowed,
+        reason: None,
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    let row = store.record(&opened).unwrap();
+    let closed = NetEvent {
+        verdict: Verdict::Denied,
+        reason: Some(Reason::NameMismatch),
+        name_seen: Some(NameSeen::Name("evil.example.com".into())),
+        duration_ms: 4,
+        ..opened
+    };
+    store.finish(row, &closed).unwrap();
+    assert_eq!(store.events(&name, None).unwrap(), [closed]);
+    let denied = store.denied(&name).unwrap();
+    assert_eq!(denied.len(), 1, "{denied:?}");
+    assert_eq!(denied[0].reason, Reason::NameMismatch);
+}
+
+#[test]
 fn a_secret_set_again_keeps_when_it_was_made_and_goes_with_its_sandbox() {
     use crate::model::audit::Actor;
     use crate::model::secret::SecretRef;
@@ -372,6 +409,7 @@ fn the_network_log_filters_by_time_and_groups_denials() {
         bytes_up: 1,
         bytes_down: 2,
         duration_ms: 3,
+        name_seen: Some(crate::model::net::NameSeen::Name(host.into())),
     };
     // Whole seconds and milliseconds mixed: the order must still be by time.
     for e in [
