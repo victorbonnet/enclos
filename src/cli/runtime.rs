@@ -38,7 +38,7 @@ enum RuntimeVerb {
         #[arg(long)]
         channel: Channel,
         /// The variable the policy grants the bot's token as; the
-        /// channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
+        /// channel's usual one (TELEGRAM_TOKEN) when left out.
         #[arg(long, value_name = "VAR")]
         token_env: Option<String>,
         /// Someone the bot answers: a Telegram user's numeric id; give it

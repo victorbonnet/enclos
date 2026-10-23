@@ -3712,9 +3712,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 .unwrap(),
         );
         let before = lab.engine.layout.read_policy("home").unwrap();
-        let after = format!(
-            "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
-        );
+        let after =
+            format!("{before}\n[secrets]\nenv = {{ TELEGRAM_TOKEN = \"secret:home/telegram\" }}\n");
         lab.engine
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
             .unwrap();
@@ -3724,7 +3723,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         };
         assert_eq!(plan.changes.len(), 3, "{plan:?}");
         assert!(
-            plan.changes[1].contains("platforms.telegram.token '${TELEGRAM_BOT_TOKEN}'"),
+            plan.changes[1].contains("platforms.telegram.token '${TELEGRAM_TOKEN}'"),
             "{plan:?}"
         );
         assert!(!calls().contains("config set"), "{}", calls());
@@ -3735,7 +3734,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .map(|u| u.parse().unwrap())
             .collect();
         let set = done(configure(&twice, Confirm::Yes).unwrap());
-        assert_eq!(set.token, "TELEGRAM_BOT_TOKEN");
+        assert_eq!(set.token, "TELEGRAM_TOKEN");
         assert_eq!(set.answers, users);
         assert!(
             set.reachable,
@@ -3744,7 +3743,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         // Who it answers first, the bot turned on last.
         assert!(
             calls().ends_with(
-                "-p default config set TELEGRAM_ALLOWED_USERS 111,222\n-p default config set platforms.telegram.token ${TELEGRAM_BOT_TOKEN}\n-p default config set platforms.telegram.enabled true\n"
+                "-p default config set TELEGRAM_ALLOWED_USERS 111,222\n-p default config set platforms.telegram.token ${TELEGRAM_TOKEN}\n-p default config set platforms.telegram.enabled true\n"
             ),
             "{}",
             calls()
@@ -3764,8 +3763,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         // token is refused for what it is.
         let before = lab.engine.layout.read_policy("home").unwrap();
         let after = before.replace(
-            "TELEGRAM_BOT_TOKEN = ",
-            "TELEGRAM_BOT_TOKEN_MAIN = \"secret:home/telegram\", TELEGRAM_BOT_TOKEN = ",
+            "TELEGRAM_TOKEN = ",
+            "TELEGRAM_BOT_TOKEN_MAIN = \"secret:home/telegram\", TELEGRAM_TOKEN = ",
         );
         lab.engine
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
@@ -3861,9 +3860,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         session.compiled = Some("/compiled/at-launch.sb".into());
         super::sandbox::put(&lab.engine, &session);
         let before = lab.engine.layout.read_policy("home").unwrap();
-        let after = format!(
-            "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
-        );
+        let after =
+            format!("{before}\n[secrets]\nenv = {{ TELEGRAM_TOKEN = \"secret:home/telegram\" }}\n");
         lab.engine
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Ask)
             .unwrap();
