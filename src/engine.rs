@@ -20,6 +20,7 @@ mod sandbox;
 mod secrets;
 mod service;
 mod session;
+mod state_check;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,7 @@ pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
+pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
     RuntimeStatus, SandboxStatus, ServiceLine, ServiceState, StatusView, Suggestion, Unlisted,
@@ -303,6 +305,20 @@ impl Engine {
         summary: impl FnOnce(&T) -> String,
         work: impl FnOnce(&StateLock) -> Result<T>,
     ) -> Result<T> {
+        self.write_with_outcome(by, command, target, |v| Outcome::ok(summary(v)), work)
+    }
+
+    /// As [`Engine::write`], with the entry's outcome made from what the work
+    /// returns: for a command that can partly fail and still report, such as
+    /// `state repair`.
+    fn write_with_outcome<T>(
+        &self,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        outcome: impl FnOnce(&T) -> Outcome,
+        work: impl FnOnce(&StateLock) -> Result<T>,
+    ) -> Result<T> {
         let lock = self.state.lock()?;
         let intent = Intent {
             by: by.clone(),
@@ -312,7 +328,7 @@ impl Engine {
         let ticket = self.audit.begin(&lock, intent)?;
         match work(&lock) {
             Ok(value) => {
-                self.audit.finish(ticket, Outcome::ok(summary(&value)))?;
+                self.audit.finish(ticket, outcome(&value))?;
                 Ok(value)
             }
             Err(error) => {

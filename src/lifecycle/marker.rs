@@ -24,10 +24,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::session::ProcessRef;
 
-/// `lsof` could not say which processes hold the markers.
+/// Which processes hold the markers could not be told.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("cannot look at the sandbox's markers with /usr/sbin/lsof: {0}")]
-pub struct MarkerError(String);
+pub enum MarkerError {
+    /// The sandbox's markers' folder could not be looked at.
+    #[error("cannot look at the sandbox's markers in {0}")]
+    Folder(String),
+    /// `lsof` could not run or answer: for every sandbox alike.
+    #[error("cannot look at the sandbox's markers with /usr/sbin/lsof: {0}")]
+    Lsof(String),
+}
 
 /// A marker made for a program about to start, not yet held by it.
 pub struct Marker {
@@ -125,7 +131,7 @@ pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerErro
     // No folder yet is no marker; a folder that cannot be read is not.
     match std::fs::metadata(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(MarkerError(format!("{}: {e}", dir.display()))),
+        Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
         Ok(_) => {}
     }
     // `-w`: a warning about another file system (an unreachable network
@@ -136,7 +142,7 @@ pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerErro
         .arg(dir)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| MarkerError(e.to_string()))?;
+        .map_err(|e| MarkerError::Lsof(e.to_string()))?;
     parse(&out)
 }
 
@@ -150,7 +156,7 @@ fn parse(out: &Output) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
         (Some(1), true, true) => return Ok(BTreeMap::new()),
         (Some(0), false, _) | (Some(1), false, true) => {}
-        _ => return Err(MarkerError(format!("{}: {why}", out.status))),
+        _ => return Err(MarkerError::Lsof(format!("{}: {why}", out.status))),
     }
     let mut held: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
     let mut pid = None;
@@ -158,7 +164,7 @@ fn parse(out: &Output) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
         if let Some(p) = line.strip_prefix('p') {
             pid = Some(
                 p.parse::<u32>()
-                    .map_err(|_| MarkerError(format!("unexpected process `{p}`")))?,
+                    .map_err(|_| MarkerError::Lsof(format!("unexpected process `{p}`")))?,
             );
         } else if let Some(name) = line.strip_prefix('n') {
             let file = Path::new(name)

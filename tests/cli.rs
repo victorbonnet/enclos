@@ -2670,3 +2670,86 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
     );
     assert!(!home.root.join("sandboxes/lab").exists());
 }
+
+/// `state check` finds nothing in a new sandbox, names what differs once a
+/// file is gone, and `state repair` puts it back.
+#[cfg(target_os = "macos")]
+#[test]
+fn state_check_and_repair_compare_the_records_with_the_host() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let out = home.run(&["state", "check"]);
+    assert!(
+        out.ok().stdout().contains("match the host"),
+        "{}",
+        out.stdout()
+    );
+    let policy = home.root.join("sandboxes/home/policy.toml");
+    let text = std::fs::read_to_string(&policy).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    let out = home.run(&["state", "check", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout().contains("repair: write policy.toml again"),
+        "{}",
+        out.stdout()
+    );
+    // The repair said is that sandbox's alone.
+    assert!(
+        out.stdout().contains("`enclos state repair home` fixes"),
+        "{}",
+        out.stdout()
+    );
+    let out = home.run(&["state", "repair", "--dry-run"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("would repair: write policy.toml again"),
+        "{}",
+        out.stdout()
+    );
+    assert!(!policy.exists());
+    let out = home.run(&["state", "repair"]);
+    assert!(
+        out.ok().stdout().contains("home: its ")
+            && out
+                .stdout()
+                .contains("  repaired: write policy.toml again from the text its active policy"),
+        "{}",
+        out.stdout()
+    );
+    assert_eq!(std::fs::read_to_string(&policy).unwrap(), text);
+    home.run(&["state", "check"]).ok();
+
+    // What is left for a person is named, by a dry run too, and exits 1.
+    std::fs::remove_dir_all(home.root.join("sandboxes/home/home")).unwrap();
+    for args in [&["state", "repair", "--dry-run"][..], &["state", "repair"]] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 1, "{args:?}: {}", out.stdout());
+        assert!(
+            out.stdout().contains("  for you: `mkdir "),
+            "{}",
+            out.stdout()
+        );
+    }
+    let out = home.run(&["state", "check", "nosuch"]);
+    assert_eq!(out.code(), 1);
+    assert!(!out.stdout().contains("match the host"), "{}", out.stdout());
+
+    // A repair that fails is said so, and exits 1.
+    std::fs::create_dir(home.root.join("sandboxes/home/home")).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    let dir = home.root.join("sandboxes/home");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = home.run(&["state", "repair"]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout()
+            .contains("  repair failed: write policy.toml again"),
+        "{}",
+        out.stdout()
+    );
+    assert!(!out.stdout().contains("repaired:"), "{}", out.stdout());
+}
