@@ -26,10 +26,6 @@ pub fn run(engine: &Engine) -> Result<u8> {
 /// The report as JSON.
 fn json(doctor: &Doctor) -> serde_json::Value {
     use serde_json::json;
-    let probe = |p: &Probe| match p {
-        Probe::Available => json!({"ok": true}),
-        Probe::Unavailable { reason } => json!({"ok": false, "reason": reason}),
-    };
     let enforced = |e: &Enforcement| match e {
         Enforcement::Enforced => json!({"enforced": "yes"}),
         Enforcement::Partial { note } => json!({"enforced": "partly", "note": note}),
@@ -42,8 +38,17 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             let c = &b.capabilities;
             json!({
                 "kind": b.kind.to_string(),
-                "found": probe(&b.found),
-                "runs": b.runs.as_ref().map(probe),
+                "state": match &b.state {
+                    BackendState::NotFound { .. } => "not_found",
+                    BackendState::Refuses { .. } => "refuses",
+                    BackendState::Runs => "runs",
+                },
+                "reason": match &b.state {
+                    BackendState::NotFound { reason } | BackendState::Refuses { reason } => {
+                        Some(reason)
+                    }
+                    BackendState::Runs => None,
+                },
                 "capabilities": {
                     "files": enforced(&c.fs),
                     "network": enforced(&c.network),
@@ -73,11 +78,14 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     version,
                     ran,
                     error,
+                    running,
                 } => json!({
                     "kind": "no_longer_compiles",
                     "version": version,
                     "ran": super::output::path(ran),
                     "error": error,
+                    "running_sessions": running.count,
+                    "running_unsure": running.unsure,
                 }),
                 Drift::Changed(c) => json!({
                     "kind": match c.edited {
@@ -87,18 +95,27 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     "version": c.version,
                     "ran": super::output::path(&c.ran),
                     "now": super::output::path(&c.now),
-                    "lines": c.lines.as_ref().map(|lines| lines.iter().map(|l| match l {
-                        LineChange::Removed(l) => json!({"removed": l}),
-                        LineChange::Added(l) => json!({"added": l}),
-                    }).collect::<Vec<_>>()),
-                    "running_sessions": c.running,
+                    "lines": match &c.lines {
+                        Lines::Changed(lines) => Some(lines.iter().map(|l| match l {
+                            LineChange::Removed(l) => json!({"removed": l}),
+                            LineChange::Added(l) => json!({"added": l}),
+                        }).collect::<Vec<_>>()),
+                        Lines::FileGone | Lines::TooLong => None,
+                    },
+                    "lines_not_shown": match &c.lines {
+                        Lines::Changed(_) => None,
+                        Lines::FileGone => Some("file_gone"),
+                        Lines::TooLong => Some("too_long"),
+                    },
+                    "running_sessions": c.running.count,
+                    "running_unsure": c.running.unsure,
                 }),
             })
             .collect();
         json!({
             "name": s.name.to_string(),
             "backend": s.backend.to_string(),
-            "backend_runs": s.backend_runs,
+            "backend_runs": s.backend_runs(),
             "next_session": next,
             "last_version": s.last_version,
             "drift": drift,
