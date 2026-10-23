@@ -114,15 +114,17 @@ pub struct Launch {
 }
 
 /// `command` run under `limits`, which every process it starts inherits:
-/// `/bin/sh` sets them with `ulimit`, hard and soft alike, so nothing in the
-/// sandbox can raise them, then becomes the program. As it is when no limit
-/// is set.
+/// `/bin/bash` sets them with `ulimit`, hard and soft alike, so nothing in
+/// the sandbox can raise them, then becomes the program. Bash, not
+/// `/bin/sh`, which macOS lets an administrator point at dash, whose
+/// `ulimit -f` counts in another unit. As it is when no limit is set.
 pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) -> Command {
     let mut set = Vec::new();
     if let Some(files) = limits.open_files {
         set.push(format!("ulimit -n {files}"));
     }
-    // In KiB, the unit of /bin/sh's `ulimit -f` (shown on macOS 26.5.2).
+    // In KiB, the unit of bash's `ulimit -f` (shown on macOS 26.5.2): the
+    // validation takes only whole KiB.
     if let Some(size) = limits.file_size {
         set.push(format!("ulimit -f {}", size.0 / 1024));
     }
@@ -133,7 +135,7 @@ pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) 
         return command;
     }
     set.push("exec \"$0\" \"$@\"".to_owned());
-    let mut limited = Command::new("/bin/sh");
+    let mut limited = Command::new("/bin/bash");
     limited
         .arg("-c")
         .arg(set.join(" && "))
@@ -189,7 +191,7 @@ mod limits_tests {
             ..Default::default()
         };
         let limited = under_limits(program, &limits);
-        assert_eq!(limited.get_program(), "/bin/sh");
+        assert_eq!(limited.get_program(), "/bin/bash");
         let args: Vec<_> = limited.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
             args,

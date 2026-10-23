@@ -263,8 +263,10 @@ impl Engine {
     }
 
     /// Every check a policy passes before it is stored, whichever command
-    /// stores it: its paths as they are now, the secrets it grants, and
-    /// that each of those is set.
+    /// stores it: its paths as they are now, the secrets it grants, that
+    /// each of those is set, and its limits against the sandbox's backend
+    /// (`sandbox create`, before the sandbox has a record, checks those
+    /// against the backend it is given).
     pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;

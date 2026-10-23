@@ -42,7 +42,7 @@ pub struct Resources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_size: Option<ByteSize>,
     /// The most CPU time a process uses, in seconds, after which it is
-    /// stopped.
+    /// stopped (macOS sends it SIGXCPU).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_seconds: Option<u64>,
     /// A memory limit, as written.
@@ -59,11 +59,30 @@ impl Resources {
     }
 }
 
-/// A size in bytes, written `1048576`, `512K`, `100M` or `2G` (powers of
-/// 1024).
+/// A size in bytes, written `1048576` (a number or text), `512K`, `100M`
+/// or `2G` (powers of 1024).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
+#[serde(try_from = "SizeText", into = "String")]
 pub struct ByteSize(pub u64);
+
+/// How a size is written: a number of bytes, or text.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SizeText {
+    Bytes(u64),
+    Text(String),
+}
+
+impl TryFrom<SizeText> for ByteSize {
+    type Error = InvalidByteSize;
+
+    fn try_from(size: SizeText) -> Result<Self, Self::Error> {
+        match size {
+            SizeText::Bytes(bytes) => Ok(ByteSize(bytes)),
+            SizeText::Text(text) => text.parse(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("`{0}` is not a size: write a number of bytes, or one ending in K, M or G, such as `512M`")]

@@ -2400,9 +2400,10 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
 }
 
-/// A `[resources]` section holds every process of the sandbox to its
-/// limits, which none can raise, and `policy test` shows each; a limit
-/// Seatbelt cannot enforce is refused.
+/// A `[resources]` section holds a sandbox's sessions to its limits: in
+/// them `ulimit` shows each, a write past the size and a process past its
+/// CPU time are stopped, the open-file limit cannot be raised, and `policy
+/// test` shows each closed; a limit Seatbelt cannot enforce is refused.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_runs_under_the_limits_its_policy_sets() {
@@ -2471,9 +2472,9 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
     let out = home.run(&["policy", "test", "home"]);
     let report = out.stdout();
     for probe in [
-        "hold more than 64 files open",
-        "write a file past 1024 KiB",
-        "use more than 600 s of CPU",
+        "have a hard limit above 64 open files",
+        "have a hard limit above 1024 KiB per file",
+        "have a hard limit above 600 s of CPU",
     ] {
         assert!(
             report
@@ -2482,4 +2483,25 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
             "{probe} is not shown closed:\n{report}"
         );
     }
+
+    // Past its CPU time, a process is stopped: a second of it here.
+    let before = std::fs::read_to_string(home.root.join("sandboxes/home/policy.toml")).unwrap();
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "sed -i '' 's/cpu_seconds = 600/cpu_seconds = 1/' \"$1\"",
+        ),
+    );
+    Run(edit.output().unwrap()).ok();
+    assert_ne!(
+        std::fs::read_to_string(home.root.join("sandboxes/home/policy.toml")).unwrap(),
+        before
+    );
+    let started = std::time::Instant::now();
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "while :; do :; done"]);
+    // SIGXCPU, as a shell reports it: 128 + 24.
+    assert_eq!(out.code(), 152, "{}", out.stderr());
+    assert!(started.elapsed() < Duration::from_secs(20));
 }

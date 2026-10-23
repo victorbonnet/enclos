@@ -88,26 +88,30 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
     ] {
         if value == Some(0) {
             problems.push(Problem::Malformed(format!(
-                "resources.{name}: 0 would stop every program; set at least 1, or leave it out"
+                "resources.{name}: 0 would leave the sandbox unusable; set at least 1, or leave it out"
             )));
         }
     }
-    // `ulimit -f` counts in KiB: a smaller limit would be none at all.
-    if r.file_size.is_some_and(|s| (1..1024).contains(&s.0)) {
-        problems.push(Problem::Malformed(
-            "resources.file_size: set at least 1K".to_owned(),
-        ));
+    // `ulimit -f` counts in KiB: a size of no whole KiB could only be cut,
+    // and one under 1K would become `ulimit -f 0`, stopping every write.
+    if r.file_size
+        .is_some_and(|s| s.0 != 0 && !s.0.is_multiple_of(1024))
+    {
+        problems.push(Problem::Malformed(format!(
+            "resources.file_size = {}: write a whole number of KiB, such as `512K` or `1G`",
+            r.file_size.expect("set")
+        )));
     }
     match backend {
         BackendKind::Seatbelt => {
             if let Some(memory) = &r.memory {
                 problems.push(Problem::Refused(format!(
-                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process (shown on macOS 26.5.2); leave it out. Linux's backend will hold one"
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process (shown on macOS 26.5.2); leave it out. Linux's backend is designed to hold one"
                 )));
             }
             if let Some(cpu) = &r.cpu {
                 problems.push(Problem::Refused(format!(
-                    "resources.cpu = {cpu}: the Seatbelt backend cannot hold a sandbox to a share of the CPU, which macOS has no means for; `cpu_seconds` limits each process's CPU time instead"
+                    "resources.cpu = {cpu}: the Seatbelt backend cannot hold a sandbox to a share of the CPU, for which enclos has no means on macOS; `cpu_seconds` limits each process's CPU time instead"
                 )));
             }
         }
@@ -340,6 +344,14 @@ mod tests {
         let zero = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
         assert!(!zero.is_refused(), "{zero}");
         policy.resources.open_files = None;
+        // Sizes are whole KiB: `ulimit -f` takes nothing smaller.
+        for bytes in [1500, 512] {
+            policy.resources.file_size = Some(crate::model::policy::ByteSize(bytes));
+            let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+            assert!(err.to_string().contains("whole number of KiB"), "{err}");
+        }
+        policy.resources.file_size = Some(crate::model::policy::ByteSize(2048));
+        assert!(validate_resources(&policy, BackendKind::Seatbelt).is_ok());
         for (memory, cpu) in [(Some("2G"), None), (None, Some("2.0"))] {
             policy.resources.memory = memory.map(str::to_owned);
             policy.resources.cpu = cpu.map(str::to_owned);
