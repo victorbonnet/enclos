@@ -1,9 +1,11 @@
 //! `enclos doctor` (design §10): whether this host can run each backend,
-//! whether each sandbox's next session can start, and which files its
+//! whether each sandbox's next session can compile its policy (not whether
+//! `sandbox-exec` then accepts what it compiles to), and which files its
 //! sessions ran under its policy now compiles differently from. Compiled
-//! policies are kept by their content, so an upgrade that changes enclos's
-//! own rules writes a new file at the next session start, without asking
-//! (ADR 0018); this is where that change is shown.
+//! policies are kept by their content, so an upgrade that changes what
+//! enclos adds when it compiles a policy writes a new file at the next
+//! session start, without asking (ADR 0018); this is where that change is
+//! shown.
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -11,6 +13,7 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use super::Engine;
+use super::compile::compiled_stem;
 use super::session::marked_in;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
@@ -19,13 +22,12 @@ use crate::lifecycle::members::is_gone;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
 use crate::model::session::SessionRecord;
-use crate::policy::sha256_hex;
 use crate::state::StateError;
 
 /// What `enclos doctor` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Doctor {
-    /// Every backend this build has, in order of preference.
+    /// Every backend this build has.
     pub backends: Vec<BackendCheck>,
     pub sandboxes: Sandboxes,
 }
@@ -103,40 +105,45 @@ pub enum NextSession {
     Fails { error: String },
     /// Not compiled: its backend does not run here.
     NotChecked,
-    /// Not compiled: enclos could not look, as its `unreadable` says.
-    Unknown,
+    /// Not compiled: enclos could not read or compile its active policy,
+    /// for another reason than the policy itself, as `why` says.
+    Unknown { why: String },
 }
 
-/// A file a session ran under that its policy version compiles differently
-/// from now.
+/// A file a session ran under, `ran`, that its policy version `version`
+/// compiles differently from now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Drift {
-    Changed(CompiledChange),
-    /// The version no longer compiles at all; its next session is the
-    /// active version's, checked apart.
-    NoLongerCompiles {
-        version: u32,
-        ran: PathBuf,
-        error: String,
-        running: Running,
-    },
-}
-
-/// Policy version `version` compiled now, against the file `ran` a session
-/// ran under. A different text is enclos's own rules changed, as an upgrade
-/// changes them, or a path the policy names now resolving elsewhere.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledChange {
+pub struct Drift {
     pub version: u32,
     pub ran: PathBuf,
-    /// The file `version` compiles to now.
-    pub now: PathBuf,
-    /// `ran` no longer holds the text its name, a digest, was made from: it
-    /// was changed after it was written. Said whether or not it now matches
-    /// what `version` compiles to.
-    pub edited: bool,
-    pub lines: Lines,
     pub running: Running,
+    pub kind: DriftKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriftKind {
+    /// It compiles to `now`, which is not what `ran` holds: what enclos adds
+    /// when it compiles a policy changed, as an upgrade changes it, or a
+    /// path the policy names resolves elsewhere now.
+    Changed { now: PathBuf, ran_file: RanFile },
+    /// It no longer compiles, or no longer passes enclos's write checks;
+    /// the next session is the active version's, checked apart.
+    NoLongerCompiles { error: String },
+}
+
+/// The file a session ran under, as found now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RanFile {
+    /// No longer there to compare: the version compiles to a file of
+    /// another name.
+    Gone,
+    There {
+        /// It no longer holds the text its name, a digest, was made from:
+        /// it was changed after it was written. Said whether or not it now
+        /// matches what the version compiles to.
+        edited: bool,
+        lines: Lines,
+    },
 }
 
 /// What changed between the file a session ran under and the text of now.
@@ -144,8 +151,6 @@ pub struct CompiledChange {
 pub enum Lines {
     /// The lines removed and added, in order.
     Changed(Vec<LineChange>),
-    /// The file it ran under is no longer there to compare.
-    FileGone,
     /// One of the two has more than [`MAX_LINES`] lines: not compared line
     /// by line.
     TooLong,
@@ -177,11 +182,15 @@ impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
     /// enclos's records cannot be read, or a sandbox's backend does not
     /// run, its next session cannot compile its policy, or enclos could not
-    /// look at all of it. A drift is reported, not a problem.
+    /// look at all of it. A compiled policy that changed is reported, not a
+    /// problem.
     pub fn has_problems(&self) -> bool {
         let sandbox = |s: &SandboxCheck| {
             !s.backend_runs()
-                || matches!(s.next, NextSession::Fails { .. })
+                || matches!(
+                    s.next,
+                    NextSession::Fails { .. } | NextSession::Unknown { .. }
+                )
                 || !s.unreadable.is_empty()
         };
         !self.backends.iter().any(BackendCheck::runs_here)
@@ -255,8 +264,10 @@ impl Engine {
         let mut check = SandboxCheck {
             name: name.clone(),
             backend: record.backend,
+            // First, and whatever else cannot be read: it needs only the
+            // active policy.
             next: match backend_runs {
-                true => NextSession::Unknown,
+                true => self.next_session(record),
                 false => NextSession::NotChecked,
             },
             last_version: None,
@@ -279,29 +290,6 @@ impl Engine {
         check.last_version = last.map(|s| s.version);
         if !backend_runs {
             return check;
-        }
-        // The policy read once, so that the version said is the one
-        // compiled.
-        match self.policy(name) {
-            Ok(view) => match self.compiled_for(name, &view.snapshot.policy, record.proxy_port) {
-                Ok((file, _)) => {
-                    check.next = NextSession::Compiles {
-                        version: view.version.version,
-                        file,
-                    }
-                }
-                Err(error) if is_compile_failure(&error) => {
-                    check.next = NextSession::Fails {
-                        error: error.to_string(),
-                    }
-                }
-                Err(error) => check
-                    .unreadable
-                    .push(format!("cannot compile its active policy: {error}")),
-            },
-            Err(e) => check
-                .unreadable
-                .push(format!("cannot read its active policy: {e}")),
         }
 
         // The files to compare: the last session's, and those of sessions
@@ -362,10 +350,42 @@ impl Engine {
         check
     }
 
+    /// Whether the sandbox's next session can compile its active policy,
+    /// read once, so that the version said is the one compiled.
+    fn next_session(&self, record: &SandboxRecord) -> NextSession {
+        let name = &record.name;
+        let view = match self.policy(name) {
+            Ok(view) => view,
+            // No active policy: no session can start.
+            Err(error) if is_compile_failure(&error) => {
+                return NextSession::Fails {
+                    error: error.to_string(),
+                };
+            }
+            Err(e) => {
+                return NextSession::Unknown {
+                    why: format!("cannot read its active policy: {e}"),
+                };
+            }
+        };
+        match self.compiled_for(name, &view.snapshot.policy, record.proxy_port) {
+            Ok((file, _)) => NextSession::Compiles {
+                version: view.version.version,
+                file,
+            },
+            Err(error) if is_compile_failure(&error) => NextSession::Fails {
+                error: error.to_string(),
+            },
+            Err(e) => NextSession::Unknown {
+                why: format!("cannot compile its active policy: {e}"),
+            },
+        }
+    }
+
     /// Policy version `version` compiled again, against the file `ran` a
-    /// session ran under: none when they match. Only a compile that fails
-    /// is a version that no longer compiles: a home gone, or a policy that
-    /// no longer passes its checks, is not compared, and its next session
+    /// session ran under: none when they match. A compile that fails, or
+    /// write paths that no longer pass their checks, are a version that no
+    /// longer compiles; a home gone is not compared, and its next session
     /// says it apart.
     fn drift(
         &self,
@@ -381,21 +401,32 @@ impl Engine {
                 "it is not recorded: `enclos state check {name}` looks at its records"
             ));
         };
+        let no_longer = |error: String| Drift {
+            version,
+            ran: ran.clone(),
+            running,
+            kind: DriftKind::NoLongerCompiles { error },
+        };
         let (now, text) = match self.compiled_for(name, &snapshot.policy, record.proxy_port) {
             Ok(compiled) => compiled,
-            Err(error @ Error::Compile(_)) => {
-                return Ok(Some(Drift::NoLongerCompiles {
-                    version,
-                    ran,
-                    error: error.to_string(),
-                    running,
-                }));
+            Err(error @ Error::Compile(_)) => return Ok(Some(no_longer(error.to_string()))),
+            // Said of this version, not of the active policy the error
+            // names.
+            Err(Error::ActivePolicyInvalid { source, .. }) => {
+                return Ok(Some(no_longer(format!(
+                    "its write paths no longer pass enclos's checks: {source}"
+                ))));
             }
             Err(error) => return Err(error.to_string()),
         };
-        let before = match std::fs::read(&ran) {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-            Err(e) if e.kind() == ErrorKind::NotFound => None,
+        let ran_file = match std::fs::read(&ran) {
+            // By its name once the file is gone.
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if ran.file_name() == now.file_name() {
+                    return Ok(None);
+                }
+                RanFile::Gone
+            }
             Err(source) => {
                 return Err(LayoutError::Io {
                     path: ran.clone(),
@@ -403,32 +434,27 @@ impl Engine {
                 }
                 .to_string());
             }
+            Ok(bytes) => {
+                // A compiled file is named after the digest of what was
+                // written: one whose content is not its name's was changed
+                // since.
+                let edited = ran.file_stem().and_then(|s| s.to_str())
+                    != Some(compiled_stem(&bytes).as_str());
+                if bytes == text.as_bytes() && !edited {
+                    return Ok(None);
+                }
+                RanFile::There {
+                    edited,
+                    lines: lines_between(&String::from_utf8_lossy(&bytes), &text),
+                }
+            }
         };
-        // A compiled file is named after the digest of what was written:
-        // one whose content is not its name's was changed since.
-        let edited = before.as_ref().is_some_and(|before| {
-            let digest = sha256_hex(before.as_bytes());
-            ran.file_stem().and_then(|s| s.to_str()) != Some(&digest[..16])
-        });
-        // By content while the file is there; else by its name.
-        let same = match &before {
-            Some(before) => *before == text,
-            None => ran.file_name() == now.file_name(),
-        };
-        if same && !edited {
-            return Ok(None);
-        }
-        Ok(Some(Drift::Changed(CompiledChange {
+        Ok(Some(Drift {
             version,
-            edited,
-            lines: match before {
-                Some(before) => lines_between(&before, &text),
-                None => Lines::FileGone,
-            },
             ran,
-            now,
             running,
-        })))
+            kind: DriftKind::Changed { now, ran_file },
+        }))
     }
 }
 

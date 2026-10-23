@@ -96,11 +96,11 @@ impl Engine {
         self.check_before_compile(name, policy)?;
         let ctx = self.sandbox_context(name, proxy_port);
         let compiled = backend.compile(policy, &ctx)?;
-        let digest = sha256_hex(compiled.text.as_bytes());
-        let file =
-            ctx.dir
-                .join("compiled")
-                .join(format!("{}.{}", &digest[..16], compiled.extension));
+        let file = ctx.dir.join("compiled").join(format!(
+            "{}.{}",
+            compiled_stem(compiled.text.as_bytes()),
+            compiled.extension
+        ));
         Ok((file, compiled.text))
     }
 
@@ -135,6 +135,13 @@ impl Engine {
             }
         })
     }
+}
+
+/// The name of the file a compiled policy's `text` is kept in, before its
+/// extension: the start of the digest of its bytes, so that the same text
+/// is the same file, and a file whose bytes are not its name's was changed.
+pub(super) fn compiled_stem(text: &[u8]) -> String {
+    sha256_hex(text)[..16].to_owned()
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error {

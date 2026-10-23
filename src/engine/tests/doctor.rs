@@ -1,6 +1,6 @@
 //! `enclos doctor` (design §10): whether the host runs each backend, whether
-//! each sandbox's next session can start, and which files its sessions ran
-//! under its policy now compiles differently from (ADR 0018).
+//! each sandbox's next session can compile its policy, and which files its
+//! sessions ran under its policy now compiles differently from (ADR 0018).
 
 use std::path::PathBuf;
 
@@ -8,7 +8,8 @@ use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, gone_process, put, session_of};
 use super::*;
 use crate::engine::{
-    BackendState, Doctor, Drift, LineChange, Lines, NextSession, Running, SandboxCheck, Sandboxes,
+    BackendState, Doctor, DriftKind, LineChange, Lines, NextSession, RanFile, Running,
+    SandboxCheck, Sandboxes,
 };
 use crate::model::sandbox::SandboxName;
 use crate::model::session::SessionRecord;
@@ -31,8 +32,8 @@ fn compiled_now(engine: &Engine, name: &SandboxName) -> PathBuf {
 }
 
 /// A file this sandbox's policy compiled to under an earlier enclos, named
-/// by its own digest: the rules of now, and one this enclos no longer
-/// writes.
+/// by its own digest: what it compiles to now, and a line this enclos no
+/// longer writes.
 fn compiled_earlier(engine: &Engine, name: &SandboxName) -> PathBuf {
     let (now, text) = engine.compiled_file(name, port(engine, name)).unwrap();
     let earlier_text = format!("{text}a rule enclos dropped\n");
@@ -69,15 +70,87 @@ fn ended(engine: &Engine, name: &SandboxName) {
     engine.state.end_sessions(&lock, &ids, &record).unwrap();
 }
 
-fn changed(check: &SandboxCheck) -> Vec<crate::engine::CompiledChange> {
+/// A change found, flattened for the tests: `lines` is none once the file
+/// it ran under is gone.
+#[derive(Debug)]
+struct Change {
+    version: u32,
+    ran: PathBuf,
+    now: PathBuf,
+    edited: bool,
+    lines: Option<Lines>,
+    running: Running,
+}
+
+fn changed(check: &SandboxCheck) -> Vec<Change> {
     check
         .drift
         .iter()
-        .filter_map(|d| match d {
-            Drift::Changed(c) => Some(c.clone()),
-            Drift::NoLongerCompiles { .. } => None,
+        .filter_map(|d| match &d.kind {
+            DriftKind::Changed { now, ran_file } => Some(Change {
+                version: d.version,
+                ran: d.ran.clone(),
+                now: now.clone(),
+                edited: matches!(ran_file, RanFile::There { edited: true, .. }),
+                lines: match ran_file {
+                    RanFile::Gone => None,
+                    RanFile::There { lines, .. } => Some(lines.clone()),
+                },
+                running: d.running,
+            }),
+            DriftKind::NoLongerCompiles { .. } => None,
         })
         .collect()
+}
+
+/// The versions said to no longer compile, with why.
+fn no_longer_compiles(check: &SandboxCheck) -> Vec<(u32, String)> {
+    check
+        .drift
+        .iter()
+        .filter_map(|d| match &d.kind {
+            DriftKind::NoLongerCompiles { error } => Some((d.version, error.clone())),
+            DriftKind::Changed { .. } => None,
+        })
+        .collect()
+}
+
+/// `policy edit` of sandbox `home` adding `path` to what it writes.
+fn grant_write(engine: &Engine, path: &std::path::Path) {
+    let before = engine.layout.read_policy("home").unwrap();
+    let after = match before.contains("write_add = []") {
+        true => before.replace(
+            "write_add = []",
+            &format!("write_add = [\"{}\"]", path.display()),
+        ),
+        false => before.replace(
+            "write_add = [",
+            &format!("write_add = [\"{}\", ", path.display()),
+        ),
+    };
+    engine
+        .policy_edit(
+            &alice(),
+            &"home".parse().unwrap(),
+            &before,
+            &after,
+            Confirm::Yes,
+        )
+        .unwrap();
+}
+
+/// `policy edit` of sandbox `home` putting back what it was created with.
+fn ungrant_writes(engine: &Engine, created: &str) {
+    let before = engine.layout.read_policy("home").unwrap();
+    engine
+        .policy_edit(
+            &alice(),
+            &"home".parse().unwrap(),
+            &before,
+            created,
+            Confirm::Yes,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -109,8 +182,8 @@ fn a_backend_not_on_this_host_is_not_tried() {
 }
 
 /// A backend that is there and refuses to run a program, as Seatbelt does
-/// in a process already in a sandbox whose policy has a rule, runs no sandbox: nothing is compiled
-/// for its sandboxes, and that is said once.
+/// in a process already in a sandbox whose policy has a deny rule, runs no
+/// sandbox: nothing is compiled for its sandboxes, and that is said once.
 #[test]
 fn a_backend_that_refuses_to_run_is_a_problem_and_nothing_is_compiled() {
     let (_dir, engine, name) = super::policy::with_sandbox_on(FakeBackend::refuses_to_run(
@@ -189,7 +262,9 @@ fn a_policy_enclos_now_compiles_differently_is_shown_with_its_lines() {
     assert!(!change.edited);
     assert_eq!(
         change.lines,
-        Lines::Changed(vec![LineChange::Removed("a rule enclos dropped".into())])
+        Some(Lines::Changed(vec![LineChange::Removed(
+            "a rule enclos dropped".into()
+        )]))
     );
     assert_eq!(
         change.running,
@@ -207,7 +282,7 @@ fn a_policy_enclos_now_compiles_differently_is_shown_with_its_lines() {
     let [change] = changed(&check_of(&engine.doctor(), &name))
         .try_into()
         .unwrap();
-    assert_eq!(change.lines, Lines::FileGone);
+    assert_eq!(change.lines, None);
     assert_eq!(change.running, Running::default());
 }
 
@@ -226,7 +301,9 @@ fn a_compiled_file_changed_after_it_was_written_is_named_as_such() {
     assert!(change.edited);
     assert_eq!(
         change.lines,
-        Lines::Changed(vec![LineChange::Removed("(allow default)".into())])
+        Some(Lines::Changed(vec![LineChange::Removed(
+            "(allow default)".into()
+        )]))
     );
 }
 
@@ -279,8 +356,8 @@ fn a_running_session_under_an_earlier_file_is_shown_after_a_later_one() {
     assert_eq!(change.ran, earlier);
     assert_eq!(change.running.count, 1);
 
-    // A gone session is not one that keeps its rules: once nothing of it
-    // runs, the later session is the one compared.
+    // A gone session keeps no compiled policy: once nothing of it runs,
+    // the later session is the one compared.
     drop(sleeping);
     assert!(check_of(&engine.doctor(), &name).drift.is_empty());
 }
@@ -420,4 +497,159 @@ fn an_earlier_file_changed_after_it_was_written_is_named_as_such() {
         .unwrap();
     assert!(change.edited, "{change:?}");
     assert_ne!(change.now, change.ran);
+}
+
+/// A version a session ran under that no longer compiles is named as such,
+/// and while it is the active one, its next session cannot start.
+#[test]
+fn a_version_that_no_longer_compiles_is_named_and_stops_the_next_session() {
+    let (dir, engine, name) = with_sandbox();
+    let created = engine.layout.read_policy("home").unwrap();
+    let path = dir.path().join(crate::backend::fake::UNCOMPILABLE);
+    std::fs::create_dir_all(&path).unwrap();
+    grant_write(&engine, &path);
+    let ran = engine
+        .layout
+        .sandbox_dir("home")
+        .join("compiled/0000000000000000.fake");
+    let mut session = session_of(&engine, &name, gone_process());
+    session.version = 2;
+    session.compiled = Some(ran.display().to_string());
+    put(&engine, &session);
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    let NextSession::Fails { error } = &check.next else {
+        panic!("{check:?}");
+    };
+    assert!(error.contains("cannot compile a write to"), "{error}");
+    assert!(doctor.has_problems());
+    let [(version, why)] = no_longer_compiles(&check).try_into().unwrap();
+    assert_eq!(version, 2);
+    assert!(why.contains("cannot compile a write to"), "{why}");
+    assert!(check.unreadable.is_empty(), "{check:?}");
+
+    // Once a later version is active, only the earlier one is named.
+    ungrant_writes(&engine, &created);
+    let check = check_of(&engine.doctor(), &name);
+    assert!(
+        matches!(check.next, NextSession::Compiles { version: 3, .. }),
+        "{check:?}"
+    );
+    assert_eq!(no_longer_compiles(&check).len(), 1, "{check:?}");
+}
+
+/// A write path that now leads into enclos's own files stops the next
+/// session, and an earlier version with it is said to no longer pass the
+/// checks, not to be the active policy.
+#[test]
+fn write_paths_that_no_longer_pass_their_checks_are_named() {
+    let (dir, engine, name) = with_sandbox();
+    let created = engine.layout.read_policy("home").unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    grant_write(&engine, &work);
+    let file = compiled_now(&engine, &name);
+    let mut session = session_of(&engine, &name, gone_process());
+    session.version = 2;
+    session.compiled = Some(file.display().to_string());
+    put(&engine, &session);
+    std::fs::remove_dir(&work).unwrap();
+    std::os::unix::fs::symlink(engine.layout.sandbox_dir("home"), &work).unwrap();
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(matches!(check.next, NextSession::Fails { .. }), "{check:?}");
+    assert!(check.unreadable.is_empty(), "{check:?}");
+    assert!(doctor.has_problems());
+
+    ungrant_writes(&engine, &created);
+    let check = check_of(&engine.doctor(), &name);
+    assert!(
+        matches!(check.next, NextSession::Compiles { version: 3, .. }),
+        "{check:?}"
+    );
+    let [(version, why)] = no_longer_compiles(&check).try_into().unwrap();
+    assert_eq!(version, 2);
+    assert!(why.starts_with("its write paths no longer pass"), "{why}");
+    assert!(!why.contains("active policy"), "{why}");
+}
+
+/// A sandbox with no active policy cannot start a session: that is said,
+/// not that enclos could not tell.
+#[test]
+fn a_sandbox_with_no_active_policy_cannot_start() {
+    let (_dir, engine, name) = with_sandbox();
+    rusqlite::Connection::open(engine.layout.state_db())
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET active_version = NULL WHERE name = 'home'",
+            [],
+        )
+        .unwrap();
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(matches!(check.next, NextSession::Fails { .. }), "{check:?}");
+    assert!(doctor.has_problems());
+}
+
+/// Its sessions that cannot be read do not keep the next session from
+/// being checked.
+#[test]
+fn unreadable_sessions_do_not_hide_the_next_session() {
+    let (_dir, engine, name) = with_sandbox();
+    rusqlite::Connection::open(engine.layout.state_db())
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions (sandbox, kind, version, snapshot, root_pid, root_start, started_at)
+             VALUES ('home', 'bogus', 1, 'x', 1, 'x', 'x')",
+            [],
+        )
+        .unwrap();
+    let check = check_of(&engine.doctor(), &name);
+    assert!(
+        check
+            .unreadable
+            .iter()
+            .any(|u| u.starts_with("cannot read its sessions")),
+        "{check:?}"
+    );
+    assert!(
+        matches!(check.next, NextSession::Compiles { version: 1, .. }),
+        "{check:?}"
+    );
+}
+
+/// Doctor writes nothing: no folder before `init`, and after, no compiled
+/// file, audit entry or record, even with a drift to report.
+#[test]
+fn doctor_changes_nothing() {
+    let (_dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
+        BackendKind::Seatbelt,
+    ))]);
+    engine.doctor();
+    assert!(!engine.layout.data().exists());
+
+    let (_dir, engine, name) = with_sandbox();
+    let earlier = compiled_earlier(&engine, &name);
+    ran_under(&engine, &name, gone_process(), &earlier);
+    let compiled = engine.layout.sandbox_dir("home").join("compiled");
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(&compiled)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let audit = engine.layout.data().join("audit.jsonl");
+    let (files, log, db) = (
+        listing(),
+        std::fs::read(&audit).unwrap(),
+        std::fs::read(engine.layout.state_db()).unwrap(),
+    );
+    for _ in 0..2 {
+        assert!(!check_of(&engine.doctor(), &name).drift.is_empty());
+    }
+    assert_eq!(listing(), files);
+    assert_eq!(std::fs::read(&audit).unwrap(), log);
+    assert_eq!(std::fs::read(engine.layout.state_db()).unwrap(), db);
 }

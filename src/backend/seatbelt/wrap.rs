@@ -44,9 +44,9 @@ const FALLBACK_TERM: &str = "xterm-256color";
 /// allows everything, with no variable of the user's, within
 /// [`TRY_RUN_WAIT`]. macOS 26.5.2 refuses it, `sandbox_apply: Operation not
 /// permitted` (exit 71), to a process in a sandbox whose policy has a deny
-/// rule, as every enclos sandbox's has (a test runs doctor in one); in one
-/// whose policy only allows everything it runs, exit 0 (by hand, macOS
-/// 26.5.2).
+/// rule, as every enclos sandbox's has (a test runs doctor under a policy
+/// that allows everything but one write); in one whose policy only allows
+/// everything it runs, exit 0 (by hand, macOS 26.5.2).
 pub fn try_run() -> Probe {
     let started = Command::new(SANDBOX_EXEC)
         .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
@@ -63,39 +63,47 @@ pub fn try_run() -> Probe {
             };
         }
     };
+    // Read as it is written, so that a full pipe never holds it up.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut said = String::new();
+        let read = stderr.map(|mut s| std::io::Read::read_to_string(&mut s, &mut said));
+        (said, read)
+    });
     let deadline = std::time::Instant::now() + TRY_RUN_WAIT;
     let status = loop {
-        match child.try_wait() {
+        let failed = match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
             }
-            Ok(None) => {
-                // Its own child: stopped and reaped.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Probe::Unavailable {
-                    reason: format!(
-                        "{SANDBOX_EXEC} did not run /usr/bin/true within {} s",
-                        TRY_RUN_WAIT.as_secs()
-                    ),
-                };
-            }
-            Err(e) => {
-                return Probe::Unavailable {
-                    reason: format!("cannot wait for {SANDBOX_EXEC}: {e}"),
-                };
-            }
-        }
+            Ok(None) => format!(
+                "{SANDBOX_EXEC} did not finish /usr/bin/true within {} s",
+                TRY_RUN_WAIT.as_secs()
+            ),
+            Err(e) => format!("cannot wait for {SANDBOX_EXEC}: {e}"),
+        };
+        // Its own child: stopped and reaped.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Probe::Unavailable { reason: failed };
     };
     if status.success() {
         return Probe::Available;
     }
-    let mut said = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+    let (said, read) = reader.join().unwrap_or_else(|_| {
+        (
+            String::new(),
+            Some(Err(std::io::Error::other("its reader failed"))),
+        )
+    });
+    let mut said = said.trim().to_owned();
+    if let Some(Err(e)) = read {
+        said = format!("{said} (its stderr could not be read: {e})")
+            .trim()
+            .to_owned();
     }
-    let said = said.trim();
     Probe::Unavailable {
         reason: match said.is_empty() {
             true => format!(

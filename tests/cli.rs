@@ -2832,8 +2832,9 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
     );
 }
 
-/// In a sandbox with any rule, as every enclos sandbox has, macOS refuses
-/// Seatbelt to the programs it runs, and doctor says so.
+/// In a sandbox whose policy has a deny rule, as every enclos sandbox's
+/// has, macOS refuses Seatbelt to the programs it runs (exit 71), and doctor
+/// says so.
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
@@ -2856,4 +2857,5 @@ fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
         "{stdout}"
     );
     assert!(stdout.contains("Operation not permitted"), "{stdout}");
+    assert!(stdout.contains("exit status: 71"), "{stdout}");
 }
