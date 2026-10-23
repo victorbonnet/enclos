@@ -1,5 +1,6 @@
 """Runs an enclos command for a sandbox under one Seatbelt baseline, and
-collects the denials tagged `enclos:<sandbox>` (ADR 0006's evidence).
+collects the denials, and the reports of `(with report)` rules, tagged
+`enclos:<sandbox>` (ADR 0006's evidence).
 
 The denials come from a live `log stream` this script starts itself: it
 needs an admin user, is bounded in lines, is read through a pipe, is never

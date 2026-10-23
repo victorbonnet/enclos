@@ -25,21 +25,16 @@ const HOST_SERVICES: &str = include_str!("host-services.sb");
 /// What a sandbox may do under `(deny default)` (ADR 0006).
 const DENY_DEFAULT: &str = include_str!("deny-default.sb");
 
-/// The variable that compiles every policy from `(allow default)` instead,
-/// as before ADR 0006: `allow-default`. For comparing the two baselines on
-/// the escape probes only, not a setting; read as each policy is compiled.
+/// The variable that compiles a policy from `(allow default)` instead, as
+/// before ADR 0006 was accepted: `allow-default`. Only so tests can compare
+/// the two baselines, not a setting: read as each policy is compiled, said
+/// on stderr when it is used, and never passed to a service.
 pub const BASELINE_VAR: &str = "ENCLOS_SEATBELT_BASELINE";
 
 /// Whether [`BASELINE_VAR`] asks for the earlier, allow-by-default
 /// baseline.
 fn allow_by_default() -> bool {
     std::env::var(BASELINE_VAR).is_ok_and(|v| v == "allow-default")
-}
-
-/// [`BASELINE_VAR`], when it asks for the allow-by-default baseline, for a
-/// service the service manager starts to compile its policy the same way.
-pub fn baseline_env() -> Option<(String, String)> {
-    allow_by_default().then(|| (BASELINE_VAR.to_owned(), "allow-default".to_owned()))
 }
 
 /// Device files every runtime writes to (shown by the prototype: shells,
@@ -105,7 +100,13 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     ));
     line("(version 1)".into());
     match allow_by_default() {
-        true => line("(allow default)".into()),
+        true => {
+            eprintln!(
+                "enclos: sandbox {}'s policy compiles from (allow default), as {BASELINE_VAR} asks: that baseline is only for comparing the two (ADR 0006)",
+                ctx.name
+            );
+            line("(allow default)".into())
+        }
         false => {
             line(format!("(deny default (with message \"{tag}\"))"));
             line(DENY_DEFAULT.trim_end().to_owned());
@@ -125,10 +126,10 @@ pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, Compil
     line(format!(
         "(deny file-read* file-write* (with message \"{tag}\") {TERMINALS})"
     ));
-    // Under `(allow default)` a sandbox may issue extensions (Apple's
-    // `application.sb` starts from `(deny default)`, which refuses them):
-    // without this rule it could grant itself this one for another terminal.
-    // A backend test shows both.
+    // `(deny default)` refuses a sandbox to issue extensions, as Apple's
+    // `application.sb` does; this rule keeps it from granting itself this one
+    // for another terminal under `(allow default)` too, which the tests'
+    // comparison still compiles. A backend test shows both.
     line(format!(
         "(deny file-issue-extension (with message \"{tag}\") (extension-class \"{PTY_EXTENSION}\"))"
     ));
@@ -633,6 +634,63 @@ mod tests {
         // The allows come after the deny, so they win for what they match.
         let first_allow = text.find(&format!("(require-all {ttys} ")).unwrap();
         assert!(first_allow > deny, "{text}");
+    }
+
+    /// The list ADR 0006 was accepted on, rule by rule: a change to it is a
+    /// change to review.
+    #[test]
+    fn the_deny_by_default_block_is_the_reviewed_list() {
+        let rules: Vec<&str> = DENY_DEFAULT
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("(allow"))
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                "(allow process-fork)",
+                "(allow process-exec*)",
+                "(allow file-read*)",
+                "(allow sysctl-read)",
+                "(allow process-info* (target same-sandbox))",
+                "(allow file-ioctl)",
+                "(allow pseudo-tty)",
+                "(allow mach-lookup",
+                "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
+            ]
+        );
+        let names: Vec<&str> = DENY_DEFAULT
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("(global-name \""))
+            .map(|l| l.trim_end_matches([')', '"']))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "com.apple.system.notification_center",
+                "com.apple.system.opendirectoryd.membership",
+                "com.apple.system.opendirectoryd.libinfo",
+                "com.apple.logd",
+                "com.apple.diagnosticd",
+                "com.apple.bsd.dirhelper",
+                "com.apple.SystemConfiguration.configd",
+                "com.apple.trustd.agent",
+            ]
+        );
+        // Each broad allow comes before the denies that narrow it.
+        let text = compile(&policy(), &ctx(Path::new("/nonexistent-enclos-test")))
+            .unwrap()
+            .text;
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}:\n{text}"))
+        };
+        assert!(at("(allow file-ioctl)") < at("(deny file-ioctl"));
+        assert!(
+            at("(allow pseudo-tty)")
+                < at("(deny file-read* file-write* (with message \"enclos:home\") (regex")
+        );
+        assert!(at("(allow file-read*)\n") < at(";; ---- Sensitive paths"));
     }
 
     #[test]

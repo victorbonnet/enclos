@@ -21,7 +21,9 @@
 
 ;; cfprefsd writes ~/Library/Preferences for the caller, which the write rules
 ;; never see. Shown: without this rule `defaults write` reached the user's own
-;; preferences although HOME pointed elsewhere. Reads stay allowed.
+;; preferences although HOME pointed elsewhere. Under (deny default) reads
+;; are refused too, as nothing allows them; this rule keeps writes closed
+;; whatever the baseline.
 (deny user-preference-write (with message "{tag}"))
 
 ;; Synthetic keyboard and mouse events and the pasteboard. Shown: the lookups

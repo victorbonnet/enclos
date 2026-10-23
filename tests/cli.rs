@@ -1124,6 +1124,13 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     // The host-service probes act on the host if a rule fails: only where
     // CI asks for them by name, never because some tool set `CI`.
     let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    // CI runs them: a workflow that lost the variable must not pass quietly.
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        assert!(
+            host_services,
+            "CI runs the host-service probes: ENCLOS_HOST_SERVICE_PROBES=1 is missing"
+        );
+    }
     let mut args = vec!["policy", "test", "home"];
     if host_services {
         args.push("--host-services");
@@ -1145,8 +1152,18 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     let out = Run(home
         .command(&args)
         .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("ENCLOS_SEATBELT_BASELINE")
         .output()
         .unwrap());
+    // Under the baseline enclos ships (ADR 0006).
+    assert!(
+        std::fs::read_dir(home.root.join("sandboxes/home/compiled"))
+            .unwrap()
+            .any(|e| std::fs::read_to_string(e.unwrap().path())
+                .unwrap()
+                .contains("\n(deny default (with message \"enclos:home\"))\n")),
+        "no deny-by-default policy was compiled"
+    );
     assert_eq!(
         out.code(),
         0,
@@ -3044,9 +3061,10 @@ fn a_secret_set_in_json_shows_no_value() {
 }
 
 /// ADR 0006's comparison: under the allow-by-default baseline enclos used
-/// before, every escape probe is closed as under deny by default, the
-/// host-service ones where CI asks for them, and a session runs a shell,
-/// Python, git and curl through the proxy under either.
+/// before, the probes a new sandbox has are closed as under deny by default
+/// (`every_escape_probe_fails_in_a_new_sandbox`), the host-service ones where
+/// CI asks for them, and a session runs a shell, Python, git and curl
+/// through the proxy under either.
 #[cfg(target_os = "macos")]
 #[test]
 fn every_escape_probe_fails_under_allow_by_default_too() {
@@ -3056,6 +3074,13 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
     let host_services = std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() == Ok("1");
+    // CI runs them: a workflow that lost the variable must not pass quietly.
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        assert!(
+            host_services,
+            "CI runs the host-service probes: ENCLOS_HOST_SERVICE_PROBES=1 is missing"
+        );
+    }
     let mut args = vec!["policy", "test", "home"];
     if host_services {
         args.push("--host-services");
@@ -3114,8 +3139,8 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
             .env("ENCLOS_SEATBELT_BASELINE", baseline)
             .output()
             .unwrap());
-        // The proxy allows example.com only once it is allowed; its refusal
-        // is a 403 from the proxy, still an answer through it.
+        // A 200 is the policy allowing the host; a 403 is the proxy refusing
+        // it: either is an answer through the proxy.
         assert!(
             out.stdout().starts_with("hi\n2\n"),
             "{baseline}: stdout: {}\nstderr: {}",

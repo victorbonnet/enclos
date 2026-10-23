@@ -874,6 +874,59 @@ fn the_sandbox_cannot_type_into_its_terminal() {
     let out = String::from_utf8_lossy(&out.stdout);
     assert!(out.contains("REFUSED"), "{out}");
     assert!(!out.contains("INJECTED"), "{out}");
+
+    // Each rule holds alone, on either baseline; and the control: with
+    // neither, the byte goes in (into `script`'s own terminal only).
+    let run = |text: &str, name: &str| {
+        let file = w.base.join(name);
+        std::fs::write(&file, text).unwrap();
+        let out = Command::new("/usr/bin/script")
+            .args(["-q", "/dev/null", "/usr/bin/sandbox-exec", "-f"])
+            .arg(&file)
+            .args(["/usr/bin/perl", "-e", try_tiocsti])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let ioctl_rule =
+        "(deny file-ioctl (with message \"enclos:home\")\n  (ioctl-command TIOCSTI))\n";
+    let hid_rule = "(deny hid-control (with message \"enclos:home\"))\n";
+    assert!(
+        text.contains(ioctl_rule) && text.contains(hid_rule),
+        "{text}"
+    );
+    let neither = format!(
+        "{}(allow hid-control)\n",
+        text.replace(ioctl_rule, "").replace(hid_rule, "")
+    );
+    assert!(
+        run(&neither, "neither.sb").contains("INJECTED"),
+        "the control"
+    );
+    let ioctl_alone = format!("{}(allow hid-control)\n", text.replace(hid_rule, ""));
+    assert!(run(&ioctl_alone, "ioctl-alone.sb").contains("REFUSED"));
+    let allow_default = text.replace(
+        "(deny default (with message \"enclos:home\"))\n",
+        "(allow default)\n",
+    );
+    assert_ne!(allow_default, text);
+    let allow_ioctl_alone = format!(
+        "{}(allow hid-control)\n",
+        allow_default.replace(hid_rule, "")
+    );
+    assert!(run(&allow_ioctl_alone, "allow-ioctl-alone.sb").contains("REFUSED"));
+}
+
+/// The sandbox still signals its own processes, as job control, timeouts
+/// and Ctrl-C need: only those it starts itself. (`ps` cannot show the
+/// rest: it is setuid, and Seatbelt runs no setuid program, whatever the
+/// baseline.)
+#[test]
+fn the_sandbox_signals_its_own_processes() {
+    let w = world();
+    assert!(w.sh("/bin/sleep 30 & p=$!; /bin/kill $p; wait $p; [ $? -eq 143 ]"));
 }
 
 /// A pseudo-terminal this test opens, as a terminal app does for each tab:
@@ -987,11 +1040,35 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             false => format!("{l}\n"),
         })
         .collect();
-    assert!(without.len() < text.len(), "no rule to remove");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("(deny file-issue-extension")),
+        "no rule to remove"
+    );
     let open = w.base.join("without-the-rule.sb");
     std::fs::write(&open, without).unwrap();
     assert!(run(&open), "the route is gone: nothing to test");
     assert!(!run(&w.compiled));
+    // The rule alone closes it on the earlier baseline, and the baseline
+    // alone closes it without the rule.
+    let with_rule = text.replace(
+        "(deny default (with message \"enclos:home\"))\n",
+        "(allow default)\n",
+    );
+    let file = w.base.join("allow-default-with-the-rule.sb");
+    std::fs::write(&file, with_rule).unwrap();
+    assert!(
+        !run(&file),
+        "the rule does not close it under (allow default)"
+    );
+    let baseline_alone: String = text
+        .lines()
+        .filter(|l| !l.starts_with("(deny file-issue-extension"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let file = w.base.join("deny-default-without-the-rule.sb");
+    std::fs::write(&file, baseline_alone).unwrap();
+    assert!(!run(&file), "(deny default) does not close it alone");
 }
 
 #[test]
