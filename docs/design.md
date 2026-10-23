@@ -2,7 +2,7 @@
 
 *enclos* (French for an enclosure, said "ahn-KLOH") is an open-source CLI that creates sandboxes, installs agent runtimes in them (Hermes first, then Claude Code, Codex, OpenClaw) and runs agents there, and keeps a proper state and an audit log of every command. It manages only the sandboxes it creates.
 
-Status: milestone 1 (§13) is done: its acceptance scenario passed on 2026-10-22. The code implements what §13 lists for milestone 1, and of milestone 2 so far the pending policy (`policy edit`, `apply` and `discard`), the policy history (`policy history`, `diff`, `rollback` and `refresh`) and resource limits (open files; the others refused), §7, `exec`, §8, secrets and the setup of the sandbox's Telegram bot, §12, and the server name check, §6; anything else described here comes later. Some sections also say where milestone 1 does less than the design. Target platforms: macOS on Apple Silicon first, then Linux (including Raspberry Pi). Windows through WSL2 later.
+Status: milestone 1 (§13) is done: its acceptance scenario passed on 2026-10-22. The code implements what §13 lists for milestone 1, and of milestone 2 so far the pending policy (`policy edit`, `apply` and `discard`), the policy history (`policy history`, `diff`, `rollback` and `refresh`), resource limits (open files; the others refused) and the `minimal` and `mcp-only` templates, §7, `exec`, §8, secrets and the setup of the sandbox's Telegram bot, §12, and the server name check, §6; anything else described here comes later. Some sections also say where milestone 1 does less than the design. Target platforms: macOS on Apple Silicon first, then Linux (including Raspberry Pi). Windows through WSL2 later.
 
 This document describes what enclos is and how it works. Decisions that are hard to reverse, and why they were made, are recorded in [`docs/adr/`](adr/). When this document and an ADR disagree, fix one of them in the same change. Three kinds of statement appear below: **decided** (an accepted ADR or plain design text), **proposed** (an ADR with `status: proposed`), and **to verify** (behavior the design depends on that no prototype has shown yet, listed in §14). What the throwaway milestone 1 prototype (`prototype/m1/`, macOS 26.5.2, Hermes 0.22.2) showed is marked "shown by the prototype", and holds only for what it probed, on one Mac.
 
@@ -190,8 +190,8 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 
 | Template | Writes | Programs | Network | Use for |
 | --- | --- | --- | --- | --- |
-| `minimal` | own home | the runtime only | model provider only | a starting point |
-| `mcp-only` | own home | runtime and its MCP servers | model provider + listed remote MCP endpoints | assistants working on outside data |
+| `minimal` | own home | the runtime only, once program rules come; for now any, since a policy with `[exec]` is refused until a backend enforces it | what is listed: from `runtime install` on, the runtime adapter's endpoints (for Hermes: its install sources, and `chatgpt.com` and `auth.openai.com` for a ChatGPT subscription), and what `policy allow` adds, such as another provider's hosts | a starting point |
+| `mcp-only` | own home | as `minimal`; the runtime's MCP servers too, once program rules come | for now the same as `minimal`: each remote MCP endpoint's host is added with `policy allow`, and the runtime is told of it with its own commands through `enclos connect`, until `runtime configure --mcp-add` does both | assistants working on outside data |
 | `assistant` | own home | any, including what the agent installs in its home | the public web (any public address on ports 80 and 443), plus the runtime's endpoints and listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 
@@ -557,8 +557,8 @@ enclos runtime install claude-code --sandbox dev
 enclos sandbox create community --backend seatbelt --template mcp-only
 enclos runtime install hermes --sandbox community
 enclos agent add community/support
-enclos runtime configure community --mcp-add data=https://mcp.example.org/data  # every agent; a remote endpoint
-enclos policy allow community mcp.example.org
+enclos policy allow community mcp.example.org              # the remote endpoint's host
+enclos connect community -- hermes ...                     # Hermes told of the endpoint with its own commands, until `runtime configure --mcp-add` comes
 ```
 
 ## 11. State, audit and files

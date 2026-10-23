@@ -34,6 +34,10 @@ pub struct SandboxSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxView {
     pub record: SandboxRecord,
+    /// The template the active policy is built on. `policy.toml` may name
+    /// another than [`SandboxRecord::created_from`], the one the sandbox
+    /// was created from, which is used when it has no active policy.
+    pub template: TemplateName,
     pub policy: Option<PolicyVersion>,
     /// The change waiting for a restart, if any (design §7).
     pub pending: Option<PendingPolicy>,
@@ -113,12 +117,30 @@ impl Engine {
             });
         }
         if confirm == Confirm::DryRun {
+            // The checks a create makes before it writes anything, a dry run
+            // makes too: the backend, the template as it resolves and is
+            // checked, a free proxy port, and what the sandbox's folder
+            // already holds.
+            let name = spec.name.as_str();
+            self.backend_for(&spec.name, spec.backend)?;
+            let overrides = policy::initial_overrides(name, &spec.template);
+            self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
+            self.free_port()?;
+            let mut changes = vec![format!(
+                "create sandbox {} ({}, template {})",
+                spec.name, spec.backend, spec.template
+            )];
+            match self.before_create(name)? {
+                Before::Kept(_) => changes.push(format!(
+                    "write its policy.toml again from the `{}` template, in place of the one its folder kept, and keep its home",
+                    spec.template
+                )),
+                Before::Folder => changes.push("reuse the folder left for it, and its home".into()),
+                Before::Nothing => {}
+            }
             return Ok(Planned::DryRun(Plan {
-                create: vec![self.layout.sandbox_home(spec.name.as_str())],
-                changes: vec![format!(
-                    "create sandbox {} ({}, template {})",
-                    spec.name, spec.backend, spec.template
-                )],
+                create: vec![self.layout.sandbox_home(name)],
+                changes,
             }));
         }
         let summary = |r: &SandboxRecord| format!("{} on port {}", r.backend, r.proxy_port);
@@ -146,7 +168,7 @@ impl Engine {
                 let record = SandboxRecord {
                     name: spec.name.clone(),
                     backend: spec.backend,
-                    template: spec.template.clone(),
+                    created_from: spec.template.clone(),
                     state: SandboxState::Created,
                     proxy_port: self.free_port()?,
                     runtime: None,
@@ -269,7 +291,12 @@ impl Engine {
     }
 
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
-        let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
+        let active = self.state.active_policy(&record.name)?;
+        let template = active.as_ref().map_or_else(
+            || record.created_from.clone(),
+            |(_, snapshot)| snapshot.inputs.template.clone(),
+        );
+        let policy = active.map(|(v, _)| v);
         let pending = self.state.pending_policy(&record.name)?.map(|(p, _)| p);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
@@ -289,6 +316,7 @@ impl Engine {
             .collect::<Result<_>>()?;
         Ok(SandboxView {
             record,
+            template,
             policy,
             pending,
             policy_refused: compile_refused(&compiled),

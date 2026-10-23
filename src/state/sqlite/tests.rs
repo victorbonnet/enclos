@@ -15,7 +15,7 @@ fn record(name: &str) -> SandboxRecord {
     SandboxRecord {
         name: name.parse().unwrap(),
         backend: BackendKind::Seatbelt,
-        template: "assistant".parse().unwrap(),
+        created_from: "assistant".parse().unwrap(),
         proxy_port: 41000,
         runtime: None,
         state: SandboxState::Created,
@@ -198,7 +198,7 @@ fn a_version_is_read_from_its_own_sandbox_and_a_replaced_rollback_restores_nothi
     let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
     let (one, two) = (
         resolve("extends = \"assistant\"\n"),
-        resolve("[network]\nallow_add = [\"b.example.com\"]\n"),
+        resolve("extends = \"assistant\"\n[network]\nallow_add = [\"b.example.com\"]\n"),
     );
     store.save_policy(&lock, &a, &one, &by, None).unwrap();
     store.save_policy(&lock, &b, &one, &by, None).unwrap();
@@ -234,8 +234,8 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
     };
     let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
     let v1 = resolve("extends = \"assistant\"\n");
-    let pending = resolve("[filesystem]\nwrite_add = [\"~/work\"]\n");
-    let live = resolve("[network]\nallow_add = [\"a.example.com\"]\n");
+    let pending = resolve("extends = \"assistant\"\n[filesystem]\nwrite_add = [\"~/work\"]\n");
+    let live = resolve("extends = \"assistant\"\n[network]\nallow_add = [\"a.example.com\"]\n");
     store.save_policy(&lock, &name, &v1, &by, None).unwrap();
 
     // A network change applies at once beside the pending one.

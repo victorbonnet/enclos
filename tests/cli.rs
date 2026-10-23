@@ -2551,3 +2551,122 @@ fn a_limit_above_enclos_own_hard_limit_stops_the_session() {
         out.stderr()
     );
 }
+
+/// A sandbox made from `minimal` or `mcp-only` reaches only what is listed:
+/// a public site the `assistant` template would reach is refused by its
+/// proxy as not allowed, `policy show` says so, and `policy test` (run
+/// once, for `minimal`, since both compile to the same rules) finds nothing
+/// open.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for template in ["minimal", "mcp-only"] {
+        let home = Home::new();
+        home.init(1);
+        home.run(&["sandbox", "create", "lab", "--template", template])
+            .ok();
+        let _stop = StopOnDrop(&home, "lab");
+        let policy = std::fs::read_to_string(home.root.join("sandboxes/lab/policy.toml")).unwrap();
+        assert!(
+            policy.contains(&format!("extends = \"{template}\"")),
+            "{policy}"
+        );
+        let shown = home.run(&["policy", "show", "lab"]).ok().stdout();
+        assert!(shown.contains("\nNetwork: allowlist"), "{shown}");
+        let listed = home.run(&["sandbox", "list"]).ok().stdout();
+        assert!(
+            listed
+                .lines()
+                .any(|l| l.starts_with("lab ") && l.contains(template)),
+            "{listed}"
+        );
+        // Refused at the proxy: no connection leaves the host.
+        let out = home.run(&[
+            "exec",
+            "lab",
+            "--",
+            "/usr/bin/curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_connect}",
+            "https://example.com/",
+        ]);
+        assert_eq!(out.stdout(), "403", "{template}: {}", out.stderr());
+        let out = home.run(&["net", "denied", "lab"]);
+        let denied = out.ok().stdout();
+        assert!(
+            denied
+                .lines()
+                .any(|l| l.contains("example.com:443") && l.contains("not-allowed")),
+            "{denied}"
+        );
+        if template == "minimal" {
+            let out = home.run(&["policy", "test", "lab"]);
+            assert_eq!(
+                out.code(),
+                0,
+                "{template}:\n{}\n{}",
+                out.stdout(),
+                out.stderr()
+            );
+            assert!(!out.stdout().contains("OPEN"), "{}", out.stdout());
+        }
+    }
+}
+
+/// Once `policy.toml` names another template, `sandbox list` and `show` name
+/// the one the active policy is built on, not the one the sandbox was
+/// created from.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_is_listed_and_shown_with_its_active_template() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let mut edit = home.command(&["policy", "edit", "lab"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "sed -i \x27\x27 \x27s/^extends = \"assistant\"$/extends = \"minimal\"/\x27 \"$1\"",
+        ),
+    );
+    Run(edit.output().unwrap()).ok();
+    let listed = home.run(&["sandbox", "list"]).ok().stdout();
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("lab ") && l.contains(" minimal ")),
+        "{listed}"
+    );
+    let shown = home.run(&["sandbox", "show", "lab"]).ok().stdout();
+    assert!(shown.contains(", template minimal, "), "{shown}");
+}
+
+/// `--help` names every template; on macOS, where the backend runs and so
+/// the template is the first thing refused, one this enclos does not ship
+/// is refused with the ones it has, and leaves no folder.
+#[test]
+fn an_unknown_template_is_refused_with_the_ones_there_are() {
+    let home = Home::new();
+    home.init(1);
+    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
+    for name in enclos::policy::template_names() {
+        assert!(help.contains(name), "{name}: {help}");
+    }
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let out = home.run(&["sandbox", "create", "lab", "--template", "coding"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("unknown template `coding`: this enclos has minimal, mcp-only, assistant"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.root.join("sandboxes/lab").exists());
+}

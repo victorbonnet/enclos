@@ -253,6 +253,28 @@ impl Engine {
     ) -> Result<PolicySnapshot> {
         let backend = self.recorded_backend(name)?;
         self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
+            .map_err(|error| self.with_active_template(name, error))
+    }
+
+    /// A `policy.toml` that names no template, said with the one the active
+    /// policy is built on: picking another, such as the default, could open
+    /// what the sandbox's template closed.
+    fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
+        if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
+            return error;
+        }
+        match self.state.active_policy(name) {
+            Ok(Some((_, active))) => {
+                let template = &active.inputs.template;
+                Error::WithContext {
+                    what: format!(
+                        "{error}; its active policy is built on `{template}`, which `extends = \"{template}\"` keeps"
+                    ),
+                    error: Box::new(error),
+                }
+            }
+            _ => error,
+        }
     }
 
     pub(super) fn checked_policy_with(
@@ -566,8 +588,8 @@ mod tests {
         assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
         // An inline or dotted network table is edited where it is.
         for text in [
-            "network = { allow_add = [\"a.example.com\"] }\n",
-            "network.allow_add = [\"a.example.com\"]\n",
+            "extends = \"assistant\"\nnetwork = { allow_add = [\"a.example.com\"] }\n",
+            "extends = \"assistant\"\nnetwork.allow_add = [\"a.example.com\"]\n",
         ] {
             let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
             let parsed = policy::resolve(&updated, None).unwrap();
