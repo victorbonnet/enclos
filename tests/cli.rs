@@ -2097,12 +2097,12 @@ fn a_reader_that_left_ends_a_listing_quietly() {
         .output()
         .unwrap());
     assert_eq!(out.code(), 1, "{}", out.stderr());
+    let said: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    let message = said["error"]["message"].as_str().unwrap();
     assert!(
-        out.stderr()
-            .contains("cannot write the JSON document (Broken pipe")
-            && out.stderr().contains("the command itself succeeded"),
-        "{}",
-        out.stderr()
+        message.contains("cannot write the JSON document (Broken pipe")
+            && message.contains("the command itself succeeded"),
+        "{said}"
     );
 }
 
@@ -3120,8 +3120,17 @@ fn a_document_that_cannot_be_written_fails_the_command() {
         .output()
         .unwrap());
     assert_eq!(out.code(), 125, "{}", out.stderr());
+    let said: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    assert_eq!(said["error"]["exit_code"], 125, "{said}");
+    assert!(
+        said["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("enclos itself succeeded"),
+        "{said}"
+    );
     // A command whose result is the document, and that failed: its own
-    // code is said.
+    // code is said, and the error the document held.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let out = Run(home
@@ -3130,11 +3139,12 @@ fn a_document_that_cannot_be_written_fails_the_command() {
         .output()
         .unwrap());
     assert_eq!(out.code(), 1, "{}", out.stderr());
+    let said: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    let message = said["error"]["message"].as_str().unwrap();
     assert!(
-        out.stderr()
-            .contains("the command itself failed, with exit code 1"),
-        "{}",
-        out.stderr()
+        message.contains("the command itself failed, with exit code 1")
+            && message.contains("nosuch"),
+        "{said}"
     );
 }
 

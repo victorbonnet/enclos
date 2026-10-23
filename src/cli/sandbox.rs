@@ -106,7 +106,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             let view = engine.show_sandbox(&name)?;
             // The view first: what follows can fail, and the view is what
             // is read when state is broken. In JSON, such a failure is an
-            // `error` beside the view, the rest left null.
+            // `error` beside the view, what was read kept and the rest left
+            // null.
             if !output::json() {
                 print_show(&view);
             }
@@ -431,9 +432,9 @@ fn each(
     Ok(code)
 }
 
-/// [`each`] without printing: returns the code and the document; with
-/// `json` false, each failure of `verb` is also said on stderr as it
-/// happens.
+/// [`each`] without emitting the document: returns the code and the
+/// document; with `json` false, each failure of `verb` is said on stderr as
+/// it happens.
 fn each_into(
     names: &[SandboxName],
     known: impl Fn(&SandboxName) -> Result<()>,
