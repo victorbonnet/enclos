@@ -2539,14 +2539,69 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
 }
 
-/// A `[resources]` section holds a sandbox's sessions to its open-file
-/// limit: in them `ulimit` shows it, a process cannot open more or raise
-/// it, `policy test` shows it closed, and one enclos itself cannot set stops
-/// the session with why. A limit Seatbelt cannot enforce as written is
-/// refused, and nothing is stored.
+/// `policy edit` of sandbox `home`, adding a `[resources]` section with
+/// `lines`.
+#[cfg(target_os = "macos")]
+fn edit_limits(home: &Home, lines: &str) -> Run {
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            home,
+            &format!("printf '\n[resources]\n{lines}\n' >> \"$1\""),
+        ),
+    );
+    Run(edit.output().unwrap())
+}
+
+/// How many versions of sandbox `home`'s policy are stored.
+#[cfg(target_os = "macos")]
+fn policy_versions(home: &Home) -> usize {
+    let history = home.run(&["policy", "history", "home"]).ok().stdout();
+    history
+        .lines()
+        .filter(|l| l.trim_start().starts_with('v'))
+        .count()
+}
+
+/// A limit Seatbelt cannot enforce as written is refused with why, by any
+/// command that stores the policy, and nothing is stored.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_sandbox_runs_under_the_limits_its_policy_sets() {
+fn a_limit_seatbelt_cannot_hold_is_refused_and_nothing_is_stored() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let policy = home.root.join("sandboxes/home/policy.toml");
+    let clean = std::fs::read_to_string(&policy).unwrap();
+    // `policy edit` keeps the refused file, so the file as created is put
+    // back each time.
+    let before = policy_versions(&home);
+    for (line, why) in [
+        ("memory = \"2G\"", "cannot enforce a memory limit"),
+        ("file_size = \"1M\"", "append"),
+        ("cpu_seconds = 600", "SIGXCPU"),
+    ] {
+        let out = edit_limits(&home, line);
+        assert_eq!(out.code(), 2, "{line}: {}", out.stderr());
+        assert!(out.stderr().contains(why), "{line}: {}", out.stderr());
+        home.run(&["policy", "discard", "home"]);
+        std::fs::write(&policy, &clean).unwrap();
+        assert_eq!(policy_versions(&home), before, "{line}");
+    }
+    // Refused by any command that stores the policy, not only `edit`.
+    std::fs::write(&policy, format!("{clean}\n[resources]\nmemory = \"2G\"\n")).unwrap();
+    let out = home.run(&["policy", "allow", "home", "x.example.com", "--yes"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert_eq!(policy_versions(&home), before);
+}
+
+/// A `[resources]` section holds a sandbox's sessions to its open-file
+/// limit: the least starts, in a session `ulimit` shows it, a process
+/// cannot open more or raise it, and `policy test` shows it closed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_runs_under_its_open_file_limit() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
@@ -2554,49 +2609,9 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
     let _stop = StopOnDrop(&home, "home");
     let policy = home.root.join("sandboxes/home/policy.toml");
     let clean = std::fs::read_to_string(&policy).unwrap();
-    let edit = |lines: &str| {
-        let mut edit = home.command(&["policy", "edit", "home"]);
-        edit.env_remove("VISUAL").env(
-            "EDITOR",
-            editor(
-                &home,
-                &format!("printf '\n[resources]\n{lines}\n' >> \"$1\""),
-            ),
-        );
-        Run(edit.output().unwrap())
-    };
-    let versions = || {
-        let history = home.run(&["policy", "history", "home"]).ok().stdout();
-        history
-            .lines()
-            .filter(|l| l.trim_start().starts_with('v'))
-            .count()
-    };
-    // Refused, with why, and nothing stored; `policy edit` keeps the
-    // refused file, so the file as created is put back each time.
-    let before = versions();
-    for (line, why) in [
-        ("memory = \"2G\"", "cannot enforce a memory limit"),
-        ("file_size = \"1M\"", "append"),
-        ("cpu_seconds = 600", "SIGXCPU"),
-    ] {
-        let out = edit(line);
-        assert_eq!(out.code(), 2, "{line}: {}", out.stderr());
-        assert!(out.stderr().contains(why), "{line}: {}", out.stderr());
-        home.run(&["policy", "discard", "home"]);
-        std::fs::write(&policy, &clean).unwrap();
-        assert_eq!(versions(), before, "{line}");
-    }
-    // Refused by any command that stores the policy, not only `edit`.
-    std::fs::write(&policy, format!("{clean}\n[resources]\nmemory = \"2G\"\n")).unwrap();
-    let out = home.run(&["policy", "allow", "home", "x.example.com", "--yes"]);
-    assert_eq!(out.code(), 2, "{}", out.stderr());
-    assert_eq!(versions(), before);
-    std::fs::write(&policy, &clean).unwrap();
 
     // The least a session starts with.
-    let out = edit("open_files = 16");
-    out.ok();
+    edit_limits(&home, "open_files = 16").ok();
     home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
     std::fs::write(&policy, &clean).unwrap();
     let mut back = home.command(&["policy", "edit", "home"]);
@@ -2604,7 +2619,7 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
         .env("EDITOR", editor(&home, "true"));
     Run(back.output().unwrap()).ok();
 
-    let out = edit("open_files = 64");
+    let out = edit_limits(&home, "open_files = 64");
     assert!(
         out.ok()
             .stdout()
@@ -2644,9 +2659,19 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
             && l.contains("have a hard limit above 64 open files")),
         "not shown closed:\n{report}"
     );
+}
 
-    // A limit above the hard one enclos runs under stops the session, with
-    // the field named, and runs nothing.
+/// A limit above the hard one enclos runs under stops the session, with
+/// the field named, and runs nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_limit_above_enclos_own_hard_limit_stops_the_session() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    edit_limits(&home, "open_files = 64").ok();
     let out = Run(Command::new("/bin/bash")
         .arg("-c")
         .arg("ulimit -n 32 && exec \"$0\" \"$@\"")
