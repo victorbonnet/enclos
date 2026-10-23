@@ -104,10 +104,19 @@ impl MemoryLog {
         self.wait_until(|events| events.len() >= n)
     }
 
-    /// Waits for `n` records to be finished.
+    /// Waits for `n` records to be finished. The count is read before the
+    /// records, so they hold every finish it counted: read after, a finish
+    /// landing in between would count a record still as it opened.
     fn wait_finished(&self, n: usize) -> Vec<NetEvent> {
-        let finished = &self.1;
-        self.wait_until(|_| finished.load(std::sync::atomic::Ordering::SeqCst) >= n)
+        let start = Instant::now();
+        loop {
+            let finished = self.1.load(std::sync::atomic::Ordering::SeqCst) >= n;
+            let events = self.0.lock().unwrap().clone();
+            if finished || start.elapsed() > Duration::from_secs(5) {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Waits until the records are `done`, for at most [`PATIENCE`].
@@ -177,7 +186,15 @@ fn start_with(
 fn start_on_both_loopbacks(tweak: impl FnOnce(&mut Proxy)) -> (u16, MemoryLog, Arc<Proxy>) {
     let (proxy, log, _) = built(&[], Box::new(NoResolver), classify, tweak);
     // Any port, so no other test can take it between choosing and binding.
-    let listeners = listen(0).unwrap();
+    // The port chosen on [::1] can be taken on 127.0.0.1 by another
+    // program: then another one is chosen.
+    let listeners = (0..20)
+        .find_map(|_| match listen(0) {
+            Ok(listeners) => Some(listeners),
+            Err(e) if e.source.kind() == io::ErrorKind::AddrInUse => None,
+            Err(e) => panic!("{e:?}"),
+        })
+        .expect("a port free on both loopbacks");
     let port = listeners[0].local_addr().unwrap().port();
     assert_eq!(listeners.len(), 2);
     // `[::1]` first, so that once 127.0.0.1 answers, both are held.
