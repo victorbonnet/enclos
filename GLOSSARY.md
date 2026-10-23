@@ -24,6 +24,10 @@ _Avoid_: rules, permissions, config
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file
 
+**Baseline**:
+What a compiled policy does with every operation no rule of it names: refuse it (deny by default) or allow it (allow by default). On Seatbelt, `(deny default)` or `(allow default)`. The comparison baseline is `(allow default)`, kept only to compare the two.
+_Avoid_: default policy, fallback
+
 **Policy snapshot**:
 One immutable, fully resolved version of a sandbox's policy, identified by its content hash and recording the inputs it was resolved from.
 _Avoid_: revision, policy file

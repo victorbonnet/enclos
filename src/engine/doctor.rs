@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use super::Engine;
 use super::compile::compiled_stem;
 use super::session::marked_in;
+use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
 use crate::layout::LayoutError;
@@ -51,8 +52,10 @@ pub struct BackendCheck {
     pub capabilities: Capabilities,
 }
 
-/// Whether a backend is on this host, as checked before every session, and
-/// then whether a program ran in it.
+/// Whether a backend can be used on this host, as checked before every
+/// session (`NotFound`, kept as the JSON's `not_found`, also covers a
+/// Seatbelt baseline asked for that is neither), and then whether a program
+/// ran in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendState {
     NotFound {
@@ -123,8 +126,8 @@ pub struct Drift {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftKind {
     /// It compiles to `now`, which is not what `ran` holds: what enclos adds
-    /// when it compiles a policy changed, as an upgrade changes it, or a
-    /// path the policy names resolves elsewhere now.
+    /// when it compiles a policy changed, as an upgrade changes it, a path
+    /// the policy names resolves elsewhere now, or the baseline changed.
     Changed { now: PathBuf, ran_file: RanFile },
     /// It no longer compiles, or no longer passes enclos's write checks;
     /// the next session is the active version's, checked apart.
@@ -142,6 +145,10 @@ pub enum RanFile {
         /// it was changed after it was written. Said whether or not it now
         /// matches what the version compiles to.
         edited: bool,
+        /// As enclos wrote it, not edited, it is on the `(allow default)`
+        /// comparison baseline (ADR 0006), which only a debug build
+        /// compiles: the change then includes that baseline.
+        on_allow_default: bool,
         lines: Lines,
     },
 }
@@ -443,9 +450,14 @@ impl Engine {
                 if bytes == text.as_bytes() && !edited {
                     return Ok(None);
                 }
+                let before = String::from_utf8_lossy(&bytes);
                 RanFile::There {
                     edited,
-                    lines: lines_between(&String::from_utf8_lossy(&bytes), &text),
+                    // Said only of a file as enclos wrote it: an edited one
+                    // is said so.
+                    on_allow_default: !edited
+                        && Baseline::of_compiled(&before) == Some(Baseline::AllowDefault),
+                    lines: lines_between(&before, &text),
                 }
             }
         };

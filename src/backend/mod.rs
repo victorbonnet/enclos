@@ -258,7 +258,7 @@ pub trait Backend {
 ///
 /// This is the one explicit list of implementations.
 pub fn registered() -> Vec<Box<dyn Backend>> {
-    vec![Box::new(seatbelt::Seatbelt)]
+    vec![Box::new(seatbelt::Seatbelt::from_env())]
 }
 
 #[cfg(test)]

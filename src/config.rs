@@ -17,6 +17,13 @@ pub fn initial(default_backend: Option<BackendKind>) -> String {
     format!("# enclos configuration\nschema_version = {SCHEMA_VERSION}\n{backend}")
 }
 
+/// Whether a `config.toml`'s text sets `default_backend`.
+pub fn names_default_backend(text: &str) -> bool {
+    text.parse::<toml::Table>()
+        .map(|table| table.contains_key("default_backend"))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27,5 +34,7 @@ mod tests {
         assert!(config.contains("schema_version = 1\n"));
         assert!(config.contains("default_backend = \"seatbelt\"\n"));
         assert!(initial(None).contains("# default_backend"));
+        assert!(names_default_backend(&initial(Some(BackendKind::Seatbelt))));
+        assert!(!names_default_backend(&initial(None)));
     }
 }

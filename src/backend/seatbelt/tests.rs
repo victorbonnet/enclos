@@ -16,6 +16,39 @@ use crate::policy::file::PolicyFile;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{Outcome, ProbeInputs, Proof, Run, outcome, probes, sandboxed_script};
 
+/// `text`, a policy compiled on `(deny default)`, as it compiles on
+/// `(allow default)`: its header and the deny-default block replaced, as
+/// `compile` does (`allow_default_differs_only_in_its_baseline`).
+fn on_allow_default(text: &str) -> String {
+    let block = format!(
+        "(deny default (with message \"enclos:home\"))\n{}\n",
+        super::compile::DENY_DEFAULT.trim_end()
+    );
+    assert!(text.contains(&block), "{text}");
+    text.replace(&block, "(allow default)\n")
+}
+
+/// Runs `script` in the sandbox under `compiled`: whether it exited 0, and
+/// what it printed on stdout and stderr together.
+fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
+    let launch = Launch {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), format!("{script} 2>&1").into()],
+        env: vec![],
+        in_terminal: false,
+        service_port: None,
+        limits: Default::default(),
+    };
+    let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
 struct World {
     _dir: tempfile::TempDir,
     base: PathBuf,
@@ -84,7 +117,11 @@ fn world() -> World {
         "{home}/private".into(),
     ];
     let compiled = base.join("policy.sb");
-    std::fs::write(&compiled, Seatbelt.compile(&policy, &ctx).unwrap().text).unwrap();
+    std::fs::write(
+        &compiled,
+        Seatbelt::default().compile(&policy, &ctx).unwrap().text,
+    )
+    .unwrap();
     let paths = PathContext {
         user_home: ctx.user_home.clone(),
         sandbox_home: ctx.home.clone(),
@@ -117,7 +154,7 @@ impl World {
             service_port,
             limits: Default::default(),
         };
-        let mut command: Command = Seatbelt.wrap(&self.compiled, &self.ctx, &launch);
+        let mut command: Command = Seatbelt::default().wrap(&self.compiled, &self.ctx, &launch);
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().unwrap().success()
     }
@@ -133,7 +170,7 @@ impl World {
             service_port: None,
             limits: Default::default(),
         };
-        let out = Seatbelt
+        let out = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
             .stderr(Stdio::null())
             .output()
@@ -157,7 +194,7 @@ impl World {
 
     /// Compiles `policy` in place of the one [`world`] wrote.
     fn enforce(&self, policy: &Policy) {
-        let text = Seatbelt.compile(policy, &self.ctx).unwrap().text;
+        let text = Seatbelt::default().compile(policy, &self.ctx).unwrap().text;
         std::fs::write(&self.compiled, text).unwrap();
     }
 }
@@ -287,7 +324,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     service_port: None,
                     limits: Default::default(),
                 };
-                let out = Seatbelt
+                let out = Seatbelt::default()
                     .wrap(&w.compiled, &w.ctx, &launch)
                     .stdin(Stdio::null())
                     .output()
@@ -588,6 +625,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
+        lookups_refused: true,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -611,7 +649,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 service_port: None,
                 limits: Default::default(),
             };
-            let (ok, stdout, stderr) = output(Seatbelt.wrap(compiled, &w.ctx, &launch));
+            let (ok, stdout, stderr) = output(Seatbelt::default().wrap(compiled, &w.ctx, &launch));
             let Proof::Control { control, .. } = &p.proof else {
                 panic!("{} has no control", p.name);
             };
@@ -746,6 +784,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
+        lookups_refused: true,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -792,7 +831,11 @@ fn the_home_stays_in_place_when_the_policy_leaves_it_out_of_its_writes() {
     let mut policy = Policy::default();
     policy.fs.write = vec!["~/work".into()];
     w.compiled = w.base.join("no-home.sb");
-    std::fs::write(&w.compiled, Seatbelt.compile(&policy, &w.ctx).unwrap().text).unwrap();
+    std::fs::write(
+        &w.compiled,
+        Seatbelt::default().compile(&policy, &w.ctx).unwrap().text,
+    )
+    .unwrap();
     let home = w.ctx.home.display().to_string();
     assert!(w.sh("echo x > \"$HOME/still-writable\""));
     let work = w.path("alice/work");
@@ -874,6 +917,111 @@ fn the_sandbox_cannot_type_into_its_terminal() {
     let out = String::from_utf8_lossy(&out.stdout);
     assert!(out.contains("REFUSED"), "{out}");
     assert!(!out.contains("INJECTED"), "{out}");
+
+    // Under `(allow default)` each rule holds alone; under `(deny default)`
+    // the `ioctl` rule holds alone, and the baseline already refuses
+    // `hid-control`, so there the hid rule is not shown alone. With
+    // neither, the byte goes in: the control (into `script`'s own terminal
+    // only).
+    let run = |text: &str, name: &str| {
+        let file = w.base.join(name);
+        std::fs::write(&file, text).unwrap();
+        let out = Command::new("/usr/bin/script")
+            .args(["-q", "/dev/null", "/usr/bin/sandbox-exec", "-f"])
+            .arg(&file)
+            .args(["/usr/bin/perl", "-e", try_tiocsti])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let ioctl_rule =
+        "(deny file-ioctl (with message \"enclos:home\")\n  (ioctl-command TIOCSTI))\n";
+    let hid_rule = "(deny hid-control (with message \"enclos:home\"))\n";
+    assert!(
+        text.contains(ioctl_rule) && text.contains(hid_rule),
+        "{text}"
+    );
+    let neither = format!(
+        "{}(allow hid-control)\n",
+        text.replace(ioctl_rule, "").replace(hid_rule, "")
+    );
+    assert!(
+        run(&neither, "neither.sb").contains("INJECTED"),
+        "the control"
+    );
+    let ioctl_alone = format!("{}(allow hid-control)\n", text.replace(hid_rule, ""));
+    assert!(run(&ioctl_alone, "ioctl-alone.sb").contains("REFUSED"));
+    let allow_default = on_allow_default(&text);
+    let allow_ioctl_alone = format!(
+        "{}(allow hid-control)\n",
+        allow_default.replace(hid_rule, "")
+    );
+    assert!(run(&allow_ioctl_alone, "allow-ioctl-alone.sb").contains("REFUSED"));
+    let hid_alone = text.replace(ioctl_rule, "");
+    assert!(run(&hid_alone, "hid-alone.sb").contains("REFUSED"));
+    let allow_hid_alone = allow_default.replace(ioctl_rule, "");
+    assert!(run(&allow_hid_alone, "allow-hid-alone.sb").contains("REFUSED"));
+    let allow_neither = allow_default.replace(ioctl_rule, "").replace(hid_rule, "");
+    assert!(
+        run(&allow_neither, "allow-neither.sb").contains("INJECTED"),
+        "the control under (allow default)"
+    );
+}
+
+/// The sandbox still signals its own processes, as job control, timeouts
+/// and Ctrl-C need, one by one and by process group (the `signals` probe
+/// shows the rest are refused). (`ps` cannot show them: it is setuid, and
+/// Seatbelt runs no setuid program, whatever the baseline.)
+#[test]
+fn the_sandbox_signals_its_own_processes() {
+    let w = world();
+    assert!(w.sh("/bin/sleep 30 & p=$!; /bin/kill $p; wait $p; [ $? -eq 143 ]"));
+    // A group the sandboxed process itself made, as a shell's job control
+    // makes one for each job.
+    // Both sides make the group, so it is there before the signal, however
+    // the two are scheduled.
+    let group = r#"my $p = fork; if (!$p) { setpgrp(0, 0); sleep 30; exit } setpgrp($p, $p); kill "TERM", -$p; waitpid($p, 0); exit($? == 15 ? 0 : 1)"#;
+    assert!(w.sh(&format!("/usr/bin/perl -e '{group}'")));
+}
+
+/// Under `(deny default)` the baseline refuses the lookups LaunchServices
+/// and Apple Events need, so the host-service probes close on what that
+/// makes the tools say; under `(allow default)` the policy's own rules
+/// refuse them. Only where host-service probes may run (CI): were a rule
+/// not to hold, Finder would open a folder.
+#[test]
+fn the_host_services_close_on_the_baseline_and_on_the_rules() {
+    if std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() != Ok("1") {
+        // CI runs them: a workflow that lost the variable must not pass.
+        assert_ne!(
+            std::env::var("GITHUB_ACTIONS").as_deref(),
+            Ok("true"),
+            "CI runs the host-service probes: ENCLOS_HOST_SERVICE_PROBES=1 is missing"
+        );
+        eprintln!("host-service probes not run: set ENCLOS_HOST_SERVICE_PROBES=1 (CI does)");
+        return;
+    }
+    let w = world();
+    let text = std::fs::read_to_string(&w.compiled).unwrap();
+    let allow = w.base.join("allow-default.sb");
+    std::fs::write(&allow, on_allow_default(&text)).unwrap();
+    let open = "/usr/bin/open -g /System";
+    let event = "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'";
+    for (compiled, opened, sent) in [
+        (
+            &w.compiled,
+            crate::probes::LS_LOOKUP_REFUSED,
+            crate::probes::AE_LOOKUP_REFUSED,
+        ),
+        (&allow, crate::probes::LS_REFUSED, crate::probes::AE_REFUSED),
+    ] {
+        let (ok, out) = run_under(&w, compiled, open);
+        assert!(!ok && out.contains(opened), "{}: {out}", compiled.display());
+        let (ok, out) = run_under(&w, compiled, event);
+        assert!(!ok && out.contains(sent), "{}: {out}", compiled.display());
+    }
 }
 
 /// A pseudo-terminal this test opens, as a terminal app does for each tab:
@@ -949,7 +1097,9 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
         function run(argv) {
             try { $.sandbox_extension_consume($.sandbox_extension_issue_file('com.apple.sandbox.pty', argv[0], 0)) } catch (e) {}
         }";
-    let script = r#"/usr/bin/osascript -l JavaScript -e "$1" "$2" >/dev/null 2>&1; : < "$2""#;
+    // The marker first: a compiled policy `sandbox-exec` refused, or no
+    // `osascript`, is then not taken for the route closed.
+    let script = r#"echo enclos-ran; /usr/bin/osascript -l JavaScript -e "$1" "$2" >/dev/null 2>&1; : < "$2""#;
     let run = |compiled: &Path| {
         let launch = Launch {
             program: "/bin/sh".into(),
@@ -965,27 +1115,67 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             service_port: None,
             limits: Default::default(),
         };
-        super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
+        let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("enclos-ran"),
+            "{}: the script never ran",
+            compiled.display()
+        );
+        out.status.success()
     };
-    // The control: without the rule that refuses it, the extension opens
-    // `other`, so the route exists and this test can see it closed.
+    // The control: from `(allow default)` and without the rule that refuses
+    // it, the extension opens `other`, so the route exists and this test can
+    // see it closed. `(deny default)` refuses it too, as Apple's own
+    // `application.sb` does: the rule keeps it closed should the baseline
+    // ever be `(allow default)` again (ADR 0006).
     let text = std::fs::read_to_string(&w.compiled).unwrap();
-    let without: String = text
+    let without: String = on_allow_default(&text)
         .lines()
         .filter(|l| !l.starts_with("(deny file-issue-extension"))
         .map(|l| format!("{l}\n"))
         .collect();
-    assert!(without.len() < text.len(), "no rule to remove");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("(deny file-issue-extension")),
+        "no rule to remove"
+    );
     let open = w.base.join("without-the-rule.sb");
     std::fs::write(&open, without).unwrap();
     assert!(run(&open), "the route is gone: nothing to test");
     assert!(!run(&w.compiled));
+    // The rule alone closes it on the earlier baseline, and the baseline
+    // alone closes it without the rule.
+    let with_rule = on_allow_default(&text);
+    let file = w.base.join("allow-default-with-the-rule.sb");
+    std::fs::write(&file, with_rule).unwrap();
+    assert!(
+        !run(&file),
+        "the rule does not close it under (allow default)"
+    );
+    let baseline_alone: String = text
+        .lines()
+        .filter(|l| !l.starts_with("(deny file-issue-extension"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let file = w.base.join("deny-default-without-the-rule.sb");
+    std::fs::write(&file, &baseline_alone).unwrap();
+    assert!(!run(&file), "(deny default) does not close it alone");
+    // The control on that baseline: allowed to issue the extension, the
+    // sandbox opens `other`, so what closes it there is the baseline.
+    let issued = format!(
+        "{baseline_alone}(allow file-issue-extension (extension-class \"{}\"))\n",
+        "com.apple.sandbox.pty"
+    );
+    let file = w.base.join("deny-default-allowed-to-issue.sb");
+    std::fs::write(&file, issued).unwrap();
+    assert!(
+        run(&file),
+        "the route is gone under (deny default): nothing to test"
+    );
 }
 
 #[test]

@@ -100,8 +100,22 @@ pub struct InitReport {
     /// Folders and files that did not exist before.
     pub created: Vec<PathBuf>,
     pub migration: Migration,
-    /// The backend written to a new `config.toml`, if one is available.
+    /// The first backend available on this host now: the one written to
+    /// `config.toml` when this run created it.
     pub default_backend: Option<BackendKind>,
+    /// Each backend this host cannot use now, and why: an unsupported
+    /// system, or a setting such as a bad `ENCLOS_SEATBELT_BASELINE`.
+    pub unavailable: Vec<Unavailable>,
+    /// Whether a `config.toml` there already names no default backend,
+    /// though one is available now: it was written while none was.
+    pub config_names_no_backend: bool,
+}
+
+/// A backend this host cannot use now, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unavailable {
+    pub backend: BackendKind,
+    pub reason: String,
 }
 
 impl InitReport {
@@ -195,15 +209,21 @@ impl Engine {
         let report = self.write(by, "init", None, InitReport::summary, |lock| {
             self.layout.create_dirs()?;
             let migration = self.state.migrate(lock)?;
-            let default_backend = self.default_backend();
-            self.layout
+            let (default_backend, unavailable) = self.probe_backends();
+            let written = self
+                .layout
                 .write_config(&config::initial(default_backend))?;
+            let config_names_no_backend = !written
+                && default_backend.is_some()
+                && !config::names_default_backend(&self.layout.read_config()?);
             Ok(InitReport {
                 data: self.layout.data().to_owned(),
                 config: self.layout.config().to_owned(),
                 created,
                 migration,
                 default_backend,
+                unavailable,
+                config_names_no_backend,
             })
         })?;
         Ok(Planned::Done(report))
@@ -268,12 +288,23 @@ impl Engine {
         self
     }
 
-    /// The first registered backend that works on this host.
-    fn default_backend(&self) -> Option<BackendKind> {
-        self.backends
-            .iter()
-            .find(|b| b.probe() == Probe::Available)
-            .map(|b| b.kind())
+    /// The first backend available here, and why each unavailable one is
+    /// not.
+    fn probe_backends(&self) -> (Option<BackendKind>, Vec<Unavailable>) {
+        let mut first = None;
+        let mut unavailable = Vec::new();
+        for backend in &self.backends {
+            match backend.probe() {
+                Probe::Available => {
+                    first.get_or_insert(backend.kind());
+                }
+                Probe::Unavailable { reason } => unavailable.push(Unavailable {
+                    backend: backend.kind(),
+                    reason,
+                }),
+            }
+        }
+        (first, unavailable)
     }
 
     /// Writes one closed audit entry, taking the lock only for the write,

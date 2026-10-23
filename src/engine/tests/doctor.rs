@@ -653,3 +653,38 @@ fn doctor_changes_nothing() {
     assert_eq!(std::fs::read(&audit).unwrap(), log);
     assert_eq!(std::fs::read(engine.layout.state_db()).unwrap(), db);
 }
+
+/// A file a session ran under that is on the `(allow default)` comparison
+/// baseline, as enclos wrote it, is said to be; an edited one is not.
+#[test]
+fn a_file_on_the_allow_default_baseline_is_said_so() {
+    let (_dir, engine, name) = with_sandbox();
+    let (now, _) = engine.compiled_file(&name, port(&engine, &name)).unwrap();
+    let text = ";; enclos compiled policy for home\n(version 1)\n(allow default)\n";
+    let digest = crate::policy::sha256_hex(text.as_bytes());
+    let ran = now.with_file_name(format!("{}.sb", &digest[..16]));
+    std::fs::create_dir_all(ran.parent().unwrap()).unwrap();
+    std::fs::write(&ran, text).unwrap();
+    ran_under(&engine, &name, gone_process(), &ran);
+    let flag = |engine: &Engine| {
+        let check = check_of(&engine.doctor(), &name);
+        let [drift] = check.drift.as_slice() else {
+            panic!("{check:?}");
+        };
+        match &drift.kind {
+            DriftKind::Changed {
+                ran_file:
+                    RanFile::There {
+                        on_allow_default,
+                        edited,
+                        ..
+                    },
+                ..
+            } => (*on_allow_default, *edited),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(flag(&engine), (true, false));
+    std::fs::write(&ran, format!("{text}(edited)\n")).unwrap();
+    assert_eq!(flag(&engine), (false, true));
+}
