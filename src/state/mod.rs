@@ -14,6 +14,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
+use crate::model::secret::{SecretRecord, SecretRef};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
@@ -165,6 +166,14 @@ pub trait StateStore: NetLogStore {
     -> Result<()>;
     /// The sandbox's agents, by name.
     fn agents(&self, sandbox: &SandboxName) -> Result<Vec<AgentRecord>>;
+
+    /// Records that `secret` was set now; true when it is new. Its value
+    /// is the secret store's alone.
+    fn put_secret(&self, lock: &StateLock, secret: &SecretRef) -> Result<bool>;
+    /// Forgets `secret`; false when it was not recorded.
+    fn remove_secret(&self, lock: &StateLock, secret: &SecretRef) -> Result<bool>;
+    /// The sandbox's secrets, by name.
+    fn secrets(&self, sandbox: &SandboxName) -> Result<Vec<SecretRecord>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections

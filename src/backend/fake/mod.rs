@@ -86,10 +86,10 @@ impl Backend for FakeBackend {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
         command.env_clear();
-        for (name, value) in super::seatbelt::environment(ctx) {
-            command.env(name, value);
-        }
         for (name, value) in &launch.env {
+            command.env(name, value.expose());
+        }
+        for (name, value) in super::seatbelt::environment(ctx) {
             command.env(name, value);
         }
         command.env(IN_TERMINAL, launch.in_terminal.to_string());

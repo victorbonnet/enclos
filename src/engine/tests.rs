@@ -1654,23 +1654,33 @@ echo \"installed $*\" > \"$HOME/installed\"
 
         /// A lab whose engine installs services through `services`.
         fn with_services(services: Option<Box<dyn crate::service::ServiceManager>>) -> Lab {
-            Lab::build(services, None)
+            Lab::build(services, None, None)
         }
 
         /// A lab whose `launch` stops a session's members with `stop` once
         /// told to end.
         fn stopping_with(stop: crate::engine::StopMembers) -> Lab {
-            Lab::build(None, Some(stop))
+            Lab::build(None, Some(stop), None)
+        }
+
+        /// A lab whose engine keeps secrets in `secrets`.
+        fn with_secrets(secrets: Box<dyn crate::secrets::SecretStore>) -> Lab {
+            Lab::build(None, None, Some(secrets))
         }
 
         fn build(
             services: Option<Box<dyn crate::service::ServiceManager>>,
             stop: Option<crate::engine::StopMembers>,
+            secrets: Option<Box<dyn crate::secrets::SecretStore>>,
         ) -> Lab {
             let (dir, engine, name) =
                 with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
             let engine = match services {
                 Some(services) => engine.with_services(services),
+                None => engine,
+            };
+            let engine = match secrets {
+                Some(secrets) => engine.with_secrets(secrets),
                 None => engine,
             };
             let engine = match stop {
@@ -3603,6 +3613,79 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
+    /// A runtime whose gateway records the secret it was given as $TOKEN.
+    #[cfg(target_os = "macos")]
+    const RECORDS_TOKEN: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+[ \"$1\" = gateway ] || exit 0
+printf '%s' \"${TOKEN:-unset}\" > \"$HOME/gateway-token\"
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+";
+
+    /// A service and a session read the secrets their policy grants as they
+    /// start; with one missing from the store, neither starts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_service_and_a_session_get_the_secrets_their_policy_grants() {
+        use crate::model::secret::{SecretRef, SecretValue};
+        use crate::secrets::{InMemory, SecretStore};
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let store = std::rc::Rc::new(InMemory::default());
+        let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+        assert!(done(lab.install(RECORDS_TOKEN, Confirm::Yes).unwrap()).installed);
+        let token: SecretRef = "home/token".parse().unwrap();
+        let value = SecretValue::new("tok-123:abc".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!("{before}\n[secrets]\nenv = {{ TOKEN = \"secret:home/token\" }}\n");
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert_eq!(end.exit, 0, "{end:?}");
+        let seen = std::fs::read_to_string(lab.home.join("gateway-token")).unwrap();
+        assert_eq!(seen, "tok-123:abc");
+
+        let records = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$TOKEN\" > \"$HOME/session-token\"".into(),
+        ];
+        done(
+            lab.engine
+                .connect(&alice(), &lab.name, records.clone(), Confirm::Yes)
+                .unwrap(),
+        );
+        let session = lab.home.join("session-token");
+        assert_eq!(std::fs::read_to_string(&session).unwrap(), "tok-123:abc");
+
+        store.remove(&token).unwrap();
+        std::fs::remove_file(&session).unwrap();
+        let err = lab
+            .engine
+            .connect(&alice(), &lab.name, records, Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::SecretMissing { .. }), "{err}");
+        assert!(!session.exists(), "the session ran");
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err();
+        assert!(err.to_string().contains("$TOKEN"), "{err}");
+    }
+
     /// A session is given the port its gateway listens on, and says why when
     /// it is given none; the gateway's own launch is given none (ADR 0028).
     #[cfg(target_os = "macos")]
@@ -4569,6 +4652,26 @@ mod services {
         engine.start_sandbox(&alice(), &name).unwrap();
         for unit in fake.started.borrow().iter() {
             assert_eq!(unit.env, engine.layout.env(), "{}", unit.label);
+        }
+    }
+
+    /// The keychain file `ENCLOS_KEYCHAIN` named reaches the services, which
+    /// read their secrets from it: their value, never.
+    #[test]
+    fn services_reach_the_keychain_of_the_enclos_that_started_them() {
+        let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+        let engine = engine.with_secrets(Box::new(crate::secrets::keychain::Keychain::new(
+            "enclos.test".into(),
+            Some("/Users/alice/test.keychain-db".into()),
+        )));
+        engine.start_sandbox(&alice(), &name).unwrap();
+        let mut expected = engine.layout.env();
+        expected.push((
+            "ENCLOS_KEYCHAIN".to_owned(),
+            "/Users/alice/test.keychain-db".to_owned(),
+        ));
+        for unit in fake.started.borrow().iter() {
+            assert_eq!(unit.env, expected, "{}", unit.label);
         }
     }
 
@@ -6291,3 +6394,4 @@ mod listener {
 mod exec;
 mod history;
 mod pending;
+mod secrets;

@@ -249,7 +249,8 @@ impl Engine {
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
-            env: Vec::new(),
+            // Read on the host, now: the sandbox reaches no secret store.
+            env: self.secret_env(&snapshot.policy)?,
             in_terminal: true,
             service_port,
         };

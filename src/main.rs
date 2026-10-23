@@ -41,6 +41,8 @@ enum Command {
     Connect(cli::connect::ConnectArgs),
     /// Run one command inside a sandbox, for a script or another program; exits with its code.
     Exec(cli::connect::ExecArgs),
+    /// Set, list or remove a sandbox's secrets, kept in the Keychain.
+    Secret(cli::secret::SecretArgs),
     /// Install a runtime in a sandbox.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
@@ -134,6 +136,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
         Command::Exec(args) => cli::connect::exec(&engine, &current_actor(), confirm, args),
+        Command::Secret(args) => cli::secret::run(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
@@ -157,6 +160,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
             | Command::Audit(_)
             | Command::Sandbox(_)
             | Command::Policy(_)
+            | Command::Secret(_)
             | Command::Net(_)
             | Command::Status(_)
     )

@@ -417,6 +417,197 @@ fn editor(home: &Home, script: &str) -> String {
     path.display().to_string()
 }
 
+/// A keychain file of the test's own, unlocked. `create-keychain` adds it
+/// to the user's search list; `delete-keychain`, when dropped, takes it out
+/// again.
+#[cfg(target_os = "macos")]
+struct TestKeychain(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl TestKeychain {
+    fn new(home: &Home) -> TestKeychain {
+        let file = home._dir.path().join("test.keychain-db");
+        let path = file.to_str().unwrap();
+        for args in [
+            &["create-keychain", "-p", "test", path][..],
+            &["unlock-keychain", "-p", "test", path],
+        ] {
+            assert!(
+                Command::new("/usr/bin/security")
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        TestKeychain(file)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TestKeychain {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/security")
+            .arg("delete-keychain")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
+    use std::io::Write;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    let run = |args: &[&str], input: Option<&[u8]>| {
+        let mut cmd = home.command(args);
+        cmd.env("ENCLOS_KEYCHAIN", &keychain.0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        if let Some(input) = input {
+            stdin.write_all(input).unwrap();
+        }
+        drop(stdin);
+        Run(child.wait_with_output().unwrap())
+    };
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let out = run(&["secret", "set", "home/telegram"], Some(b"tok-123:abc\n"));
+    assert!(
+        out.ok().stdout().contains("Stored secret home/telegram"),
+        "{}",
+        out.stdout()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(out.ok().stdout().contains("telegram"), "{}", out.stdout());
+    assert!(!out.stdout().contains("tok-123"), "{}", out.stdout());
+
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(
+                &home,
+                r#"printf '\n[secrets]\nenv = { TOKEN = "secret:home/telegram" }\n' >> "$1""#,
+            ),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(
+        &["exec", "home", "--", "/bin/sh", "-c", "echo \"$TOKEN\""],
+        None,
+    );
+    assert_eq!(out.ok().stdout(), "tok-123:abc\n");
+
+    // Granted, it cannot go; neither the audit log nor the files hold it.
+    let out = run(&["--yes", "secret", "rm", "home/telegram"], None);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("granted as $TOKEN"),
+        "{}",
+        out.stderr()
+    );
+    for file in ["audit.jsonl", "sandboxes/home/policy.toml"] {
+        let text = std::fs::read_to_string(home.root.join(file)).unwrap();
+        assert!(!text.contains("tok-123"), "{file}");
+    }
+
+    // Taken out of the policy, it goes, after asking.
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(&home, r#"sed -i '' '/secrets/d; /TOKEN/d' "$1""#),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(&["secret", "rm", "home/telegram"], None);
+    assert_eq!(out.code(), 3, "{}", out.stderr());
+    let out = run(&["--yes", "secret", "rm", "home/telegram"], None);
+    assert!(
+        out.ok().stdout().contains("Removed secret home/telegram"),
+        "{}",
+        out.stdout()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(
+        out.ok().stdout().contains("has no secrets"),
+        "{}",
+        out.stdout()
+    );
+
+    // A value of several lines, piped in, comes whole; nothing is not one.
+    let pem = "-----BEGIN KEY-----\nabc\n-----END KEY-----\n";
+    run(&["secret", "set", "home/pem"], Some(pem.as_bytes())).ok();
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .env_remove("VISUAL")
+        .env(
+            "EDITOR",
+            editor(
+                &home,
+                r#"printf '\n[secrets]\nenv = { PEM = "secret:home/pem" }\n' >> "$1""#,
+            ),
+        );
+    Run(edit.output().unwrap()).ok();
+    let out = run(
+        &[
+            "exec",
+            "home",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf '%s' \"$PEM\"",
+        ],
+        None,
+    );
+    assert_eq!(out.ok().stdout(), pem.trim_end_matches('\n'));
+    let out = run(&["secret", "set", "home/empty"], Some(b""));
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("the value is empty"),
+        "{}",
+        out.stderr()
+    );
+    let out = run(&["secret", "list", "home"], None);
+    assert!(!out.ok().stdout().contains("empty"), "{}", out.stdout());
+}
+
+/// With no keychain to write to, a secret is refused before anything is
+/// written, rather than waiting on a dialog nobody sees.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_with_no_keychain_to_hold_it_is_refused() {
+    use std::io::Write;
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let missing = home._dir.path().join("none.keychain-db");
+    let mut cmd = home.command(&["secret", "set", "home/telegram"]);
+    cmd.env("ENCLOS_KEYCHAIN", &missing)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"tok\n").unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("does not exist"), "{}", out.stderr());
+    let out = home.run(&["secret", "list", "home"]);
+    assert!(
+        out.ok().stdout().contains("has no secrets"),
+        "{}",
+        out.stdout()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
@@ -912,7 +1103,25 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     if host_services {
         args.push("--host-services");
     }
-    let out = home.run(&args);
+    // A keychain of the test's own, holding a secret of the sandbox, so the
+    // keychain item probe runs, and is seen not to touch that secret.
+    let keychain = TestKeychain::new(&home);
+    let mut set = home.command(&["secret", "set", "home/keep"]);
+    set.env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = set.spawn().unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"kept\n").unwrap();
+    }
+    Run(child.wait_with_output().unwrap()).ok();
+    let out = Run(home
+        .command(&args)
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .output()
+        .unwrap());
     assert_eq!(
         out.code(),
         0,
@@ -993,6 +1202,22 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
         let agents = "write in ~/Library/LaunchAgents";
         assert!(closed(agents), "{agents} is not shown closed:\n{report}");
     }
+    assert!(closed("read a keychain item"), "{report}");
+    assert!(!report.contains("keychain items ("), "{report}");
+    let items = Command::new("/usr/bin/security")
+        .arg("dump-keychain")
+        .arg(&keychain.0)
+        .output()
+        .unwrap();
+    let items = String::from_utf8_lossy(&items.stdout);
+    assert!(
+        !items.contains("home/probe"),
+        "the probe's item stays:\n{items}"
+    );
+    assert!(
+        items.contains("home/keep"),
+        "the sandbox's secret went:\n{items}"
+    );
     assert!(!report.contains("denied paths exists here"), "{report}");
     assert!(
         !report.contains("no ~/Library/LaunchAgents here"),
@@ -2029,5 +2254,148 @@ fn status_shows_each_sandbox_its_agents_and_what_to_do() {
     assert_eq!(
         rm.ok().stdout(),
         "Removed the record of agent home/gone, which Hermes no longer had.\n"
+    );
+}
+
+/// `secret set` at a terminal: a line longer than the terminal's own limit
+/// comes whole, a pasted second line is refused, Ctrl-C cancels at once,
+/// and echo is back on after each.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use rustix::termios::{LocalModes, tcgetattr};
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let at_terminal = |name: &str, keys: &[u8]| {
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let path = ptsname(&master, Vec::new()).unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.to_str().unwrap())
+            .unwrap();
+        let mut cmd = home.command(&["secret", "set", &format!("home/{name}")]);
+        cmd.env("ENCLOS_KEYCHAIN", &keychain.0)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        // From a thread: a paste longer than the terminal's queue waits for
+        // enclos to read it. A 0xff byte, never typed, stands for a pause
+        // longer than enclos waits for a quiet input.
+        let keys = keys.to_vec();
+        let writer = master.try_clone().unwrap();
+        let typing = std::thread::spawn(move || {
+            for part in keys.split(|b| *b == 0xff) {
+                let mut part = part;
+                while !part.is_empty() {
+                    match rustix::io::write(&writer, part) {
+                        Ok(n) => part = &part[n..],
+                        Err(_) => return,
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        });
+        let out = Run(child.wait_with_output().unwrap());
+        // Not joined: a writer still blocked means enclos stopped reading,
+        // which the bytes left below show, rather than a test that hangs.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(typing);
+        let echo = tcgetattr(&slave)
+            .unwrap()
+            .local_modes
+            .contains(LocalModes::ECHO);
+        // What the shell would read next: nothing of the value.
+        let left = rustix::io::ioctl_fionread(&slave).unwrap();
+        assert_eq!(left, 0, "{left} bytes left for the shell");
+        // enclos turned bracketed paste on, then off, on this terminal.
+        rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).unwrap();
+        let mut shown = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n @ 1..) = rustix::io::read(&master, &mut buf[..]) {
+            shown.extend_from_slice(&buf[..n]);
+        }
+        let shown = String::from_utf8_lossy(&shown);
+        assert!(
+            shown.contains("\x1b[?2004h") && shown.ends_with("\x1b[?2004l"),
+            "{shown:?}"
+        );
+        (out, echo)
+    };
+    let (out, echo) = at_terminal("long", &[b"k".repeat(1500), b"\r".to_vec()].concat());
+    assert!(
+        out.ok().stdout().contains("Stored secret home/long"),
+        "{}",
+        out.stdout()
+    );
+    assert!(echo);
+    let (out, echo) = at_terminal("pasted", b"first-line\rsecond-part");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    // A paste far past the limit and the terminal's queue: refused, and
+    // none of it left for the shell.
+    let (out, echo) = at_terminal("huge", &b"k".repeat(6000));
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("at most 4096 bytes"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    let pem = [
+        b"-----BEGIN KEY-----\r".to_vec(),
+        b"k".repeat(3000),
+        b"\r-----END KEY-----\r".to_vec(),
+    ]
+    .concat();
+    let (out, echo) = at_terminal("pem", &pem);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    // A paste whose second half comes after a pause, as over a slow link:
+    // its end is known from the marks a terminal puts around a paste.
+    let (out, echo) = at_terminal(
+        "slow",
+        b"\x1b[200~first-line\rsecond\xff\rthird-line\x1b[201~",
+    );
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("more came after the line"),
+        "{}",
+        out.stderr()
+    );
+    assert!(echo);
+    // A pasted value with its line ending, then Return: one line.
+    let (out, _) = at_terminal("whole", b"\x1b[200~tok-123\r\x1b[201~");
+    assert!(
+        out.ok().stdout().contains("Stored secret home/whole"),
+        "{}",
+        out.stdout()
+    );
+    let (out, echo) = at_terminal("cancel", b"abc\x03");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stderr().contains("cancelled"), "{}", out.stderr());
+    assert!(echo);
+    let listed = home.run(&["secret", "list", "home"]);
+    let listed = listed.ok().stdout();
+    assert!(
+        listed.contains("long") && !listed.contains("pasted"),
+        "{listed}"
     );
 }

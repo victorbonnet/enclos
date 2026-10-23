@@ -49,10 +49,12 @@ enum SandboxVerb {
         #[arg(required = true)]
         names: Vec<SandboxName>,
     },
-    /// Remove a stopped sandbox, and its home unless --keep-data.
+    /// Remove a stopped sandbox and its secrets, and its home unless
+    /// --keep-data.
     Rm {
         name: SandboxName,
-        /// Keep the sandbox's folder and home on disk.
+        /// Keep the sandbox's folder and home on disk; its secrets go
+        /// still.
         #[arg(long)]
         keep_data: bool,
     },
@@ -133,7 +135,19 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-                Planned::Done(()) => println!("Removed sandbox {name}."),
+                Planned::Done(left) => {
+                    println!("Removed sandbox {name}.");
+                    for left in &left {
+                        eprintln!(
+                            "error: secret {} stays, and no enclos command reaches it any more: {}",
+                            left.secret, left.why
+                        );
+                    }
+                    // Removed, but not all of it: a script must see that.
+                    if !left.is_empty() {
+                        return Ok(exit::ERROR);
+                    }
+                }
             }
         }
     }

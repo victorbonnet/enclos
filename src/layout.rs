@@ -114,6 +114,27 @@ impl Layout {
         &self.data
     }
 
+    /// What tells this install apart from the user's other ones
+    /// (`ENCLOS_HOME`) where they share a name space, as in launchd labels
+    /// and Keychain items: the first 8 hex digits of the SHA-256 of the data
+    /// folder, with links and `.` resolved, so that every spelling of the
+    /// folder names the same install.
+    pub fn install_id(&self) -> Result<String, LayoutError> {
+        use std::os::unix::ffi::OsStrExt;
+        let data = match std::fs::canonicalize(&self.data) {
+            Ok(data) => data,
+            // Missing, the folder holds nothing yet to name.
+            Err(e) if e.kind() == ErrorKind::NotFound => self.data.clone(),
+            Err(source) => {
+                return Err(LayoutError::Io {
+                    path: self.data.clone(),
+                    source,
+                });
+            }
+        };
+        Ok(crate::policy::sha256_hex(data.as_os_str().as_bytes())[..8].to_owned())
+    }
+
     pub fn config(&self) -> &Path {
         &self.config
     }

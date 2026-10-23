@@ -209,6 +209,44 @@ pub enum Error {
         "sandbox `{sandbox}` has a pending policy change, which needs a restart. Apply it first with `enclos policy apply {sandbox}`, or drop it with `enclos policy discard {sandbox}`"
     )]
     PolicyPending { sandbox: String },
+    #[error(transparent)]
+    Secret(#[from] crate::secrets::SecretError),
+    /// A policy granting a secret the sandbox does not have.
+    #[error(
+        "sandbox `{}` has no secret `{}`: set it first with `enclos secret set {secret}`",
+        secret.sandbox,
+        secret.name
+    )]
+    NoSuchSecret {
+        secret: crate::model::secret::SecretRef,
+    },
+    /// A secret to remove that the sandbox does not have.
+    #[error(
+        "sandbox `{}` has no secret `{}`: `enclos secret list {}` lists those it has",
+        secret.sandbox,
+        secret.name,
+        secret.sandbox
+    )]
+    SecretUnknown {
+        secret: crate::model::secret::SecretRef,
+    },
+    /// A secret the active or pending policy grants, which a session would
+    /// then not find.
+    #[error("secret {secret} is granted as {variables} by {by}; {advice}")]
+    SecretGranted {
+        secret: crate::model::secret::SecretRef,
+        variables: String,
+        by: String,
+        advice: String,
+    },
+    /// A secret the policy grants, which the secret store does not hold.
+    #[error(
+        "the policy gives secret {secret} as ${variable}, but the Keychain has no value for it; set it with `enclos secret set {secret}`"
+    )]
+    SecretMissing {
+        secret: crate::model::secret::SecretRef,
+        variable: String,
+    },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -306,6 +344,11 @@ impl Error {
             | Error::NoSuchPolicyVersion { .. }
             | Error::PolicyFileEdited { .. }
             | Error::PolicyChangedMeanwhile { .. }
+            | Error::Secret(_)
+            | Error::NoSuchSecret { .. }
+            | Error::SecretUnknown { .. }
+            | Error::SecretGranted { .. }
+            | Error::SecretMissing { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }
