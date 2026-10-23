@@ -41,7 +41,7 @@ struct Cli {
 enum Command {
     /// Create the enclos folders, state database and audit log. Safe to run again.
     Init,
-    /// Say whether this host runs each backend, whether each sandbox's next session can start, and which compiled policies enclos now writes differently. Exits 1 when no backend runs, or something keeps a sandbox from running.
+    /// Say whether this host runs each backend, whether each sandbox's next session can start, and which compiled policies enclos now writes differently. Exits 1 when no backend runs, enclos's records cannot be read, or for a sandbox its backend does not run, its next session cannot compile its policy, or doctor could not look at all of it.
     Doctor,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),

@@ -9,7 +9,7 @@ use super::output;
 use enclos::engine::{Engine, Finding, Remedy, Subject};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
-use enclos::model::plan::{Confirm, Planned};
+use enclos::model::plan::Confirm;
 use enclos::model::sandbox::SandboxName;
 
 #[derive(Args)]
@@ -73,10 +73,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
             let (found, label) = if confirm == Confirm::DryRun {
                 (engine.state_check(sandbox.as_ref())?, "would repair")
             } else {
-                match engine.state_repair(by, sandbox.as_ref(), confirm)? {
-                    Planned::Done(found) => (found, "repaired"),
-                    Planned::DryRun(_) => unreachable!("only a dry run plans"),
-                }
+                (engine.state_repair(by, sandbox.as_ref())?, "repaired")
             };
             let left = found.iter().any(|f| f.remedy.is_left());
             if output::json() {
@@ -133,9 +130,7 @@ fn print_finding(f: &Finding, fix: &str) {
     println!("{}: {}.", f.subject, f.what);
     match &f.remedy {
         Remedy::Repairs(repair) => println!("  {fix}: {repair}"),
-        Remedy::Failed { repair, error } => {
-            println!("  repair failed: {repair}: {error}; its records were not changed")
-        }
+        Remedy::Failed { repair, error } => println!("  repair failed: {repair}: {error}"),
         Remedy::Manual(what) => println!("  for you: {what}"),
     }
 }

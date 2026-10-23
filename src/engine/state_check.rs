@@ -17,11 +17,10 @@ use crate::layout::LayoutError;
 use crate::lifecycle::members::{find, is_gone};
 use crate::lifecycle::process::{Proc, processes};
 use crate::lifecycle::programs::{lsof_name, program_files};
-use crate::model::audit::Actor;
-use crate::model::plan::{Confirm, Plan, Planned};
+use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionId;
-use crate::state::StateLock;
+use crate::state::{StateError, StateLock};
 
 /// Something enclos's records say that the host does not, or the reverse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +104,26 @@ struct Host {
     programs: BTreeMap<u32, Vec<String>>,
 }
 
+impl Host {
+    /// Program files first: a process listed there and not by `ps` after is
+    /// one that ended between the two, not one that left its session, which
+    /// ran before either. With no sandbox, nothing is listed: no process can
+    /// be one's.
+    fn list(sandboxes: usize) -> Result<Host> {
+        if sandboxes == 0 {
+            return Ok(Host {
+                procs: Vec::new(),
+                programs: BTreeMap::new(),
+            });
+        }
+        let programs = program_files()?;
+        Ok(Host {
+            procs: processes()?,
+            programs,
+        })
+    }
+}
+
 impl Engine {
     /// What differs between enclos's records and the host, for `only` or
     /// every sandbox; changes nothing. A sandbox enclos cannot look at is a
@@ -117,30 +136,12 @@ impl Engine {
     }
 
     /// Fixes what `state_check` finds that it can fix, under the lock, with
-    /// an audit entry; returns every finding, as fixed ([`Remedy::Repairs`]),
-    /// failed or left. Asks nothing: it changes only enclos's own records
-    /// and `policy.toml`, to agree with the host and the snapshots.
-    pub fn state_repair(
-        &self,
-        by: &Actor,
-        only: Option<&SandboxName>,
-        confirm: Confirm,
-    ) -> Result<Planned<Vec<Finding>>> {
-        if confirm == Confirm::DryRun {
-            let changes = self
-                .state_check(only)?
-                .iter()
-                .filter_map(|f| match &f.remedy {
-                    Remedy::Repairs(repair) => Some(format!("{repair} (sandbox {})", f.subject)),
-                    _ => None,
-                })
-                .collect();
-            return Ok(Planned::DryRun(Plan {
-                changes,
-                ..Plan::default()
-            }));
-        }
-        let found = self.write(
+    /// an audit entry, failed when a repair failed; returns every finding, as
+    /// fixed ([`Remedy::Repairs`]), failed or left. Asks nothing: it changes
+    /// only enclos's own records and `policy.toml`, to agree with the host
+    /// and the snapshots. Its dry run is `state_check`, which finds the same.
+    pub fn state_repair(&self, by: &Actor, only: Option<&SandboxName>) -> Result<Vec<Finding>> {
+        self.write_with_outcome(
             by,
             "state repair",
             only.map(ToString::to_string),
@@ -151,12 +152,14 @@ impl Engine {
                 let failed = count(|r| matches!(r, Remedy::Failed { .. }));
                 let manual = count(|r| matches!(r, Remedy::Manual(_)));
                 match (fixed, failed, manual) {
-                    (0, 0, 0) => "nothing to repair".to_owned(),
-                    (fixed, 0, manual) => format!("repaired {fixed}, left {manual} for a person"),
-                    (fixed, failed, manual) => format!(
+                    (0, 0, 0) => Outcome::ok("nothing to repair"),
+                    (fixed, 0, manual) => {
+                        Outcome::ok(format!("repaired {fixed}, left {manual} for a person"))
+                    }
+                    (fixed, failed, manual) => Outcome::failed(format!(
                         "repaired {fixed}, failed to repair {failed}, left {} for a person",
                         failed + manual
-                    ),
+                    )),
                 }
             },
             |lock| {
@@ -180,52 +183,50 @@ impl Engine {
                             _ => None,
                         })
                         .collect();
-                    if let Err(failed) = self.repair(lock, &name, &repairs) {
-                        let error = printable_line(&failed.error.to_string());
-                        for f in found.iter_mut().filter(|f| mine(f)) {
-                            let Remedy::Repairs(repair) = &f.remedy else {
-                                continue;
-                            };
-                            if failed.written && matches!(repair.0, Fix::WritePolicy { .. }) {
-                                continue;
-                            }
+                    let file = self.repair_file(&name, &repairs).err();
+                    let records = self.repair_records(lock, &name, &repairs).err();
+                    for f in found.iter_mut().filter(|f| mine(f)) {
+                        let Remedy::Repairs(repair) = &f.remedy else {
+                            continue;
+                        };
+                        // Each repair is told the error of its own step.
+                        let error = match repair.0 {
+                            Fix::WritePolicy { .. } => &file,
+                            Fix::EndSessions(_) | Fix::RecordStopped => &records,
+                        };
+                        if let Some(error) = error {
                             f.remedy = Remedy::Failed {
                                 repair: repair.clone(),
-                                error: error.clone(),
+                                error: printable_line(&error.to_string()),
                             };
                         }
                     }
                 }
                 Ok(found)
             },
-        )?;
-        Ok(Planned::Done(found))
+        )
     }
 
-    /// Makes one sandbox's repairs. The file first: written from a snapshot,
-    /// it is right whatever follows. Then the records, in one transaction,
-    /// after which nothing can fail: a failure leaves every record as it was.
-    fn repair(
+    /// Writes the sandbox's `policy.toml` again, when a repair says so,
+    /// from a snapshot: right whatever becomes of its records.
+    fn repair_file(&self, name: &SandboxName, repairs: &[&Repair]) -> Result<()> {
+        for repair in repairs {
+            if let Fix::WritePolicy { text, .. } = &repair.0 {
+                self.layout.write_policy(name.as_str(), text)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the end of gone sessions and a sandbox stopped, when repairs
+    /// say so, in one transaction, after which nothing can fail: a failure
+    /// leaves every record as it was. Done whatever became of the file.
+    fn repair_records(
         &self,
         lock: &StateLock,
         name: &SandboxName,
         repairs: &[&Repair],
-    ) -> std::result::Result<(), RepairFailed> {
-        let mut written = false;
-        let failed = |written: bool| {
-            move |error: Error| RepairFailed {
-                written,
-                error: Box::new(error),
-            }
-        };
-        for repair in repairs {
-            if let Fix::WritePolicy { text, .. } = &repair.0 {
-                self.layout
-                    .write_policy(name.as_str(), text)
-                    .map_err(|e| failed(false)(e.into()))?;
-                written = true;
-            }
-        }
+    ) -> Result<()> {
         let mut ended = Vec::new();
         let mut stopped = false;
         for repair in repairs {
@@ -238,33 +239,19 @@ impl Engine {
         if ended.is_empty() && !stopped {
             return Ok(());
         }
-        let mut record = self
-            .state
-            .get(name)
-            .map_err(|e| failed(written)(e.into()))?
-            .ok_or_else(|| {
-                failed(written)(Error::NoSuchSandbox {
-                    name: name.to_string(),
-                })
-            })?;
+        let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
         if stopped {
             record.state = SandboxState::Stopped;
         }
         if ended.is_empty() {
-            return self
-                .state
-                .put(lock, &record)
-                .map_err(|e| failed(written)(e.into()));
+            return Ok(self.state.put(lock, &record)?);
         }
         // Listed before the commit, so that nothing after it can fail.
-        let sessions = self
-            .state
-            .sessions(name, true)
-            .map_err(|e| failed(written)(e.into()))?;
+        let sessions = self.state.sessions(name, true)?;
         // Saves the record too, in the same transaction.
-        self.state
-            .end_sessions(lock, &ended, &record)
-            .map_err(|e| failed(written)(e.into()))?;
+        self.state.end_sessions(lock, &ended, &record)?;
         for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
             self.forget_marker(session);
         }
@@ -278,14 +265,7 @@ impl Engine {
             })?],
             None => self.state.list()?,
         };
-        // Program files first: a process listed there and not by `ps` after
-        // is one that started or ended between the two, not one that left
-        // its session, which ran before either.
-        let programs = program_files()?;
-        let host = Host {
-            procs: processes()?,
-            programs,
-        };
+        let host = Host::list(records.len())?;
         let mut found = Vec::new();
         for record in &records {
             let name = &record.name;
@@ -293,7 +273,7 @@ impl Engine {
             match self.look_at(record, &host, &mut found) {
                 Ok(()) => {}
                 // What fails for the whole host fails the check, once.
-                Err(error) if !about_files_in(&error, &dir) => return Err(error),
+                Err(error) if !about_this_sandbox(&error, &dir) => return Err(error),
                 Err(error) => found.push(Finding {
                     subject: Subject::Sandbox(name.clone()),
                     what: format!(
@@ -374,7 +354,7 @@ impl Engine {
                     Some(kind) if !kind.is_file() => push(
                         format!("its {} is not a file", policy_file.display()),
                         Remedy::Manual(
-                            "move what is there away; `enclos state repair` then writes the file again"
+                            "move what is there away, then run `enclos state check` again"
                                 .to_owned(),
                         ),
                     ),
@@ -383,8 +363,12 @@ impl Engine {
             }
         }
 
-        // Gone sessions: recorded open, and nothing of them runs.
-        let held = self.held(name)?;
+        // Gone sessions: recorded open, and nothing of them runs. Markers are
+        // only looked for in a folder: one gone or replaced holds none.
+        let held = match dir_found.is_some_and(|k| k.is_dir()) {
+            true => self.held(name)?,
+            false => Default::default(),
+        };
         let open = self.state.sessions(name, true)?;
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();
@@ -516,7 +500,7 @@ impl Engine {
                 (false, _) => push(
                     "it is recorded running, and no session or service of it runs".to_owned(),
                     Remedy::Manual(format!(
-                        "enclos cannot look for processes running from its folder while that is not a folder; `enclos sandbox stop {name}` records it stopped"
+                        "enclos cannot look for processes running from its folder while it is gone or not a folder; `enclos sandbox stop {name}` records it stopped"
                     )),
                 ),
             }
@@ -582,20 +566,13 @@ impl Engine {
     }
 }
 
-/// Why one sandbox's repairs failed, and whether its `policy.toml` was
-/// written before.
-struct RepairFailed {
-    written: bool,
-    error: Box<Error>,
-}
-
-/// Whether `error` is about files in the sandbox folder `dir`, and so the
-/// sandbox's alone: what fails for the host, such as the state database or
-/// the service manager, is not.
-fn about_files_in(error: &Error, dir: &Path) -> bool {
+/// Whether `error` is the sandbox's alone: about files in its folder `dir`,
+/// its markers, or a record of its that does not read. What fails for the
+/// host, such as the state database itself or the service manager, is not.
+fn about_this_sandbox(error: &Error, dir: &Path) -> bool {
     match error {
         Error::Layout(LayoutError::Io { path, .. }) => path.starts_with(dir),
-        Error::Markers(_) => true,
+        Error::Markers(_) | Error::State(StateError::Corrupt { .. }) => true,
         _ => false,
     }
 }
