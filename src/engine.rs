@@ -102,6 +102,9 @@ pub struct InitReport {
     pub migration: Migration,
     /// The backend written to a new `config.toml`, if one is available.
     pub default_backend: Option<BackendKind>,
+    /// Each backend this host cannot use now, and why: an unsupported
+    /// system, or a setting such as a bad `ENCLOS_SEATBELT_BASELINE`.
+    pub unavailable: Vec<(BackendKind, String)>,
 }
 
 impl InitReport {
@@ -195,7 +198,7 @@ impl Engine {
         let report = self.write(by, "init", None, InitReport::summary, |lock| {
             self.layout.create_dirs()?;
             let migration = self.state.migrate(lock)?;
-            let default_backend = self.default_backend();
+            let (default_backend, unavailable) = self.probe_backends();
             self.layout
                 .write_config(&config::initial(default_backend))?;
             Ok(InitReport {
@@ -204,6 +207,7 @@ impl Engine {
                 created,
                 migration,
                 default_backend,
+                unavailable,
             })
         })?;
         Ok(Planned::Done(report))
@@ -269,11 +273,19 @@ impl Engine {
     }
 
     /// The first registered backend that works on this host.
-    fn default_backend(&self) -> Option<BackendKind> {
-        self.backends
-            .iter()
-            .find(|b| b.probe() == Probe::Available)
-            .map(|b| b.kind())
+    /// The first backend available here, and why each other one is not.
+    fn probe_backends(&self) -> (Option<BackendKind>, Vec<(BackendKind, String)>) {
+        let mut first = None;
+        let mut unavailable = Vec::new();
+        for backend in &self.backends {
+            match backend.probe() {
+                Probe::Available => {
+                    first.get_or_insert(backend.kind());
+                }
+                Probe::Unavailable { reason } => unavailable.push((backend.kind(), reason)),
+            }
+        }
+        (first, unavailable)
     }
 
     /// Writes one closed audit entry, taking the lock only for the write,

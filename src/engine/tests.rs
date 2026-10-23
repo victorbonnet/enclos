@@ -90,6 +90,10 @@ fn init_records_the_first_available_backend() {
     ]);
     let report = done(engine.init(&alice(), Confirm::Ask).unwrap());
     assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
+    assert_eq!(
+        report.unavailable,
+        [(BackendKind::Libkrun, "no VM support".to_owned())]
+    );
     let config = std::fs::read_to_string(engine.layout.config_file()).unwrap();
     assert!(
         config.contains("default_backend = \"seatbelt\""),

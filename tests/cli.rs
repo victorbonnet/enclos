@@ -3759,6 +3759,39 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     }
 }
 
+/// `init` with a baseline value that names neither says why Seatbelt is
+/// not available, rather than only that no backend is.
+#[cfg(target_os = "macos")]
+#[test]
+fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
+    let home = Home::new();
+    let out = Run(home
+        .command(&["init"])
+        .env("ENCLOS_SEATBELT_BASELINE", "1")
+        .output()
+        .unwrap());
+    let said = out.ok().stdout();
+    assert!(
+        said.contains("No backend is available on this host yet:\n  seatbelt: ENCLOS_SEATBELT_BASELINE is \"1\""),
+        "{said}"
+    );
+    let out = home
+        .piped(&["init"])
+        .env("ENCLOS_SEATBELT_BASELINE", "1")
+        .output()
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["default_backend"], serde_json::Value::Null, "{doc}");
+    assert_eq!(doc["unavailable"][0]["backend"], "seatbelt", "{doc}");
+    assert!(
+        doc["unavailable"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("it takes `deny-default` or `allow-default`"),
+        "{doc}"
+    );
+}
+
 /// Programs run, and TLS goes through, on either baseline: a page the
 /// policy allows answers 200 over HTTP and HTTPS through the proxy. Needs
 /// the network, as CI has.
