@@ -138,7 +138,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 Planned::Done(restarted) => {
                     let (code, value) = print_restarted(engine, &sandbox, &restarted)?;
                     if output::json() {
-                        output::emit(&json!({"sandbox": sandbox.to_string(), "restarted": value}));
+                        output::emit(&output::with_error(
+                            json!({"sandbox": sandbox.to_string(), "restarted": value}),
+                            code,
+                            || restart_failed(&sandbox),
+                        ));
                     }
                     Ok(code)
                 }
@@ -278,6 +282,14 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "not_probed": NOT_PROBED,
         "listens": report.listens,
     })
+}
+
+/// Why a change that restarted the sandbox exits 1: its stop or its start
+/// failed, as `restarted` says.
+fn restart_failed(sandbox: &SandboxName) -> String {
+    format!(
+        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as `restarted` says; `enclos sandbox show {sandbox}` shows where it is"
+    )
 }
 
 /// A change that was applied, or not: its version, whether it changed,
@@ -422,7 +434,7 @@ fn print_allowed(
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
         let mut shown = applied_json(sandbox, &applied, outcome);
         shown["destination"] = json!(destination);
-        output::emit(&shown);
+        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
         return Ok(code);
     }
     let version = applied.version.version;
@@ -614,7 +626,11 @@ fn print_replaced(
     };
     if output::json() {
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
-        output::emit(&applied_json(sandbox, &applied, outcome));
+        output::emit(&output::with_error(
+            applied_json(sandbox, &applied, outcome),
+            code,
+            || restart_failed(sandbox),
+        ));
         return Ok(code);
     }
     let version = applied.version.version;
@@ -785,7 +801,7 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
         let mut shown = applied_json(sandbox, &applied, outcome);
         shown["edit_left"] = json!(left);
-        output::emit(&shown);
+        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
         return Ok(code);
     }
     let version = applied.version.version;

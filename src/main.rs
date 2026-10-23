@@ -157,7 +157,10 @@ fn main() -> ExitCode {
     // command did.
     if let Some(e) = cli::output::write_failure() {
         eprintln!("error: cannot write the JSON document: {e}");
-        return ExitCode::from(code.max(exit::ERROR));
+        return ExitCode::from(match exec {
+            true => exit::EXEC_FAILED,
+            false => code.max(exit::ERROR),
+        });
     }
     ExitCode::from(code)
 }

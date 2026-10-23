@@ -60,7 +60,10 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
             args.sandbox, args.sandbox
         );
         match json {
-            true => eprintln!("{none}"),
+            true => eprintln!(
+                "{}",
+                super::output::line(&serde_json::json!({ "note": none }))
+            ),
             false => println!("{none}"),
         }
         return Ok(0);
@@ -125,14 +128,16 @@ fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(),
 }
 
 /// Shows `from` on `to` line by line, each line escaped and without its
-/// line ending (`\n` or `\r\n`); with `json`, each as `{"line": …}`, with
-/// `"cut": true` on a piece of a longer line. Bytes that are not UTF-8 show
-/// as U+FFFD, and a line longer than `MAX_LINE` bytes is shown in pieces.
+/// line ending (`\n` or `\r\n`); with `json`, each as `{"line": …}`. Bytes
+/// that are not UTF-8 show as U+FFFD, and a line longer than `MAX_LINE`
+/// bytes is shown in pieces, which JSON numbers: `"piece": 1`, 2, ….
+/// A piece 1 starts a line, so two cut lines in a row are told apart.
 fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
     // Whether the last piece was cut before its line ended.
     let mut cut = false;
+    let mut piece: u32 = 0;
     loop {
         line.clear();
         let read = (&mut from)
@@ -143,25 +148,34 @@ fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::
             return Ok(());
         }
         let ended = line.ends_with(b"\n");
+        let continues = cut;
         // The end of a line cut right before it is no line of its own.
         if std::mem::replace(&mut cut, !ended) && line == b"\n" {
+            piece = 0;
             continue;
         }
+        // Which piece of a line cut at `MAX_LINE` this is, from 1; 0 for a
+        // line shown whole.
+        piece = match (continues, !ended && read as u64 == MAX_LINE) {
+            (true, _) => piece + 1,
+            (false, true) => 1,
+            (false, false) => 0,
+        };
         let text = String::from_utf8_lossy(&line);
         let text = text
             .strip_suffix("\r\n")
             .or_else(|| text.strip_suffix('\n'))
             .unwrap_or(&text);
-        let written = match (json, ended) {
-            (true, true) => writeln!(
+        let written = match (json, piece) {
+            (true, 0) => writeln!(
                 to,
                 "{}",
                 super::output::line(&serde_json::json!({ "line": text }))
             ),
-            (true, false) => writeln!(
+            (true, piece) => writeln!(
                 to,
                 "{}",
-                super::output::line(&serde_json::json!({ "line": text, "cut": true }))
+                super::output::line(&serde_json::json!({ "line": text, "piece": piece }))
             ),
             (false, _) => writeln!(to, "{}", printable_line(text)),
         };
@@ -192,6 +206,28 @@ mod tests {
             String::from_utf8(shown).unwrap(),
             "{\"line\":\"started\"}\n{\"line\":\"\\u001b[2Jcleared\"}\n"
         );
+    }
+
+    /// The pieces of a cut line are numbered, so a reader tells them from
+    /// lines and joins them; an unended last line is not a piece.
+    #[test]
+    fn in_json_the_pieces_of_a_cut_line_are_numbered() {
+        let mut written = vec![b'x'; MAX_LINE as usize + 3];
+        written.extend_from_slice(b"\nnext\nlast");
+        let mut shown = Vec::new();
+        show_lines(&written[..], &mut shown, true).unwrap();
+        let shown: Vec<serde_json::Value> = String::from_utf8(shown)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(shown.len(), 4);
+        assert_eq!(shown[0]["piece"], 1);
+        assert_eq!(shown[1]["piece"], 2);
+        assert_eq!(shown[1]["line"], "xxx");
+        assert!(shown[2].get("piece").is_none());
+        assert_eq!(shown[3]["line"], "last");
+        assert!(shown[3].get("piece").is_none());
     }
 
     #[test]
