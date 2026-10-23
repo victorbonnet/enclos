@@ -6,6 +6,9 @@ use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 
 use clap::{Args, Subcommand};
+use serde_json::json;
+
+use super::output;
 
 use enclos::engine::{Engine, SecretSet, SecretView};
 use enclos::error::{Error, Result, exit};
@@ -45,16 +48,53 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                 Confirm::DryRun => None,
                 _ => Some(read_value(&secret)?),
             };
-            match engine.secret_set(by, &secret, value.as_ref(), confirm)? {
-                Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-                Planned::Done(set) => print_set(&secret, &set),
+            match (
+                engine.secret_set(by, &secret, value.as_ref(), confirm)?,
+                output::json(),
+            ) {
+                (Planned::DryRun(plan), true) => output::emit(&output::plan(&plan)),
+                (Planned::DryRun(plan), false) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."))
+                }
+                (Planned::Done(set), true) => output::emit(&json!({
+                    "secret": secret.to_string(),
+                    "new": set.new,
+                    "granted_as": set.granted_as,
+                    "pending_as": set.pending_as,
+                    "running_sessions_keep_old_value": set.running,
+                })),
+                (Planned::Done(set), false) => print_set(&secret, &set),
             }
         }
-        SecretVerb::List { sandbox } => print_list(&sandbox, &engine.secret_list(&sandbox)?),
-        SecretVerb::Rm { secret } => match engine.secret_rm(by, &secret, confirm)? {
-            Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-            Planned::Done(()) => println!("Removed secret {secret} from the Keychain."),
-        },
+        SecretVerb::List { sandbox } => {
+            let secrets = engine.secret_list(&sandbox)?;
+            match output::json() {
+                true => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "secrets": secrets.iter().map(|s| json!({
+                        "name": s.record.secret.name.as_str(),
+                        "granted_as": s.granted_as,
+                        "pending_as": s.pending_as,
+                        "updated_at": s.record.updated_at.to_string(),
+                    })).collect::<Vec<_>>(),
+                })),
+                false => print_list(&sandbox, &secrets),
+            }
+        }
+        SecretVerb::Rm { secret } => {
+            match (engine.secret_rm(by, &secret, confirm)?, output::json()) {
+                (Planned::DryRun(plan), true) => output::emit(&output::plan(&plan)),
+                (Planned::DryRun(plan), false) => {
+                    plan.changes.iter().for_each(|c| println!("Would {c}."))
+                }
+                (Planned::Done(()), true) => {
+                    output::emit(&json!({"secret": secret.to_string(), "removed": true}))
+                }
+                (Planned::Done(()), false) => {
+                    println!("Removed secret {secret} from the Keychain.")
+                }
+            }
+        }
     }
     Ok(exit::OK)
 }

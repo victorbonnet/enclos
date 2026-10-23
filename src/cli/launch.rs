@@ -50,15 +50,26 @@ pub struct LogsArgs {
 
 pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     let files = engine.log_files(&args.sandbox)?;
+    // With --json, JSON Lines: one `{"line": …}` per line, the escaping
+    // JSON's own. Which file a line is from is left out: tail's headers are
+    // lines a sandbox could write too.
+    let json = super::output::json();
     if files.is_empty() {
-        println!(
+        let none = format!(
             "Sandbox {} has no service logs yet. Start it with `enclos sandbox start {}`.",
             args.sandbox, args.sandbox
         );
+        match json {
+            true => eprintln!("{none}"),
+            false => println!("{none}"),
+        }
         return Ok(0);
     }
     let mut tail = Command::new("tail");
     tail.args(["-n", "40"]);
+    if json {
+        tail.arg("-q");
+    }
     if args.follow {
         tail.arg("-F");
     }
@@ -70,7 +81,7 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     let out = tail.stdout.take().expect("tail's output is piped");
     // What the services print comes from the sandbox: shown escaped, so it
     // cannot drive the terminal (design §4).
-    let shown = show_escaped(out, &mut io::stdout().lock());
+    let shown = show_lines(out, &mut io::stdout().lock(), json);
     if let Err(e) = shown {
         // tail would otherwise wait for a service's next line to learn that
         // nobody reads it any more.
@@ -110,7 +121,13 @@ enum Failed {
 /// Shows `from` on `to` line by line, each line escaped and without its
 /// line ending (`\n` or `\r\n`). Bytes that are not UTF-8 show as U+FFFD,
 /// and a line longer than `MAX_LINE` bytes is shown in pieces.
+#[cfg(test)]
 fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(), Failed> {
+    show_lines(from, to, false)
+}
+
+/// As `show_escaped`, or with `json` each line as `{"line": …}`.
+fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::Result<(), Failed> {
     let mut from = BufReader::new(from);
     let mut line = Vec::new();
     // Whether the last piece was cut before its line ended.
@@ -134,9 +151,11 @@ fn show_escaped(from: impl Read, to: &mut impl Write) -> std::result::Result<(),
             .strip_suffix("\r\n")
             .or_else(|| text.strip_suffix('\n'))
             .unwrap_or(&text);
-        writeln!(to, "{}", printable_line(text))
-            .and_then(|()| to.flush())
-            .map_err(Failed::Write)?;
+        let written = match json {
+            true => writeln!(to, "{}", serde_json::json!({ "line": text })),
+            false => writeln!(to, "{}", printable_line(text)),
+        };
+        written.and_then(|()| to.flush()).map_err(Failed::Write)?;
     }
 }
 
@@ -152,6 +171,16 @@ mod tests {
         assert_eq!(
             String::from_utf8(shown).unwrap(),
             "started\n\\u{1b}]52;c;cHduZWQ=\\u{7}\\u{1b}[2Jcleared\nno end\n"
+        );
+    }
+
+    #[test]
+    fn in_json_each_line_is_an_object_with_its_control_characters_escaped() {
+        let mut shown = Vec::new();
+        show_lines(&b"started\n\x1b[2Jcleared\r\n"[..], &mut shown, true).unwrap();
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            "{\"line\":\"started\"}\n{\"line\":\"\\u001b[2Jcleared\"}\n"
         );
     }
 

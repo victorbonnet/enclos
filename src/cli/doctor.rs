@@ -9,11 +9,113 @@ use enclos::error::{Result, exit};
 
 pub fn run(engine: &Engine) -> Result<u8> {
     let doctor = engine.doctor();
-    print!("{}", shown(&doctor));
+    match super::output::json() {
+        true => super::output::emit(&json(&doctor)),
+        false => print!("{}", shown(&doctor)),
+    }
     Ok(if doctor.has_problems() {
         exit::ERROR
     } else {
         exit::OK
+    })
+}
+
+/// The report as JSON.
+fn json(doctor: &Doctor) -> serde_json::Value {
+    use serde_json::json;
+    let probe = |p: &Probe| match p {
+        Probe::Available => json!({"ok": true}),
+        Probe::Unavailable { reason } => json!({"ok": false, "reason": reason}),
+    };
+    let enforced = |e: &Enforcement| match e {
+        Enforcement::Enforced => json!({"enforced": "yes"}),
+        Enforcement::Partial { note } => json!({"enforced": "partly", "note": note}),
+        Enforcement::Unsupported => json!({"enforced": "no"}),
+    };
+    let backends: Vec<_> = doctor
+        .backends
+        .iter()
+        .map(|b| {
+            let c = &b.capabilities;
+            json!({
+                "kind": b.kind.to_string(),
+                "found": probe(&b.found),
+                "runs": b.runs.as_ref().map(probe),
+                "capabilities": {
+                    "files": enforced(&c.fs),
+                    "network": enforced(&c.network),
+                    "programs": enforced(&c.exec),
+                    "limits": enforced(&c.resources),
+                    "members": enforced(&c.members),
+                },
+            })
+        })
+        .collect();
+    let sandbox = |s: &SandboxCheck| {
+        let next = match &s.next {
+            NextSession::Compiles { version, file } => json!({
+                "state": "compiles",
+                "version": version,
+                "file": super::output::path(file),
+            }),
+            NextSession::Fails { error } => json!({"state": "fails", "error": error}),
+            NextSession::NotChecked => json!({"state": "not_checked"}),
+            NextSession::Unknown => json!({"state": "unknown"}),
+        };
+        let drift: Vec<_> = s
+            .drift
+            .iter()
+            .map(|d| match d {
+                Drift::NoLongerCompiles {
+                    version,
+                    ran,
+                    error,
+                } => json!({
+                    "kind": "no_longer_compiles",
+                    "version": version,
+                    "ran": super::output::path(ran),
+                    "error": error,
+                }),
+                Drift::Changed(c) => json!({
+                    "kind": match c.edited {
+                        true => "edited",
+                        false => "changed",
+                    },
+                    "version": c.version,
+                    "ran": super::output::path(&c.ran),
+                    "now": super::output::path(&c.now),
+                    "lines": c.lines.as_ref().map(|lines| lines.iter().map(|l| match l {
+                        LineChange::Removed(l) => json!({"removed": l}),
+                        LineChange::Added(l) => json!({"added": l}),
+                    }).collect::<Vec<_>>()),
+                    "running_sessions": c.running,
+                }),
+            })
+            .collect();
+        json!({
+            "name": s.name.to_string(),
+            "backend": s.backend.to_string(),
+            "backend_runs": s.backend_runs,
+            "next_session": next,
+            "last_version": s.last_version,
+            "drift": drift,
+            "unreadable": s.unreadable,
+        })
+    };
+    let sandboxes = match &doctor.sandboxes {
+        Sandboxes::NotInitialized => json!({"initialized": false, "sandboxes": []}),
+        Sandboxes::Unreadable { error } => {
+            json!({"initialized": true, "unreadable": error, "sandboxes": []})
+        }
+        Sandboxes::Listed(list) => json!({
+            "initialized": true,
+            "sandboxes": list.iter().map(sandbox).collect::<Vec<_>>(),
+        }),
+    };
+    json!({
+        "problems": doctor.has_problems(),
+        "backends": backends,
+        "records": sandboxes,
     })
 }
 

@@ -1,6 +1,9 @@
 //! `enclos net`: a sandbox's network log and the destinations it was refused.
 
 use clap::{Args, Subcommand};
+use serde_json::{Value, json};
+
+use super::output;
 
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
@@ -32,11 +35,56 @@ pub fn run(engine: &Engine, args: NetArgs) -> Result<u8> {
     match args.verb {
         NetVerb::Log { sandbox, since } => {
             let from = since.and_then(|s| now().checked_sub(s.duration()).ok());
-            print_log(&engine.net_log(&sandbox, from)?);
+            let events = engine.net_log(&sandbox, from)?;
+            match output::json() {
+                true => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "connections": events.iter().map(event_json).collect::<Vec<_>>(),
+                })),
+                false => print_log(&events),
+            }
         }
-        NetVerb::Denied { sandbox } => print_denied(&sandbox, &engine.net_denied(&sandbox)?),
+        NetVerb::Denied { sandbox } => {
+            let denied = engine.net_denied(&sandbox)?;
+            match output::json() {
+                true => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "denied": denied.iter().map(|d| json!({
+                        "host": d.host,
+                        "port": d.port,
+                        "reason": d.reason.as_str(),
+                        "count": d.count,
+                        "first": d.first.to_string(),
+                        "last": d.last.to_string(),
+                    })).collect::<Vec<_>>(),
+                })),
+                false => print_denied(&sandbox, &denied),
+            }
+        }
     }
     Ok(exit::OK)
+}
+
+fn event_json(e: &NetEvent) -> Value {
+    json!({
+        "at": e.at.to_string(),
+        "host": e.host,
+        "port": e.port,
+        "method": e.method,
+        "address": e.address,
+        "verdict": match e.verdict {
+            Verdict::Allowed => "allowed",
+            Verdict::Denied => "denied",
+        },
+        "reason": e.reason.map(Reason::as_str),
+        "bytes_up": e.bytes_up,
+        "bytes_down": e.bytes_down,
+        "duration_ms": e.duration_ms,
+        "server_name": e.name_seen.as_ref().map(|n| json!({
+            "seen": n.as_str(),
+            "name": n.name(),
+        })),
+    })
 }
 
 fn bytes(n: u64) -> String {

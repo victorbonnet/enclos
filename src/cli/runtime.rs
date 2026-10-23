@@ -2,14 +2,16 @@
 //! a messaging channel. Logging it in is the runtime's own command, through
 //! `enclos connect` (ADR 0024).
 
-use clap::{Args, Subcommand};
-
-use enclos::engine::Engine;
-use enclos::error::{Error, Result, exit};
-use enclos::model::audit::Actor;
 use std::str::FromStr;
 
+use clap::{Args, Subcommand};
+use serde_json::json;
+
+use super::output;
+use enclos::engine::Engine;
+use enclos::error::{Error, Result, exit};
 use enclos::model::agent::AgentName;
+use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::runtime::RuntimeKind;
@@ -61,6 +63,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         }
     };
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
+        Planned::DryRun(plan) if output::json() => {
+            output::emit(&output::plan(&plan));
+            return Ok(exit::OK);
+        }
         Planned::DryRun(plan) => {
             plan.changes.iter().for_each(|c| println!("Would {c}."));
             return Ok(exit::OK);
@@ -69,6 +75,21 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     };
     super::connect::report_end(&sandbox, &end.end);
     let shown = runtime.display_name();
+    if output::json() {
+        output::emit(&json!({
+            "sandbox": sandbox.to_string(),
+            "runtime": runtime.to_string(),
+            "installed": end.installed,
+            "installer_exit": end.end.exit,
+            "recorded": end.recorded.map(|k| k.to_string()),
+            "policy_version": end.policy,
+            "login": format!("enclos connect {sandbox} -- {}", enclos::runtime::adapter(runtime).login()),
+        }));
+        return Ok(match end.installed {
+            true => exit::OK,
+            false => exit::ERROR,
+        });
+    }
     if !end.installed {
         let after = match end.recorded {
             Some(kept) => format!(
@@ -145,6 +166,10 @@ fn configure(
         });
     }
     let set = match engine.configure_channel(by, &sandbox, channel, token, answers, confirm)? {
+        Planned::DryRun(plan) if output::json() => {
+            output::emit(&output::plan(&plan));
+            return Ok(exit::OK);
+        }
         Planned::DryRun(plan) => {
             plan.changes.iter().for_each(|c| println!("Would {c}."));
             return Ok(exit::OK);
@@ -152,6 +177,17 @@ fn configure(
         Planned::Done(set) => set,
     };
     let shown = channel.display_name();
+    if output::json() {
+        output::emit(&json!({
+            "sandbox": sandbox.to_string(),
+            "channel": channel.to_string(),
+            "token_variable": set.token.to_string(),
+            "answers": set.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "reachable": set.reachable,
+            "host": channel.host(),
+        }));
+        return Ok(exit::OK);
+    }
     println!(
         "Sandbox {sandbox}'s {shown} bot is set up: its token is read from ${} as its service starts, and it answers {} user(s). A running service restarts with it.",
         set.token,

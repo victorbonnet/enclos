@@ -16,22 +16,16 @@ use enclos::model::{Timestamp, now};
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Only this sandbox.
+    /// Only this sandbox. In JSON, sizes are in bytes, times in RFC 3339,
+    /// and each fact read from a sandbox is `{"known": …}`, `"absent"`,
+    /// `{"cannot_tell": why}` or `"not_provided"`.
     sandbox: Option<SandboxName>,
-    /// Print JSON: sizes in bytes, times in RFC 3339, and each fact read
-    /// from a sandbox as `{"known": …}`, `"absent"`, `{"cannot_tell": why}`
-    /// or `"not_provided"`.
-    #[arg(long)]
-    json: bool,
 }
 
 pub fn run(engine: &Engine, args: StatusArgs) -> Result<u8> {
     let view = engine.status(args.sandbox.as_ref())?;
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&view).expect("the view serializes")
-        );
+    if super::output::json() {
+        super::output::emit(&serde_json::to_value(&view).expect("the view serializes"));
         return Ok(exit::OK);
     }
     print(&view, now(), std::env::var("HOME").ok().as_deref());

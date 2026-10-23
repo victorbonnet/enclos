@@ -22,6 +22,13 @@ struct Cli {
     /// Make changes without asking for confirmation.
     #[arg(long, global = true)]
     yes: bool,
+    /// Print JSON, the result or the error, also in a terminal; the default
+    /// when the output is piped.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Print readable text, also when the output is piped; --json wins.
+    #[arg(long, global = true)]
+    text: bool,
     /// Show what would change, and change nothing.
     #[arg(long, global = true)]
     dry_run: bool,
@@ -87,17 +94,32 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
-            let _ = err.print();
             // Help and version go to stdout and succeed; usage errors are
             // errors (exit 1), since exit 2 means refused by policy, or 125
             // for `exec`, whose 1 is its command's.
-            return ExitCode::from(match err.use_stderr() {
+            let code = match err.use_stderr() {
                 false => exit::OK,
                 true if names_exec(std::env::args_os().skip(1)) => exit::EXEC_FAILED,
                 true => exit::ERROR,
-            });
+            };
+            match code != exit::OK && usage_is_json(std::env::args_os().skip(1).collect()) {
+                true => cli::output::emit(&cli::output::error_text(
+                    err.render().to_string().trim(),
+                    code,
+                )),
+                false => {
+                    let _ = err.print();
+                }
+            }
+            return ExitCode::from(code);
         }
     };
+    let owns_output = runs_a_program(&cli.command);
+    if cli::output::choose(cli.json, cli.text, !owns_output) == cli::output::Format::Json
+        && !owns_output
+    {
+        cli::output::keep_stdout_for_the_document();
+    }
     if ends_on_closed_output(&cli.command) {
         // Without it, the print after the reader left panics. Should the
         // handler not install, that is still what happens.
@@ -112,11 +134,21 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(match exec {
+            let code = match exec {
                 true => exit::EXEC_FAILED,
                 false => err.exit_code(),
-            })
+            };
+            match (cli::output::json(), owns_output) {
+                (false, _) => eprintln!("error: {err}"),
+                (true, false) => cli::output::emit(&cli::output::error(&err, code)),
+                // Its stdout is the program's: enclos's words go to stderr.
+                (true, true) => eprintln!(
+                    "{}",
+                    serde_json::to_string(&cli::output::error(&err, code))
+                        .expect("a JSON value serializes")
+                ),
+            }
+            ExitCode::from(code)
         }
     }
 }
@@ -126,18 +158,40 @@ fn run(cli: Cli) -> Result<u8> {
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
     match cli.command {
         Command::Init => {
-            print_init(engine.init(&current_actor(), confirm)?);
+            let planned = engine.init(&current_actor(), confirm)?;
+            match cli::output::json() {
+                true => cli::output::emit(&init_json(&planned)),
+                false => print_init(planned),
+            }
             Ok(exit::OK)
         }
         Command::Doctor => cli::doctor::run(&engine),
         Command::Audit(AuditArgs { verb: None, since }) => {
-            print_entries(&engine.audit(since)?, since.is_some());
+            let entries = engine.audit(since)?;
+            match cli::output::json() {
+                true => cli::output::emit(&serde_json::json!({
+                    "entries": entries.iter().map(cli::output::audit_entry).collect::<Vec<_>>(),
+                })),
+                false => print_entries(&entries, since.is_some()),
+            }
             Ok(exit::OK)
         }
         Command::Audit(AuditArgs {
             verb: Some(AuditVerb::Verify),
             ..
-        }) => Ok(print_verify(&engine.verify_audit()?)),
+        }) => {
+            let report = engine.verify_audit()?;
+            match cli::output::json() {
+                true => {
+                    cli::output::emit(&verify_json(&report));
+                    Ok(match report.broken {
+                        Some(_) => exit::ERROR,
+                        None => exit::OK,
+                    })
+                }
+                false => Ok(print_verify(&report)),
+            }
+        }
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
         Command::Exec(args) => cli::connect::exec(&engine, &current_actor(), confirm, args),
@@ -172,6 +226,72 @@ fn ends_on_closed_output(command: &Command) -> bool {
             | Command::Net(_)
             | Command::Status(_)
     )
+}
+
+/// Whether `command` runs a program whose output is its own, so that its
+/// stdout is never enclos's JSON (design §10).
+fn runs_a_program(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Connect(_)
+            | Command::Exec(_)
+            | Command::Logs(_)
+            | Command::Launch(_)
+            | Command::Proxy(_)
+    )
+}
+
+/// Whether a usage error is told as JSON: `--json` is asked, or the output
+/// is piped and neither `--text` is asked nor the command runs a program,
+/// as [`runs_a_program`] says, taken from its first word. Only the words
+/// before a `--` count.
+fn usage_is_json(args: Vec<std::ffi::OsString>) -> bool {
+    let words: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .take_while(|a| a != "--")
+        .collect();
+    let flag = |f: &str| words.iter().any(|w| w == f);
+    let runs = words
+        .iter()
+        .find(|w| !w.starts_with('-'))
+        .is_some_and(|w| matches!(w.as_str(), "connect" | "exec" | "logs" | "launch" | "proxy"));
+    use std::io::IsTerminal;
+    flag("--json") || (!flag("--text") && !runs && !std::io::stdout().is_terminal())
+}
+
+fn init_json(planned: &Planned<InitReport>) -> serde_json::Value {
+    use cli::output::path;
+    match planned {
+        Planned::DryRun(plan) => cli::output::plan(plan),
+        Planned::Done(report) => serde_json::json!({
+            "data": path(&report.data),
+            "config": path(&report.config),
+            "created": report.created.iter().map(|p| path(p)).collect::<Vec<_>>(),
+            "schema": {"from": report.migration.from, "to": report.migration.to},
+            "default_backend": report.default_backend.map(|k| k.to_string()),
+        }),
+    }
+}
+
+fn verify_json(report: &VerifyReport) -> serde_json::Value {
+    serde_json::json!({
+        "intact": report.broken.is_none(),
+        "lines": report.lines,
+        "entries": report.entries,
+        "broken": report.broken.as_ref().map(|b| serde_json::json!({
+            "line": b.line,
+            "problem": b.to_string(),
+        })),
+        "unfinished": report.unfinished.iter().map(cli::output::audit_entry).collect::<Vec<_>>(),
+        "torn_tail_bytes": report.torn_tail,
+        "recoveries": report.recoveries.iter().map(|r| serde_json::json!({
+            "line": r.line,
+            "at": r.at.to_string(),
+            "removed_bytes": r.removed_bytes,
+            "saved_to": r.saved_to,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// Whether `args`, the command line after the program, run `exec`: its

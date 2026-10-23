@@ -24,7 +24,10 @@ impl Home {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
-        cmd.args(args)
+        // Text, though the output is piped: the tests below read what a
+        // person reads, and ask for JSON with --json.
+        cmd.arg("--text")
+            .args(args)
             .env("ENCLOS_HOME", &self.root)
             .env("HOME", self._dir.path());
         cmd
@@ -32,6 +35,28 @@ impl Home {
 
     fn run(&self, args: &[&str]) -> Run {
         Run(self.command(args).output().unwrap())
+    }
+
+    /// As a script runs it: output piped, and no --text.
+    fn run_piped(&self, args: &[&str]) -> Run {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
+        cmd.args(args)
+            .env("ENCLOS_HOME", &self.root)
+            .env("HOME", self._dir.path());
+        Run(cmd.output().unwrap())
+    }
+
+    /// The JSON document a piped run printed.
+    fn json(&self, args: &[&str]) -> (i32, serde_json::Value) {
+        let out = self.run_piped(args);
+        let doc = serde_json::from_str(&out.stdout()).unwrap_or_else(|e| {
+            panic!(
+                "{args:?}: {e}\nstdout: {}\nstderr: {}",
+                out.stdout(),
+                out.stderr()
+            )
+        });
+        (out.code(), doc)
     }
 
     fn init(&self, times: usize) {
@@ -346,7 +371,7 @@ fn commands_before_init_say_to_run_init() {
 #[test]
 fn a_relative_enclos_home_is_refused() {
     let out = Command::new(env!("CARGO_BIN_EXE_enclos"))
-        .args(["init"])
+        .args(["--text", "init"])
         .env("ENCLOS_HOME", "relative/enclos")
         .output()
         .unwrap();
@@ -2710,4 +2735,74 @@ fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
         "{stdout}"
     );
     assert!(stdout.contains("Operation not permitted"), "{stdout}");
+}
+
+/// Piped, each command prints one JSON document: its result, or its error
+/// with what kind of failure it is and the exit code, also for a refusal, a
+/// change that needs confirmation and a usage error (design §10).
+#[cfg(target_os = "macos")]
+#[test]
+fn piped_output_is_json_errors_and_refusals_included() {
+    let home = Home::new();
+    let (code, init) = home.json(&["init"]);
+    assert_eq!(code, 0);
+    assert!(
+        init["created"].as_array().is_some_and(|c| !c.is_empty()),
+        "{init}"
+    );
+    let (code, created) = home.json(&["sandbox", "create", "home"]);
+    assert_eq!(code, 0, "{created}");
+    assert_eq!(created["sandbox"], "home");
+    assert_eq!(created["policy_version"], 1);
+    let (_, list) = home.json(&["sandbox", "list"]);
+    assert_eq!(list["sandboxes"][0]["name"], "home", "{list}");
+    assert_eq!(list["sandboxes"][0]["state"]["state"], "created", "{list}");
+    let (_, policy) = home.json(&["policy", "show", "home"]);
+    assert_eq!(policy["version"]["version"], 1, "{policy}");
+    assert!(policy["policy"]["fs"]["write"].is_array(), "{policy}");
+    let (code, planned) = home.json(&["--dry-run", "sandbox", "create", "lab"]);
+    assert_eq!(code, 0);
+    assert_eq!(planned["dry_run"], true, "{planned}");
+
+    let failure = |args: &[&str], code: i32, kind: &str| {
+        let out = home.run_piped(args);
+        assert_eq!(out.code(), code, "{args:?}: {}", out.stdout());
+        let doc: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+        assert_eq!(doc["error"]["kind"], kind, "{args:?}: {doc}");
+        assert_eq!(doc["error"]["exit_code"], code, "{doc}");
+        assert!(
+            doc["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty())
+        );
+        assert_eq!(out.stderr(), "", "{args:?}");
+    };
+    failure(&["sandbox", "show", "nosuch"], 1, "error");
+    failure(&["policy", "allow", "home", "localhost"], 2, "refused");
+    failure(&["sandbox", "rm", "home"], 3, "needs_confirmation");
+    failure(&["sandbox", "frobnicate"], 1, "error");
+
+    // --text reads as a person reads, though piped; --json wins over it.
+    let out = home.run_piped(&["--text", "sandbox", "list"]);
+    assert!(out.ok().stdout().starts_with("NAME"), "{}", out.stdout());
+    let (_, list) = home.json(&["--text", "--json", "sandbox", "list"]);
+    assert_eq!(list["sandboxes"][0]["name"], "home");
+}
+
+/// `exec`'s output is its command's, piped or not; with --json, a failure
+/// of enclos's own is JSON on stderr.
+#[cfg(target_os = "macos")]
+#[test]
+fn exec_output_stays_its_commands_when_piped() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let out = home.run_piped(&["exec", "home", "--", "/bin/echo", "hi"]);
+    assert_eq!(out.stdout(), "hi\n");
+    let out = home.run_piped(&["--json", "exec", "nosuch", "--", "/bin/echo", "hi"]);
+    assert_eq!(out.code(), 125);
+    assert_eq!(out.stdout(), "");
+    let doc: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    assert_eq!(doc["error"]["exit_code"], 125, "{doc}");
 }
