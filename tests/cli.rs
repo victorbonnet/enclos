@@ -2042,23 +2042,35 @@ fn a_reader_that_left_ends_a_listing_quietly() {
     for name in ["home", "lab"] {
         home.run(&["sandbox", "create", name]).ok();
     }
-    // In text, and in JSON, whose document has a descriptor of its own.
-    for text in [true, false] {
-        let mut cmd = match text {
-            true => home.command(&["sandbox", "list"]),
-            false => home.piped(&["sandbox", "list"]),
-        };
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        drop(child.stdout.take());
-        let out = child.wait_with_output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!stderr.contains("panicked"), "{stderr}");
-        assert_eq!(out.status.signal(), Some(13), "{:?} {stderr}", out.status);
-    }
+    let mut child = home
+        .command(&["sandbox", "list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.signal(), Some(13), "{:?} {stderr}", out.status);
+    // In JSON, whose document has a descriptor of its own, the write fails
+    // and the command says what it did. The reader is gone before enclos
+    // starts, so no write can come first.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Run(home
+        .piped(&["sandbox", "list"])
+        .stdout(writer)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("cannot write the JSON document (Broken pipe")
+            && out.stderr().contains("the command itself succeeded"),
+        "{}",
+        out.stderr()
+    );
 }
 
 /// Records Hermes as the runtime of sandbox `name` without installing it,
@@ -2947,6 +2959,14 @@ fn exec_output_stays_its_commands_when_piped() {
     ]);
     assert_eq!(out.code(), 7, "{}", out.stderr());
     assert_eq!(out.stdout(), "hi\n");
+    // Every word of enclos's own there is a JSON line.
+    assert!(
+        out.stderr()
+            .lines()
+            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
+        "{}",
+        out.stderr()
+    );
     let ended = out
         .stderr()
         .lines()
@@ -2998,7 +3018,8 @@ fn a_terminal_gets_text_and_json_only_when_asked() {
     assert!(!text.contains('{'), "{text:?}");
     let json = in_terminal(&["--json", "sandbox", "list"]);
     let start = json.find('{').unwrap_or_else(|| panic!("{json:?}"));
-    let doc: serde_json::Value = serde_json::from_str(json[start..].trim()).unwrap();
+    let end = json.rfind('}').unwrap_or_else(|| panic!("{json:?}"));
+    let doc: serde_json::Value = serde_json::from_str(&json[start..=end]).unwrap();
     assert_eq!(doc["sandboxes"], serde_json::json!([]), "{doc}");
 }
 
@@ -3041,12 +3062,146 @@ fn a_document_that_cannot_be_written_fails_the_command() {
         .output()
         .unwrap());
     assert_eq!(out.code(), 1, "{}", out.stderr());
+    // enclos's own words are JSON on stderr there.
+    let said: serde_json::Value = serde_json::from_str(out.stderr().trim()).unwrap();
+    let message = said["error"]["message"].as_str().unwrap();
     assert!(
-        out.stderr().contains("cannot write the JSON document")
-            && out.stderr().contains("the command itself succeeded"),
+        message.contains("cannot write the JSON document")
+            && message.contains("the command itself succeeded"),
+        "{said}"
+    );
+    // `exec`'s own failure is 125, whatever it was.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Run(home
+        .piped(&[
+            "--json",
+            "--dry-run",
+            "exec",
+            "home",
+            "--",
+            "/bin/echo",
+            "x",
+        ])
+        .stdout(writer)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    // A command whose result is the document, and that failed: its own
+    // code is said.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Run(home
+        .piped(&["sandbox", "show", "nosuch"])
+        .stdout(writer)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("the command itself failed, with exit code 1"),
         "{}",
         out.stderr()
     );
+}
+
+/// Help and the version are text, piped or not, and succeed.
+#[test]
+fn help_and_version_are_text_when_piped() {
+    let home = Home::new();
+    let out = home.run_piped(&["--version"]);
+    assert_eq!(out.code(), 0);
+    assert_eq!(
+        out.stdout(),
+        format!("enclos {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let out = home.run_piped(&["--help"]);
+    assert_eq!(out.code(), 0);
+    assert!(out.stdout().contains("Usage"), "{}", out.stdout());
+    assert!(serde_json::from_str::<serde_json::Value>(&out.stdout()).is_err());
+}
+
+/// `logs` fails when `tail` does, and says so as enclos's own error: what it
+/// could read is still shown.
+#[cfg(target_os = "macos")]
+#[test]
+fn logs_fail_when_a_log_cannot_be_read() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let logs = home.root.join("sandboxes/home/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("gateway.log"), "fine\n").unwrap();
+    let hidden = logs.join("proxy.log");
+    std::fs::write(&hidden, "hidden\n").unwrap();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let out = home.run_piped(&["--json", "logs", "home"]);
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(out.stdout().contains("\"fine\""), "{}", out.stdout());
+    let last = out.stderr().lines().last().unwrap_or_default().to_owned();
+    let said: serde_json::Value =
+        serde_json::from_str(&last).unwrap_or_else(|e| panic!("{e}: {}", out.stderr()));
+    assert_eq!(said["error"]["exit_code"], 1, "{said}");
+    assert!(
+        said["error"]["message"].as_str().unwrap().contains("tail"),
+        "{said}"
+    );
+}
+
+/// A policy change while a session runs waits as the pending policy; `policy
+/// apply` stops the sandbox into it. Both in JSON, with no service started:
+/// the only session is one this test starts.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_change_while_a_session_runs_waits_and_apply_restarts_into_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let mut session = home
+        .command(&["exec", "home", "--", "/bin/sleep", "30"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(eventually(|| {
+        home.run(&["sandbox", "show", "home"])
+            .stdout()
+            .contains("/bin/sleep")
+    }));
+    let file = home.root.join("sandboxes/home/policy.toml");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let work = home._dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(
+        &file,
+        text.replace(
+            "write_add = []",
+            &format!("write_add = [\"{}\"]", work.display()),
+        ),
+    )
+    .unwrap();
+    let mut edit = home.piped(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL")
+        .env("EDITOR", editor(&home, "true"));
+    let out = Run(edit.output().unwrap());
+    let doc: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
+    assert_eq!(doc["outcome"]["in_force"], false, "{doc}");
+    assert!(doc["outcome"]["pending"]["snapshot"].is_string(), "{doc}");
+    let (code, applied) = home.json(&["--yes", "policy", "apply", "home"]);
+    let _ = session.wait();
+    assert_eq!(code, 0, "{applied}");
+    assert_eq!(applied["restarted"]["version"], 2, "{applied}");
+    assert!(
+        applied["restarted"]["stopped"]["sessions_ended"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()),
+        "{applied}"
+    );
+    assert!(applied["restarted"]["started"].is_null(), "{applied}");
+    assert!(applied.get("error").is_none(), "{applied}");
 }
 
 /// Several sandboxes give one document, one element each, in order; a dry
@@ -3069,6 +3224,11 @@ fn several_sandboxes_give_one_document_with_an_element_each() {
     for verb in ["start", "restart"] {
         let (code, planned) = home.json(&["--dry-run", "sandbox", verb, "home", "lab"]);
         assert_eq!(code, 0, "{planned}");
+        assert_eq!(
+            planned["sandboxes"].as_array().unwrap().len(),
+            2,
+            "{planned}"
+        );
         for (element, name) in planned["sandboxes"]
             .as_array()
             .unwrap()
@@ -3076,6 +3236,14 @@ fn several_sandboxes_give_one_document_with_an_element_each() {
             .zip(["home", "lab"])
         {
             assert_eq!(element["dry_run"], true, "{planned}");
+            // The plan says what it would start, as the text does.
+            assert!(
+                element["changes"].as_array().unwrap().iter().any(|c| c
+                    .as_str()
+                    .unwrap()
+                    .starts_with("install and start the service")),
+                "{planned}"
+            );
             assert!(
                 element["would_start"]
                     .as_array()
@@ -3195,7 +3363,9 @@ fn logs_in_json_are_json_lines() {
     );
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
-    std::fs::write(logs.join("gateway.log"), "one\n\x1b[2Jtwo\n").unwrap();
+    // A C1 control and a bidirectional one, which JSON leaves alone: the
+    // document escapes them itself.
+    std::fs::write(logs.join("gateway.log"), "o\u{9b}ne\u{202e}\n\x1b[2Jtwo\n").unwrap();
     std::fs::write(logs.join("proxy.log"), "three\n").unwrap();
     let out = home.run_piped(&["--json", "logs", "home"]);
     assert_eq!(out.code(), 0, "{}", out.stderr());
@@ -3209,10 +3379,12 @@ fn logs_in_json_are_json_lines() {
         .collect();
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert!(!lines.iter().any(|l| l.contains("==>")), "{lines:?}");
-    for want in ["one", "\x1b[2Jtwo", "three"] {
+    for want in ["o\u{9b}ne\u{202e}", "\x1b[2Jtwo", "three"] {
         assert!(lines.iter().any(|l| l == want), "{want:?} in {lines:?}");
     }
-    assert!(!out.stdout().contains('\x1b'));
+    for raw in ['\x1b', '\u{9b}', '\u{202e}'] {
+        assert!(!out.stdout().contains(raw), "{raw:?} in {}", out.stdout());
+    }
     let out = home.run_piped(&["logs", "home"]);
     assert!(
         out.ok().stdout().contains("\\u{1b}[2Jtwo"),

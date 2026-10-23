@@ -141,7 +141,8 @@ fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::
     let mut line = Vec::new();
     // What a cut kept back for the next piece: a character it would split.
     let mut kept = Vec::new();
-    // Which piece of a cut line comes next, from 1; 0 outside one.
+    // The number of the piece just shown of a line still being cut; 0
+    // outside one.
     let mut piece: u32 = 0;
     loop {
         line.clear();
@@ -156,17 +157,23 @@ fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::
         }
         let ended = line.ends_with(b"\n");
         // Full before its end: a line exactly as long as the limit is whole
-        // when its end comes next; else it is cut, between characters.
+        // when its end (`\n` or `\r\n`) comes next, or when the logs end
+        // there; else it is cut, between characters.
         let cut = !ended && line.len() as u64 == MAX_LINE && {
             let next = from.fill_buf().map_err(Failed::Read)?;
-            match next.first() {
-                Some(b'\n') => {
-                    from.consume(1);
-                    line.push(b'\n');
+            let end: &[u8] = match next {
+                [b'\n', ..] => b"\n",
+                [b'\r', b'\n', ..] => b"\r\n",
+                _ => b"",
+            };
+            match (end.is_empty(), next.is_empty()) {
+                (false, _) => {
+                    let n = end.len();
+                    line.extend_from_slice(end);
+                    from.consume(n);
                     false
                 }
-                Some(_) => true,
-                None => false,
+                (true, empty) => !empty,
             }
         };
         if cut {
@@ -387,6 +394,13 @@ mod tests {
         let shown = pieces(&vec![b'x'; max]);
         assert_eq!(shown.len(), 1);
         assert!(shown[0].get("piece").is_none());
+        // Ended by `\r\n` too: no empty piece after it.
+        let mut written = vec![b'x'; max];
+        written.extend_from_slice(b"\r\nnext\n");
+        let shown = pieces(&written);
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown.iter().all(|v| v.get("piece").is_none()), "{shown:?}");
+        assert_eq!(shown[0]["line"].as_str().unwrap().len(), max);
     }
 
     /// A cut never splits a character, so joined pieces are the line; one

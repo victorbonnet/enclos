@@ -31,15 +31,16 @@ pub enum Output {
     OnStderr,
 }
 
-/// The commands, by their word, whose stdout is the program's they run or
-/// the services' logs: `connect`, `exec`, `logs`, and the hidden `launch`
-/// and `proxy`, which the service manager or enclos starts.
+/// The commands, by their word, whose stdout is not enclos's to fill with a
+/// document: the program's they run (`connect`, `exec`, the hidden
+/// `launch`), the services' logs (`logs`), or a service's own log (the
+/// hidden `proxy`).
 pub const RUNS_A_PROGRAM: [&str; 5] = ["connect", "exec", "logs", "launch", "proxy"];
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 
-/// Whether a document was written: a command writes one, and a second is a
-/// bug.
+/// Whether a document was emitted: a command emits one, and a second is a
+/// bug, refused.
 static EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Where the JSON document goes: the stdout enclos was given, kept while
@@ -78,13 +79,13 @@ pub fn output() -> Output {
     OUTPUT.get().copied().unwrap_or(Output::Text)
 }
 
-/// For [`Output::Document`]: writes the document to a close-on-exec copy of
-/// the stdout enclos was given, and points descriptor 1 at stderr, so that
-/// what any program enclos starts prints, such as an installer's progress
-/// or an editor, goes there, and so does a `println!` of enclos's own; no
-/// program enclos starts holds the copy. When that cannot be done, it says
-/// so and the document stays on descriptor 1, with whatever else is
-/// printed there.
+/// For [`Output::Document`]: makes [`emit`] write to a close-on-exec copy
+/// of the stdout enclos was given, and points descriptor 1 at stderr, so
+/// that what any program enclos starts prints, such as an installer's
+/// progress or an editor, goes there, and so does a `println!` of enclos's
+/// own; no program enclos starts holds the copy. A stdout that is closed is
+/// a document that cannot be written. Any other failure is said, and the
+/// document stays on descriptor 1, with whatever else is printed there.
 pub fn keep_stdout_for_the_document() {
     let kept = rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 3).and_then(|kept| {
         rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
@@ -94,9 +95,12 @@ pub fn keep_stdout_for_the_document() {
         Ok(kept) => {
             let _ = DOCUMENT.set(Mutex::new(File::from(kept)));
         }
-        Err(e) => eprintln!(
-            "enclos: cannot keep stdout for the JSON document alone ({e}): what programs enclos runs print may go into it"
-        ),
+        Err(rustix::io::Errno::BADF) => {
+            let _ = WRITE_FAILED.set(std::io::Error::other("stdout is closed"));
+        }
+        Err(e) => note(&format!(
+            "cannot keep stdout for the JSON document alone ({e}): what programs enclos runs print may go into it"
+        )),
     }
 }
 
@@ -110,7 +114,18 @@ pub fn json() -> bool {
 pub fn emit(value: &Value) {
     let first = !EMITTED.swap(true, Ordering::SeqCst);
     debug_assert!(first, "a command writes one JSON document");
-    let text = for_terminal(&serde_json::to_string_pretty(value).expect("a JSON value serializes"));
+    if !first {
+        // Two documents back to back are no JSON a reader takes: the
+        // second is refused, and the command fails.
+        let _ = WRITE_FAILED.set(std::io::Error::other(
+            "a second JSON document was refused: this is a bug of enclos",
+        ));
+        return;
+    }
+    if WRITE_FAILED.get().is_some() {
+        return;
+    }
+    let text = document_text(value);
     let written = match DOCUMENT.get() {
         Some(document) => {
             let mut document = document.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,8 +141,23 @@ pub fn emit(value: &Value) {
     }
 }
 
-/// `value` compact, on one line, for stderr: a note or a failure of a
-/// command whose stdout is its program's.
+/// `value` as a document's text: indented, and escaped by [`for_terminal`].
+pub fn document_text(value: &Value) -> String {
+    for_terminal(&serde_json::to_string_pretty(value).expect("a JSON value serializes"))
+}
+
+/// A dry run's plan, as this command prints it: its document in JSON, else
+/// a `Would …` line for each change.
+pub fn show_plan(planned: &Plan) {
+    match json() {
+        true => emit(&plan(planned)),
+        false => planned.changes.iter().for_each(|c| println!("Would {c}.")),
+    }
+}
+
+/// `value` compact, on one line, escaped as a document is: one line of JSON
+/// Lines, such as a note, a session's end or a failure on stderr, or a
+/// `logs` line on stdout.
 pub fn line(value: &Value) -> String {
     for_terminal(&serde_json::to_string(value).expect("a JSON value serializes"))
 }
@@ -190,8 +220,8 @@ pub fn path(p: &Path) -> Value {
 }
 
 /// An error as JSON: its message, what kind of failure it is, and the exit
-/// code it gives (the command's, or one sandbox's in `sandboxes`), which for
-/// `exec` is 125 whatever the kind.
+/// code it gives (the command's, or a part's, such as one sandbox's in
+/// `sandboxes`), which for `exec` is 125 whatever the kind.
 pub fn error(err: &Error, code: u8) -> Value {
     json!({"error": error_body(&err.to_string(), kind(err.exit_code()), code)})
 }
@@ -213,6 +243,14 @@ pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String)
         result["error"] = error_body(&message(), kind(code), code);
     }
     result
+}
+
+/// `result` with `err` beside it as its `error`, and the code it gives: a
+/// part of a command that failed, kept with what it did.
+pub fn with_failure(mut result: Value, err: &Error) -> (u8, Value) {
+    let code = err.exit_code();
+    result["error"] = error_body(&err.to_string(), kind(code), code);
+    (code, result)
 }
 
 /// Who did something, as an audit entry records them.
@@ -243,8 +281,9 @@ fn kind(code: u8) -> &'static str {
     }
 }
 
-/// How a session ended, as `report_end` says it: its exit status, the
-/// signal that ended it, its notes, and what it left running.
+/// How a session ended, as `report_end` says it: its id, its exit status,
+/// the signal that ended it, its notes, what it left running, and whether
+/// it restarts.
 pub fn session(end: &SessionEnd) -> Value {
     let left = match &end.left {
         Left::Nothing => json!({"state": "nothing"}),
@@ -300,7 +339,7 @@ mod tests {
 
     /// Each end of each range is escaped, a character past U+FFFF as its
     /// two halves, and every value reads back as it was, a backslash before
-    /// one included; the characters around each range are kept.
+    /// one included; some characters just outside the ranges are kept.
     #[test]
     fn every_listed_character_is_escaped_and_reads_back() {
         let escaped = [
@@ -394,5 +433,18 @@ mod tests {
         assert_eq!(failed["stopped"], false);
         let fine = with_error(json!({"stopped": true}), 0, || unreachable!());
         assert!(fine.get("error").is_none());
+    }
+
+    /// A document's text escapes what a sandbox may write, through the
+    /// same path `emit` writes.
+    #[test]
+    fn a_documents_text_is_escaped() {
+        let value = json!({"command": "a\u{9b}2Jb\u{202e}c"});
+        let text = document_text(&value);
+        assert!(
+            !text.contains('\u{9b}') && !text.contains('\u{202e}'),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
     }
 }

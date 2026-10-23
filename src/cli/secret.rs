@@ -52,10 +52,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                 engine.secret_set(by, &secret, value.as_ref(), confirm)?,
                 output::json(),
             ) {
-                (Planned::DryRun(plan), true) => output::emit(&output::plan(&plan)),
-                (Planned::DryRun(plan), false) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."))
-                }
+                (Planned::DryRun(plan), _) => output::show_plan(&plan),
                 (Planned::Done(set), true) => output::emit(&json!({
                     "secret": secret.to_string(),
                     "new": set.new,
@@ -83,10 +80,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
         }
         SecretVerb::Rm { secret } => {
             match (engine.secret_rm(by, &secret, confirm)?, output::json()) {
-                (Planned::DryRun(plan), true) => output::emit(&output::plan(&plan)),
-                (Planned::DryRun(plan), false) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."))
-                }
+                (Planned::DryRun(plan), _) => output::show_plan(&plan),
                 (Planned::Done(()), true) => {
                     output::emit(&json!({"secret": secret.to_string(), "removed": true}))
                 }
