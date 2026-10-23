@@ -5,10 +5,10 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 use super::output;
-use enclos::engine::{Engine, PROXY_WAIT, SandboxSpec, SandboxView, StopReport};
+use enclos::engine::{Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
-use enclos::model::plan::{Confirm, Planned};
+use enclos::model::plan::{Confirm, Plan, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use enclos::model::session::SessionKind;
@@ -107,44 +107,59 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         }
         SandboxVerb::Show { name } => {
             let view = engine.show_sandbox(&name)?;
+            // The view first: what follows can fail, and the view is what
+            // is read when state is broken. In JSON, such a failure is an
+            // `error` beside the view, the rest left null.
             if !output::json() {
-                // The view first: what follows can fail, and the view is
-                // what is read when state is broken.
                 print_show(&view);
             }
-            let services = engine.service_status(&name)?;
-            // Agents are the runtime's: nothing to list without one.
-            let agents = match engine.runtime(&name)?.is_some() {
-                true => Some((
-                    engine.agents(&name)?,
-                    super::agent::check_notes(engine, &name, true)?,
-                )),
-                false => None,
+            let more = || -> Result<_> {
+                let services = engine.service_status(&name)?;
+                // Agents are the runtime's: nothing to list without one.
+                let agents = match engine.runtime(&name)?.is_some() {
+                    true => Some((
+                        engine.agents(&name)?,
+                        super::agent::check_notes(engine, &name, true)?,
+                    )),
+                    false => None,
+                };
+                Ok((services, agents))
             };
             if output::json() {
                 let mut shown = show_json(&view);
-                shown["services"] = services
-                    .iter()
-                    .map(|(label, status)| {
-                        let (state, pid) = match status {
-                            ServiceStatus::Running { pid } => ("running", Some(*pid)),
-                            ServiceStatus::Loaded => ("loaded", None),
-                            ServiceStatus::NotLoaded => ("not_loaded", None),
+                let code = match more() {
+                    Ok((services, agents)) => {
+                        shown["services"] = json!(
+                            services
+                                .iter()
+                                .map(|(label, status)| ServiceLine::new(label, status.clone()))
+                                .collect::<Vec<_>>()
+                        );
+                        shown["agents"] = match &agents {
+                            Some((agents, _)) => {
+                                agents.iter().map(|a| json!(a.name.to_string())).collect()
+                            }
+                            None => Value::Null,
                         };
-                        json!({"label": label.to_string(), "state": state, "pid": pid})
-                    })
-                    .collect();
-                shown["agents"] = match &agents {
-                    Some((agents, _)) => agents.iter().map(|a| json!(a.name.to_string())).collect(),
-                    None => Value::Null,
+                        shown["notes"] = agents
+                            .as_ref()
+                            .map_or_else(Vec::new, |(_, notes)| notes.clone())
+                            .into();
+                        exit::OK
+                    }
+                    Err(e) => {
+                        let code = e.exit_code();
+                        for field in ["services", "agents", "notes"] {
+                            shown[field] = Value::Null;
+                        }
+                        shown["error"] = output::error(&e, code)["error"].clone();
+                        code
+                    }
                 };
-                shown["notes"] = agents
-                    .as_ref()
-                    .map_or_else(Vec::new, |(_, notes)| notes.clone())
-                    .into();
                 output::emit(&shown);
-                return Ok(exit::OK);
+                return Ok(code);
             }
+            let (services, agents) = more()?;
             for (label, status) in services {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
@@ -194,11 +209,12 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Planned::DryRun(plan) if output::json() => output::emit(&output::plan(&plan)),
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(left) => {
+                    // Removed, but not all of it: a script must see that.
+                    let code = match left.is_empty() {
+                        true => exit::OK,
+                        false => exit::ERROR,
+                    };
                     if output::json() {
-                        let code = match left.is_empty() {
-                            true => exit::OK,
-                            false => exit::ERROR,
-                        };
                         output::emit(&output::with_error(
                             json!({
                                 "sandbox": name.to_string(),
@@ -225,10 +241,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                             );
                         }
                     }
-                    // Removed, but not all of it: a script must see that.
-                    if !left.is_empty() {
-                        return Ok(exit::ERROR);
-                    }
+                    return Ok(code);
                 }
             }
         }
@@ -245,12 +258,9 @@ fn state(s: &SandboxState) -> String {
     }
 }
 
-/// A state as JSON: its word, and why for a failed one.
+/// A state as JSON: its word, and why for a failed one, as in `status`.
 fn state_json(s: &SandboxState) -> Value {
-    match s {
-        SandboxState::Failed { reason } => json!({"state": "failed", "reason": reason}),
-        other => json!({"state": state(other)}),
-    }
+    json!(s)
 }
 
 fn list_json(v: &SandboxView) -> Value {
@@ -289,10 +299,7 @@ fn show_json(v: &SandboxView) -> Value {
                 "gone": view.gone(),
                 "version": s.version,
                 "needs_restart": view.needs_restart,
-                "members": view.members.iter().map(|m| json!({
-                    "pid": m.pid,
-                    "command": m.command,
-                })).collect::<Vec<_>>(),
+                "members": view.members.iter().map(|m| output::member(m.pid, &m.command)).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),
     })
@@ -416,12 +423,28 @@ fn print_show(v: &SandboxView) {
 /// once. A sandbox that fails is said, as for a single one, and the next
 /// one is still done: one that cannot stop does not keep the others
 /// running. The exit code is the highest of theirs. In JSON, each one's
-/// result, or error, is one element of `sandboxes`.
+/// result, or error, is one element of `sandboxes`, and an `error` beside
+/// them says how many failed.
 fn each(
     names: &[SandboxName],
     known: impl Fn(&SandboxName) -> Result<()>,
-    mut verb: impl FnMut(&SandboxName) -> Result<(u8, Value)>,
+    verb: impl FnMut(&SandboxName) -> Result<(u8, Value)>,
 ) -> Result<u8> {
+    let (code, document) = each_into(names, known, verb, output::json())?;
+    if output::json() {
+        output::emit(&document);
+    }
+    Ok(code)
+}
+
+/// [`each`], with its document: in text, a failure is said on stderr as it
+/// happens and the document is not printed.
+fn each_into(
+    names: &[SandboxName],
+    known: impl Fn(&SandboxName) -> Result<()>,
+    mut verb: impl FnMut(&SandboxName) -> Result<(u8, Value)>,
+    json: bool,
+) -> Result<(u8, Value)> {
     let mut seen = Vec::new();
     for name in names {
         if !seen.contains(&name) {
@@ -430,31 +453,33 @@ fn each(
         }
     }
     let mut code = exit::OK;
+    let mut failed = 0;
     let mut results = Vec::new();
+    let count = seen.len();
     for name in seen {
-        code = code.max(match verb(name) {
+        let one = match verb(name) {
             Ok((code, result)) => {
                 results.push(result);
                 code
             }
             Err(e) => {
                 let code = e.exit_code();
-                match output::json() {
-                    true => {
-                        let mut failed = output::error(&e, code);
-                        failed["sandbox"] = json!(name.to_string());
-                        results.push(failed);
-                    }
-                    false => eprintln!("error: {e}"),
+                let mut failed = output::error(&e, code);
+                failed["sandbox"] = json!(name.to_string());
+                results.push(failed);
+                if !json {
+                    eprintln!("error: {e}");
                 }
                 code
             }
-        });
+        };
+        failed += usize::from(one != exit::OK);
+        code = code.max(one);
     }
-    if output::json() {
-        output::emit(&json!({ "sandboxes": results }));
-    }
-    Ok(code)
+    let document = output::with_error(json!({ "sandboxes": results }), code, || {
+        format!("{failed} of the {count} sandboxes failed: see each one's error")
+    });
+    Ok((code, document))
 }
 
 fn start(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<(u8, Value)> {
@@ -546,16 +571,14 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
             }))
         }).collect::<Vec<_>>(),
     });
+    let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let value = output::with_error(value, code, || {
+        format!(
+            "sandbox {name} is marked failed: {survivors} processes survived stop; end them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses"
+        )
+    });
     if output::json() {
-        let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
-        return (
-            code,
-            output::with_error(value, code, || {
-                format!(
-                    "sandbox {name} is marked failed: {survivors} processes survived stop; end them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses"
-                )
-            }),
-        );
+        return (code, value);
     }
     let gone = match report.gone.len() {
         0 => String::new(),
@@ -589,20 +612,31 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
     (code, value)
 }
 
+/// The services a start would install and start, as sentences.
+fn would_start(name: &SandboxName, labels: &[ServiceLabel]) -> Vec<String> {
+    labels
+        .iter()
+        .map(|label| format!("install and start the service {label} of sandbox {name}"))
+        .collect()
+}
+
+/// A start's dry run, as a plan with the services it would start.
 fn would_start_json(name: &SandboxName, labels: &[ServiceLabel]) -> Value {
-    json!({
-        "sandbox": name.to_string(),
-        "dry_run": true,
-        "would_start": labels.iter().map(ToString::to_string).collect::<Vec<_>>(),
-    })
+    let mut planned = output::plan(&Plan {
+        changes: would_start(name, labels),
+        ..Plan::default()
+    });
+    planned["sandbox"] = json!(name.to_string());
+    planned["would_start"] = labels.iter().map(ToString::to_string).collect();
+    planned
 }
 
 fn print_would_start(name: &SandboxName, labels: &[ServiceLabel]) {
     if output::json() {
         return;
     }
-    for label in labels {
-        println!("Would install and start the service {label} of sandbox {name}.");
+    for change in would_start(name, labels) {
+        println!("Would {change}.");
     }
 }
 
@@ -623,16 +657,14 @@ pub(super) fn print_started(
         true => exit::OK,
         false => exit::ERROR,
     };
+    let value = output::with_error(value, code, || {
+        format!(
+            "the proxy of sandbox {name} has not started after {} seconds; see `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`",
+            PROXY_WAIT.as_secs()
+        )
+    });
     if output::json() {
-        return Ok((
-            code,
-            output::with_error(value, code, || {
-                format!(
-                    "the proxy of sandbox {name} has not started after {} seconds; see `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`",
-                    PROXY_WAIT.as_secs()
-                )
-            }),
-        ));
+        return Ok((code, value));
     }
     let labels = labels
         .iter()
@@ -709,5 +741,35 @@ mod tests {
         });
         assert_eq!(code.unwrap(), exit::ERROR);
         assert_eq!(done, ["home", "lab", "work"]);
+    }
+
+    /// In JSON, each one's result or error is an element, in order, and an
+    /// `error` beside them says how many failed.
+    #[test]
+    fn in_json_each_one_is_an_element_and_the_failures_are_counted() {
+        let (code, document) = each_into(
+            &names(&["home", "lab", "work"]),
+            known,
+            |n| match n.as_str() {
+                "home" => Err(Error::NoSuchSandbox {
+                    name: n.to_string(),
+                }),
+                "lab" => Ok((exit::ERROR, json!({"sandbox": "lab", "stopped": false}))),
+                _ => Ok((exit::OK, json!({"sandbox": "work", "stopped": true}))),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(code, exit::ERROR);
+        let elements = document["sandboxes"].as_array().unwrap();
+        assert_eq!(elements[0]["sandbox"], "home");
+        assert_eq!(elements[0]["error"]["kind"], "error");
+        assert_eq!(elements[1]["stopped"], false);
+        assert!(elements[2].get("error").is_none());
+        assert_eq!(
+            document["error"]["message"],
+            "2 of the 3 sandboxes failed: see each one's error"
+        );
+        assert_eq!(document["error"]["exit_code"], 1);
     }
 }

@@ -23,7 +23,11 @@ pub struct StatusArgs {
 pub fn run(engine: &Engine, args: StatusArgs) -> Result<u8> {
     let view = engine.status(args.sandbox.as_ref())?;
     if super::output::json() {
-        super::output::emit(&serde_json::to_value(&view).expect("the view serializes"));
+        let shown = serde_json::to_value(&view).map_err(|source| enclos::error::Error::Json {
+            what: "the status",
+            source,
+        })?;
+        super::output::emit(&shown);
         return Ok(exit::OK);
     }
     print(&view, now(), std::env::var("HOME").ok().as_deref());

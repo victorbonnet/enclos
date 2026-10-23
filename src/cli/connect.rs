@@ -14,17 +14,7 @@ macro_rules! say {
     }};
 }
 
-/// A note of enclos's own, on stderr: `enclos: …` in text, `{"note": …}`
-/// with --json.
-fn note(what: &str) {
-    match super::output::json() {
-        true => say!(
-            "{}",
-            super::output::line(&serde_json::json!({ "note": what }))
-        ),
-        false => say!("enclos: {what}"),
-    }
-}
+use super::output::note;
 
 use clap::Args;
 

@@ -1,14 +1,15 @@
 //! How a command prints (design §10): readable text in a terminal, JSON when
 //! its output is piped or with `--json`, errors and refusals included. A
-//! command that runs a program whose output is its own (`connect`, `exec`,
-//! `logs`, and what launchd starts) is never JSON because it is piped. With
-//! `--json`, its dry run's plan is JSON on stdout, and enclos's own words in
-//! it, its failure and its notes, are JSON on stderr.
+//! command whose stdout is a program's or the services' ([`RUNS_A_PROGRAM`])
+//! is never JSON because it is piped. With `--json`, its dry run's plan is
+//! JSON on stdout, `logs` writes its lines as JSON Lines there, and enclos's
+//! own words, its failure and its notes, are JSON on stderr.
 
 use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -18,13 +19,28 @@ use enclos::error::{Error, exit};
 use enclos::model::audit::{AuditEntry, AuditResult};
 use enclos::model::plan::Plan;
 
+/// How a command prints, decided once for it by [`decide`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
+pub enum Output {
     Text,
-    Json,
+    /// One JSON document, on the stdout enclos was given.
+    Document,
+    /// The command's stdout is a program's: enclos's own words are JSON
+    /// lines on stderr, and only a dry run's plan, or `logs`' lines, are
+    /// JSON on stdout.
+    OnStderr,
 }
 
-static FORMAT: OnceLock<Format> = OnceLock::new();
+/// The commands, by their word, whose stdout is the program's they run or
+/// the services' logs: `connect`, `exec`, `logs`, and the hidden `launch`
+/// and `proxy`, which the service manager or enclos starts.
+pub const RUNS_A_PROGRAM: [&str; 5] = ["connect", "exec", "logs", "launch", "proxy"];
+
+static OUTPUT: OnceLock<Output> = OnceLock::new();
+
+/// Whether a document was written: a command writes one, and a second is a
+/// bug.
+static EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Where the JSON document goes: the stdout enclos was given, kept while
 /// its descriptor 1 points at stderr.
@@ -33,24 +49,42 @@ static DOCUMENT: OnceLock<Mutex<File>> = OnceLock::new();
 /// Why the document could not be written, if it could not.
 static WRITE_FAILED: OnceLock<std::io::Error> = OnceLock::new();
 
-/// Decides the format once, for the whole command: `--json` or `--text` as
-/// asked, else JSON when stdout is not a terminal and `piped_is_json`.
-pub fn choose(json: bool, text: bool, piped_is_json: bool) -> Format {
-    let format = match (json, text) {
-        (true, _) => Format::Json,
-        (false, true) => Format::Text,
-        (false, false) if piped_is_json && !std::io::stdout().is_terminal() => Format::Json,
-        (false, false) => Format::Text,
-    };
-    *FORMAT.get_or_init(|| format)
+/// How `command`, by its word, prints: JSON with `--json`, which wins over
+/// `--text`; else text with `--text` or in a terminal, and JSON when piped,
+/// but for the commands in [`RUNS_A_PROGRAM`], whose JSON is only on
+/// stderr and only with `--json`. The same for a parsed command and for a
+/// usage error, which is told as the command would print.
+pub fn decide(command: &str, json: bool, text: bool, stdout_is_terminal: bool) -> Output {
+    let runs = RUNS_A_PROGRAM.contains(&command);
+    match (runs, json, text || stdout_is_terminal) {
+        (true, true, _) => Output::OnStderr,
+        (true, false, _) => Output::Text,
+        (false, true, _) | (false, false, false) => Output::Document,
+        (false, false, true) => Output::Text,
+    }
 }
 
-/// In JSON, keeps the stdout enclos was given for its document alone, and
-/// points descriptor 1 at stderr: what any program enclos starts prints,
-/// such as an installer's progress or an editor, goes there, and so does a
-/// `println!` of enclos's own. The copy kept is closed on exec, so no
-/// program enclos starts holds it. When that cannot be done, it says so and
-/// the document stays on descriptor 1, with whatever else is printed there.
+/// [`decide`] for this process, with its stdout as it is now: called once,
+/// before anything is printed.
+pub fn choose(command: &str, json: bool, text: bool) -> Output {
+    let output = decide(command, json, text, std::io::stdout().is_terminal());
+    let chosen = *OUTPUT.get_or_init(|| output);
+    debug_assert_eq!(chosen, output, "the output is chosen once");
+    chosen
+}
+
+/// How this command prints: text until [`choose`] says otherwise.
+pub fn output() -> Output {
+    OUTPUT.get().copied().unwrap_or(Output::Text)
+}
+
+/// For [`Output::Document`]: writes the document to a close-on-exec copy of
+/// the stdout enclos was given, and points descriptor 1 at stderr, so that
+/// what any program enclos starts prints, such as an installer's progress
+/// or an editor, goes there, and so does a `println!` of enclos's own; no
+/// program enclos starts holds the copy. When that cannot be done, it says
+/// so and the document stays on descriptor 1, with whatever else is
+/// printed there.
 pub fn keep_stdout_for_the_document() {
     let kept = rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 3).and_then(|kept| {
         rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
@@ -66,14 +100,16 @@ pub fn keep_stdout_for_the_document() {
     }
 }
 
-/// Whether this command prints JSON.
+/// Whether this command prints JSON, as a document or on stderr.
 pub fn json() -> bool {
-    FORMAT.get() == Some(&Format::Json)
+    output() != Output::Text
 }
 
 /// Prints `value` as the command's one JSON document. A failure to write it
 /// is kept, for [`write_failure`] to report as the command ends.
 pub fn emit(value: &Value) {
+    let first = !EMITTED.swap(true, Ordering::SeqCst);
+    debug_assert!(first, "a command writes one JSON document");
     let text = for_terminal(&serde_json::to_string_pretty(value).expect("a JSON value serializes"));
     let written = match DOCUMENT.get() {
         Some(document) => {
@@ -101,22 +137,38 @@ pub fn write_failure() -> Option<&'static std::io::Error> {
     WRITE_FAILED.get()
 }
 
-/// JSON text with what could still drive a terminal or hide text escaped
-/// as `\uXXXX`: DEL, the C1 controls, the bidirectional controls, the
-/// zero-width characters and the line and paragraph separators. JSON
-/// escapes only the C0 controls itself, and a sandbox writes some of what a
-/// document holds, such as its log lines and its processes' commands. Such
-/// characters only ever appear inside strings, so this changes no value.
+/// JSON text with these characters escaped as `\uXXXX`, a character past
+/// U+FFFF as its two UTF-16 halves: DEL and the C1 controls, which can drive
+/// a terminal; the bidirectional controls, which reorder what is shown; and
+/// characters that show nothing: zero-width ones, the line and paragraph
+/// separators, the soft hyphen, the combining grapheme joiner, the
+/// Mongolian vowel separator, the word joiner and invisible operators, the
+/// variation selectors, the interlinear annotation characters and the tag
+/// characters. JSON escapes only the C0 controls itself, and a sandbox
+/// writes some of what a document holds, such as its log lines and its
+/// processes' commands. Such characters only ever appear inside strings,
+/// so this changes no value.
 pub fn for_terminal(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
             '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
+            | '\u{34f}'
             | '\u{61c}'
+            | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2069}'
-            | '\u{feff}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            | '\u{2060}'..='\u{206f}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}' => {
+                for unit in c.encode_utf16(&mut [0; 2]) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
             c => out.push(c),
         }
     }
@@ -138,36 +190,49 @@ pub fn path(p: &Path) -> Value {
 }
 
 /// An error as JSON: its message, what kind of failure it is, and the exit
-/// code the command gives, which for `exec` is 125 whatever the kind.
+/// code it gives (the command's, or one sandbox's in `sandboxes`), which for
+/// `exec` is 125 whatever the kind.
 pub fn error(err: &Error, code: u8) -> Value {
-    json!({
-        "error": {
-            "message": err.to_string(),
-            "kind": kind(err.exit_code()),
-            "exit_code": code,
-        }
-    })
+    json!({"error": error_body(&err.to_string(), kind(err.exit_code()), code)})
 }
 
 /// A failure given only as text, as for a usage error.
 pub fn error_text(message: &str, code: u8) -> Value {
-    json!({
-        "error": {
-            "message": message,
-            "kind": kind(code),
-            "exit_code": code,
-        }
-    })
+    json!({"error": error_body(message, kind(code), code)})
 }
 
-/// `result` with an `error` beside it when `code` is not 0, saying in
-/// `message` what the text says: a command that fails with a result to
+fn error_body(message: &str, kind: &str, code: u8) -> Value {
+    json!({"message": message, "kind": kind, "exit_code": code})
+}
+
+/// `result` with an `error` beside it when `code` is not 0, its `message` a
+/// line saying why the command fails: a command that fails with a result to
 /// show still has an `error` a script can look for.
 pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String) -> Value {
     if code != exit::OK {
-        result["error"] = error_text(&message(), code)["error"].clone();
+        result["error"] = error_body(&message(), kind(code), code);
     }
     result
+}
+
+/// Who did something, as an audit entry records them.
+pub fn actor(by: &enclos::model::audit::Actor) -> Value {
+    json!({"user": by.user, "host": by.host})
+}
+
+/// A process: its pid and its command as `ps` lists it.
+pub fn member(pid: u32, command: &str) -> Value {
+    json!({"pid": pid, "command": command})
+}
+
+/// A note of enclos's own, on stderr: `enclos: …` in text, one
+/// `{"note": …}` line in JSON. A stderr closed already never makes it fail.
+pub fn note(what: &str) {
+    let shown = match json() {
+        true => line(&json!({ "note": what })),
+        false => format!("enclos: {what}"),
+    };
+    let _ = writeln!(std::io::stderr(), "{shown}");
 }
 
 fn kind(code: u8) -> &'static str {
@@ -185,10 +250,7 @@ pub fn session(end: &SessionEnd) -> Value {
         Left::Nothing => json!({"state": "nothing"}),
         Left::Running(members) => json!({
             "state": "running",
-            "members": members.iter().map(|m| json!({
-                "pid": m.pid,
-                "command": m.command,
-            })).collect::<Vec<_>>(),
+            "members": members.iter().map(|m| member(m.pid, &m.command)).collect::<Vec<_>>(),
         }),
         Left::Unknown(why) => json!({"state": "unknown", "why": why}),
     };
@@ -207,7 +269,7 @@ pub fn audit_entry(entry: &AuditEntry) -> Value {
     json!({
         "line": entry.seq,
         "at": entry.at.to_string(),
-        "by": {"user": entry.intent.by.user, "host": entry.intent.by.host},
+        "by": actor(&entry.intent.by),
         "command": entry.intent.command,
         "target": entry.intent.target,
         "finished": entry.finished.as_ref().map(|f| json!({
@@ -234,6 +296,94 @@ mod tests {
             "{\"line\":\"a\\u007fb\\u009b2J\\u202ec\\u200bd\\u2028é\"}"
         );
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+    }
+
+    /// Each end of each range is escaped, a character past U+FFFF as its
+    /// two halves, and every value reads back as it was, a backslash before
+    /// one included; the characters around each range are kept.
+    #[test]
+    fn every_listed_character_is_escaped_and_reads_back() {
+        let escaped = [
+            '\u{7f}',
+            '\u{9f}',
+            '\u{ad}',
+            '\u{34f}',
+            '\u{61c}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{206f}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{e0000}',
+            '\u{e007f}',
+            '\u{e0100}',
+            '\u{e01ef}',
+        ];
+        for c in escaped {
+            let value = json!({"s": format!("\\{c}1")});
+            let text = for_terminal(&serde_json::to_string(&value).unwrap());
+            assert!(!text.contains(c), "{c:?} in {text}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&text).unwrap(),
+                value,
+                "{c:?}"
+            );
+        }
+        assert_eq!(
+            for_terminal("\u{e0041}"),
+            "\\udb40\\udc41",
+            "a tag character is its two halves"
+        );
+        for kept in [
+            '~',
+            '\u{a0}',
+            '\u{2027}',
+            '\u{2070}',
+            '\u{fe10}',
+            '\u{e0080}',
+        ] {
+            assert_eq!(
+                for_terminal(&kept.to_string()),
+                kept.to_string(),
+                "{kept:?}"
+            );
+        }
+    }
+
+    /// Every combination of the flags and the terminal, for a command that
+    /// prints its own result and for one that runs a program.
+    #[test]
+    fn the_output_is_decided_by_the_flags_the_terminal_and_the_command() {
+        for (json, text, terminal) in (0..8).map(|i| (i & 1 != 0, i & 2 != 0, i & 4 != 0)) {
+            let own = match (json, text, terminal) {
+                (true, _, _) => Output::Document,
+                (false, false, false) => Output::Document,
+                _ => Output::Text,
+            };
+            assert_eq!(
+                decide("status", json, text, terminal),
+                own,
+                "{json} {text} {terminal}"
+            );
+            for runs in RUNS_A_PROGRAM {
+                let theirs = match json {
+                    true => Output::OnStderr,
+                    false => Output::Text,
+                };
+                assert_eq!(
+                    decide(runs, json, text, terminal),
+                    theirs,
+                    "{runs} {json} {text}"
+                );
+            }
+        }
     }
 
     #[test]

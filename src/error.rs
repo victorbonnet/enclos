@@ -45,6 +45,13 @@ pub enum Error {
     NoFreePorts,
     #[error("{what}")]
     Session { what: String },
+    /// A value enclos could not write as JSON.
+    #[error("cannot write {what} as JSON: {source}")]
+    Json {
+        what: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
     /// Guidance for a failed operation, preserving its cause and exit code.
     #[error("{what}")]
     WithContext {
@@ -335,6 +342,7 @@ impl Error {
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
+            | Error::Json { .. }
             | Error::Service(_)
             | Error::Processes(_)
             | Error::Markers(_)
