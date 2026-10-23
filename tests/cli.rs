@@ -2761,6 +2761,10 @@ fn a_sandbox_is_listed_and_shown_with_its_active_template() {
     );
     let shown = home.run(&["sandbox", "show", "lab"]).ok().stdout();
     assert!(shown.contains(", template minimal, "), "{shown}");
+    let (_, list) = home.json(&["sandbox", "list"]);
+    assert_eq!(list["sandboxes"][0]["template"], "minimal", "{list}");
+    let (_, show) = home.json(&["sandbox", "show", "lab"]);
+    assert_eq!(show["template"], "minimal", "{show}");
 }
 
 /// `--help` names every template; on macOS, where the backend runs and so

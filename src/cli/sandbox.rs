@@ -83,7 +83,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 (Planned::Done(r), true) => output::emit(&json!({
                     "sandbox": r.name.to_string(),
                     "backend": r.backend.to_string(),
-                    "template": r.template.to_string(),
+                    "template": r.created_from.to_string(),
                     "policy_version": 1,
                     "proxy_port": r.proxy_port,
                 })),
