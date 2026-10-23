@@ -40,7 +40,7 @@ Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defau
 On an Apple silicon Mac running macOS 15 or later, with an account with a model provider Hermes supports:
 
 ```bash
-curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
+curl -fsSL https://enclos.dev/install.sh | bash
 enclos init
 enclos sandbox create lab
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
@@ -73,7 +73,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
-- [Website](https://victorbonnet.github.io/enclos/): a visual introduction, everyday examples and common questions ([source](site/)).
+- [Website](https://enclos.dev/): a visual introduction, everyday examples and common questions ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under.
