@@ -1189,10 +1189,22 @@ fn a_tunnel_whose_server_speaks_first_works_and_is_logged_as_not_tls() {
         LOCAL,
         loopback_is_global,
     );
-    let mut conn = tunnel(&proxy, "mail.example.com", port);
-    let mut banner = [0u8; 12];
-    conn.read_exact(&mut banner).unwrap();
-    assert_eq!(&banner, b"220 banner\r\n");
+    let (mut conn, reply) = send(
+        proxy.addr,
+        &format!("CONNECT mail.example.com:{port} HTTP/1.1\r\n\r\n"),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    // The server speaks first, so its banner can come in the same read as
+    // the reply's head: what follows the head is the banner's start.
+    let head = reply.find("\r\n\r\n").unwrap() + 4;
+    let mut banner = reply.as_bytes()[head..].to_vec();
+    while banner.len() < 12 {
+        let mut more = [0u8; 12];
+        let n = conn.read(&mut more).unwrap();
+        assert!(n > 0, "the tunnel closed before the banner");
+        banner.extend_from_slice(&more[..n]);
+    }
+    assert_eq!(banner, b"220 banner\r\n");
     conn.write_all(b"EHLO x\r\n").unwrap();
     assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"EHLO x\r\n");
     let mut rest = String::new();
