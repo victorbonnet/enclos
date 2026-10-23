@@ -190,8 +190,8 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 
 | Template | Writes | Programs | Network | Use for |
 | --- | --- | --- | --- | --- |
-| `minimal` | own home | any for now: program rules come with `[exec]`, refused until enforced | the runtime adapter's endpoints only (for Hermes: its install sources, and the ChatGPT-subscription provider, `chatgpt.com` and `auth.openai.com`; another provider's hosts with `policy allow`), and what `policy allow` adds | a starting point |
-| `mcp-only` | own home | any for now, as `minimal` | as `minimal`, plus the remote MCP endpoints listed for it with `policy allow`; the runtime is told of them with its own commands, through `enclos connect`, until `runtime configure --mcp-add` comes | assistants working on outside data |
+| `minimal` | own home | the runtime only, once program rules come; for now any, since a policy with `[exec]` is refused until a backend enforces it | what is listed: the runtime adapter's endpoints once a runtime is installed (for Hermes: its install sources, and `chatgpt.com` and `auth.openai.com` for a ChatGPT subscription), and what `policy allow` adds, such as another provider's hosts | a starting point |
+| `mcp-only` | own home | as `minimal`; the runtime's MCP servers too, once program rules come | for now the same as `minimal`: each remote MCP endpoint's host is added with `policy allow`, and the runtime is told of it with its own commands through `enclos connect`, until `runtime configure --mcp-add` lists both | assistants working on outside data |
 | `assistant` | own home | any, including what the agent installs in its home | the public web (any public address on ports 80 and 443), plus the runtime's endpoints and listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 
