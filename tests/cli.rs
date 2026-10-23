@@ -2695,6 +2695,12 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
         "{}",
         out.stdout()
     );
+    // The repair said is that sandbox's alone.
+    assert!(
+        out.stdout().contains("`enclos state repair home` fixes"),
+        "{}",
+        out.stdout()
+    );
     let out = home.run(&["state", "repair", "--dry-run"]);
     assert!(
         out.ok()
@@ -2730,6 +2736,22 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
     let out = home.run(&["state", "check", "nosuch"]);
     assert_eq!(out.code(), 1);
     assert!(!out.stdout().contains("match the host"), "{}", out.stdout());
+
+    // A repair that fails is said so, and exits 1.
+    std::fs::create_dir(home.root.join("sandboxes/home/home")).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    let dir = home.root.join("sandboxes/home");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = home.run(&["state", "repair"]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout()
+            .contains("  repair failed: write policy.toml again"),
+        "{}",
+        out.stdout()
+    );
+    assert!(!out.stdout().contains("repaired:"), "{}", out.stdout());
 }
 
 /// `doctor` runs a program in Seatbelt, checks each sandbox's next session,

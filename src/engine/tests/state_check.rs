@@ -13,11 +13,12 @@ use crate::engine::{Finding, Remedy, Subject};
 use crate::lifecycle::programs::tests::Sleeper;
 use crate::model::sandbox::{SandboxName, SandboxState};
 
+/// The repairs found, or made: a check's and a repair's findings alike.
 fn repairs(found: &[Finding]) -> Vec<String> {
     found
         .iter()
         .filter_map(|f| match &f.remedy {
-            Remedy::Repairs(repair) => Some(repair.to_string()),
+            Remedy::Repairs(repair) | Remedy::Repaired(repair) => Some(repair.to_string()),
             _ => None,
         })
         .collect()
@@ -346,6 +347,13 @@ fn a_repair_that_fails_is_named_alone_and_the_others_are_made() {
         })
         .collect();
     assert_eq!(failed.len(), 1, "{repaired:?}");
+    // A repair that failed is left for a person: `state repair` exits 1.
+    assert!(
+        repaired
+            .iter()
+            .filter(|f| matches!(f.remedy, Remedy::Failed { .. }))
+            .all(|f| f.remedy.is_left())
+    );
     assert!(
         failed[0].0.starts_with("write policy.toml again"),
         "{failed:?}"
@@ -520,12 +528,9 @@ fn a_process_no_session_tracks_is_named_and_never_stopped() {
     let mut escaped = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
     let pid = escaped.pid();
     let found = engine.state_check(None).unwrap();
-    let named = about(&found, &format!("process {pid} runs "));
+    let named = about(&found, &format!("process {pid}, listed as ./sleeper, has "));
     assert_eq!(named.len(), 1, "{found:?}");
-    assert!(
-        named[0].what.contains("/home/sleeper, listed as ./sleeper"),
-        "{named:?}"
-    );
+    assert!(named[0].what.contains("/home/sleeper mapped"), "{named:?}");
     assert!(named[0].remedy.is_left());
     repair(&engine, None);
     assert!(escaped.runs(), "repair stopped it");
@@ -577,4 +582,184 @@ fn a_sandbox_whose_folder_is_gone_is_not_recorded_stopped_by_repair() {
     );
     repair(&engine, None);
     assert_eq!(state_of(&engine, &name), SandboxState::Running);
+}
+
+/// `state check` looks under the lock a session starts under: a program
+/// started and recorded meanwhile is not taken for one that left its
+/// session.
+#[test]
+fn a_check_looks_under_the_lock() {
+    let (_dir, engine, name) = with_sandbox();
+    let member = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
+    let started = session_of(
+        &engine,
+        &name,
+        crate::lifecycle::process::reference(member.pid())
+            .unwrap()
+            .unwrap(),
+    );
+    let found = while_waiting(
+        &engine,
+        || engine.state_check(None).unwrap(),
+        |other, lock| {
+            other.state.put_session(lock, &started).unwrap();
+        },
+    );
+    assert_eq!(found, []);
+}
+
+/// A program run from `home2`'s folder is not `home`'s: the folder is
+/// matched as a whole name, not as a prefix.
+#[test]
+fn a_program_of_a_sandbox_whose_name_extends_anothers_is_not_the_others() {
+    let (_dir, engine, name) = with_sandbox();
+    let other: SandboxName = "home2".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: other.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    let member = Sleeper::in_folder(&engine.layout.sandbox_home(other.as_str()));
+    put(
+        &engine,
+        &session_of(
+            &engine,
+            &other,
+            crate::lifecycle::process::reference(member.pid())
+                .unwrap()
+                .unwrap(),
+        ),
+    );
+    set_state(&engine, &name, SandboxState::Running);
+    let found = engine.state_check(Some(&name)).unwrap();
+    assert_eq!(repairs(&found), ["record it stopped"], "{found:?}");
+    assert!(about(&found, "process").is_empty(), "{found:?}");
+}
+
+/// A process of a session's that only its marker tracks, running a program
+/// from the sandbox's folder, is the session's, not one that left it.
+#[test]
+fn a_member_its_marker_keeps_running_from_the_folder_is_not_named() {
+    let (_dir, engine, name) = with_sandbox();
+    let home = engine.layout.sandbox_home(name.as_str());
+    std::fs::copy(std::env::current_exe().unwrap(), home.join("sleeper")).unwrap();
+    let marker = engine.new_marker(&name).unwrap();
+    let mut command = std::process::Command::new("./sleeper");
+    command
+        .args([
+            "--exact",
+            "lifecycle::programs::tests::sleeps_when_asked",
+            "--test-threads=1",
+        ])
+        .env(crate::lifecycle::programs::tests::SLEEP, "1")
+        .current_dir(&home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let (child, marked) = marker.spawn(&mut command).unwrap();
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _child = Reap(child);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let root = gone_process();
+    engine.name_marker(&name, marked, &root).unwrap();
+    put(&engine, &session_of(&engine, &name, root));
+    assert_eq!(engine.state_check(None).unwrap(), []);
+}
+
+/// What fails for the whole host, such as the service manager, stops the
+/// check, and the repair's audit entry says it failed: it is not one
+/// finding per sandbox.
+#[test]
+fn a_failure_of_the_host_stops_the_check() {
+    let (_dir, engine, fake, _name) = sandbox_with_services(None);
+    *fake.refuse_installed.borrow_mut() = true;
+    let err = engine.state_check(None).unwrap_err();
+    assert!(err.to_string().contains("did not answer"), "{err}");
+    engine.state_repair(&alice(), None).unwrap_err();
+    let audit = engine.audit(None).unwrap();
+    let last = audit.last().unwrap();
+    assert_eq!(last.intent.command, "state repair");
+    assert_eq!(
+        last.finished.as_ref().unwrap().outcome.result,
+        crate::model::audit::AuditResult::Failed
+    );
+}
+
+/// A sandbox record that does not read is a finding of its own, and the
+/// other sandboxes are still looked at and repaired.
+#[test]
+fn a_record_that_does_not_read_does_not_hide_the_others() {
+    let (_dir, engine, name) = with_sandbox();
+    let lab: SandboxName = "lab".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: lab.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    rusqlite::Connection::open(engine.layout.state_db())
+        .unwrap()
+        .execute(
+            "UPDATE sandboxes SET state = 'bogus' WHERE name = 'lab'",
+            [],
+        )
+        .unwrap();
+    std::fs::remove_file(engine.layout.policy_file(name.as_str())).unwrap();
+    let found = engine.state_check(None).unwrap();
+    let unread = about(&found, "its record does not read");
+    assert_eq!(unread.len(), 1, "{found:?}");
+    assert_eq!(unread[0].subject, Subject::Sandbox(lab.clone()));
+    assert!(unread[0].remedy.is_left());
+    // Its folder is not taken for one with no record.
+    assert!(about(&found, "has no record").is_empty(), "{found:?}");
+    assert_eq!(
+        repairs(&found),
+        ["write policy.toml again from the text its active policy was resolved from"]
+    );
+    let alone = engine.state_check(Some(&lab)).unwrap();
+    assert_eq!(
+        about(&alone, "its record does not read").len(),
+        1,
+        "{alone:?}"
+    );
+    repair(&engine, None);
+    assert!(engine.layout.policy_file(name.as_str()).exists());
+}
+
+/// With its folder gone, a session's markers cannot be looked for, so a
+/// session whose root is gone is not ended by repair: a process holding
+/// its marker may still run.
+#[test]
+fn a_gone_session_of_a_sandbox_whose_folder_is_gone_is_left() {
+    let (_dir, engine, name) = with_sandbox();
+    let id = put(&engine, &session_of(&engine, &name, gone_process()));
+    std::fs::remove_dir_all(engine.layout.sandbox_dir(name.as_str())).unwrap();
+    let found = engine.state_check(None).unwrap();
+    let gone = about(&found, &format!("session {id} is gone"));
+    assert_eq!(gone.len(), 1, "{found:?}");
+    assert!(
+        matches!(&gone[0].remedy, Remedy::Manual(m) if m.contains("sandbox stop home")),
+        "{gone:?}"
+    );
+    repair(&engine, None);
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// Something in the sandboxes' folder that is not a folder, and no record
+/// names, is named.
+#[test]
+fn an_entry_that_is_not_a_folder_is_named() {
+    let (_dir, engine, _name) = with_sandbox();
+    std::fs::write(engine.layout.sandboxes_dir().join("notes.txt"), "x").unwrap();
+    let found = engine.state_check(None).unwrap();
+    let named = about(&found, "is not a folder and has no record");
+    assert_eq!(named.len(), 1, "{found:?}");
+    assert_eq!(named[0].subject, Subject::Folder("notes.txt".into()));
+    assert!(named[0].remedy.is_left());
 }

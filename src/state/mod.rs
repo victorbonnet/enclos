@@ -54,6 +54,14 @@ impl Migration {
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
+/// A sandbox record that does not read: the name stored in it, which may
+/// not be a sandbox's, and why.
+#[derive(Debug)]
+pub struct UnreadableRecord {
+    pub name: String,
+    pub error: StateError,
+}
+
 /// Sandbox records, each change made under the state lock, and the network
 /// log beside them.
 pub trait StateStore: NetLogStore {
@@ -66,6 +74,9 @@ pub trait StateStore: NetLogStore {
     fn migrate(&self, lock: &StateLock) -> Result<Migration>;
     fn get(&self, name: &SandboxName) -> Result<Option<SandboxRecord>>;
     fn list(&self) -> Result<Vec<SandboxRecord>>;
+    /// Every sandbox record, as [`StateStore::list`], but one that does not
+    /// read is its stored name and why, so that it does not hide the others.
+    fn list_each(&self) -> Result<Vec<std::result::Result<SandboxRecord, UnreadableRecord>>>;
     fn put(&self, lock: &StateLock, rec: &SandboxRecord) -> Result<()>;
     fn remove(&self, lock: &StateLock, name: &SandboxName) -> Result<()>;
     /// Records a new sandbox with `snapshot` as its first, active policy
