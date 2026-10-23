@@ -176,29 +176,38 @@ fn usage_error(err: &clap::Error) -> ExitCode {
 }
 
 /// `code`, unless the JSON document could not be written: that is a
-/// failure whatever the command did, and the message says what it did, so
-/// that it is not run again blindly.
+/// failure whatever the command did, and the message says what it did, and
+/// the error the document held, so that it is not run again blindly. As
+/// JSON on stderr, as enclos's notes are there.
 fn written(code: u8, exec: bool) -> u8 {
-    let Some(e) = cli::output::write_failure() else {
-        return code;
-    };
-    let did = match code {
-        exit::OK => "the command itself succeeded".to_owned(),
-        code => format!("the command itself failed, with exit code {code}"),
-    };
-    let message = format!("cannot write the JSON document ({e}); {did}");
-    match cli::output::output() {
-        // enclos's own words are JSON on stderr there.
-        cli::output::Output::OnStderr => say(&cli::output::line(&cli::output::error_text(
-            &message,
-            code.max(exit::ERROR),
-        ))),
-        _ => say(&format!("error: {message}")),
-    }
-    match exec {
+    let failed = match exec {
         true => exit::EXEC_FAILED,
         false => code.max(exit::ERROR),
-    }
+    };
+    let who = match exec {
+        true => "enclos itself",
+        false => "the command itself",
+    };
+    let did = match code {
+        exit::OK => format!("{who} succeeded"),
+        code => format!("{who} failed, with exit code {code}"),
+    };
+    let message = match (cli::output::second_refused(), cli::output::write_failure()) {
+        (true, _) => format!(
+            "enclos tried to print a second JSON document, refused: a bug of enclos; the first was printed, and {did}"
+        ),
+        (false, Some(e)) => format!("cannot write the JSON document ({e}); {did}"),
+        (false, None) => return code,
+    };
+    // What the document said of a failure is said here, or it is lost.
+    let message = match cli::output::unsent_error() {
+        Some(why) => format!("{message}: {why}"),
+        None => message,
+    };
+    say(&cli::output::line(&cli::output::error_text(
+        &message, failed,
+    )));
+    failed
 }
 
 /// A line on stderr. A stderr closed already never turns the exit code into
@@ -275,10 +284,10 @@ fn run(cli: Cli) -> Result<u8> {
 
 /// Whether a reader that left early, as `head` does, ends `command`'s text
 /// as it ends any Unix tool, by SIGPIPE, not by a panic on the next print.
-/// In JSON the document's write fails instead, and the command says so. Not for
-/// those that run the user's or a runtime's programs (`connect`, `runtime`,
-/// `agent`), keep running (`proxy`, `launch`), or handle a closed output
-/// themselves (`logs`).
+/// In JSON the document's write fails instead, and the command says so.
+/// Not for those that run the user's or a runtime's programs (`connect`,
+/// `exec`, `runtime`, `agent`), keep running (`proxy`, `launch`), or handle
+/// a closed output themselves (`logs`).
 fn ends_on_closed_output(command: &Command) -> bool {
     matches!(
         command,

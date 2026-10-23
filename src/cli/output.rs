@@ -40,8 +40,15 @@ pub const RUNS_A_PROGRAM: [&str; 5] = ["connect", "exec", "logs", "launch", "pro
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 
 /// Whether a document was emitted: a command emits one, and a second is a
-/// bug, refused.
+/// bug: a debug build panics, a release refuses it and fails the command.
 static EMITTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a second document was refused.
+static SECOND_REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// The `error` message of a document that could not be written: said on
+/// stderr instead, or it is lost.
+static UNSENT: OnceLock<String> = OnceLock::new();
 
 /// Where the JSON document goes: the stdout enclos was given, kept while
 /// its descriptor 1 points at stderr.
@@ -83,9 +90,11 @@ pub fn output() -> Output {
 /// of the stdout enclos was given, and points descriptor 1 at stderr, so
 /// that what any program enclos starts prints, such as an installer's
 /// progress or an editor, goes there, and so does a `println!` of enclos's
-/// own; no program enclos starts holds the copy. A stdout that is closed is
-/// a document that cannot be written. Any other failure is said, and the
-/// document stays on descriptor 1, with whatever else is printed there.
+/// own; no program enclos starts holds the copy. When that cannot be done,
+/// it says so, and the document stays on descriptor 1, with whatever else is
+/// printed there. (A stdout that was closed is `/dev/null` by then: Rust
+/// reopens it so before `main`, so a document there is lost unsaid, as with
+/// `>/dev/null`.)
 pub fn keep_stdout_for_the_document() {
     let kept = rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 3).and_then(|kept| {
         rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
@@ -94,9 +103,6 @@ pub fn keep_stdout_for_the_document() {
     match kept {
         Ok(kept) => {
             let _ = DOCUMENT.set(Mutex::new(File::from(kept)));
-        }
-        Err(rustix::io::Errno::BADF) => {
-            let _ = WRITE_FAILED.set(std::io::Error::other("stdout is closed"));
         }
         Err(e) => note(&format!(
             "cannot keep stdout for the JSON document alone ({e}): what programs enclos runs print may go into it"
@@ -115,11 +121,11 @@ pub fn emit(value: &Value) {
     let first = !EMITTED.swap(true, Ordering::SeqCst);
     debug_assert!(first, "a command writes one JSON document");
     if !first {
-        // Two documents back to back are no JSON a reader takes: the
-        // second is refused, and the command fails.
-        let _ = WRITE_FAILED.set(std::io::Error::other(
-            "a second JSON document was refused: this is a bug of enclos",
-        ));
+        // Two documents back to back are no JSON a reader takes: a debug
+        // build panics above; a release refuses the second, and the command
+        // fails.
+        SECOND_REFUSED.store(true, Ordering::SeqCst);
+        keep_unsent(value);
         return;
     }
     if WRITE_FAILED.get().is_some() {
@@ -138,7 +144,25 @@ pub fn emit(value: &Value) {
     };
     if let Err(e) = written {
         let _ = WRITE_FAILED.set(e);
+        keep_unsent(value);
     }
+}
+
+/// Keeps what `value` says of a failure, for [`unsent_error`].
+fn keep_unsent(value: &Value) {
+    if let Some(message) = value["error"]["message"].as_str() {
+        let _ = UNSENT.set(message.to_owned());
+    }
+}
+
+/// What a document that could not be written said of a failure, if it did.
+pub fn unsent_error() -> Option<&'static str> {
+    UNSENT.get().map(String::as_str)
+}
+
+/// Whether a second document was refused.
+pub fn second_refused() -> bool {
+    SECOND_REFUSED.load(Ordering::SeqCst)
 }
 
 /// `value` as a document's text: indented, and escaped by [`for_terminal`].

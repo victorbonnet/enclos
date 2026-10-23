@@ -183,7 +183,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
     Ok(exit::OK)
 }
 
-/// A dry run's plan: one JSON document, or each change as `Would ….`.
 fn version_json(v: &PolicyVersion) -> Value {
     json!({
         "version": v.version,
@@ -525,11 +524,8 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
     }
     let (code, started) = match r.started.is_empty() {
         true => (exit::OK, Value::Null),
-        false => match super::sandbox::print_started(engine, sandbox, &r.started) {
-            Ok(started) => started,
-            Err(e) if output::json() => output::with_failure(json!({}), &e),
-            Err(e) => return Err(e),
-        },
+        // In JSON, a start that cannot be checked is said in its value.
+        false => super::sandbox::print_started(engine, sandbox, &r.started)?,
     };
     let code = code.max(stopped.as_ref().map_or(exit::OK, |(c, _)| *c));
     Ok((
@@ -785,8 +781,8 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         // is the file now, and keeping it would only open it again.
         Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
             let left = forget_edit(&files);
-            // In JSON, what was left goes with the error, as `edit_left`
-            // goes with a document.
+            // In JSON, what was left is said in the error's message, as
+            // `edit_left` says it in a document.
             if output::json() && !left.is_empty() {
                 return Err(Error::WithContext {
                     what: format!("{e}; {}", left.join("; ")),

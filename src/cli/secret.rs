@@ -111,7 +111,7 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
         what: format!("secret {secret} was not set: {why}"),
     };
     let bytes = if stdin.is_terminal() {
-        eprint!("Value of secret {secret} (not shown): ");
+        let _ = write!(std::io::stderr(), "Value of secret {secret} (not shown): ");
         let _ = std::io::stderr().flush();
         let quiet = Quiet::new(&stdin).map_err(io)?;
         let typed = typed(&mut std::iter::from_fn(|| {
@@ -129,7 +129,7 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
         let paste_open = matches!(typed, Ok((_, true)));
         let after = quiet.drain(paste_open);
         quiet.restore();
-        eprintln!();
+        let _ = writeln!(std::io::stderr());
         let (typed, _) = typed.map_err(io)?;
         let after = after.map_err(|e| {
             refused(&format!(
@@ -445,7 +445,8 @@ impl<'a> Quiet<'a> {
         if let Some(mut tty) = self.tty.take()
             && let Err(e) = tty.write_all(b"\x1b[?2004l")
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "\nwarning: cannot turn the terminal's bracketed paste back off ({e}); run `printf '\\e[?2004l'`"
             );
         }
@@ -456,7 +457,10 @@ impl<'a> Quiet<'a> {
                 &before,
             )
         {
-            eprintln!("\nwarning: cannot turn the terminal's echo back on ({e}); run `stty sane`");
+            let _ = writeln!(
+                std::io::stderr(),
+                "\nwarning: cannot turn the terminal's echo back on ({e}); run `stty sane`"
+            );
         }
     }
 }

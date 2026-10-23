@@ -112,9 +112,9 @@ fn failed(what: String) -> Error {
     Error::Session { what }
 }
 
-/// The most bytes of one line held before it is shown, its newline
-/// included: a service that never ends a line cannot make `enclos logs`
-/// hold all it wrote.
+/// The most bytes of one line, before its line ending, held before it is
+/// shown: a service that never ends a line cannot make `enclos logs` hold
+/// all it wrote.
 const MAX_LINE: u64 = 64 * 1024;
 
 /// Which side of `show_escaped` failed.
@@ -157,8 +157,9 @@ fn show_lines(from: impl Read, to: &mut impl Write, json: bool) -> std::result::
         }
         let ended = line.ends_with(b"\n");
         // Full before its end: a line exactly as long as the limit is whole
-        // when its end (`\n` or `\r\n`) comes next, or when the logs end
-        // there; else it is cut, between characters.
+        // when its end (`\n` or `\r\n`) comes next in what was read, or
+        // when the logs end there; else it is cut, between characters (a
+        // `\r\n` split across two reads gives a last, empty piece).
         let cut = !ended && line.len() as u64 == MAX_LINE && {
             let next = from.fill_buf().map_err(Failed::Read)?;
             let end: &[u8] = match next {
