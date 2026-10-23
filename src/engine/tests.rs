@@ -756,7 +756,7 @@ mod sandbox {
         let first = SandboxRecord {
             name: "lab".parse().unwrap(),
             backend: BackendKind::Seatbelt,
-            template: "assistant".parse().unwrap(),
+            created_from: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
             runtime: None,
@@ -1088,6 +1088,33 @@ mod sandbox {
         assert!(!engine.layout.sandbox_dir("lab").exists());
     }
 
+    /// A dry run says a `policy.toml` kept in the sandbox's folder is
+    /// written again, and refuses one the create could not read.
+    #[test]
+    fn a_dry_run_create_says_what_it_does_with_a_kept_folder() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine.layout.create_sandbox_dirs("lab").unwrap();
+        engine.layout.write_policy("lab", "# kept\n").unwrap();
+        let Planned::DryRun(plan) = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("expected a plan")
+        };
+        assert!(
+            plan.changes[1]
+                .starts_with("write its policy.toml again from the `assistant` template"),
+            "{plan:?}"
+        );
+        assert_eq!(engine.layout.read_policy("lab").unwrap(), "# kept\n");
+        let file = engine.layout.policy_file("lab");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap_err();
+    }
+
     /// `sandbox list` and `show` name the template the active policy is
     /// built on, once `policy.toml` names another than the sandbox was
     /// created from.
@@ -1104,7 +1131,7 @@ mod sandbox {
                 .unwrap(),
         );
         let view = engine.show_sandbox(&name).unwrap();
-        assert_eq!(view.record.template.as_str(), "assistant");
+        assert_eq!(view.record.created_from.as_str(), "assistant");
         assert_eq!(view.template.as_str(), "minimal");
         assert_eq!(
             engine.list_sandboxes().unwrap()[0].template.as_str(),
@@ -1267,7 +1294,7 @@ mod sandbox {
         let lab = SandboxRecord {
             name: "lab".parse().unwrap(),
             backend: BackendKind::Seatbelt,
-            template: "assistant".parse().unwrap(),
+            created_from: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
             runtime: None,
@@ -1297,7 +1324,7 @@ mod sandbox {
         let work = SandboxRecord {
             name: "work".parse().unwrap(),
             backend: BackendKind::Bubblewrap,
-            template: "coding".parse().unwrap(),
+            created_from: "coding".parse().unwrap(),
             ..lab.clone()
         };
         engine

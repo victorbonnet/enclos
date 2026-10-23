@@ -253,6 +253,28 @@ impl Engine {
     ) -> Result<PolicySnapshot> {
         let backend = self.recorded_backend(name)?;
         self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
+            .map_err(|error| self.with_active_template(name, error))
+    }
+
+    /// A `policy.toml` that names no template, said with the one the active
+    /// policy is built on: picking another, such as the default, could open
+    /// what the sandbox's template closed.
+    fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
+        if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
+            return error;
+        }
+        match self.state.active_policy(name) {
+            Ok(Some((_, active))) => {
+                let template = &active.inputs.template;
+                Error::WithContext {
+                    what: format!(
+                        "{error}; its active policy is built on `{template}`, which `extends = \"{template}\"` keeps"
+                    ),
+                    error: Box::new(error),
+                }
+            }
+            _ => error,
+        }
     }
 
     pub(super) fn checked_policy_with(

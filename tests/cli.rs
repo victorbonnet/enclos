@@ -2592,6 +2592,35 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
     }
 }
 
+/// Once `policy.toml` names another template, `sandbox list` and `show` name
+/// the one the active policy is built on, not the one the sandbox was
+/// created from.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_is_listed_and_shown_with_its_active_template() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "lab"]).ok();
+    let mut edit = home.command(&["policy", "edit", "lab"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "sed -i \x27\x27 \x27s/^extends = \"assistant\"$/extends = \"minimal\"/\x27 \"$1\"",
+        ),
+    );
+    Run(edit.output().unwrap()).ok();
+    let listed = home.run(&["sandbox", "list"]).ok().stdout();
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("lab ") && l.contains(" minimal ")),
+        "{listed}"
+    );
+    let shown = home.run(&["sandbox", "show", "lab"]).ok().stdout();
+    assert!(shown.contains(", template minimal, "), "{shown}");
+}
+
 /// `--help` names every template; on macOS, where the backend runs and so
 /// the template is the first thing refused, one this enclos does not ship
 /// is refused with the ones it has, and leaves no folder.
