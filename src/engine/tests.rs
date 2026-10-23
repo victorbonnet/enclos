@@ -548,7 +548,9 @@ mod compile {
         }
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
-        let inputs = engine.probe_inputs(&name, &ctx, None, None).unwrap();
+        let inputs = engine
+            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
         assert_eq!(
@@ -645,6 +647,7 @@ mod compile {
             env: Vec::new(),
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let ctx = engine.sandbox_context(&name, 41001);
         let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
@@ -3614,6 +3617,54 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
+    /// A runtime whose gateway records its open-file limit, and whether a
+    /// variable of enclos's own environment reached it.
+    #[cfg(target_os = "macos")]
+    const RECORDS_LIMITS: &str = "#!/bin/sh
+mkdir -p \"$HOME/.local/bin\"
+cat > \"$HOME/.local/bin/hermes\" <<'STUB'
+#!/bin/sh
+[ \"$3\" = gateway ] || exit 0
+printf '%s %s' \"$(ulimit -Hn)\" \"${CARGO_MANIFEST_DIR:-absent}\" > \"$HOME/gateway-limits\"
+STUB
+chmod 700 \"$HOME/.local/bin/hermes\"
+";
+
+    /// A service and a session start under the policy's limits, and only
+    /// the sandbox's variables reach them through the shell that sets them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_service_and_a_session_run_under_the_policys_limits() {
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lab = Lab::new();
+        assert!(done(lab.install(RECORDS_LIMITS, Confirm::Yes).unwrap()).installed);
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!("{before}\n[resources]\nopen_files = 64\n");
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+        let ended = std::sync::atomic::AtomicBool::new(false);
+        let end = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert_eq!(end.exit, 0, "{end:?}");
+        let seen = std::fs::read_to_string(lab.home.join("gateway-limits")).unwrap();
+        assert_eq!(seen, "64 absent");
+        let records = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s %s' \"$(ulimit -Hn)\" \"${CARGO_MANIFEST_DIR:-absent}\" > \"$HOME/session-limits\"".into(),
+        ];
+        done(
+            lab.engine
+                .connect(&alice(), &lab.name, records, Confirm::Yes)
+                .unwrap(),
+        );
+        let seen = std::fs::read_to_string(lab.home.join("session-limits")).unwrap();
+        assert_eq!(seen, "64 absent");
+    }
+
     /// A runtime whose gateway records the secret it was given as $TOKEN.
     #[cfg(target_os = "macos")]
     const RECORDS_TOKEN: &str = "#!/bin/sh
@@ -4534,6 +4585,29 @@ mod services {
         assert_eq!(said, ["waiting for the gateway of sandbox home to listen…"]);
         assert_eq!(fake.started.borrow().len(), installed);
         assert_eq!(fake.stopped.borrow().len(), stopped);
+    }
+
+    /// A limit no program could start under refuses the start before any
+    /// service is removed or installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_under_a_limit_no_program_could_run_under_installs_nothing() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        let most = crate::backend::max_files_per_process().unwrap();
+        if most >= 1 << 20 {
+            return;
+        }
+        let before = engine.layout.read_policy(name.as_str()).unwrap();
+        let after = format!("{before}\n[resources]\nopen_files = {}\n", most + 1);
+        done(
+            engine
+                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+                .unwrap(),
+        );
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(err.to_string().contains("kern.maxfilesperproc"), "{err}");
+        assert!(fake.started.borrow().is_empty());
+        assert!(fake.stopped.borrow().is_empty());
     }
 
     /// A sandbox started before its runtime was installed: its proxy

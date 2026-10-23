@@ -251,6 +251,9 @@ pub struct ProbeInputs {
     /// failed), and then that probe is not run. A dry run on macOS gets a
     /// placeholder, only to count it.
     pub keychain_item: Result<KeychainItem, String>,
+    /// The limits the sandbox's processes run under, each of which gets a
+    /// probe.
+    pub limits: crate::backend::LaunchLimits,
 }
 
 /// A path as one shell word.
@@ -776,6 +779,18 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
+    // Each limit a backend sets, as a process sees it, hard: closed when it
+    // is no higher than the policy's (a hard limit no process without root
+    // can raise). The control, the same check on the host, passes when the
+    // host's own hard limit is higher than the policy's, or unlimited. A
+    // value that does not read as a number is no proof: it reads open.
+    if let Some(limit) = i.limits.open_files() {
+        list.push(same_outside(
+            "resources",
+            format!("have a hard limit above {limit} open files"),
+            &limit_script("-Hn", limit),
+        ));
+    }
     if let Ok(item) = &i.keychain_item {
         // Through `security` and the security daemon, as a program in the
         // sandbox would read a secret: closed when the value does not come
@@ -871,6 +886,14 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
         absent.push(format!("keychain items ({why})"));
     }
     absent
+}
+
+/// The script of a limit's probe: it succeeds, open, when the limit
+/// `ulimit {flag}` reads is above `limit`, unlimited, or not a number.
+pub(crate) fn limit_script(flag: &str, limit: u64) -> String {
+    format!(
+        "v=$(ulimit {flag}); case \"$v\" in unlimited) exit 0 ;; ''|*[!0-9]*) echo \"unreadable limit: $v\"; exit 0 ;; esac; test \"$v\" -gt {limit}"
+    )
 }
 
 /// The probes that could act on the host if a rule did not hold: CI and VMs
@@ -1124,6 +1147,7 @@ mod tests {
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
             keychain_item: Err("no test item".into()),
+            limits: Default::default(),
         }
     }
 
@@ -1499,6 +1523,30 @@ mod tests {
                 "{route} is missing from {NOT_PROBED:?}"
             );
         }
+    }
+
+    #[test]
+    fn each_limit_set_is_probed_as_a_hard_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = inputs(dir.path());
+        assert!(!probes(&i).iter().any(|p| p.route == "resources"));
+        i.limits = crate::backend::LaunchLimits::of_checked(&crate::model::policy::Resources {
+            open_files: Some(256),
+            ..Default::default()
+        });
+        let list = probes(&i);
+        let limits: Vec<(&str, &str)> = list
+            .iter()
+            .filter(|p| p.route == "resources")
+            .map(|p| (p.name.as_str(), p.script.as_str()))
+            .collect();
+        assert_eq!(
+            limits,
+            [(
+                "have a hard limit above 256 open files",
+                limit_script("-Hn", 256).as_str()
+            )]
+        );
     }
 
     #[test]

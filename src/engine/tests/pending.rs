@@ -906,3 +906,51 @@ fn what_allow_lists_is_what_goes_in_force_when_the_file_no_longer_waits() {
         .unwrap_err();
     assert!(err.to_string().contains("allow b.example.com"), "{err}");
 }
+
+/// A change of limits, made while a session runs, waits as the pending
+/// policy: the active policy keeps the limits it had, and a session started
+/// meanwhile runs under those.
+#[test]
+fn a_change_of_limits_while_a_session_runs_waits_for_the_restart() {
+    let (_dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = format!("{before}\n[resources]\nopen_files = 64\n");
+    make_pending(&engine, &name, &before, &after);
+    let view = engine.policy(&name).unwrap();
+    let (_, pending) = view.pending.as_ref().expect("pending");
+    assert_eq!(pending.policy.resources.open_files, Some(64));
+    assert!(view.snapshot.policy.resources.is_unset(), "{view:?}");
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let (_, active) = engine.active_policy(&name).unwrap();
+    let next = engine.launch_limits(&record, &active.policy).unwrap();
+    assert_eq!(next, crate::backend::LaunchLimits::default());
+}
+
+/// A limit the backend cannot enforce never reaches a program, even one
+/// stored without the checks a stored policy passes: the limits are
+/// checked again where a program is launched.
+#[test]
+fn a_stored_limit_the_backend_cannot_enforce_is_refused_at_launch() {
+    let (_dir, engine, name) = with_sandbox();
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let (_, active) = engine.active_policy(&name).unwrap();
+    for (set, why) in [
+        (
+            (|r: &mut crate::model::policy::Resources| r.cpu_seconds = Some(60))
+                as fn(&mut crate::model::policy::Resources),
+            "SIGXCPU",
+        ),
+        (
+            |r: &mut crate::model::policy::Resources| {
+                r.file_size = Some(crate::model::policy::ByteSize(1 << 20))
+            },
+            "append",
+        ),
+    ] {
+        let mut policy = active.policy.clone();
+        set(&mut policy.resources);
+        let err = engine.launch_limits(&record, &policy).unwrap_err();
+        assert!(err.to_string().contains(why), "{why}: {err}");
+    }
+}
