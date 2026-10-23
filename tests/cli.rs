@@ -2400,10 +2400,11 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
 }
 
-/// A `[resources]` section holds a sandbox's sessions to its limits: in
-/// them `ulimit` shows each, a process past its CPU time is stopped, the
-/// open-file limit cannot be raised, and `policy test` shows each closed; a
-/// limit Seatbelt cannot enforce as written is refused.
+/// A `[resources]` section holds a sandbox's sessions to its open-file
+/// limit: in them `ulimit` shows it, a process cannot open more or raise
+/// it, `policy test` shows it closed, and one enclos itself cannot set stops
+/// the session with why. A limit Seatbelt cannot enforce as written is
+/// refused, and nothing is stored.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_runs_under_the_limits_its_policy_sets() {
@@ -2420,24 +2421,51 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
             "EDITOR",
             editor(
                 &home,
-                &format!("printf '\\n[resources]\\n{lines}\\n' >> \"$1\""),
+                &format!("printf '\n[resources]\n{lines}\n' >> \"$1\""),
             ),
         );
         Run(edit.output().unwrap())
     };
-    // Refused, with why; `policy edit` keeps the refused file, so the
-    // template's is put back each time.
+    let versions = || {
+        let history = home.run(&["policy", "history", "home"]).ok().stdout();
+        history
+            .lines()
+            .filter(|l| l.trim_start().starts_with('v'))
+            .count()
+    };
+    // Refused, with why, and nothing stored; `policy edit` keeps the
+    // refused file, so the file as created is put back each time.
+    let before = versions();
     for (line, why) in [
-        ("memory = \\\"2G\\\"", "memory"),
-        ("file_size = \\\"1M\\\"", "append"),
+        ("memory = \"2G\"", "cannot enforce a memory limit"),
+        ("file_size = \"1M\"", "append"),
+        ("cpu_seconds = 600", "SIGXCPU"),
     ] {
         let out = edit(line);
-        assert_eq!(out.code(), 2, "{}", out.stderr());
-        assert!(out.stderr().contains(why), "{}", out.stderr());
+        assert_eq!(out.code(), 2, "{line}: {}", out.stderr());
+        assert!(out.stderr().contains(why), "{line}: {}", out.stderr());
         home.run(&["policy", "discard", "home"]);
         std::fs::write(&policy, &clean).unwrap();
+        assert_eq!(versions(), before, "{line}");
     }
-    let out = edit("open_files = 64\\ncpu_seconds = 600");
+    // Refused by any command that stores the policy, not only `edit`.
+    std::fs::write(&policy, format!("{clean}\n[resources]\nmemory = \"2G\"\n")).unwrap();
+    let out = home.run(&["policy", "allow", "home", "x.example.com", "--yes"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert_eq!(versions(), before);
+    std::fs::write(&policy, &clean).unwrap();
+
+    // The least a session starts with.
+    let out = edit("open_files = 16");
+    out.ok();
+    home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
+    std::fs::write(&policy, &clean).unwrap();
+    let mut back = home.command(&["policy", "edit", "home"]);
+    back.env_remove("VISUAL")
+        .env("EDITOR", editor(&home, "true"));
+    Run(back.output().unwrap()).ok();
+
+    let out = edit("open_files = 64");
     assert!(
         out.ok()
             .stdout()
@@ -2445,17 +2473,19 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
         "{}",
         out.stdout()
     );
-
-    let out = home.run(&[
-        "exec",
-        "home",
-        "--",
-        "/bin/sh",
-        "-c",
-        "ulimit -Hn; ulimit -Ht",
-    ]);
-    assert_eq!(out.ok().stdout(), "64\n600\n");
-    // No process can raise a limit.
+    let shown = home.run(&["policy", "show", "home"]).ok().stdout();
+    assert!(shown.contains("  open files: 64"), "{shown}");
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "ulimit -Hn"]);
+    assert_eq!(out.ok().stdout(), "64\n");
+    // No process opens more, or raises the limit.
+    let opens = "my @f; for my $n (1..100) { open(my $f, '<', '/dev/null') or die \"refused at $n: $!\\n\"; push @f, $f }";
+    let out = home.run(&["exec", "home", "--", "/usr/bin/perl", "-e", opens]);
+    assert_ne!(out.code(), 0, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("Too many open files"),
+        "{}",
+        out.stderr()
+    );
     let out = home.run(&[
         "exec",
         "home",
@@ -2470,31 +2500,29 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
 
     let out = home.run(&["policy", "test", "home"]);
     let report = out.stdout();
-    for probe in [
-        "have a hard limit above 64 open files",
-        "have a hard limit above 600 s of CPU",
-    ] {
-        assert!(
-            report
-                .lines()
-                .any(|l| l.trim_start().starts_with("closed ") && l.contains(probe)),
-            "{probe} is not shown closed:\n{report}"
-        );
-    }
-
-    // Past its CPU time, a process is stopped: a second of it here.
-    let mut edit = home.command(&["policy", "edit", "home"]);
-    edit.env_remove("VISUAL").env(
-        "EDITOR",
-        editor(
-            &home,
-            "sed -i '' 's/cpu_seconds = 600/cpu_seconds = 1/' \"$1\"",
-        ),
+    assert!(
+        report.lines().any(|l| l.trim_start().starts_with("closed ")
+            && l.contains("have a hard limit above 64 open files")),
+        "not shown closed:\n{report}"
     );
-    Run(edit.output().unwrap()).ok();
-    let started = std::time::Instant::now();
-    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "while :; do :; done"]);
-    // SIGXCPU, as a shell reports it: 128 + 24.
-    assert_eq!(out.code(), 152, "{}", out.stderr());
-    assert!(started.elapsed() < Duration::from_secs(20));
+
+    // A limit above the hard one enclos runs under stops the session, with
+    // the field named, and runs nothing.
+    let out = Run(Command::new("/bin/bash")
+        .arg("-c")
+        .arg("ulimit -n 32 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_enclos"))
+        .args(["exec", "home", "--", "/bin/echo", "ran"])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert!(!out.stdout().contains("ran"));
+    assert!(
+        out.stderr()
+            .contains("resources.open_files = 64 is above the hard limit enclos runs under (32)"),
+        "{}",
+        out.stderr()
+    );
 }

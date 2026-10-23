@@ -908,7 +908,8 @@ fn what_allow_lists_is_what_goes_in_force_when_the_file_no_longer_waits() {
 }
 
 /// A change of limits, made while a session runs, waits as the pending
-/// policy: the session keeps the limits it started with.
+/// policy: the active policy keeps the limits it had, and a session started
+/// meanwhile runs under those.
 #[test]
 fn a_change_of_limits_while_a_session_runs_waits_for_the_restart() {
     let (_dir, engine, name) = with_sandbox();
@@ -920,4 +921,8 @@ fn a_change_of_limits_while_a_session_runs_waits_for_the_restart() {
     let (_, pending) = view.pending.as_ref().expect("pending");
     assert_eq!(pending.policy.resources.open_files, Some(64));
     assert!(view.snapshot.policy.resources.is_unset(), "{view:?}");
+    let record = engine.state.get(&name).unwrap().unwrap();
+    let (_, active) = engine.active_policy(&name).unwrap();
+    let next = engine.launch_limits(&record, &active.policy).unwrap();
+    assert!(next.is_unset(), "{next:?}");
 }

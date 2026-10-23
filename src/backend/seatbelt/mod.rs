@@ -46,7 +46,7 @@ impl Backend for Seatbelt {
             network: Enforcement::Enforced,
             exec: Enforcement::Unsupported,
             resources: Enforcement::Partial {
-                note: "per process: open files and CPU time; no memory, file size or CPU share"
+                note: "per process: open files; no CPU time, memory, file size or CPU share"
                     .to_owned(),
             },
             members: Enforcement::Partial {
