@@ -980,7 +980,9 @@ fn the_sandbox_signals_its_own_processes() {
     assert!(w.sh("/bin/sleep 30 & p=$!; /bin/kill $p; wait $p; [ $? -eq 143 ]"));
     // A group the sandboxed process itself made, as a shell's job control
     // makes one for each job.
-    let group = r#"my $p = fork; if (!$p) { setpgrp(0, 0); sleep 30; exit } sleep 1; kill "TERM", -$p; waitpid($p, 0); exit($? == 15 ? 0 : 1)"#;
+    // Both sides make the group, so it is there before the signal, however
+    // the two are scheduled.
+    let group = r#"my $p = fork; if (!$p) { setpgrp(0, 0); sleep 30; exit } setpgrp($p, $p); kill "TERM", -$p; waitpid($p, 0); exit($? == 15 ? 0 : 1)"#;
     assert!(w.sh(&format!("/usr/bin/perl -e '{group}'")));
 }
 
@@ -992,6 +994,12 @@ fn the_sandbox_signals_its_own_processes() {
 #[test]
 fn the_host_services_close_on_the_baseline_and_on_the_rules() {
     if std::env::var("ENCLOS_HOST_SERVICE_PROBES").as_deref() != Ok("1") {
+        // CI runs them: a workflow that lost the variable must not pass.
+        assert_ne!(
+            std::env::var("GITHUB_ACTIONS").as_deref(),
+            Ok("true"),
+            "CI runs the host-service probes: ENCLOS_HOST_SERVICE_PROBES=1 is missing"
+        );
         eprintln!("host-service probes not run: set ENCLOS_HOST_SERVICE_PROBES=1 (CI does)");
         return;
     }
@@ -1089,7 +1097,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
         function run(argv) {
             try { $.sandbox_extension_consume($.sandbox_extension_issue_file('com.apple.sandbox.pty', argv[0], 0)) } catch (e) {}
         }";
-    // The marker first: a profile `sandbox-exec` refused, or no
+    // The marker first: a compiled policy `sandbox-exec` refused, or no
     // `osascript`, is then not taken for the route closed.
     let script = r#"echo enclos-ran; /usr/bin/osascript -l JavaScript -e "$1" "$2" >/dev/null 2>&1; : < "$2""#;
     let run = |compiled: &Path| {

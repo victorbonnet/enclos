@@ -264,7 +264,7 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "verdict": verdict(sandbox, report),
         "probes": report.results.iter().map(|r| {
             let (outcome, why) = match &r.outcome {
-                Outcome::Closed => ("closed", None),
+                Outcome::Closed => ("closed", r.closed_by.map(|by| by.why().to_owned())),
                 Outcome::Open(why) => ("open", Some(why.clone())),
                 Outcome::Inconclusive(why) => ("inconclusive", Some(why.clone())),
                 Outcome::NotRun(why) => ("not_run", Some(why.clone())),
@@ -274,7 +274,10 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
                 "name": r.name,
                 "outcome": outcome,
                 "why": why,
-                "closed_by": r.closed_by.map(enclos::probes::ClosedBy::why),
+                "closed_by": r.closed_by.map(|by| match by {
+                    enclos::probes::ClosedBy::Seatbelt => "seatbelt",
+                    enclos::probes::ClosedBy::Baseline => "baseline",
+                }),
             })
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,

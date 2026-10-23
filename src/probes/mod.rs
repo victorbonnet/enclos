@@ -22,10 +22,9 @@
 //! says: it refuses to run setuid programs such as `crontab` and `at`, even
 //! under a bare `(allow default)`. Others are closed under `(deny default)`
 //! by the baseline before the rule they test is reached: LaunchServices and
-//! Apple Events, whose lookups the baseline refuses. Those probes carry a
-//! note saying so ([`ClosedBy`]), which the report repeats, so that their
-//! being closed is not read as proof of a rule enclos
-//! adds.
+//! Apple Events at least, whose lookups the baseline refuses. Those probes
+//! carry a note saying so ([`ClosedBy`]), which the report repeats, so that
+//! their being closed is not read as proof of the route's own rule.
 //!
 //! The probes of [`probes`] are harmless even when a rule does not hold. The
 //! ones of [`host_service_probes`] could act on the host if they succeeded
@@ -105,7 +104,7 @@ impl ClosedBy {
 }
 
 /// Under `(deny default)`, the baseline refuses the lookup first.
-const LOOKUP_REFUSED: &str = "the (deny default) baseline refuses the lookup first; the policy's own rule is shown on (allow default)";
+const LOOKUP_REFUSED: &str = "the (deny default) baseline refuses the lookup first; the policy's own rule is shown only by a run on (allow default)";
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
 /// module makes one, and each is harmless whatever the policy says.
@@ -161,7 +160,7 @@ pub struct Probe {
     pub script: String,
     pub proof: Proof,
     pub host: Option<HostCheck>,
-    /// What closes the route when the rule it tests does not: Seatbelt
+    /// What closes the route before the rule it tests is reached: Seatbelt
     /// itself, or the baseline.
     pub closed_by: Option<ClosedBy>,
 }
@@ -1170,10 +1169,12 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         Expect::AppleEventBlocked(_) if succeeded => {
             Outcome::Open(format!("Finder answered: {}", last_line(output)))
         }
-        Expect::AppleEventBlocked(_) if output.contains("(-1743)") => Outcome::Open(
+        // What shows the event left is matched loosely, what shows it did not
+        // strictly.
+        Expect::AppleEventBlocked(_) if output.contains("-1743") => Outcome::Open(
             "the event reached macOS's privacy check (TCC refused it, -1743), so Seatbelt did not block it".into(),
         ),
-        Expect::AppleEventBlocked(_) if output.contains("(-1712)") => Outcome::Open(
+        Expect::AppleEventBlocked(_) if output.contains("-1712") => Outcome::Open(
             "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
         ),
         Expect::AppleEventBlocked(refusals) if refusals.iter().any(|r| output.contains(r)) => {

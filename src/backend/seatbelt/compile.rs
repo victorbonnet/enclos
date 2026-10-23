@@ -27,7 +27,7 @@ pub(super) const DENY_DEFAULT: &str = include_str!("deny-default.sb");
 
 /// The variable that compiles a policy from `(allow default)` instead, as
 /// before ADR 0006 was accepted: `allow-default`. Only so tests can compare
-/// the two baselines, not a setting: see [`Baseline::from_env`].
+/// the two baselines, not a setting: see [`Baseline::parse`].
 pub const BASELINE_VAR: &str = "ENCLOS_SEATBELT_BASELINE";
 
 /// What a compiled policy does with an operation none of its rules names
@@ -42,26 +42,56 @@ pub enum Baseline {
 }
 
 impl Baseline {
-    /// What [`BASELINE_VAR`] asks for. Unset is `(deny default)`, and
-    /// `deny-default` or `allow-default` names one; any other value is an
-    /// error, so a mistyped one is taken for neither. Only a build with
-    /// debug assertions, as tests run, takes `allow-default`: a release
-    /// refuses it. A service never runs on it: `enclos launch` refuses to
-    /// start one while it is asked for.
+    /// What [`BASELINE_VAR`] asks for: [`Baseline::parse`] of its value, in
+    /// a build with debug assertions or not. A service never runs on
+    /// `allow-default`: `enclos launch` refuses to start one while anything
+    /// but `deny-default` is asked for.
     pub fn from_env() -> Result<Baseline, String> {
-        match std::env::var(BASELINE_VAR) {
+        Baseline::parse(std::env::var(BASELINE_VAR), cfg!(debug_assertions))
+    }
+
+    /// The baseline `value` asks for. Unset is `(deny default)`, and
+    /// `deny-default` or `allow-default` names one; any other value is an
+    /// error, so a mistyped one is taken for neither. Only a debug build
+    /// (`debug`, as `cargo build` and `cargo test` make) takes
+    /// `allow-default`: a release refuses it.
+    pub fn parse(
+        value: Result<String, std::env::VarError>,
+        debug: bool,
+    ) -> Result<Baseline, String> {
+        let takes = "it takes `deny-default` or `allow-default`, or is unset";
+        match value {
             Err(std::env::VarError::NotPresent) => Ok(Baseline::DenyDefault),
             Ok(v) if v == "deny-default" => Ok(Baseline::DenyDefault),
-            Ok(v) if v == "allow-default" && cfg!(debug_assertions) => Ok(Baseline::AllowDefault),
+            Ok(v) if v == "allow-default" && debug => Ok(Baseline::AllowDefault),
             Ok(v) if v == "allow-default" => Err(format!(
-                "{BASELINE_VAR}=allow-default is only for comparing the baselines in a test build of enclos; unset it"
+                "{BASELINE_VAR}=allow-default is only for comparing the baselines in a debug build of enclos, never a release; unset it"
             )),
-            Ok(v) => Err(format!(
-                "{BASELINE_VAR} is {v:?}: it takes `deny-default` or `allow-default`, or is unset"
-            )),
-            Err(std::env::VarError::NotUnicode(v)) => Err(format!(
-                "{BASELINE_VAR} is {v:?}: it takes `deny-default` or `allow-default`, or is unset"
-            )),
+            Ok(v) => Err(format!("{BASELINE_VAR} is {v:?}: {takes}")),
+            Err(std::env::VarError::NotUnicode(v)) => {
+                Err(format!("{BASELINE_VAR} is {v:?}: {takes}"))
+            }
+        }
+    }
+
+    /// The baseline a compiled policy's text is on, as [`compile`] writes it:
+    /// its third line, after the header comment and `(version 1)`, which no
+    /// path in the policy can reach. None for a text it did not write.
+    pub fn of_compiled(text: &str) -> Option<Baseline> {
+        let mut lines = text.lines();
+        match (lines.next(), lines.next(), lines.next()) {
+            (Some(c), Some("(version 1)"), Some(b))
+                if c.starts_with(";; enclos compiled policy") =>
+            {
+                match b {
+                    "(allow default)" => Some(Baseline::AllowDefault),
+                    b if b.starts_with("(deny default (with message \"enclos:") => {
+                        Some(Baseline::DenyDefault)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 }
@@ -733,6 +763,17 @@ mod tests {
         let allowed = global_names(DENY_DEFAULT);
         let denied = global_names(HOST_SERVICES);
         assert_eq!(allowed.len(), 8);
+        // The probes count what a refused lookup makes `open` and
+        // `osascript` say as closed on this baseline: none of the services
+        // they look up may be allowed.
+        for needed in [
+            "com.apple.coreservices.launchservicesd",
+            "com.apple.lsd.mapdb",
+            "com.apple.lsd.modifydb",
+            "com.apple.coreservices.appleevents",
+        ] {
+            assert!(!allowed.contains(&needed), "{needed} is allowed");
+        }
         assert!(!denied.is_empty());
         assert!(
             allowed.iter().all(|name| !denied.contains(name)),
@@ -754,6 +795,57 @@ mod tests {
             .skip(1)
             .filter_map(|rest| rest.split('"').next())
             .collect()
+    }
+
+    /// What the variable asks for, in a debug build and in a release.
+    #[test]
+    fn the_baseline_is_one_of_two_values_and_allow_default_only_in_a_debug_build() {
+        use std::env::VarError;
+        let given = |v: &str| Ok(v.to_owned());
+        for debug in [true, false] {
+            assert_eq!(
+                Baseline::parse(Err(VarError::NotPresent), debug),
+                Ok(Baseline::DenyDefault)
+            );
+            assert_eq!(
+                Baseline::parse(given("deny-default"), debug),
+                Ok(Baseline::DenyDefault)
+            );
+            for bad in ["", "1", "Allow-Default", " allow-default", "allow_default"] {
+                let err = Baseline::parse(given(bad), debug).unwrap_err();
+                assert!(
+                    err.contains("it takes `deny-default` or `allow-default`"),
+                    "{bad:?}: {err}"
+                );
+            }
+            let not_text = Baseline::parse(
+                Err(VarError::NotUnicode(std::ffi::OsString::from("x"))),
+                debug,
+            );
+            assert!(not_text.is_err());
+        }
+        assert_eq!(
+            Baseline::parse(given("allow-default"), true),
+            Ok(Baseline::AllowDefault)
+        );
+        let release = Baseline::parse(given("allow-default"), false).unwrap_err();
+        assert!(release.contains("never a release"), "{release}");
+    }
+
+    /// A compiled text says its baseline on its third line, and only there:
+    /// a path holding the same words further down changes nothing.
+    #[test]
+    fn a_compiled_text_says_its_baseline() {
+        let base = Path::new("/nonexistent-enclos-test");
+        for baseline in [Baseline::DenyDefault, Baseline::AllowDefault] {
+            let text = compile(&policy(), &ctx(base), baseline).unwrap().text;
+            assert_eq!(Baseline::of_compiled(&text), Some(baseline));
+        }
+        assert_eq!(
+            Baseline::of_compiled("(version 1)\n(allow default)\n"),
+            None
+        );
+        assert_eq!(Baseline::of_compiled(""), None);
     }
 
     #[test]

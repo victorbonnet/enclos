@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use super::Engine;
 use super::session::marked_in;
+use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
 use crate::layout::LayoutError;
@@ -135,6 +136,10 @@ pub struct CompiledChange {
     /// was changed after it was written. Said whether or not it now matches
     /// what `version` compiles to.
     pub edited: bool,
+    /// `ran` is on the `(allow default)` comparison baseline (ADR 0006),
+    /// which a session of a debug build may have run under: a change of
+    /// baseline, not of enclos's rules.
+    pub ran_on_allow_default: bool,
     pub lines: Lines,
     pub running: Running,
 }
@@ -418,9 +423,12 @@ impl Engine {
         if same && !edited {
             return Ok(None);
         }
+        let ran_on_allow_default =
+            before.as_deref().and_then(Baseline::of_compiled) == Some(Baseline::AllowDefault);
         Ok(Some(Drift::Changed(CompiledChange {
             version,
             edited,
+            ran_on_allow_default,
             lines: match before {
                 Some(before) => lines_between(&before, &text),
                 None => Lines::FileGone,

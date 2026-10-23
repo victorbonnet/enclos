@@ -83,7 +83,8 @@ impl TestReport {
         self.count_closed(|r| r.closed_by == Some(ClosedBy::Seatbelt))
     }
 
-    /// Closed probes that show a rule enclos adds.
+    /// Closed probes that show something enclos adds: a rule of the route,
+    /// or the `(deny default)` baseline, which is part of what it compiles.
     pub fn closed_by_enclos(&self) -> usize {
         self.count_closed(|r| r.closed_by != Some(ClosedBy::Seatbelt))
     }
@@ -298,8 +299,16 @@ impl Engine {
                 path: compiled.clone(),
                 source,
             })?;
-            inputs.lookups_refused = text.contains("\n(deny default ");
-            let allow_default = text.lines().any(|l| l == "(allow default)");
+            let baseline = crate::backend::seatbelt::Baseline::of_compiled(&text).ok_or_else(
+                || Error::Session {
+                    what: format!(
+                        "{} names no baseline enclos writes: run `enclos policy test {name}` again",
+                        compiled.display()
+                    ),
+                },
+            )?;
+            inputs.lookups_refused = baseline == crate::backend::seatbelt::Baseline::DenyDefault;
+            let allow_default = !inputs.lookups_refused;
             inputs.keychain_item = keychain
                 .as_ref()
                 .map(|k| k.item.clone())
@@ -659,6 +668,26 @@ mod tests {
         let label = format!("org.enclos.probe.absent.{}", std::process::id());
         assert_eq!(present(&HostCheck::LaunchdJob(label.clone())), Ok(false));
         assert_eq!(present(&HostCheck::PreferencesDomain(label)), Ok(false));
+    }
+
+    /// What closed apart from a route's rule is said by who, and a route the
+    /// baseline closed still shows something enclos compiles.
+    #[test]
+    fn closures_apart_from_the_rules_are_said_by_who() {
+        let mut r = report(vec![Outcome::Closed; 4]);
+        r.results[0].closed_by = Some(ClosedBy::Seatbelt);
+        r.results[1].closed_by = Some(ClosedBy::Baseline);
+        r.results[2].closed_by = Some(ClosedBy::Baseline);
+        assert_eq!(
+            r.closed_apart(),
+            " (1 by Seatbelt itself, 2 by the (deny default) baseline)"
+        );
+        assert_eq!((r.closed_by_platform(), r.closed_by_baseline()), (1, 2));
+        assert_eq!(report(vec![Outcome::Closed]).closed_apart(), "");
+        let mut baseline_only = report(vec![Outcome::Closed]);
+        baseline_only.results[0].closed_by = Some(ClosedBy::Baseline);
+        assert!(baseline_only.passed());
+        assert_eq!(baseline_only.closed_by_enclos(), 1);
     }
 
     #[test]

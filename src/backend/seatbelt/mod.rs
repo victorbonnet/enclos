@@ -34,18 +34,15 @@ impl Seatbelt {
             baseline: Baseline::from_env(),
         }
     }
-
-    /// On `baseline`, whatever the environment says.
-    pub fn on(baseline: Baseline) -> Seatbelt {
-        Seatbelt {
-            baseline: Ok(baseline),
-        }
-    }
 }
 
+/// On `(deny default)`, whatever the environment says: the only other way
+/// to make one, and never on the comparison baseline.
 impl Default for Seatbelt {
     fn default() -> Seatbelt {
-        Seatbelt::on(Baseline::DenyDefault)
+        Seatbelt {
+            baseline: Ok(Baseline::DenyDefault),
+        }
     }
 }
 
@@ -69,6 +66,13 @@ impl Backend for Seatbelt {
         if !cfg!(target_os = "macos") {
             return Probe::Unavailable {
                 reason: "Seatbelt exists only on macOS".to_owned(),
+            };
+        }
+        // A baseline asked for that is neither: no policy compiles, so the
+        // backend is not usable here, and doctor says why.
+        if let Err(reason) = &self.baseline {
+            return Probe::Unavailable {
+                reason: reason.clone(),
             };
         }
         if !Path::new(wrap::SANDBOX_EXEC).exists() {

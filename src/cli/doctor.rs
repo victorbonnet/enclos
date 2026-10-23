@@ -9,6 +9,12 @@ use enclos::engine::{
 use enclos::error::{Result, exit};
 
 pub fn run(engine: &Engine) -> Result<u8> {
+    use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
+    if Baseline::from_env() == Ok(Baseline::AllowDefault) {
+        super::output::note(&format!(
+            "doctor compiles on the (allow default) comparison baseline, as {BASELINE_VAR} asks: what it compares below is against that baseline, not the one sandboxes run on"
+        ));
+    }
     let doctor = engine.doctor();
     let code = match doctor.has_problems() {
         true => exit::ERROR,
@@ -92,6 +98,7 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                         true => "edited",
                         false => "changed",
                     },
+                    "ran_on_allow_default": c.ran_on_allow_default,
                     "version": c.version,
                     "ran": super::output::path(&c.ran),
                     "now": super::output::path(&c.now),
@@ -165,7 +172,7 @@ pub fn shown(doctor: &Doctor) -> String {
 
 fn backend(b: &BackendCheck) -> String {
     let state = match &b.state {
-        BackendState::NotFound { reason } => format!("not on this host: {reason}"),
+        BackendState::NotFound { reason } => format!("not usable here: {reason}"),
         BackendState::Refuses { reason } => {
             format!("on this host, and it refused to run a program: {reason}")
         }
@@ -241,6 +248,12 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
             running
         }
         Drift::Changed(c) => {
+            if c.ran_on_allow_default {
+                out += &format!(
+                    "    {} is on the (allow default) comparison baseline (ADR 0006): a session of a debug build ran under it\n",
+                    c.ran.display()
+                );
+            }
             if c.edited {
                 out += &format!(
                     "    {} no longer holds what policy v{} compiled to: it was changed after it was written\n",
@@ -347,6 +360,7 @@ mod tests {
 
     fn change(edited: bool, lines: Lines, running: Running) -> Drift {
         Drift::Changed(CompiledChange {
+            ran_on_allow_default: false,
             version: 2,
             ran: PathBuf::from("/c/ran.sb"),
             now: PathBuf::from("/c/now.sb"),

@@ -11,7 +11,8 @@
 
 ;; Apple Events (osascript, scripting Terminal or any app). Shown: either rule
 ;; alone makes an event to Finder fail with -600 on (allow default). On (deny
-;; default) the baseline refuses the lookup of Finder first (-1728).
+;; default) the baseline first refuses a lookup `osascript` needs to find
+;; Finder (-1728).
 (deny appleevent-send (with message "{tag}"))
 (deny mach-lookup (with message "{tag}")
   (global-name "com.apple.coreservices.appleevents"))
@@ -23,9 +24,9 @@
 
 ;; cfprefsd writes ~/Library/Preferences for the caller, which the write rules
 ;; never see. Shown: without this rule `defaults write` reached the user's own
-;; preferences although HOME pointed elsewhere. Under (deny default) reads
-;; are refused too, as nothing allows them; this rule keeps writes closed
-;; whatever the baseline.
+;; preferences although HOME pointed elsewhere. Under (deny default)
+;; nothing allows `user-preference-read` or the cfprefsd lookups either (not
+;; probed); this rule keeps writes closed whatever the baseline.
 (deny user-preference-write (with message "{tag}"))
 
 ;; Synthetic keyboard and mouse events and the pasteboard. Shown: the lookups
