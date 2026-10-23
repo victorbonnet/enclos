@@ -53,8 +53,8 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route the `(deny default)` baseline closes before
-    /// the rule the probe tests is reached.
+    /// Closed probes whose route the `(deny default)` baseline closed, on a
+    /// lookup it refuses before the rule the probe tests is reached.
     pub fn closed_by_baseline(&self) -> usize {
         self.count_closed(|r| r.closed_by == Some(ClosedBy::Baseline))
     }
@@ -276,6 +276,21 @@ impl Engine {
                 name: name.to_string(),
             })?;
             let compiled = self.compile_policy(name, record.proxy_port)?;
+            // The baseline's refused lookups count as closed only on
+            // `(deny default)`, as the file compiled for these probes says.
+            // Read before anything is started for the probes.
+            let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
+                path: compiled.clone(),
+                source,
+            })?;
+            let baseline = crate::backend::seatbelt::Baseline::of_compiled(&text).ok_or_else(
+                || Error::Session {
+                    what: format!(
+                        "{} names no baseline enclos writes, though enclos just wrote it: a bug of enclos, or the file was edited meanwhile",
+                        compiled.display()
+                    ),
+                },
+            )?;
             // The limits the sandbox's processes run under, which the
             // resource probes show.
             let limits = self.active_policy(name)?.1.policy.resources;
@@ -293,20 +308,6 @@ impl Engine {
             let keychain = KeychainProbe::store(&self.layout, name);
             let mut inputs =
                 self.probe_inputs(name, &ctx, Some(target.0.id()), Some(terminal.path.clone()))?;
-            // The baseline's refused lookups count as closed only on
-            // `(deny default)`, as the file compiled for these probes says.
-            let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
-                path: compiled.clone(),
-                source,
-            })?;
-            let baseline = crate::backend::seatbelt::Baseline::of_compiled(&text).ok_or_else(
-                || Error::Session {
-                    what: format!(
-                        "{} names no baseline enclos writes: run `enclos policy test {name}` again",
-                        compiled.display()
-                    ),
-                },
-            )?;
             inputs.lookups_refused = baseline == crate::backend::seatbelt::Baseline::DenyDefault;
             let allow_default = !inputs.lookups_refused;
             inputs.keychain_item = keychain

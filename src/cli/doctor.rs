@@ -12,7 +12,7 @@ pub fn run(engine: &Engine) -> Result<u8> {
     use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
     if Baseline::from_env() == Ok(Baseline::AllowDefault) {
         super::output::note(&format!(
-            "doctor compiles on the (allow default) comparison baseline, as {BASELINE_VAR} asks: what it compares below is against that baseline, not the one sandboxes run on"
+            "doctor compiles on the (allow default) comparison baseline, as {BASELINE_VAR} asks: what it compares below is against that baseline, not (deny default), which services and release builds always use"
         ));
     }
     let doctor = engine.doctor();
@@ -250,7 +250,7 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
         Drift::Changed(c) => {
             if c.ran_on_allow_default {
                 out += &format!(
-                    "    {} is on the (allow default) comparison baseline (ADR 0006): a session of a debug build ran under it\n",
+                    "    {} is on the (allow default) comparison baseline (ADR 0006), which only a debug build compiles\n",
                     c.ran.display()
                 );
             }

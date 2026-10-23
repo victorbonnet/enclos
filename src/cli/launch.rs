@@ -31,7 +31,7 @@ pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
     };
     if let Some(why) = why {
         return Err(failed(format!(
-            "{why}: a service runs only on (deny default); unset it (`launchctl unsetenv {BASELINE_VAR}` for the service manager's environment)"
+            "{why}: a service runs only on (deny default) (`launchctl unsetenv {BASELINE_VAR}` unsets it in the service manager's environment)"
         )));
     }
     let end = engine.launch(by, &args.sandbox, &args.service)?;

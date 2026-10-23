@@ -50,8 +50,10 @@ pub struct BackendCheck {
     pub capabilities: Capabilities,
 }
 
-/// Whether a backend is on this host, as checked before every session, and
-/// then whether a program ran in it.
+/// Whether a backend can be used on this host, as checked before every
+/// session (`NotFound`, kept as the JSON's `not_found`, also covers a
+/// Seatbelt baseline asked for that is neither), and then whether a program
+/// ran in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendState {
     NotFound {
@@ -125,7 +127,8 @@ pub enum Drift {
 
 /// Policy version `version` compiled now, against the file `ran` a session
 /// ran under. A different text is enclos's own rules changed, as an upgrade
-/// changes them, or a path the policy names now resolving elsewhere.
+/// changes them, a path the policy names now resolving elsewhere, or a
+/// change of baseline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledChange {
     pub version: u32,
@@ -136,9 +139,9 @@ pub struct CompiledChange {
     /// was changed after it was written. Said whether or not it now matches
     /// what `version` compiles to.
     pub edited: bool,
-    /// `ran` is on the `(allow default)` comparison baseline (ADR 0006),
-    /// which a session of a debug build may have run under: a change of
-    /// baseline, not of enclos's rules.
+    /// `ran`, as enclos wrote it, is on the `(allow default)` comparison
+    /// baseline (ADR 0006), which only a debug build compiles: the drift then
+    /// includes that baseline, not only enclos's rules.
     pub ran_on_allow_default: bool,
     pub lines: Lines,
     pub running: Running,
@@ -423,8 +426,9 @@ impl Engine {
         if same && !edited {
             return Ok(None);
         }
-        let ran_on_allow_default =
-            before.as_deref().and_then(Baseline::of_compiled) == Some(Baseline::AllowDefault);
+        // Said only of a file as enclos wrote it: an edited one is said so.
+        let ran_on_allow_default = !edited
+            && before.as_deref().and_then(Baseline::of_compiled) == Some(Baseline::AllowDefault);
         Ok(Some(Drift::Changed(CompiledChange {
             version,
             edited,

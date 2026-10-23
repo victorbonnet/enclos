@@ -975,7 +975,9 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
             ),
         };
         let baseline = match report.allow_default {
-            true => " On the (allow default) comparison baseline, which no sandbox runs on.",
+            true => {
+                " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
+            }
             false => "",
         };
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
@@ -994,7 +996,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by an enclos rule, so the test showed nothing about the policy".to_owned());
+        why.push("no probe was shown closed by something enclos compiles, so the test showed nothing about the policy".to_owned());
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1058,7 +1060,7 @@ mod tests {
         );
         assert_eq!(
             verdict(&lab, &report(Outcome::Inconclusive("x".into()))),
-            "NOT READY: sandbox lab: no probe was shown closed by an enclos rule, so the test showed nothing about the policy."
+            "NOT READY: sandbox lab: no probe was shown closed by something enclos compiles, so the test showed nothing about the policy."
         );
     }
 

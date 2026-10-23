@@ -42,8 +42,8 @@ pub enum Baseline {
 }
 
 impl Baseline {
-    /// What [`BASELINE_VAR`] asks for: [`Baseline::parse`] of its value, in
-    /// a build with debug assertions or not. A service never runs on
+    /// What [`BASELINE_VAR`] asks for: [`Baseline::parse`] of its value,
+    /// with `debug` set to whether this build has debug assertions. A service never runs on
     /// `allow-default`: `enclos launch` refuses to start one while anything
     /// but `deny-default` is asked for.
     pub fn from_env() -> Result<Baseline, String> {
@@ -765,7 +765,8 @@ mod tests {
         assert_eq!(allowed.len(), 8);
         // The probes count what a refused lookup makes `open` and
         // `osascript` say as closed on this baseline: none of the services
-        // they look up may be allowed.
+        // they are known or thought to look up may be allowed (traced for
+        // launchservicesd, through Node; not for `open` and `osascript`).
         for needed in [
             "com.apple.coreservices.launchservicesd",
             "com.apple.lsd.mapdb",

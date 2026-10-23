@@ -104,7 +104,7 @@ impl ClosedBy {
 }
 
 /// Under `(deny default)`, the baseline refuses the lookup first.
-const LOOKUP_REFUSED: &str = "the (deny default) baseline refuses the lookup first; the policy's own rule is shown only by a run on (allow default)";
+const LOOKUP_REFUSED: &str = "on (deny default) a lookup the tool needs is refused before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes";
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
 /// module makes one, and each is harmless whatever the policy says.
@@ -160,8 +160,9 @@ pub struct Probe {
     pub script: String,
     pub proof: Proof,
     pub host: Option<HostCheck>,
-    /// What closes the route before the rule it tests is reached: Seatbelt
-    /// itself, or the baseline.
+    /// What closes the route apart from a rule of its own: Seatbelt itself
+    /// (no rule is tested), or the `(deny default)` baseline (before the
+    /// rule is reached).
     pub closed_by: Option<ClosedBy>,
 }
 
@@ -960,8 +961,10 @@ pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
     // A session with Finder, which LaunchServices and Apple Events need.
     let finder = "/usr/bin/pgrep -x Finder >/dev/null";
     let mut list = vec![
-        // `open <folder>` reports the rule's refusal (-54, design §5), or on
-        // `(deny default)` the baseline's refused lookup (-10661). Not `open
+        // `open <folder>` reports the rule's refusal (-54, design §5), and on
+        // `(deny default)` only the baseline's refused lookup (-10661), so a
+        // probe closed there is the baseline's: the rule's refusal there would
+        // mean the lookup was allowed, and reads inconclusive. Not `open
         // -R`: inside the sandbox it exits 0 although Finder reveals nothing,
         // so its exit code says nothing (ADR 0016).
         probe(
@@ -969,7 +972,7 @@ pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
             "open a folder through LaunchServices",
             "/usr/bin/open -g /System",
             Expect::FailsWith(match i.lookups_refused {
-                true => &[LS_REFUSED, LS_LOOKUP_REFUSED],
+                true => &[LS_LOOKUP_REFUSED],
                 false => &[LS_REFUSED],
             }),
             finder,
@@ -979,7 +982,7 @@ pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
             "send an Apple Event to Finder",
             "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
             Expect::AppleEventBlocked(match i.lookups_refused {
-                true => &[AE_REFUSED, AE_LOOKUP_REFUSED],
+                true => &[AE_LOOKUP_REFUSED],
                 false => &[AE_REFUSED],
             }),
             finder,
@@ -1953,8 +1956,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let list = all(dir.path());
         let open = find(&list, "launchservices");
+        // On (deny default) the rule's own refusal would mean the lookup was
+        // allowed: not shown closed.
         let refused = "LSOpenURLsWithRole() failed with error -54 for the file /System.";
-        assert_eq!(proven(open, ran(false, refused)), Outcome::Closed);
+        assert!(matches!(
+            proven(open, ran(false, refused)),
+            Outcome::Inconclusive(_)
+        ));
         let other = "LSOpenURLsWithRole() failed with error -10810 for the file /System.";
         assert!(matches!(
             proven(open, ran(false, other)),
@@ -1973,10 +1981,8 @@ mod tests {
         let timeout = "execution error: Finder got an error: AppleEvent timed out. (-1712)";
         assert!(matches!(proven(ae, ran(false, timeout)), Outcome::Open(_)));
         let blocked = "execution error: Finder got an error: Application isn't running. (-600)";
-        assert_eq!(proven(ae, ran(false, blocked)), Outcome::Closed);
-        // Finder not running makes -600 too: the control then fails.
         assert!(matches!(
-            outcome(ae, ran(false, blocked), Ok(None), Some((false, ""))),
+            proven(ae, ran(false, blocked)),
             Outcome::Inconclusive(_)
         ));
         let unreachable = "55:68: execution error: Can’t get application \"Finder\". (-1728)";
