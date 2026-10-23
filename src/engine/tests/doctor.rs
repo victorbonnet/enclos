@@ -34,9 +34,11 @@ fn compiled_now(engine: &Engine, name: &SandboxName) -> PathBuf {
 /// writes.
 fn compiled_earlier(engine: &Engine, name: &SandboxName) -> PathBuf {
     let (now, text) = engine.compiled_file(name, port(engine, name)).unwrap();
-    let earlier = now.with_file_name("earlier.fake");
+    let earlier_text = format!("{text}a rule enclos dropped\n");
+    let digest = crate::policy::sha256_hex(earlier_text.as_bytes());
+    let earlier = now.with_file_name(format!("{}.fake", &digest[..16]));
     std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
-    std::fs::write(&earlier, format!("{text}a rule enclos dropped\n")).unwrap();
+    std::fs::write(&earlier, earlier_text).unwrap();
     earlier
 }
 
@@ -144,11 +146,10 @@ fn a_next_session_that_cannot_compile_its_policy_is_a_problem() {
     let (_dir, engine, name) = with_sandbox();
     std::fs::remove_dir_all(engine.layout.sandbox_home(name.as_str())).unwrap();
     let doctor = engine.doctor();
-    let NextSession::Fails { error, refused } = check_of(&doctor, &name).next else {
+    let NextSession::Fails { error } = check_of(&doctor, &name).next else {
         panic!("{doctor:?}");
     };
     assert!(error.contains("home"), "{error}");
-    assert!(!refused);
     assert!(doctor.has_problems());
 }
 
@@ -306,4 +307,20 @@ fn a_sandbox_whose_backend_cannot_run_here_is_a_problem() {
     assert!(!check.backend_runs);
     assert_eq!(check.next, NextSession::NotChecked);
     assert!(doctor.has_problems());
+}
+
+/// An earlier file edited after it was written is named as such, though
+/// the policy also compiles to another file now.
+#[test]
+fn an_earlier_file_changed_after_it_was_written_is_named_as_such() {
+    let (_dir, engine, name) = with_sandbox();
+    let earlier = compiled_earlier(&engine, &name);
+    ran_under(&engine, &name, gone_process(), &earlier);
+    let text = std::fs::read_to_string(&earlier).unwrap();
+    std::fs::write(&earlier, format!("{text}(allow default)\n")).unwrap();
+    let [change] = changed(&check_of(&engine.doctor(), &name))
+        .try_into()
+        .unwrap();
+    assert!(change.edited, "{change:?}");
+    assert_ne!(change.now, change.ran);
 }

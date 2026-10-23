@@ -10,12 +10,14 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use super::Engine;
+use super::session::marked_in;
 use crate::backend::{Capabilities, Probe};
-use crate::error::{Error, Result, exit};
+use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::is_gone;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
+use crate::policy::sha256_hex;
 use crate::state::StateError;
 
 /// What `enclos doctor` found.
@@ -79,12 +81,12 @@ pub struct SandboxCheck {
 pub enum NextSession {
     /// Its active policy version compiles to `file`.
     Compiles { version: u32, file: PathBuf },
-    /// It does not, so its next session cannot start; `refused` when
-    /// enclos refuses the policy (exit 2), as for a write path that now
-    /// leads into enclos's own files.
-    Fails { error: String, refused: bool },
+    /// It does not, so its next session cannot start.
+    Fails { error: String },
     /// Not compiled: its backend does not run here.
     NotChecked,
+    /// Not compiled: enclos could not look, as its `unreadable` says.
+    Unknown,
 }
 
 /// A file a session ran under that its policy version compiles differently
@@ -111,7 +113,8 @@ pub struct CompiledChange {
     /// The file `version` compiles to now.
     pub now: PathBuf,
     /// `ran` no longer holds the text its name, a digest, was made from: it
-    /// was changed after it was written.
+    /// was changed after it was written. Said whether or not it now matches
+    /// what `version` compiles to.
     pub edited: bool,
     /// The lines removed and added, in order; none when `ran` is gone.
     pub lines: Option<Vec<LineChange>>,
@@ -204,7 +207,10 @@ impl Engine {
             name: record.name.clone(),
             backend: record.backend,
             backend_runs,
-            next: NextSession::NotChecked,
+            next: match backend_runs {
+                true => NextSession::Unknown,
+                false => NextSession::NotChecked,
+            },
             last_version: None,
             drift: Vec::new(),
             unreadable: Vec::new(),
@@ -237,7 +243,6 @@ impl Engine {
                 file,
             },
             Err(error) if is_compile_failure(&error) => NextSession::Fails {
-                refused: error.exit_code() == exit::REFUSED,
                 error: error.to_string(),
             },
             Err(error) => return Err(error),
@@ -245,19 +250,37 @@ impl Engine {
 
         // The files to compare: the last session's, and those of sessions
         // still running, each with the version it was compiled from.
+        // A session that cannot be told gone counts as running: its file
+        // is still compared.
+        let held = match procs {
+            Ok(_) => match self.held(name) {
+                Ok(held) => Some(held),
+                Err(e) => {
+                    check
+                        .unreadable
+                        .push(format!("cannot tell which of its sessions run: {e}"));
+                    None
+                }
+            },
+            Err(e) => {
+                check
+                    .unreadable
+                    .push(format!("cannot tell which of its sessions run: {e}"));
+                None
+            }
+        };
         let mut running: Vec<(u32, String)> = Vec::new();
         for session in sessions.iter().filter(|s| s.ended_at.is_none()) {
             let Some(compiled) = &session.compiled else {
                 continue;
             };
-            let gone = match procs {
-                Ok(procs) => is_gone(procs, &self.marked(session)?),
-                Err(e) => {
-                    check
-                        .unreadable
-                        .push(format!("cannot tell which of its sessions run: {e}"));
-                    false
+            let gone = match (procs, &held) {
+                (Ok(procs), Some(held)) => {
+                    let mut marked = session.clone();
+                    marked.tracked = marked_in(session, &session.tracked, procs, held);
+                    is_gone(procs, &marked)
                 }
+                _ => false,
             };
             if !gone {
                 running.push((session.version, compiled.clone()));
@@ -323,19 +346,23 @@ impl Engine {
                 return Ok(None);
             }
         };
-        let same_name = ran.file_name() == now.file_name();
-        // By content while the file is there, since it may have changed
-        // after it was written; else by its name, its content's digest.
+        // A compiled file is named after the digest of what was written:
+        // one whose content is not its name's was changed since.
+        let edited = before.as_ref().is_some_and(|before| {
+            let digest = sha256_hex(before.as_bytes());
+            ran.file_stem().and_then(|s| s.to_str()) != Some(&digest[..16])
+        });
+        // By content while the file is there; else by its name.
         let same = match &before {
             Some(before) => *before == text,
-            None => same_name,
+            None => ran.file_name() == now.file_name(),
         };
-        if same {
+        if same && !edited {
             return Ok(None);
         }
         Ok(Some(Drift::Changed(CompiledChange {
             version,
-            edited: before.is_some() && same_name,
+            edited,
             lines: before.map(|before| line_changes(&before, &text)),
             ran,
             now,

@@ -72,6 +72,9 @@ fn sandbox(s: &SandboxCheck) -> String {
                 s.backend
             );
         }
+        NextSession::Unknown => {
+            out += &format!("  {name}: enclos could not tell whether its next session can start\n");
+        }
         NextSession::Fails { error, .. } => {
             out += &format!(
                 "  {name}: its active policy cannot be compiled, so its next session cannot start: {error}\n"
@@ -81,7 +84,8 @@ fn sandbox(s: &SandboxCheck) -> String {
             out += &format!("  {name}: its next session compiles policy v{version}\n");
         }
     }
-    if s.backend_runs {
+    // Only once everything was looked at: else nothing was compared.
+    if s.backend_runs && s.unreadable.is_empty() {
         match (s.last_version, s.drift.is_empty()) {
             (None, _) => out += "    no session has run under a compiled policy yet\n",
             (Some(v), true) => {
@@ -155,5 +159,57 @@ fn enforced(e: &Enforcement) -> String {
         Enforcement::Enforced => "enforced".to_owned(),
         Enforcement::Partial { note } => format!("partly ({note})"),
         Enforcement::Unsupported => "not enforced".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclos::backend::{Capabilities, Enforcement};
+    use enclos::model::sandbox::BackendKind;
+
+    fn doctor(check: SandboxCheck) -> Doctor {
+        Doctor {
+            backends: vec![BackendCheck {
+                kind: BackendKind::Seatbelt,
+                found: Probe::Available,
+                runs: Some(Probe::Available),
+                capabilities: Capabilities {
+                    fs: Enforcement::Enforced,
+                    network: Enforcement::Enforced,
+                    exec: Enforcement::Unsupported,
+                    resources: Enforcement::Unsupported,
+                    members: Enforcement::Enforced,
+                },
+            }],
+            sandboxes: Sandboxes::Listed(vec![check]),
+        }
+    }
+
+    /// What doctor could not look at is said, and nothing it did not
+    /// compare is said to match.
+    #[test]
+    fn what_could_not_be_looked_at_is_not_said_to_match() {
+        let shown = shown(&doctor(SandboxCheck {
+            name: "home".parse().unwrap(),
+            backend: BackendKind::Seatbelt,
+            backend_runs: true,
+            next: NextSession::Unknown,
+            last_version: Some(99),
+            drift: Vec::new(),
+            unreadable: vec![
+                "policy version 99, which a session ran under, is not recorded".into(),
+            ],
+        }));
+        assert!(
+            shown.contains("home: enclos could not tell whether its next session can start"),
+            "{shown}"
+        );
+        assert!(!shown.contains("does not run here"), "{shown}");
+        assert!(!shown.contains("compiles as it did"), "{shown}");
+        assert!(
+            shown.contains("enclos could not look: policy version 99"),
+            "{shown}"
+        );
     }
 }
