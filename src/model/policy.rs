@@ -29,10 +29,10 @@ pub struct Policy {
 }
 
 /// Limits on each process of a sandbox (design §7). The Seatbelt backend
-/// enforces `open_files`, `file_size` and `cpu_seconds`, through the
-/// process limits macOS keeps; `memory` and `cpu` are kept as written only
-/// for the validation to refuse them where they cannot be enforced (ADR
-/// 0009), so a stored policy never holds one.
+/// enforces `open_files` and `cpu_seconds`, through the process limits
+/// macOS keeps, and refuses `file_size`, `memory` and `cpu` (ADR 0033), so
+/// a policy it stores holds none of them; `memory` and `cpu` are kept as
+/// written for that refusal, and for a backend that enforces them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     /// The most files a process holds open at once.
