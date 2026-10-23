@@ -220,6 +220,22 @@ pub struct ServiceLine {
     pub state: ServiceState,
 }
 
+impl ServiceLine {
+    /// A service as the service manager says it is, the same in `status`
+    /// and `sandbox show`.
+    pub fn new(label: &crate::service::ServiceLabel, status: ServiceStatus) -> ServiceLine {
+        ServiceLine {
+            service: label.service().to_owned(),
+            label: label.to_string(),
+            state: match status {
+                ServiceStatus::Running { pid } => ServiceState::Running { pid },
+                ServiceStatus::Loaded => ServiceState::Loaded,
+                ServiceStatus::NotLoaded => ServiceState::NotLoaded,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ServiceState {
@@ -593,15 +609,7 @@ impl Engine {
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(
                 list.into_iter()
-                    .map(|(label, status)| ServiceLine {
-                        service: label.service().to_owned(),
-                        label: label.to_string(),
-                        state: match status {
-                            ServiceStatus::Running { pid } => ServiceState::Running { pid },
-                            ServiceStatus::Loaded => ServiceState::Loaded,
-                            ServiceStatus::NotLoaded => ServiceState::NotLoaded,
-                        },
-                    })
+                    .map(|(label, status)| ServiceLine::new(&label, status))
                     .collect(),
             ),
             Err(e) => Fact::CannotTell(e.to_string()),

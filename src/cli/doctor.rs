@@ -10,11 +10,129 @@ use enclos::error::{Result, exit};
 
 pub fn run(engine: &Engine) -> Result<u8> {
     let doctor = engine.doctor();
-    print!("{}", shown(&doctor));
-    Ok(if doctor.has_problems() {
-        exit::ERROR
-    } else {
-        exit::OK
+    let code = match doctor.has_problems() {
+        true => exit::ERROR,
+        false => exit::OK,
+    };
+    match super::output::json() {
+        true => super::output::emit(&super::output::with_error(json(&doctor), code, || {
+            "something keeps enclos, or one of its sandboxes, from running here".to_owned()
+        })),
+        false => print!("{}", shown(&doctor)),
+    }
+    Ok(code)
+}
+
+/// The report as JSON.
+fn json(doctor: &Doctor) -> serde_json::Value {
+    use serde_json::json;
+    let enforced = |e: &Enforcement| match e {
+        Enforcement::Enforced => json!({"enforced": "yes"}),
+        Enforcement::Partial { note } => json!({"enforced": "partly", "note": note}),
+        Enforcement::Unsupported => json!({"enforced": "no"}),
+    };
+    let backends: Vec<_> = doctor
+        .backends
+        .iter()
+        .map(|b| {
+            let c = &b.capabilities;
+            json!({
+                "kind": b.kind.to_string(),
+                "state": match &b.state {
+                    BackendState::NotFound { .. } => "not_found",
+                    BackendState::Refuses { .. } => "refuses",
+                    BackendState::Runs => "runs",
+                },
+                "reason": match &b.state {
+                    BackendState::NotFound { reason } | BackendState::Refuses { reason } => {
+                        Some(reason)
+                    }
+                    BackendState::Runs => None,
+                },
+                "capabilities": {
+                    "files": enforced(&c.fs),
+                    "network": enforced(&c.network),
+                    "programs": enforced(&c.exec),
+                    "limits": enforced(&c.resources),
+                    "members": enforced(&c.members),
+                },
+            })
+        })
+        .collect();
+    let sandbox = |s: &SandboxCheck| {
+        let next = match &s.next {
+            NextSession::Compiles { version, file } => json!({
+                "state": "compiles",
+                "version": version,
+                "file": super::output::path(file),
+            }),
+            NextSession::Fails { error } => json!({"state": "fails", "error": error}),
+            NextSession::NotChecked => json!({"state": "not_checked"}),
+            NextSession::Unknown { why } => json!({"state": "unknown", "why": why}),
+        };
+        let drift: Vec<_> = s
+            .drift
+            .iter()
+            .map(|d| {
+                let mut found = match &d.kind {
+                    DriftKind::NoLongerCompiles { error } => json!({
+                        "kind": "no_longer_compiles",
+                        "error": error,
+                    }),
+                    DriftKind::Changed { now, ran_file } => {
+                        let (edited, lines) = match ran_file {
+                            RanFile::Gone => (false, None),
+                            RanFile::There { edited, lines } => (*edited, Some(lines)),
+                        };
+                        json!({
+                            "kind": if edited { "edited" } else { "changed" },
+                            "now": super::output::path(now),
+                            "lines": match lines {
+                                Some(Lines::Changed(lines)) => Some(lines.iter().map(|l| match l {
+                                    LineChange::Removed(l) => json!({"removed": l}),
+                                    LineChange::Added(l) => json!({"added": l}),
+                                }).collect::<Vec<_>>()),
+                                Some(Lines::TooLong) | None => None,
+                            },
+                            "lines_not_shown": match lines {
+                                Some(Lines::Changed(_)) => None,
+                                Some(Lines::TooLong) => Some("too_long"),
+                                None => Some("file_gone"),
+                            },
+                        })
+                    }
+                };
+                found["version"] = json!(d.version);
+                found["ran"] = json!(super::output::path(&d.ran));
+                found["running_sessions"] = json!(d.running.count);
+                found["running_unsure"] = json!(d.running.unsure);
+                found
+            })
+            .collect();
+        json!({
+            "name": s.name.to_string(),
+            "backend": s.backend.to_string(),
+            "backend_runs": s.backend_runs(),
+            "next_session": next,
+            "last_version": s.last_version,
+            "drift": drift,
+            "unreadable": s.unreadable,
+        })
+    };
+    let sandboxes = match &doctor.sandboxes {
+        Sandboxes::NotInitialized => json!({"initialized": false, "sandboxes": []}),
+        Sandboxes::Unreadable { error } => {
+            json!({"initialized": true, "unreadable": error, "sandboxes": []})
+        }
+        Sandboxes::Listed(list) => json!({
+            "initialized": true,
+            "sandboxes": list.iter().map(sandbox).collect::<Vec<_>>(),
+        }),
+    };
+    json!({
+        "problems": doctor.has_problems(),
+        "backends": backends,
+        "records": sandboxes,
     })
 }
 

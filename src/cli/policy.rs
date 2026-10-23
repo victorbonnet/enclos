@@ -6,6 +6,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use clap::{Args, Subcommand};
+use serde_json::{Value, json};
+
+use super::output;
 
 use enclos::engine::{
     ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyDiff, PolicyHistory,
@@ -15,7 +18,7 @@ use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
-use enclos::model::policy::{NetMode, Policy};
+use enclos::model::policy::{NetMode, PendingPolicy, Policy, PolicyVersion};
 use enclos::model::sandbox::SandboxName;
 use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
 
@@ -91,14 +94,29 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
             return Ok(
                 match engine.policy_test(by, &sandbox, host_services, confirm)? {
                     Planned::DryRun(plan) => {
-                        plan.changes.iter().for_each(|c| println!("Would {c}."));
+                        output::show_plan(&plan);
                         exit::OK
+                    }
+                    Planned::Done(report) if output::json() => {
+                        let code = test_code(&report);
+                        output::emit(&output::with_error(
+                            test_json(&sandbox, &report),
+                            code,
+                            || verdict(&sandbox, &report),
+                        ));
+                        code
                     }
                     Planned::Done(report) => print_test(&sandbox, &report),
                 },
             );
         }
-        PolicyVerb::Show { sandbox, pending } => print_policy(&engine.policy(&sandbox)?, pending)?,
+        PolicyVerb::Show { sandbox, pending } => {
+            let view = engine.policy(&sandbox)?;
+            match output::json() {
+                true => output::emit(&show_json(&view, pending)?),
+                false => print_policy(&view, pending)?,
+            }
+        }
         PolicyVerb::Allow {
             sandbox,
             destination,
@@ -114,18 +132,44 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
         PolicyVerb::Apply { sandbox } => {
             return match engine.policy_apply(by, &sandbox, confirm)? {
                 Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    output::show_plan(&plan);
                     Ok(exit::OK)
                 }
-                Planned::Done(restarted) => print_restarted(engine, &sandbox, &restarted),
+                Planned::Done(restarted) => {
+                    let (code, value) = print_restarted(engine, &sandbox, &restarted)?;
+                    if output::json() {
+                        output::emit(&output::with_error(
+                            json!({"sandbox": sandbox.to_string(), "restarted": value}),
+                            code,
+                            || restart_failed(&sandbox),
+                        ));
+                    }
+                    Ok(code)
+                }
             };
         }
         PolicyVerb::Discard { sandbox } => {
             print_discarded(&sandbox, engine.policy_discard(by, &sandbox, confirm)?)
         }
-        PolicyVerb::History { sandbox } => print_history(&engine.policy_history(&sandbox)?),
+        PolicyVerb::History { sandbox } => {
+            let history = engine.policy_history(&sandbox)?;
+            match output::json() {
+                true => output::emit(&history_json(&history)),
+                false => print_history(&history),
+            }
+        }
         PolicyVerb::Diff { sandbox, from, to } => {
-            print_diff(&sandbox, &engine.policy_diff(&sandbox, from, to)?)
+            let diff = engine.policy_diff(&sandbox, from, to)?;
+            match output::json() {
+                true => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "from": diff.from,
+                    "to": diff.to.to_string(),
+                    "changes": diff.changes,
+                    "inputs": diff.inputs,
+                })),
+                false => print_diff(&sandbox, &diff),
+            }
         }
         PolicyVerb::Rollback { sandbox, to } => {
             let planned = engine.policy_rollback(by, &sandbox, to, confirm)?;
@@ -137,6 +181,126 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
         }
     }
     Ok(exit::OK)
+}
+
+fn version_json(v: &PolicyVersion) -> Value {
+    json!({
+        "version": v.version,
+        "snapshot": v.snapshot.0,
+        "by": output::actor(&v.by),
+        "at": v.at.to_string(),
+        "restores": v.restores,
+    })
+}
+
+fn pending_json(p: &PendingPolicy) -> Value {
+    json!({
+        "snapshot": p.snapshot.0,
+        "by": output::actor(&p.by),
+        "at": p.at.to_string(),
+        "restores": p.restores,
+    })
+}
+
+fn policy_json(policy: &enclos::model::policy::Policy) -> Result<Value> {
+    serde_json::to_value(policy).map_err(|source| Error::Json {
+        what: "the policy",
+        source,
+    })
+}
+
+/// The policy in force, or with `pending` the pending one, field by field.
+fn show_json(view: &PolicyView, pending: bool) -> Result<Value> {
+    let snap = &view.snapshot;
+    if pending {
+        let Some((p, pending)) = &view.pending else {
+            return Err(Error::NoPendingPolicy {
+                sandbox: view.sandbox.to_string(),
+            });
+        };
+        return Ok(json!({
+            "sandbox": view.sandbox.to_string(),
+            "pending": pending_json(p),
+            "template": pending.inputs.template.to_string(),
+            "active_version": view.version.version,
+            "policy": policy_json(&pending.policy)?,
+        }));
+    }
+    Ok(json!({
+        "sandbox": view.sandbox.to_string(),
+        "version": version_json(&view.version),
+        "template": snap.inputs.template.to_string(),
+        "file": output::path(&view.file),
+        "policy": policy_json(&snap.policy)?,
+        "pending": view.pending.as_ref().map(|(p, pending)| {
+            let mut shown = pending_json(p);
+            shown["changes"] = json!(enclos::engine::policy_differences(&snap.policy, &pending.policy));
+            shown
+        }),
+    }))
+}
+
+fn history_json(history: &PolicyHistory) -> Value {
+    json!({
+        "sandbox": history.sandbox.to_string(),
+        "active": history.active().map(|a| a.version),
+        "versions": history.versions.iter().map(version_json).collect::<Vec<_>>(),
+        "pending": history.pending.as_ref().map(pending_json),
+    })
+}
+
+fn test_code(report: &TestReport) -> u8 {
+    match report.passed() {
+        true => exit::OK,
+        false => exit::ERROR,
+    }
+}
+
+fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
+    json!({
+        "sandbox": sandbox.to_string(),
+        "ready": report.passed(),
+        "verdict": verdict(sandbox, report),
+        "probes": report.results.iter().map(|r| {
+            let (outcome, why) = match &r.outcome {
+                Outcome::Closed => ("closed", None),
+                Outcome::Open(why) => ("open", Some(why.clone())),
+                Outcome::Inconclusive(why) => ("inconclusive", Some(why.clone())),
+                Outcome::NotRun(why) => ("not_run", Some(why.clone())),
+            };
+            json!({
+                "route": r.route,
+                "name": r.name,
+                "outcome": outcome,
+                "why": why,
+                "closed_by_platform": r.closed_by_platform,
+            })
+        }).collect::<Vec<_>>(),
+        "host_services_probed": report.host_services,
+        "not_here": report.not_here,
+        "not_probed": NOT_PROBED,
+        "listens": report.listens,
+    })
+}
+
+/// Why a change that restarted the sandbox fails: its stop or its start
+/// failed, as `restarted` says.
+fn restart_failed(sandbox: &SandboxName) -> String {
+    format!(
+        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as `restarted` says (under `outcome` for a change other than `policy apply`); `enclos sandbox show {sandbox}` shows where it is"
+    )
+}
+
+/// A change that was applied, or not: its version, whether it changed,
+/// what else it does, and how it took effect.
+fn applied_json(sandbox: &SandboxName, applied: &PolicyApplied, outcome: Value) -> Value {
+    json!({
+        "sandbox": sandbox.to_string(),
+        "version": applied.version.version,
+        "changed": applied.changed,
+        "also": applied.also,
+        "outcome": outcome,
+    })
 }
 
 fn print_policy(view: &PolicyView, pending: bool) -> Result<()> {
@@ -260,13 +424,18 @@ fn print_allowed(
 ) -> Result<u8> {
     let applied = match planned {
         Planned::DryRun(plan) => {
-            for change in plan.changes {
-                println!("Would {change}.");
-            }
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(applied) => applied,
     };
+    if output::json() {
+        let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
+        let mut shown = applied_json(sandbox, &applied, outcome);
+        shown["destination"] = json!(destination);
+        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
+        return Ok(code);
+    }
     let version = applied.version.version;
     match (applied.changed, &applied.outcome) {
         (true, _) => println!(
@@ -285,52 +454,88 @@ fn print_allowed(
             println!("  {change}");
         }
     }
-    print_outcome(engine, sandbox, &applied)
+    Ok(print_outcome(engine, sandbox, &applied)?.0)
 }
 
 /// Says whether a change waits as the pending policy, or how the restart
-/// that applied it went.
-fn print_outcome(engine: &Engine, sandbox: &SandboxName, applied: &PolicyApplied) -> Result<u8> {
+/// that applied it went; returns its code and, for JSON, the outcome.
+fn print_outcome(
+    engine: &Engine,
+    sandbox: &SandboxName,
+    applied: &PolicyApplied,
+) -> Result<(u8, Value)> {
+    let text = !output::json();
     match &applied.outcome {
         ChangeOutcome::InForce { dropped: Some(p) } => {
-            println!(
-                "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
-                p.snapshot.short()
-            );
-            Ok(exit::OK)
+            if text {
+                println!(
+                    "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
+                    p.snapshot.short()
+                );
+            }
+            Ok((
+                exit::OK,
+                json!({"in_force": true, "dropped_pending": pending_json(p)}),
+            ))
         }
-        ChangeOutcome::InForce { dropped: None } => Ok(exit::OK),
+        ChangeOutcome::InForce { dropped: None } => {
+            Ok((exit::OK, json!({"in_force": true, "dropped_pending": null})))
+        }
         ChangeOutcome::Pending(p) => {
-            println!(
-                "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
-                p.snapshot.short()
-            );
-            println!(
-                "`enclos policy apply {sandbox}` restarts the sandbox into it; `enclos policy discard {sandbox}` drops it."
-            );
-            Ok(exit::OK)
+            if text {
+                println!(
+                    "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
+                    p.snapshot.short()
+                );
+                println!(
+                    "`enclos policy apply {sandbox}` restarts the sandbox into it; `enclos policy discard {sandbox}` drops it."
+                );
+            }
+            Ok((
+                exit::OK,
+                json!({"in_force": false, "pending": pending_json(p)}),
+            ))
         }
-        ChangeOutcome::Restarted(restarted) => print_restarted(engine, sandbox, restarted),
+        ChangeOutcome::Restarted(restarted) => {
+            let (code, value) = print_restarted(engine, sandbox, restarted)?;
+            Ok((code, json!({"in_force": true, "restarted": value})))
+        }
     }
 }
 
 /// How a restart into the pending policy went: what stopped, the version
-/// now in force, and the services started again.
-fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Result<u8> {
-    if let Some(stopped) = &r.stopped {
-        super::sandbox::print_stop(sandbox, stopped);
+/// now in force, and the services started again; returns its code and,
+/// for JSON, the restart. The version is in force once this is reached, so
+/// a start that cannot be checked is said beside it, in JSON, rather than
+/// losing it.
+fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Result<(u8, Value)> {
+    let stopped = r
+        .stopped
+        .as_ref()
+        .map(|stopped| super::sandbox::print_stop(sandbox, stopped));
+    if !output::json() {
+        println!(
+            "Sandbox {sandbox} runs under policy v{} from now on.",
+            r.version.version
+        );
+        if r.stopped.as_ref().is_some_and(|s| !s.stopped.is_empty()) {
+            println!("To use it in a terminal again: `enclos connect {sandbox}`.");
+        }
     }
-    println!(
-        "Sandbox {sandbox} runs under policy v{} from now on.",
-        r.version.version
-    );
-    if r.stopped.as_ref().is_some_and(|s| !s.stopped.is_empty()) {
-        println!("To use it in a terminal again: `enclos connect {sandbox}`.");
-    }
-    match r.started.is_empty() {
-        true => Ok(exit::OK),
-        false => super::sandbox::print_started(engine, sandbox, &r.started),
-    }
+    let (code, started) = match r.started.is_empty() {
+        true => (exit::OK, Value::Null),
+        // In JSON, a start that cannot be checked is said in its value.
+        false => super::sandbox::print_started(engine, sandbox, &r.started)?,
+    };
+    let code = code.max(stopped.as_ref().map_or(exit::OK, |(c, _)| *c));
+    Ok((
+        code,
+        json!({
+            "version": r.version.version,
+            "stopped": stopped.map(|(_, v)| v),
+            "started": started,
+        }),
+    ))
 }
 
 fn print_history(history: &PolicyHistory) {
@@ -416,11 +621,20 @@ fn print_replaced(
 ) -> Result<u8> {
     let applied = match planned {
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(applied) => applied,
     };
+    if output::json() {
+        let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
+        output::emit(&output::with_error(
+            applied_json(sandbox, &applied, outcome),
+            code,
+            || restart_failed(sandbox),
+        ));
+        return Ok(code);
+    }
     let version = applied.version.version;
     match (&applied.outcome, applied.changed) {
         (ChangeOutcome::Pending(_), true) => println!(
@@ -441,17 +655,27 @@ fn print_replaced(
     for change in &applied.also {
         println!("  {change}");
     }
-    print_outcome(engine, sandbox, &applied)
+    Ok(print_outcome(engine, sandbox, &applied)?.0)
 }
 
 fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
     let discarded = match planned {
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return;
         }
         Planned::Done(d) => d,
     };
+    if output::json() {
+        output::emit(&json!({
+            "sandbox": sandbox.to_string(),
+            "version": discarded.version.version,
+            "dropped_pending": discarded.pending.as_ref().map(pending_json),
+            "kept": discarded.kept.as_deref().map(output::path),
+            "edit_moved_to": discarded.edit.as_deref().map(output::path),
+        }));
+        return;
+    }
     let version = discarded.version.version;
     match (&discarded.pending, &discarded.kept, &discarded.edit) {
         (None, None, None) => println!(
@@ -511,7 +735,9 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
                     file,
                 });
             }
-            println!("Continuing the edit kept in {}.", files.copy.display());
+            if !output::json() {
+                println!("Continuing the edit kept in {}.", files.copy.display());
+            }
             (current, kept)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -524,12 +750,25 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
     if after == before && recorded.as_deref().is_none_or(|r| r == after) {
-        forget_edit(&files);
-        println!("No change to the policy of sandbox {sandbox}.");
+        let left = forget_edit(&files);
+        match output::json() {
+            true => output::emit(&json!({
+                "sandbox": sandbox.to_string(),
+                "changed": false,
+                "edit_left": left,
+            })),
+            false => println!("No change to the policy of sandbox {sandbox}."),
+        }
         return Ok(exit::OK);
     }
     let applied = match engine.policy_edit(by, sandbox, &before, &after, confirm) {
         Ok(Planned::DryRun(plan)) => {
+            if output::json() {
+                let mut planned = output::plan(&plan);
+                planned["edit_kept_in"] = output::path(&files.copy);
+                output::emit(&planned);
+                return Ok(exit::OK);
+            }
             plan.changes.iter().for_each(|c| println!("Would {c}."));
             println!(
                 "Your edit is kept in {}; `enclos policy edit {sandbox}` opens it again.",
@@ -541,7 +780,15 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         // Recorded before it failed (a restart with --yes, say): the edit
         // is the file now, and keeping it would only open it again.
         Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
-            forget_edit(&files);
+            let left = forget_edit(&files);
+            // In JSON, what was left is said in the error's message, as
+            // `edit_left` says it in a document.
+            if output::json() && !left.is_empty() {
+                return Err(Error::WithContext {
+                    what: format!("{e}; {}", left.join("; ")),
+                    error: Box::new(e),
+                });
+            }
             return Err(e);
         }
         Err(e @ Error::PolicyFileChanged { .. }) => return Err(e),
@@ -555,7 +802,14 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
             });
         }
     };
-    forget_edit(&files);
+    let left = forget_edit(&files);
+    if output::json() {
+        let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
+        let mut shown = applied_json(sandbox, &applied, outcome);
+        shown["edit_left"] = json!(left);
+        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
+        return Ok(code);
+    }
     let version = applied.version.version;
     match (&applied.outcome, applied.changed) {
         (ChangeOutcome::Pending(_), true) => println!(
@@ -572,22 +826,30 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     for change in &applied.also {
         println!("  {change}");
     }
-    print_outcome(engine, sandbox, &applied)
+    Ok(print_outcome(engine, sandbox, &applied)?.0)
 }
 
 /// Removes the copy `policy edit` edited and its base, saying so when it
-/// cannot: the next `policy edit` would open it again.
-fn forget_edit(files: &EditFiles) {
+/// cannot, in text: the next `policy edit` would open it again. Returns
+/// what it says, or in JSON would say, for the caller to carry in its
+/// document or its error.
+fn forget_edit(files: &EditFiles) -> Vec<String> {
+    let mut left = Vec::new();
     for path in [&files.copy, &files.base] {
         if let Err(e) = std::fs::remove_file(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            eprintln!(
-                "enclos: could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
+            let said = format!(
+                "could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
                 path.display()
             );
+            if !output::json() {
+                eprintln!("enclos: {said}");
+            }
+            left.push(said);
         }
     }
+    left
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {

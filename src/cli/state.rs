@@ -2,8 +2,11 @@
 //! can be (design §11).
 
 use clap::{Args, Subcommand};
+use serde_json::{Value, json};
 
-use enclos::engine::{Engine, Finding, Remedy};
+use super::output;
+
+use enclos::engine::{Engine, Finding, Remedy, Subject};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::Confirm;
@@ -40,6 +43,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
     match args.verb {
         StateVerb::Check { sandbox } => {
             let found = engine.state_check(sandbox.as_ref())?;
+            if output::json() {
+                let code = match found.is_empty() {
+                    true => exit::OK,
+                    false => exit::ERROR,
+                };
+                output::emit(&output::with_error(
+                    findings_json(&found, false),
+                    code,
+                    || "enclos's records and the host differ".to_owned(),
+                ));
+                return Ok(code);
+            }
             if found.is_empty() {
                 println!("enclos's records match the host.");
                 return Ok(exit::OK);
@@ -63,16 +78,68 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
                 Confirm::DryRun => engine.state_check(sandbox.as_ref())?,
                 _ => engine.state_repair(by, sandbox.as_ref())?,
             };
+            let left = found.iter().any(|f| f.remedy.is_left());
+            if output::json() {
+                let code = if left { exit::ERROR } else { exit::OK };
+                output::emit(&output::with_error(
+                    findings_json(&found, confirm == Confirm::DryRun),
+                    code,
+                    || {
+                        let failed = found
+                            .iter()
+                            .filter(|f| matches!(f.remedy, Remedy::Failed { .. }))
+                            .count();
+                        let manual = found
+                            .iter()
+                            .filter(|f| matches!(f.remedy, Remedy::Manual(_)))
+                            .count();
+                        format!("{failed} repairs failed and {manual} findings need you")
+                    },
+                ));
+                return Ok(code);
+            }
             if found.is_empty() {
                 println!("enclos's records match the host: nothing to repair.");
             }
             for f in &found {
                 print_finding(f, "would repair");
             }
-            let left = found.iter().any(|f| f.remedy.is_left());
             Ok(if left { exit::ERROR } else { exit::OK })
         }
     }
+}
+
+/// The findings as JSON, each with what is done about it: a remedy of kind
+/// `repair` is one `state repair` would make, of kind `repaired` one it
+/// made; `dry_run` when the repairs are only planned. Names are as they
+/// are: JSON escapes what a terminal would not show.
+fn findings_json(found: &[Finding], dry_run: bool) -> Value {
+    json!({
+        "match": found.is_empty(),
+        "dry_run": dry_run,
+        "findings": found.iter().map(|f| {
+            let (kind, name) = match &f.subject {
+                Subject::Sandbox(name) => ("sandbox", name.to_string()),
+                Subject::Folder(folder) => ("folder", folder.clone()),
+                Subject::Record(name) => ("record", name.clone()),
+            };
+            let remedy = match &f.remedy {
+                Remedy::Repairs(what) => json!({"kind": "repair", "what": what.to_string()}),
+                Remedy::Repaired(what) => json!({"kind": "repaired", "what": what.to_string()}),
+                Remedy::Failed { repair, error } => json!({
+                    "kind": "repair_failed",
+                    "what": repair.to_string(),
+                    "error": error,
+                }),
+                Remedy::Manual(what) => json!({"kind": "manual", "what": what}),
+            };
+            json!({
+                "subject": {"kind": kind, "name": name},
+                "what": f.what,
+                "remedy": remedy,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 /// One finding and what is done about it, `fix` naming a repair still to

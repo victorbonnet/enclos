@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::{Args, Subcommand};
+use serde_json::json;
+
+use super::output;
 
 use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept};
 use enclos::error::{Result, exit};
@@ -72,7 +75,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             };
             let added = match planned {
                 Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    output::show_plan(&plan);
                     return Ok(exit::OK);
                 }
                 Planned::Done(added) => added,
@@ -80,6 +83,36 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             let name = &added.agent.name;
             let runtime = enclos::runtime::adapter(added.kind);
             let kind = added.kind.display_name();
+            if output::json() {
+                let (how, session, archive, copy_left) = match &added.how {
+                    Added::Adopted => ("adopted", None, None, None),
+                    Added::Created(end) => ("created", Some(output::session(end)), None, None),
+                    Added::Imported {
+                        end,
+                        archive,
+                        copy_left,
+                    } => (
+                        "imported",
+                        Some(output::session(end)),
+                        Some(json!({
+                            "path": output::path(&archive.path),
+                            "sha256": archive.sha256,
+                        })),
+                        copy_left.as_ref().map(ToString::to_string),
+                    ),
+                };
+                output::emit(&json!({
+                    "agent": format!("{sandbox}/{name}"),
+                    "runtime": added.kind.to_string(),
+                    "how": how,
+                    "session": session,
+                    "archive": archive,
+                    "copy_left": copy_left,
+                    "talk": format!("enclos connect {sandbox} -- {}", runtime.talk(name)),
+                    "home": output::path(&engine.sandbox_home(&sandbox)),
+                }));
+                return Ok(exit::OK);
+            }
             match &added.how {
                 Added::Adopted => {
                     println!(
@@ -149,6 +182,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             let agents = engine.agents(&sandbox)?;
             let notes = check_notes(engine, &sandbox, true)?;
             let builtin = engine.builtin_agent(&sandbox)?;
+            if output::json() {
+                output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "builtin": builtin.map(|b| b.to_string()),
+                    "agents": agents.iter().map(|a| a.name.to_string()).collect::<Vec<_>>(),
+                    "notes": notes,
+                }));
+                return Ok(exit::OK);
+            }
             if let Some(b) = builtin {
                 println!("{sandbox}/{b}  built in");
             }
@@ -169,11 +211,33 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             let AgentTarget { sandbox, agent } = agent;
             let removed = match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
                 Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    output::show_plan(&plan);
                     return Ok(exit::OK);
                 }
                 Planned::Done(removed) => removed,
             };
+            if output::json() {
+                let (files_removed, files, kept_because) = match &removed {
+                    AgentRemoved::Deleted { .. } => (true, None, None),
+                    AgentRemoved::RecordOnly { files, why, .. } => (
+                        false,
+                        Some(files.to_string()),
+                        Some(match why {
+                            FilesKept::Asked => "asked",
+                            FilesKept::RuntimeLacksIt => "runtime_lacks_it",
+                            FilesKept::NoDeleteCommand => "no_delete_command",
+                        }),
+                    ),
+                };
+                output::emit(&json!({
+                    "agent": format!("{sandbox}/{agent}"),
+                    "removed": true,
+                    "files_removed": files_removed,
+                    "files": files,
+                    "files_kept_because": kept_because,
+                }));
+                return Ok(exit::OK);
+            }
             match removed {
                 AgentRemoved::Deleted { .. } => {
                     println!("Removed agent {sandbox}/{agent} and its files.")
