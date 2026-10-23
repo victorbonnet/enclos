@@ -164,6 +164,13 @@ pub trait Backend {
     fn kind(&self) -> BackendKind;
     /// Checks, without side effects, whether this backend works on this host.
     fn probe(&self) -> Probe;
+    /// What `probe` says, and once that passes, whether a program runs in
+    /// the backend: a host can have it and still refuse it, as macOS
+    /// refuses a sandbox to a process already in one. Starts a process;
+    /// `enclos doctor` asks.
+    fn try_run(&self) -> Probe {
+        self.probe()
+    }
     fn capabilities(&self) -> Capabilities;
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;

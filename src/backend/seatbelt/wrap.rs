@@ -11,9 +11,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use super::super::{Launch, SandboxContext};
+use super::super::{Launch, Probe, SandboxContext};
 use super::compile::{SERVICE_PARAM, TERMINAL_PARAM};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -39,6 +39,29 @@ const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
 /// can find; terminals that bring their own (Ghostty's `xterm-ghostty`)
 /// understand it.
 const FALLBACK_TERM: &str = "xterm-256color";
+
+/// Whether `sandbox-exec` runs `/usr/bin/true` under a profile that allows
+/// everything: it fails, with "Operation not permitted", where macOS will
+/// not apply a sandbox, as in a process already in one.
+pub fn try_run() -> Probe {
+    let out = Command::new(SANDBOX_EXEC)
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => Probe::Available,
+        Ok(out) => Probe::Unavailable {
+            reason: format!(
+                "{SANDBOX_EXEC} could not run /usr/bin/true under a profile that allows everything ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        },
+        Err(e) => Probe::Unavailable {
+            reason: format!("cannot run {SANDBOX_EXEC}: {e}"),
+        },
+    }
+}
 
 pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     let terminal = match launch.in_terminal {

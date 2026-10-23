@@ -80,11 +80,22 @@ impl Engine {
         name: &SandboxName,
         proxy_port: u16,
     ) -> Result<(PathBuf, String)> {
-        let backend = self.backend_of(name)?;
         let policy = self.policy(name)?.snapshot.policy;
-        self.check_before_compile(name, &policy)?;
+        self.compiled_for(name, &policy, proxy_port)
+    }
+
+    /// The file `policy` compiles to for the sandbox, and its text, without
+    /// writing it.
+    pub(super) fn compiled_for(
+        &self,
+        name: &SandboxName,
+        policy: &Policy,
+        proxy_port: u16,
+    ) -> Result<(PathBuf, String)> {
+        let backend = self.backend_of(name)?;
+        self.check_before_compile(name, policy)?;
         let ctx = self.sandbox_context(name, proxy_port);
-        let compiled = backend.compile(&policy, &ctx)?;
+        let compiled = backend.compile(policy, &ctx)?;
         let digest = sha256_hex(compiled.text.as_bytes());
         let file =
             ctx.dir

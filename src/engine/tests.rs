@@ -6643,6 +6643,7 @@ mod listener {
     }
 }
 
+mod doctor;
 mod exec;
 mod history;
 mod pending;

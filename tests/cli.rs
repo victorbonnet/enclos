@@ -2608,3 +2608,53 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
     assert_eq!(out.code(), 1);
     assert!(!out.stdout().contains("match the host"), "{}", out.stdout());
 }
+
+/// `doctor` runs a program in Seatbelt, and names a compiled policy that
+/// enclos now writes differently from the file a session ran under.
+#[test]
+fn doctor_checks_the_backend_and_names_a_policy_compiled_differently() {
+    let home = Home::new();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok().stdout().contains("seatbelt: runs here"),
+        "{}",
+        out.stdout()
+    );
+    assert!(out.stdout().contains("not initialized"), "{}", out.stdout());
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("home: policy v1 compiles as it did"),
+        "{}",
+        out.stdout()
+    );
+    // As if an earlier enclos had written one more rule.
+    let compiled = home.root.join("sandboxes/home/compiled");
+    let file = std::fs::read_dir(&compiled)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "sb"))
+        .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        format!("{text}(deny file-read* (literal \"/earlier\"))\n"),
+    )
+    .unwrap();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok().stdout().contains("compiles differently"),
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        out.stdout()
+            .contains("    - (deny file-read* (literal \"/earlier\"))"),
+        "{}",
+        out.stdout()
+    );
+}

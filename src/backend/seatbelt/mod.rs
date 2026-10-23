@@ -40,6 +40,13 @@ impl Backend for Seatbelt {
         Probe::Available
     }
 
+    fn try_run(&self) -> Probe {
+        match self.probe() {
+            Probe::Available => wrap::try_run(),
+            refused => refused,
+        }
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             fs: Enforcement::Enforced,
