@@ -83,13 +83,13 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 (Planned::Done(r), true) => output::emit(&json!({
                     "sandbox": r.name.to_string(),
                     "backend": r.backend.to_string(),
-                    "template": r.template.to_string(),
+                    "template": r.created_from.to_string(),
                     "policy_version": 1,
                     "proxy_port": r.proxy_port,
                 })),
                 (Planned::Done(r), false) => println!(
                     "Created sandbox {} ({}, template {}), policy v1, proxy port {}.\nConnect with `enclos connect {}`.",
-                    r.name, r.backend, r.template, r.proxy_port, r.name
+                    r.name, r.backend, r.created_from, r.proxy_port, r.name
                 ),
             }
         }

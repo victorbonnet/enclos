@@ -139,7 +139,7 @@ impl SqliteStateStore {
         Ok(SandboxRecord {
             name: name.parse().map_err(|e| corrupt(format!("{e}")))?,
             backend: backend.parse().map_err(|e| corrupt(format!("{e}")))?,
-            template: template.parse().map_err(|e| corrupt(format!("{e}")))?,
+            created_from: template.parse().map_err(|e| corrupt(format!("{e}")))?,
             proxy_port: u16::try_from(proxy_port)
                 .map_err(|_| corrupt(format!("proxy_port {proxy_port}")))?,
             runtime: runtime
@@ -203,7 +203,7 @@ fn insert_sandbox(
             state,
             reason,
             rec.created_at.to_string(),
-            rec.template.as_str(),
+            rec.created_from.as_str(),
             rec.proxy_port,
             rec.runtime.map(|a| a.as_str())
         ],

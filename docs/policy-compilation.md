@@ -58,7 +58,7 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
 | 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `mcp-only` and `assistant` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
-| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is refused |
+| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is an error (`names no template`) |
 
 **How a layer applies** (`PolicyFile::apply`):
 

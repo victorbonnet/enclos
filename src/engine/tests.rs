@@ -552,7 +552,9 @@ mod compile {
         }
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
-        let inputs = engine.probe_inputs(&name, &ctx, None, None).unwrap();
+        let inputs = engine
+            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
         assert_eq!(
@@ -761,7 +763,7 @@ mod sandbox {
         let first = SandboxRecord {
             name: "lab".parse().unwrap(),
             backend: BackendKind::Seatbelt,
-            template: "assistant".parse().unwrap(),
+            created_from: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
             runtime: None,
@@ -1093,6 +1095,33 @@ mod sandbox {
         assert!(!engine.layout.sandbox_dir("lab").exists());
     }
 
+    /// A dry run says a `policy.toml` kept in the sandbox's folder is
+    /// written again, and refuses one the create could not read.
+    #[test]
+    fn a_dry_run_create_says_what_it_does_with_a_kept_folder() {
+        let (_dir, engine, _) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        engine.layout.create_sandbox_dirs("lab").unwrap();
+        engine.layout.write_policy("lab", "# kept\n").unwrap();
+        let Planned::DryRun(plan) = engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap()
+        else {
+            panic!("expected a plan")
+        };
+        assert!(
+            plan.changes[1]
+                .starts_with("write its policy.toml again from the `assistant` template"),
+            "{plan:?}"
+        );
+        assert_eq!(engine.layout.read_policy("lab").unwrap(), "# kept\n");
+        let file = engine.layout.policy_file("lab");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        engine
+            .create_sandbox(&alice(), spec("lab"), Confirm::DryRun)
+            .unwrap_err();
+    }
+
     /// `sandbox list` and `show` name the template the active policy is
     /// built on, once `policy.toml` names another than the sandbox was
     /// created from.
@@ -1109,7 +1138,7 @@ mod sandbox {
                 .unwrap(),
         );
         let view = engine.show_sandbox(&name).unwrap();
-        assert_eq!(view.record.template.as_str(), "assistant");
+        assert_eq!(view.record.created_from.as_str(), "assistant");
         assert_eq!(view.template.as_str(), "minimal");
         assert_eq!(
             engine.list_sandboxes().unwrap()[0].template.as_str(),
@@ -1272,7 +1301,7 @@ mod sandbox {
         let lab = SandboxRecord {
             name: "lab".parse().unwrap(),
             backend: BackendKind::Seatbelt,
-            template: "assistant".parse().unwrap(),
+            created_from: "assistant".parse().unwrap(),
             state: SandboxState::Created,
             proxy_port: 1,
             runtime: None,
@@ -1302,7 +1331,7 @@ mod sandbox {
         let work = SandboxRecord {
             name: "work".parse().unwrap(),
             backend: BackendKind::Bubblewrap,
-            template: "coding".parse().unwrap(),
+            created_from: "coding".parse().unwrap(),
             ..lab.clone()
         };
         engine
@@ -4633,6 +4662,29 @@ mod services {
         assert_eq!(said, ["waiting for the gateway of sandbox home to listen…"]);
         assert_eq!(fake.started.borrow().len(), installed);
         assert_eq!(fake.stopped.borrow().len(), stopped);
+    }
+
+    /// A limit no program could start under refuses the start before any
+    /// service is removed or installed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_start_under_a_limit_no_program_could_run_under_installs_nothing() {
+        let (_dir, engine, fake, name) = sandbox_with_services(None);
+        let most = crate::backend::max_files_per_process().unwrap();
+        if most >= 1 << 20 {
+            return;
+        }
+        let before = engine.layout.read_policy(name.as_str()).unwrap();
+        let after = format!("{before}\n[resources]\nopen_files = {}\n", most + 1);
+        done(
+            engine
+                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+                .unwrap(),
+        );
+        let err = engine.start_sandbox(&alice(), &name).unwrap_err();
+        assert!(err.to_string().contains("kern.maxfilesperproc"), "{err}");
+        assert!(fake.started.borrow().is_empty());
+        assert!(fake.stopped.borrow().is_empty());
     }
 
     /// A sandbox started before its runtime was installed: its proxy
