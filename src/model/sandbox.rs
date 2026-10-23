@@ -126,6 +126,8 @@ pub enum SandboxState {
 pub struct SandboxRecord {
     pub name: SandboxName,
     pub backend: BackendKind,
+    /// The template it was created from. Its `policy.toml` may name
+    /// another since; the active policy's inputs say which it is built on.
     pub template: TemplateName,
     pub state: SandboxState,
     /// The sandbox's proxy port on loopback (design §4), reserved when it
