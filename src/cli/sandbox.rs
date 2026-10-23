@@ -79,7 +79,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
                 Planned::Done(r) => println!(
                     "Created sandbox {} ({}, template {}), policy v1, proxy port {}.\nConnect with `enclos connect {}`.",
-                    r.name, r.backend, r.template, r.proxy_port, r.name
+                    r.name, r.backend, r.created_from, r.proxy_port, r.name
                 ),
             }
         }

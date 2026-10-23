@@ -243,7 +243,7 @@ impl Engine {
         Err(Error::NoPolicy {
             sandbox: name.to_string(),
             backend: record.backend.to_string(),
-            template: record.template.to_string(),
+            template: record.created_from.to_string(),
         })
     }
 

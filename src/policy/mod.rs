@@ -308,7 +308,8 @@ mod tests {
     }
 
     /// Under `minimal`, a Hermes sandbox reaches the hosts Hermes needs to
-    /// install, log in and run, and may listen, as the template says.
+    /// install, log in and run, and may listen, as the Hermes adapter's
+    /// layer sets.
     #[test]
     fn minimal_with_hermes_reaches_the_adapter_endpoints() {
         use crate::runtime::RuntimeAdapter;
