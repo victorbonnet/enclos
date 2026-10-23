@@ -100,7 +100,7 @@ impl Engine {
     /// The labels of the sandbox installed now, the proxy last: those this
     /// enclos would install, and any other under the sandbox's prefix, such
     /// as one a runtime no longer declares.
-    fn installed_labels(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    pub(super) fn installed_labels(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
         let mut labels = self.services.installed(&self.label_prefix(name)?)?;
         let proxy = self.label(name, Unit::Proxy)?;
         labels.sort_by_key(|l| (*l == proxy, l.clone()));

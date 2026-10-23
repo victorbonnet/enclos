@@ -10,4 +10,5 @@ pub mod proxy;
 pub mod runtime;
 pub mod sandbox;
 pub mod secret;
+pub mod state;
 pub mod status;
