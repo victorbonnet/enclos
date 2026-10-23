@@ -114,26 +114,34 @@ pub struct Launch {
 }
 
 /// `command` run under `limits`, which every process it starts inherits:
-/// `/bin/bash` sets them with `ulimit`, hard and soft alike, so nothing in
-/// the sandbox can raise them, then becomes the program; one it cannot set
-/// stops the chain, so no program runs without its limits. Bash, not
-/// `/bin/sh`, which macOS lets an administrator point at dash, whose
-/// `ulimit -f` counts in another unit; in privileged mode (`-p`), as it
-/// runs on the host with the sandbox's variables: it then reads no
-/// `BASH_ENV` or `ENV` file, no `SHELLOPTS` and no function from them. As it
-/// is when no limit is set.
+/// `/bin/bash` sets them with `ulimit`, hard and soft alike, so no process
+/// in the sandbox without root can raise them, then becomes the program;
+/// one it cannot set stops it with exit 125 and the field named, so no
+/// program runs without its limits. Only the limits a backend enforces as
+/// written are set: `open_files` (ADR 0033 refuses the others). In
+/// privileged mode (`-p`), as it runs on the host with the sandbox's
+/// variables: it then reads no `BASH_ENV` or `ENV` file, no `SHELLOPTS` and
+/// no function from them. Only `command`'s program and arguments are kept:
+/// set its environment and folder on the result. Returns `command`
+/// unchanged when no limit is set.
 pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) -> Command {
+    debug_assert!(
+        command.get_envs().next().is_none() && command.get_current_dir().is_none(),
+        "set the environment and folder after the limits"
+    );
+    // Every field named, so one added is decided on here.
+    let crate::model::policy::Resources {
+        open_files,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = limits;
     let mut set = Vec::new();
-    if let Some(files) = limits.open_files {
-        set.push(format!("ulimit -n {files}"));
-    }
-    // In KiB, the unit of bash's `ulimit -f` (shown on macOS 26.5.2): the
-    // validation takes only whole KiB.
-    if let Some(size) = limits.file_size {
-        set.push(format!("ulimit -f {}", size.0 / 1024));
-    }
-    if let Some(seconds) = limits.cpu_seconds {
-        set.push(format!("ulimit -t {seconds}"));
+    if let Some(files) = open_files {
+        set.push(format!(
+            "ulimit -n {files} || {{ echo \"enclos: cannot set resources.open_files = {files}\" >&2; exit 125; }}"
+        ));
     }
     if set.is_empty() {
         return command;
@@ -143,10 +151,24 @@ pub fn under_limits(command: Command, limits: &crate::model::policy::Resources) 
     limited
         .arg("-p")
         .arg("-c")
-        .arg(set.join(" && "))
+        .arg(set.join("; "))
         .arg(command.get_program())
         .args(command.get_args());
     limited
+}
+
+/// Why `limits` cannot be set where enclos runs, if they cannot: a limit
+/// above the hard one enclos itself runs under, which no process without
+/// root can raise, would stop every program with it.
+pub fn unsettable(limits: &crate::model::policy::Resources) -> Option<String> {
+    let files = limits.open_files?;
+    let hard = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum;
+    match hard {
+        Some(hard) if files > hard => Some(format!(
+            "resources.open_files = {files} is above the hard limit enclos runs under ({hard}): lower it in the policy, or raise the hard limit of the shell or service manager enclos runs from"
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -186,6 +208,13 @@ pub fn registered() -> Vec<Box<dyn Backend>> {
 mod limits_tests {
     use super::*;
 
+    fn files(n: u64) -> crate::model::policy::Resources {
+        crate::model::policy::Resources {
+            open_files: Some(n),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn limits_are_set_by_the_shell_that_becomes_the_program() {
         let plain = Command::new("/usr/bin/true");
@@ -193,11 +222,12 @@ mod limits_tests {
         assert_eq!(none.get_program(), "/usr/bin/true");
         let mut program = Command::new("/usr/bin/sandbox-exec");
         program.args(["-f", "x.sb", "/bin/zsh"]);
+        // Only what a backend enforces is set; the others are refused
+        // before a policy is stored.
         let limits = crate::model::policy::Resources {
-            open_files: Some(256),
             file_size: Some("1M".parse().unwrap()),
             cpu_seconds: Some(60),
-            ..Default::default()
+            ..files(256)
         };
         let limited = under_limits(program, &limits);
         assert_eq!(limited.get_program(), "/bin/bash");
@@ -207,7 +237,7 @@ mod limits_tests {
             [
                 "-p",
                 "-c",
-                "ulimit -n 256 && ulimit -f 1024 && ulimit -t 60 && exec \"$0\" \"$@\"",
+                "ulimit -n 256 || { echo \"enclos: cannot set resources.open_files = 256\" >&2; exit 125; }; exec \"$0\" \"$@\"",
                 "/usr/bin/sandbox-exec",
                 "-f",
                 "x.sb",
@@ -216,43 +246,51 @@ mod limits_tests {
         );
     }
 
-    /// macOS refuses a file size past what it can hold; Linux takes any
-    /// value, so the case does not arise there.
-    #[cfg(target_os = "macos")]
+    /// A limit above the hard one the shell runs under cannot be set: no
+    /// program runs, and the field is named, with exit 125.
     #[test]
     fn a_limit_that_cannot_be_set_runs_no_program() {
         let mut echo = Command::new("/bin/echo");
         echo.arg("ran");
-        let limits = crate::model::policy::Resources {
-            file_size: Some(crate::model::policy::ByteSize(u64::MAX)),
-            ..Default::default()
-        };
-        let out = under_limits(echo, &limits).output().unwrap();
-        assert!(!out.status.success());
+        let limited = under_limits(echo, &files(200));
+        let out = Command::new("/bin/bash")
+            .arg("-c")
+            .arg("ulimit -n 100 && exec \"$0\" \"$@\"")
+            .arg(limited.get_program())
+            .args(limited.get_args())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(125), "{out:?}");
         assert!(!String::from_utf8_lossy(&out.stdout).contains("ran"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot set resources.open_files = 200"),
+            "{out:?}"
+        );
     }
 
+    /// The shell reads nothing from the sandbox's variables: no startup
+    /// file, no option, and no function, such as one named `ulimit` that
+    /// would set no limit.
     #[test]
-    fn the_shell_reads_no_startup_file_or_option_from_the_environment() {
+    fn the_shell_reads_no_startup_file_option_or_function_from_the_environment() {
         let dir = tempfile::tempdir().unwrap();
         let startup = dir.path().join("startup.sh");
         let touched = dir.path().join("touched");
         std::fs::write(&startup, format!("touch {}\n", touched.display())).unwrap();
-        let mut echo = Command::new("/bin/echo");
-        echo.arg("ran");
-        let limits = crate::model::policy::Resources {
-            open_files: Some(256),
-            ..Default::default()
-        };
-        let mut limited = under_limits(echo, &limits);
+        // Read by a shell that imports no function either: the limit the
+        // wrapper set.
+        let mut sh = Command::new("/bin/bash");
+        sh.args(["-p", "-c", "ulimit -Hn"]);
+        let mut limited = under_limits(sh, &files(256));
         limited
             .env_clear()
             .env("BASH_ENV", &startup)
             .env("ENV", &startup)
-            .env("SHELLOPTS", "xtrace");
+            .env("SHELLOPTS", "xtrace")
+            .env("BASH_FUNC_ulimit%%", "() { :; }");
         let out = limited.output().unwrap();
         assert!(out.status.success(), "{out:?}");
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "ran\n");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "256\n");
         assert!(!touched.exists(), "the shell ran a startup file");
         assert!(
             out.stderr.is_empty(),
@@ -261,28 +299,37 @@ mod limits_tests {
         );
     }
 
-    /// Each probe's script, run under the limit it checks, is closed (it
+    /// The probe's own script, run under the limit it checks, is closed (it
     /// fails); under one higher, open.
     #[test]
     fn a_probe_is_closed_under_its_limit_and_open_above_it() {
-        let probe = |flag: &str, limit: u64, under: crate::model::policy::Resources| {
+        let probe = |limit: u64, under: u64| {
             let mut sh = Command::new("/bin/sh");
-            sh.arg("-c").arg(format!(
-                "test \"$(ulimit {flag})\" = unlimited || test \"$(ulimit {flag})\" -gt {limit}"
-            ));
-            under_limits(sh, &under).status().unwrap().success()
+            sh.arg("-c").arg(crate::probes::limit_script("-Hn", limit));
+            under_limits(sh, &files(under)).status().unwrap().success()
         };
-        let files = |n| crate::model::policy::Resources {
-            open_files: Some(n),
-            ..Default::default()
-        };
-        assert!(!probe("-Hn", 64, files(64)), "closed at the limit");
-        assert!(probe("-Hn", 63, files(64)), "open above it");
-        let cpu = |n| crate::model::policy::Resources {
-            cpu_seconds: Some(n),
-            ..Default::default()
-        };
-        assert!(!probe("-Ht", 600, cpu(600)));
-        assert!(probe("-Ht", 599, cpu(600)));
+        assert!(!probe(64, 64), "closed at the limit");
+        assert!(probe(63, 64), "open above it");
+    }
+
+    /// Why Seatbelt refuses `cpu_seconds` (ADR 0033): a process that
+    /// ignores SIGXCPU runs on past its CPU time. This test's own child,
+    /// ended by it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_that_ignores_sigxcpu_runs_past_its_cpu_time() {
+        let mut child = Command::new("/bin/bash")
+            .args([
+                "-p",
+                "-c",
+                "ulimit -t 1 && trap '' XCPU && exec /usr/bin/perl -e '1 while 1'",
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(running, "a process ignoring SIGXCPU was held to 1 s of CPU");
     }
 }

@@ -34,6 +34,10 @@ pub struct SandboxSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxView {
     pub record: SandboxRecord,
+    /// The template the active policy is built on, which `policy.toml` may
+    /// have changed since the sandbox was created from
+    /// [`SandboxRecord::template`]; that one when it has no active policy.
+    pub template: TemplateName,
     pub policy: Option<PolicyVersion>,
     /// The change waiting for a restart, if any (design §7).
     pub pending: Option<PendingPolicy>,
@@ -113,6 +117,11 @@ impl Engine {
             });
         }
         if confirm == Confirm::DryRun {
+            // What the create would refuse, a dry run refuses too: the
+            // backend, and the template as it resolves and is checked.
+            self.backend_for(&spec.name, spec.backend)?;
+            let overrides = policy::initial_overrides(spec.name.as_str(), &spec.template);
+            self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
             return Ok(Planned::DryRun(Plan {
                 create: vec![self.layout.sandbox_home(spec.name.as_str())],
                 changes: vec![format!(
@@ -141,8 +150,8 @@ impl Engine {
                 let name = spec.name.as_str();
                 self.backend_for(&spec.name, spec.backend)?;
                 let overrides = policy::initial_overrides(name, &spec.template);
-                let snapshot = self.checked_policy_with(&spec.name, &overrides, None)?;
-                crate::policy::validate::validate_resources(&snapshot.policy, spec.backend)?;
+                let snapshot =
+                    self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
                 let record = SandboxRecord {
                     name: spec.name.clone(),
                     backend: spec.backend,
@@ -269,7 +278,12 @@ impl Engine {
     }
 
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
-        let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
+        let active = self.state.active_policy(&record.name)?;
+        let template = active.as_ref().map_or_else(
+            || record.template.clone(),
+            |(_, snapshot)| snapshot.inputs.template.clone(),
+        );
+        let policy = active.map(|(v, _)| v);
         let pending = self.state.pending_policy(&record.name)?.map(|(p, _)| p);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
@@ -289,6 +303,7 @@ impl Engine {
             .collect::<Result<_>>()?;
         Ok(SandboxView {
             record,
+            template,
             policy,
             pending,
             policy_refused: compile_refused(&compiled),

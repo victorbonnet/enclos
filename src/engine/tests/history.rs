@@ -241,7 +241,8 @@ fn with_adapter(engine: &Engine, name: &SandboxName, older: AdapterLayer) {
                 record.runtime = Some(RuntimeKind::Hermes);
                 engine.state.put(lock, &record)?;
                 let text = engine.layout.read_policy(name.as_str())?;
-                let snapshot = engine.checked_policy_with(name, &text, Some(older))?;
+                let snapshot =
+                    engine.checked_policy_with(name, &text, Some(older), BackendKind::Seatbelt)?;
                 engine.store_policy(lock, &alice(), name, &text, &snapshot, None)
             },
         )
