@@ -1046,7 +1046,12 @@ fn closed(proxy: &Running) -> NetEvent {
 fn closed_soon(conn: &mut TcpStream) -> Vec<u8> {
     let started = Instant::now();
     let mut rest = Vec::new();
-    conn.read_to_end(&mut rest).unwrap();
+    // A proxy that closes while the client still sends resets it: closed too.
+    match conn.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("{e}"),
+    }
     assert!(started.elapsed() < Duration::from_secs(2), "not closed");
     rest
 }
@@ -1328,13 +1333,20 @@ fn a_hello_that_never_ends_is_closed_at_the_cap() {
     let (port, received) = upstream(b"pong");
     let proxy = api(port);
     let mut conn = tunnel(&proxy, "api.example.com", port);
-    // A handshake that says it is 16 MiB long, then zeros.
-    conn.write_all(&[0x16, 3, 1, 0xff, 0xff, 0x01, 0xff, 0xff, 0xff])
-        .unwrap();
-    let chunk = [0u8; 4096];
-    let mut sent = 9;
-    while sent < 70 * 1024 && conn.write_all(&chunk).is_ok() {
-        sent += chunk.len();
+    // A handshake that says it is 16 MiB long, in records of 16 KiB that
+    // each fit: the proxy holds them until 64 KiB came.
+    let record = |first: bool| {
+        let mut bytes = vec![0x16, 3, 1, 0x40, 0x00];
+        let mut body = vec![0u8; 16 * 1024];
+        if first {
+            body[..4].copy_from_slice(&[0x01, 0xff, 0xff, 0xff]);
+        }
+        bytes.extend_from_slice(&body);
+        bytes
+    };
+    let mut sent = 0;
+    while sent < 70 * 1024 && conn.write_all(&record(sent == 0)).is_ok() {
+        sent += 16 * 1024 + 5;
     }
     closed_soon(&mut conn);
     assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
