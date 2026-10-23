@@ -63,12 +63,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         }
     };
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
-        Planned::DryRun(plan) if output::json() => {
-            output::emit(&output::plan(&plan));
-            return Ok(exit::OK);
-        }
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
@@ -180,12 +176,8 @@ fn configure(
         });
     }
     let set = match engine.configure_channel(by, &sandbox, channel, token, answers, confirm)? {
-        Planned::DryRun(plan) if output::json() => {
-            output::emit(&output::plan(&plan));
-            return Ok(exit::OK);
-        }
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(set) => set,

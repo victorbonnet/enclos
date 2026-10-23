@@ -79,10 +79,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 confirm,
             )?;
             match (planned, output::json()) {
-                (Planned::DryRun(plan), true) => output::emit(&output::plan(&plan)),
-                (Planned::DryRun(plan), false) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."))
-                }
+                (Planned::DryRun(plan), _) => output::show_plan(&plan),
                 (Planned::Done(r), true) => output::emit(&json!({
                     "sandbox": r.name.to_string(),
                     "backend": r.backend.to_string(),
@@ -113,28 +110,32 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             if !output::json() {
                 print_show(&view);
             }
-            let more = || -> Result<_> {
-                let services = engine.service_status(&name)?;
-                // Agents are the runtime's: nothing to list without one.
-                let agents = match engine.runtime(&name)?.is_some() {
+            // Agents are the runtime's: nothing to list without one.
+            let agents = || -> Result<_> {
+                Ok(match engine.runtime(&name)?.is_some() {
                     true => Some((
                         engine.agents(&name)?,
                         super::agent::check_notes(engine, &name, true)?,
                     )),
                     false => None,
-                };
-                Ok((services, agents))
+                })
             };
             if output::json() {
                 let mut shown = show_json(&view);
-                let code = match more() {
-                    Ok((services, agents)) => {
-                        shown["services"] = json!(
-                            services
-                                .iter()
-                                .map(|(label, status)| ServiceLine::new(label, status.clone()))
-                                .collect::<Vec<_>>()
-                        );
+                for field in ["services", "agents", "notes"] {
+                    shown[field] = Value::Null;
+                }
+                let read = engine.service_status(&name).and_then(|services| {
+                    shown["services"] = json!(
+                        services
+                            .iter()
+                            .map(|(label, status)| ServiceLine::new(label, status.clone()))
+                            .collect::<Vec<_>>()
+                    );
+                    agents()
+                });
+                let (code, shown) = match read {
+                    Ok(agents) => {
                         shown["agents"] = match &agents {
                             Some((agents, _)) => {
                                 agents.iter().map(|a| json!(a.name.to_string())).collect()
@@ -145,21 +146,15 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                             .as_ref()
                             .map_or_else(Vec::new, |(_, notes)| notes.clone())
                             .into();
-                        exit::OK
+                        (exit::OK, shown)
                     }
-                    Err(e) => {
-                        let code = e.exit_code();
-                        for field in ["services", "agents", "notes"] {
-                            shown[field] = Value::Null;
-                        }
-                        shown["error"] = output::error(&e, code)["error"].clone();
-                        code
-                    }
+                    Err(e) => output::with_failure(shown, &e),
                 };
                 output::emit(&shown);
                 return Ok(code);
             }
-            let (services, agents) = more()?;
+            let services = engine.service_status(&name)?;
+            let agents = agents()?;
             for (label, status) in services {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
@@ -206,8 +201,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
         }
         SandboxVerb::Rm { name, keep_data } => {
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
-                Planned::DryRun(plan) if output::json() => output::emit(&output::plan(&plan)),
-                Planned::DryRun(plan) => plan.changes.iter().for_each(|c| println!("Would {c}.")),
+                Planned::DryRun(plan) => output::show_plan(&plan),
                 Planned::Done(left) => {
                     // Removed, but not all of it: a script must see that.
                     let code = match left.is_empty() {
@@ -437,8 +431,9 @@ fn each(
     Ok(code)
 }
 
-/// [`each`], with its document: in text, a failure is said on stderr as it
-/// happens and the document is not printed.
+/// [`each`] without printing: returns the code and the document; with
+/// `json` false, each failure of `verb` is also said on stderr as it
+/// happens.
 fn each_into(
     names: &[SandboxName],
     known: impl Fn(&SandboxName) -> Result<()>,
@@ -463,9 +458,7 @@ fn each_into(
                 code
             }
             Err(e) => {
-                let code = e.exit_code();
-                let mut failed = output::error(&e, code);
-                failed["sandbox"] = json!(name.to_string());
+                let (code, failed) = output::with_failure(json!({"sandbox": name.to_string()}), &e);
                 results.push(failed);
                 if !json {
                     eprintln!("error: {e}");
@@ -485,8 +478,11 @@ fn each_into(
 fn start(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<(u8, Value)> {
     if confirm == Confirm::DryRun {
         let labels = engine.service_labels(name)?;
-        print_would_start(name, &labels);
-        return Ok((exit::OK, would_start_json(name, &labels)));
+        let plan = Plan {
+            changes: would_start(name, &labels),
+            ..Plan::default()
+        };
+        return Ok((exit::OK, planned_start(name, &plan, &labels)));
     }
     print_started(engine, name, &engine.start_sandbox(by, name)?)
 }
@@ -512,16 +508,11 @@ fn restart(
     confirm: Confirm,
 ) -> Result<(u8, Value)> {
     match engine.stop_sandbox(by, name, confirm)? {
-        Planned::DryRun(plan) => {
+        Planned::DryRun(mut plan) => {
+            // One plan: the stop's changes, then the start's.
             let labels = engine.service_labels(name)?;
-            if !output::json() {
-                plan.changes.iter().for_each(|c| println!("Would {c}."));
-            }
-            print_would_start(name, &labels);
-            let mut planned = output::plan(&plan);
-            planned["sandbox"] = json!(name.to_string());
-            planned["would_start"] = would_start_json(name, &labels)["would_start"].clone();
-            Ok((exit::OK, planned))
+            plan.changes.extend(would_start(name, &labels));
+            Ok((exit::OK, planned_start(name, &plan, &labels)))
         }
         Planned::Done(report) => match print_stop(name, &report) {
             (exit::OK, stopped) => {
@@ -534,13 +525,10 @@ fn restart(
                         Ok((code, started))
                     }
                     // Stopped, then not started: in JSON, both are said.
-                    Err(e) if output::json() => {
-                        let code = e.exit_code();
-                        let mut failed = output::error(&e, code);
-                        failed["sandbox"] = json!(name.to_string());
-                        failed["stop"] = stopped;
-                        Ok((code, failed))
-                    }
+                    Err(e) if output::json() => Ok(output::with_failure(
+                        json!({"sandbox": name.to_string(), "stop": stopped}),
+                        &e,
+                    )),
                     Err(e) => Err(e),
                 }
             }
@@ -571,11 +559,13 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
             }))
         }).collect::<Vec<_>>(),
     });
+    // The same words in text and in JSON.
+    let what_now = format!(
+        "End them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses."
+    );
     let survivors = report.survivors.iter().map(|(_, s)| s.len()).sum::<usize>();
     let value = output::with_error(value, code, || {
-        format!(
-            "sandbox {name} is marked failed: {survivors} processes survived stop; end them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses"
-        )
+        format!("sandbox {name} is marked failed: {survivors} processes survived stop. {what_now}")
     });
     if output::json() {
         return (code, value);
@@ -606,9 +596,7 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
             );
         }
     }
-    eprintln!(
-        "End them, then run `enclos sandbox stop {name}` again; until then `enclos sandbox rm {name}` refuses."
-    );
+    eprintln!("{what_now}");
     (code, value)
 }
 
@@ -620,57 +608,68 @@ fn would_start(name: &SandboxName, labels: &[ServiceLabel]) -> Vec<String> {
         .collect()
 }
 
-/// A start's dry run, as a plan with the services it would start.
-fn would_start_json(name: &SandboxName, labels: &[ServiceLabel]) -> Value {
-    let mut planned = output::plan(&Plan {
-        changes: would_start(name, labels),
-        ..Plan::default()
-    });
+/// A dry run of a start or a restart: in text, its `Would …` lines; for
+/// JSON, the plan with the sandbox and the services it would start.
+fn planned_start(name: &SandboxName, plan: &Plan, labels: &[ServiceLabel]) -> Value {
+    if !output::json() {
+        plan.changes.iter().for_each(|c| println!("Would {c}."));
+    }
+    let mut planned = output::plan(plan);
     planned["sandbox"] = json!(name.to_string());
     planned["would_start"] = labels.iter().map(ToString::to_string).collect();
     planned
 }
 
-fn print_would_start(name: &SandboxName, labels: &[ServiceLabel]) {
-    if output::json() {
-        return;
-    }
-    for change in would_start(name, labels) {
-        println!("Would {change}.");
-    }
-}
-
 /// Reports the services installed, once the proxy runs: the services start
-/// on their own, and a proxy whose port is taken never does.
+/// on their own, and a proxy whose port is taken never does. Returns its
+/// code and, for JSON, the start; the services are said installed even
+/// when whether the proxy started cannot be checked.
 pub(super) fn print_started(
     engine: &Engine,
     name: &SandboxName,
     labels: &[ServiceLabel],
 ) -> Result<(u8, Value)> {
-    let started = engine.proxy_started(name, PROXY_WAIT)?;
-    let value = json!({
+    let mut value = json!({
         "sandbox": name.to_string(),
         "services": labels.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "proxy_started": started,
+        "proxy_started": null,
     });
-    let code = match started {
-        true => exit::OK,
-        false => exit::ERROR,
-    };
-    let value = output::with_error(value, code, || {
-        format!(
-            "the proxy of sandbox {name} has not started after {} seconds; see `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`",
-            PROXY_WAIT.as_secs()
-        )
-    });
-    if output::json() {
-        return Ok((code, value));
-    }
-    let labels = labels
+    let shown = labels
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let started = match engine.proxy_started(name, PROXY_WAIT) {
+        Ok(started) => started,
+        Err(e) => {
+            let e = enclos::error::Error::WithContext {
+                what: format!(
+                    "the services of sandbox {name} are installed, and are tried again at each login until `enclos sandbox stop {name}`; whether its proxy started could not be checked: {e}"
+                ),
+                error: Box::new(e),
+            };
+            if output::json() {
+                return Ok(output::with_failure(value, &e));
+            }
+            println!("Installed the services of sandbox {name}: {shown}.");
+            return Err(e);
+        }
+    };
+    value["proxy_started"] = json!(started);
+    let code = match started {
+        true => exit::OK,
+        false => exit::ERROR,
+    };
+    // The same words in text and in JSON.
+    let not_started = format!(
+        "the proxy of sandbox {name} has not started after {} seconds. See `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`",
+        PROXY_WAIT.as_secs()
+    );
+    let value = output::with_error(value, code, || not_started.clone());
+    if output::json() {
+        return Ok((code, value));
+    }
+    let labels = shown;
     if started {
         println!("Started sandbox {name} in the background: {labels}.");
         println!(
@@ -679,10 +678,7 @@ pub(super) fn print_started(
         return Ok((code, value));
     }
     println!("Installed the services of sandbox {name}: {labels}.");
-    eprintln!(
-        "error: the proxy of sandbox {name} has not started after {} seconds. See `enclos logs {name}` and `enclos sandbox show {name}`; the services stay installed and are tried again until `enclos sandbox stop {name}`.",
-        PROXY_WAIT.as_secs()
-    );
+    eprintln!("error: {not_started}.");
     Ok((code, value))
 }
 

@@ -74,12 +74,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 None => engine.add_agent(by, &sandbox, agent, confirm)?,
             };
             let added = match planned {
-                Planned::DryRun(plan) if output::json() => {
-                    output::emit(&output::plan(&plan));
-                    return Ok(exit::OK);
-                }
                 Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    output::show_plan(&plan);
                     return Ok(exit::OK);
                 }
                 Planned::Done(added) => added,
@@ -214,12 +210,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
         AgentVerb::Rm { agent, keep_data } => {
             let AgentTarget { sandbox, agent } = agent;
             let removed = match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
-                Planned::DryRun(plan) if output::json() => {
-                    output::emit(&output::plan(&plan));
-                    return Ok(exit::OK);
-                }
                 Planned::DryRun(plan) => {
-                    plan.changes.iter().for_each(|c| println!("Would {c}."));
+                    output::show_plan(&plan);
                     return Ok(exit::OK);
                 }
                 Planned::Done(removed) => removed,

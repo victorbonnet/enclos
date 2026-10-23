@@ -23,9 +23,10 @@ struct Cli {
     #[arg(long, global = true)]
     yes: bool,
     /// Print JSON, the result or the error, also in a terminal; the default
-    /// when stdout is piped. `connect` and `exec` keep their command's
-    /// output and give only enclos's own messages as JSON, on stderr; `logs`
-    /// prints JSON Lines.
+    /// when stdout is piped, except for `connect`, `exec` and `logs`. With
+    /// it, `connect` and `exec` keep their command's output on stdout and
+    /// give enclos's own messages as JSON lines on stderr (a dry run's plan
+    /// is JSON on stdout); `logs` prints JSON Lines.
     #[arg(long, global = true)]
     json: bool,
     /// Print readable text, also when the output is piped; --json wins.
@@ -109,9 +110,11 @@ fn main() -> ExitCode {
     if cli::output::choose(&name, cli.json, cli.text) == Output::Document {
         cli::output::keep_stdout_for_the_document();
     }
-    if ends_on_closed_output(&cli.command) {
+    if ends_on_closed_output(&cli.command) && cli::output::output() == Output::Text {
         // Without it, the print after the reader left panics. Should the
-        // handler not install, that is still what happens.
+        // handler not install, that is still what happens. Not for a JSON
+        // document: its write fails instead, and `written` says what the
+        // command did.
         let _ = signal_hook::flag::register_conditional_default(
             signal_hook::consts::SIGPIPE,
             Arc::new(AtomicBool::new(true)),
@@ -183,9 +186,15 @@ fn written(code: u8, exec: bool) -> u8 {
         exit::OK => "the command itself succeeded".to_owned(),
         code => format!("the command itself failed, with exit code {code}"),
     };
-    say(&format!(
-        "error: cannot write the JSON document ({e}); {did}"
-    ));
+    let message = format!("cannot write the JSON document ({e}); {did}");
+    match cli::output::output() {
+        // enclos's own words are JSON on stderr there.
+        cli::output::Output::OnStderr => say(&cli::output::line(&cli::output::error_text(
+            &message,
+            code.max(exit::ERROR),
+        ))),
+        _ => say(&format!("error: {message}")),
+    }
     match exec {
         true => exit::EXEC_FAILED,
         false => code.max(exit::ERROR),
@@ -264,8 +273,9 @@ fn run(cli: Cli) -> Result<u8> {
     }
 }
 
-/// Whether a reader that left early, as `head` does, ends `command` as it
-/// ends any Unix tool, by SIGPIPE, not by a panic on the next print. Not for
+/// Whether a reader that left early, as `head` does, ends `command`'s text
+/// as it ends any Unix tool, by SIGPIPE, not by a panic on the next print.
+/// In JSON the document's write fails instead, and the command says so. Not for
 /// those that run the user's or a runtime's programs (`connect`, `runtime`,
 /// `agent`), keep running (`proxy`, `launch`), or handle a closed output
 /// themselves (`logs`).
@@ -529,6 +539,20 @@ mod tests {
         let names: Vec<&str> = cli.get_subcommands().map(|c| c.get_name()).collect();
         for word in super::cli::output::RUNS_A_PROGRAM {
             assert!(names.contains(&word), "{word} is no command");
+        }
+    }
+
+    /// No argument before the command takes a value, so its first word that
+    /// is not a flag is the command, as `command_word` reads it.
+    #[test]
+    fn no_global_argument_takes_a_value() {
+        let cli = Cli::command();
+        for arg in cli.get_arguments() {
+            assert!(
+                !arg.get_action().takes_values(),
+                "--{} takes a value: `command_word` would read it as the command",
+                arg.get_id()
+            );
         }
     }
 

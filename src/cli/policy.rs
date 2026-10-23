@@ -94,7 +94,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
             return Ok(
                 match engine.policy_test(by, &sandbox, host_services, confirm)? {
                     Planned::DryRun(plan) => {
-                        print_plan(&plan);
+                        output::show_plan(&plan);
                         exit::OK
                     }
                     Planned::Done(report) if output::json() => {
@@ -132,7 +132,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
         PolicyVerb::Apply { sandbox } => {
             return match engine.policy_apply(by, &sandbox, confirm)? {
                 Planned::DryRun(plan) => {
-                    print_plan(&plan);
+                    output::show_plan(&plan);
                     Ok(exit::OK)
                 }
                 Planned::Done(restarted) => {
@@ -184,13 +184,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
 }
 
 /// A dry run's plan: one JSON document, or each change as `Would ….`.
-fn print_plan(plan: &enclos::model::plan::Plan) {
-    match output::json() {
-        true => output::emit(&output::plan(plan)),
-        false => plan.changes.iter().for_each(|c| println!("Would {c}.")),
-    }
-}
-
 fn version_json(v: &PolicyVersion) -> Value {
     json!({
         "version": v.version,
@@ -295,11 +288,11 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
     })
 }
 
-/// Why a change that restarted the sandbox exits 1: its stop or its start
-/// failed, as its `restarted` field says.
+/// Why a change that restarted the sandbox fails: its stop or its start
+/// failed, as `restarted` says.
 fn restart_failed(sandbox: &SandboxName) -> String {
     format!(
-        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as its `restarted` field says; `enclos sandbox show {sandbox}` shows where it is"
+        "the restart of sandbox {sandbox} did not complete: its stop or its start failed, as `restarted` says (under `outcome` for a change other than `policy apply`); `enclos sandbox show {sandbox}` shows where it is"
     )
 }
 
@@ -436,7 +429,7 @@ fn print_allowed(
 ) -> Result<u8> {
     let applied = match planned {
         Planned::DryRun(plan) => {
-            print_plan(&plan);
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(applied) => applied,
@@ -538,10 +531,7 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
         true => (exit::OK, Value::Null),
         false => match super::sandbox::print_started(engine, sandbox, &r.started) {
             Ok(started) => started,
-            Err(e) if output::json() => {
-                let code = e.exit_code();
-                (code, output::error(&e, code))
-            }
+            Err(e) if output::json() => output::with_failure(json!({}), &e),
             Err(e) => return Err(e),
         },
     };
@@ -639,7 +629,7 @@ fn print_replaced(
 ) -> Result<u8> {
     let applied = match planned {
         Planned::DryRun(plan) => {
-            print_plan(&plan);
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(applied) => applied,
@@ -679,7 +669,7 @@ fn print_replaced(
 fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
     let discarded = match planned {
         Planned::DryRun(plan) => {
-            print_plan(&plan);
+            output::show_plan(&plan);
             return;
         }
         Planned::Done(d) => d,
@@ -798,10 +788,14 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
         // Recorded before it failed (a restart with --yes, say): the edit
         // is the file now, and keeping it would only open it again.
         Err(e) if std::fs::read_to_string(&file).is_ok_and(|now| now == after) => {
-            for said in forget_edit(&files) {
-                if output::json() {
-                    output::note(&said);
-                }
+            let left = forget_edit(&files);
+            // In JSON, what was left goes with the error, as `edit_left`
+            // goes with a document.
+            if output::json() && !left.is_empty() {
+                return Err(Error::WithContext {
+                    what: format!("{e}; {}", left.join("; ")),
+                    error: Box::new(e),
+                });
             }
             return Err(e);
         }
@@ -845,7 +839,8 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
 
 /// Removes the copy `policy edit` edited and its base, saying so when it
 /// cannot, in text: the next `policy edit` would open it again. Returns
-/// what it says, or in JSON would say, for the document to carry.
+/// what it says, or in JSON would say, for the caller to carry in its
+/// document or its error.
 fn forget_edit(files: &EditFiles) -> Vec<String> {
     let mut left = Vec::new();
     for path in [&files.copy, &files.base] {

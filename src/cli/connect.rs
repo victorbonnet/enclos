@@ -46,12 +46,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
     start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.connect(by, &args.sandbox, args.command, confirm)? {
         // Nothing runs on a dry run: with --json, its plan is the document.
-        Planned::DryRun(plan) if super::output::json() => {
-            super::output::emit(&super::output::plan(&plan));
-            return Ok(exit::OK);
-        }
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            super::output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
@@ -65,12 +61,8 @@ pub fn exec(engine: &Engine, by: &Actor, confirm: Confirm, args: ExecArgs) -> Re
     start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.exec(by, &args.sandbox, args.command, confirm)? {
         // Nothing runs on a dry run: with --json, its plan is the document.
-        Planned::DryRun(plan) if super::output::json() => {
-            super::output::emit(&super::output::plan(&plan));
-            return Ok(exit::OK);
-        }
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            super::output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
