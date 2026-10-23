@@ -212,6 +212,9 @@ mod limits_tests {
         );
     }
 
+    /// macOS refuses a file size past what it can hold; Linux takes any
+    /// value, so the case does not arise there.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_limit_that_cannot_be_set_runs_no_program() {
         let mut echo = Command::new("/bin/echo");
