@@ -18,6 +18,9 @@ pub const IN_TERMINAL: &str = "ENCLOS_FAKE_IN_TERMINAL";
 /// port it was given (`Launch::service_port`, ADR 0028): the port, or `none`.
 pub const SERVICE_PORT: &str = "ENCLOS_FAKE_SERVICE_PORT";
 
+/// The name of a path the fake refuses to compile a write to.
+pub const UNCOMPILABLE: &str = "uncompilable";
+
 pub struct FakeBackend {
     kind: BackendKind,
     probe: Probe,
@@ -37,7 +40,7 @@ impl FakeBackend {
 
     /// A fake that stands in for `kind`, is there, and refuses to run a
     /// program for `reason`, as Seatbelt does in a process already in a
-    /// sandbox whose policy has a rule.
+    /// sandbox whose policy has a deny rule (macOS 26.5.2).
     pub fn refuses_to_run(kind: BackendKind, reason: &str) -> Self {
         FakeBackend {
             kind,
@@ -85,8 +88,16 @@ impl Backend for FakeBackend {
         }
     }
 
-    /// One line per grant, so tests can see what reached the backend.
+    /// One line per grant, so tests can see what reached the backend. A
+    /// write to a path named [`UNCOMPILABLE`] is refused, as a backend
+    /// refuses what it cannot hold.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
+        if let Some(w) = policy.fs.write.iter().find(|w| w.ends_with(UNCOMPILABLE)) {
+            return Err(CompileError::Unsupported {
+                backend: self.kind,
+                reason: format!("the fake cannot compile a write to {w}"),
+            });
+        }
         let mut text = format!("fake policy for {}\n", ctx.name);
         for w in &policy.fs.write {
             text.push_str(&format!("write {w}\n"));

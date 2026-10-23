@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
-use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore};
+use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore, UnreadableRecord};
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
@@ -321,6 +321,29 @@ impl StateStore for SqliteStateStore {
         let mut records = Vec::new();
         while let Some(row) = rows.next().map_err(self.sqlite_err())? {
             records.push(self.sandbox_row(row)?);
+        }
+        Ok(records)
+    }
+
+    fn list_each(&self) -> Result<Vec<std::result::Result<SandboxRecord, UnreadableRecord>>> {
+        let conn = self.open()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, backend, state, failed_reason, created_at, template, proxy_port, runtime
+                 FROM sandboxes ORDER BY name",
+            )
+            .map_err(self.sqlite_err())?;
+        let mut rows = stmt.query([]).map_err(self.sqlite_err())?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().map_err(self.sqlite_err())? {
+            records.push(match self.sandbox_row(row) {
+                Ok(record) => Ok(record),
+                Err(error @ StateError::Corrupt { .. }) => Err(UnreadableRecord {
+                    name: row.get::<_, String>(0).map_err(self.sqlite_err())?,
+                    error,
+                }),
+                Err(e) => return Err(e),
+            });
         }
         Ok(records)
     }

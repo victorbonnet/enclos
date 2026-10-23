@@ -2874,6 +2874,12 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
         "{}",
         out.stdout()
     );
+    // The repair said is that sandbox's alone.
+    assert!(
+        out.stdout().contains("`enclos state repair home` fixes"),
+        "{}",
+        out.stdout()
+    );
     let out = home.run(&["state", "repair", "--dry-run"]);
     assert!(
         out.ok()
@@ -2909,6 +2915,22 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
     let out = home.run(&["state", "check", "nosuch"]);
     assert_eq!(out.code(), 1);
     assert!(!out.stdout().contains("match the host"), "{}", out.stdout());
+
+    // A repair that fails is said so, and exits 1.
+    std::fs::create_dir(home.root.join("sandboxes/home/home")).unwrap();
+    std::fs::remove_file(&policy).unwrap();
+    let dir = home.root.join("sandboxes/home");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = home.run(&["state", "repair"]);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout()
+            .contains("  repair failed: write policy.toml again"),
+        "{}",
+        out.stdout()
+    );
+    assert!(!out.stdout().contains("repaired:"), "{}", out.stdout());
 }
 
 /// `doctor` runs a program in Seatbelt, checks each sandbox's next session,
@@ -3002,8 +3024,9 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
     );
 }
 
-/// In a sandbox with any rule, as every enclos sandbox has, macOS refuses
-/// Seatbelt to the programs it runs, and doctor says so.
+/// In a sandbox whose policy has a deny rule, as every enclos sandbox's
+/// has, macOS refuses Seatbelt to the programs it runs (exit 71), and doctor
+/// says so.
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
@@ -3026,6 +3049,7 @@ fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
         "{stdout}"
     );
     assert!(stdout.contains("Operation not permitted"), "{stdout}");
+    assert!(stdout.contains("exit status: 71"), "{stdout}");
 }
 
 /// Piped, each command prints one JSON document: its result, or its error

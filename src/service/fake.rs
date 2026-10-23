@@ -20,6 +20,8 @@ pub struct FakeServices {
     /// unit ends and reaps them, as launchd's `bootout` waits for the job
     /// to exit.
     pub jobs: RefCell<Vec<(ServiceLabel, std::process::Child)>>,
+    /// Listing the installed units fails, as when launchd does not answer.
+    pub refuse_installed: RefCell<bool>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -86,6 +88,11 @@ impl ServiceManager for FakeServices {
     }
 
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
+        if *self.refuse_installed.borrow() {
+            return Err(ServiceError {
+                what: "the service manager did not answer".into(),
+            });
+        }
         Ok(self
             .started
             .borrow()
