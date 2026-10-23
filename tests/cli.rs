@@ -2551,6 +2551,7 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
 
 /// `state check` finds nothing in a new sandbox, names what differs once a
 /// file is gone, and `state repair` puts it back.
+#[cfg(target_os = "macos")]
 #[test]
 fn state_check_and_repair_compare_the_records_with_the_host() {
     let home = Home::new();

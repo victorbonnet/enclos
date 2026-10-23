@@ -6647,4 +6647,6 @@ mod exec;
 mod history;
 mod pending;
 mod secrets;
+// `state check` lists program files with `lsof`, which only macOS has here.
+#[cfg(target_os = "macos")]
 mod state_check;
