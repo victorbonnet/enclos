@@ -780,16 +780,24 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         ));
     }
     // Each limit as a process sees it, hard: closed when it is no higher
-    // than the policy's, which no process can raise. The control, on the
-    // host, finds no such limit.
+    // than the policy's, which no process can raise. The control, the same
+    // check on the host, passes when the host sets no lower limit.
     for (what, flag, limit) in [
-        ("hold more than {} files open", "-Hn", i.limits.open_files),
         (
-            "write a file past {} KiB",
+            "have a hard limit above {} open files",
+            "-Hn",
+            i.limits.open_files,
+        ),
+        (
+            "have a hard limit above {} KiB per file",
             "-Hf",
             i.limits.file_size.map(|s| s.0 / 1024),
         ),
-        ("use more than {} s of CPU", "-Ht", i.limits.cpu_seconds),
+        (
+            "have a hard limit above {} s of CPU",
+            "-Ht",
+            i.limits.cpu_seconds,
+        ),
     ] {
         if let Some(limit) = limit {
             let script = format!(
@@ -1546,15 +1554,15 @@ mod tests {
             limits,
             [
                 (
-                    "hold more than 256 files open",
+                    "have a hard limit above 256 open files",
                     "test \"$(ulimit -Hn)\" = unlimited || test \"$(ulimit -Hn)\" -gt 256"
                 ),
                 (
-                    "write a file past 1024 KiB",
+                    "have a hard limit above 1024 KiB per file",
                     "test \"$(ulimit -Hf)\" = unlimited || test \"$(ulimit -Hf)\" -gt 1024"
                 ),
                 (
-                    "use more than 60 s of CPU",
+                    "have a hard limit above 60 s of CPU",
                     "test \"$(ulimit -Ht)\" = unlimited || test \"$(ulimit -Ht)\" -gt 60"
                 ),
             ]

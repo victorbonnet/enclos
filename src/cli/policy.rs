@@ -237,6 +237,19 @@ fn print_rules(policy: &Policy) {
             "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
         );
     }
+    let r = &policy.resources;
+    if !r.is_unset() {
+        println!("\nLimits (each process, from its start)");
+        if let Some(files) = r.open_files {
+            println!("  open files: {files}");
+        }
+        if let Some(seconds) = r.cpu_seconds {
+            println!("  CPU time:   {seconds} s");
+        }
+        if let Some(size) = r.file_size {
+            println!("  file size:  {size}");
+        }
+    }
 }
 
 fn print_allowed(

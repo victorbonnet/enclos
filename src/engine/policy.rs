@@ -263,8 +263,10 @@ impl Engine {
     }
 
     /// Every check a policy passes before it is stored, whichever command
-    /// stores it: its paths as they are now, the secrets it grants, and
-    /// that each of those is set.
+    /// stores it: its paths as they are now, the secrets it grants, that
+    /// each of those is set, and its limits against the sandbox's backend
+    /// (`sandbox create`, before the sandbox has a record, checks those
+    /// against the backend it is given).
     pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
@@ -551,6 +553,37 @@ mod tests {
         assert!(
             bare.contains("[network]") && bare.contains("allow_add = [\"a.example.com\"]"),
             "{bare}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_limits_says_what_each_becomes() {
+        let none = Policy::default();
+        let mut set = none.clone();
+        set.resources.open_files = Some(64);
+        set.resources.file_size = Some("1M".parse().unwrap());
+        set.resources.cpu_seconds = Some(600);
+        assert_eq!(
+            differences(&none, &set, &[]),
+            [
+                "limit the files a process holds open to 64 (sessions started from now on)",
+                "limit the size of a file a process writes to 1M (sessions started from now on)",
+                "limit a process's CPU time to 600 s (sessions started from now on)",
+            ]
+        );
+        let mut changed = set.clone();
+        changed.resources.open_files = Some(128);
+        assert_eq!(
+            differences(&set, &changed, &[]),
+            ["limit the files a process holds open to 128 (sessions started from now on)"]
+        );
+        assert_eq!(
+            differences(&set, &none, &[]),
+            [
+                "stop limiting the files a process holds open (sessions started from now on)",
+                "stop limiting the size of a file a process writes (sessions started from now on)",
+                "stop limiting a process's CPU time (sessions started from now on)",
+            ]
         );
     }
 

@@ -2400,9 +2400,10 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
 }
 
-/// A `[resources]` section holds every process of the sandbox to its
-/// limits, which none can raise, and `policy test` shows each; a limit
-/// Seatbelt cannot enforce is refused.
+/// A `[resources]` section holds a sandbox's sessions to its limits: in
+/// them `ulimit` shows each, a process past its CPU time is stopped, the
+/// open-file limit cannot be raised, and `policy test` shows each closed; a
+/// limit Seatbelt cannot enforce as written is refused.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_runs_under_the_limits_its_policy_sets() {
@@ -2411,27 +2412,32 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
     home.init(1);
     home.run(&["sandbox", "create", "home"]).ok();
     let _stop = StopOnDrop(&home, "home");
-    let edit = |line: &str| {
+    let policy = home.root.join("sandboxes/home/policy.toml");
+    let clean = std::fs::read_to_string(&policy).unwrap();
+    let edit = |lines: &str| {
         let mut edit = home.command(&["policy", "edit", "home"]);
         edit.env_remove("VISUAL").env(
             "EDITOR",
             editor(
                 &home,
-                &format!("printf '\\n[resources]\\n{line}\\n' >> \"$1\""),
+                &format!("printf '\\n[resources]\\n{lines}\\n' >> \"$1\""),
             ),
         );
         Run(edit.output().unwrap())
     };
-    let out = edit("memory = \\\"2G\\\"");
-    assert_eq!(out.code(), 2, "{}", out.stderr());
-    assert!(out.stderr().contains("memory"), "{}", out.stderr());
-    // policy edit keeps the refused file: put the template's back.
-    home.run(&["policy", "discard", "home"]);
-    let policy = home.root.join("sandboxes/home/policy.toml");
-    let kept = std::fs::read_to_string(&policy).unwrap();
-    let clean = kept.split("\n[resources]").next().unwrap().to_owned();
-    std::fs::write(&policy, clean).unwrap();
-    let out = edit("open_files = 64\\nfile_size = \\\"1M\\\"\\ncpu_seconds = 600");
+    // Refused, with why; `policy edit` keeps the refused file, so the
+    // template's is put back each time.
+    for (line, why) in [
+        ("memory = \\\"2G\\\"", "memory"),
+        ("file_size = \\\"1M\\\"", "append"),
+    ] {
+        let out = edit(line);
+        assert_eq!(out.code(), 2, "{}", out.stderr());
+        assert!(out.stderr().contains(why), "{}", out.stderr());
+        home.run(&["policy", "discard", "home"]);
+        std::fs::write(&policy, &clean).unwrap();
+    }
+    let out = edit("open_files = 64\\ncpu_seconds = 600");
     assert!(
         out.ok()
             .stdout()
@@ -2446,34 +2452,27 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
         "--",
         "/bin/sh",
         "-c",
-        "ulimit -Hn; ulimit -Hf; ulimit -Ht",
+        "ulimit -Hn; ulimit -Ht",
     ]);
-    assert_eq!(out.ok().stdout(), "64\n1024\n600\n");
-    // Past the size: refused. And no process can raise a limit.
+    assert_eq!(out.ok().stdout(), "64\n600\n");
+    // No process can raise a limit.
     let out = home.run(&[
         "exec",
         "home",
         "--",
         "/bin/sh",
         "-c",
-        "dd if=/dev/zero of=\"$TMPDIR/big\" bs=1024 count=2048 2>&1; ulimit -n 65 && echo raised",
+        "ulimit -n 65 && echo raised",
     ]);
-    // dd is stopped by the signal the limit sends, or told its write is too
-    // large when it ignores it.
     let said = format!("{}{}", out.stdout(), out.stderr());
-    assert!(
-        said.contains("Filesize limit exceeded") || said.contains("File too large"),
-        "{said}"
-    );
     assert!(!said.contains("raised"), "{said}");
     assert!(said.contains("cannot modify limit"), "{said}");
 
     let out = home.run(&["policy", "test", "home"]);
     let report = out.stdout();
     for probe in [
-        "hold more than 64 files open",
-        "write a file past 1024 KiB",
-        "use more than 600 s of CPU",
+        "have a hard limit above 64 open files",
+        "have a hard limit above 600 s of CPU",
     ] {
         assert!(
             report
@@ -2482,6 +2481,22 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
             "{probe} is not shown closed:\n{report}"
         );
     }
+
+    // Past its CPU time, a process is stopped: a second of it here.
+    let mut edit = home.command(&["policy", "edit", "home"]);
+    edit.env_remove("VISUAL").env(
+        "EDITOR",
+        editor(
+            &home,
+            "sed -i '' 's/cpu_seconds = 600/cpu_seconds = 1/' \"$1\"",
+        ),
+    );
+    Run(edit.output().unwrap()).ok();
+    let started = std::time::Instant::now();
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "while :; do :; done"]);
+    // SIGXCPU, as a shell reports it: 128 + 24.
+    assert_eq!(out.code(), 152, "{}", out.stderr());
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 /// A sandbox made from `minimal` or `mcp-only` reaches only what is listed:

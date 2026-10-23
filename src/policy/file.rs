@@ -303,6 +303,12 @@ mod tests {
         let layer = PolicyFile::parse("adapter", "[resources]\nopen_files = 1").unwrap();
         assert_eq!(layer.beyond_destinations(), ["resources"]);
         assert!(PolicyFile::parse("c", "[resources]\nfile_size = \"1T\"").is_err());
+        // A size may be a number of bytes, as well as text.
+        let mut bytes = Policy::default();
+        PolicyFile::parse("d", "[resources]\nfile_size = 1048576")
+            .unwrap()
+            .apply(&mut bytes);
+        assert_eq!(bytes.resources.file_size, Some(ByteSize(1 << 20)));
         assert!(PolicyFile::parse("c", "[resources]\nthreads = 4").is_err());
     }
 
