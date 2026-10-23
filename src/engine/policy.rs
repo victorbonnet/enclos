@@ -570,8 +570,8 @@ mod tests {
         assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
         // An inline or dotted network table is edited where it is.
         for text in [
-            "network = { allow_add = [\"a.example.com\"] }\n",
-            "network.allow_add = [\"a.example.com\"]\n",
+            "extends = \"assistant\"\nnetwork = { allow_add = [\"a.example.com\"] }\n",
+            "extends = \"assistant\"\nnetwork.allow_add = [\"a.example.com\"]\n",
         ] {
             let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
             let parsed = policy::resolve(&updated, None).unwrap();

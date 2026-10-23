@@ -56,9 +56,9 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos; milestone 1 ships `assistant` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `mcp-only` and `assistant` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
-| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, `assistant` when left out |
+| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is refused |
 
 **How a layer applies** (`PolicyFile::apply`):
 
@@ -251,6 +251,7 @@ A change to the filesystem rules or `listen` reaches running sessions only throu
 | `cannot read the <layer> policy` | resolve | TOML that does not parse, an unknown key, or a section milestone 1 does not enforce |
 | `unknown template` | resolve | `extends` names a template this build does not ship |
 | `a template cannot extend another` | resolve | a template layer sets `extends` |
+| `names no template` | resolve | the sandbox's `policy.toml` has no `extends` |
 | `the <runtime> adapter's layer may only add network destinations` | resolve | an adapter's layer sets more than `allow_add` and `listen` |
 | `refused by policy:` | validate | every problem is a refusal (exit 2) |
 | `the policy is not valid:` | validate | at least one entry is malformed |

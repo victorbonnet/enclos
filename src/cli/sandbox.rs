@@ -26,8 +26,8 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from.
-        #[arg(long, default_value = "assistant")]
+        /// The policy it starts from: minimal, mcp-only or assistant (design §7).
+        #[arg(long, default_value = enclos::policy::DEFAULT_TEMPLATE)]
         template: TemplateName,
     },
     /// List sandboxes.
@@ -175,7 +175,7 @@ fn print_list(views: &[SandboxView]) {
             .fold(header.len(), usize::max)
     };
     let name = widest("NAME", |v| v.record.name.as_str());
-    let template = widest("TEMPLATE", |v| v.record.template.as_str());
+    let template = widest("TEMPLATE", |v| v.template.as_str());
     println!(
         "{:<name$}  {:<10}  {:<template$}  {:<8}  STATE",
         "NAME", "BACKEND", "TEMPLATE", "POLICY"
@@ -196,7 +196,7 @@ fn print_list(views: &[SandboxView]) {
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
             v.record.name,
             v.record.backend,
-            v.record.template,
+            v.template,
             policy,
             state(&v.record.state)
         );
@@ -208,7 +208,7 @@ fn print_show(v: &SandboxView) {
     println!("Sandbox {}: {}", r.name, state(&r.state));
     println!(
         "  backend {}, template {}, proxy port {}",
-        r.backend, r.template, r.proxy_port
+        r.backend, v.template, r.proxy_port
     );
     if let Some(p) = &v.policy {
         println!(

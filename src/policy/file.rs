@@ -350,11 +350,11 @@ mod tests {
 
     #[test]
     fn the_built_in_layers_parse() {
-        for (name, text) in [
-            ("defaults", include_str!("templates/defaults.toml")),
-            ("assistant", include_str!("templates/assistant.toml")),
-        ] {
-            PolicyFile::parse(name, text).unwrap();
+        PolicyFile::parse("defaults", crate::policy::DEFAULTS).unwrap();
+        for name in crate::policy::template_names() {
+            let text = crate::policy::template(&name.parse().unwrap()).unwrap();
+            let layer = PolicyFile::parse(name, text).unwrap();
+            assert!(layer.extends.is_none(), "{name}");
         }
     }
 }

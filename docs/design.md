@@ -559,7 +559,6 @@ enclos runtime install hermes --sandbox community
 enclos agent add community/support
 enclos policy allow community mcp.example.org              # the remote endpoint's host
 enclos connect community -- hermes ...                     # Hermes told of the endpoint with its own commands, until `runtime configure --mcp-add` comes
-enclos policy allow community mcp.example.org
 ```
 
 ## 11. State, audit and files
