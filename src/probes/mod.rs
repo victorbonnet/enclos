@@ -826,36 +826,17 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &info,
         ));
     }
-    // Each limit as a process sees it, hard: closed when it is no higher
-    // than the policy's, which no process can raise. The control, the same
-    // check on the host, passes when the host sets no lower limit.
-    for (what, flag, limit) in [
-        (
-            "have a hard limit above {} open files",
-            "-Hn",
-            i.limits.open_files,
-        ),
-        (
-            "have a hard limit above {} KiB per file",
-            "-Hf",
-            i.limits.file_size.map(|s| s.0 / 1024),
-        ),
-        (
-            "have a hard limit above {} s of CPU",
-            "-Ht",
-            i.limits.cpu_seconds,
-        ),
-    ] {
-        if let Some(limit) = limit {
-            let script = format!(
-                "test \"$(ulimit {flag})\" = unlimited || test \"$(ulimit {flag})\" -gt {limit}"
-            );
-            list.push(same_outside(
-                "resources",
-                what.replace("{}", &limit.to_string()),
-                &script,
-            ));
-        }
+    // Each limit a backend sets, as a process sees it, hard: closed when it
+    // is no higher than the policy's (a hard limit no process without root
+    // can raise). The control, the same check on the host, passes when the
+    // host's own hard limit is higher than the policy's, or unlimited. A
+    // value that does not read as a number is no proof: it reads open.
+    if let Some(limit) = i.limits.open_files {
+        list.push(same_outside(
+            "resources",
+            format!("have a hard limit above {limit} open files"),
+            &limit_script("-Hn", limit),
+        ));
     }
     if let Ok(item) = &i.keychain_item {
         // Through `security` and the security daemon, as a program in the
@@ -952,6 +933,14 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
         absent.push(format!("keychain items ({why})"));
     }
     absent
+}
+
+/// The script of a limit's probe: it succeeds, open, when the limit
+/// `ulimit {flag}` reads is above `limit`, unlimited, or not a number.
+pub(crate) fn limit_script(flag: &str, limit: u64) -> String {
+    format!(
+        "v=$(ulimit {flag}); case \"$v\" in unlimited) exit 0 ;; ''|*[!0-9]*) echo \"unreadable limit: $v\"; exit 0 ;; esac; test \"$v\" -gt {limit}"
+    )
 }
 
 /// The probes that could act on the host if a rule did not hold: CI and VMs
@@ -1613,6 +1602,7 @@ mod tests {
         let mut i = inputs(dir.path());
         assert!(!probes(&i).iter().any(|p| p.route == "resources"));
         i.limits.open_files = Some(256);
+        // Refused on every backend, so never probed.
         i.limits.file_size = Some("1M".parse().unwrap());
         i.limits.cpu_seconds = Some(60);
         let list = probes(&i);
@@ -1623,20 +1613,10 @@ mod tests {
             .collect();
         assert_eq!(
             limits,
-            [
-                (
-                    "have a hard limit above 256 open files",
-                    "test \"$(ulimit -Hn)\" = unlimited || test \"$(ulimit -Hn)\" -gt 256"
-                ),
-                (
-                    "have a hard limit above 1024 KiB per file",
-                    "test \"$(ulimit -Hf)\" = unlimited || test \"$(ulimit -Hf)\" -gt 1024"
-                ),
-                (
-                    "have a hard limit above 60 s of CPU",
-                    "test \"$(ulimit -Ht)\" = unlimited || test \"$(ulimit -Ht)\" -gt 60"
-                ),
-            ]
+            [(
+                "have a hard limit above 256 open files",
+                limit_script("-Hn", 256).as_str()
+            )]
         );
     }
 

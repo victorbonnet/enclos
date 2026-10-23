@@ -56,15 +56,15 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `assistant`, `minimal` and `mcp-only` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `mcp-only` and `assistant` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
-| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, `assistant` when left out |
+| 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is refused |
 
 **How a layer applies** (`PolicyFile::apply`):
 
 - A list written `name = [...]` replaces what the layers below set; `name_add = [...]` adds to it. If one layer writes both, the replacement comes first, then the additions. The lists are `filesystem.write`, `filesystem.read_deny`, `network.allow` and `network.private`.
 - `secrets.env` replaces the secrets the layers below grant, and `secrets.env_add` adds to them, by variable. An adapter's layer may not grant any. Each grant must read `secret:<sandbox>/<name>`, or the file is refused as it is read.
-- A single value (`network.mode`, `network.log`, `network.listen`, each of `[resources]`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`. An adapter's layer may not set `[resources]`; `memory`, `cpu` and `file_size` are refused on Seatbelt, and every limit on a backend not built yet.
+- A single value (`network.mode`, `network.log`, `network.listen`, each of `[resources]`) is set by the last layer that names it. So a sandbox's `policy.toml` with `listen = false` wins over the Hermes adapter's `listen = true`. An adapter's layer may not set `[resources]`; `cpu_seconds`, `memory`, `cpu` and `file_size` are refused on Seatbelt, and every limit on a backend not built yet.
 - Unknown keys and sections are errors (`deny_unknown_fields`). That is how enclos refuses `[exec]`, which it cannot enforce yet ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)), and how it catches a misspelling such as `alow`.
 
 **Normalizing.** After the last layer, `normalize` puts the policy in one canonical form, so the same grants always give the same snapshot: each `network.allow` entry is rewritten in its canonical form (lowercase, default port dropped), each `network.private` entry the same way, and the four lists are sorted with repeats removed.
@@ -262,6 +262,7 @@ A change to the filesystem rules or `listen` reaches running sessions only throu
 | `cannot read the <layer> policy` | resolve | TOML that does not parse, an unknown key, or a section this build does not enforce |
 | `unknown template` | resolve | `extends` names a template this build does not ship |
 | `a template cannot extend another` | resolve | a template layer sets `extends` |
+| `names no template` | resolve | the sandbox's `policy.toml` has no `extends` |
 | `the <runtime> adapter's layer may only add network destinations` | resolve | an adapter's layer sets more than `allow_add` and `listen` |
 | `refused by policy:` | validate | every problem is a refusal (exit 2) |
 | `the policy is not valid:` | validate | at least one entry is malformed |

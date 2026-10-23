@@ -13,7 +13,7 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
@@ -238,7 +238,9 @@ impl Engine {
         overrides: &str,
         runtime: Option<RuntimeKind>,
     ) -> Result<PolicyVersion> {
-        let snapshot = self.checked_policy_with(name, overrides, runtime.map(adapter_layer))?;
+        let backend = self.recorded_backend(name)?;
+        let snapshot =
+            self.checked_policy_with(name, overrides, runtime.map(adapter_layer), backend)?;
         self.store_policy(lock, by, name, overrides, &snapshot, None)
     }
 
@@ -248,7 +250,8 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
     ) -> Result<PolicySnapshot> {
-        self.checked_policy_with(name, overrides, self.adapter_layer(name)?)
+        let backend = self.recorded_backend(name)?;
+        self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
     }
 
     pub(super) fn checked_policy_with(
@@ -256,24 +259,56 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
         adapter: Option<AdapterLayer>,
+        backend: BackendKind,
     ) -> Result<PolicySnapshot> {
         let snapshot = policy::resolve(overrides, adapter.as_ref())?;
-        self.check_policy(name, &snapshot.policy)?;
+        self.check_policy(name, &snapshot.policy, backend)?;
         Ok(snapshot)
     }
 
     /// Every check a policy passes before it is stored, whichever command
     /// stores it: its paths as they are now, the secrets it grants, that
-    /// each of those is set, and its limits against the sandbox's backend
-    /// (`sandbox create`, before the sandbox has a record, checks those
-    /// against the backend it is given).
-    pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+    /// each of those is set, and its limits against `backend`, which the
+    /// caller names: the recorded one, or for `sandbox create`, before the
+    /// sandbox has a record, the one it is given. Never skipped.
+    pub(super) fn check_policy(
+        &self,
+        name: &SandboxName,
+        policy: &Policy,
+        backend: BackendKind,
+    ) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
-        if let Some(record) = self.state.get(name)? {
-            validate_resources(policy, record.backend)?;
-        }
+        validate_resources(policy, backend)?;
         self.check_secrets_set(name, policy)
+    }
+
+    /// The backend of sandbox `name`, as recorded, whose limits its policy
+    /// is checked against.
+    pub(super) fn recorded_backend(&self, name: &SandboxName) -> Result<BackendKind> {
+        Ok(self
+            .state
+            .get(name)?
+            .ok_or_else(|| Error::NoSuchSandbox {
+                name: name.to_string(),
+            })?
+            .backend)
+    }
+
+    /// The limits `policy`'s programs run under in sandbox `record`: checked
+    /// again against its backend, though stored checked, and against the
+    /// hard limits enclos itself runs under, so a program never starts
+    /// without them or fails with only bash's word for why.
+    pub(super) fn launch_limits(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+        policy: &Policy,
+    ) -> Result<crate::model::policy::Resources> {
+        validate_resources(policy, record.backend)?;
+        if let Some(why) = crate::backend::unsettable(&policy.resources) {
+            return Err(Error::Session { what: why });
+        }
+        Ok(policy.resources.clone())
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
@@ -535,8 +570,8 @@ mod tests {
         assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
         // An inline or dotted network table is edited where it is.
         for text in [
-            "network = { allow_add = [\"a.example.com\"] }\n",
-            "network.allow_add = [\"a.example.com\"]\n",
+            "extends = \"assistant\"\nnetwork = { allow_add = [\"a.example.com\"] }\n",
+            "extends = \"assistant\"\nnetwork.allow_add = [\"a.example.com\"]\n",
         ] {
             let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
             let parsed = policy::resolve(&updated, None).unwrap();

@@ -73,11 +73,15 @@ pub fn decide(command: &str, json: bool, text: bool, stdout_is_terminal: bool) -
 }
 
 /// [`decide`] for this process, with its stdout as it is now: called once,
-/// before anything is printed.
+/// before anything is printed. A document's stdout is then kept for it
+/// ([`keep_stdout_for_the_document`]).
 pub fn choose(command: &str, json: bool, text: bool) -> Output {
     let output = decide(command, json, text, std::io::stdout().is_terminal());
     let chosen = *OUTPUT.get_or_init(|| output);
     debug_assert_eq!(chosen, output, "the output is chosen once");
+    if chosen == Output::Document {
+        keep_stdout_for_the_document();
+    }
     chosen
 }
 
@@ -95,7 +99,7 @@ pub fn output() -> Output {
 /// printed there. (A stdout that was closed is `/dev/null` by then: Rust
 /// reopens it so before `main`, so a document there is lost unsaid, as with
 /// `>/dev/null`.)
-pub fn keep_stdout_for_the_document() {
+fn keep_stdout_for_the_document() {
     let kept = rustix::io::fcntl_dupfd_cloexec(std::io::stdout(), 3).and_then(|kept| {
         rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
         Ok(kept)

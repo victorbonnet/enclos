@@ -309,6 +309,17 @@ mod tests {
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
             "TZ",
+            // What the shell that sets the limits would read (`bash -p`
+            // reads none of them, and none can be granted either).
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "IFS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "BASH_FUNC_ulimit%%",
         ] {
             assert!(reserved_variable(reserved), "{reserved}");
         }

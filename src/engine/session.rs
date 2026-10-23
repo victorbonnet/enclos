@@ -253,7 +253,7 @@ impl Engine {
             env: self.secret_env(&snapshot.policy)?,
             in_terminal: true,
             service_port,
-            limits: snapshot.policy.resources.clone(),
+            limits: self.launch_limits(&record, &snapshot.policy)?,
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
         // TMPDIR inside the sandbox (the policy denies /tmp).

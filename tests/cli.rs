@@ -2572,10 +2572,11 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     );
 }
 
-/// A `[resources]` section holds a sandbox's sessions to its limits: in
-/// them `ulimit` shows each, a process past its CPU time is stopped, the
-/// open-file limit cannot be raised, and `policy test` shows each closed; a
-/// limit Seatbelt cannot enforce as written is refused.
+/// A `[resources]` section holds a sandbox's sessions to its open-file
+/// limit: in them `ulimit` shows it, a process cannot open more or raise
+/// it, `policy test` shows it closed, and one enclos itself cannot set stops
+/// the session with why. A limit Seatbelt cannot enforce as written is
+/// refused, and nothing is stored.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_runs_under_the_limits_its_policy_sets() {
@@ -2592,24 +2593,51 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
             "EDITOR",
             editor(
                 &home,
-                &format!("printf '\\n[resources]\\n{lines}\\n' >> \"$1\""),
+                &format!("printf '\n[resources]\n{lines}\n' >> \"$1\""),
             ),
         );
         Run(edit.output().unwrap())
     };
-    // Refused, with why; `policy edit` keeps the refused file, so the
-    // template's is put back each time.
+    let versions = || {
+        let history = home.run(&["policy", "history", "home"]).ok().stdout();
+        history
+            .lines()
+            .filter(|l| l.trim_start().starts_with('v'))
+            .count()
+    };
+    // Refused, with why, and nothing stored; `policy edit` keeps the
+    // refused file, so the file as created is put back each time.
+    let before = versions();
     for (line, why) in [
-        ("memory = \\\"2G\\\"", "memory"),
-        ("file_size = \\\"1M\\\"", "append"),
+        ("memory = \"2G\"", "cannot enforce a memory limit"),
+        ("file_size = \"1M\"", "append"),
+        ("cpu_seconds = 600", "SIGXCPU"),
     ] {
         let out = edit(line);
-        assert_eq!(out.code(), 2, "{}", out.stderr());
-        assert!(out.stderr().contains(why), "{}", out.stderr());
+        assert_eq!(out.code(), 2, "{line}: {}", out.stderr());
+        assert!(out.stderr().contains(why), "{line}: {}", out.stderr());
         home.run(&["policy", "discard", "home"]);
         std::fs::write(&policy, &clean).unwrap();
+        assert_eq!(versions(), before, "{line}");
     }
-    let out = edit("open_files = 64\\ncpu_seconds = 600");
+    // Refused by any command that stores the policy, not only `edit`.
+    std::fs::write(&policy, format!("{clean}\n[resources]\nmemory = \"2G\"\n")).unwrap();
+    let out = home.run(&["policy", "allow", "home", "x.example.com", "--yes"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert_eq!(versions(), before);
+    std::fs::write(&policy, &clean).unwrap();
+
+    // The least a session starts with.
+    let out = edit("open_files = 16");
+    out.ok();
+    home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
+    std::fs::write(&policy, &clean).unwrap();
+    let mut back = home.command(&["policy", "edit", "home"]);
+    back.env_remove("VISUAL")
+        .env("EDITOR", editor(&home, "true"));
+    Run(back.output().unwrap()).ok();
+
+    let out = edit("open_files = 64");
     assert!(
         out.ok()
             .stdout()
@@ -2617,17 +2645,19 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
         "{}",
         out.stdout()
     );
-
-    let out = home.run(&[
-        "exec",
-        "home",
-        "--",
-        "/bin/sh",
-        "-c",
-        "ulimit -Hn; ulimit -Ht",
-    ]);
-    assert_eq!(out.ok().stdout(), "64\n600\n");
-    // No process can raise a limit.
+    let shown = home.run(&["policy", "show", "home"]).ok().stdout();
+    assert!(shown.contains("  open files: 64"), "{shown}");
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "ulimit -Hn"]);
+    assert_eq!(out.ok().stdout(), "64\n");
+    // No process opens more, or raises the limit.
+    let opens = "my @f; for my $n (1..100) { open(my $f, '<', '/dev/null') or die \"refused at $n: $!\\n\"; push @f, $f }";
+    let out = home.run(&["exec", "home", "--", "/usr/bin/perl", "-e", opens]);
+    assert_ne!(out.code(), 0, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("Too many open files"),
+        "{}",
+        out.stderr()
+    );
     let out = home.run(&[
         "exec",
         "home",
@@ -2642,38 +2672,38 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
 
     let out = home.run(&["policy", "test", "home"]);
     let report = out.stdout();
-    for probe in [
-        "have a hard limit above 64 open files",
-        "have a hard limit above 600 s of CPU",
-    ] {
-        assert!(
-            report
-                .lines()
-                .any(|l| l.trim_start().starts_with("closed ") && l.contains(probe)),
-            "{probe} is not shown closed:\n{report}"
-        );
-    }
-
-    // Past its CPU time, a process is stopped: a second of it here.
-    let mut edit = home.command(&["policy", "edit", "home"]);
-    edit.env_remove("VISUAL").env(
-        "EDITOR",
-        editor(
-            &home,
-            "sed -i '' 's/cpu_seconds = 600/cpu_seconds = 1/' \"$1\"",
-        ),
+    assert!(
+        report.lines().any(|l| l.trim_start().starts_with("closed ")
+            && l.contains("have a hard limit above 64 open files")),
+        "not shown closed:\n{report}"
     );
-    Run(edit.output().unwrap()).ok();
-    let started = std::time::Instant::now();
-    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "while :; do :; done"]);
-    // SIGXCPU, as a shell reports it: 128 + 24.
-    assert_eq!(out.code(), 152, "{}", out.stderr());
-    assert!(started.elapsed() < Duration::from_secs(20));
+
+    // A limit above the hard one enclos runs under stops the session, with
+    // the field named, and runs nothing.
+    let out = Run(Command::new("/bin/bash")
+        .arg("-c")
+        .arg("ulimit -n 32 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_enclos"))
+        .args(["exec", "home", "--", "/bin/echo", "ran"])
+        .env("ENCLOS_HOME", &home.root)
+        .env("HOME", home._dir.path())
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert!(!out.stdout().contains("ran"));
+    assert!(
+        out.stderr()
+            .contains("resources.open_files = 64 is above the hard limit enclos runs under (32)"),
+        "{}",
+        out.stderr()
+    );
 }
 
 /// A sandbox made from `minimal` or `mcp-only` reaches only what is listed:
 /// a public site the `assistant` template would reach is refused by its
-/// proxy, and `policy test` finds nothing open.
+/// proxy as not allowed, `policy show` says so, and `policy test` (run
+/// once, for `minimal`, since both compile to the same rules) finds nothing
+/// open.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
@@ -2689,6 +2719,18 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
             policy.contains(&format!("extends = \"{template}\"")),
             "{policy}"
         );
+        let shown = home.run(&["policy", "show", "lab"]).ok().stdout();
+        assert!(shown.contains("\nNetwork: allowlist"), "{shown}");
+        let listed = home.run(&["sandbox", "list"]).ok().stdout();
+        assert!(
+            listed
+                .lines()
+                .any(|l| l.starts_with("lab ") && l.contains(template)),
+            "{listed}"
+        );
+        let (code, list) = home.json(&["sandbox", "list"]);
+        assert_eq!(code, 0, "{list}");
+        assert_eq!(list["sandboxes"][0]["template"], template, "{list}");
         // Refused at the proxy: no connection leaves the host.
         let out = home.run(&[
             "exec",
@@ -2704,20 +2746,45 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
         ]);
         assert_eq!(out.stdout(), "403", "{template}: {}", out.stderr());
         let out = home.run(&["net", "denied", "lab"]);
+        let denied = out.ok().stdout();
         assert!(
-            out.ok().stdout().contains("example.com:443"),
-            "{}",
-            out.stdout()
+            denied
+                .lines()
+                .any(|l| l.contains("example.com:443") && l.contains("not-allowed")),
+            "{denied}"
         );
-        let out = home.run(&["policy", "test", "lab"]);
-        assert_eq!(
-            out.code(),
-            0,
-            "{template}:\n{}\n{}",
-            out.stdout(),
-            out.stderr()
-        );
-        assert!(!out.stdout().contains("OPEN"), "{}", out.stdout());
+        if template == "minimal" {
+            let out = home.run(&["policy", "test", "lab"]);
+            assert_eq!(
+                out.code(),
+                0,
+                "{template}:\n{}\n{}",
+                out.stdout(),
+                out.stderr()
+            );
+            assert!(!out.stdout().contains("OPEN"), "{}", out.stdout());
+        }
+    }
+}
+
+/// A template this enclos does not ship is refused with the ones it has,
+/// and leaves no folder; `--help` names them all.
+#[test]
+fn an_unknown_template_is_refused_with_the_ones_there_are() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "lab", "--template", "coding"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("unknown template `coding`: this enclos has minimal, mcp-only, assistant"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.root.join("sandboxes/lab").exists());
+    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
+    for name in enclos::policy::template_names() {
+        assert!(help.contains(name), "{name}: {help}");
     }
 }
 
@@ -3146,6 +3213,36 @@ fn a_document_that_cannot_be_written_fails_the_command() {
             && message.contains("nosuch"),
         "{said}"
     );
+}
+
+/// `sandbox show` keeps its view when what it reads after fails: in text,
+/// the view first and then the error; in JSON, the view with an `error`
+/// beside it, what could not be read null.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_show_keeps_its_view_beside_an_error() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _make = record_hermes(&home, "home");
+    // An agent record that does not read as an agent's name: the sandbox's
+    // view reads, its agents do not.
+    let broke = Command::new("/usr/bin/sqlite3")
+        .arg(home.root.join("state.db"))
+        .arg("INSERT INTO agents (sandbox, name, created_at) VALUES ('home', 'Not A Name!', 'x');")
+        .status()
+        .unwrap();
+    assert!(broke.success());
+    let out = home.run(&["sandbox", "show", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(out.stdout().starts_with("Sandbox home"), "{}", out.stdout());
+    let (code, shown) = home.json(&["sandbox", "show", "home"]);
+    assert_eq!(code, 1, "{shown}");
+    assert_eq!(shown["name"], "home", "{shown}");
+    assert!(shown["state"].is_object(), "{shown}");
+    assert!(shown["services"].is_array(), "{shown}");
+    assert!(shown["agents"].is_null(), "{shown}");
+    assert_eq!(shown["error"]["exit_code"], 1, "{shown}");
 }
 
 /// Help and the version are text, piped or not, and succeed.

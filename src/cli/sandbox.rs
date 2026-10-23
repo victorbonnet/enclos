@@ -28,8 +28,8 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from.
-        #[arg(long, default_value = "assistant")]
+        /// The policy it starts from: minimal, mcp-only or assistant (design §7).
+        #[arg(long, default_value = enclos::policy::DEFAULT_TEMPLATE)]
         template: TemplateName,
     },
     /// List sandboxes.
@@ -263,7 +263,7 @@ fn list_json(v: &SandboxView) -> Value {
     json!({
         "name": v.record.name.to_string(),
         "backend": v.record.backend.to_string(),
-        "template": v.record.template.to_string(),
+        "template": v.template.to_string(),
         "policy_version": v.policy.as_ref().map(|p| p.version),
         "state": state_json(&v.record.state),
         "sessions_running": running,
@@ -277,7 +277,7 @@ fn show_json(v: &SandboxView) -> Value {
         "name": r.name.to_string(),
         "state": state_json(&r.state),
         "backend": r.backend.to_string(),
-        "template": r.template.to_string(),
+        "template": v.template.to_string(),
         "proxy_port": r.proxy_port,
         "active_policy": v.policy.as_ref().map(|p| json!({
             "version": p.version,
@@ -312,7 +312,7 @@ fn print_list(views: &[SandboxView]) {
             .fold(header.len(), usize::max)
     };
     let name = widest("NAME", |v| v.record.name.as_str());
-    let template = widest("TEMPLATE", |v| v.record.template.as_str());
+    let template = widest("TEMPLATE", |v| v.template.as_str());
     println!(
         "{:<name$}  {:<10}  {:<template$}  {:<8}  STATE",
         "NAME", "BACKEND", "TEMPLATE", "POLICY"
@@ -333,7 +333,7 @@ fn print_list(views: &[SandboxView]) {
             "{:<name$}  {:<10}  {:<template$}  {:<8}  {}{sessions}",
             v.record.name,
             v.record.backend,
-            v.record.template,
+            v.template,
             policy,
             state(&v.record.state)
         );
@@ -345,7 +345,7 @@ fn print_show(v: &SandboxView) {
     println!("Sandbox {}: {}", r.name, state(&r.state));
     println!(
         "  backend {}, template {}, proxy port {}",
-        r.backend, r.template, r.proxy_port
+        r.backend, v.template, r.proxy_port
     );
     if let Some(p) = &v.policy {
         println!(
@@ -470,8 +470,9 @@ fn each_into(
         failed += usize::from(one != exit::OK);
         code = code.max(one);
     }
-    let document = output::with_error(json!({ "sandboxes": results }), code, || {
-        format!("{failed} of the {count} sandboxes failed: see each one's error")
+    let document = output::with_error(json!({ "sandboxes": results }), code, || match count {
+        1 => "the sandbox failed: see its error".to_owned(),
+        count => format!("{failed} of the {count} sandboxes failed: see each one's error"),
     });
     Ok((code, document))
 }
@@ -738,6 +739,59 @@ mod tests {
         });
         assert_eq!(code.unwrap(), exit::ERROR);
         assert_eq!(done, ["home", "lab", "work"]);
+    }
+
+    /// A stop that leaves processes running is said in its value whatever
+    /// the output: not stopped, each survivor, and an `error` with code 1.
+    #[test]
+    fn a_stop_that_leaves_processes_says_so_with_an_error() {
+        use enclos::lifecycle::stop::{Survivor, Why};
+        use enclos::model::session::{Member, SessionId};
+        let report = StopReport {
+            services: Vec::new(),
+            stopped: vec![SessionId(3)],
+            gone: Vec::new(),
+            survivors: vec![(
+                SessionId(3),
+                vec![Survivor {
+                    member: Member {
+                        pid: 4242,
+                        started: "x".into(),
+                        command: "sleep".into(),
+                    },
+                    why: Why::Survived,
+                }],
+            )],
+        };
+        let (code, value) = print_stop(&"home".parse().unwrap(), &report);
+        assert_eq!(code, exit::ERROR);
+        assert_eq!(value["stopped"], false);
+        assert_eq!(value["survivors"][0]["pid"], 4242);
+        assert_eq!(value["survivors"][0]["session"], 3);
+        assert_eq!(value["error"]["exit_code"], 1);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1 processes survived stop"),
+            "{value}"
+        );
+    }
+
+    /// One sandbox named: its failure is not counted as one of one.
+    #[test]
+    fn one_sandbox_that_fails_is_said_as_one() {
+        let (_, document) = each_into(
+            &names(&["home"]),
+            known,
+            |_| Ok((exit::ERROR, json!({"sandbox": "home"}))),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            document["error"]["message"],
+            "the sandbox failed: see its error"
+        );
     }
 
     /// In JSON, each one's result or error is an element, in order, and an

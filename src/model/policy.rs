@@ -28,21 +28,22 @@ pub struct Policy {
     pub resources: Resources,
 }
 
-/// Limits on each process of a sandbox (design §7). The Seatbelt backend
-/// enforces `open_files` and `cpu_seconds`, through the process limits
-/// macOS keeps, and refuses `file_size`, `memory` and `cpu` (ADR 0033), so
-/// a policy it stores holds none of them; `memory` and `cpu` are kept as
+/// Limits on a sandbox (design §7): `open_files`, `file_size` and
+/// `cpu_seconds` on each of its processes, `memory` and `cpu` on the
+/// sandbox as a whole. The Seatbelt backend enforces `open_files`, through
+/// the process limits macOS keeps, and refuses the others (ADR 0033), so a
+/// policy it stores holds none of them; `memory` and `cpu` are kept as
 /// written for that refusal, and for a backend that enforces them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
-    /// The most files a process holds open at once.
+    /// The most file descriptors (files, sockets, pipes) a process holds at
+    /// once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_files: Option<u64>,
     /// The largest file a process writes, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_size: Option<ByteSize>,
-    /// The most CPU time a process uses, in seconds, after which it is
-    /// stopped (macOS sends it SIGXCPU).
+    /// The most CPU time a process uses, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_seconds: Option<u64>,
     /// A memory limit, as written.
@@ -67,7 +68,10 @@ pub struct ByteSize(pub u64);
 
 /// How a size is written: a number of bytes, or text.
 #[derive(Deserialize)]
-#[serde(untagged)]
+#[serde(
+    untagged,
+    expecting = "a size: a whole number of bytes, or one ending in K, M or G, such as \"512M\""
+)]
 enum SizeText {
     Bytes(u64),
     Text(String),

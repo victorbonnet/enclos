@@ -107,9 +107,7 @@ fn main() -> ExitCode {
         Ok(parsed) => parsed,
         Err(err) => return usage_error(&err),
     };
-    if cli::output::choose(&name, cli.json, cli.text) == Output::Document {
-        cli::output::keep_stdout_for_the_document();
-    }
+    cli::output::choose(&name, cli.json, cli.text);
     if ends_on_closed_output(&cli.command) && cli::output::output() == Output::Text {
         // Without it, the print after the reader left panics. Should the
         // handler not install, that is still what happens. Not for a JSON
