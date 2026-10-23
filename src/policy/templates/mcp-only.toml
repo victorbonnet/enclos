@@ -1,0 +1,14 @@
+# Assistants working on outside data through remote MCP servers (design
+# §7): the sandbox writes only to its own home and reaches only the runtime
+# adapter's endpoints (for Hermes: its model provider, its login and its
+# install sources) and the MCP endpoints listed for it, through the
+# sandbox's proxy, which logs every connection. List an endpoint's host with
+# `enclos policy allow`, such as `enclos policy allow community
+# mcp.example.org`: nothing else of the web is reachable.
+
+[filesystem]
+write = ["{home}"]
+
+[network]
+mode = "allowlist"
+allow = []

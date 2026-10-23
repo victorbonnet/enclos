@@ -2483,3 +2483,53 @@ fn a_sandbox_runs_under_the_limits_its_policy_sets() {
         );
     }
 }
+
+/// A sandbox made from `minimal` or `mcp-only` reaches only what is listed:
+/// a public site the `assistant` template would reach is refused by its
+/// proxy, and `policy test` finds nothing open.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for template in ["minimal", "mcp-only"] {
+        let home = Home::new();
+        home.init(1);
+        home.run(&["sandbox", "create", "lab", "--template", template])
+            .ok();
+        let _stop = StopOnDrop(&home, "lab");
+        let policy = std::fs::read_to_string(home.root.join("sandboxes/lab/policy.toml")).unwrap();
+        assert!(
+            policy.contains(&format!("extends = \"{template}\"")),
+            "{policy}"
+        );
+        // Refused at the proxy: no connection leaves the host.
+        let out = home.run(&[
+            "exec",
+            "lab",
+            "--",
+            "/usr/bin/curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_connect}",
+            "https://example.com/",
+        ]);
+        assert_eq!(out.stdout(), "403", "{template}: {}", out.stderr());
+        let out = home.run(&["net", "denied", "lab"]);
+        assert!(
+            out.ok().stdout().contains("example.com:443"),
+            "{}",
+            out.stdout()
+        );
+        let out = home.run(&["policy", "test", "lab"]);
+        assert_eq!(
+            out.code(),
+            0,
+            "{template}:\n{}\n{}",
+            out.stdout(),
+            out.stderr()
+        );
+        assert!(!out.stdout().contains("OPEN"), "{}", out.stdout());
+    }
+}

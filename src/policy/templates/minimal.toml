@@ -1,0 +1,12 @@
+# A starting point (design §7): the sandbox writes only to its own home and
+# reaches only what is listed. With no list of its own, that is the runtime
+# adapter's endpoints (for Hermes: its model provider, its login and its
+# install sources), through the sandbox's proxy, which logs every connection.
+# Add a destination with `enclos policy allow`.
+
+[filesystem]
+write = ["{home}"]
+
+[network]
+mode = "allowlist"
+allow = []

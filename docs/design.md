@@ -2,7 +2,7 @@
 
 *enclos* (French for an enclosure, said "ahn-KLOH") is an open-source CLI that creates sandboxes, installs agent runtimes in them (Hermes first, then Claude Code, Codex, OpenClaw) and runs agents there, and keeps a proper state and an audit log of every command. It manages only the sandboxes it creates.
 
-Status: milestone 1 (§13) is done: its acceptance scenario passed on 2026-10-22. The code implements what §13 lists for milestone 1, and of milestone 2 so far the pending policy (`policy edit`, `apply` and `discard`) the policy history (`policy history`, `diff`, `rollback` and `refresh`) and resource limits, §7, `exec`, §8, secrets and the setup of the sandbox's Telegram bot, §12, and the server name check, §6; anything else described here comes later. Some sections also say where milestone 1 does less than the design. Target platforms: macOS on Apple Silicon first, then Linux (including Raspberry Pi). Windows through WSL2 later.
+Status: milestone 1 (§13) is done: its acceptance scenario passed on 2026-10-22. The code implements what §13 lists for milestone 1, and of milestone 2 so far the pending policy (`policy edit`, `apply` and `discard`) the policy history (`policy history`, `diff`, `rollback` and `refresh`), resource limits and the `minimal` and `mcp-only` templates, §7, `exec`, §8, secrets and the setup of the sandbox's Telegram bot, §12, and the server name check, §6; anything else described here comes later. Some sections also say where milestone 1 does less than the design. Target platforms: macOS on Apple Silicon first, then Linux (including Raspberry Pi). Windows through WSL2 later.
 
 This document describes what enclos is and how it works. Decisions that are hard to reverse, and why they were made, are recorded in [`docs/adr/`](adr/). When this document and an ADR disagree, fix one of them in the same change. Three kinds of statement appear below: **decided** (an accepted ADR or plain design text), **proposed** (an ADR with `status: proposed`), and **to verify** (behavior the design depends on that no prototype has shown yet, listed in §14). What the throwaway milestone 1 prototype (`prototype/m1/`, macOS 26.5.2, Hermes 0.22.2) showed is marked "shown by the prototype", and holds only for what it probed, on one Mac.
 
@@ -192,8 +192,8 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 
 | Template | Writes | Programs | Network | Use for |
 | --- | --- | --- | --- | --- |
-| `minimal` | own home | the runtime only | model provider only | a starting point |
-| `mcp-only` | own home | runtime and its MCP servers | model provider + listed remote MCP endpoints | assistants working on outside data |
+| `minimal` | own home | any for now: program rules come with `[exec]`, refused until enforced | the runtime adapter's endpoints only (model provider, login, install sources), and what `policy allow` adds | a starting point |
+| `mcp-only` | own home | any for now, as `minimal` | as `minimal`, plus the remote MCP endpoints listed for it with `policy allow`; the runtime is told of them with its own commands, through `enclos connect`, until `runtime configure --mcp-add` comes | assistants working on outside data |
 | `assistant` | own home | any, including what the agent installs in its home | the public web (any public address on ports 80 and 443), plus the runtime's endpoints and listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
 

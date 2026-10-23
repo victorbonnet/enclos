@@ -17,9 +17,13 @@ use file::PolicyFile;
 /// The built-in defaults every template builds on.
 pub const DEFAULTS: &str = include_str!("templates/defaults.toml");
 
-/// The templates this build of enclos ships (design §7). Milestone 1 has the
-/// one Hermes uses.
-const TEMPLATES: &[(&str, &str)] = &[("assistant", include_str!("templates/assistant.toml"))];
+/// The templates this build of enclos ships (design §7). `coding` comes
+/// with the runtimes it is for.
+const TEMPLATES: &[(&str, &str)] = &[
+    ("minimal", include_str!("templates/minimal.toml")),
+    ("mcp-only", include_str!("templates/mcp-only.toml")),
+    ("assistant", include_str!("templates/assistant.toml")),
+];
 
 /// The template a new sandbox gets unless told otherwise.
 pub const DEFAULT_TEMPLATE: &str = "assistant";
@@ -268,6 +272,24 @@ mod tests {
         assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
         assert!(snap.policy.net.allow.is_empty());
         assert_eq!(snap.id.0.len(), 64);
+    }
+
+    #[test]
+    fn minimal_and_mcp_only_reach_only_what_is_listed() {
+        for name in ["minimal", "mcp-only"] {
+            let template: TemplateName = name.parse().unwrap();
+            let snap = resolve(&initial_overrides("lab", &template), None).unwrap();
+            assert_eq!(snap.inputs.template.as_str(), name);
+            assert_eq!(
+                snap.policy.net.mode,
+                crate::model::policy::NetMode::Allowlist
+            );
+            assert!(snap.policy.net.allow.is_empty(), "{name}");
+            assert_eq!(snap.policy.fs.write, ["{home}"]);
+            // The defaults' deny list holds under every template.
+            assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
+        }
+        assert_eq!(template_names(), ["minimal", "mcp-only", "assistant"]);
     }
 
     // The list repeats entries of `defaults.toml` on purpose: it guards against
