@@ -12,7 +12,7 @@ use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
-use crate::model::policy::{PolicyVersion, TemplateName};
+use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
 use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
@@ -34,6 +34,8 @@ pub struct SandboxSpec {
 pub struct SandboxView {
     pub record: SandboxRecord,
     pub policy: Option<PolicyVersion>,
+    /// The change waiting for a restart, if any (design §7).
+    pub pending: Option<PendingPolicy>,
     /// Why enclos now refuses to compile the active policy, if it does: see
     /// [`compile_refused`].
     pub policy_refused: Option<String>,
@@ -266,6 +268,7 @@ impl Engine {
 
     fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
         let policy = self.state.active_policy(&record.name)?.map(|(v, _)| v);
+        let pending = self.state.pending_policy(&record.name)?.map(|(p, _)| p);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
         let sessions = self
@@ -285,6 +288,7 @@ impl Engine {
         Ok(SandboxView {
             record,
             policy,
+            pending,
             policy_refused: compile_refused(&compiled),
             sessions,
         })

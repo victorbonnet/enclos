@@ -1,7 +1,7 @@
 //! Policy models: what a sandbox may do (design §7, ADRs 0008, 0015, 0018).
 //!
-//! Milestone 1 has the filesystem and network sections. `[exec]`,
-//! `[resources]` and `[secrets]` arrive with the milestones that enforce them.
+//! The filesystem and network sections so far. `[exec]`, `[resources]` and
+//! `[secrets]` arrive with the work that enforces them.
 
 use std::fmt;
 use std::str::FromStr;
@@ -185,6 +185,37 @@ pub struct PolicySnapshot {
     pub id: SnapshotId,
     pub inputs: PolicyInputs,
     pub policy: Policy,
+    /// The sandbox's `policy.toml` it was resolved from, whose SHA-256
+    /// `inputs.overrides` holds: what `policy discard` writes back.
+    pub overrides: String,
+}
+
+impl PolicySnapshot {
+    /// The `policy.toml` this snapshot was resolved from, if the text
+    /// stored is the one its inputs name.
+    pub fn overrides_text(&self) -> Option<&str> {
+        (crate::policy::sha256_hex(self.overrides.as_bytes()) == self.inputs.overrides)
+            .then_some(self.overrides.as_str())
+    }
+}
+
+impl Policy {
+    /// Whether `self` and `other` have the same rules a session keeps from
+    /// its start: files and listening, which its compiled policy holds
+    /// (design §7). The rest is the proxy's, which applies it live.
+    pub fn same_at_launch(&self, other: &Policy) -> bool {
+        self.fs == other.fs && self.net.listen == other.net.listen
+    }
+}
+
+/// A sandbox's pending policy: a snapshot saved because the user declined
+/// the restart it needs. It applies to nothing until `policy apply`
+/// (design §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPolicy {
+    pub snapshot: SnapshotId,
+    pub by: Actor,
+    pub at: Timestamp,
 }
 
 /// One entry of a sandbox's append-only policy history.
@@ -201,6 +232,21 @@ pub struct PolicyVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_file_rules_and_listening_are_kept_from_a_sessions_start() {
+        let old = Policy::default();
+        let mut net = old.clone();
+        net.net.allow.push("a.example.com".into());
+        net.net.mode = NetMode::Public;
+        assert!(old.same_at_launch(&net));
+        let mut writes = old.clone();
+        writes.fs.write.push("~/work".into());
+        assert!(!old.same_at_launch(&writes));
+        let mut listens = old.clone();
+        listens.net.listen = true;
+        assert!(!old.same_at_launch(&listens));
+    }
 
     #[test]
     fn template_names_follow_the_naming_rule() {

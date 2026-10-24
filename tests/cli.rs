@@ -408,6 +408,141 @@ fn policy_allow_of_a_destination_that_does_not_parse_is_an_error() {
     }
 }
 
+/// An `EDITOR` that runs `script` on the file it is given, as `$1`.
+#[cfg(target_os = "macos")]
+fn editor(home: &Home, script: &str) -> String {
+    let path = home._dir.path().join("editor.sh");
+    std::fs::write(&path, format!("#!/bin/sh\nset -e\n{script}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path.display().to_string()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let edit = |script: &str| {
+        let mut cmd = home.command(&["policy", "edit", "home"]);
+        cmd.env_remove("VISUAL")
+            .env("EDITOR", editor(&home, script));
+        Run(cmd.output().unwrap())
+    };
+
+    let out = edit(r#"sed -i '' 's/allow_add = \[\]/allow_add = ["api.example.com"]/' "$1""#);
+    out.ok();
+    assert!(out.stdout().contains("policy v2"), "{}", out.stdout());
+    assert!(
+        out.stdout().contains("allow api.example.com"),
+        "{}",
+        out.stdout()
+    );
+    let shown = home.run(&["policy", "show", "home"]).ok().stdout();
+    assert!(shown.contains("allowed: api.example.com"), "{shown}");
+    assert!(shown.contains("enclos policy edit home"), "{shown}");
+
+    // Refused by policy: nothing applies, and the edit is kept for the next
+    // `policy edit`, which opens it again.
+    let out = edit(r#"sed -i '' 's/write_add = \[\]/write_add = ["~"]/' "$1""#);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    let kept = home.root.join("sandboxes/home/policy.toml.edit");
+    assert!(
+        out.stderr().contains(&kept.display().to_string()),
+        "{}",
+        out.stderr()
+    );
+    let out = edit("true");
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(
+        out.stdout().contains("Continuing the edit kept"),
+        "{}",
+        out.stdout()
+    );
+    std::fs::remove_file(&kept).unwrap();
+    assert!(edit("true").ok().stdout().contains("No change"));
+
+    // A kept edit is never applied over a change made since it began: it
+    // would undo that change.
+    let out = edit(r#"sed -i '' 's/write_add = \[\]/write_add = ["~"]/' "$1""#);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    home.run(&["policy", "allow", "home", "b.example.com"]).ok();
+    let out = edit("true");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("changed since your edit"),
+        "{}",
+        out.stderr()
+    );
+    let file = home.root.join("sandboxes/home/policy.toml");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("b.example.com")
+    );
+    home.run(&["policy", "discard", "home"]).ok();
+    assert!(!kept.exists());
+
+    // An editor that fails applies nothing and keeps the edit.
+    let out = edit(r#"sed -i '' 's/allow_add = \[/allow_add = ["c.example.com", /' "$1"; exit 1"#);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("did not exit cleanly"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        !std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("c.example.com")
+    );
+    assert!(kept.exists());
+
+    // Kept, then refused once the file changed; copied over its base, as
+    // the error says, it opens again and applies.
+    home.run(&["policy", "allow", "home", "d.example.com"]).ok();
+    let out = edit("true");
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("copy policy.toml over"),
+        "{}",
+        out.stderr()
+    );
+    std::fs::copy(
+        &file,
+        home.root.join("sandboxes/home/policy.toml.edit.base"),
+    )
+    .unwrap();
+    let out = edit("true");
+    assert!(
+        out.ok().stdout().contains("Continuing the edit kept"),
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("c.example.com")
+    );
+    assert!(!kept.exists());
+
+    let out = home.run(&["policy", "discard", "home"]);
+    assert!(
+        out.ok().stdout().contains("nothing pending"),
+        "{}",
+        out.stdout()
+    );
+    let out = home.run(&["policy", "apply", "home"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr().contains("no pending policy"),
+        "{}",
+        out.stderr()
+    );
+    let out = home.run(&["policy", "show", "home", "--pending"]);
+    assert_eq!(out.code(), 1);
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_seatbelt_sandbox_is_refused_off_macos() {

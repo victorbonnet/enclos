@@ -198,6 +198,7 @@ pub fn resolve(
         id: snapshot_id(&inputs, &policy),
         inputs,
         policy,
+        overrides: overrides.to_owned(),
     })
 }
 

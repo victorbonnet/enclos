@@ -382,7 +382,9 @@ impl Engine {
                 })?;
                 record.runtime = Some(kind);
                 self.state.put(lock, &record)?;
-                Ok(())
+                // A change made while the installer ran was resolved without
+                // the runtime's destinations, as it was not recorded yet.
+                self.resolve_with_runtime(lock, by, name)
             },
         )?;
         Ok(Planned::Done(InstallEnd {
@@ -401,6 +403,13 @@ impl Engine {
     ) -> Result<InstallPlan> {
         let kind = runtime.kind();
         let active = self.policy(name)?;
+        // The install resolves `policy.toml`, which holds the pending
+        // change: it would be in force without the restart it needs.
+        if active.pending.is_some() {
+            return Err(Error::PolicyPending {
+                sandbox: name.to_string(),
+            });
+        }
         let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
         })?;
@@ -471,11 +480,9 @@ impl Engine {
                 let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
-                let overrides = self.layout.read_policy(name.as_str())?;
-                Ok((
-                    self.save_policy(lock, by, name, &overrides)?,
-                    record.runtime,
-                ))
+                // A change saved as pending while the installer ran stays
+                // pending.
+                Ok((self.resolve_again(lock, by, name)?, record.runtime))
             },
         )?;
         Ok((version.version, recorded))
