@@ -48,12 +48,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
                     true => exit::OK,
                     false => exit::ERROR,
                 };
-                output::emit(&output::with_error(
-                    findings_json(&found, false),
-                    code,
-                    || "enclos's records and the host differ".to_owned(),
-                ));
-                return Ok(code);
+                return Ok(output::conclude(findings_json(&found, false), code, || {
+                    "enclos's records and the host differ".to_owned()
+                }));
             }
             if found.is_empty() {
                 println!("enclos's records match the host.");
@@ -81,7 +78,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
             let left = found.iter().any(|f| f.remedy.is_left());
             if output::json() {
                 let code = if left { exit::ERROR } else { exit::OK };
-                output::emit(&output::with_error(
+                return Ok(output::conclude(
                     findings_json(&found, confirm == Confirm::DryRun),
                     code,
                     || {
@@ -96,7 +93,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: StateArgs) -> Re
                         format!("{failed} repairs failed and {manual} findings need you")
                     },
                 ));
-                return Ok(code);
             }
             if found.is_empty() {
                 println!("enclos's records match the host: nothing to repair.");

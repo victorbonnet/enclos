@@ -73,11 +73,27 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     if args.follow {
         tail.arg("-F");
     }
+    // In JSON, tail's own words are notes, as enclos's are, not text
+    // among them.
+    if json {
+        tail.stderr(Stdio::piped());
+    }
     let mut tail = tail
         .args(&files)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| failed(format!("cannot run tail: {e}")))?;
+    let said = tail.stderr.take().map(|err| {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in io::BufReader::new(err)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                super::output::note(&format!("tail: {line}"));
+            }
+        })
+    });
     let out = tail.stdout.take().expect("tail's output is piped");
     // What the services print comes from the sandbox: shown escaped, in
     // text and in JSON, so it cannot drive the terminal (design §4).
@@ -87,6 +103,9 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
         // nobody reads it any more.
         let _ = tail.kill();
         let _ = tail.wait();
+        if let Some(said) = said {
+            let _ = said.join();
+        }
         return match e {
             // Whoever read the logs, such as `head`, has what it wanted.
             Failed::Write(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
@@ -99,9 +118,16 @@ pub fn logs(engine: &Engine, args: LogsArgs) -> Result<u8> {
     let status = tail
         .wait()
         .map_err(|e| failed(format!("cannot wait for tail: {e}")))?;
+    if let Some(said) = said {
+        let _ = said.join();
+    }
     if !status.success() {
+        let above = match json {
+            true => "in the notes above",
+            false => "above",
+        };
         return Err(failed(format!(
-            "tail {status} reading the logs of sandbox {}; what it said is above",
+            "tail {status} reading the logs of sandbox {}; what it said is {above}",
             args.sandbox
         )));
     }
@@ -117,7 +143,7 @@ fn failed(what: String) -> Error {
 /// all it wrote.
 const MAX_LINE: u64 = 64 * 1024;
 
-/// Which side of `show_escaped` failed.
+/// Which side of `show_lines` failed.
 #[derive(Debug)]
 enum Failed {
     Read(io::Error),

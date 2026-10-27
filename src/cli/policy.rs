@@ -99,12 +99,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                     }
                     Planned::Done(report) if output::json() => {
                         let code = test_code(&report);
-                        output::emit(&output::with_error(
-                            test_json(&sandbox, &report),
-                            code,
-                            || verdict(&sandbox, &report),
-                        ));
-                        code
+                        output::conclude(test_json(&sandbox, &report), code, || {
+                            verdict(&sandbox, &report)
+                        })
                     }
                     Planned::Done(report) => print_test(&sandbox, &report),
                 },
@@ -138,7 +135,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 Planned::Done(restarted) => {
                     let (code, value) = print_restarted(engine, &sandbox, &restarted)?;
                     if output::json() {
-                        output::emit(&output::with_error(
+                        return Ok(output::conclude(
                             json!({"sandbox": sandbox.to_string(), "restarted": value}),
                             code,
                             || restart_failed(&sandbox),
@@ -433,8 +430,7 @@ fn print_allowed(
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
         let mut shown = applied_json(sandbox, &applied, outcome);
         shown["destination"] = json!(destination);
-        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
-        return Ok(code);
+        return Ok(output::conclude(shown, code, || restart_failed(sandbox)));
     }
     let version = applied.version.version;
     match (applied.changed, &applied.outcome) {
@@ -628,12 +624,11 @@ fn print_replaced(
     };
     if output::json() {
         let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
-        output::emit(&output::with_error(
+        return Ok(output::conclude(
             applied_json(sandbox, &applied, outcome),
             code,
             || restart_failed(sandbox),
         ));
-        return Ok(code);
     }
     let version = applied.version.version;
     match (&applied.outcome, applied.changed) {
@@ -751,15 +746,20 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
     if after == before && recorded.as_deref().is_none_or(|r| r == after) {
         let left = forget_edit(&files);
-        match output::json() {
-            true => output::emit(&json!({
-                "sandbox": sandbox.to_string(),
-                "changed": false,
-                "edit_left": left,
-            })),
-            false => println!("No change to the policy of sandbox {sandbox}."),
+        let code = edit_left_code(&left, exit::OK);
+        if output::json() {
+            return Ok(output::conclude(
+                json!({
+                    "sandbox": sandbox.to_string(),
+                    "changed": false,
+                    "edit_left": left,
+                }),
+                code,
+                || left.join("; "),
+            ));
         }
-        return Ok(exit::OK);
+        println!("No change to the policy of sandbox {sandbox}.");
+        return Ok(code);
     }
     let applied = match engine.policy_edit(by, sandbox, &before, &after, confirm) {
         Ok(Planned::DryRun(plan)) => {
@@ -804,11 +804,18 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     };
     let left = forget_edit(&files);
     if output::json() {
-        let (code, outcome) = print_outcome(engine, sandbox, &applied)?;
+        let (restarted, outcome) = print_outcome(engine, sandbox, &applied)?;
         let mut shown = applied_json(sandbox, &applied, outcome);
         shown["edit_left"] = json!(left);
-        output::emit(&output::with_error(shown, code, || restart_failed(sandbox)));
-        return Ok(code);
+        let code = edit_left_code(&left, restarted);
+        return Ok(output::conclude(shown, code, || {
+            let mut why = Vec::new();
+            if restarted != exit::OK {
+                why.push(restart_failed(sandbox));
+            }
+            why.extend(left.iter().cloned());
+            why.join("; ")
+        }));
     }
     let version = applied.version.version;
     match (&applied.outcome, applied.changed) {
@@ -826,13 +833,24 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     for change in &applied.also {
         println!("  {change}");
     }
-    Ok(print_outcome(engine, sandbox, &applied)?.0)
+    let restarted = print_outcome(engine, sandbox, &applied)?.0;
+    Ok(edit_left_code(&left, restarted))
+}
+
+/// `code`, or a failure when the edit's copy or base stays: the next `policy
+/// edit` would take it up again, though the policy has changed since.
+fn edit_left_code(left: &[String], code: u8) -> u8 {
+    match left.is_empty() {
+        true => code,
+        false => code.max(exit::ERROR),
+    }
 }
 
 /// Removes the copy `policy edit` edited and its base, saying so when it
-/// cannot, in text: the next `policy edit` would open it again. Returns
-/// what it says, or in JSON would say, for the caller to carry in its
-/// document or its error.
+/// cannot, in text: the next `policy edit` would open it again, and refuse
+/// it, made from a policy that has changed since. Returns what it says, or
+/// in JSON would say, for the caller to carry in its document and its
+/// error; a copy left fails the command.
 fn forget_edit(files: &EditFiles) -> Vec<String> {
     let mut left = Vec::new();
     for path in [&files.copy, &files.base] {
@@ -840,11 +858,11 @@ fn forget_edit(files: &EditFiles) -> Vec<String> {
             && e.kind() != std::io::ErrorKind::NotFound
         {
             let said = format!(
-                "could not remove {} ({e}); remove it, or the next `enclos policy edit` opens it again",
+                "could not remove {} ({e}); remove it: until then the next `enclos policy edit` opens it again, and refuses it as made from the policy before this edit",
                 path.display()
             );
             if !output::json() {
-                eprintln!("enclos: {said}");
+                eprintln!("error: {said}");
             }
             left.push(said);
         }

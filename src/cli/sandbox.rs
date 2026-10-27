@@ -419,7 +419,7 @@ fn print_show(v: &SandboxView) {
 /// one is still done: one that cannot stop does not keep the others
 /// running. The exit code is the highest of theirs. In JSON, each one's
 /// result, or error, is one element of `sandboxes`, and an `error` beside
-/// them says how many failed.
+/// them says that it failed, or how many of them did.
 fn each(
     names: &[SandboxName],
     known: impl Fn(&SandboxName) -> Result<()>,
@@ -534,9 +534,19 @@ fn restart(
                     Err(e) => Err(e),
                 }
             }
-            failed => Ok(failed),
+            (code, stopped) => Ok((code, not_restarted(name, code, stopped))),
         },
     }
+}
+
+/// A restart whose stop failed, shaped as one whose start failed: the stop
+/// under `stop`, and why the sandbox was not started again beside it.
+fn not_restarted(name: &SandboxName, code: u8, stopped: Value) -> Value {
+    output::with_error(
+        json!({"sandbox": name.to_string(), "stop": stopped}),
+        code,
+        || format!("sandbox {name} did not stop, so it was not started again: see `stop`"),
+    )
 }
 
 /// Says how a stop went, in text; returns its code and, for JSON, its
@@ -764,6 +774,18 @@ mod tests {
             )],
         };
         let (code, value) = print_stop(&"home".parse().unwrap(), &report);
+        // A restart whose stop failed keeps the stop where a restart puts it.
+        let restart = not_restarted(&"home".parse().unwrap(), code, value.clone());
+        assert_eq!(restart["stop"]["stopped"], false);
+        assert_eq!(restart["stop"]["survivors"][0]["pid"], 4242);
+        assert_eq!(restart["error"]["exit_code"], 1);
+        assert!(
+            restart["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("was not started again"),
+            "{restart}"
+        );
         assert_eq!(code, exit::ERROR);
         assert_eq!(value["stopped"], false);
         assert_eq!(value["survivors"][0]["pid"], 4242);
@@ -795,7 +817,7 @@ mod tests {
     }
 
     /// In JSON, each one's result or error is an element, in order, and an
-    /// `error` beside them says how many failed.
+    /// `error` beside them says that one failed, or how many did.
     #[test]
     fn in_json_each_one_is_an_element_and_the_failures_are_counted() {
         let (code, document) = each_into(

@@ -108,6 +108,8 @@ fn main() -> ExitCode {
         Err(err) => return usage_error(&err),
     };
     cli::output::choose(&name, cli.json, cli.text);
+    // The library's notes, said as this command says its own.
+    enclos::notes::send_to(cli::output::note);
     if ends_on_closed_output(&cli.command) && cli::output::output() == Output::Text {
         // Without it, the print after the reader left panics. Should the
         // handler not install, that is still what happens. Not for a JSON
@@ -137,7 +139,8 @@ fn main() -> ExitCode {
             code
         }
     };
-    ExitCode::from(written(code, exec))
+    let expected = cli::output::output() == Output::Document;
+    ExitCode::from(written(code, exec, expected))
 }
 
 /// Tells a usage error as the command would print (design §10), and exits:
@@ -170,14 +173,18 @@ fn usage_error(err: &clap::Error) -> ExitCode {
         (_, Output::Document) => cli::output::emit(&error()),
         (_, Output::OnStderr) => say(&cli::output::line(&error())),
     }
-    ExitCode::from(written(code, exec))
+    // Help and the version are text, piped or not: no document is owed.
+    ExitCode::from(written(code, exec, false))
 }
 
-/// `code`, unless the JSON document could not be written: that is a
-/// failure whatever the command did, and the message says what it did, and
-/// the error the document held, so that it is not run again blindly. As
-/// JSON on stderr, as enclos's notes are there.
-fn written(code: u8, exec: bool) -> u8 {
+/// `code`, unless the JSON document could not be written, a second was
+/// refused, or none was printed though one was `expected`, all bugs of
+/// enclos but the first: that is a failure whatever the command did, and
+/// the message says what it did, and the error the document held, so that
+/// it is not run again blindly. As JSON on stderr, as enclos's notes are
+/// there.
+fn written(code: u8, exec: bool, expected: bool) -> u8 {
+    use cli::output::Sent;
     let failed = match exec {
         true => exit::EXEC_FAILED,
         false => code.max(exit::ERROR),
@@ -190,15 +197,41 @@ fn written(code: u8, exec: bool) -> u8 {
         exit::OK => format!("{who} succeeded"),
         code => format!("{who} failed, with exit code {code}"),
     };
-    let message = match (cli::output::second_refused(), cli::output::write_failure()) {
-        (true, _) => format!(
-            "enclos tried to print a second JSON document, refused: a bug of enclos; the first was printed, and {did}"
+    let (message, unsent) = match cli::output::sent() {
+        Sent::Written => return code,
+        Sent::Nothing if !expected => return code,
+        Sent::Nothing => {
+            debug_assert!(false, "a command in JSON prints its document");
+            (
+                format!("enclos printed no JSON document, a bug of enclos; {did}"),
+                None,
+            )
+        }
+        Sent::WriteFailed { why, unsent } => (
+            format!("cannot write the JSON document ({why}); {did}"),
+            unsent,
         ),
-        (false, Some(e)) => format!("cannot write the JSON document ({e}); {did}"),
-        (false, None) => return code,
+        Sent::SecondRefused {
+            first_failed: None,
+            unsent,
+        } => (
+            format!(
+                "enclos tried to print a second JSON document, refused: a bug of enclos; the first was printed, and {did}"
+            ),
+            unsent,
+        ),
+        Sent::SecondRefused {
+            first_failed: Some(why),
+            unsent,
+        } => (
+            format!(
+                "cannot write the JSON document ({why}), and a second was refused, a bug of enclos; {did}"
+            ),
+            unsent,
+        ),
     };
     // What the document said of a failure is said here, or it is lost.
-    let message = match cli::output::unsent_error() {
+    let message = match unsent {
         Some(why) => format!("{message}: {why}"),
         None => message,
     };
@@ -249,7 +282,7 @@ fn run(cli: Cli) -> Result<u8> {
                         Some(_) => exit::ERROR,
                         None => exit::OK,
                     };
-                    cli::output::emit(&cli::output::with_error(verify_json(&report), code, || {
+                    Ok(cli::output::conclude(verify_json(&report), code, || {
                         format!(
                             "the audit log is broken: {}; no state-changing command runs until it is repaired: keep audit.jsonl under a name that starts with audit.jsonl, such as audit.jsonl.damaged",
                             report
@@ -258,8 +291,7 @@ fn run(cli: Cli) -> Result<u8> {
                                 .map(ToString::to_string)
                                 .unwrap_or_default()
                         )
-                    }));
-                    Ok(code)
+                    }))
                 }
                 false => Ok(print_verify(&report)),
             }

@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{IsTerminal, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -39,23 +38,34 @@ pub const RUNS_A_PROGRAM: [&str; 5] = ["connect", "exec", "logs", "launch", "pro
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 
-/// Whether a document was emitted: a command emits one, and a second is a
-/// bug: a debug build panics, a release refuses it and fails the command.
-static EMITTED: AtomicBool = AtomicBool::new(false);
+/// What became of the command's JSON document. A command emits one: a
+/// second is a bug, which a debug build panics on and a release refuses,
+/// failing the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sent {
+    /// None was emitted.
+    Nothing,
+    Written,
+    /// It could not be written, and why; `unsent` is what it said of a
+    /// failure, to be said on stderr instead, or it is lost.
+    WriteFailed {
+        why: String,
+        unsent: Option<String>,
+    },
+    /// A second was refused. `first_failed` is why the first could not be
+    /// written, if it could not; `unsent` what the documents said of a
+    /// failure.
+    SecondRefused {
+        first_failed: Option<String>,
+        unsent: Option<String>,
+    },
+}
 
-/// Whether a second document was refused.
-static SECOND_REFUSED: AtomicBool = AtomicBool::new(false);
-
-/// The `error` message of a document that could not be written: said on
-/// stderr instead, or it is lost.
-static UNSENT: OnceLock<String> = OnceLock::new();
+static SENT: Mutex<Sent> = Mutex::new(Sent::Nothing);
 
 /// Where the JSON document goes: the stdout enclos was given, kept while
 /// its descriptor 1 points at stderr.
 static DOCUMENT: OnceLock<Mutex<File>> = OnceLock::new();
-
-/// Why the document could not be written, if it could not.
-static WRITE_FAILED: OnceLock<std::io::Error> = OnceLock::new();
 
 /// How `command`, by its word, prints: JSON with `--json`, which wins over
 /// `--text`; else text with `--text` or in a terminal, and JSON when piped,
@@ -119,24 +129,38 @@ pub fn json() -> bool {
     output() != Output::Text
 }
 
-/// Prints `value` as the command's one JSON document. A failure to write it
-/// is kept, for [`write_failure`] to report as the command ends.
+/// Prints `value` as the command's one JSON document. What became of it is
+/// kept, for [`sent`] to report as the command ends.
 pub fn emit(value: &Value) {
-    let first = !EMITTED.swap(true, Ordering::SeqCst);
-    debug_assert!(first, "a command writes one JSON document");
-    if !first {
-        // Two documents back to back are no JSON a reader takes: a debug
-        // build panics above; a release refuses the second, and the command
-        // fails.
-        SECOND_REFUSED.store(true, Ordering::SeqCst);
-        keep_unsent(value);
-        return;
-    }
-    if WRITE_FAILED.get().is_some() {
-        return;
-    }
+    let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let failure = || value["error"]["message"].as_str().map(str::to_owned);
+    *sent = match std::mem::replace(&mut *sent, Sent::Nothing) {
+        Sent::Nothing => match write_document(value) {
+            Ok(()) => Sent::Written,
+            Err(e) => Sent::WriteFailed {
+                why: e.to_string(),
+                unsent: failure(),
+            },
+        },
+        // Two documents back to back are no JSON a reader takes.
+        Sent::Written => Sent::SecondRefused {
+            first_failed: None,
+            unsent: failure(),
+        },
+        Sent::WriteFailed { why, unsent } => Sent::SecondRefused {
+            first_failed: Some(why),
+            unsent: unsent.or_else(failure),
+        },
+        refused @ Sent::SecondRefused { .. } => refused,
+    };
+    let refused = matches!(*sent, Sent::SecondRefused { .. });
+    drop(sent);
+    debug_assert!(!refused, "a command writes one JSON document");
+}
+
+fn write_document(value: &Value) -> std::io::Result<()> {
     let text = document_text(value);
-    let written = match DOCUMENT.get() {
+    match DOCUMENT.get() {
         Some(document) => {
             let mut document = document.lock().unwrap_or_else(|e| e.into_inner());
             writeln!(document, "{text}").and_then(|()| document.flush())
@@ -145,28 +169,20 @@ pub fn emit(value: &Value) {
             let mut out = std::io::stdout().lock();
             writeln!(out, "{text}").and_then(|()| out.flush())
         }
-    };
-    if let Err(e) = written {
-        let _ = WRITE_FAILED.set(e);
-        keep_unsent(value);
     }
 }
 
-/// Keeps what `value` says of a failure, for [`unsent_error`].
-fn keep_unsent(value: &Value) {
-    if let Some(message) = value["error"]["message"].as_str() {
-        let _ = UNSENT.set(message.to_owned());
-    }
+/// What became of the command's document so far.
+pub fn sent() -> Sent {
+    SENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// What a document that could not be written said of a failure, if it did.
-pub fn unsent_error() -> Option<&'static str> {
-    UNSENT.get().map(String::as_str)
-}
-
-/// Whether a second document was refused.
-pub fn second_refused() -> bool {
-    SECOND_REFUSED.load(Ordering::SeqCst)
+/// Emits `result`, with an `error` beside it when `code` is not 0 (see
+/// [`with_error`]), and returns `code`: the document's code and the
+/// command's are then the same by construction.
+pub fn conclude(result: Value, code: u8, message: impl FnOnce() -> String) -> u8 {
+    emit(&with_error(result, code, message));
+    code
 }
 
 /// `value` as a document's text: indented, and escaped by [`for_terminal`].
@@ -188,11 +204,6 @@ pub fn show_plan(planned: &Plan) {
 /// `logs` line on stdout.
 pub fn line(value: &Value) -> String {
     for_terminal(&serde_json::to_string(value).expect("a JSON value serializes"))
-}
-
-/// Why the document could not be written, if it could not.
-pub fn write_failure() -> Option<&'static std::io::Error> {
-    WRITE_FAILED.get()
 }
 
 /// JSON text with these characters escaped as `\uXXXX`, a character past
@@ -267,6 +278,10 @@ fn error_body(message: &str, kind: &str, code: u8) -> Value {
 /// line saying why the command fails: a command that fails with a result to
 /// show still has an `error` a script can look for.
 pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String) -> Value {
+    debug_assert!(
+        result.is_object() && result.get("error").is_none(),
+        "a result is an object with no error of its own: {result}"
+    );
     if code != exit::OK {
         result["error"] = error_body(&message(), kind(code), code);
     }
@@ -276,6 +291,10 @@ pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String)
 /// `result` with `err` beside it as its `error`, and the code it gives: a
 /// part of a command that failed, kept with what it did.
 pub fn with_failure(mut result: Value, err: &Error) -> (u8, Value) {
+    debug_assert!(
+        result.is_object() && result.get("error").is_none(),
+        "a result is an object with no error of its own: {result}"
+    );
     let code = err.exit_code();
     result["error"] = error_body(&err.to_string(), kind(code), code);
     (code, result)

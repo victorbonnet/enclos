@@ -13,6 +13,7 @@ pub mod layout;
 pub mod lifecycle;
 pub mod model;
 pub mod net;
+pub mod notes;
 pub mod policy;
 pub mod probes;
 pub mod proxy;
