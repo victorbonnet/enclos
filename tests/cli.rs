@@ -1646,7 +1646,10 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     // Without a terminal the program runs in a group of its own: the INT
     // sent below reaches this enclos alone, which outlives it and passes it
     // on to the program, which handles it and exits 3.
-    let script = "trap 'exit 3' INT; /bin/sleep 10 & wait";
+    // It says when its trap is set: an INT passed on before would end it
+    // as INT does, 130, not 3.
+    let script = "trap 'exit 3' INT; : > \"$HOME/trapped\"; /bin/sleep 10 & wait";
+    let trapped = home.root.join("sandboxes/home/home/trapped");
     let mut connect = KillOnDrop(
         home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
             .stdin(Stdio::null())
@@ -1662,6 +1665,7 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
         "{}",
         audit()
     );
+    assert!(eventually(|| trapped.exists()), "the program set no trap");
     // The enclos this test started.
     Command::new("/bin/kill")
         .args(["-INT", &connect.0.id().to_string()])
