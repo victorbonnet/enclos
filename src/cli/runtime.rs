@@ -92,7 +92,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
             true => exit::OK,
             false => exit::ERROR,
         };
-        output::emit(&output::with_error(
+        return Ok(output::conclude(
             json!({
                 "sandbox": sandbox.to_string(),
                 "runtime": runtime.to_string(),
@@ -109,7 +109,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
                 )
             },
         ));
-        return Ok(code);
     }
     super::connect::report_end(&sandbox, &end.end);
     if !end.installed {

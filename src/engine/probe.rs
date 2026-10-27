@@ -208,10 +208,10 @@ impl KeychainProbe {
 impl Drop for KeychainProbe {
     fn drop(&mut self) {
         if let Err(e) = self.store.remove(&self.secret) {
-            eprintln!(
-                "warning: the keychain item probe's test item stays: {e}; it is {}",
+            crate::notes::say(&format!(
+                "the keychain item probe's test item stays: {e}; it is {}",
                 self.store.whereabouts(&self.secret)
-            );
+            ));
         }
     }
 }

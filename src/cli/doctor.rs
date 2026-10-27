@@ -22,7 +22,7 @@ pub fn run(engine: &Engine) -> Result<u8> {
     };
     match super::output::json() {
         true => super::output::emit(&super::output::with_error(json(&doctor), code, || {
-            "something keeps enclos, or one of its sandboxes, from running here".to_owned()
+            "doctor found something that keeps enclos or a sandbox from running here, or could not look at all of it: see the report".to_owned()
         })),
         false => print!("{}", shown(&doctor)),
     }

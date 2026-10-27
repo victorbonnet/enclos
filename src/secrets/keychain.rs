@@ -65,10 +65,10 @@ impl Keychain {
             .map(|f| match std::path::absolute(&f) {
                 Ok(absolute) => absolute,
                 Err(e) => {
-                    eprintln!(
-                        "warning: cannot tell where {KEYCHAIN_VAR}={} is from here ({e}); services enclos installs may not find it",
+                    crate::notes::say(&format!(
+                        "cannot tell where {KEYCHAIN_VAR}={} is from here ({e}); services enclos installs may not find it",
                         f.display()
-                    );
+                    ));
                     f
                 }
             });
