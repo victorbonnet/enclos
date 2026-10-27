@@ -38,4 +38,4 @@ The binary is not signed with an Apple Developer ID or notarized. `curl` does no
 
 ## The website
 
-[`pages.yml`](../.github/workflows/pages.yml) publishes [`site/`](../site/) and `install.sh` to <https://victorbonnet.github.io/enclos/> on every change to them on `main`, so the install command always serves the installer on `main`. It needs the repository's Pages source set to GitHub Actions, once.
+[`pages.yml`](../.github/workflows/pages.yml) publishes [`site/`](../site/) and `install.sh` to <https://enclos.dev/> on every change to them on `main`, so the install command always serves the installer on `main`. It needs the repository's Pages source set to GitHub Actions and its custom domain (`enclos.dev`) set under Settings → Pages, once each. The `victorbonnet.github.io/enclos` address redirects there.
