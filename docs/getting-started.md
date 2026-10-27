@@ -17,10 +17,10 @@ The words used here:
 ## Install enclos
 
 ```bash
-curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
+curl -fsSL https://enclos.dev/install.sh | bash
 ```
 
-The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
+The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
 
 **No release is published yet.** Until the first one, the installer says so and installs nothing. Build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
 
