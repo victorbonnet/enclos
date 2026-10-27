@@ -1,6 +1,6 @@
 # Website
 
-The page at <https://victorbonnet.github.io/enclos/>: what enclos does, a few illustrated boundaries, how to install it and common questions. It is plain HTML, CSS and JavaScript, with no build step, external font or analytics. The only request it makes is to the GitHub API, to name the latest release.
+The page at <https://enclos.dev/>: what enclos does, a few illustrated boundaries, how to install it and common questions. It is plain HTML, CSS and JavaScript, with no build step, external font or analytics. The only request it makes is to the GitHub API, to name the latest release.
 
 [`pages.yml`](../.github/workflows/pages.yml) publishes this folder and [`install.sh`](../install.sh) on every change to them on `main` ([releases](../docs/releases.md#the-website)). To preview it:
 
