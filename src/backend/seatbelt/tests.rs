@@ -625,7 +625,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        lookups_refused: true,
+        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -784,7 +784,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        lookups_refused: true,
+        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
@@ -1306,4 +1306,19 @@ fn the_mktemp_wrapper_puts_temp_files_under_the_sandbox_tmp() {
         ok && made.starts_with(&format!("{}/pfx.", alt.display())),
         "{made}"
     );
+}
+
+/// What doctor runs to tell whether Seatbelt runs here: a program starts
+/// under each baseline alone, `(deny default)` with its allowances as every
+/// session compiles them.
+#[test]
+fn a_program_starts_under_either_baseline_alone() {
+    use super::Baseline;
+    for baseline in [Baseline::DenyDefault, Baseline::AllowDefault] {
+        assert_eq!(
+            super::wrap::try_run(baseline),
+            crate::backend::Probe::Available,
+            "{baseline:?}"
+        );
+    }
 }

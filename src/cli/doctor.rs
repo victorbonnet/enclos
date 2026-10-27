@@ -45,12 +45,12 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             json!({
                 "kind": b.kind.to_string(),
                 "state": match &b.state {
-                    BackendState::NotFound { .. } => "not_found",
+                    BackendState::Unavailable { .. } => "unavailable",
                     BackendState::Refuses { .. } => "refuses",
                     BackendState::Runs => "runs",
                 },
                 "reason": match &b.state {
-                    BackendState::NotFound { reason } | BackendState::Refuses { reason } => {
+                    BackendState::Unavailable { reason } | BackendState::Refuses { reason } => {
                         Some(reason)
                     }
                     BackendState::Runs => None,
@@ -88,11 +88,9 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     DriftKind::Changed { now, ran_file } => {
                         let (edited, on_allow_default, lines) = match ran_file {
                             RanFile::Gone => (false, false, None),
-                            RanFile::There {
-                                edited,
-                                on_allow_default,
-                                lines,
-                            } => (*edited, *on_allow_default, Some(lines)),
+                            RanFile::There { written, lines } => {
+                                (written.edited(), written.on_allow_default(), Some(lines))
+                            }
                         };
                         json!({
                             "kind": if edited { "edited" } else { "changed" },
@@ -173,7 +171,7 @@ pub fn shown(doctor: &Doctor) -> String {
 
 fn backend(b: &BackendCheck) -> String {
     let state = match &b.state {
-        BackendState::NotFound { reason } => format!("not usable here: {reason}"),
+        BackendState::Unavailable { reason } => format!("not usable here: {reason}"),
         BackendState::Refuses { reason } => {
             format!("on this host, and it refused to run a program: {reason}")
         }
@@ -245,16 +243,16 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
             );
         }
         DriftKind::Changed { now, ran_file } => {
-            if let RanFile::There {
-                on_allow_default: true,
-                ..
-            } = ran_file
+            if let RanFile::There { written, .. } = ran_file
+                && written.on_allow_default()
             {
                 out += &format!(
                     "    {ran} is on the (allow default) comparison baseline (ADR 0006), which only a debug build compiles\n"
                 );
             }
-            if let RanFile::There { edited: true, .. } = ran_file {
+            if let RanFile::There { written, .. } = ran_file
+                && written.edited()
+            {
                 out += &format!(
                     "    {ran} no longer holds what policy v{version} compiled to: it was changed after it was written\n"
                 );
@@ -323,7 +321,7 @@ fn enforced(e: &Enforcement) -> String {
 mod tests {
     use super::*;
     use enclos::backend::{Capabilities, Enforcement};
-    use enclos::engine::Running;
+    use enclos::engine::{Running, Written};
     use enclos::model::sandbox::BackendKind;
     use std::path::PathBuf;
 
@@ -403,8 +401,9 @@ mod tests {
         let shown = shown(&doctor(SandboxCheck {
             drift: vec![change(
                 RanFile::There {
-                    edited: false,
-                    on_allow_default: false,
+                    written: Written::AsWritten {
+                        on_allow_default: false,
+                    },
                     lines: Lines::Changed(vec![
                         LineChange::Removed("(old)".into()),
                         LineChange::Added("(new)".into()),
@@ -432,6 +431,34 @@ mod tests {
         assert!(!shown.contains("compiles as it did"), "{shown}");
     }
 
+    /// A file on the `(allow default)` comparison baseline is said to be,
+    /// in text and in JSON.
+    #[test]
+    fn a_file_on_the_comparison_baseline_is_said_so() {
+        let doctor = doctor(SandboxCheck {
+            drift: vec![change(
+                RanFile::There {
+                    written: Written::AsWritten {
+                        on_allow_default: true,
+                    },
+                    lines: Lines::TooLong,
+                },
+                Running::default(),
+            )],
+            ..compiles()
+        });
+        let shown = shown(&doctor);
+        assert!(
+            shown.contains("/c/ran.sb is on the (allow default) comparison baseline (ADR 0006)"),
+            "{shown}"
+        );
+        let json = json(&doctor);
+        assert_eq!(
+            json["records"]["sandboxes"][0]["drift"][0]["ran_on_allow_default"], true,
+            "{json}"
+        );
+    }
+
     /// An edited file that also compiles differently now names the file of
     /// now as well; a count enclos could not check is not said as a fact.
     #[test]
@@ -439,8 +466,7 @@ mod tests {
         let shown = shown(&doctor(SandboxCheck {
             drift: vec![change(
                 RanFile::There {
-                    edited: true,
-                    on_allow_default: false,
+                    written: Written::Edited,
                     lines: Lines::TooLong,
                 },
                 Running {

@@ -25,6 +25,15 @@ const HOST_SERVICES: &str = include_str!("host-services.sb");
 /// What a sandbox may do under `(deny default)` (ADR 0006).
 pub(super) const DENY_DEFAULT: &str = include_str!("deny-default.sb");
 
+/// How a compiled policy's first line starts, which [`Baseline::of_compiled`]
+/// reads as [`compile`] writes it.
+const HEADER: &str = ";; enclos compiled policy";
+/// The line of the `(allow default)` baseline.
+const ALLOW_DEFAULT_LINE: &str = "(allow default)";
+/// How the line of the `(deny default)` baseline starts, before the rest of
+/// its tag (see [`tag`]).
+const DENY_DEFAULT_START: &str = "(deny default (with message \"enclos:";
+
 /// The variable that compiles a policy from `(allow default)` instead, as
 /// before ADR 0006 was accepted: `allow-default`. Only so tests can compare
 /// the two baselines, not a setting: see [`Baseline::parse`].
@@ -74,23 +83,30 @@ impl Baseline {
         }
     }
 
+    /// What a policy on this baseline starts with, after `(version 1)`, its
+    /// denials tagged `tag` (see [`tag`]).
+    pub(crate) fn text(self, tag: &str) -> String {
+        debug_assert!(tag.starts_with("enclos:"), "{tag}");
+        match self {
+            Baseline::AllowDefault => ALLOW_DEFAULT_LINE.to_owned(),
+            Baseline::DenyDefault => format!(
+                "(deny default (with message \"{tag}\"))\n{}",
+                DENY_DEFAULT.trim_end()
+            ),
+        }
+    }
+
     /// The baseline a compiled policy's text is on, as [`compile`] writes it:
     /// its third line, after the header comment and `(version 1)`, which no
     /// path in the policy can reach. None for a text it did not write.
     pub fn of_compiled(text: &str) -> Option<Baseline> {
         let mut lines = text.lines();
         match (lines.next(), lines.next(), lines.next()) {
-            (Some(c), Some("(version 1)"), Some(b))
-                if c.starts_with(";; enclos compiled policy") =>
-            {
-                match b {
-                    "(allow default)" => Some(Baseline::AllowDefault),
-                    b if b.starts_with("(deny default (with message \"enclos:") => {
-                        Some(Baseline::DenyDefault)
-                    }
-                    _ => None,
-                }
-            }
+            (Some(c), Some("(version 1)"), Some(b)) if c.starts_with(HEADER) => match b {
+                ALLOW_DEFAULT_LINE => Some(Baseline::AllowDefault),
+                b if b.starts_with(DENY_DEFAULT_START) => Some(Baseline::DenyDefault),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -158,17 +174,11 @@ pub fn compile(
         sb.push('\n');
     };
     line(format!(
-        ";; enclos compiled policy for sandbox {}. Generated: edit policy.toml instead.",
+        "{HEADER} for sandbox {}. Generated: edit policy.toml instead.",
         ctx.name
     ));
     line("(version 1)".into());
-    match baseline {
-        Baseline::AllowDefault => line("(allow default)".into()),
-        Baseline::DenyDefault => {
-            line(format!("(deny default (with message \"{tag}\"))"));
-            line(DENY_DEFAULT.trim_end().to_owned());
-        }
-    }
+    line(baseline.text(&tag));
 
     line("\n;; ---- Writes: the sandbox home, granted workspaces and device files".into());
     line(format!("(deny file-write* (with message \"{tag}\"))"));
@@ -782,12 +792,105 @@ mod tests {
         );
     }
 
-    /// Whether a compiled text, its comments left out, allows everything.
-    fn allows_everything(text: &str) -> bool {
-        text.lines()
+    /// Each `(allow …)` of a compiled text, whole however many lines it
+    /// takes, nested ones too, comments left out and its spaces and line
+    /// breaks made one space: a clause added anywhere in one changes it.
+    fn allowances(text: &str) -> Vec<String> {
+        let code: Vec<char> = text
+            .lines()
             .map(|l| l.split(";;").next().unwrap_or(""))
-            .map(|l| l.split_whitespace().collect::<String>())
-            .any(|l| l.contains("(allowdefault)"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .collect();
+        let starts_allow = |i: usize| {
+            let word: String = code[i + 1..].iter().take(6).collect();
+            word.starts_with("allow")
+                && word
+                    .chars()
+                    .nth(5)
+                    .is_none_or(|c| c.is_whitespace() || c == '(' || c == ')')
+        };
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < code.len() {
+            if code[i] == '"' {
+                i = string_end(&code, i) + 1;
+                continue;
+            }
+            if code[i] == '(' && starts_allow(i) {
+                let (mut depth, mut j) = (0, i);
+                while j < code.len() {
+                    match code[j] {
+                        '"' => j = string_end(&code, j),
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let whole: String = code[i..=j.min(code.len() - 1)].iter().collect();
+                found.push(whole.split_whitespace().collect::<Vec<_>>().join(" "));
+                // Its nested allowances are found too.
+                i += 1;
+                continue;
+            }
+            i += 1;
+        }
+        found
+    }
+
+    /// Where the string starting at `start`, a `"`, ends: its closing `"`.
+    fn string_end(code: &[char], start: usize) -> usize {
+        let mut j = start + 1;
+        while j < code.len() && code[j] != '"' {
+            if code[j] == '\\' {
+                j += 1;
+            }
+            j += 1;
+        }
+        j
+    }
+
+    /// Whether a compiled text, its comments left out, allows everything:
+    /// an allowance whose operation, among its words outside strings, is
+    /// `default`, however it is spaced or split.
+    fn allows_everything(text: &str) -> bool {
+        allowances(text).iter().any(|allow| {
+            let mut words = String::new();
+            let mut in_string = false;
+            for c in allow.chars() {
+                match c {
+                    '"' => in_string = !in_string,
+                    '(' | ')' if !in_string => words.push(' '),
+                    c if !in_string => words.push(c),
+                    _ => {}
+                }
+            }
+            words.split_whitespace().any(|w| w == "default")
+        })
+    }
+
+    #[test]
+    fn allowances_are_found_whole_however_written() {
+        let text = "(version 1)\n(allow\n  default)\n;; (allow nothing)\n(if (param \"P\")\n  (allow file-read* (subpath \"/a (b)\")\n    (subpath \"/c\")))\n(deny file-write*)\n";
+        assert_eq!(
+            allowances(text),
+            [
+                "(allow default)",
+                "(allow file-read* (subpath \"/a (b)\") (subpath \"/c\"))"
+            ]
+        );
+        assert!(allows_everything(text));
+        assert!(allows_everything("(allow (with report) default)"));
+        assert!(!allows_everything(
+            "(allow file-read* (subpath \"/default\"))"
+        ));
     }
 
     /// The Mach service names a policy text names.
@@ -875,21 +978,16 @@ mod tests {
         assert_eq!(allow, deny.replace(&block, "(allow default)\n"));
     }
 
-    /// Every allowance a policy using every feature compiles to, by its
-    /// first line: one added anywhere in the compiled text, not only in
-    /// `deny-default.sb`, is a change to this list.
+    /// Every allowance a policy using every feature compiles to, whole: one
+    /// added anywhere in the compiled text, not only in `deny-default.sb`,
+    /// or a clause added to one, is a change to this list.
     #[test]
     fn every_allowance_of_a_compiled_policy_is_reviewed() {
         let base = Path::new("/nonexistent-enclos-test");
         let mut p = policy();
         p.net.listen = true;
         let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
-        let allows: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with(";;") && l.contains("(allow "))
-            .collect();
-        assert_eq!(allows, REVIEWED_ALLOWANCES, "{text}");
+        assert_eq!(allowances(&text), REVIEWED_ALLOWANCES, "{text}");
     }
 
     /// The deny-default block, then writes, terminals, the home's reads,
@@ -903,17 +1001,17 @@ mod tests {
         "(allow process-info* (target same-sandbox))",
         "(allow file-ioctl)",
         "(allow pseudo-tty)",
-        "(allow mach-lookup",
+        "(allow mach-lookup (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\") (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.trustd.agent\"))",
         "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
-        "(allow file-write*",
+        "(allow file-write* (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\"))",
         "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))",
-        "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (literal (param \"ENCLOS_TERMINAL\")))))",
+        "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (literal (param \"ENCLOS_TERMINAL\"))))",
         "(allow file-read* (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\"))",
         "(allow network-outbound (remote tcp \"localhost:41001\"))",
         "(allow network-bind network-inbound (local unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
         "(allow network-outbound (remote unix-socket (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\")))",
         "(allow network-bind network-inbound (local tcp \"localhost:*\"))",
-        "(allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\"))))",
+        "(allow network-outbound (remote tcp4 (param \"ENCLOS_SERVICE\")))",
         "(allow signal (target same-sandbox))",
     ];
 

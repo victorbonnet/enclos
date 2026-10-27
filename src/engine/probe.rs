@@ -8,6 +8,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 
 use crate::backend::LaunchLimits;
+use crate::backend::seatbelt::Baseline;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -41,9 +42,9 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
-    /// Whether the probes ran on the `(allow default)` baseline, which only
-    /// a comparison asks for (ADR 0006): the report says so.
-    pub allow_default: bool,
+    /// The baseline the probes ran on: `(allow default)` only when a
+    /// comparison asks for it (ADR 0006), which the report says.
+    pub baseline: Baseline,
 }
 
 impl TestReport {
@@ -259,9 +260,9 @@ impl Engine {
         }
         let summary = |r: &TestReport| {
             let platform = r.closed_apart();
-            let baseline = match r.allow_default {
-                true => ", on the (allow default) comparison baseline",
-                false => "",
+            let baseline = match r.baseline {
+                Baseline::AllowDefault => ", on the (allow default) comparison baseline",
+                Baseline::DenyDefault => "",
             };
             format!(
                 "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run{baseline}",
@@ -285,7 +286,7 @@ impl Engine {
                 path: compiled.clone(),
                 source,
             })?;
-            let baseline = crate::backend::seatbelt::Baseline::of_compiled(&text).ok_or_else(
+            let baseline = Baseline::of_compiled(&text).ok_or_else(
                 || Error::Session {
                     what: format!(
                         "{} names no baseline enclos writes, though enclos just wrote it: a bug of enclos, or the file was edited meanwhile",
@@ -314,9 +315,8 @@ impl Engine {
                 Some(target.0.id()),
                 Some(terminal.path.clone()),
                 limits.clone(),
+                baseline,
             )?;
-            inputs.lookups_refused = baseline == crate::backend::seatbelt::Baseline::DenyDefault;
-            let allow_default = !inputs.lookups_refused;
             inputs.keychain_item = keychain
                 .as_ref()
                 .map(|k| k.item.clone())
@@ -352,7 +352,7 @@ impl Engine {
                 host_services,
                 not_here: not_here(&inputs),
                 listens: inputs.listen,
-                allow_default,
+                baseline,
             })
         })
         .map(Planned::Done)
@@ -369,6 +369,7 @@ impl Engine {
         target: Option<u32>,
         other_terminal: Option<PathBuf>,
         limits: LaunchLimits,
+        baseline: Baseline,
     ) -> Result<ProbeInputs> {
         let policy = self.policy(name)?.snapshot.policy;
         let paths = PathContext {
@@ -411,7 +412,7 @@ impl Engine {
             host_sockets: host_sockets(&ctx.user_home),
             proxy_port: ctx.proxy_port,
             listen: policy.net.listen,
-            lookups_refused: false,
+            baseline,
             target,
             other_terminal,
             tag: std::process::id(),
@@ -430,12 +431,14 @@ impl Engine {
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
         let limits = self.launch_limits(&record, &self.policy(name)?.snapshot.policy)?;
+        // The baseline only changes what closes a probe, not how many run.
         let mut inputs = self.probe_inputs(
             name,
             &ctx,
             Some(0),
             Some(PathBuf::from("/dev/ttys0")),
             limits,
+            Baseline::default(),
         )?;
         inputs.keychain_item = match cfg!(target_os = "macos") {
             true => Ok(KeychainItem {
@@ -673,7 +676,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            allow_default: false,
+            baseline: Baseline::DenyDefault,
         }
     }
 
@@ -752,7 +755,7 @@ mod tests {
             host_sockets: Vec::new(),
             proxy_port: 41001,
             listen: false,
-            lookups_refused: false,
+            baseline: crate::backend::seatbelt::Baseline::AllowDefault,
             target: Some(target),
             other_terminal: None,
             tag: 7,

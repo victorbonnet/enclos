@@ -22,7 +22,8 @@
 //! says: it refuses to run setuid programs such as `crontab` and `at`, even
 //! under a bare `(allow default)`. Others are closed under `(deny default)`
 //! by the baseline before the rule they test is reached: LaunchServices and
-//! Apple Events at least, whose lookups the baseline refuses. Those probes
+//! Apple Events at least, where the baseline refuses something the tool
+//! needs (which operation is not traced; a lookup is likely). Those probes
 //! carry a note saying so ([`ClosedBy`]), which the report repeats, so that
 //! their being closed is not read as proof of the route's own rule.
 //!
@@ -33,12 +34,15 @@
 //! `--host-services`, which CI's macOS runners ask for. A launchd job,
 //! preferences domain or file they leave is checked from the host and
 //! removed; LaunchServices and the Apple Event leave nothing to check, so
-//! they count as closed only with a refusal Seatbelt gives: the rule's own
-//! (-54, -600), or, when the compiled policy is on `(deny default)`, what a
-//! refused lookup makes the tool say (-10661, -1728).
+//! they count as closed only with a refusal Seatbelt gives: on `(allow
+//! default)` the rule's own (-54, -600), and on `(deny default)` only what
+//! the baseline's refusal makes the tool say (-10661, -1728); the rule's
+//! there reads inconclusive, as it would mean the baseline let the tool
+//! through.
 
 use std::path::{Path, PathBuf};
 
+use crate::backend::seatbelt::Baseline;
 use crate::policy::paths::is_within;
 
 /// How a probe's own result is read.
@@ -46,11 +50,11 @@ use crate::policy::paths::is_within;
 pub enum Expect {
     /// Closed when the script fails.
     Fails,
-    /// Closed when it fails with one of these texts in its output: a
-    /// refusal Seatbelt was shown to give, a rule's, the platform's own for
-    /// setuid programs, or what a lookup the baseline refuses makes a tool
-    /// say. Any other failure is inconclusive.
-    FailsWith(&'static [&'static str]),
+    /// Closed when it fails with this text in its output: a refusal
+    /// Seatbelt was shown to give, a rule's, the platform's own for setuid
+    /// programs, or what the baseline's refusal makes a tool say. Any other
+    /// failure is inconclusive.
+    FailsWith(&'static str),
     /// Closed when the output does not contain this text.
     OutputLacks(&'static str),
     /// A folder renamed or cloned into itself, which the filesystem refuses
@@ -63,24 +67,26 @@ pub enum Expect {
     IntoItself,
     /// An Apple Event to Finder. An answer, a refusal by TCC (-1743) or a
     /// wait on Finder (-1712) all mean the event left the sandbox: open
-    /// (ADR 0016). Closed when the output has one of these texts: the
-    /// policy rule's refusal ([`AE_REFUSED`]), and on `(deny default)` what
-    /// `osascript` says when the baseline refuses its lookup of Finder
-    /// ([`AE_LOOKUP_REFUSED`]). Any other failure is inconclusive.
-    AppleEventBlocked(&'static [&'static str]),
+    /// (ADR 0016). Closed when the output has this text: the policy rule's
+    /// refusal ([`AE_REFUSED`]) on `(allow default)`, and on `(deny
+    /// default)` what `osascript` says when the baseline refuses what it
+    /// needs to reach Finder ([`AE_LOOKUP_REFUSED`]). Any other failure is
+    /// inconclusive.
+    AppleEventBlocked(&'static str),
 }
 
 /// What `osascript` says when the policy's rule refuses the event.
 pub const AE_REFUSED: &str = "(-600)";
-/// What `osascript` says when it cannot look Finder up, as the `(deny
-/// default)` baseline refuses (macOS 15 and 26, CI): `Can’t get application
+/// What `osascript` says when the `(deny default)` baseline refuses what it
+/// needs to reach Finder, likely its lookup (macOS 15 and 26, CI; not
+/// traced): `Can’t get application
 /// "Finder". (-1728)`. Finder's own -1728, `Finder got an error: Can’t get
 /// …`, means the event reached it, and does not match.
 pub const AE_LOOKUP_REFUSED: &str = "application \"Finder\". (-1728)";
 /// What `open` says when the policy's `lsopen` rule refuses it.
 pub const LS_REFUSED: &str = "error -54 ";
-/// What `open` says when it cannot look LaunchServices up, as the `(deny
-/// default)` baseline refuses (macOS 15 and 26, CI).
+/// What `open` says when the `(deny default)` baseline refuses what it needs
+/// of LaunchServices, likely its lookup (macOS 15 and 26, CI; not traced).
 pub const LS_LOOKUP_REFUSED: &str = "Code=-10661";
 
 /// Why a closed probe shows no rule of its route.
@@ -88,12 +94,20 @@ pub const LS_LOOKUP_REFUSED: &str = "Code=-10661";
 pub enum ClosedBy {
     /// Seatbelt itself, whatever the compiled policy says.
     Seatbelt,
-    /// The `(deny default)` baseline, which refuses a lookup before the
-    /// operation the route's rule refuses is tried.
+    /// The `(deny default)` baseline, which refuses something the tool
+    /// needs before the operation the route's rule refuses is tried.
     Baseline,
 }
 
 impl ClosedBy {
+    /// Its name in a JSON report.
+    pub fn key(self) -> &'static str {
+        match self {
+            ClosedBy::Seatbelt => "seatbelt",
+            ClosedBy::Baseline => "baseline",
+        }
+    }
+
     /// What the report says of it.
     pub fn why(self) -> &'static str {
         match self {
@@ -103,8 +117,8 @@ impl ClosedBy {
     }
 }
 
-/// Under `(deny default)`, the baseline refuses the lookup first.
-const LOOKUP_REFUSED: &str = "on (deny default) a lookup the tool needs is refused before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes";
+/// Under `(deny default)`, the baseline refuses first.
+const LOOKUP_REFUSED: &str = "on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes";
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
 /// module makes one, and each is harmless whatever the policy says.
@@ -281,9 +295,9 @@ pub struct ProbeInputs {
     pub proxy_port: u16,
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028).
     pub listen: bool,
-    /// Whether the compiled policy is on `(deny default)`, whose baseline
-    /// refuses every lookup it does not allow.
-    pub lookups_refused: bool,
+    /// The baseline of the compiled policy the probes run under: on `(deny
+    /// default)` it refuses what it does not allow before a route's rule.
+    pub baseline: Baseline,
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
@@ -450,7 +464,7 @@ pub(crate) fn listen_probes(listen: bool, proxy_port: u16) -> Vec<Probe> {
                 "network",
                 name,
                 bind_script(at, port),
-                Expect::FailsWith(&[BIND_REFUSED]),
+                Expect::FailsWith(BIND_REFUSED),
                 bind_script(at, 0),
             )
         })
@@ -487,7 +501,7 @@ fn setuid_probe(
     name: &str,
     program: &str,
     args: &str,
-    refusal: &'static [&'static str],
+    refusal: &'static str,
 ) -> Probe {
     let script = format!("{program} {args}");
     let mut setuid = probe(route, name, &script, Expect::FailsWith(refusal), &script);
@@ -525,7 +539,7 @@ fn folder_probe(name: impl Into<String>, prepare: Option<String>, change: String
         "writable folders",
         name,
         format!("{prepare}{refused}; echo \"the policy let it through: $out\""),
-        Expect::FailsWith(&[NOT_PERMITTED]),
+        Expect::FailsWith(NOT_PERMITTED),
         format!("{prepare}{refused}"),
     )
 }
@@ -808,7 +822,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
                 "terminals",
                 name,
                 open.clone(),
-                Expect::FailsWith(&[REFUSED]),
+                Expect::FailsWith(REFUSED),
                 open,
             ));
         }
@@ -871,14 +885,14 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "read the crontab",
         "/usr/bin/crontab",
         "-l >/dev/null",
-        &["/usr/bin/crontab: Operation not permitted"],
+        "/usr/bin/crontab: Operation not permitted",
     ));
     list.push(setuid_probe(
         "at",
         "list the `at` queue",
         "/usr/bin/atq",
         ">/dev/null",
-        &["/usr/bin/atq: Operation not permitted"],
+        "/usr/bin/atq: Operation not permitted",
     ));
     list
 }
@@ -949,39 +963,37 @@ pub(crate) fn limit_script(flag: &str, limit: u64) -> String {
 pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
     // A session with Finder, which LaunchServices and Apple Events need.
     let finder = "/usr/bin/pgrep -x Finder >/dev/null";
-    let mut list = vec![
-        // `open <folder>` reports the rule's refusal (-54, design §5), and on
-        // `(deny default)` only the baseline's refused lookup (-10661), so a
-        // probe closed there is the baseline's: the rule's refusal there would
-        // mean the lookup was allowed, and reads inconclusive. Not `open
-        // -R`: inside the sandbox it exits 0 although Finder reveals nothing,
-        // so its exit code says nothing (ADR 0016).
-        probe(
-            "launchservices",
-            "open a folder through LaunchServices",
-            "/usr/bin/open -g /System",
-            Expect::FailsWith(match i.lookups_refused {
-                true => &[LS_LOOKUP_REFUSED],
-                false => &[LS_REFUSED],
-            }),
-            finder,
+    // What closes LaunchServices and Apple Events, and why, on the baseline
+    // the probes run under: on `(deny default)` only the baseline's refusal,
+    // the rule's there meaning the baseline let the tool through.
+    let (ls_refused, ae_refused, closed_by) = match i.baseline {
+        Baseline::DenyDefault => (
+            LS_LOOKUP_REFUSED,
+            AE_LOOKUP_REFUSED,
+            Some(ClosedBy::Baseline),
         ),
-        probe(
-            "apple events",
-            "send an Apple Event to Finder",
-            "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
-            Expect::AppleEventBlocked(match i.lookups_refused {
-                true => &[AE_LOOKUP_REFUSED],
-                false => &[AE_REFUSED],
-            }),
-            finder,
-        ),
-    ];
-    if i.lookups_refused {
-        for p in &mut list {
-            p.closed_by = Some(ClosedBy::Baseline);
-        }
-    }
+        Baseline::AllowDefault => (LS_REFUSED, AE_REFUSED, None),
+    };
+    // `open <folder>` reports the rule's refusal (-54, design §5). Not `open
+    // -R`: inside the sandbox it exits 0 although Finder reveals nothing,
+    // so its exit code says nothing (ADR 0016).
+    let mut launch_services = probe(
+        "launchservices",
+        "open a folder through LaunchServices",
+        "/usr/bin/open -g /System",
+        Expect::FailsWith(ls_refused),
+        finder,
+    );
+    launch_services.closed_by = closed_by;
+    let mut apple_events = probe(
+        "apple events",
+        "send an Apple Event to Finder",
+        "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
+        Expect::AppleEventBlocked(ae_refused),
+        finder,
+    );
+    apple_events.closed_by = closed_by;
+    let mut list = vec![launch_services, apple_events];
     let label = format!("org.enclos.probe.{}", i.tag);
     let mut job = probe(
         "launchd",
@@ -1133,12 +1145,9 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             Outcome::Open(format!("it succeeded: {}", last_line(output)))
         }
         Expect::Fails => Outcome::Closed,
-        Expect::FailsWith(refusals) if refusals.iter().any(|r| output.contains(r)) => {
-            Outcome::Closed
-        }
-        Expect::FailsWith(refusals) => Outcome::Inconclusive(format!(
-            "it failed, but not with the expected refusal ({}): {}",
-            refusals.join(" or "),
+        Expect::FailsWith(refusal) if output.contains(refusal) => Outcome::Closed,
+        Expect::FailsWith(refusal) => Outcome::Inconclusive(format!(
+            "it failed, but not with the expected refusal ({refusal}): {}",
             last_line(output)
         )),
         Expect::OutputLacks(text) if output.contains(text) => {
@@ -1169,12 +1178,9 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         Expect::AppleEventBlocked(_) if output.contains("-1712") => Outcome::Open(
             "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
         ),
-        Expect::AppleEventBlocked(refusals) if refusals.iter().any(|r| output.contains(r)) => {
-            Outcome::Closed
-        }
-        Expect::AppleEventBlocked(refusals) => Outcome::Inconclusive(format!(
-            "the event failed, but not with a refusal Seatbelt gives ({}): {}",
-            refusals.join(" or "),
+        Expect::AppleEventBlocked(refusal) if output.contains(refusal) => Outcome::Closed,
+        Expect::AppleEventBlocked(refusal) => Outcome::Inconclusive(format!(
+            "the event failed, but not with the refusal Seatbelt gives ({refusal}): {}",
             last_line(output)
         )),
     }
@@ -1212,7 +1218,7 @@ mod tests {
             host_sockets: vec![dir.join("agent.sock")],
             proxy_port: 41001,
             listen: false,
-            lookups_refused: true,
+            baseline: crate::backend::seatbelt::Baseline::DenyDefault,
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
@@ -1998,7 +2004,7 @@ mod tests {
     fn on_allow_default_only_the_rules_refusals_close_the_host_services() {
         let dir = tempfile::tempdir().unwrap();
         let mut i = inputs(dir.path());
-        i.lookups_refused = false;
+        i.baseline = Baseline::AllowDefault;
         let list = host_service_probes(&i);
         let open = find(&list, "launchservices");
         let ae = find(&list, "apple events");

@@ -97,7 +97,7 @@ fn init_records_the_first_available_backend() {
             reason: "no VM support".to_owned(),
         }]
     );
-    assert!(!report.config_names_no_backend);
+    assert_eq!(report.config_backend, None);
     let config = std::fs::read_to_string(engine.layout.config_file()).unwrap();
     assert!(
         config.contains("default_backend = \"seatbelt\""),
@@ -105,24 +105,55 @@ fn init_records_the_first_available_backend() {
     );
 }
 
-/// A `config.toml` written while no backend was available is said to name
-/// none once one is, and is left as it is.
+/// A `config.toml` written while no backend was available gets the one
+/// available now, in place of init's own line for that; one changed by
+/// hand is said to name none and left; one that does not parse is said, and
+/// does not fail init.
 #[test]
-fn init_says_when_its_config_names_no_backend_though_one_is_available() {
+fn init_names_a_backend_in_a_config_written_while_none_was_available() {
+    use crate::engine::ConfigBackend;
     let (_dir, mut engine) = engine_with(vec![Box::new(FakeBackend::unavailable(
         BackendKind::Seatbelt,
         "a bad setting",
     ))]);
     let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
     assert_eq!(report.default_backend, None);
-    assert!(!report.config_names_no_backend);
+    assert_eq!(report.config_backend, None);
     let written = engine.layout.read_config().unwrap();
     engine.backends = vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))];
     let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
     assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
     assert!(report.unavailable.is_empty());
-    assert!(report.config_names_no_backend);
-    assert_eq!(engine.layout.read_config().unwrap(), written);
+    assert_eq!(
+        report.config_backend,
+        Some(ConfigBackend::Written(BackendKind::Seatbelt))
+    );
+    assert_eq!(
+        engine.layout.read_config().unwrap(),
+        crate::config::initial(Some(BackendKind::Seatbelt))
+    );
+    assert_ne!(engine.layout.read_config().unwrap(), written);
+    // Named now: nothing to say.
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.config_backend, None);
+
+    // Changed by hand: said, and left as it is.
+    let mine = "# mine\nschema_version = 1\n";
+    std::fs::write(engine.layout.config_file(), mine).unwrap();
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(
+        report.config_backend,
+        Some(ConfigBackend::NotNamed(BackendKind::Seatbelt))
+    );
+    assert_eq!(engine.layout.read_config().unwrap(), mine);
+
+    // Not TOML: said why, and init still succeeds.
+    std::fs::write(engine.layout.config_file(), "not = [toml").unwrap();
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let Some(ConfigBackend::Unchecked(why)) = &report.config_backend else {
+        panic!("{report:?}");
+    };
+    assert!(why.contains("does not parse"), "{why}");
 }
 
 #[test]
@@ -577,7 +608,14 @@ mod compile {
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
         let inputs = engine
-            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .probe_inputs(
+                &name,
+                &ctx,
+                None,
+                None,
+                Default::default(),
+                Default::default(),
+            )
             .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);

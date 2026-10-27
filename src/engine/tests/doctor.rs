@@ -91,7 +91,7 @@ fn changed(check: &SandboxCheck) -> Vec<Change> {
                 version: d.version,
                 ran: d.ran.clone(),
                 now: now.clone(),
-                edited: matches!(ran_file, RanFile::There { edited: true, .. }),
+                edited: matches!(ran_file, RanFile::There { written, .. } if written.edited()),
                 lines: match ran_file {
                     RanFile::Gone => None,
                     RanFile::There { lines, .. } => Some(lines.clone()),
@@ -174,7 +174,7 @@ fn a_backend_not_on_this_host_is_not_tried() {
     let doctor = engine.doctor();
     assert_eq!(
         doctor.backends[0].state,
-        BackendState::NotFound {
+        BackendState::Unavailable {
             reason: "not on this host".into()
         }
     );
@@ -673,14 +673,9 @@ fn a_file_on_the_allow_default_baseline_is_said_so() {
         };
         match &drift.kind {
             DriftKind::Changed {
-                ran_file:
-                    RanFile::There {
-                        on_allow_default,
-                        edited,
-                        ..
-                    },
+                ran_file: RanFile::There { written, .. },
                 ..
-            } => (*on_allow_default, *edited),
+            } => (written.on_allow_default(), written.edited()),
             other => panic!("{other:?}"),
         }
     };

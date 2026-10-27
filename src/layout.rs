@@ -299,6 +299,28 @@ impl Layout {
         Ok(true)
     }
 
+    /// Replaces `config.toml` in one step: written beside it, then renamed
+    /// over it, so a crash leaves the old or the new file.
+    pub fn replace_config(&self, contents: &str) -> Result<(), LayoutError> {
+        let path = self.config_file();
+        let tmp = path.with_extension("toml.new");
+        let io_err = |path: &Path| {
+            let path = path.to_owned();
+            move |source| LayoutError::Io { path, source }
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(io_err(&tmp))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
+    }
+
     /// Creates a sandbox's folder, its home, and the home's `tmp`, which
     /// `TMPDIR` points at: the sandbox cannot write `/tmp`.
     pub fn create_sandbox_dirs(&self, name: &str) -> Result<(), LayoutError> {

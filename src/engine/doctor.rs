@@ -53,12 +53,12 @@ pub struct BackendCheck {
 }
 
 /// Whether a backend can be used on this host, as checked before every
-/// session (`NotFound`, kept as the JSON's `not_found`, also covers a
-/// Seatbelt baseline asked for that is neither), and then whether a program
-/// ran in it.
+/// session, and then whether a program ran in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendState {
-    NotFound {
+    /// Not usable here: not on this host, or, for Seatbelt, a baseline asked
+    /// for that is neither.
+    Unavailable {
         reason: String,
     },
     /// On this host, and it refused to run a program.
@@ -141,16 +141,34 @@ pub enum RanFile {
     /// another name.
     Gone,
     There {
-        /// It no longer holds the text its name, a digest, was made from:
-        /// it was changed after it was written. Said whether or not it now
-        /// matches what the version compiles to.
-        edited: bool,
-        /// As enclos wrote it, not edited, it is on the `(allow default)`
-        /// comparison baseline (ADR 0006), which only a debug build
-        /// compiles: the change then includes that baseline.
-        on_allow_default: bool,
+        written: Written,
         lines: Lines,
     },
+}
+
+/// The file a session ran under, against what enclos wrote in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// It no longer holds the text its name, a digest, was made from: it
+    /// was changed after it was written. Said whether or not it now matches
+    /// what the version compiles to.
+    Edited,
+    /// As enclos wrote it; `on_allow_default` when that was on the `(allow
+    /// default)` comparison baseline (ADR 0006), which only a debug build
+    /// compiles: the change then includes that baseline.
+    AsWritten { on_allow_default: bool },
+}
+
+impl Written {
+    pub fn edited(self) -> bool {
+        self == Written::Edited
+    }
+
+    pub fn on_allow_default(self) -> bool {
+        self == Written::AsWritten {
+            on_allow_default: true,
+        }
+    }
 }
 
 /// What changed between the file a session ran under and the text of now.
@@ -224,7 +242,7 @@ impl Engine {
             .map(|b| BackendCheck {
                 kind: b.kind(),
                 state: match b.probe() {
-                    Probe::Unavailable { reason } => BackendState::NotFound { reason },
+                    Probe::Unavailable { reason } => BackendState::Unavailable { reason },
                     Probe::Available => match b.try_run() {
                         Probe::Unavailable { reason } => BackendState::Refuses { reason },
                         Probe::Available => BackendState::Runs,
@@ -452,11 +470,13 @@ impl Engine {
                 }
                 let before = String::from_utf8_lossy(&bytes);
                 RanFile::There {
-                    edited,
-                    // Said only of a file as enclos wrote it: an edited one
-                    // is said so.
-                    on_allow_default: !edited
-                        && Baseline::of_compiled(&before) == Some(Baseline::AllowDefault),
+                    written: match edited {
+                        true => Written::Edited,
+                        false => Written::AsWritten {
+                            on_allow_default: Baseline::of_compiled(&before)
+                                == Some(Baseline::AllowDefault),
+                        },
+                    },
                     lines: lines_between(&before, &text),
                 }
             }

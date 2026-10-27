@@ -29,7 +29,7 @@ mod tests;
 pub use channel::ChannelSet;
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
-    NextSession, RanFile, Running, SandboxCheck, Sandboxes,
+    NextSession, RanFile, Running, SandboxCheck, Sandboxes, Written,
 };
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
@@ -104,11 +104,25 @@ pub struct InitReport {
     /// `config.toml` when this run created it.
     pub default_backend: Option<BackendKind>,
     /// Each backend this host cannot use now, and why: an unsupported
-    /// system, or a setting such as a bad `ENCLOS_SEATBELT_BASELINE`.
+    /// system, or a bad value of a variable such as
+    /// `ENCLOS_SEATBELT_BASELINE`.
     pub unavailable: Vec<Unavailable>,
-    /// Whether a `config.toml` there already names no default backend,
-    /// though one is available now: it was written while none was.
-    pub config_names_no_backend: bool,
+    /// What became of a `config.toml` that was there already, when a
+    /// backend is available now: none when it names one.
+    pub config_backend: Option<ConfigBackend>,
+}
+
+/// An existing `config.toml` that named no default backend, though one is
+/// available now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigBackend {
+    /// It held the line init writes while none is available: the backend
+    /// is written in its place.
+    Written(BackendKind),
+    /// It was changed by hand: left as it is, for the user to name one.
+    NotNamed(BackendKind),
+    /// It could not be read or does not parse, and why: left as it is.
+    Unchecked(String),
 }
 
 /// A backend this host cannot use now, and why.
@@ -213,9 +227,10 @@ impl Engine {
             let written = self
                 .layout
                 .write_config(&config::initial(default_backend))?;
-            let config_names_no_backend = !written
-                && default_backend.is_some()
-                && !config::names_default_backend(&self.layout.read_config()?);
+            let config_backend = match (written, default_backend) {
+                (false, Some(kind)) => self.fill_config_backend(kind),
+                _ => None,
+            };
             Ok(InitReport {
                 data: self.layout.data().to_owned(),
                 config: self.layout.config().to_owned(),
@@ -223,7 +238,7 @@ impl Engine {
                 migration,
                 default_backend,
                 unavailable,
-                config_names_no_backend,
+                config_backend,
             })
         })?;
         Ok(Planned::Done(report))
@@ -286,6 +301,32 @@ impl Engine {
     pub(crate) fn with_stop_members(mut self, stop: StopMembers) -> Engine {
         self.stop_members = stop;
         self
+    }
+
+    /// Names `kind` in a `config.toml` written while no backend was
+    /// available, when it still holds init's own line for that; says what
+    /// it did, or why not, rather than fail `init` over it.
+    fn fill_config_backend(&self, kind: BackendKind) -> Option<ConfigBackend> {
+        let text = match self.layout.read_config() {
+            Ok(text) => text,
+            Err(e) => return Some(ConfigBackend::Unchecked(e.to_string())),
+        };
+        match config::backend_named(&text) {
+            Ok(config::BackendNamed::Named) => None,
+            Ok(config::BackendNamed::NotNamed) => Some(ConfigBackend::NotNamed(kind)),
+            Ok(config::BackendNamed::Placeholder) => Some(
+                match self
+                    .layout
+                    .replace_config(&config::with_backend(&text, kind))
+                {
+                    Ok(()) => ConfigBackend::Written(kind),
+                    Err(e) => ConfigBackend::Unchecked(e.to_string()),
+                },
+            ),
+            Err(why) => Some(ConfigBackend::Unchecked(format!(
+                "it does not parse: {why}"
+            ))),
+        }
     }
 
     /// The first backend available here, and why each unavailable one is

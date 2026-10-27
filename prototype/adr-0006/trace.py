@@ -12,10 +12,13 @@ A capture that could read as clean without being so fails instead: a
 stream that is not running, says anything on stderr or reports lost
 events; a canary denial (a write to `/`, made through `enclos exec` before
 and after the command) that never shows parsed; events past the cap; tagged
-events the script cannot read; or a command run on another baseline than
-the one asked for, as enclos's notice on stderr says, and the compiled
-files written meanwhile when there are some. Only events between the two
-canaries count. SANDBOX must be named in ENCLOS-ARGS.
+events the script cannot read; a command run on another baseline than the
+one asked for, as enclos's notice on stderr says, and the compiled files
+written meanwhile when there are some, each of which must name a baseline
+enclos writes. Only events between the two canaries count. SANDBOX must be
+named in ENCLOS-ARGS, and nothing else of it may run when the trace starts:
+a session or service of the sandbox carries the same tag, so its denials
+would be counted as the command's.
 
 usage: ENCLOS=<enclos binary> ENCLOS_HOME=<folder> [TIMEOUT=<seconds>] \\
        python3 -I trace.py SANDBOX allow|deny OUT -- ENCLOS-ARGS...
@@ -148,14 +151,44 @@ def compiled_files():
     return found
 
 
-def third_line(path):
-    """A compiled policy's baseline line, as `Baseline::of_compiled` reads it."""
+DENY_DEFAULT_START = '(deny default (with message "enclos:'
+
+
+def baseline_of(path):
+    """The baseline a compiled policy is on, as `Baseline::of_compiled` reads
+    its third line: "allow" or "deny"; None when the file is gone; raises
+    ValueError when it names no baseline enclos writes or cannot be read."""
     try:
         with open(path) as f:
             lines = [f.readline().rstrip("\n") for _ in range(3)]
     except FileNotFoundError:
         return None
-    return lines[2]
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"{path} cannot be read: {e}")
+    if lines[2] == "(allow default)":
+        return "allow"
+    if lines[2].startswith(DENY_DEFAULT_START):
+        return "deny"
+    raise ValueError(f"{path} names no baseline enclos writes: {lines[2]!r}")
+
+
+def others_running():
+    """Why the sandbox already runs something whose denials carry its tag,
+    or None: any session not gone but its proxy, which runs on the host."""
+    shown = subprocess.run([enclos, "--json", "sandbox", "show", sandbox], env=env,
+                           capture_output=True, text=True, timeout=120)
+    if shown.returncode != 0:
+        return f"`enclos sandbox show {sandbox}` failed: {shown.stderr.strip()}"
+    try:
+        sessions = json.loads(shown.stdout)["sessions"]
+    except (ValueError, KeyError) as e:
+        return f"`enclos sandbox show {sandbox}` printed no sessions to read: {e}"
+    running = [s for s in sessions if not s["gone"] and s["kind"] != "proxy"]
+    if running:
+        named = ", ".join(f"{s['kind']} session {s['id']}" for s in running)
+        return (f"the sandbox already runs {named}, whose denials carry the same tag: "
+                f"stop it (`enclos sandbox stop {sandbox}`), then trace again")
+    return None
 
 
 def stop_command():
@@ -192,6 +225,9 @@ try:
     time.sleep(1)
     if stream.poll() is not None:
         sys.exit("log stream is not running: " + "".join(errors).strip())
+    why = others_running()
+    if why:
+        sys.exit(why)
     start_at, why = canary("start")
     if why:
         sys.exit(why)
@@ -213,9 +249,12 @@ try:
     if not written:
         notes.append("no compiled file was written: the baseline is shown by enclos's notice alone")
     for path in written:
-        line = third_line(path)
-        on_allow = line == "(allow default)"
-        if line is not None and on_allow != (baseline == "allow"):
+        try:
+            on = baseline_of(path)
+        except ValueError as e:
+            failed.append(str(e))
+            continue
+        if on is not None and on != baseline:
             failed.append(f"{path} was compiled on another baseline than {baseline}")
     end_at, why = canary("end")
     if why:

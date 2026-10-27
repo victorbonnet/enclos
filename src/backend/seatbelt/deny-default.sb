@@ -23,8 +23,8 @@
 (allow sysctl-read)
 (allow process-info* (target same-sandbox))
 
-;; Controlling what a program has open, such as its terminal's size or
-;; dtrace's helper, which every program opens at start. The host-service
+;; Controlling what a program has open, such as its terminal's size, or
+;; dtrace's helper, which programs open at start. The host-service
 ;; rules after this still refuse TIOCSTI, typing into the terminal.
 (allow file-ioctl)
 

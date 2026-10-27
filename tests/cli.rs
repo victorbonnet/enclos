@@ -3072,6 +3072,53 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
 /// In a sandbox whose policy has a deny rule, as every enclos sandbox's
 /// has, macOS refuses Seatbelt to the programs it runs (exit 71), and doctor
 /// says so.
+/// A baseline value that is neither makes Seatbelt unusable, which doctor
+/// says with why, in text and JSON; on the comparison baseline it says what
+/// it compares against.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_says_what_a_baseline_value_does() {
+    let home = Home::new();
+    home.init(1);
+    let out = Run(home
+        .command(&["doctor"])
+        .env("ENCLOS_SEATBELT_BASELINE", "1")
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout()
+            .contains("not usable here: ENCLOS_SEATBELT_BASELINE is \"1\""),
+        "{}",
+        out.stdout()
+    );
+    let out = home
+        .piped(&["doctor"])
+        .env("ENCLOS_SEATBELT_BASELINE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["backends"][0]["state"], "unavailable", "{doc}");
+    assert!(
+        doc["backends"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ENCLOS_SEATBELT_BASELINE is \"1\""),
+        "{doc}"
+    );
+    let out = Run(home
+        .command(&["doctor"])
+        .env("ENCLOS_SEATBELT_BASELINE", "allow-default")
+        .output()
+        .unwrap());
+    assert!(
+        out.stderr().contains("(allow default) comparison baseline"),
+        "{}",
+        out.stderr()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
@@ -3943,13 +3990,18 @@ fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
             .contains("it takes `deny-default` or `allow-default`"),
         "{doc}"
     );
-    // Once the value is gone, Seatbelt is available: init says the
-    // config written meanwhile names no default backend.
+    // Once the value is gone, Seatbelt is available: init writes it in the
+    // config written meanwhile, and says so.
     let said = home.run(&["init"]).ok().stdout();
     assert!(!said.contains("No backend is available"), "{said}");
     assert!(
-        said.contains("names no default backend, though seatbelt is available now"),
+        said.contains("Default backend: seatbelt, now written to"),
         "{said}"
+    );
+    let config = std::fs::read_to_string(home.root.join("config.toml")).unwrap();
+    assert!(
+        config.contains("default_backend = \"seatbelt\""),
+        "{config}"
     );
 }
 

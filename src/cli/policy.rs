@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::output;
 
+use enclos::backend::seatbelt::Baseline;
 use enclos::engine::{
     ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyDiff, PolicyHistory,
     PolicyView, Restarted, TestReport,
@@ -270,19 +271,16 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
                 "name": r.name,
                 "outcome": outcome,
                 "why": why,
-                "closed_by": r.closed_by.map(|by| match by {
-                    enclos::probes::ClosedBy::Seatbelt => "seatbelt",
-                    enclos::probes::ClosedBy::Baseline => "baseline",
-                }),
+                "closed_by": r.closed_by.map(enclos::probes::ClosedBy::key),
             })
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,
         "not_here": report.not_here,
         "not_probed": NOT_PROBED,
         "listens": report.listens,
-        "baseline": match report.allow_default {
-            true => "allow_default",
-            false => "deny_default",
+        "baseline": match report.baseline {
+            Baseline::AllowDefault => "allow_default",
+            Baseline::DenyDefault => "deny_default",
         },
     })
 }
@@ -992,11 +990,11 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
                 report.inconclusive()
             ),
         };
-        let baseline = match report.allow_default {
-            true => {
+        let baseline = match report.baseline {
+            Baseline::AllowDefault => {
                 " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
             }
-            false => "",
+            Baseline::DenyDefault => "",
         };
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
@@ -1046,7 +1044,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            allow_default: false,
+            baseline: Baseline::DenyDefault,
         }
     }
 

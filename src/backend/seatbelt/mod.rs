@@ -50,10 +50,10 @@ impl Default for Seatbelt {
 fn say_allow_default(ctx: &SandboxContext) {
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| {
-        eprintln!(
-            "enclos: sandbox {} runs under a policy compiled from (allow default), as {BASELINE_VAR} asks: that baseline is only for comparing the two (ADR 0006)",
+        crate::notes::say(&format!(
+            "sandbox {} runs under a policy compiled from (allow default), as {BASELINE_VAR} asks: that baseline is only for comparing the two (ADR 0006)",
             ctx.name
-        );
+        ));
     });
 }
 
@@ -83,8 +83,15 @@ impl Backend for Seatbelt {
         Probe::Available
     }
 
+    /// On the baseline every session here compiles from: a bad value is
+    /// unavailable already, and said by `probe`.
     fn try_run(&self) -> Probe {
-        wrap::try_run()
+        match &self.baseline {
+            Ok(baseline) => wrap::try_run(*baseline),
+            Err(reason) => Probe::Unavailable {
+                reason: reason.clone(),
+            },
+        }
     }
 
     fn capabilities(&self) -> Capabilities {
