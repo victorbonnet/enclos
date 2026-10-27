@@ -1,7 +1,7 @@
 name: pages
 
 # Publishes site/ and install.sh to GitHub Pages, so the installer is at
-# https://victorbonnet.github.io/enclos/install.sh.
+# https://enclos.dev/install.sh.
 on:
   push:
     branches: [main]

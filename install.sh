@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the latest enclos release on an Apple silicon Mac:
 #
-#   curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash
+#   curl -fsSL https://enclos.dev/install.sh | bash
 #
 # The entry point is the last line, so a download cut short installs nothing.
 set -euo pipefail
@@ -21,7 +21,7 @@ Usage: install.sh [--prefix PATH]
   --prefix PATH  Install into PATH/bin (default: $HOME/.local).
   --help         Show this help.
 
-Through a pipe: curl -fsSL https://victorbonnet.github.io/enclos/install.sh | bash -s -- --prefix PATH
+Through a pipe: curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix PATH
 
 The installer needs curl, tar and shasum. It never uses sudo, edits shell
 startup files or creates sandboxes. To build from source instead, see
