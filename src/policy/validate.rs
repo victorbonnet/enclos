@@ -5,9 +5,10 @@
 //! inside another workspace, or one reached through a symlink the sandbox
 //! can change; a dropped built-in read-deny entry; a path the compiled
 //! policy cannot hold; a destination the proxy never lets a sandbox reach.
-//! Malformed: a path or destination that does not parse, or a
-//! `network.private` opt-in for a host not in `network.allow`. A policy
-//! exits 2 only when every problem is a refusal (design §10).
+//! Malformed: a path or destination that does not parse, a
+//! `network.private` opt-in for a host not in `network.allow`, or a write
+//! grant at or inside a deny-list path. A policy exits 2 only when every
+//! problem is a refusal (design §10).
 
 use std::path::{Path, PathBuf};
 
@@ -225,7 +226,7 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     check_hidden(&granted, policy, ctx, &own_home, problems);
 }
 
-/// A folder granted inside a path the deny list hides: the deny list wins
+/// A folder granted at or inside a path the deny list hides: the deny list wins
 /// over every write grant (design §5), so the sandbox could write nothing
 /// there, and the grant only reads as if it could. A grant that holds a
 /// hidden path, such as a workspace with a denied file in it, is fine. The
@@ -239,7 +240,8 @@ fn check_hidden(
     problems: &mut Vec<Problem>,
 ) {
     for g in granted.iter().filter(|g| g.path != own_home) {
-        // An entry that does not expand is said by `validate`.
+        // An entry that does not expand is said by `validate`, and refused
+        // by the compiler.
         let hidden = policy.fs.read_deny.iter().find(|entry| {
             ctx.paths
                 .expand(entry)
@@ -247,7 +249,7 @@ fn check_hidden(
         });
         if let Some(entry) = hidden {
             problems.push(Problem::Malformed(format!(
-                "filesystem.write: `{}` ({}) is inside `{entry}`, which the deny list hides, so the sandbox could write nothing there; grant a folder outside it",
+                "filesystem.write: `{}` ({}) is `{entry}` or inside it, which the deny list hides, so the sandbox could write nothing there; grant a folder outside it",
                 g.entry,
                 g.path.display()
             )));
@@ -584,7 +586,7 @@ mod tests {
             "{found:?}"
         );
         assert!(
-            found[0].to_string().contains("is inside `~/.claude`"),
+            found[0].to_string().contains("is `~/.claude` or inside it"),
             "{found:?}"
         );
         assert!(validate_writes(&policy(&["~/.claude/work"], &[], &[]), &f.ctx).is_err());
@@ -593,7 +595,7 @@ mod tests {
         own.fs.read_deny.push("~/work".into());
         let found = problems(&own, &f);
         assert!(
-            found.iter().any(|p| p.contains("is inside `~/work`")),
+            found.iter().any(|p| p.contains("is `~/work` or inside it")),
             "{found:?}"
         );
 
@@ -603,6 +605,48 @@ mod tests {
             problems(&holds, &f).is_empty(),
             "{:?}",
             problems(&holds, &f)
+        );
+
+        // The sandbox home is left out of a denial that holds it, as the
+        // compiler leaves it out.
+        let mut home_hidden = policy(&["{home}", "~/work"], &[], &[]);
+        home_hidden.fs.read_deny.push("~/.enclos".into());
+        let found = problems(&home_hidden, &f);
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.contains("which the deny list hides")),
+            "{found:?}"
+        );
+    }
+
+    /// Compared by real paths, as the compiler denies: a grant reached
+    /// through a link into a denied folder, and a denied entry that is
+    /// itself a link, are both found.
+    #[test]
+    fn a_workspace_hidden_through_a_link_is_an_error() {
+        let f = fixture();
+        let user = &f.ctx.paths.user_home;
+        std::fs::create_dir_all(user.join(".claude/work")).unwrap();
+        std::os::unix::fs::symlink(user.join(".claude/work"), user.join("proj")).unwrap();
+        let found = problems(&policy(&["~/proj"], &[], &[]), &f);
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("is `~/.claude` or inside it")),
+            "{found:?}"
+        );
+
+        let g = fixture();
+        let user = &g.ctx.paths.user_home;
+        std::fs::create_dir_all(user.join("dotfiles/claude/work")).unwrap();
+        std::os::unix::fs::symlink(user.join("dotfiles/claude"), user.join(".claude")).unwrap();
+        let found = problems(&policy(&["~/dotfiles/claude/work"], &[], &[]), &g);
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("is `~/.claude` or inside it")),
+            "{found:?}"
         );
     }
 
