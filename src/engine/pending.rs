@@ -20,7 +20,7 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetPolicy, PendingPolicy, PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::SandboxName;
-use crate::model::session::SessionRecord;
+use crate::model::session::{SessionKind, SessionRecord};
 use crate::policy::PolicyError;
 use crate::service::ServiceLabel;
 use crate::state::StateLock;
@@ -357,7 +357,8 @@ impl Engine {
 
     /// Restarts the sandbox into its pending policy: stops what runs, makes
     /// the pending policy active, then starts the services again when it
-    /// had services installed. Asks first when sessions would end.
+    /// had services installed. Asks first when a session the user started
+    /// would end; the runtime's services start again on their own.
     pub fn policy_apply(
         &self,
         by: &Actor,
@@ -398,11 +399,15 @@ impl Engine {
                     ..Plan::default()
                 }));
             }
-            Confirm::Ask if !running.is_empty() => {
+            Confirm::Ask if running.iter().any(|s| s.kind != SessionKind::Service) => {
+                let ended = running
+                    .iter()
+                    .filter(|s| s.kind != SessionKind::Service)
+                    .count();
                 return Err(Error::NeedsConfirmation {
                     what: format!(
-                        "restarting sandbox {name} to apply its pending policy, which ends {} (an interactive one ends too: connect again after)",
-                        sessions(running.len())
+                        "restarting sandbox {name} to apply its pending policy, which ends {} you started (connect again after)",
+                        sessions(ended)
                     ),
                 });
             }
@@ -421,6 +426,8 @@ impl Engine {
         name: &SandboxName,
         pending: &PendingPolicy,
     ) -> Result<Restarted> {
+        // Before anything stops, and again under the lock below.
+        self.check_pending_file(name, pending)?;
         let services = self.has_services(name)?;
         let stopped = match self.stops_to_restart(name)? {
             true => match self.stop_sandbox(by, name, Confirm::Yes) {
@@ -474,6 +481,7 @@ impl Engine {
                 Some(name.to_string()),
                 |v: &PolicyVersion| format!("policy v{}", v.version),
                 |lock| {
+                    self.check_pending_file(name, pending)?;
                     self.state
                         .apply_pending(lock, name, &pending.snapshot, by)?
                         .ok_or_else(|| Error::PendingChanged {
@@ -505,6 +513,36 @@ impl Engine {
             stopped,
             started,
         })
+    }
+
+    /// Refuses to put `pending` in force unless it still waits and
+    /// `policy.toml` holds the text it was resolved from (design §7: the
+    /// file holds the pending text while a change waits). Otherwise the
+    /// policy in force would be one the file does not describe, and the
+    /// next change, which resolves the file, would drop what it lacks.
+    fn check_pending_file(&self, name: &SandboxName, pending: &PendingPolicy) -> Result<()> {
+        let Some((_, snapshot)) = self
+            .state
+            .pending_policy(name)?
+            .filter(|(now, _)| now.snapshot == pending.snapshot)
+        else {
+            return Err(Error::PendingChanged {
+                sandbox: name.to_string(),
+            });
+        };
+        let file = self.layout.policy_file(name.as_str());
+        let holds = match std::fs::read(&file) {
+            Ok(text) => crate::policy::sha256_hex(&text) == snapshot.inputs.overrides,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => return Err(io(&file)(source)),
+        };
+        match holds {
+            true => Ok(()),
+            false => Err(Error::PendingFileDiffers {
+                sandbox: name.to_string(),
+                file,
+            }),
+        }
     }
 
     /// Whether a restart stops the sandbox first: it has services installed,
@@ -645,37 +683,72 @@ impl Engine {
             |lock| {
                 let plan = self.plan_discard(name)?;
                 let file = self.layout.policy_file(name.as_str());
-                let kept = match plan.edited {
-                    true => {
-                        let kept = self.discarded_file(name);
-                        let current = std::fs::read(&file).map_err(io(&file))?;
-                        write_private(&kept, &current)?;
-                        self.layout.write_policy(name.as_str(), &plan.text)?;
-                        Some(kept)
-                    }
-                    false => None,
-                };
+                // In an order that leaves one coherent state at each step:
+                // the kept edit moves aside first, and back if the pending
+                // policy cannot be dropped; the file is put back last, so
+                // a failure there leaves an edit not applied, which another
+                // `policy discard` puts back, never a pending policy the
+                // file does not hold.
+                let files = self.edit_files(name);
                 let edit = match plan.kept_edit {
                     true => {
-                        let files = self.edit_files(name);
                         let to = discarded(&files.copy);
                         std::fs::rename(&files.copy, &to).map_err(io(&files.copy))?;
-                        remove_if_there(&files.base)?;
                         Some(to)
                     }
                     false => None,
                 };
-                if plan.pending.is_some() {
-                    self.state
-                        .discard_pending(lock, name)
-                        .map_err(|e| Error::FailedAfter {
-                            error: Box::new(e.into()),
-                            done: format!(
-                                "putting back the policy.toml of policy v{}",
-                                plan.version.version
-                            ),
-                        })?;
+                if plan.pending.is_some()
+                    && let Err(e) = self.state.discard_pending(lock, name)
+                {
+                    let error = Error::from(e);
+                    return Err(match &edit {
+                        Some(to) => match std::fs::rename(to, &files.copy) {
+                            Ok(()) => error,
+                            Err(back) => Error::FailedAfter {
+                                error: Box::new(error),
+                                done: format!(
+                                    "moving the edit `policy edit` kept to {}, which could not be moved back ({back})",
+                                    to.display()
+                                ),
+                            },
+                        },
+                        None => error,
+                    });
                 }
+                let after = |error: Error| match &plan.pending {
+                    Some(p) => Error::FailedAfter {
+                        error: Box::new(error),
+                        done: format!(
+                            "dropping the pending policy of sandbox {name} (snapshot {}); `enclos policy discard {name}` puts back the policy.toml of policy v{}",
+                            p.snapshot.short(),
+                            plan.version.version
+                        ),
+                    },
+                    None => error,
+                };
+                if edit.is_some() {
+                    remove_if_there(&files.base).map_err(after)?;
+                }
+                let kept = match plan.edited {
+                    true => {
+                        // A file gone has nothing to keep.
+                        let kept = match std::fs::read(&file) {
+                            Ok(current) => {
+                                let kept = self.discarded_file(name);
+                                write_private(&kept, &current).map_err(after)?;
+                                Some(kept)
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                            Err(e) => return Err(after(io(&file)(e))),
+                        };
+                        self.layout
+                            .write_policy(name.as_str(), &plan.text)
+                            .map_err(|e| after(e.into()))?;
+                        kept
+                    }
+                    false => None,
+                };
                 Ok(Discarded {
                     pending: plan.pending,
                     kept,

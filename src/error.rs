@@ -166,6 +166,15 @@ pub enum Error {
         file.display()
     )]
     PolicyFileChanged { sandbox: String, file: PathBuf },
+    /// `policy.toml` no longer holds the text the pending policy was
+    /// resolved from: put in force, it would be a policy the file does not
+    /// describe, and the next change, which resolves the file, would drop
+    /// what the file lacks.
+    #[error(
+        "{} no longer holds the pending policy of sandbox `{sandbox}`, so it was not applied: nothing was stopped. `enclos policy edit {sandbox}` makes what the file holds the pending change, or `enclos policy discard {sandbox}` drops it and puts back the file of the policy in force",
+        file.display()
+    )]
+    PendingFileDiffers { sandbox: String, file: PathBuf },
     /// The active snapshot's stored `policy.toml` is not the text its
     /// inputs name, so enclos cannot write it back.
     #[error(
@@ -272,6 +281,7 @@ impl Error {
             | Error::NoPendingPolicy { .. }
             | Error::PendingChanged { .. }
             | Error::PolicyFileChanged { .. }
+            | Error::PendingFileDiffers { .. }
             | Error::PolicyTextUnknown { .. }
             | Error::PolicyPending { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
