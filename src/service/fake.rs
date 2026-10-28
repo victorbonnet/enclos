@@ -22,9 +22,13 @@ pub struct FakeServices {
     pub jobs: RefCell<Vec<(ServiceLabel, std::process::Child)>>,
     /// Listing the installed units fails, as when launchd does not answer.
     pub refuse_installed: RefCell<bool>,
-    /// Units whose file is there but that the manager has not loaded, as
-    /// after `launchctl bootout`: listed as installed, said not loaded.
+    /// Labels `status` reports as not loaded, whatever `started` holds, as
+    /// after `launchctl bootout` left the job file. `installed` lists them
+    /// only while they are in `started`; `stop` clears them, as launchd's
+    /// does by removing the file, and `start` does not.
     pub unloaded: RefCell<Vec<ServiceLabel>>,
+    /// Asking a unit's status fails, as when launchctl cannot answer.
+    pub refuse_status: RefCell<bool>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -71,6 +75,7 @@ impl ServiceManager for FakeServices {
             });
         }
         self.started.borrow_mut().retain(|u| u.label != *label);
+        self.unloaded.borrow_mut().retain(|l| l != label);
         self.stopped.borrow_mut().push(label.clone());
         for (_, mut job) in self.jobs.borrow_mut().extract_if(.., |(l, _)| l == label) {
             let _ = job.kill();
@@ -83,6 +88,11 @@ impl ServiceManager for FakeServices {
     }
 
     fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus, ServiceError> {
+        if *self.refuse_status.borrow() {
+            return Err(ServiceError {
+                what: "launchctl did not answer".into(),
+            });
+        }
         if self.unloaded.borrow().contains(label) {
             return Ok(ServiceStatus::NotLoaded);
         }

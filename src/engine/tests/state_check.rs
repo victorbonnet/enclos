@@ -498,6 +498,8 @@ fn a_service_removed_by_hand_while_the_others_are_installed_is_named() {
     fake.seed(engine.label(&name, Unit::Proxy).unwrap().as_str());
     set_state(&engine, &name, SandboxState::Running);
     let found = engine.state_check(None).unwrap();
+    // Named as missing only, not also as not loaded.
+    assert_eq!(found.len(), 1, "{found:?}");
     let partial = about(&found, "is not installed while its others are");
     assert_eq!(partial.len(), 1, "{found:?}");
     assert!(partial[0].what.contains("gateway"), "{partial:?}");
@@ -784,4 +786,49 @@ fn a_service_installed_and_not_loaded_is_named() {
     // Left for a person: repair does not reload it.
     repair(&engine, None);
     assert_eq!(engine.state_check(None).unwrap(), found);
+    // What it tells loads it again.
+    done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+    engine.start_sandbox(&alice(), &name).unwrap();
+    assert_eq!(engine.state_check(None).unwrap(), []);
+}
+
+/// A sandbox recorded stopped whose services stay installed is told to
+/// stop them, not to start it again: not named as not loaded.
+#[test]
+fn a_stopped_sandboxs_unloaded_service_is_not_named_as_such() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    let proxy = engine.label(&name, Unit::Proxy).unwrap();
+    fake.seed(proxy.as_str());
+    fake.unloaded.borrow_mut().push(proxy);
+    set_state(&engine, &name, SandboxState::Stopped);
+    let found = engine.state_check(None).unwrap();
+    assert!(about(&found, "not loaded").is_empty(), "{found:?}");
+    assert_eq!(
+        about(&found, "installed while it is recorded stopped").len(),
+        1
+    );
+}
+
+/// What the service manager cannot answer stops the check, as for any
+/// failure of the host's: no service is taken for loaded or not.
+#[test]
+fn a_status_the_service_manager_cannot_give_stops_the_check() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    *fake.refuse_status.borrow_mut() = true;
+    let err = engine.state_check(None).unwrap_err();
+    assert!(err.to_string().contains("did not answer"), "{err}");
+    engine.state_repair(&alice(), None).unwrap_err();
+    let audit = engine.audit(None).unwrap();
+    assert_eq!(
+        audit
+            .last()
+            .unwrap()
+            .finished
+            .as_ref()
+            .unwrap()
+            .outcome
+            .result,
+        crate::model::audit::AuditResult::Failed
+    );
 }
