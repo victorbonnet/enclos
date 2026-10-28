@@ -222,6 +222,37 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     }
     check_nesting(&granted, &own_home, problems);
     check_links(&granted, &own_home, problems);
+    check_hidden(&granted, policy, ctx, &own_home, problems);
+}
+
+/// A folder granted inside a path the deny list hides: the deny list wins
+/// over every write grant (design §5), so the sandbox could write nothing
+/// there, and the grant only reads as if it could. A grant that holds a
+/// hidden path, such as a workspace with a denied file in it, is fine. The
+/// sandbox home is left out, as the compiler leaves it out of a denial that
+/// holds it.
+fn check_hidden(
+    granted: &[Granted],
+    policy: &Policy,
+    ctx: &ValidationContext,
+    own_home: &Path,
+    problems: &mut Vec<Problem>,
+) {
+    for g in granted.iter().filter(|g| g.path != own_home) {
+        // An entry that does not expand is said by `validate`.
+        let hidden = policy.fs.read_deny.iter().find(|entry| {
+            ctx.paths
+                .expand(entry)
+                .is_ok_and(|denied| is_within(&g.path, &real_path(&denied)))
+        });
+        if let Some(entry) = hidden {
+            problems.push(Problem::Malformed(format!(
+                "filesystem.write: `{}` ({}) is inside `{entry}`, which the deny list hides, so the sandbox could write nothing there; grant a folder outside it",
+                g.entry,
+                g.path.display()
+            )));
+        }
+    }
 }
 
 /// A write entry, as written, expanded, and resolved.
@@ -535,6 +566,44 @@ mod tests {
         assert!(problems(&policy(&["{home}", "~/work"], &[], &[]), &f).is_empty());
         // The same folder twice is still one workspace.
         assert!(problems(&policy(&["~/work", "~/work/"], &[], &[]), &f).is_empty());
+    }
+
+    /// A folder granted inside a denied path could never be written, as
+    /// the deny list wins: said as a policy written wrong, whether the
+    /// denial is a default or the policy's own. One that holds a denied
+    /// path is fine.
+    #[test]
+    fn a_workspace_the_deny_list_hides_is_an_error() {
+        let f = fixture();
+        std::fs::create_dir_all(f.ctx.paths.user_home.join(".claude/work")).unwrap();
+        let found = checked(&policy(&["{home}", "~/.claude/work"], &[], &[]), &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].is_refused(), "{found:?}");
+        assert!(
+            found[0].to_string().contains("`~/.claude/work` ("),
+            "{found:?}"
+        );
+        assert!(
+            found[0].to_string().contains("is inside `~/.claude`"),
+            "{found:?}"
+        );
+        assert!(validate_writes(&policy(&["~/.claude/work"], &[], &[]), &f.ctx).is_err());
+
+        let mut own = policy(&["~/work"], &[], &[]);
+        own.fs.read_deny.push("~/work".into());
+        let found = problems(&own, &f);
+        assert!(
+            found.iter().any(|p| p.contains("is inside `~/work`")),
+            "{found:?}"
+        );
+
+        let mut holds = policy(&["~/work"], &[], &[]);
+        holds.fs.read_deny.push("~/work/.env".into());
+        assert!(
+            problems(&holds, &f).is_empty(),
+            "{:?}",
+            problems(&holds, &f)
+        );
     }
 
     #[test]
