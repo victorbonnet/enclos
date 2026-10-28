@@ -529,10 +529,15 @@ impl Engine {
         // A service whose launchd job file is there but that launchd has
         // not loaded, as after `launchctl bootout`: it does not run until
         // the next login loads it. Only for a sandbox recorded running: one
-        // recorded otherwise is told to stop its services below.
+        // recorded otherwise is named below for its services installed
+        // while it is not running.
         let mut unloaded = Vec::new();
-        if matches!(record.state, SandboxState::Running) {
-            for label in installed.iter().filter(|l| expected.contains(l)) {
+        let asked: Vec<_> = installed.iter().filter(|l| expected.contains(l)).collect();
+        if matches!(record.state, SandboxState::Running) && !asked.is_empty() {
+            // With no login session, launchd says so, rather than failing
+            // each status with an exit code.
+            self.services.available()?;
+            for label in asked {
                 if self.services.status(label)? == ServiceStatus::NotLoaded {
                     unloaded.push(label.to_string());
                 }
@@ -541,17 +546,17 @@ impl Engine {
         if !unloaded.is_empty() {
             let what = match unloaded.as_slice() {
                 [one] => format!(
-                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand, or while `enclos sandbox stop` removes it: it does not run until the next login"
+                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand: it does not run until the next login"
                 ),
                 more => format!(
-                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand, or while `enclos sandbox stop` removes them: they do not run until the next login",
+                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand: they do not run until the next login",
                     more.join(", ")
                 ),
             };
             push(
                 what,
                 Remedy::Manual(format!(
-                    "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, loads every service again"
+                    "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, loads every service again; while a `sandbox stop` or `sandbox start` of it runs, which removes its services first, check again once it is done"
                 )),
             );
         }

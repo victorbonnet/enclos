@@ -29,6 +29,8 @@ pub struct FakeServices {
     pub unloaded: RefCell<Vec<ServiceLabel>>,
     /// Asking a unit's status fails, as when launchctl cannot answer.
     pub refuse_status: RefCell<bool>,
+    /// The manager is not available, as with no login session.
+    pub refuse_available: RefCell<bool>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -49,6 +51,11 @@ impl FakeServices {
 
 impl ServiceManager for FakeServices {
     fn available(&self) -> Result<(), ServiceError> {
+        if *self.refuse_available.borrow() {
+            return Err(ServiceError {
+                what: "launchd has no login session".into(),
+            });
+        }
         Ok(())
     }
 
