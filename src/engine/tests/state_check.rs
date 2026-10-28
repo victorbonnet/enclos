@@ -512,6 +512,10 @@ fn a_service_enclos_no_longer_runs_is_named_alone() {
     let proxy = engine.label(&name, Unit::Proxy).unwrap();
     let old = proxy.as_str().replace(".proxy", ".retired");
     fake.seed(&old);
+    // Not loaded either, and still named only as no longer run.
+    fake.unloaded
+        .borrow_mut()
+        .push(crate::service::ServiceLabel::parse(&old).unwrap());
     set_state(&engine, &name, SandboxState::Running);
     let found = engine.state_check(None).unwrap();
     assert_eq!(found.len(), 1, "{found:?}");
@@ -773,12 +777,12 @@ fn a_service_installed_and_not_loaded_is_named() {
     let (_dir, engine, fake, name) = sandbox_with_services(None);
     engine.start_sandbox(&alice(), &name).unwrap();
     assert_eq!(engine.state_check(None).unwrap(), []);
-    let gateway = engine.label(&name, Unit::Proxy).unwrap();
-    fake.unloaded.borrow_mut().push(gateway.clone());
+    let proxy = engine.label(&name, Unit::Proxy).unwrap();
+    fake.unloaded.borrow_mut().push(proxy.clone());
     let found = engine.state_check(None).unwrap();
     let unloaded = about(&found, "is installed and not loaded");
     assert_eq!(unloaded.len(), 1, "{found:?}");
-    assert!(unloaded[0].what.contains(gateway.as_str()), "{unloaded:?}");
+    assert!(unloaded[0].what.contains(proxy.as_str()), "{unloaded:?}");
     assert!(
         matches!(&unloaded[0].remedy, Remedy::Manual(m) if m.contains("sandbox start home")),
         "{unloaded:?}"
@@ -792,8 +796,41 @@ fn a_service_installed_and_not_loaded_is_named() {
     assert_eq!(engine.state_check(None).unwrap(), []);
 }
 
-/// A sandbox recorded stopped whose services stay installed is told to
-/// stop them, not to start it again: not named as not loaded.
+/// Several services not loaded are named in one finding.
+#[test]
+fn services_installed_and_not_loaded_are_named_together() {
+    let (_dir, engine, fake, name) = hermes_with_services();
+    let labels = engine.service_labels(&name).unwrap();
+    assert!(labels.len() > 1, "{labels:?}");
+    for label in &labels {
+        fake.seed(label.as_str());
+    }
+    set_state(&engine, &name, SandboxState::Running);
+    fake.unloaded.borrow_mut().extend(labels.iter().cloned());
+    let found = engine.state_check(None).unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].what.contains("are installed and not loaded"),
+        "{found:?}"
+    );
+    for label in &labels {
+        assert!(found[0].what.contains(label.as_str()), "{found:?}");
+    }
+}
+
+/// With no login session, the check stops with launchd's own words, not
+/// an exit code for each service.
+#[test]
+fn a_service_manager_with_no_login_session_stops_the_check() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    *fake.refuse_available.borrow_mut() = true;
+    let err = engine.state_check(None).unwrap_err();
+    assert!(err.to_string().contains("no login session"), "{err}");
+}
+
+/// A sandbox recorded stopped whose services stay installed is named for
+/// that, not as having a service not loaded.
 #[test]
 fn a_stopped_sandboxs_unloaded_service_is_not_named_as_such() {
     let (_dir, engine, fake, name) = sandbox_with_services(None);
@@ -817,7 +854,10 @@ fn a_status_the_service_manager_cannot_give_stops_the_check() {
     engine.start_sandbox(&alice(), &name).unwrap();
     *fake.refuse_status.borrow_mut() = true;
     let err = engine.state_check(None).unwrap_err();
-    assert!(err.to_string().contains("did not answer"), "{err}");
+    assert!(
+        err.to_string().contains("launchctl did not answer"),
+        "{err}"
+    );
     engine.state_repair(&alice(), None).unwrap_err();
     let audit = engine.audit(None).unwrap();
     assert_eq!(
