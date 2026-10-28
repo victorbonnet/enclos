@@ -21,6 +21,7 @@ use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionId;
+use crate::service::ServiceStatus;
 use crate::state::{StateError, StateLock, UnreadableRecord};
 
 /// Something enclos's records say that the host does not, or the reverse.
@@ -522,6 +523,32 @@ impl Engine {
                 what,
                 Remedy::Manual(format!(
                     "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, installs every service again"
+                )),
+            );
+        }
+        // A job whose file is there that the service manager has not
+        // loaded, as after `launchctl bootout`: it does not run until the
+        // next login loads it, though its file says it is installed.
+        let mut unloaded = Vec::new();
+        for label in installed.iter().filter(|l| expected.contains(l)) {
+            if self.services.status(label)? == ServiceStatus::NotLoaded {
+                unloaded.push(label.to_string());
+            }
+        }
+        if !unloaded.is_empty() {
+            let what = match unloaded.as_slice() {
+                [one] => format!(
+                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand: it does not run until the next login"
+                ),
+                more => format!(
+                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand: they do not run until the next login",
+                    more.join(", ")
+                ),
+            };
+            push(
+                what,
+                Remedy::Manual(format!(
+                    "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, loads every service again"
                 )),
             );
         }

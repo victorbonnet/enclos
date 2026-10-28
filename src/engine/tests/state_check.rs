@@ -763,3 +763,25 @@ fn an_entry_that_is_not_a_folder_is_named() {
     assert_eq!(named[0].subject, Subject::Folder("notes.txt".into()));
     assert!(named[0].remedy.is_left());
 }
+
+/// A service whose file is there but that launchd has not loaded, as after
+/// `launchctl bootout`, is named: it does not run until the next login.
+#[test]
+fn a_service_installed_and_not_loaded_is_named() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    assert_eq!(engine.state_check(None).unwrap(), []);
+    let gateway = engine.label(&name, Unit::Proxy).unwrap();
+    fake.unloaded.borrow_mut().push(gateway.clone());
+    let found = engine.state_check(None).unwrap();
+    let unloaded = about(&found, "is installed and not loaded");
+    assert_eq!(unloaded.len(), 1, "{found:?}");
+    assert!(unloaded[0].what.contains(gateway.as_str()), "{unloaded:?}");
+    assert!(
+        matches!(&unloaded[0].remedy, Remedy::Manual(m) if m.contains("sandbox start home")),
+        "{unloaded:?}"
+    );
+    // Left for a person: repair does not reload it.
+    repair(&engine, None);
+    assert_eq!(engine.state_check(None).unwrap(), found);
+}
