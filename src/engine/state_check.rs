@@ -526,22 +526,25 @@ impl Engine {
                 )),
             );
         }
-        // A job whose file is there that the service manager has not
-        // loaded, as after `launchctl bootout`: it does not run until the
-        // next login loads it, though its file says it is installed.
+        // A service whose launchd job file is there but that launchd has
+        // not loaded, as after `launchctl bootout`: it does not run until
+        // the next login loads it. Only for a sandbox recorded running: one
+        // recorded otherwise is told to stop its services below.
         let mut unloaded = Vec::new();
-        for label in installed.iter().filter(|l| expected.contains(l)) {
-            if self.services.status(label)? == ServiceStatus::NotLoaded {
-                unloaded.push(label.to_string());
+        if matches!(record.state, SandboxState::Running) {
+            for label in installed.iter().filter(|l| expected.contains(l)) {
+                if self.services.status(label)? == ServiceStatus::NotLoaded {
+                    unloaded.push(label.to_string());
+                }
             }
         }
         if !unloaded.is_empty() {
             let what = match unloaded.as_slice() {
                 [one] => format!(
-                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand: it does not run until the next login"
+                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand, or while `enclos sandbox stop` removes it: it does not run until the next login"
                 ),
                 more => format!(
-                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand: they do not run until the next login",
+                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand, or while `enclos sandbox stop` removes them: they do not run until the next login",
                     more.join(", ")
                 ),
             };
