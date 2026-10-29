@@ -397,17 +397,13 @@ impl Engine {
                                 what,
                                 Remedy::Repairs(Repair(Fix::WritePolicy { text, pending })),
                             ),
-                            // The template the active policy is built on,
-                            // which `policy.toml` may have changed since the
-                            // sandbox was created.
+                            // No policy recorded: the template the sandbox
+                            // was created from.
                             None => push(
                                 what,
                                 Remedy::Manual(format!(
-                                    "enclos does not keep the text it came from: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
-                                    self.state.active_policy(name)?.map_or_else(
-                                        || record.created_from.clone(),
-                                        |(_, snapshot)| snapshot.inputs.template
-                                    )
+                                    "sandbox {name} has no policy recorded: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
+                                    record.created_from
                                 )),
                             ),
                         }
@@ -611,15 +607,15 @@ impl Engine {
 
     /// The text `policy.toml` holds for the sandbox's latest snapshot, its
     /// pending one if a change waits, and whether it is pending; none when
-    /// the snapshot does not keep the text it was resolved from.
+    /// the sandbox has no policy recorded at all.
     fn latest_policy_text(&self, name: &SandboxName) -> Result<Option<(String, bool)>> {
         if let Some((_, snapshot)) = self.state.pending_policy(name)? {
-            return Ok(snapshot.overrides_text().map(|t| (t.to_owned(), true)));
+            return Ok(Some((snapshot.overrides_text().to_owned(), true)));
         }
         Ok(self
             .state
             .active_policy(name)?
-            .and_then(|(_, snapshot)| snapshot.overrides_text().map(|t| (t.to_owned(), false))))
+            .map(|(_, snapshot)| (snapshot.overrides_text().to_owned(), false)))
     }
 
     /// Entries in the sandboxes' folder that no record, by its `names`,
