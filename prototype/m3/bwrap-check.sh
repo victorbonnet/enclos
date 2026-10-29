@@ -2,7 +2,7 @@
 # Whether bubblewrap runs as an unprivileged user, and which setting it needs
 # (design §14, M3-01). It creates user namespaces and, with sudo, loads an
 # AppArmor profile and changes a sysctl, so it runs only on a throwaway
-# GitHub-hosted runner, never on the user's host.
+# GitHub-hosted runner, never on a host in use.
 set -u
 
 if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
