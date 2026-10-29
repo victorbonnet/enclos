@@ -6,6 +6,7 @@ pub mod connect;
 pub mod doctor;
 pub mod launch;
 pub mod net;
+pub mod output;
 pub mod policy;
 pub mod proxy;
 pub mod runtime;

@@ -14,10 +14,12 @@ macro_rules! say {
     }};
 }
 
+use super::output::note;
+
 use clap::Args;
 
 use enclos::engine::Engine;
-use enclos::engine::{Left, ServiceWait, SessionEnd};
+use enclos::engine::{Left, ServiceWait, SessionEnd, printable_line};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -43,8 +45,9 @@ pub struct ExecArgs {
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> Result<u8> {
     start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.connect(by, &args.sandbox, args.command, confirm)? {
+        // Nothing runs on a dry run: with --json, its plan is the document.
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            super::output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
@@ -57,8 +60,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: ConnectArgs) -> 
 pub fn exec(engine: &Engine, by: &Actor, confirm: Confirm, args: ExecArgs) -> Result<u8> {
     start_service_first(engine, by, &args.sandbox, confirm)?;
     let end = match engine.exec(by, &args.sandbox, args.command, confirm)? {
+        // Nothing runs on a dry run: with --json, its plan is the document.
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            super::output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
@@ -78,16 +82,16 @@ fn start_service_first(
     if confirm == Confirm::DryRun {
         return Ok(());
     }
-    let mut say = |what: String| say!("enclos: {what}");
+    let mut say = |what: String| note(&what);
     if let Some(ServiceWait {
         service,
         late: Some(why),
         ..
     }) = engine.start_listener_service(by, sandbox, &mut say)?
     {
-        say!(
-            "enclos: starting the session while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
-        );
+        note(&format!(
+            "starting the session while the {service} is not listening ({why}); its log: `enclos logs {sandbox}`."
+        ));
     }
     Ok(())
 }
@@ -100,15 +104,23 @@ fn finish(engine: &Engine, sandbox: &SandboxName, end: &SessionEnd) -> Result<u8
     // On stderr, so a command's output stays clean; the session's exit code
     // stays the command's.
     match super::agent::check_notes(engine, sandbox, false) {
-        Ok(notes) => notes.iter().for_each(|note| say!("enclos: {note}")),
-        Err(e) => say!("enclos: could not check the sandbox's agents: {e}"),
+        Ok(notes) => notes.iter().for_each(|n| note(n)),
+        Err(e) => note(&format!("could not check the sandbox's agents: {e}")),
     }
     Ok(u8::try_from(end.exit).unwrap_or(1))
 }
 
 /// Tells the user what a session's end left behind: notes, the signal that
-/// ended the command, and processes still running.
+/// ended the command, and processes still running; with --json, as one
+/// `{"session": …}` line on stderr.
 pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
+    if super::output::json() {
+        say!(
+            "{}",
+            super::output::line(&serde_json::json!({ "session": super::output::session(end) }))
+        );
+        return;
+    }
     let shown = format!("sandbox {sandbox}");
     for note in &end.notes {
         say!("enclos: session {} in {shown}: {note}", end.session);
@@ -125,7 +137,7 @@ pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
         Left::Running(left) => {
             let pids: Vec<String> = left
                 .iter()
-                .map(|m| format!("{} ({})", m.pid, m.command))
+                .map(|m| format!("{} ({})", m.pid, printable_line(&m.command)))
                 .collect();
             say!(
                 "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",

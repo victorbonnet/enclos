@@ -2,14 +2,16 @@
 //! a messaging channel. Logging it in is the runtime's own command, through
 //! `enclos connect` (ADR 0024).
 
-use clap::{Args, Subcommand};
-
-use enclos::engine::Engine;
-use enclos::error::{Error, Result, exit};
-use enclos::model::audit::Actor;
 use std::str::FromStr;
 
+use clap::{Args, Subcommand};
+use serde_json::json;
+
+use super::output;
+use enclos::engine::Engine;
+use enclos::error::{Error, Result, exit};
 use enclos::model::agent::AgentName;
+use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::runtime::RuntimeKind;
@@ -63,28 +65,56 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     };
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(end) => end,
     };
-    super::connect::report_end(&sandbox, &end.end);
     let shown = runtime.display_name();
-    if !end.installed {
-        let after = match end.recorded {
-            Some(kept) => format!(
-                "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
-                kept.display_name(),
-                end.policy
-            ),
-            None => format!(
-                "Nothing is recorded as installed, and policy v{} is without {shown}'s destinations",
-                end.policy
-            ),
+    // How the installer ended, and what that leaves recorded: the same in
+    // text and in JSON, since a policy left wider must be said.
+    let ended = match end.end.signal {
+        Some(signal) => format!("was ended by signal {signal}"),
+        None => format!("exited with {}", end.end.exit),
+    };
+    let after = match end.recorded {
+        Some(kept) => format!(
+            "{} is still recorded as installed, and policy v{} still allows its destinations; its files may be incomplete",
+            kept.display_name(),
+            end.policy
+        ),
+        None => format!(
+            "Nothing is recorded as installed, and policy v{} is without {shown}'s destinations",
+            end.policy
+        ),
+    };
+    if output::json() {
+        let code = match end.installed {
+            true => exit::OK,
+            false => exit::ERROR,
         };
+        return Ok(output::conclude(
+            json!({
+                "sandbox": sandbox.to_string(),
+                "runtime": runtime.to_string(),
+                "installed": end.installed,
+                "session": output::session(&end.end),
+                "recorded": end.recorded.map(|k| k.to_string()),
+                "policy_version": end.policy,
+                "login": format!("enclos connect {sandbox} -- {}", enclos::runtime::adapter(runtime).login()),
+            }),
+            code,
+            || {
+                format!(
+                    "the {shown} installer {ended} in sandbox {sandbox}. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again"
+                )
+            },
+        ));
+    }
+    super::connect::report_end(&sandbox, &end.end);
+    if !end.installed {
         eprintln!(
-            "enclos: the {shown} installer exited with {} in sandbox {sandbox}; its output above says why. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again.",
-            end.end.exit
+            "enclos: the {shown} installer {ended} in sandbox {sandbox}; its output above says why. {after}. Fix the cause, then run `enclos runtime install {runtime} --sandbox {sandbox}` again."
         );
         return Ok(exit::ERROR);
     }
@@ -147,12 +177,23 @@ fn configure(
     }
     let set = match engine.configure_channel(by, &sandbox, channel, token, answers, confirm)? {
         Planned::DryRun(plan) => {
-            plan.changes.iter().for_each(|c| println!("Would {c}."));
+            output::show_plan(&plan);
             return Ok(exit::OK);
         }
         Planned::Done(set) => set,
     };
     let shown = channel.display_name();
+    if output::json() {
+        output::emit(&json!({
+            "sandbox": sandbox.to_string(),
+            "channel": channel.to_string(),
+            "token_variable": set.token.to_string(),
+            "answers": set.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "reachable": set.reachable,
+            "host": channel.host(),
+        }));
+        return Ok(exit::OK);
+    }
     println!(
         "Sandbox {sandbox}'s {shown} bot is set up: its token is read from ${} as its service starts, and it answers {} user(s). A running service restarts with it.",
         set.token,

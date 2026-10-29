@@ -157,10 +157,10 @@ impl JsonlAuditLog {
                 continue;
             }
             for (file, why) in kept {
-                eprintln!(
-                    "enclos: saved the incomplete last line of the audit log to {name}, and \
+                crate::notes::say(&format!(
+                    "saved the incomplete last line of the audit log to {name}, and \
                      kept {file} as it is: it {why}"
-                );
+                ));
             }
             return Ok(name);
         }
