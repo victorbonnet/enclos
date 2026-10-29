@@ -798,7 +798,7 @@ mod sandbox {
     /// A process this test started and reaped: nothing runs as that process
     /// any more (its pid is free, or used again with another start time), as
     /// a session's after a crash or a restart of the Mac.
-    fn gone_process() -> ProcessRef {
+    pub(super) fn gone_process() -> ProcessRef {
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         let recorded = crate::lifecycle::process::reference_of_child(&child).unwrap();
         child.wait().unwrap();
@@ -838,6 +838,12 @@ mod sandbox {
     }
 
     pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
+        // As a session's start makes it, for its marker, when it can (a
+        // test may have put something else there): on macOS, where the
+        // markers are looked for with `lsof`.
+        if cfg!(target_os = "macos") {
+            let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
+        }
         let lock = engine.state.lock().unwrap();
         engine.state.put_session(&lock, session).unwrap()
     }
@@ -3002,8 +3008,18 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let home = lab.home.clone();
         let audit = lab.engine.layout.audit_log();
         let edit = std::thread::spawn(move || {
+            // The gateway runs, and `launch` has recorded it: the audit made
+            // read-only fails the restart, not the start's own entry.
+            let log = crate::audit::jsonl::JsonlAuditLog::new(&audit);
+            let launched = || {
+                use crate::audit::AuditLog;
+                log.entries(&Default::default())
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.intent.command == "launch" && e.finished.is_some())
+            };
             let start = std::time::Instant::now();
-            while !home.join("gateway-up").exists() {
+            while !home.join("gateway-up").exists() || !launched() {
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(30),
                     "no gateway"
@@ -3567,8 +3583,17 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             let pids_file = pids_file.clone();
             let markers = markers.clone();
             std::thread::spawn(move || {
+                // The stub gateway runs, and `launch` has named its marker
+                // after it.
+                let named = || {
+                    std::fs::read_dir(&markers).is_ok_and(|mut files| {
+                        files.any(|f| {
+                            f.is_ok_and(|f| f.file_name().to_string_lossy().starts_with("root-"))
+                        })
+                    })
+                };
                 let start = Instant::now();
-                while !pids_file.exists() {
+                while !pids_file.exists() || !named() {
                     assert!(
                         start.elapsed() < Duration::from_secs(30),
                         "the stub gateway did not start"
@@ -4612,7 +4637,7 @@ mod services {
 
     const GATEWAY: ServiceName = ServiceName::new("gateway");
 
-    fn sandbox_with_services(
+    pub(super) fn sandbox_with_services(
         runtime: Option<RuntimeKind>,
     ) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
         let fake = Rc::new(FakeServices::default());
@@ -4659,7 +4684,7 @@ mod services {
     };
 
     /// A Hermes sandbox whose runtime's files are there.
-    fn hermes_with_services() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+    pub(super) fn hermes_with_services() -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
         let (dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
         let home = engine.layout.sandbox_home(name.as_str());
         std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
@@ -6864,3 +6889,6 @@ mod exec;
 mod history;
 mod pending;
 mod secrets;
+// `state check` lists program files with `lsof`, which only macOS has here.
+#[cfg(target_os = "macos")]
+mod state_check;

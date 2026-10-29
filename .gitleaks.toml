@@ -26,6 +26,9 @@ regexes = [
   # Placeholders. `x` is in an older version of docs/design.md, allowed so
   # a scan of the whole history passes.
   '''^(?:alice|alicex|x)$''',
+  # A test program in a sandbox's home folder (`sandboxes/home/home/sleeper`),
+  # named in a test's expected text.
+  '''^sleeper$''',
   # macOS's shared folder, and the GitHub Actions runner's user.
   '''^(?:Shared|runner)$''',
 ]

@@ -56,6 +56,8 @@ pub enum Error {
     Processes(#[from] crate::lifecycle::process::PsError),
     #[error(transparent)]
     Markers(#[from] crate::lifecycle::marker::MarkerError),
+    #[error(transparent)]
+    Programs(#[from] crate::lifecycle::programs::ProgramsError),
     /// A failed command whose cleanup failed too.
     #[error("{error}; cleaning up after it failed too, and left {left}")]
     CleanupFailed { error: Box<Error>, left: String },
@@ -351,6 +353,7 @@ impl Error {
             | Error::Service(_)
             | Error::Processes(_)
             | Error::Markers(_)
+            | Error::Programs(_)
             | Error::NoPendingPolicy { .. }
             | Error::PendingChanged { .. }
             | Error::PolicyFileChanged { .. }
