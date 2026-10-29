@@ -166,17 +166,15 @@ pub enum Error {
         file.display()
     )]
     PolicyFileChanged { sandbox: String, file: PathBuf },
-    /// The active snapshot's stored `policy.toml` is not the text its
-    /// inputs name, so enclos cannot write it back.
+    /// `policy.toml` no longer holds the text the pending policy was
+    /// resolved from: put in force, it would be a policy the file does not
+    /// describe, and the next change, which resolves the file, would drop
+    /// what the file lacks.
     #[error(
-        "enclos does not have the policy.toml that policy v{version} of sandbox `{sandbox}` was resolved from, so it cannot put it back or resolve it again. Edit {} to what you want with `enclos policy edit {sandbox}`",
+        "{} no longer holds the pending policy of sandbox `{sandbox}`, so it was not applied. `enclos policy edit {sandbox}`, saved, makes what the file holds the pending change; `enclos policy discard {sandbox}` drops it and puts back the file of the policy in force",
         file.display()
     )]
-    PolicyTextUnknown {
-        sandbox: String,
-        version: u32,
-        file: PathBuf,
-    },
+    PendingFileDiffers { sandbox: String, file: PathBuf },
     #[error(
         "sandbox `{sandbox}` has no policy v{version}: its versions are v1 to v{last}. `enclos policy history {sandbox}` lists them"
     )]
@@ -188,7 +186,7 @@ pub enum Error {
     /// `policy.toml` holds an edit not applied, which rollback or refresh
     /// would overwrite.
     #[error(
-        "{} holds an edit not applied, which `{command}` would overwrite. Apply it with `enclos policy edit {sandbox}` (closing the editor applies the file as it is), or drop it with `enclos policy discard {sandbox}`, which also drops a pending change; then run `enclos {command}` again",
+        "{} holds an edit not applied, which `{command}` would overwrite. Apply it with `enclos policy edit {sandbox}` (closing the editor applies the file as it is), or drop it with `enclos policy discard {sandbox}`, which also drops a pending change; then run `{command}` again",
         file.display()
     )]
     PolicyFileEdited {
@@ -301,7 +299,7 @@ impl Error {
             | Error::NoPendingPolicy { .. }
             | Error::PendingChanged { .. }
             | Error::PolicyFileChanged { .. }
-            | Error::PolicyTextUnknown { .. }
+            | Error::PendingFileDiffers { .. }
             | Error::PolicyPending { .. }
             | Error::NoSuchPolicyVersion { .. }
             | Error::PolicyFileEdited { .. }

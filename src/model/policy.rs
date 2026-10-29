@@ -186,16 +186,31 @@ pub struct PolicySnapshot {
     pub inputs: PolicyInputs,
     pub policy: Policy,
     /// The sandbox's `policy.toml` it was resolved from, whose SHA-256
-    /// `inputs.overrides` holds: what `policy discard` writes back.
-    pub overrides: String,
+    /// `inputs.overrides` holds, as `new` checks: what `policy discard`
+    /// writes back.
+    overrides: String,
 }
 
 impl PolicySnapshot {
-    /// The `policy.toml` this snapshot was resolved from, if the text
-    /// stored is the one its inputs name.
-    pub fn overrides_text(&self) -> Option<&str> {
-        (crate::policy::sha256_hex(self.overrides.as_bytes()) == self.inputs.overrides)
-            .then_some(self.overrides.as_str())
+    /// A snapshot of `policy`, resolved from `overrides`: none when the text
+    /// is not the one `inputs` names.
+    pub fn new(
+        id: SnapshotId,
+        inputs: PolicyInputs,
+        policy: Policy,
+        overrides: String,
+    ) -> Option<Self> {
+        (crate::policy::sha256_hex(overrides.as_bytes()) == inputs.overrides).then_some(Self {
+            id,
+            inputs,
+            policy,
+            overrides,
+        })
+    }
+
+    /// The `policy.toml` this snapshot was resolved from.
+    pub fn overrides_text(&self) -> &str {
+        &self.overrides
     }
 }
 

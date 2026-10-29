@@ -385,6 +385,12 @@ impl Engine {
                 // A change made while the installer ran was resolved without
                 // the runtime's destinations, as it was not recorded yet.
                 self.resolve_with_runtime(lock, by, name)
+                    .map_err(|error| Error::FailedAfter {
+                        error: Box::new(error),
+                        done: format!(
+                            "recording {kind} as installed in sandbox {name}; a policy change made while its installer ran was not resolved again with {kind}'s destinations, which the next change of the policy, such as `enclos policy edit {name}`, does"
+                        ),
+                    })
             },
         )?;
         Ok(Planned::Done(InstallEnd {
