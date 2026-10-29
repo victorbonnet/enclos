@@ -319,6 +319,57 @@ fn discard_also_drops_an_edit_policy_edit_kept() {
     assert!(!files.copy.exists() && !files.base.exists());
 }
 
+/// A pending policy that cannot be dropped leaves everything as it was:
+/// the file still holds it, and the kept edit is moved back.
+#[test]
+fn a_discard_whose_pending_policy_cannot_be_dropped_changes_nothing() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    let files = engine.edit_files(&name);
+    std::fs::write(&files.copy, "kept edit").unwrap();
+    std::fs::write(&files.base, "base").unwrap();
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_drop BEFORE DELETE ON pending_policies
+         BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+    )
+    .unwrap();
+    engine
+        .policy_discard(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert!(engine.policy(&name).unwrap().pending.is_some());
+    assert_eq!(engine.layout.read_policy("home").unwrap(), after);
+    assert_eq!(std::fs::read_to_string(&files.copy).unwrap(), "kept edit");
+    assert!(files.base.exists());
+    conn.execute_batch("DROP TRIGGER refuse_drop").unwrap();
+    done(
+        engine
+            .policy_discard(&alice(), &name, Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(engine.layout.read_policy("home").unwrap(), before);
+}
+
+/// A `policy.toml` gone is written back, with nothing kept beside it.
+#[test]
+fn discard_writes_back_a_file_gone() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    std::fs::remove_file(engine.layout.policy_file("home")).unwrap();
+    let discarded = done(
+        engine
+            .policy_discard(&alice(), &name, Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(discarded.kept, None);
+    assert_eq!(engine.layout.read_policy("home").unwrap(), before);
+    assert!(engine.policy(&name).unwrap().pending.is_none());
+}
+
 /// Empties the text the active snapshot keeps, as for one stored before
 /// snapshots kept their `policy.toml`.
 fn forget_active_text(engine: &Engine, name: &SandboxName) {
@@ -419,6 +470,53 @@ fn apply_after_the_sessions_ended_asks_nothing() {
     assert_eq!(restarted.version.version, 2);
     // The stop records the end of the session gone.
     assert!(engine.state.sessions(&name, true).unwrap().is_empty());
+    assert!(writes(&engine, &name, &work));
+}
+
+/// A `policy.toml` that no longer holds the pending text (changed by hand
+/// since) is not put in force: nothing is stopped, and the change waits.
+#[test]
+fn apply_refuses_a_file_that_no_longer_holds_the_pending_policy() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    let file = engine.layout.policy_file(name.as_str());
+    std::fs::write(&file, &before).unwrap();
+    let err = engine
+        .policy_apply(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::PendingFileDiffers { .. }), "{err}");
+    assert_eq!(err.exit_code(), 1);
+    assert!(engine.policy(&name).unwrap().pending.is_some());
+    let open = engine.state.sessions(&name, true).unwrap();
+    assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [id]);
+    // Gone, the file holds nothing of it either.
+    std::fs::remove_file(&file).unwrap();
+    let err = engine
+        .policy_apply(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::PendingFileDiffers { .. }), "{err}");
+    // Put back, it applies.
+    std::fs::write(&file, &after).unwrap();
+    done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
+}
+
+/// Only the runtime's services run: they start again on their own, so
+/// nothing is asked.
+#[test]
+fn apply_while_only_services_run_asks_nothing() {
+    let (dir, engine, name) = with_sandbox();
+    let sleeping = Sleeping::new();
+    let mut service = session_of(&engine, &name, sleeping.process());
+    service.kind = SessionKind::Service;
+    service.service = Some("gateway".into());
+    service.compiled = Some("/compiled/at-launch.sb".into());
+    put(&engine, &service);
+    let (work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Ask).unwrap());
+    assert_eq!(restarted.version.version, 2);
     assert!(writes(&engine, &name, &work));
 }
 
@@ -769,20 +867,19 @@ fn a_network_change_whose_pending_part_cannot_be_saved_is_not_in_force_either() 
     assert_eq!(engine.layout.read_policy("home").unwrap(), after);
 }
 
+/// Refused before anything is stopped.
 #[test]
 fn applying_a_pending_policy_replaced_since_is_refused() {
     let (dir, engine, name) = with_sandbox();
-    let (_sleeping, _id) = running(&engine, &name);
+    let (_sleeping, id) = running(&engine, &name);
     let (_work, before, after) = grant_work(&dir, &engine);
     let first = make_pending(&engine, &name, &before, &after);
     let (_more, _, more) = grant(&dir, &engine, "more");
     make_pending(&engine, &name, &after, &more);
     let err = engine.restart_into(&alice(), &name, &first).unwrap_err();
-    let Error::FailedAfter { error, done } = &err else {
-        panic!("{err}")
-    };
-    assert!(matches!(**error, Error::PendingChanged { .. }), "{err}");
-    assert!(done.starts_with("stopping sandbox home"), "{done}");
+    assert!(matches!(err, Error::PendingChanged { .. }), "{err}");
+    let open = engine.state.sessions(&name, true).unwrap();
+    assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [id]);
     let view = engine.policy(&name).unwrap();
     assert_eq!(view.version.version, 1);
     assert_ne!(view.pending.unwrap().0, first);
