@@ -3,9 +3,9 @@
 //! `<sandbox>/<name>`.
 //!
 //! An item `security` adds trusts `security` itself, so reading it back
-//! through `security` asks nothing, whichever program runs it, a service
-//! started by launchd included, and whatever enclos's own code signature is
-//! after an upgrade. Any program of the user can read it the same way: the
+//! through `security` asks nothing, whichever program runs it: shown for
+//! `exec` across two builds of enclos with different code signatures; for
+//! a service launchd starts, still to verify (design §14). Any program of the user can read it the same way: the
 //! Keychain keeps secrets away from sandboxes, which reach neither the
 //! security daemon nor the keychain files (design §5), not from the user's
 //! other programs (ADR 0014).
@@ -88,6 +88,35 @@ impl Keychain {
         SecretError {
             what: format!("cannot {what} secret {secret} in the Keychain: {why}"),
             untouched: false,
+        }
+    }
+
+    /// Whether the keychain can be read without a dialog: `security
+    /// show-keychain-info` answers at once, with no dialog, and fails on a
+    /// locked keychain (exit 152 on macOS 26.5.2, "Unable to obtain
+    /// authorization").
+    fn check_unlocked(&self) -> Result<(), SecretError> {
+        let which = match &self.file {
+            Some(file) => format!("keychain {}", file.display()),
+            None => "default keychain".to_owned(),
+        };
+        let fail = |why: String| SecretError {
+            what: format!("the {which} cannot be read without asking: {why}"),
+            untouched: true,
+        };
+        let out = run(
+            Command::new(SECURITY)
+                .arg("show-keychain-info")
+                .args(self.file_args()),
+            None,
+        )
+        .map_err(fail)?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(fail(format!(
+                "it is locked ({})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
         }
     }
 
@@ -287,6 +316,10 @@ impl SecretStore for Keychain {
             .iter()
             .map(|f| (KEYCHAIN_VAR.to_owned(), f.display().to_string()))
             .collect()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        self.check_unlocked()
     }
 }
 
@@ -592,6 +625,38 @@ mod tests {
                 .arg(&self.file)
                 .status();
         }
+    }
+
+    /// A locked keychain is told apart at once, with no dialog, by the
+    /// same call a service makes before reading its secrets.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_locked_keychain_is_found_without_a_dialog() {
+        let keychain = ThrowawayKeychain::new();
+        let store = Keychain::new("enclos.test".into(), Some(keychain.file.clone()));
+        store.readable().unwrap();
+        let file = keychain.file.to_str().unwrap();
+        let security = |args: &[&str]| {
+            assert!(
+                Command::new(SECURITY)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        security(&["lock-keychain", file]);
+        let asked = std::time::Instant::now();
+        let err = store.readable().unwrap_err();
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(err.untouched);
+        assert!(err.what.contains("locked"), "{}", err.what);
+        security(&["unlock-keychain", "-p", "test", file]);
+        store.readable().unwrap();
     }
 
     #[cfg(target_os = "macos")]

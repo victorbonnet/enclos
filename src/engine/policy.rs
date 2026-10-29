@@ -51,8 +51,8 @@ pub struct PolicyApplied {
     pub changed: bool,
     /// What the change does besides the entry asked for, one sentence each:
     /// edits to `policy.toml` not applied yet, or a newer template or
-    /// built-in defaults. For `policy edit`, everything it changes from the
-    /// active policy.
+    /// built-in defaults. For `policy edit`, `rollback` and `refresh`,
+    /// everything it changes from the active policy.
     pub also: Vec<String>,
     pub outcome: ChangeOutcome,
 }
@@ -60,14 +60,24 @@ pub struct PolicyApplied {
 /// Where a change ended up (design §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeOutcome {
-    /// In force for new sessions, and live for the network; `dropped` is
-    /// the pending policy it replaced, if one waited.
-    InForce { dropped: Option<PendingPolicy> },
+    /// In force for new sessions, and live for the network; `pending` is
+    /// what became of the pending policy, if one waited.
+    InForce { pending: Option<PendingEnd> },
     /// A change waits as the pending policy: this one, or one saved before
     /// it that this change left waiting.
     Pending(PendingPolicy),
     /// With `--yes`, the sandbox restarted into it.
     Restarted(Restarted),
+}
+
+/// What became of a pending policy when a change went in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEnd {
+    /// Dropped: the change put the policy in force back.
+    Dropped(PendingPolicy),
+    /// In force with the change, which was resolved from the file that held
+    /// it, now that no session runs under rules it changes.
+    Applied(PendingPolicy),
 }
 
 /// What `policy allow` would do, worked out without changing anything.
@@ -92,9 +102,21 @@ impl Engine {
         })
     }
 
+    /// Whether the policy in force allows `destination`, written as
+    /// `policy allow` writes it.
+    pub fn allows(&self, name: &SandboxName, destination: &str) -> Result<bool> {
+        let Ok(entry) = AllowEntry::parse(destination) else {
+            return Ok(false);
+        };
+        let entry = entry.to_string();
+        let view = self.policy(name)?;
+        Ok(view.snapshot.policy.net.allow.contains(&entry))
+    }
+
     /// Allows the sandbox to reach `destination` (`host`, `host:port` or
-    /// `*.domain`). A network change applies at once: the proxy enforces it,
-    /// so nothing restarts, and a change pending gets it too. The new
+    /// `*.domain`). A network change applies at once when it can be
+    /// separated from a pending change (design §7): the proxy enforces it,
+    /// so nothing restarts, and the pending change gets it too. The new
     /// version is what `policy.toml` resolves to, so when it changes more
     /// than this entry (edits not applied yet, a newer template or built-in
     /// defaults), it asks first; with `--yes`, a part that needs a restart
@@ -120,7 +142,7 @@ impl Engine {
                     )],
                     Some((_, ref snapshot)) => {
                         let mut changes: Vec<String> = std::iter::once(format!(
-                            "allow {entry} in sandbox {name}; applies at once"
+                            "allow {entry} in sandbox {name}; applies at once, unless it waits with a pending change it cannot be separated from"
                         ))
                         .chain(plan.also.iter().map(|c| format!("also {c}")))
                         .collect();
@@ -166,7 +188,7 @@ impl Engine {
                             also: Vec::new(),
                             outcome: match plan.view.pending {
                                 Some((p, _)) => ChangeOutcome::Pending(p),
-                                None => ChangeOutcome::InForce { dropped: None },
+                                None => ChangeOutcome::InForce { pending: None },
                             },
                         },
                         restarts: false,
@@ -293,9 +315,11 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        // The same policy as the active one is not a new version. Read
+        // before the file is written, so a failure leaves it as it was.
+        let active = self.state.active_policy(name)?;
         self.layout.write_policy(name.as_str(), overrides)?;
-        // The same policy as the active one is not a new version.
-        if let Some((active, current)) = self.state.active_policy(name)?
+        if let Some((active, current)) = active
             && current.id == snapshot.id
         {
             return Ok(active);
@@ -353,6 +377,15 @@ fn allow_summary(applied: &PolicyApplied) -> String {
         ),
         (ChangeOutcome::Pending(p), false) => format!(
             "waits with pending snapshot {}; policy v{version} stays in force{others}",
+            p.snapshot.short()
+        ),
+        (
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(p)),
+            },
+            false,
+        ) => format!(
+            "already allowed in policy v{version}; dropped pending snapshot {}",
             p.snapshot.short()
         ),
         (_, false) => "already allowed; nothing changed".to_owned(),
