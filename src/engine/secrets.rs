@@ -334,7 +334,7 @@ impl Engine {
             return Ok(values);
         };
         let folder = self.layout.sandbox_secrets_dir(name.as_str());
-        write_secrets_file(&folder, &values)?;
+        write_secrets_file(name, &folder, &values)?;
         // Not a secret, but where the secrets are.
         let named = SecretValue::new(folder.display().to_string())
             .expect("a folder's path is text with no NUL");
@@ -384,17 +384,36 @@ fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<String> {
 
 /// Writes `values` as the `.env` of `folder`, which only the user reads:
 /// the folder 0700, the file 0600, written whole beside it and then renamed
-/// over it. Each value is single-quoted with its `\` and `'` escaped, as
-/// python-dotenv reads them back. A value holding `${` is refused:
-/// python-dotenv expands it even in single quotes, and has no escape for
-/// it, so the runtime would read another value.
-fn write_secrets_file(folder: &Path, values: &[(String, SecretValue)]) -> Result<()> {
-    if let Some((variable, _)) = values.iter().find(|(_, v)| v.expose().contains("${")) {
-        return Err(Error::Session {
-            what: format!(
-                "the secret given as ${variable} holds `${{`, which the runtime would expand as it reads its secrets file; set it to a value without it with `enclos secret set`"
-            ),
-        });
+/// over it. Each value is double-quoted with its `\` and `"` escaped, which
+/// python-dotenv and Hermes's own reader (`agent.secret_scope.load_env_file`)
+/// both read back as it was (checked against Hermes 0.22.4's). Refused,
+/// before anything is written: a value holding a line break or `${`, since
+/// Hermes's reader splits lines and python-dotenv expands `${…}` with no
+/// escape for it, so the two would read different values; and a folder
+/// that is a link, never followed.
+fn write_secrets_file(
+    name: &SandboxName,
+    folder: &Path,
+    values: &[(String, SecretValue)],
+) -> Result<()> {
+    let refused = |why: String| Error::SecretsFileRefused {
+        sandbox: name.to_string(),
+        why,
+    };
+    let unreadable = |v: &SecretValue| {
+        let v = v.expose();
+        v.contains('\n') || v.contains('\r') || v.contains("${")
+    };
+    if let Some((variable, _)) = values.iter().find(|(_, v)| unreadable(v)) {
+        return Err(refused(format!(
+            "the secret given as ${variable} holds a line break or `${{`, which its secrets file cannot hold as it is; set a value without them with `enclos secret set`"
+        )));
+    }
+    if std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(refused(format!(
+            "{} is a link, which secrets are never written through; remove it",
+            folder.display()
+        )));
     }
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -411,14 +430,14 @@ fn write_secrets_file(folder: &Path, values: &[(String, SecretValue)]) -> Result
     let mut text = zeroize::Zeroizing::new(String::new());
     for (variable, value) in values {
         text.push_str(variable);
-        text.push_str("='");
+        text.push_str("=\"");
         for c in value.expose().chars() {
-            if c == '\\' || c == '\'' {
+            if c == '\\' || c == '"' {
                 text.push('\\');
             }
             text.push(c);
         }
-        text.push_str("'\n");
+        text.push_str("\"\n");
     }
     let new = folder.join(".env.new");
     let file = folder.join(".env");
@@ -446,30 +465,56 @@ mod tests {
         SecretValue::new(text.to_owned()).unwrap()
     }
 
-    /// Each value single-quoted, `\` and `'` escaped, as python-dotenv reads
-    /// them back; written in place of the file there was.
+    fn home() -> SandboxName {
+        "home".parse().unwrap()
+    }
+
+    /// Each value double-quoted, `\` and `"` escaped, as both of Hermes's
+    /// readers read them back; written in place of the file there was.
     #[test]
     fn a_secrets_file_holds_each_value_escaped() {
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().join("secrets");
         let values = vec![
             ("A".to_owned(), value("plain")),
-            ("B".to_owned(), value("a'b\\c$HOME")),
+            ("B".to_owned(), value("a'b\\c\"d$HOME #e")),
         ];
-        write_secrets_file(&folder, &values).unwrap();
-        write_secrets_file(&folder, &values).unwrap();
+        write_secrets_file(&home(), &folder, &values).unwrap();
+        write_secrets_file(&home(), &folder, &values).unwrap();
         let text = std::fs::read_to_string(folder.join(".env")).unwrap();
-        assert_eq!(text, "A='plain'\nB='a\\'b\\\\c$HOME'\n");
+        assert_eq!(text, "A=\"plain\"\nB=\"a'b\\\\c\\\"d$HOME #e\"\n");
         assert!(!folder.join(".env.new").exists());
     }
 
-    /// `${` would be expanded by python-dotenv, which has no escape for it.
+    /// A line break or `${` would be read differently by Hermes's two
+    /// readers: refused, and nothing written.
     #[test]
-    fn a_value_the_runtime_would_expand_is_refused() {
+    fn a_value_the_runtime_would_read_otherwise_is_refused() {
+        for bad in ["a${HOME}b", "line\nnext", "cr\rhere"] {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("secrets");
+            let err =
+                write_secrets_file(&home(), &folder, &[("T".to_owned(), value(bad))]).unwrap_err();
+            assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
+            assert!(
+                err.to_string().contains("$T holds a line break or `${`"),
+                "{err}"
+            );
+            assert!(!folder.exists());
+        }
+    }
+
+    /// A folder that is a link is never written through.
+    #[test]
+    fn a_secrets_folder_that_is_a_link_is_refused() {
         let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
         let folder = dir.path().join("secrets");
-        let err = write_secrets_file(&folder, &[("T".to_owned(), value("a${HOME}b"))]).unwrap_err();
-        assert!(err.to_string().contains("$T holds `${`"), "{err}");
-        assert!(!folder.join(".env").exists());
+        std::os::unix::fs::symlink(&elsewhere, &folder).unwrap();
+        let err =
+            write_secrets_file(&home(), &folder, &[("T".to_owned(), value("v"))]).unwrap_err();
+        assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
+        assert!(!elsewhere.join(".env").exists());
     }
 }

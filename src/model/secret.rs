@@ -139,7 +139,7 @@ impl fmt::Display for SecretGrant {
 /// A secret's value: text an environment variable can hold, never empty.
 /// Nothing prints it: its `Debug` shows only that there is one. Not
 /// `Clone`, and its text is overwritten with zeros when it is dropped; the
-/// copies others make, such as a child's environment or a pipe's buffer,
+/// copies others make, such as the program's environment or a pipe's buffer,
 /// are not.
 #[derive(PartialEq, Eq)]
 pub struct SecretValue(String);

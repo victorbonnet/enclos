@@ -223,6 +223,29 @@ fn the_sandbox_reads_but_cannot_write_its_own_installers_folder() {
     )));
 }
 
+/// Where a runtime's services read their secrets (ADR 0034): the sandbox
+/// reads the file, and can neither change nor remove it, nor make the
+/// folder, or a link in its place, before enclos writes it.
+#[test]
+fn the_sandbox_reads_but_cannot_write_its_own_secrets_folder() {
+    let w = world();
+    let folder = w.ctx.dir.join("secrets");
+    let dir = folder.display().to_string();
+    assert!(!w.sh(&format!("mkdir '{dir}'")));
+    assert!(!w.sh(&format!("ln -s \"$HOME\" '{dir}'")));
+    assert!(!folder.exists() && std::fs::symlink_metadata(&folder).is_err());
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join(".env");
+    std::fs::write(&file, "T=\"v\"\n").unwrap();
+    let path = file.display().to_string();
+    assert!(w.sh(&format!("cat '{path}'")));
+    assert!(!w.sh(&format!("echo x > '{path}'")));
+    assert!(!w.sh(&format!("rm '{path}'")));
+    assert!(!w.sh(&format!("mv '{path}' '{dir}/moved'")));
+    assert!(!w.sh(&format!("echo x > '{dir}/new'")));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "T=\"v\"\n");
+}
+
 #[test]
 fn the_network_reaches_only_the_proxy_port() {
     let w = world();

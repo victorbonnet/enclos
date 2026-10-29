@@ -445,10 +445,9 @@ impl Engine {
                             self.forget_marker(session);
                         }
                         // What its services read their secrets from, once
-                        // nothing of it runs (ADR 0034).
-                        if record.state == SandboxState::Stopped {
-                            self.remove_secrets_file(name)?;
-                        }
+                        // its services are removed, however its sessions
+                        // ended (ADR 0034).
+                        self.remove_secrets_file(name)?;
                         Ok(report)
                     }
                     (Some(e), Ok(())) => Err(e),
@@ -538,6 +537,9 @@ impl Engine {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
                 let gone = self.require_stopped(name)?;
+                // Kept data or not, the file its services read their
+                // secrets from goes before the record (ADR 0034).
+                self.remove_secrets_file(name)?;
                 let secrets = self.state.secrets(name)?;
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.

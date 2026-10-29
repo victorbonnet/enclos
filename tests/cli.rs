@@ -454,6 +454,51 @@ impl Drop for TestKeychain {
     }
 }
 
+/// A secret `sandbox rm` cannot remove from the store makes it exit 1, so a
+/// script sees it, naming the secret and how to remove it by hand.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_removed_with_a_secret_left_exits_1() {
+    use std::io::Write;
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let mut set = home
+        .command(&["secret", "set", "home/xy"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    set.stdin.take().unwrap().write_all(b"v\n").unwrap();
+    Run(set.wait_with_output().unwrap()).ok();
+    // The keychain gone from under it: the item cannot be removed.
+    Command::new("/usr/bin/security")
+        .arg("delete-keychain")
+        .arg(&keychain.0)
+        .status()
+        .unwrap();
+    let out = Run(home
+        .command(&["--yes", "sandbox", "rm", "home"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stdout().contains("Removed sandbox home"),
+        "{}",
+        out.stdout()
+    );
+    assert!(out.stderr().contains("home/xy"), "{}", out.stderr());
+    assert!(
+        out.stderr().contains("security delete-generic-password"),
+        "{}",
+        out.stderr()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {

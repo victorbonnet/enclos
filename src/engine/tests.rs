@@ -3663,7 +3663,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let seen = std::fs::read_to_string(lab.home.join("gateway-token")).unwrap();
         assert_eq!(seen, "unset", "the value is in the gateway's environment");
         let file = std::fs::read_to_string(lab.home.join("gateway-env")).unwrap();
-        assert_eq!(file, "TOKEN='tok-123:a\\'b\\\\c'\n");
+        assert_eq!(file, "TOKEN=\"tok-123:a'b\\\\c\"\n");
         let folder = lab.engine.layout.sandbox_secrets_dir("home");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&folder), 0o700);
@@ -3717,6 +3717,22 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap_err();
         assert!(err.to_string().contains("$TOKEN"), "{err}");
+
+        // The grant taken out, a file an earlier start left (a crash, a
+        // logout) goes as the gateway starts again with no secrets.
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(".env"), "TOKEN=\"stale\"\n").unwrap();
+        let now = lab.engine.layout.read_policy("home").unwrap();
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &now, &before, Confirm::Yes)
+            .unwrap();
+        // The stub's `cat` of the file then fails: what it found is that.
+        lab.engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert!(!folder.exists());
+        let found = std::fs::read_to_string(lab.home.join("gateway-env")).unwrap();
+        assert!(!found.contains("stale"), "{found}");
     }
 
     /// A session is given the port its gateway listens on, and says why when

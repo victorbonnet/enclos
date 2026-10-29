@@ -255,6 +255,13 @@ pub enum Error {
         service: String,
         why: String,
     },
+    /// What the secrets file of a runtime's services cannot hold, or where
+    /// it cannot be written: the service is not started, and not started
+    /// again, until the user acts.
+    #[error(
+        "{why}, so sandbox `{sandbox}`'s services, whose runtime reads its secrets from a file, were not started; then run `enclos sandbox start {sandbox}`"
+    )]
+    SecretsFileRefused { sandbox: String, why: String },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -358,6 +365,7 @@ impl Error {
             | Error::SecretGranted { .. }
             | Error::SecretMissing { .. }
             | Error::SecretsLocked { .. }
+            | Error::SecretsFileRefused { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

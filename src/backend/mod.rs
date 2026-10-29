@@ -95,8 +95,10 @@ pub struct Compiled {
 pub struct Launch {
     pub program: OsString,
     pub args: Vec<OsString>,
-    /// The secrets its policy grants, by variable, set before the
-    /// sandbox's own environment, which they never replace.
+    /// The secrets its policy grants, by variable, or, for a service whose
+    /// runtime reads them from a file, the variable naming that file's
+    /// folder (ADR 0034); set before the sandbox's own environment, which
+    /// they never replace.
     pub env: Vec<(String, crate::model::secret::SecretValue)>,
     /// Whether the program runs in the terminal enclos runs in, as a
     /// session does: the backend then lets it open that terminal by name. A

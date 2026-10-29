@@ -175,10 +175,10 @@ impl Layout {
         self.sandboxes_dir().join(name)
     }
 
-    /// Where a runtime that reads its secrets from a file finds them while
-    /// the sandbox's services run (ADR 0034): in the sandbox's folder,
-    /// which the sandbox reads but never writes, and no other sandbox
-    /// reads.
+    /// Where a runtime that reads its secrets from a file finds them (ADR
+    /// 0034): written as a service starts, removed by `sandbox stop` and
+    /// `sandbox rm`; in the sandbox's folder, which the sandbox reads but
+    /// never writes, and no other sandbox reads.
     pub fn sandbox_secrets_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("secrets")
     }
