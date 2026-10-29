@@ -249,7 +249,7 @@ pub fn compile(
         return Err(CompileError::Unsupported {
             backend: BackendKind::Seatbelt,
             reason: format!(
-                "sandbox {name} has proxy port {port}, outside enclos's proxy range {PORT_FIRST} to {PORT_LAST}, which sandboxes that listen are kept from binding (ADR 0028); make it again with `enclos sandbox rm {name}`, then `enclos sandbox create {name}`",
+                "sandbox {name} has proxy port {port}, outside enclos's proxy range {PORT_FIRST} to {PORT_LAST}, which sandboxes that listen are kept from binding (ADR 0028); make it again with `enclos sandbox rm {name}`, then `enclos sandbox create {name}` with the `--template` it was made from",
                 name = ctx.name,
                 port = ctx.proxy_port,
             ),
@@ -733,11 +733,9 @@ mod tests {
                 "(allow file-ioctl)",
                 "(allow pseudo-tty)",
                 "(allow mach-lookup",
-                "(global-name \"com.apple.system.notification_center\")",
                 "(global-name \"com.apple.system.opendirectoryd.membership\")",
                 "(global-name \"com.apple.system.opendirectoryd.libinfo\")",
                 "(global-name \"com.apple.logd\")",
-                "(global-name \"com.apple.diagnosticd\")",
                 "(global-name \"com.apple.bsd.dirhelper\")",
                 "(global-name \"com.apple.SystemConfiguration.configd\")",
                 "(global-name \"com.apple.trustd.agent\"))",
@@ -772,7 +770,7 @@ mod tests {
         );
         let allowed = global_names(DENY_DEFAULT);
         let denied = global_names(HOST_SERVICES);
-        assert_eq!(allowed.len(), 8);
+        assert_eq!(allowed.len(), 6);
         // The probes count what a refused lookup makes `open` and
         // `osascript` say as closed on this baseline: none of the services
         // they are known or thought to look up may be allowed (traced for
@@ -936,8 +934,7 @@ mod tests {
         assert!(release.contains("never a release"), "{release}");
     }
 
-    /// A compiled text says its baseline on its third line, and only there:
-    /// a path holding the same words further down changes nothing.
+    /// A compiled text says its baseline on its third line, and only there.
     #[test]
     fn a_compiled_text_says_its_baseline() {
         let base = Path::new("/nonexistent-enclos-test");
@@ -988,6 +985,11 @@ mod tests {
         p.net.listen = true;
         let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         assert_eq!(allowances(&text), REVIEWED_ALLOWANCES, "{text}");
+        // Nothing the list above cannot see: an `(import "system.sb")`
+        // would bring Apple's allowances, a macro hidden ones.
+        for form in ["(import", "(define", "(debug", "(macro"] {
+            assert!(!text.contains(form), "{form} in:\n{text}");
+        }
     }
 
     /// The deny-default block, then writes, terminals, the home's reads,
@@ -1001,7 +1003,7 @@ mod tests {
         "(allow process-info* (target same-sandbox))",
         "(allow file-ioctl)",
         "(allow pseudo-tty)",
-        "(allow mach-lookup (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.logd\") (global-name \"com.apple.diagnosticd\") (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.trustd.agent\"))",
+        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.logd\") (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.trustd.agent\"))",
         "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
         "(allow file-write* (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\"))",
         "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))",

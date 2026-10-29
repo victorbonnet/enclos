@@ -69,8 +69,8 @@ static DOCUMENT: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// How `command`, by its word, prints: JSON with `--json`, which wins over
 /// `--text`; else text with `--text` or in a terminal, and JSON when piped,
-/// but for the commands in [`RUNS_A_PROGRAM`], whose JSON is only on
-/// stderr and only with `--json`. The same for a parsed command and for a
+/// but for the commands in [`RUNS_A_PROGRAM`], which print JSON only with
+/// `--json`, and then mostly on stderr (see [`Output::OnStderr`]). The same for a parsed command and for a
 /// usage error, which is told as the command would print.
 pub fn decide(command: &str, json: bool, text: bool, stdout_is_terminal: bool) -> Output {
     let runs = RUNS_A_PROGRAM.contains(&command);
@@ -185,9 +185,32 @@ pub fn conclude(result: Value, code: u8, message: impl FnOnce() -> String) -> u8
     code
 }
 
-/// `value` as a document's text: indented, and escaped by [`for_terminal`].
+/// The shape of what enclos prints as JSON: raised when a field a reader
+/// may rely on changes or goes, so a script can tell one shape from the
+/// next. A field added keeps it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// `value`, an object as everything enclos prints as JSON is, with its
+/// `schema_version`. Anything else is a bug, which a debug build panics on;
+/// a release prints it as it is.
+fn versioned(value: &Value) -> std::borrow::Cow<'_, Value> {
+    match value {
+        Value::Object(fields) => {
+            let mut fields = fields.clone();
+            fields.insert("schema_version".into(), SCHEMA_VERSION.into());
+            std::borrow::Cow::Owned(Value::Object(fields))
+        }
+        _ => {
+            debug_assert!(false, "enclos prints JSON objects only: {value}");
+            std::borrow::Cow::Borrowed(value)
+        }
+    }
+}
+
+/// `value` as a document's text: with its `schema_version`, indented, and
+/// escaped by [`for_terminal`].
 pub fn document_text(value: &Value) -> String {
-    for_terminal(&serde_json::to_string_pretty(value).expect("a JSON value serializes"))
+    for_terminal(&serde_json::to_string_pretty(&versioned(value)).expect("a JSON value serializes"))
 }
 
 /// A dry run's plan, as this command prints it: its document in JSON, else
@@ -199,11 +222,11 @@ pub fn show_plan(planned: &Plan) {
     }
 }
 
-/// `value` compact, on one line, escaped as a document is: one line of JSON
-/// Lines, such as a note, a session's end or a failure on stderr, or a
-/// `logs` line on stdout.
+/// `value` compact, on one line, with its `schema_version` and escaped as a
+/// document is: one line of JSON Lines, such as a note, a session's end or
+/// a failure on stderr, or a `logs` line on stdout.
 pub fn line(value: &Value) -> String {
-    for_terminal(&serde_json::to_string(value).expect("a JSON value serializes"))
+    for_terminal(&serde_json::to_string(&versioned(value)).expect("a JSON value serializes"))
 }
 
 /// JSON text with these characters escaped as `\uXXXX`, a character past
@@ -214,8 +237,8 @@ pub fn line(value: &Value) -> String {
 /// Mongolian vowel separator, the word joiner and invisible operators, the
 /// variation selectors, the interlinear annotation characters and the tag
 /// characters. JSON escapes only the C0 controls itself, and a sandbox
-/// writes some of what a document holds, such as its log lines and its
-/// processes' commands. Such characters only ever appear inside strings,
+/// writes some of what a document holds, such as its services' logs and
+/// its processes' commands. Such characters only ever appear inside strings,
 /// so this changes no value.
 pub fn for_terminal(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -258,9 +281,8 @@ pub fn path(p: &Path) -> Value {
     Value::String(p.to_string_lossy().into_owned())
 }
 
-/// An error as JSON: its message, what kind of failure it is, and the exit
-/// code it gives (the command's, or a part's, such as one sandbox's in
-/// `sandboxes`), which for `exec` is 125 whatever the kind.
+/// The command's error as JSON: its message, its kind, from the error
+/// itself, and `code`, which for `exec` is 125 whatever the kind.
 pub fn error(err: &Error, code: u8) -> Value {
     json!({"error": error_body(&err.to_string(), kind(err.exit_code()), code)})
 }
@@ -289,7 +311,8 @@ pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String)
 }
 
 /// `result` with `err` beside it as its `error`, and the code it gives: a
-/// part of a command that failed, kept with what it did.
+/// part of a command that failed, such as one sandbox's in `sandboxes`,
+/// kept with what it did.
 pub fn with_failure(mut result: Value, err: &Error) -> (u8, Value) {
     debug_assert!(
         result.is_object() && result.get("error").is_none(),
@@ -492,6 +515,19 @@ mod tests {
             !text.contains('\u{9b}') && !text.contains('\u{202e}'),
             "{text}"
         );
-        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+        let mut versioned = value;
+        versioned["schema_version"] = SCHEMA_VERSION.into();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), versioned);
+    }
+
+    /// A document and each line of JSON Lines say their shape.
+    #[test]
+    fn what_enclos_prints_as_json_carries_its_schema_version() {
+        let value = json!({"sandboxes": []});
+        for text in [document_text(&value), line(&value)] {
+            let read: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(read["schema_version"], SCHEMA_VERSION, "{text}");
+            assert_eq!(read["sandboxes"], json!([]), "{text}");
+        }
     }
 }

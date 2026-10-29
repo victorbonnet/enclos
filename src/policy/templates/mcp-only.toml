@@ -5,7 +5,10 @@
 # Hermes: its install sources and the ChatGPT-subscription provider).
 # List each MCP endpoint's host with `enclos policy allow`, such as
 # `enclos policy allow community mcp.example.org`: nothing beyond the
-# adapter's endpoints and what you allow is reachable.
+# adapter's endpoints and what you allow is reachable. Then tell the runtime
+# of the endpoint with its own commands, through `enclos connect`, until
+# `runtime configure --mcp-add` does both. The same rules as `minimal` for
+# now, until program rules come (design §7).
 
 [filesystem]
 write = ["{home}"]

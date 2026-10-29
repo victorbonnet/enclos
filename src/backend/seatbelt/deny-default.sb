@@ -19,7 +19,11 @@
 
 ;; What a program reads of the kernel about itself and the host, and what
 ;; it may learn or set of its own sandbox's processes (`process-info*`, the
-;; same sandbox only).
+;; same sandbox only). Not narrowed, so the host's processes stay listed:
+;; a `sysctl-read` deny on `kern.proc.` hides the listings, but not a read
+;; of each pid in turn nor `kern.procargs2`, a process's arguments and
+;; start-up environment, which no rule covers (macOS 26.5.2), and Hermes
+;; lists processes with psutil (design §5, the table).
 (allow sysctl-read)
 (allow process-info* (target same-sandbox))
 
@@ -34,18 +38,24 @@
 (allow pseudo-tty)
 
 ;; Host services the workloads looked up (a shell, Python, git, curl, Node
-;; and Hermes's installer; prototype/adr-0006/README.md): notifications,
-;; logging, user and group records, the per-user temporary folder, the
-;; network settings, and certificate trust.
+;; and Hermes's installer; prototype/adr-0006/README.md): logging, user and
+;; group records, the per-user temporary folder, the network settings, and
+;; certificate trust. Not the notification center, through which a sandbox
+;; posts a notification a host process waits for (macOS 26.5.2), nor
+;; diagnosticd, which serves the unified log to its readers: no workload
+;; failed without them.
 (allow mach-lookup
-  (global-name "com.apple.system.notification_center")
   (global-name "com.apple.system.opendirectoryd.membership")
   (global-name "com.apple.system.opendirectoryd.libinfo")
   (global-name "com.apple.logd")
-  (global-name "com.apple.diagnosticd")
   (global-name "com.apple.bsd.dirhelper")
   (global-name "com.apple.SystemConfiguration.configd")
   ;; Certificate trust, for TLS through the Security framework: the Hermes
   ;; installer's downloads failed with OSStatus -26276 without it.
   (global-name "com.apple.trustd.agent"))
+;; The notification center's shared memory, read only: libinfo reads its
+;; notification states there, and the shell workload failed without it
+;; (prototype/adr-0006/README.md). Posting needs the lookup refused above.
+;; Whether a sandbox learns of a host notification by reading a state here
+;; is not probed.
 (allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))

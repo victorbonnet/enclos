@@ -12,8 +12,8 @@ use super::output;
 
 use enclos::backend::seatbelt::Baseline;
 use enclos::engine::{
-    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyDiff, PolicyHistory,
-    PolicyView, Restarted, TestReport,
+    ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyDiff,
+    PolicyHistory, PolicyView, Restarted, TestReport,
 };
 use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
@@ -38,7 +38,8 @@ enum PolicyVerb {
         #[arg(long)]
         pending: bool,
     },
-    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once.
+    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once, or
+    /// waits with a pending change it cannot be separated from.
     Allow {
         sandbox: SandboxName,
         destination: String,
@@ -57,7 +58,7 @@ enum PolicyVerb {
     Diff {
         sandbox: SandboxName,
         /// The version compared from: by default the active one when the
-        /// pending policy is compared, else the one before --to.
+        /// pending policy is compared, else the version before the one compared.
         #[arg(long, value_name = "VERSION")]
         from: Option<u32>,
         /// The version compared: by default the pending policy, when there
@@ -101,7 +102,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                     Planned::Done(report) if output::json() => {
                         let code = test_code(&report);
                         output::conclude(test_json(&sandbox, &report), code, || {
-                            verdict(&sandbox, &report)
+                            verdict(&sandbox, &report, true)
                         })
                     }
                     Planned::Done(report) => print_test(&sandbox, &report),
@@ -258,7 +259,7 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
     json!({
         "sandbox": sandbox.to_string(),
         "ready": report.passed(),
-        "verdict": verdict(sandbox, report),
+        "verdict": verdict(sandbox, report, true),
         "probes": report.results.iter().map(|r| {
             let (outcome, why) = match &r.outcome {
                 Outcome::Closed => ("closed", r.closed_by.map(|by| by.why().to_owned())),
@@ -404,8 +405,16 @@ fn print_rules(policy: &Policy) {
         );
     }
     let r = &policy.resources;
+    // Every field named, so one added is decided on here.
+    let enclos::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = r;
     if !r.is_unset() {
-        println!("\nLimits (each process, from its start)");
+        println!("\nLimits (each process, from its start; memory and CPU share for the sandbox)");
         if let Some(files) = r.open_files {
             println!("  open files: {files}");
         }
@@ -414,6 +423,12 @@ fn print_rules(policy: &Policy) {
         }
         if let Some(size) = r.file_size {
             println!("  file size:  {size}");
+        }
+        if let Some(memory) = &r.memory {
+            println!("  memory:     {memory}");
+        }
+        if let Some(cpu) = &r.cpu {
+            println!("  CPU share:  {cpu}");
         }
     }
 }
@@ -442,6 +457,11 @@ fn print_allowed(
         (true, _) => println!(
             "Sandbox {sandbox} now allows {destination}: policy v{version}, in force at once."
         ),
+        // Waits with the pending policy, unless the policy in force
+        // allows it already (a pending change that dropped it, say).
+        (false, ChangeOutcome::Pending(_)) if engine.allows(sandbox, destination)? => println!(
+            "Sandbox {sandbox} allows {destination} under policy v{version}; the change waits with its pending policy."
+        ),
         (false, ChangeOutcome::Pending(_)) => println!(
             "Sandbox {sandbox} does not allow {destination} yet: the change waits with its pending policy, and policy v{version} stays in force."
         ),
@@ -467,10 +487,12 @@ fn print_outcome(
 ) -> Result<(u8, Value)> {
     let text = !output::json();
     match &applied.outcome {
-        ChangeOutcome::InForce { dropped: Some(p) } => {
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Dropped(p)),
+        } => {
             if text {
                 println!(
-                    "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
+                    "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: the file is back to the policy in force.",
                     p.snapshot.short()
                 );
             }
@@ -479,7 +501,21 @@ fn print_outcome(
                 json!({"in_force": true, "dropped_pending": pending_json(p)}),
             ))
         }
-        ChangeOutcome::InForce { dropped: None } => {
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Applied(p)),
+        } => {
+            if text {
+                println!(
+                    "The pending policy of sandbox {sandbox} (snapshot {}) is in force with this change: no session runs under rules it changes any more.",
+                    p.snapshot.short()
+                );
+            }
+            Ok((
+                exit::OK,
+                json!({"in_force": true, "dropped_pending": null, "applied_pending": pending_json(p)}),
+            ))
+        }
+        ChangeOutcome::InForce { pending: None } => {
             Ok((exit::OK, json!({"in_force": true, "dropped_pending": null})))
         }
         ChangeOutcome::Pending(p) => {
@@ -643,7 +679,7 @@ fn print_replaced(
         (ChangeOutcome::Pending(_), false) => {
             println!("Sandbox {sandbox} keeps policy v{version} for now.")
         }
-        (ChangeOutcome::InForce { dropped: None }, false) => {
+        (ChangeOutcome::InForce { pending: None }, false) => {
             println!("Sandbox {sandbox} already has that policy: v{version}, nothing changed.")
         }
         (_, false) => println!("Sandbox {sandbox} keeps policy v{version}."),
@@ -708,12 +744,7 @@ fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
 /// applied: refused, cut short, or a dry run) is opened again instead, as
 /// long as `policy.toml` is still the file it started from.
 fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) -> Result<u8> {
-    let view = engine.policy(sandbox)?;
-    // The text the latest policy was resolved from: a file that holds
-    // anything else holds an edit not applied, which closing the editor
-    // applies.
-    let recorded = view.latest().overrides_text().map(str::to_owned);
-    let file = view.file;
+    let file = engine.policy(sandbox)?.file;
     let files = engine.edit_files(sandbox);
     let io = |path: &Path| {
         let path = path.to_owned();
@@ -749,7 +780,10 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     write_private(&files.copy, &start).map_err(io(&files.copy))?;
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
-    if after == before && recorded.as_deref().is_none_or(|r| r == after) {
+    // Saved unchanged, an edit records nothing, unless the file holds what
+    // the state does not record yet: an edit not applied, such as one made
+    // by hand, which closing the editor applies.
+    if after == before && engine.policy_file_recorded(sandbox)? {
         let left = forget_edit(&files);
         let code = edit_left_code(&left, exit::OK);
         if output::json() {
@@ -966,28 +1000,35 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     println!();
     match report.passed() {
         true => {
-            println!("{}", verdict(sandbox, report));
+            println!("{}", verdict(sandbox, report, false));
             exit::OK
         }
         false => {
-            eprintln!("{}", verdict(sandbox, report));
+            eprintln!("{}", verdict(sandbox, report, false));
             exit::ERROR
         }
     }
 }
 
 /// Whether the sandbox is ready, in one line: READY when the test passed,
-/// with what it showed, or NOT READY with every reason it did not.
-fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
+/// with what it showed, or NOT READY with every reason it did not. Each
+/// probe is listed above it in text, and in the document's `probes` in
+/// `json`.
+fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
     let total = report.results.len();
+    let listed = |text: &str, value: &str| match json {
+        true => format!("\"{value}\" in probes"),
+        false => format!("{text} above"),
+    };
     if report.passed() {
         let platform = report.closed_apart();
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
-                "{} of {total} shown closed{platform}, {} could not be checked on this Mac (inconclusive above), none open",
+                "{} of {total} shown closed{platform}, {} could not be checked on this Mac ({}), none open",
                 report.closed(),
-                report.inconclusive()
+                report.inconclusive(),
+                listed("inconclusive", "inconclusive")
             ),
         };
         let baseline = match report.baseline {
@@ -1001,18 +1042,20 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
     let mut why = Vec::new();
     if report.open() > 0 {
         why.push(format!(
-            "{} of {total} probes got out (OPEN above)",
-            report.open()
+            "{} of {total} probes got out ({})",
+            report.open(),
+            listed("OPEN", "open")
         ));
     }
     if report.not_run() > 0 {
         why.push(format!(
-            "{} could not run or be checked, so their routes were not tested (NOT RUN above)",
-            report.not_run()
+            "{} could not run or be checked, so their routes were not tested ({})",
+            report.not_run(),
+            listed("NOT RUN", "not_run")
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by something enclos compiles, so the test showed nothing about the policy".to_owned());
+        why.push("no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules".to_owned());
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1053,13 +1096,14 @@ mod tests {
         let lab: SandboxName = "lab".parse().unwrap();
         let closed = || Outcome::Closed;
         assert_eq!(
-            verdict(&lab, &reports(vec![closed(), closed()])),
+            verdict(&lab, &reports(vec![closed(), closed()]), false),
             "READY: no probe got out of sandbox lab: all 2 shown closed."
         );
         assert_eq!(
             verdict(
                 &lab,
-                &reports(vec![closed(), closed(), Outcome::Inconclusive("x".into())])
+                &reports(vec![closed(), closed(), Outcome::Inconclusive("x".into())]),
+                false
             ),
             "READY: no probe got out of sandbox lab: 2 of 3 shown closed, 1 could not be checked on this Mac (inconclusive above), none open."
         );
@@ -1070,13 +1114,27 @@ mod tests {
                     closed(),
                     Outcome::Open("x".into()),
                     Outcome::NotRun("y".into())
-                ])
+                ]),
+                false
             ),
             "NOT READY: sandbox lab: 1 of 3 probes got out (OPEN above); 1 could not run or be checked, so their routes were not tested (NOT RUN above). Do not use it until this is fixed."
         );
+        // In JSON, nothing is above: the verdict points at `probes`.
         assert_eq!(
-            verdict(&lab, &report(Outcome::Inconclusive("x".into()))),
-            "NOT READY: sandbox lab: no probe was shown closed by something enclos compiles, so the test showed nothing about the policy."
+            verdict(
+                &lab,
+                &reports(vec![
+                    closed(),
+                    Outcome::Open("x".into()),
+                    Outcome::NotRun("y".into())
+                ]),
+                true
+            ),
+            "NOT READY: sandbox lab: 1 of 3 probes got out (\"open\" in probes); 1 could not run or be checked, so their routes were not tested (\"not_run\" in probes). Do not use it until this is fixed."
+        );
+        assert_eq!(
+            verdict(&lab, &report(Outcome::Inconclusive("x".into())), false),
+            "NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules."
         );
     }
 

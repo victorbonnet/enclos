@@ -178,8 +178,13 @@ fn backend(b: &BackendCheck) -> String {
         BackendState::Runs => "runs here".to_owned(),
     };
     let c = &b.capabilities;
+    // Not a claim about this host when the backend is not on it.
+    let would = match b.state {
+        BackendState::Unavailable { .. } => "would enforce: ",
+        _ => "",
+    };
     format!(
-        "  {}: {state}\n    files {}; network {}; programs {}; limits {}; members {}\n",
+        "  {}: {state}\n    {would}files {}; network {}; programs {}; limits {}; members {}\n",
         b.kind,
         enforced(&c.fs),
         enforced(&c.network),
@@ -201,7 +206,7 @@ fn sandbox(s: &SandboxCheck) -> String {
         }
         NextSession::Unknown { why } => {
             out += &format!(
-                "  {name}: enclos could not tell whether its next session can start: {why}\n"
+                "  {name}: enclos could not tell whether its active policy compiles: {why}\n"
             );
         }
         NextSession::Fails { error } => {
@@ -293,11 +298,19 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
             }
         }
     }
+    // A restart helps only a version that still compiles: one that does
+    // not would stop the sandbox and then not start it again.
+    let compiles = matches!(drift.kind, DriftKind::Changed { .. });
     match (drift.running.count, drift.running.unsure) {
         (0, _) => {}
-        (n, false) => {
+        (n, false) if compiles => {
             out += &format!(
                 "      {n} running session(s) keep that compiled policy until restarted (`enclos sandbox restart {name}`)\n"
+            );
+        }
+        (n, false) => {
+            out += &format!(
+                "      {n} running session(s) keep that compiled policy; fix what keeps it from compiling (above) before `enclos sandbox restart {name}`, which would not start it again\n"
             );
         }
         (n, true) => {
@@ -320,6 +333,7 @@ fn enforced(e: &Enforcement) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclos::backend::seatbelt::Baseline;
     use enclos::backend::{Capabilities, Enforcement};
     use enclos::engine::{Running, Written};
     use enclos::model::sandbox::BackendKind;
@@ -383,7 +397,7 @@ mod tests {
             ..compiles()
         }));
         assert!(
-            shown.contains("home: enclos could not tell whether its next session can start: cannot read its active policy: the database is busy"),
+            shown.contains("home: enclos could not tell whether its active policy compiles: cannot read its active policy: the database is busy"),
             "{shown}"
         );
         assert!(!shown.contains("does not run here"), "{shown}");
@@ -402,7 +416,7 @@ mod tests {
             drift: vec![change(
                 RanFile::There {
                     written: Written::AsWritten {
-                        on_allow_default: false,
+                        baseline: Some(Baseline::DenyDefault),
                     },
                     lines: Lines::Changed(vec![
                         LineChange::Removed("(old)".into()),
@@ -439,7 +453,7 @@ mod tests {
             drift: vec![change(
                 RanFile::There {
                     written: Written::AsWritten {
-                        on_allow_default: true,
+                        baseline: Some(Baseline::AllowDefault),
                     },
                     lines: Lines::TooLong,
                 },
@@ -519,6 +533,12 @@ mod tests {
             shown.contains("policy v1, which a session ran under (/c/one.sb), no longer compiles: bad rule\n      1 running session(s) keep that compiled policy"),
             "{shown}"
         );
+        // No restart is suggested for a version that would not start again.
+        assert!(
+            shown.contains("fix what keeps it from compiling"),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("until restarted").count(), 0, "{shown}");
     }
 
     /// A sandbox whose backend does not run here is never said to compile

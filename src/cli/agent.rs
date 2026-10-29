@@ -21,6 +21,14 @@ pub struct AgentArgs {
     verb: AgentVerb,
 }
 
+impl AgentArgs {
+    /// Whether the verb runs none of the runtime's programs: only `list`,
+    /// which reads the runtime's agents from the sandbox's files.
+    pub fn runs_no_program(&self) -> bool {
+        matches!(self.verb, AgentVerb::List { .. })
+    }
+}
+
 #[derive(Subcommand)]
 enum AgentVerb {
     /// Add an agent, such as `lab/main`: the runtime creates it in the

@@ -262,6 +262,29 @@ fn the_sandbox_reads_but_cannot_write_its_own_installers_folder() {
     )));
 }
 
+/// Where a runtime's services read their secrets (ADR 0034): the sandbox
+/// reads the file, and can neither change nor remove it, nor make the
+/// folder, or a link in its place, before enclos writes it.
+#[test]
+fn the_sandbox_reads_but_cannot_write_its_own_secrets_folder() {
+    let w = world();
+    let folder = w.ctx.dir.join("secrets");
+    let dir = folder.display().to_string();
+    assert!(!w.sh(&format!("mkdir '{dir}'")));
+    assert!(!w.sh(&format!("ln -s \"$HOME\" '{dir}'")));
+    assert!(!folder.exists() && std::fs::symlink_metadata(&folder).is_err());
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join(".env");
+    std::fs::write(&file, "T=\"v\"\n").unwrap();
+    let path = file.display().to_string();
+    assert!(w.sh(&format!("cat '{path}'")));
+    assert!(!w.sh(&format!("echo x > '{path}'")));
+    assert!(!w.sh(&format!("rm '{path}'")));
+    assert!(!w.sh(&format!("mv '{path}' '{dir}/moved'")));
+    assert!(!w.sh(&format!("echo x > '{dir}/new'")));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "T=\"v\"\n");
+}
+
 #[test]
 fn the_network_reaches_only_the_proxy_port() {
     let w = world();
@@ -986,8 +1009,8 @@ fn the_sandbox_signals_its_own_processes() {
     assert!(w.sh(&format!("/usr/bin/perl -e '{group}'")));
 }
 
-/// Under `(deny default)` the baseline refuses the lookups LaunchServices
-/// and Apple Events need, so the host-service probes close on what that
+/// Under `(deny default)` the baseline refuses something LaunchServices
+/// and Apple Events need (likely a lookup; not traced), so the host-service probes close on what that
 /// makes the tools say; under `(allow default)` the policy's own rules
 /// refuse them. Only where host-service probes may run (CI): were a rule
 /// not to hold, Finder would open a folder.

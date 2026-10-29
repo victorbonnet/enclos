@@ -46,7 +46,8 @@ impl Default for Seatbelt {
     }
 }
 
-/// Says once, on stderr, that a program runs on the comparison baseline.
+/// Says on stderr, once per process and so for the first sandbox only,
+/// that a program runs on the comparison baseline.
 fn say_allow_default(ctx: &SandboxContext) {
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| {

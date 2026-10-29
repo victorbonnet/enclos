@@ -165,6 +165,29 @@ fn before_init_the_backends_are_still_checked() {
     assert!(!doctor.has_problems());
 }
 
+/// A sandbox whose active policy cannot be read is one doctor could not
+/// tell about: never said to compile, and a problem (exit 1), though no
+/// session of it runs.
+#[test]
+fn a_policy_that_cannot_be_read_is_unknown_and_a_problem() {
+    let (_dir, engine, name) = with_sandbox();
+    let id = engine.policy(&name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = '{' WHERE id = ?1",
+        [&id.0],
+    )
+    .unwrap();
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(
+        matches!(check.next, NextSession::Unknown { .. }),
+        "{:?}",
+        check.next
+    );
+    assert!(doctor.has_problems());
+}
+
 #[test]
 fn a_backend_not_on_this_host_is_not_tried() {
     let (_dir, engine) = engine_with(vec![Box::new(FakeBackend::unavailable(

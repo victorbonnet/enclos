@@ -52,8 +52,8 @@ pub struct PolicyApplied {
     pub changed: bool,
     /// What the change does besides the entry asked for, one sentence each:
     /// edits to `policy.toml` not applied yet, or a newer template or
-    /// built-in defaults. For `policy edit`, everything it changes from the
-    /// active policy.
+    /// built-in defaults. For `policy edit`, `rollback` and `refresh`,
+    /// everything it changes from the active policy.
     pub also: Vec<String>,
     pub outcome: ChangeOutcome,
 }
@@ -61,14 +61,24 @@ pub struct PolicyApplied {
 /// Where a change ended up (design §7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangeOutcome {
-    /// In force for new sessions, and live for the network; `dropped` is
-    /// the pending policy it replaced, if one waited.
-    InForce { dropped: Option<PendingPolicy> },
+    /// In force for new sessions, and live for the network; `pending` is
+    /// what became of the pending policy, if one waited.
+    InForce { pending: Option<PendingEnd> },
     /// A change waits as the pending policy: this one, or one saved before
     /// it that this change left waiting.
     Pending(PendingPolicy),
     /// With `--yes`, the sandbox restarted into it.
     Restarted(Restarted),
+}
+
+/// What became of a pending policy when a change went in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEnd {
+    /// Dropped: the change put the policy in force back.
+    Dropped(PendingPolicy),
+    /// In force with the change, which was resolved from the file that held
+    /// it, now that no session runs under rules it changes.
+    Applied(PendingPolicy),
 }
 
 /// What `policy allow` would do, worked out without changing anything.
@@ -93,9 +103,21 @@ impl Engine {
         })
     }
 
+    /// Whether the policy in force allows `destination`, written as
+    /// `policy allow` writes it.
+    pub fn allows(&self, name: &SandboxName, destination: &str) -> Result<bool> {
+        let Ok(entry) = AllowEntry::parse(destination) else {
+            return Ok(false);
+        };
+        let entry = entry.to_string();
+        let view = self.policy(name)?;
+        Ok(view.snapshot.policy.net.allow.contains(&entry))
+    }
+
     /// Allows the sandbox to reach `destination` (`host`, `host:port` or
-    /// `*.domain`). A network change applies at once: the proxy enforces it,
-    /// so nothing restarts, and a change pending gets it too. The new
+    /// `*.domain`). A network change applies at once when it can be
+    /// separated from a pending change (design §7): the proxy enforces it,
+    /// so nothing restarts, and the pending change gets it too. The new
     /// version is what `policy.toml` resolves to, so when it changes more
     /// than this entry (edits not applied yet, a newer template or built-in
     /// defaults), it asks first; with `--yes`, a part that needs a restart
@@ -121,7 +143,7 @@ impl Engine {
                     )],
                     Some((_, ref snapshot)) => {
                         let mut changes: Vec<String> = std::iter::once(format!(
-                            "allow {entry} in sandbox {name}; applies at once"
+                            "allow {entry} in sandbox {name}; applies at once, unless it waits with a pending change it cannot be separated from"
                         ))
                         .chain(plan.also.iter().map(|c| format!("also {c}")))
                         .collect();
@@ -167,7 +189,7 @@ impl Engine {
                             also: Vec::new(),
                             outcome: match plan.view.pending {
                                 Some((p, _)) => ChangeOutcome::Pending(p),
-                                None => ChangeOutcome::InForce { dropped: None },
+                                None => ChangeOutcome::InForce { pending: None },
                             },
                         },
                         restarts: false,
@@ -253,12 +275,11 @@ impl Engine {
     ) -> Result<PolicySnapshot> {
         let backend = self.recorded_backend(name)?;
         self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
-            .map_err(|error| self.with_active_template(name, error))
     }
 
     /// A `policy.toml` that names no template, said with the one the active
-    /// policy is built on: picking another, such as the default, could open
-    /// what the sandbox's template closed.
+    /// policy is built on: picking another template could open what the
+    /// sandbox's own template closed.
     fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
         if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
             return error;
@@ -284,7 +305,10 @@ impl Engine {
         adapter: Option<AdapterLayer>,
         backend: BackendKind,
     ) -> Result<PolicySnapshot> {
-        let snapshot = policy::resolve(overrides, adapter.as_ref())?;
+        // Every path that resolves a policy.toml says which template the
+        // sandbox has when the file names none (`runtime install` too).
+        let snapshot = policy::resolve(overrides, adapter.as_ref())
+            .map_err(|e| self.with_active_template(name, e.into()))?;
         self.check_policy(name, &snapshot.policy, backend)?;
         Ok(snapshot)
     }
@@ -302,7 +326,7 @@ impl Engine {
     ) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
-        validate_resources(policy, backend)?;
+        validate_resources(policy, backend, crate::backend::max_files_per_process())?;
         self.check_secrets_set(name, policy)
     }
 
@@ -321,12 +345,27 @@ impl Engine {
         record: &crate::model::sandbox::SandboxRecord,
         policy: &Policy,
     ) -> Result<LaunchLimits> {
-        validate_resources(policy, record.backend)?;
-        let limits = LaunchLimits::of_checked(&policy.resources);
+        validate_resources(
+            policy,
+            record.backend,
+            crate::backend::max_files_per_process(),
+        )?;
+        let limits =
+            LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
         if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });
         }
         Ok(limits)
+    }
+
+    /// Whether the sandbox's active policy could start a session or service
+    /// now, under its limits: for a command that stops the sandbox before
+    /// it starts it again, such as `sandbox restart`, to ask before
+    /// anything stops.
+    pub fn check_start_limits(&self, name: &SandboxName) -> Result<()> {
+        let record = self.record(name)?;
+        self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+        Ok(())
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
@@ -351,9 +390,11 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        // The same policy as the active one is not a new version. Read
+        // before the file is written, so a failure leaves it as it was.
+        let active = self.state.active_policy(name)?;
         self.layout.write_policy(name.as_str(), overrides)?;
-        // The same policy as the active one is not a new version.
-        if let Some((active, current)) = self.state.active_policy(name)?
+        if let Some((active, current)) = active
             && current.id == snapshot.id
         {
             return Ok(active);
@@ -411,6 +452,15 @@ fn allow_summary(applied: &PolicyApplied) -> String {
         ),
         (ChangeOutcome::Pending(p), false) => format!(
             "waits with pending snapshot {}; policy v{version} stays in force{others}",
+            p.snapshot.short()
+        ),
+        (
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(p)),
+            },
+            false,
+        ) => format!(
+            "already allowed in policy v{version}; dropped pending snapshot {}",
             p.snapshot.short()
         ),
         (_, false) => "already allowed; nothing changed".to_owned(),
@@ -495,6 +545,14 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "stop giving it ${variable} (sessions started from now on)"
         ));
     }
+    // Every field named, so one added is decided on here.
+    let crate::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = &new.resources;
     let (was, now) = (&old.resources, &new.resources);
     for (what, before, after) in [
         (
@@ -511,6 +569,16 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "a process's CPU time",
             was.cpu_seconds.map(|s| format!("{s} s")),
             now.cpu_seconds.map(|s| format!("{s} s")),
+        ),
+        (
+            "the sandbox's memory",
+            was.memory.clone(),
+            now.memory.clone(),
+        ),
+        (
+            "the sandbox's share of the CPU",
+            was.cpu.clone(),
+            now.cpu.clone(),
         ),
     ] {
         if before != after {

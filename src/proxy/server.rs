@@ -529,12 +529,19 @@ fn forward(
             event.reason = Some(reason);
             // Said here too, so the proxy's log keeps it should its record
             // not be written.
+            let name = checked.seen.name().unwrap_or("none");
             eprintln!(
-                "enclos proxy: closed a tunnel to {}: {}",
+                "enclos proxy: closed a tunnel to {}: {} ({reason})",
                 destination(&event.host, event.port),
-                match checked.seen.name() {
-                    Some(name) => format!("its TLS hello asks for {name} ({reason})"),
-                    None => format!("its TLS hello cannot be read ({reason})"),
+                match reason {
+                    Reason::NameMismatch => format!("its TLS hello asks for {name}"),
+                    Reason::NoServerName => "its TLS hello names no server".to_owned(),
+                    Reason::EncryptedHello => {
+                        format!(
+                            "its TLS hello hides the name it asks for under ECH, public name {name}"
+                        )
+                    }
+                    _ => "its TLS hello cannot be read".to_owned(),
                 }
             );
         }
@@ -583,9 +590,9 @@ impl Checked {
                 checked(NameSeen::Name(NameSeen::shown(&name)), None)
             }
             // Under ECH the name shown is the public name of the server
-            // that decrypts the real one, which is not the host: it is not
-            // compared, so a client that only claims ECH is not checked
-            // either (design §6).
+            // that decrypts the real one: the name asked for cannot be
+            // compared, so the tunnel is closed, as one that only claims ECH
+            // to skip the check is (design §6).
             FirstBytes::ClientHello {
                 server_name,
                 encrypted: true,
@@ -593,7 +600,7 @@ impl Checked {
                 NameSeen::Encrypted {
                     public: server_name.as_deref().map(NameSeen::shown),
                 },
-                None,
+                Some(Reason::EncryptedHello),
             ),
             FirstBytes::ClientHello {
                 server_name: Some(name),
@@ -602,12 +609,34 @@ impl Checked {
                 NameSeen::Name(NameSeen::shown(&name)),
                 Some(Reason::NameMismatch),
             ),
+            // A client names no server for an address, and a tunnel opened
+            // for a host name that names none would reach whichever site the
+            // address serves by default (design §6).
             FirstBytes::ClientHello {
                 server_name: None, ..
-            } => checked(NameSeen::NoName, None),
+            } => checked(
+                NameSeen::NoName,
+                (!is_address(host)).then_some(Reason::NoServerName),
+            ),
         }
     }
 }
+
+/// Whether a tunnel's host is an address (`10.1.2.3`, `[::1]`), for which
+/// a client names no server, rather than a host name.
+fn is_address(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// How long a tunnel's first bytes may take to show what server it asks
+/// for, however they trickle in: a ClientHello comes as the connection
+/// opens, and a client that keeps sending a byte now and then must not hold
+/// the check open, its bytes and its log record, for days.
+const HELLO_WAIT: Duration = Duration::from_secs(30);
 
 /// When bytes last moved through a connection, either way, as both copies
 /// of a relay see it, and whether one of them closed it for the idle limit.
@@ -673,24 +702,26 @@ fn relay(
             // was done before the check could see anything.
             let (checked, mut moved, go_on, done) = match check {
                 None => (None, 0, true, false),
-                Some(check) => match check_name(client, upstream, check, &activity, limit) {
-                    Held::Decided {
-                        checked,
-                        sent,
-                        passed,
-                    } => {
-                        let go_on = passed && checked.refused.is_none();
-                        (Some(checked), sent, go_on, false)
+                Some(check) => {
+                    match check_name(client, upstream, check, &activity, limit, HELLO_WAIT) {
+                        Held::Decided {
+                            checked,
+                            sent,
+                            passed,
+                        } => {
+                            let go_on = passed && checked.refused.is_none();
+                            (Some(checked), sent, go_on, false)
+                        }
+                        Held::ClientDone => (None, 0, false, true),
+                        Held::Stopped { held } => {
+                            let checked = held.then_some(Checked {
+                                seen: NameSeen::Incomplete,
+                                refused: None,
+                            });
+                            (checked, 0, false, false)
+                        }
                     }
-                    Held::ClientDone => (None, 0, false, true),
-                    Held::Stopped { held } => {
-                        let checked = held.then_some(Checked {
-                            seen: NameSeen::Incomplete,
-                            refused: None,
-                        });
-                        (checked, 0, false, false)
-                    }
-                },
+                }
             };
             if go_on {
                 moved += copy(client, upstream, &activity, limit, room);
@@ -758,15 +789,18 @@ enum Held {
 
 /// Reads the client's first bytes until they show what server it asks
 /// for, or [`hello::MAX_HELLO`] of them do not, and sends them upstream
-/// unless the check refuses them.
+/// unless the check refuses them; stopped, as idle, at `deadline` (the
+/// proxy's is [`HELLO_WAIT`]) whatever moved.
 fn check_name(
     mut client: &TcpStream,
     upstream: &TcpStream,
     check: NameCheck,
     activity: &Activity,
     limit: Duration,
+    deadline: Duration,
 ) -> Held {
     let NameCheck { host, mut held } = check;
+    let began = Instant::now();
     let mut buf = [0u8; 16 * 1024];
     // Read again only once as many bytes as it waits for have come.
     let mut needed = 0;
@@ -810,12 +844,14 @@ fn check_name(
             held: !held.is_empty(),
         };
         let quiet = activity.quiet();
-        if quiet >= limit {
+        let left = deadline.saturating_sub(began.elapsed());
+        if quiet >= limit || left.is_zero() {
             activity.close_idle();
             return stopped;
         }
-        // As `copy` waits: at most until the connection would turn idle.
-        if let Err(e) = client.set_read_timeout(Some(limit - quiet))
+        // As `copy` waits: at most until the connection would turn idle, and
+        // never past the check's own deadline.
+        if let Err(e) = client.set_read_timeout(Some((limit - quiet).min(left)))
             && e.kind() != io::ErrorKind::InvalidInput
         {
             eprintln!("enclos proxy: cannot wait on the client of a tunnel to {host}: {e}");
@@ -989,6 +1025,110 @@ fn response(status: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::loggable_host;
+
+    /// What a hello naming no server, or under ECH another, comes to: for
+    /// a host name, closed; for an address, which a client names no server
+    /// for, no name is no refusal.
+    #[test]
+    fn no_name_is_refused_for_a_host_name_and_not_for_an_address() {
+        use super::{Checked, FirstBytes, Reason};
+        let no_name = || FirstBytes::ClientHello {
+            server_name: None,
+            encrypted: false,
+        };
+        let refused = |hello, host| Checked::of(hello, host).unwrap().refused;
+        assert_eq!(
+            refused(no_name(), "api.example.com"),
+            Some(Reason::NoServerName)
+        );
+        assert_eq!(refused(no_name(), "93.184.215.14"), None);
+        assert_eq!(refused(no_name(), "[2606:4700::1]"), None);
+        let ech = |name: &str| FirstBytes::ClientHello {
+            server_name: Some(name.to_owned()),
+            encrypted: true,
+        };
+        assert_eq!(
+            refused(ech("public.example.net"), "api.example.com"),
+            Some(Reason::EncryptedHello)
+        );
+        assert_eq!(refused(ech("api.example.com"), "api.example.com"), None);
+        // ECH with no visible name: the name asked for is all inside, so it
+        // is closed, for an address too.
+        let ech_no_name = || FirstBytes::ClientHello {
+            server_name: None,
+            encrypted: true,
+        };
+        for host in ["93.184.215.14", "api.example.com"] {
+            assert_eq!(
+                refused(ech_no_name(), host),
+                Some(Reason::EncryptedHello),
+                "{host}"
+            );
+        }
+        // A tunnel opened for an address matches no host name.
+        let named = |name: &str| FirstBytes::ClientHello {
+            server_name: Some(name.to_owned()),
+            encrypted: false,
+        };
+        for host in ["93.184.215.14", "[2606:4700::1]"] {
+            assert_eq!(
+                refused(named("evil.example.com"), host),
+                Some(Reason::NameMismatch),
+                "{host}"
+            );
+        }
+    }
+
+    /// A client that keeps sending a byte now and then, never a whole
+    /// hello, is stopped at the check's deadline, though never idle.
+    #[test]
+    fn a_hello_trickled_in_is_stopped_at_the_deadline() {
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let pair = || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (far, _) = listener.accept().unwrap();
+            (near, far)
+        };
+        let (mut client, proxied) = pair();
+        let (upstream, _server) = pair();
+        let trickle = std::thread::spawn(move || {
+            // A TLS record header saying more is to come, then a byte at a
+            // time.
+            let _ = client.write_all(&[0x16, 3, 1, 0x40, 0]);
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(100));
+                if client.write_all(&[1]).is_err() {
+                    break;
+                }
+            }
+        });
+        let activity = super::Activity::new();
+        let check = super::NameCheck {
+            host: "api.example.com".into(),
+            held: Vec::new(),
+        };
+        let began = Instant::now();
+        let held = super::check_name(
+            &proxied,
+            &upstream,
+            check,
+            &activity,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        );
+        assert!(matches!(held, super::Held::Stopped { held: true }));
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            began.elapsed()
+        );
+        drop(proxied);
+        trickle.join().unwrap();
+    }
 
     /// A server that answered and closed after the proxy told it the client
     /// was done: its connection is closed both ways, and its answer is

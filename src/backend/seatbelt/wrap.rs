@@ -44,11 +44,12 @@ const FALLBACK_TERM: &str = "xterm-256color";
 /// every session's compiled policy starts, with no variable of the user's,
 /// within [`TRY_RUN_WAIT`]: on `(deny default)`, a macOS that rejects one of
 /// its allowances, or needs one it lacks to start a program, is found here,
-/// not at a session's start. macOS 26.5.2 refuses any, `sandbox_apply:
-/// Operation not permitted` (exit 71), to a process in a sandbox whose
-/// policy has a deny rule, as every enclos sandbox's has (a test runs doctor
-/// under a policy that allows everything but one write); in one whose
-/// policy only allows everything it runs, exit 0 (by hand, macOS 26.5.2).
+/// not at a session's start. Inside a sandbox whose policy denies a write,
+/// as every enclos sandbox's does, macOS 26.5.2 refuses to apply this
+/// policy, `sandbox_apply: Operation not permitted` (exit 71): a test runs
+/// doctor so, on either baseline. Inside one whose policy only allows
+/// everything, `(version 1)(allow default)` ran, exit 0 (by hand, macOS
+/// 26.5.2); this policy on `(deny default)` there is not shown.
 pub fn try_run(baseline: Baseline) -> Probe {
     let policy = format!("(version 1)\n{}", baseline.text("enclos:doctor"));
     let named = match baseline {
@@ -316,6 +317,31 @@ mod tests {
         assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
         assert!(env["PATH"].starts_with("/Users/alice/.enclos/sandboxes/home/home/.local/bin:"));
         assert!(env["PATH"].contains(":/usr/bin:/bin"));
+    }
+
+    /// Set before what enclos sets, a secret never replaces one of its
+    /// variables, whatever the validation of a policy let through.
+    #[test]
+    fn a_secret_never_replaces_a_variable_enclos_sets() {
+        let value = |v: &str| crate::model::secret::SecretValue::new(v.to_owned()).unwrap();
+        let launch = Launch {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: vec![
+                ("HOME".to_owned(), value("/elsewhere")),
+                ("TOKEN".to_owned(), value("t")),
+            ],
+            in_terminal: false,
+            service_port: None,
+            limits: Default::default(),
+        };
+        let command = wrap_in(Path::new("/c.sb"), &ctx(), &launch, None);
+        let env: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+            .collect();
+        assert_eq!(env["HOME"], "/Users/alice/.enclos/sandboxes/home/home");
+        assert_eq!(env["TOKEN"], "t");
     }
 
     #[test]

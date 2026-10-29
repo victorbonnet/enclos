@@ -56,8 +56,9 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route the `(deny default)` baseline closed, on a
-    /// lookup it refuses before the rule the probe tests is reached.
+    /// Closed probes whose route the `(deny default)` baseline closed, on
+    /// something it refuses the tool before the rule the probe tests is
+    /// reached (likely a lookup; not traced).
     pub fn closed_by_baseline(&self) -> usize {
         self.count_closed(|r| r.closed_by == Some(ClosedBy::Baseline))
     }
@@ -86,10 +87,11 @@ impl TestReport {
         self.count_closed(|r| r.closed_by == Some(ClosedBy::Seatbelt))
     }
 
-    /// Closed probes that show something enclos adds: a rule of the route,
-    /// or the `(deny default)` baseline, which is part of what it compiles.
-    pub fn closed_by_enclos(&self) -> usize {
-        self.count_closed(|r| r.closed_by != Some(ClosedBy::Seatbelt))
+    /// Closed probes their route's own rule closed: neither Seatbelt itself
+    /// nor the `(deny default)` baseline, which closes a route whether or
+    /// not its rule is there, so shows nothing of the rule.
+    pub fn closed_by_rule(&self) -> usize {
+        self.count_closed(|r| r.closed_by.is_none())
     }
 
     fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
@@ -113,11 +115,12 @@ impl TestReport {
     }
 
     /// Whether the test passed: nothing got through, every probe ran, and at
-    /// least one was shown closed by an enclos rule. An inconclusive probe
+    /// least one was shown closed by its route's rule. An inconclusive probe
     /// does not fail it, but a test where none was closed, or only those
-    /// Seatbelt itself closes, showed nothing about the policy.
+    /// Seatbelt itself or the baseline closes, showed nothing about the
+    /// policy's rules.
     pub fn passed(&self) -> bool {
-        self.open() == 0 && self.not_run() == 0 && self.closed_by_enclos() > 0
+        self.open() == 0 && self.not_run() == 0 && self.closed_by_rule() > 0
     }
 }
 
@@ -689,8 +692,9 @@ mod tests {
         assert_eq!(present(&HostCheck::PreferencesDomain(label)), Ok(false));
     }
 
-    /// What closed apart from a route's rule is said by who, and a route the
-    /// baseline closed still shows something enclos compiles.
+    /// What closed apart from a route's rule is said by who, and a test the
+    /// baseline alone closed shows no rule: deleting `(deny lsopen)` must
+    /// not leave it READY on what the baseline refuses.
     #[test]
     fn closures_apart_from_the_rules_are_said_by_who() {
         let mut r = report(vec![Outcome::Closed; 4]);
@@ -705,8 +709,13 @@ mod tests {
         assert_eq!(report(vec![Outcome::Closed]).closed_apart(), "");
         let mut baseline_only = report(vec![Outcome::Closed]);
         baseline_only.results[0].closed_by = Some(ClosedBy::Baseline);
+        assert!(!baseline_only.passed());
+        assert_eq!(baseline_only.closed_by_rule(), 0);
+        baseline_only
+            .results
+            .extend(report(vec![Outcome::Closed]).results);
         assert!(baseline_only.passed());
-        assert_eq!(baseline_only.closed_by_enclos(), 1);
+        assert_eq!(baseline_only.closed_by_rule(), 1);
     }
 
     #[test]
@@ -731,7 +740,7 @@ mod tests {
             .extend(report(vec![Outcome::Closed]).results);
         assert!(platform.passed());
         assert_eq!(
-            (platform.closed_by_platform(), platform.closed_by_enclos()),
+            (platform.closed_by_platform(), platform.closed_by_rule()),
             (1, 1)
         );
         assert!(!report(vec![Outcome::Closed, Outcome::Open("x".into())]).passed());
