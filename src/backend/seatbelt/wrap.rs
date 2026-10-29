@@ -279,6 +279,9 @@ pub fn environment(ctx: &SandboxContext) -> Vec<(String, String)> {
         ("UV_CACHE_DIR", format!("{home}/.cache/uv")),
         ("npm_config_cache", format!("{home}/.npm")),
         ("ENCLOS_SANDBOX", ctx.name.to_string()),
+        // Print the URL instead of trying each browser through Apple
+        // Events, which the policy refuses noisily.
+        ("BROWSER", "/bin/echo".to_owned()),
     ];
     // curl reads only the lowercase forms; Node's fetch needs NODE_USE_ENV_PROXY.
     for name in [
@@ -315,6 +318,7 @@ mod tests {
         assert_eq!(env["https_proxy"], "http://127.0.0.1:41001");
         assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:41001");
         assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
+        assert_eq!(env["BROWSER"], "/bin/echo");
         assert!(env["PATH"].starts_with("/Users/alice/.enclos/sandboxes/home/home/.local/bin:"));
         assert!(env["PATH"].contains(":/usr/bin:/bin"));
     }

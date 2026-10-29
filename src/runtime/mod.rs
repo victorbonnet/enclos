@@ -190,6 +190,13 @@ pub trait RuntimeAdapter {
     /// enclos shows it, never runs it (ADR 0024).
     fn login(&self) -> String;
     fn create_agent(&self, name: &AgentName) -> SandboxCommand;
+    /// The runtime's own commands run in the sandbox right after
+    /// [`create_agent`](Self::create_agent) made `name`, such as undoing
+    /// what it copied from another agent that is that agent's alone. An
+    /// empty list (the default): nothing to run.
+    fn after_create_agent(&self, _name: &AgentName) -> Vec<SandboxCommand> {
+        Vec::new()
+    }
     /// Where the runtime keeps an agent's files, relative to the sandbox
     /// home, for enclos's messages.
     fn agent_files(&self, name: &AgentName) -> String;
@@ -247,29 +254,53 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
         None
     }
-    /// The file in the home where the runtime's own setup keeps a bot's
-    /// token for `channel` in plain text, as a `.env` line of the variable
-    /// it names: `runtime configure` refuses while it holds one, so that the
-    /// token the runtime's own setup writes for the built-in agent does not
-    /// sit readable in the home (ADR 0022). `None`: no such file.
-    fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
+    /// The file in the home where the runtime's own setup keeps `agent`'s
+    /// bot token for `channel` in plain text, as a `.env` line of the
+    /// variable it names: `runtime configure` refuses while it holds one, so
+    /// that a token the runtime's own setup wrote does not sit readable in
+    /// the home (ADR 0022). `None`: no such file.
+    fn channel_token_file(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+    ) -> Option<(HomePath, &'static str)> {
         None
     }
-    /// The runtime's own commands that set up the sandbox's bot on
-    /// `channel`, run in the sandbox by `enclos runtime configure`: its
-    /// token read from the variable `token`, which the sandbox's policy
-    /// grants as a secret, so that enclos hands the runtime the variable's
-    /// name, never its value (ADR 0022), and the people it answers. The
-    /// people it answers come first and the channel is turned on last, so
-    /// a run that fails turns no bot on (one whose token alone turns it on,
-    /// such as Hermes's `TELEGRAM_BOT_TOKEN`, is on already).
-    /// `None`: the runtime has no such channel.
-    fn channel(
+    /// The runtime's own commands that make `agent` read the secrets the
+    /// policy grants it from `secrets_file`, the file `enclos launch` writes
+    /// them to while the services run (ADR 0036), run in the sandbox by
+    /// `enclos runtime configure`. `None`: the runtime gives no agent
+    /// secrets of its own.
+    fn agent_secrets_source(
+        &self,
+        _agent: &RuntimeAgentName,
+        _secrets_file: &Path,
+    ) -> Option<Vec<SandboxCommand>> {
+        None
+    }
+    /// The runtime's own command that sets `agent`'s setting `key` to
+    /// `value`, as written: a secret there is a `${VAR}`, which the runtime
+    /// resolves from the agent's secrets, so that enclos hands it a name,
+    /// never a value (ADR 0022). `None`: the runtime has no such command.
+    fn set_setting(
+        &self,
+        _agent: &RuntimeAgentName,
+        _key: &str,
+        _value: &str,
+    ) -> Option<SandboxCommand> {
+        None
+    }
+    /// The settings that set up a bot on `channel`, in order, for
+    /// [`set_setting`](Self::set_setting): its token read from the variable
+    /// `token` as `${token}`, and the people it answers. The people it
+    /// answers come first and the channel is turned on last, so a run that
+    /// fails turns no bot on. `None`: the runtime has no such channel.
+    fn channel_settings(
         &self,
         _channel: Channel,
         _token: &str,
         _answers: &[ChannelUser],
-    ) -> Option<Vec<SandboxCommand>> {
+    ) -> Option<Vec<(String, String)>> {
         None
     }
 

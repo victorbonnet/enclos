@@ -431,6 +431,18 @@ fn print_rules(policy: &Policy) {
             println!("  CPU share:  {cpu}");
         }
     }
+    if !policy.secrets.is_empty() || !policy.agent_secrets.is_empty() {
+        // Which secret each variable holds, never its value.
+        println!("\nSecrets (values in the secret store, never shown)");
+        for (variable, grant) in &policy.secrets {
+            println!("  ${variable} = {grant}  (every session and agent)");
+        }
+        for (agent, grants) in &policy.agent_secrets {
+            for (variable, grant) in grants {
+                println!("  ${variable} = {grant}  (agent {agent})");
+            }
+        }
+    }
 }
 
 fn print_allowed(

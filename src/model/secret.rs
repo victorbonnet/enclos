@@ -1,5 +1,6 @@
 //! Secrets (design §12, ADR 0022): values such as a bot token, kept on the
-//! host and granted to a whole sandbox through its policy.
+//! host and granted to a whole sandbox, or to one agent of it (ADR 0036),
+//! through its policy.
 
 use std::fmt;
 use std::str::FromStr;
@@ -203,6 +204,7 @@ pub fn reserved_variable(name: &str) -> bool {
         "UV_CACHE_DIR",
         "npm_config_cache",
         "NODE_USE_ENV_PROXY",
+        "BROWSER",
         // Read by the shell that sets a sandbox's limits, on the host.
         "BASH_ENV",
         "ENV",
@@ -319,6 +321,7 @@ mod tests {
             "DYLD_INSERT_LIBRARIES",
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
+            "BROWSER",
             "TZ",
             // What the shell that sets the limits would read (`bash -p`
             // reads none of them, and none can be granted either).

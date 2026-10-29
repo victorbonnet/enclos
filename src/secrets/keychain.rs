@@ -37,10 +37,10 @@ const NOT_FOUND: i32 = 44;
 /// How long a call to `security` may take: long past any answer, short of
 /// a wait on a dialog nobody sees.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
-/// How long the look at whether the keychain is locked may take: it answers
-/// at once in a login session (exit 152 on macOS 26.5.2), but waits on a
-/// dialog where no session can show one, as on CI's runners, which a
-/// service must not wait out.
+/// How long the look at whether the keychain is locked may take: in a login
+/// session it has answered at once (exit 152) and also shown macOS's unlock
+/// dialog instead (both on macOS 26.5.2), and where no session can show one,
+/// as on CI's runners, it waits; a service must not wait out either.
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// The longest line `security -i` reads as one command, its line ending
 /// included (macOS 26.5.2: a longer one runs as two).
@@ -99,8 +99,10 @@ impl Keychain {
     /// Whether the keychain can be read without a dialog: `security
     /// show-keychain-info` fails on a locked keychain, at once in a login
     /// session (exit 152 on macOS 26.5.2, "Unable to obtain
-    /// authorization"); where it waits instead, as with no session to show
-    /// a dialog in, past [`LOCK_WAIT`] counts as locked too.
+    /// authorization"); where it waits instead, on a dialog no session
+    /// shows or on the unlock dialog it showed (also seen in a login
+    /// session, macOS 26.5.2), past [`LOCK_WAIT`] counts as locked too, and
+    /// a dialog shown stays on screen.
     fn check_unlocked(&self) -> Result<(), SecretError> {
         let which = match &self.file {
             Some(file) => format!("keychain {}", file.display()),
@@ -634,12 +636,20 @@ mod tests {
         }
     }
 
-    /// A locked keychain is told apart, with no dialog, by the same call a
-    /// service makes before reading its secrets, and in no more than its
-    /// own short wait.
+    /// A locked keychain is told apart by the same call a service makes
+    /// before reading its secrets, in no more than its own short wait.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_locked_keychain_is_found_without_a_dialog() {
+    fn a_locked_keychain_is_found_within_the_short_wait() {
+        // On a Mac with someone at its screen, that call can show macOS's
+        // unlock dialog for the locked keychain (macOS 26.5.2), so this runs
+        // on CI's runners, or where ENCLOS_KEYCHAIN_LOCK_TEST asks for it.
+        if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+            && std::env::var_os("ENCLOS_KEYCHAIN_LOCK_TEST").is_none()
+        {
+            eprintln!("skipped: the look at a locked keychain may show a dialog here");
+            return;
+        }
         let keychain = ThrowawayKeychain::new();
         let store = Keychain::new("enclos.test".into(), Some(keychain.file.clone()));
         store.readable().unwrap();

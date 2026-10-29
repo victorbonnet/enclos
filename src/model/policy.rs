@@ -21,13 +21,22 @@ pub struct Policy {
     /// snapshot when empty, so a policy without any resolves as it did
     /// before secrets existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub secrets: std::collections::BTreeMap<String, super::secret::SecretGrant>,
+    pub secrets: SecretGrants,
+    /// Secrets granted to one agent each, by its name, then by variable
+    /// (ADR 0036): only its runtime's service receives them, through a file
+    /// of that agent's. Left out of the snapshot when empty, as `secrets`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agent_secrets: std::collections::BTreeMap<super::agent::AgentName, SecretGrants>,
     /// Limits on the sandbox's processes, each fixed when it starts (and,
     /// for `memory` and `cpu`, on the sandbox as a whole). Left
     /// out of the snapshot when none is set, as secrets are.
     #[serde(default, skip_serializing_if = "Resources::is_unset")]
     pub resources: Resources,
 }
+
+/// Secrets granted, by the environment variable each is set as: to the
+/// whole sandbox (ADR 0022), or to one agent (ADR 0036).
+pub type SecretGrants = std::collections::BTreeMap<String, super::secret::SecretGrant>;
 
 /// Limits on a sandbox (design §7): `open_files`, `file_size` and
 /// `cpu_seconds` on each of its processes, `memory` and `cpu` on the
@@ -350,6 +359,7 @@ impl Policy {
         self.fs == other.fs
             && self.net.listen == other.net.listen
             && self.secrets == other.secrets
+            && self.agent_secrets == other.agent_secrets
             && self.resources == other.resources
     }
 }
@@ -419,6 +429,18 @@ mod tests {
         let mut listens = old.clone();
         listens.net.listen = true;
         assert!(!old.same_at_launch(&listens));
+        // What a session or an agent's service is given, from its start.
+        let grant: crate::model::secret::SecretGrant = "secret:home/xy".parse().unwrap();
+        let mut secrets = old.clone();
+        secrets.secrets.insert("T".into(), grant.clone());
+        assert!(!old.same_at_launch(&secrets));
+        let mut agents = old.clone();
+        agents
+            .agent_secrets
+            .entry("main".parse().unwrap())
+            .or_default()
+            .insert("T".into(), grant);
+        assert!(!old.same_at_launch(&agents));
     }
 
     #[test]

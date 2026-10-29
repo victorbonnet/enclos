@@ -5,8 +5,8 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
-mod channel;
 mod compile;
+mod configure;
 mod doctor;
 mod history;
 mod import;
@@ -26,7 +26,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-pub use channel::ChannelSet;
+pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
     NextSession, RanFile, Running, SandboxCheck, Sandboxes, Written,
@@ -41,7 +41,7 @@ pub use probe::TestReport;
 pub(crate) use runtime::home_files_script;
 pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
-pub use secrets::{SecretLeft, SecretSet, SecretView};
+pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 pub use state_check::{Finding, Remedy, Repair, Subject};
