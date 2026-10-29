@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::Engine;
-use super::policy::{ChangeOutcome, PolicyApplied, differences, with_allowed};
+use super::policy::{ChangeOutcome, PendingEnd, PolicyApplied, differences, with_allowed};
 use super::sandbox::StopReport;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
@@ -128,8 +128,9 @@ impl Engine {
     /// - otherwise pending. When the change itself touches only network
     ///   rules (`entry`, a destination `policy allow` adds, or an edit made
     ///   while a change waits), that part also goes on the active policy at
-    ///   once, provided the active policy's `policy.toml` is known and the
-    ///   result differs from it by exactly that change.
+    ///   once, provided the result differs from the active policy by exactly
+    ///   that change. A change that also touches rules sessions keep waits
+    ///   as a whole.
     ///
     /// `policy.toml` holds `overrides` either way.
     pub(super) fn propose(
@@ -147,13 +148,15 @@ impl Engine {
         } = change;
         let (active_version, active) = self.active_policy(name)?;
         let before = self.state.pending_policy(name)?;
-        let in_force = |version: PolicyVersion, changed: bool| Recorded {
+        let in_force = |version: PolicyVersion,
+                        changed: bool,
+                        end: fn(PendingPolicy) -> PendingEnd| Recorded {
             applied: PolicyApplied {
                 version,
                 changed,
                 also: Vec::new(),
                 outcome: ChangeOutcome::InForce {
-                    dropped: before.as_ref().map(|(p, _)| p.clone()),
+                    pending: before.as_ref().map(|(p, _)| end(p.clone())),
                 },
             },
             restarts: false,
@@ -167,20 +170,22 @@ impl Engine {
             {
                 return Err(self.restore_policy(name, &previous, e.into()));
             }
-            return Ok(in_force(active_version, false));
+            return Ok(in_force(active_version, false, PendingEnd::Dropped));
         }
         if snapshot.policy.same_at_launch(&active.policy)
             || self.sessions_under_rules(name)?.is_empty()
         {
+            // The file held the pending text, and the change is made on it.
             let version = self.store_policy(lock, by, name, overrides, snapshot, restores)?;
-            return Ok(in_force(version, true));
+            return Ok(in_force(version, true, PendingEnd::Applied));
         }
         let base = before.as_ref().map_or(&active, |(_, s)| s);
         let restarts = !snapshot.policy.same_at_launch(&base.policy);
         let live = match entry {
+            // A change that also changes rules sessions keep waits as a
+            // whole, the destination `policy allow` adds included.
+            _ if restarts => None,
             Some(entry) => self.live_entry(name, &active, entry)?,
-            // An edit that also changes rules sessions keep waits as a whole.
-            None if restarts => None,
             None => self.live_network(name, &active, base, overrides, snapshot)?,
         };
         let pending = |version: PolicyVersion, p: PendingPolicy, changed: bool| Recorded {
@@ -243,9 +248,7 @@ impl Engine {
         if active.policy.net.allow.iter().any(|a| a == entry) {
             return Ok(None);
         }
-        let Some(text) = active.overrides_text() else {
-            return Ok(None);
-        };
+        let text = active.overrides_text();
         let text = with_allowed(text, entry)?.unwrap_or_else(|| text.to_owned());
         let live = self.checked_policy(name, &text)?;
         let mut expected = active.policy.net.clone();
@@ -270,9 +273,7 @@ impl Engine {
         if !same_network(&base.policy.net, &active.policy.net) {
             return Ok(None);
         }
-        let Some(text) = active.overrides_text() else {
-            return Ok(None);
-        };
+        let text = active.overrides_text();
         let live = self.checked_policy(name, &with_network_of(text, overrides)?)?;
         let mut expected = snapshot.policy.net.clone();
         expected.listen = active.policy.net.listen;
@@ -314,7 +315,7 @@ impl Engine {
                     "save the edit as the pending policy of sandbox {name}, since sessions run under rules it changes; with --yes, restart the sandbox to apply it"
                 ),
                 (false, true, false) => format!(
-                    "keep the change of sandbox {name} pending, with this edit; a network-only edit also applies at once"
+                    "keep the change of sandbox {name} pending, with this edit; a network-only edit also applies at once when it is the only difference from the active policy"
                 ),
             };
             return Ok(Planned::DryRun(Plan {
@@ -368,10 +369,12 @@ impl Engine {
         let restarted = self.restart_into(by, name, pending).map_err(|error| {
             // Said only while the change still waits: a restart can fail
             // after the change went in force, when its services start.
-            let waits = matches!(
-                self.state.pending_policy(name),
-                Ok(Some((p, _))) if p.snapshot == pending.snapshot
-            );
+            // A state that cannot be read says nothing either way: the
+            // change was saved as pending before the restart began.
+            let waits = match self.state.pending_policy(name) {
+                Ok(now) => matches!(now, Some((p, _)) if p.snapshot == pending.snapshot),
+                Err(_) => true,
+            };
             match waits {
                 true => Error::FailedAfter {
                     error: Box::new(error),
@@ -410,6 +413,7 @@ impl Engine {
         let services = self.has_services(name)?;
         match confirm {
             Confirm::DryRun => {
+                self.check_pending_file(name, pending)?;
                 let mut changes = Vec::new();
                 if self.stops_to_restart(name)? {
                     changes.push(format!(
@@ -517,6 +521,22 @@ impl Engine {
                 |v: &PolicyVersion| format!("policy v{}", v.version),
                 |lock| {
                     self.check_pending_file(name, pending)?;
+                    // A session started since the stop runs under the policy
+                    // in force, which it would keep: the change waits.
+                    let started = self.sessions_under_rules(name)?;
+                    if !started.is_empty() {
+                        return Err(Error::Session {
+                            what: format!(
+                                "{} of sandbox {name} started while it was being restarted ({}), under the policy in force, so its pending policy stays pending: run `enclos policy apply {name}` again",
+                                sessions(started.len()),
+                                started
+                                    .iter()
+                                    .map(|s| s.id.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                    }
                     self.state
                         .apply_pending(lock, name, &pending.snapshot, by)?
                         .ok_or_else(|| Error::PendingChanged {
@@ -580,6 +600,15 @@ impl Engine {
         }
     }
 
+    /// Whether `policy.toml` holds the text the sandbox's latest policy, the
+    /// pending or else the active one, was resolved from: when it does not,
+    /// an edit saved unchanged still records what the file holds.
+    pub fn policy_file_recorded(&self, name: &SandboxName) -> Result<bool> {
+        let view = self.policy(name)?;
+        let text = self.layout.read_policy(name.as_str())?;
+        Ok(crate::policy::sha256_hex(text.as_bytes()) == view.latest().inputs.overrides)
+    }
+
     /// Whether a restart stops the sandbox first: it has services installed,
     /// which run under the policy they started with, or sessions open.
     fn stops_to_restart(&self, name: &SandboxName) -> Result<bool> {
@@ -603,8 +632,8 @@ impl Engine {
 
     /// Once a runtime is recorded as installed, or after an install failed,
     /// resolves again what was resolved with another runtime's destinations:
-    /// the active policy and a pending one, each from its own `policy.toml`
-    /// (the file's when that text is not known). A pending rollback keeps
+    /// the active policy and a pending one, each from its own `policy.toml`.
+    /// A pending rollback keeps
     /// what it restores. An edit of the file not applied stays as it is.
     pub(super) fn resolve_with_runtime(
         &self,
@@ -612,18 +641,12 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
     ) -> Result<()> {
-        let own_text = |snapshot: &PolicySnapshot| -> Result<String> {
-            match snapshot.overrides_text() {
-                Some(text) => Ok(text.to_owned()),
-                None => Ok(self.layout.read_policy(name.as_str())?),
-            }
-        };
         let (_, active) = self.active_policy(name)?;
-        let now = self.checked_policy(name, &own_text(&active)?)?;
+        let now = self.checked_policy(name, active.overrides_text())?;
         let now = (now.id != active.id && now.policy != active.policy).then_some(now);
         match self.state.pending_policy(name)? {
             Some((p, pending)) => {
-                let again = self.checked_policy(name, &own_text(&pending)?)?;
+                let again = self.checked_policy(name, pending.overrides_text())?;
                 if again.id != pending.id || now.is_some() {
                     self.state
                         .save_pending(lock, name, &again, now.as_ref(), by, p.restores)?;
@@ -740,16 +763,31 @@ impl Engine {
                         None => error,
                     });
                 }
-                let after = |error: Error| match &plan.pending {
-                    Some(p) => Error::FailedAfter {
-                        error: Box::new(error),
-                        done: format!(
-                            "dropping the pending policy of sandbox {name} (snapshot {}); `enclos policy discard {name}` puts back the policy.toml of policy v{}",
-                            p.snapshot.short(),
-                            plan.version.version
-                        ),
-                    },
-                    None => error,
+                let after = |error: Error| {
+                    let mut done = Vec::new();
+                    if let Some(to) = &edit {
+                        done.push(format!(
+                            "moving the edit `policy edit` kept to {}",
+                            to.display()
+                        ));
+                    }
+                    if let Some(p) = &plan.pending {
+                        done.push(format!(
+                            "dropping the pending policy of sandbox {name} (snapshot {})",
+                            p.snapshot.short()
+                        ));
+                    }
+                    match done.is_empty() {
+                        true => error,
+                        false => Error::FailedAfter {
+                            error: Box::new(error),
+                            done: format!(
+                                "{}; `enclos policy discard {name}` puts back the policy.toml of policy v{}",
+                                done.join(", and "),
+                                plan.version.version
+                            ),
+                        },
+                    }
                 };
                 if edit.is_some() {
                     remove_if_there(&files.base).map_err(after)?;
@@ -786,15 +824,7 @@ impl Engine {
 
     fn plan_discard(&self, name: &SandboxName) -> Result<DiscardPlan> {
         let view = self.policy(name)?;
-        let text = view
-            .snapshot
-            .overrides_text()
-            .ok_or_else(|| Error::PolicyTextUnknown {
-                sandbox: name.to_string(),
-                version: view.version.version,
-                file: view.file.clone(),
-            })?
-            .to_owned();
+        let text = view.snapshot.overrides_text().to_owned();
         let edited = match std::fs::read(&view.file) {
             Ok(current) => current != text.as_bytes(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
@@ -937,7 +967,12 @@ pub(super) fn change_summary(applied: &PolicyApplied) -> String {
             "pending snapshot {}, as sessions run under rules it changes{changes}",
             p.snapshot.short()
         ),
-        (ChangeOutcome::InForce { dropped: Some(p) }, false) => format!(
+        (
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(p)),
+            },
+            false,
+        ) => format!(
             "back to policy v{}, dropping pending snapshot {}",
             applied.version.version,
             p.snapshot.short()

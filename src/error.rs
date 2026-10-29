@@ -171,21 +171,10 @@ pub enum Error {
     /// describe, and the next change, which resolves the file, would drop
     /// what the file lacks.
     #[error(
-        "{} no longer holds the pending policy of sandbox `{sandbox}`, so it was not applied: nothing was stopped. `enclos policy edit {sandbox}` makes what the file holds the pending change, or `enclos policy discard {sandbox}` drops it and puts back the file of the policy in force",
+        "{} no longer holds the pending policy of sandbox `{sandbox}`, so it was not applied. `enclos policy edit {sandbox}`, saved, makes what the file holds the pending change; `enclos policy discard {sandbox}` drops it and puts back the file of the policy in force",
         file.display()
     )]
     PendingFileDiffers { sandbox: String, file: PathBuf },
-    /// The active snapshot's stored `policy.toml` is not the text its
-    /// inputs name, so enclos cannot write it back.
-    #[error(
-        "enclos does not have the policy.toml that policy v{version} of sandbox `{sandbox}` was resolved from, so it cannot put it back or resolve it again. Edit {} to what you want with `enclos policy edit {sandbox}`",
-        file.display()
-    )]
-    PolicyTextUnknown {
-        sandbox: String,
-        version: u32,
-        file: PathBuf,
-    },
     #[error(
         "sandbox `{sandbox}` has no policy v{version}: its versions are v1 to v{last}. `enclos policy history {sandbox}` lists them"
     )]
@@ -307,7 +296,6 @@ impl Error {
             | Error::PendingChanged { .. }
             | Error::PolicyFileChanged { .. }
             | Error::PendingFileDiffers { .. }
-            | Error::PolicyTextUnknown { .. }
             | Error::PolicyPending { .. }
             | Error::NoSuchPolicyVersion { .. }
             | Error::PolicyFileEdited { .. }

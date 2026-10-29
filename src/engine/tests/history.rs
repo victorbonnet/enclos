@@ -4,7 +4,7 @@
 use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, put, session_of};
 use super::*;
-use crate::engine::{ChangeOutcome, Side};
+use crate::engine::{ChangeOutcome, PendingEnd, Side};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::policy::AdapterLayer;
@@ -112,7 +112,7 @@ fn a_rollback_restores_the_version_and_its_policy_toml() {
     // Later edits start from v1's policy.toml.
     assert_eq!(
         engine.layout.read_policy("home").unwrap(),
-        v1.overrides_text().unwrap()
+        v1.overrides_text()
     );
     let last = engine.audit(None).unwrap().pop().unwrap();
     assert_eq!(last.intent.command, "policy rollback");
@@ -197,36 +197,8 @@ fn a_rollback_over_an_edit_not_applied_is_refused() {
     assert_eq!(engine.policy(&name).unwrap().version.version, 3);
 }
 
-/// The active snapshot's text unknown, the file is still compared, by
-/// the hash the snapshot's inputs name: an edit is refused, the same file
-/// is not.
-#[test]
-fn an_edit_not_applied_is_refused_when_the_active_text_is_unknown() {
-    let (_dir, engine, name) = with_three_versions();
-    let id = engine.policy(&name).unwrap().snapshot.id;
-    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
-    conn.execute(
-        "UPDATE policy_snapshots SET overrides = '' WHERE id = ?1",
-        [&id.0],
-    )
-    .unwrap();
-    let text = engine.layout.read_policy("home").unwrap();
-    engine
-        .layout
-        .write_policy("home", &format!("{text}# a note\n"))
-        .unwrap();
-    let err = engine
-        .policy_rollback(&alice(), &name, 1, Confirm::Yes)
-        .unwrap_err();
-    assert!(matches!(err, Error::PolicyFileEdited { .. }), "{err}");
-    engine.layout.write_policy("home", &text).unwrap();
-    done(
-        engine
-            .policy_rollback(&alice(), &name, 1, Confirm::Yes)
-            .unwrap(),
-    );
-}
-
+/// A version whose kept `policy.toml` is not the text its inputs name
+/// reads as a corrupt state: nothing is rolled back.
 #[test]
 fn a_rollback_to_a_version_whose_policy_toml_is_unknown_says_so() {
     let (_dir, engine, name) = with_three_versions();
@@ -241,9 +213,10 @@ fn a_rollback_to_a_version_whose_policy_toml_is_unknown_says_so() {
         .policy_rollback(&alice(), &name, 1, Confirm::Yes)
         .unwrap_err();
     assert!(
-        matches!(err, Error::PolicyTextUnknown { version: 1, .. }),
+        err.to_string().contains("is not the one its inputs name"),
         "{err}"
     );
+    assert_eq!(engine.policy(&name).unwrap().version.version, 3);
 }
 
 /// Records Hermes as the sandbox's runtime, and makes its active policy one
@@ -448,7 +421,7 @@ fn a_rollback_with_yes_restarts_into_it_and_drops_a_change_pending() {
     assert_eq!(view.snapshot.id, v1.id);
     assert_eq!(
         engine.layout.read_policy("home").unwrap(),
-        v1.overrides_text().unwrap()
+        v1.overrides_text()
     );
 }
 
@@ -652,7 +625,12 @@ fn a_refresh_while_a_change_waits_asks_then_drops_it() {
     );
     assert!(!applied.changed);
     assert!(
-        matches!(applied.outcome, ChangeOutcome::InForce { dropped: Some(_) }),
+        matches!(
+            applied.outcome,
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(_))
+            }
+        ),
         "{applied:?}"
     );
     assert_eq!(applied.version.version, 2);

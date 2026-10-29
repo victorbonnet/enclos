@@ -117,14 +117,7 @@ impl Engine {
     ) -> Result<Planned<PolicyApplied>> {
         self.require_sandbox(name)?;
         let target = self.version_snapshot(name, to)?;
-        let text = target
-            .overrides_text()
-            .ok_or_else(|| Error::PolicyTextUnknown {
-                sandbox: name.to_string(),
-                version: to,
-                file: self.layout.policy_file(name.as_str()),
-            })?
-            .to_owned();
+        let text = target.overrides_text().to_owned();
         // Its paths are checked again as they are now, as any policy stored.
         validate(&target.policy, &self.validation_context(name)).map_err(|e| {
             let error = Error::from(e);
@@ -158,15 +151,7 @@ impl Engine {
         confirm: Confirm,
     ) -> Result<Planned<PolicyApplied>> {
         let view = self.policy(name)?;
-        let text = view
-            .snapshot
-            .overrides_text()
-            .ok_or_else(|| Error::PolicyTextUnknown {
-                sandbox: name.to_string(),
-                version: view.version.version,
-                file: view.file.clone(),
-            })?
-            .to_owned();
+        let text = view.snapshot.overrides_text().to_owned();
         let fresh = self.checked_policy(name, &text).map_err(|error| Error::WithContext {
             what: format!(
                 "policy v{} of sandbox {name}, resolved against this enclos's templates and the runtime's adapter, is not accepted: {error}",
@@ -179,7 +164,7 @@ impl Engine {
                 version: view.version,
                 changed: false,
                 also: Vec::new(),
-                outcome: ChangeOutcome::InForce { dropped: None },
+                outcome: ChangeOutcome::InForce { pending: None },
             }));
         }
         // The same policy resolved from newer inputs is no change: the
@@ -323,9 +308,7 @@ impl Engine {
 
     /// Refuses when `policy.toml` holds anything but the text `latest`, the
     /// pending or else the active policy, was resolved from: an edit not
-    /// applied, which putting back another file would lose. Compared by the
-    /// hash its inputs name, so it holds also when the snapshot does not
-    /// keep the text.
+    /// applied, which putting back another file would lose.
     fn refuse_unapplied_edit(
         &self,
         name: &SandboxName,
