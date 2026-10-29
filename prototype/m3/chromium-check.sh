@@ -6,7 +6,7 @@
 # start. It uses the Chromium Hermes's installer left in the sandbox's home
 # (hermes-check.sh runs first); if there is none, Playwright's, installed in
 # the sandbox's home through the relay. On the host as the control, then in
-# each sandbox mode. A proxy in --learn mode on the host. CI only.
+# each sandbox mode, driven over the DevTools protocol (cdp-load.py). A proxy in --learn mode on the host. CI only.
 set -u
 source "$(dirname "$0")/lib.sh"
 out="$RESULTS_DIR/50-chromium.md"
@@ -33,48 +33,61 @@ if [ -z "$chrome" ]; then
     chrome=$(find_chrome)
 fi
 
-# Each run: one label, the sandbox mode (host = no sandbox, the control,
-# going straight out rather than through the relay), Chromium's own sandbox
-# on or off. The first CI run had only the last two modes: with its own
-# sandbox Chromium aborted, and with it off it loaded the page through the
-# relay but never printed it, so these runs tell seccomp, Landlock and
-# bubblewrap apart, and show whether the host does the same.
-runs=(
-    "host|host|off"
-    "bwrap|bubblewrap only|off"
-    "seccomp|+ seccomp, no Landlock|off"
-    "landlock|+ Landlock, no seccomp|off"
-    "full|full|off"
-    "full-own|full, its own sandbox on|on"
-)
+# Two ways to load the page. `--dump-dom` is what the first two runs used;
+# in the second (PR #113) it never returned within 120 s on the host either,
+# so it says nothing about the sandbox, and it is kept only on the host and
+# in full mode, for comparison. cdp-load.py drives Chromium over the
+# DevTools protocol on a pipe, as Hermes's browser tool and Playwright do,
+# and waits for the page's load event: that runs in every mode. Each run:
+# key, label, the sandbox mode's prefix, Chromium's own sandbox on or off.
+# The host goes straight out; the sandbox modes through the relay.
+prefix() {
+    case $1 in
+        host) pre=() ;;
+        bwrap) pre=(env SBX_LANDLOCK=off SBX_SECCOMP=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
+        seccomp) pre=(env SBX_LANDLOCK=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
+        landlock) pre=(env SBX_SECCOMP=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
+        *) pre=(env SBX_RELAY=1 "$M3/sbx.sh" --) ;;
+    esac
+}
+row() {  # label, status, took, err file, detail
+    local renderers why
+    renderers=$(grep -c 'adjust OOM score of renderer' "$4")
+    why=$(grep -iE 'fatal|crash|signal|seccomp|sandbox|renderer process' "$4" \
+        | grep -v '^inside:' | head -2 | tr '\t\n' '  ' | cut -c1-160)
+    printf '%s\t%s\t%s\n' "$1" "$([ "$2" = 0 ] && echo ok || echo "exit $2")" \
+        "$5, ${3}s, ${renderers} renderer OOM-score refusals; $why" >>"$tmp/runs.tsv"
+}
 : >"$tmp/runs.tsv"
 if [ -n "$chrome" ]; then
-    for r in "${runs[@]}"; do
-        IFS='|' read -r key label own <<<"$r"
-        flags=(--headless --disable-gpu --no-first-run --enable-logging=stderr)
-        [ "$own" = off ] && flags+=(--no-sandbox)
-        prof="$SBX_HOME/tmp-chrome-$key"
-        rm -rf "$prof"
-        case $key in
-            host) pre=() ;;
-            bwrap) pre=(env SBX_LANDLOCK=off SBX_SECCOMP=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
-            seccomp) pre=(env SBX_LANDLOCK=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
-            landlock) pre=(env SBX_SECCOMP=off SBX_RELAY=1 "$M3/sbx.sh" --) ;;
-            *) pre=(env SBX_RELAY=1 "$M3/sbx.sh" --) ;;
-        esac
+    base=(--headless --disable-gpu --no-first-run --enable-logging=stderr)
+    for r in "host|host" "bwrap|bubblewrap only" "seccomp|+ seccomp, no Landlock" \
+        "landlock|+ Landlock, no seccomp" "full|full"; do
+        IFS='|' read -r key label <<<"$r"
+        prefix "$key"
+        flags=("${base[@]}" --no-sandbox --remote-debugging-pipe --user-data-dir="$SBX_HOME/tmp-chrome-cdp-$key")
         [ "$key" = host ] || flags+=(--proxy-server="http://127.0.0.1:$RELAY_PORT")
+        rm -rf "$SBX_HOME/tmp-chrome-cdp-$key"
         start=$(date +%s)
-        o=$(timeout 120 "${pre[@]}" "$chrome" "${flags[@]}" --user-data-dir="$prof" \
-            --dump-dom https://example.com/ 2>"$tmp/$key.err")
+        o=$(timeout 150 python3 -I "$M3/cdp-load.py" https://example.com/ 90 -- \
+            "${pre[@]}" "$chrome" "${flags[@]}" about:blank 2>"$tmp/cdp-$key.err")
         st=$?
-        took=$(( $(date +%s) - start ))
+        row "DevTools protocol, $label" "$st" "$(( $(date +%s) - start ))" "$tmp/cdp-$key.err" "$o"
+        rm -rf "$SBX_HOME/tmp-chrome-cdp-$key"
+    done
+    for r in "host|host|off" "full|full|off" "full-own|full, its own sandbox on|on"; do
+        IFS='|' read -r key label own <<<"$r"
+        prefix "$key"
+        flags=("${base[@]}" --user-data-dir="$SBX_HOME/tmp-chrome-$key")
+        [ "$own" = off ] && flags+=(--no-sandbox)
+        [ "$key" = host ] || flags+=(--proxy-server="http://127.0.0.1:$RELAY_PORT")
+        rm -rf "$SBX_HOME/tmp-chrome-$key"
+        start=$(date +%s)
+        o=$(timeout 120 "${pre[@]}" "$chrome" "${flags[@]}" --dump-dom https://example.com/ 2>"$tmp/$key.err")
+        st=$?
         title=$(printf '%s' "$o" | grep -o '<title>[^<]*</title>' | head -1)
-        renderers=$(grep -c 'adjust OOM score of renderer' "$tmp/$key.err")
-        why=$(grep -iE 'fatal|crash|signal|seccomp|sandbox|renderer process' "$tmp/$key.err" \
-            | grep -v '^inside:' | head -2 | tr '\t\n' '  ' | cut -c1-160)
-        printf '%s\t%s\t%s\n' "chromium $label" "$([ $st = 0 ] && echo ok || echo "exit $st")" \
-            "${title:-no page}, ${took}s, ${renderers} renderer OOM-score refusals; $why" >>"$tmp/runs.tsv"
-        rm -rf "$prof"
+        row "--dump-dom, $label" "$st" "$(( $(date +%s) - start ))" "$tmp/$key.err" "${title:-no page}"
+        rm -rf "$SBX_HOME/tmp-chrome-$key"
     done
 fi
 
