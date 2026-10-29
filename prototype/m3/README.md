@@ -218,3 +218,37 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 - `ptrace` is not refused: the PID namespace leaves nothing outside to trace (the probe tries a host process), and debuggers inside keep working.
 
 The errno is a choice for M3-14: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
+
+## M3-03: namespaces per session or per sandbox
+
+Design §15's row on network and PID namespaces, and its §14 item on the runtime's own service: a session with a network namespace of its own reaches neither its runtime's service port ([ADR 0028](../../docs/adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md)) nor anything another session of its sandbox listens on. The recommendation is one network and PID namespace per sandbox, held while its proxy service runs and joined by every session, if bubblewrap can be started inside a network namespace enclos entered first. bubblewrap joins an existing user namespace (`--userns`) and PID namespace (`--pidns`) but has no option to join a network namespace, and entering one needs a capability in the user namespace that owns it. So the experiment tries each way of joining, and records what sharing changes. It runs only in CI, as M3-02's checks do (`lib.sh`'s guard).
+
+**The holder.** `ns-holder.py`, started by bubblewrap in a new user, PID and network namespace, stands for what enclos would run per sandbox (in its proxy service, for instance). It opens its own namespaces and hands them as file descriptors to whoever connects to its Unix socket, in a folder of the sandbox's that no session mounts, so the host needs no access to `/proc/<pid>/ns`. It also serves the sandbox's one relay on `127.0.0.1` in that network namespace.
+
+**The ways a session joins** (`nsjoin.py`; the descriptors arrive as 10, 11 and 12 through `ns-fds.py`):
+
+| Way | What runs | Network | PIDs |
+| --- | --- | --- | --- |
+| `own` | `sbx.sh`'s arguments as they are (control) | its own | its own |
+| `nsenter` | `nsenter` enters the holder's user and network namespaces; bubblewrap makes a user namespace nested in it | the sandbox's | its own |
+| `nsenter-pid` | the same, `nsenter` also entering the holder's PID namespace, which bubblewrap keeps | the sandbox's | the sandbox's |
+| `nsenter-userns` | `nsenter` enters the user and network namespaces, then bubblewrap is given that same user namespace with `--userns` (expected refused: a process cannot join the user namespace it is in) | the sandbox's | its own |
+| `userns` | bubblewrap joins the holder's user and PID namespaces (`--userns`, `--pidns`) and keeps `CAP_SYS_ADMIN` there; `inside.py --setns-net-fd` enters the network namespace, then drops every capability, then applies Landlock and seccomp | the sandbox's | the sandbox's |
+| `userns-subpid` | the same, with a PID namespace of the session's own under the holder's (`--unshare-pid` with `--pidns`) | the sandbox's | its own, under the sandbox's |
+
+### Files (M3-03)
+
+| File | What it does |
+| --- | --- |
+| `nsjoin.py`, `test_nsjoin.py` | The ways above, as a pure rewrite of the compiled bubblewrap arguments, and its tests, which run anywhere (`python3 -I prototype/m3/test_nsjoin.py`). |
+| `ns-holder.py`, `ns-fds.py` | The holder, and the program that fetches its descriptors and runs a session's command with them. `lib.sh`'s `start_holder` starts a holder. |
+| `sbx-ns.sh` | Runs a command as one session of the sandbox, joined in the way `SBX_JOIN` names to the holder at `SBX_HOLDER`. |
+| `ns-service.py` | A stand-in for a runtime's service: listens on `127.0.0.1` at a port the kernel picks, as Hermes's gateway does, on every address, and on an abstract socket, with a marker in its command line and start-up environment. |
+| `inside.py` (`--setns-net-fd`, `--close-fd`), `probe.py` (`netns`, `find`, `peer-kill`, `peer-environ`, `peer-ptrace`, `listen-tcp`, `http`, `fds`, `nsopen`) | Additions for these checks; M3-02's behaviour is unchanged. |
+| `namespaces-check.sh` | For each way, in full mode and without Landlock: holders for two sandboxes, A and B; a service session in A; then the same probes from another session of A, a session of B and the host (the service's ports, its abstract socket, finding it by its marker, signal 0, its start-up environment and ptrace, a relay of the session's own, a request through the relay, the host's loopback, a user namespace, namespace descriptors left open); and whether the service outlives A's holder. Controls on the host: whether `unshare` makes the namespaces without bubblewrap's AppArmor profile. |
+| `hermes-ns-check.sh`, `hermes-discover.py` | Installs Hermes in the sandbox's home, reads in its source how a client finds its gateway, then for `own`, `nsenter`, `nsenter-pid` and `userns`: the gateway (`hermes -p default gateway run --external-supervisor`) as the service session, and in a second session a one-shot chat and the client module's lookup functions; the gateway processes on the host before and after (a client that cannot find the gateway starts one of its own, ADR 0028). No account is logged in, so the chat stops at the model at best. |
+| `.github/workflows/namespaces-prototype.yml` | Runs the two checks on `ubuntu-latest` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
+
+### Results
+
+To measure (CI): the `namespaces-prototype` workflow has not run yet. Nothing in this section is shown until it has, and the ADR on namespaces waits for its output.
