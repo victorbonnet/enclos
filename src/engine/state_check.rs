@@ -87,7 +87,7 @@ impl Remedy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repair(Fix);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 impl Repair {
     /// Recording the end of `ids`, as a repair would, for a test of what
     /// it looks at before it does.
