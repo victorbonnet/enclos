@@ -25,9 +25,6 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("assistant", include_str!("templates/assistant.toml")),
 ];
 
-/// The template a new sandbox gets unless told otherwise.
-pub const DEFAULT_TEMPLATE: &str = "assistant";
-
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     #[error("cannot read the {layer} policy: {reason}")]

@@ -32,7 +32,7 @@ cargo install --locked --path .
 
 ```bash
 enclos init                                    # the ~/.enclos folder, state database and audit log
-enclos sandbox create lab                      # Seatbelt backend, `assistant` template
+enclos sandbox create lab --template assistant # Seatbelt backend, the public web
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, run inside the sandbox; takes a few minutes
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider and its login, then a model
 ```

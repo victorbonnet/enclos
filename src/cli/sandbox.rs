@@ -26,8 +26,11 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from: minimal, mcp-only or assistant (design §7).
-        #[arg(long, default_value = enclos::policy::DEFAULT_TEMPLATE)]
+        /// The policy it starts from, named every time so the widest is
+        /// never had by leaving it out: minimal (the runtime's own hosts),
+        /// mcp-only (those and the MCP servers you list) or assistant (the
+        /// public web) (design §7).
+        #[arg(long)]
         template: TemplateName,
     },
     /// List sandboxes.
@@ -165,7 +168,9 @@ fn state(s: &SandboxState) -> String {
 
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {
-        println!("No sandboxes yet. Create one with `enclos sandbox create <name>`.");
+        println!(
+            "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`."
+        );
         return;
     }
     let widest = |header: &str, cell: fn(&SandboxView) -> &str| {

@@ -42,7 +42,7 @@ On an Apple silicon Mac running macOS 15 or later, with an account with a model 
 ```bash
 curl -fsSL https://enclos.dev/install.sh | bash
 enclos init
-enclos sandbox create lab
+enclos sandbox create lab --template assistant   # the public web; minimal for only Hermes's hosts
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider, its login, a model
 enclos agent add lab/main
