@@ -44,6 +44,14 @@ pub enum Reason {
     /// A tunnel whose first bytes start a TLS handshake that does not read
     /// as a ClientHello: closed, since the name it asks for is unknown.
     HelloUnreadable,
+    /// A tunnel opened for a host name whose TLS ClientHello names no
+    /// server: closed, since it would reach whichever site the address
+    /// serves by default (design §6). One opened for an address names none.
+    NoServerName,
+    /// A tunnel whose TLS ClientHello carries Encrypted Client Hello with a
+    /// visible name other than its host: closed, since the name it asks for
+    /// cannot be compared (design §6).
+    EncryptedHello,
 }
 
 impl Reason {
@@ -59,6 +67,8 @@ impl Reason {
             Reason::Idle => "idle",
             Reason::NameMismatch => "name-mismatch",
             Reason::HelloUnreadable => "hello-unreadable",
+            Reason::NoServerName => "no-server-name",
+            Reason::EncryptedHello => "encrypted-hello",
         }
     }
 
@@ -73,7 +83,9 @@ impl Reason {
             Reason::PolicyUnreadable
             | Reason::BadRequest
             | Reason::NameMismatch
-            | Reason::HelloUnreadable => true,
+            | Reason::HelloUnreadable
+            | Reason::NoServerName
+            | Reason::EncryptedHello => true,
             Reason::NotAllowed
             | Reason::BlockedAddress
             | Reason::PrivateAddress
@@ -83,7 +95,7 @@ impl Reason {
         }
     }
 
-    const ALL: [Reason; 10] = [
+    const ALL: [Reason; 12] = [
         Reason::NotAllowed,
         Reason::BlockedAddress,
         Reason::PrivateAddress,
@@ -94,6 +106,8 @@ impl Reason {
         Reason::Idle,
         Reason::NameMismatch,
         Reason::HelloUnreadable,
+        Reason::NoServerName,
+        Reason::EncryptedHello,
     ];
 }
 
@@ -254,6 +268,8 @@ mod tests {
                 Reason::Idle => 7,
                 Reason::NameMismatch => 8,
                 Reason::HelloUnreadable => 9,
+                Reason::NoServerName => 10,
+                Reason::EncryptedHello => 11,
             }
         }
         for (i, reason) in Reason::ALL.into_iter().enumerate() {
