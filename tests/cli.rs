@@ -3044,7 +3044,7 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
     );
     assert!(out.stdout().contains("not initialized"), "{}", out.stdout());
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"]).ok();
     let out = home.run(&["doctor"]);
     assert!(
         out.ok()
