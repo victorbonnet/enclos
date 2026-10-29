@@ -40,8 +40,8 @@ Ubuntu 24.04's x86_64 and arm64 builds have the same values for every setting be
 
 ### What this shows
 
-- **Landlock is not in Raspberry Pi OS's kernel.** It is not active, and not even built: `CONFIG_SECURITY_LANDLOCK` is unset in every Raspberry Pi kernel installed (6.12 and 6.18, Pi 4 and Pi 5 builds), so no `lsm=` boot option can turn it on. ADR 0004 asked for this check before the backend is built. On a stock Raspberry Pi OS, the bubblewrap backend as designed (Landlock applied first inside) cannot run, and the milestone 3 acceptance scenario's Pi host fails its step 1. What to do instead is a decision (design §15).
-- **The memory controller is off on the Pi** by the firmware's own boot arguments, so a `memory` limit cannot be held by a session's cgroup there unless the user adds `cgroup_enable=memory`; `cpu` and `pids` are delegated.
+- **Landlock is not in Raspberry Pi OS's kernel.** It is not active, and not even built: `CONFIG_SECURITY_LANDLOCK` is unset in every Raspberry Pi kernel installed (6.12 and 6.18, Pi 4 and Pi 5 builds), so no `lsm=` boot option can turn it on. ADR 0004 asked for this check before the backend is built. Under ADR 0004 as written, the bubblewrap backend could not run on a stock Raspberry Pi OS. Decided since, in [ADR 0037](../../docs/adr/0037-landlock-where-the-kernel-has-it.md) (proposed): Landlock is applied wherever the kernel has it, and where it is missing the backend still runs, its writes held by bubblewrap's mounts alone and the seccomp filter unchanged; its capabilities declare the weaker execute control, a policy with an `[exec]` section is refused there, and `doctor` states what is not enforced and why it matters (design §5, Without Landlock). That the mounts alone hold the writes is still to show (design §14).
+- **The memory controller is off on the Pi** by the firmware's own boot arguments, so a session's cgroup cannot hold a `memory` limit there; `cpu` and `pids` are delegated. Raspberry Pi's kernel documents `cgroup_enable=memory` to turn it back on, not tried here. Whether the Pi host is expected to carry that setting, or `memory` is refused without the controller, is open (design §15).
 - **Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor and ships no rule for bubblewrap**, so bubblewrap is expected to fail there as installed; whether a profile naming `/usr/bin/bwrap` is enough is what `bwrap-check.sh` tries on the runners. Debian turns neither the restriction nor a bwrap rule on.
 - **The oldest bubblewrap among the targets is Debian 12's 0.8.0**, then Ubuntu 24.04's 0.9.0. Whether each has every option the backend uses waits for M3-02's list of options.
 
@@ -49,6 +49,7 @@ Ubuntu 24.04's x86_64 and arm64 builds have the same values for every setting be
 
 - **In CI** (the `host-survey` workflow, both runners): every "to measure (CI)" cell. Its first run is the result for the runners, and the table and design §14 are updated from it.
 - **In a VM** (Ubuntu 24.04 x86_64 and arm64, Debian 12 and 13): `survey.sh` for the "to measure (VM)" cells, then `bwrap-check.sh`'s steps by hand (it refuses outside a runner by design).
+- **Without Landlock** (in a VM booted with Landlock left out of the active LSM list, then on the Pi with the user): that bubblewrap's mounts alone refuse every write outside the home and workspaces (ADR 0037, design §14).
 - **On the Pi, with the user**: whether bubblewrap runs as the user, and a logout without lingering, both of which act on the user's host.
 
 ## Sources
