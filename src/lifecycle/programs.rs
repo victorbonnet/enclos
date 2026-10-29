@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use std::process::Stdio;
 use std::process::{Command, Output};
 

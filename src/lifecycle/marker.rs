@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use std::process::Stdio;
 use std::process::{Child, Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
