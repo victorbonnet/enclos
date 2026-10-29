@@ -2344,6 +2344,75 @@ fn a_reader_that_left_ends_a_listing_quietly() {
     );
 }
 
+/// A member's command is the sandbox's to write: `sandbox show` shows it
+/// escaped, as `logs` shows a service's lines, not as bytes that drive the
+/// terminal.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_show_escapes_a_members_command() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _stop = StopOnDrop(&home, "home");
+    // The member's name, as `ps` gives it, is the escape sequence: `ps`
+    // shows a control as `^[`, and what it shows is escaped again.
+    let child = home
+        .command(&[
+            "exec",
+            "home",
+            "--",
+            "/bin/bash",
+            "-c",
+            "exec -a \"$0\" /bin/sleep 30",
+            "\u{1b}[31mred",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    assert!(eventually(|| {
+        home.run(&["sandbox", "show", "home"])
+            .stdout()
+            .contains("[31mred")
+    }));
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(!show.contains('\u{1b}'), "{show:?}");
+    Command::new("/bin/kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    let _ = child.wait_with_output();
+}
+
+/// `agent list` runs no program of the runtime's, so a reader that left
+/// ends it by SIGPIPE, as for the other listings.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reader_that_left_ends_agent_list_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _profile = record_hermes(&home, "home");
+    let mut child = home
+        .command(&["agent", "list", "home"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(out.status.signal(), Some(13), "{:?} {stderr}", out.status);
+}
+
 /// Records Hermes as the runtime of sandbox `name` without installing it,
 /// and gives back a way to make a Hermes profile in the sandbox home as
 /// `hermes profile create` would, so the agent commands have something to
@@ -3348,7 +3417,7 @@ fn piped_output_is_json_errors_and_refusals_included() {
         init["created"].as_array().is_some_and(|c| !c.is_empty()),
         "{init}"
     );
-    let (code, created) = home.json(&["sandbox", "create", "home"]);
+    let (code, created) = home.json(&["sandbox", "create", "home", "--template", "assistant"]);
     assert_eq!(code, 0, "{created}");
     assert_eq!(created["sandbox"], "home");
     assert_eq!(created["policy_version"], 1);
@@ -3358,7 +3427,14 @@ fn piped_output_is_json_errors_and_refusals_included() {
     let (_, policy) = home.json(&["policy", "show", "home"]);
     assert_eq!(policy["version"]["version"], 1, "{policy}");
     assert!(policy["policy"]["fs"]["write"].is_array(), "{policy}");
-    let (code, planned) = home.json(&["--dry-run", "sandbox", "create", "lab"]);
+    let (code, planned) = home.json(&[
+        "--dry-run",
+        "sandbox",
+        "create",
+        "lab",
+        "--template",
+        "assistant",
+    ]);
     assert_eq!(code, 0);
     assert_eq!(planned["dry_run"], true, "{planned}");
 
@@ -3395,7 +3471,8 @@ fn exec_output_stays_its_commands_when_piped() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let out = home.run_piped(&["exec", "home", "--", "/bin/echo", "hi"]);
     assert_eq!(out.stdout(), "hi\n");
@@ -3508,7 +3585,8 @@ fn a_terminal_gets_text_and_json_only_when_asked() {
 fn what_a_program_enclos_starts_prints_stays_out_of_the_document() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let script = r#"echo editor-noise; sed -i '' 's/allow_add = \[\]/allow_add = ["api.example.com"]/' "$1""#;
     let mut cmd = home.piped(&["policy", "edit", "home"]);
     cmd.env_remove("VISUAL")
@@ -3530,7 +3608,8 @@ fn what_a_program_enclos_starts_prints_stays_out_of_the_document() {
 fn a_document_that_cannot_be_written_fails_the_command() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     // A pipe whose reader is gone before enclos starts: its write fails.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
@@ -3601,7 +3680,8 @@ fn a_document_that_cannot_be_written_fails_the_command() {
 fn sandbox_show_keeps_its_view_beside_an_error() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _make = record_hermes(&home, "home");
     // An agent record that does not read as an agent's name: the sandbox's
     // view reads, its agents do not.
@@ -3646,7 +3726,8 @@ fn help_and_version_are_text_when_piped() {
 fn logs_fail_when_a_log_cannot_be_read() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(logs.join("gateway.log"), "fine\n").unwrap();
@@ -3676,7 +3757,8 @@ fn a_change_while_a_session_runs_waits_and_apply_restarts_into_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let mut session = home
         .command(&["exec", "home", "--", "/bin/sleep", "30"])
@@ -3730,8 +3812,10 @@ fn a_change_while_a_session_runs_waits_and_apply_restarts_into_it() {
 fn several_sandboxes_give_one_document_with_an_element_each() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
-    home.run(&["sandbox", "create", "lab"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
     let (code, stopped) = home.json(&["sandbox", "stop", "home", "lab", "home"]);
     assert_eq!(code, 0, "{stopped}");
     let elements = stopped["sandboxes"].as_array().unwrap();
@@ -3826,7 +3910,8 @@ fn doctor_and_state_check_in_json() {
     assert!(seatbelt["reason"].is_null(), "{doctor}");
     assert!(doctor.get("error").is_none(), "{doctor}");
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let (code, check) = home.json(&["state", "check"]);
     assert_eq!(code, 0);
     assert_eq!(check["match"], true, "{check}");
@@ -3870,7 +3955,8 @@ fn doctor_and_state_check_in_json() {
 fn logs_in_json_are_json_lines() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let out = home.run_piped(&["--json", "logs", "home"]);
     assert_eq!(out.code(), 0);
     assert_eq!(out.stdout(), "");
@@ -3919,7 +4005,8 @@ fn a_piped_command_that_starts_the_proxy_ends_its_document() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
     cmd.args(["policy", "test", "home"])
@@ -3962,7 +4049,8 @@ fn a_secret_set_in_json_shows_no_value() {
     let home = Home::new();
     let keychain = TestKeychain::new(&home);
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_enclos"));
     cmd.args(["secret", "set", "home/telegram"])
         .env("ENCLOS_HOME", &home.root)
@@ -4004,7 +4092,8 @@ fn a_secret_set_in_json_shows_no_value() {
 fn the_commands_that_change_a_policy_print_their_documents() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let (code, allowed) = home.json(&["policy", "allow", "home", "a.example.com"]);
     assert_eq!(code, 0, "{allowed}");
     assert_eq!(allowed["version"], 2, "{allowed}");
@@ -4037,7 +4126,8 @@ fn the_commands_that_change_a_policy_print_their_documents() {
 fn logs_to_a_reader_that_left_stop_quietly() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(logs.join("gateway.log"), "one\ntwo\nthree\n".repeat(20)).unwrap();
@@ -4062,7 +4152,7 @@ fn a_start_whose_proxy_cannot_listen_fails_in_json() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    let (_, created) = home.json(&["sandbox", "create", "home"]);
+    let (_, created) = home.json(&["sandbox", "create", "home", "--template", "assistant"]);
     let _stop = StopOnDrop(&home, "home");
     let port = created["proxy_port"].as_u64().unwrap() as u16;
     let _held = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();

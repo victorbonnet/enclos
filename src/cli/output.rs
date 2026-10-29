@@ -185,9 +185,28 @@ pub fn conclude(result: Value, code: u8, message: impl FnOnce() -> String) -> u8
     code
 }
 
-/// `value` as a document's text: indented, and escaped by [`for_terminal`].
+/// The shape of what enclos prints as JSON: raised when a field a reader
+/// may rely on changes or goes, so a script can tell one shape from the
+/// next. A field added keeps it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// `value` with its `schema_version`, when it is an object, as everything
+/// enclos prints as JSON is.
+fn versioned(value: &Value) -> std::borrow::Cow<'_, Value> {
+    match value {
+        Value::Object(fields) => {
+            let mut fields = fields.clone();
+            fields.insert("schema_version".into(), SCHEMA_VERSION.into());
+            std::borrow::Cow::Owned(Value::Object(fields))
+        }
+        _ => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+/// `value` as a document's text: with its `schema_version`, indented, and
+/// escaped by [`for_terminal`].
 pub fn document_text(value: &Value) -> String {
-    for_terminal(&serde_json::to_string_pretty(value).expect("a JSON value serializes"))
+    for_terminal(&serde_json::to_string_pretty(&versioned(value)).expect("a JSON value serializes"))
 }
 
 /// A dry run's plan, as this command prints it: its document in JSON, else
@@ -199,11 +218,11 @@ pub fn show_plan(planned: &Plan) {
     }
 }
 
-/// `value` compact, on one line, escaped as a document is: one line of JSON
-/// Lines, such as a note, a session's end or a failure on stderr, or a
-/// `logs` line on stdout.
+/// `value` compact, on one line, with its `schema_version` and escaped as a
+/// document is: one line of JSON Lines, such as a note, a session's end or
+/// a failure on stderr, or a `logs` line on stdout.
 pub fn line(value: &Value) -> String {
-    for_terminal(&serde_json::to_string(value).expect("a JSON value serializes"))
+    for_terminal(&serde_json::to_string(&versioned(value)).expect("a JSON value serializes"))
 }
 
 /// JSON text with these characters escaped as `\uXXXX`, a character past
@@ -492,6 +511,19 @@ mod tests {
             !text.contains('\u{9b}') && !text.contains('\u{202e}'),
             "{text}"
         );
-        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), value);
+        let mut versioned = value;
+        versioned["schema_version"] = SCHEMA_VERSION.into();
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), versioned);
+    }
+
+    /// A document and each line of JSON Lines say their shape.
+    #[test]
+    fn what_enclos_prints_as_json_carries_its_schema_version() {
+        let value = json!({"sandboxes": []});
+        for text in [document_text(&value), line(&value)] {
+            let read: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(read["schema_version"], SCHEMA_VERSION, "{text}");
+            assert_eq!(read["sandboxes"], json!([]), "{text}");
+        }
     }
 }

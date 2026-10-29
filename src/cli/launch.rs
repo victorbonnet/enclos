@@ -326,7 +326,7 @@ mod tests {
         show_lines(&b"started\n\x1b[2Jcleared\r\n"[..], &mut shown, true).unwrap();
         assert_eq!(
             String::from_utf8(shown).unwrap(),
-            "{\"line\":\"started\"}\n{\"line\":\"\\u001b[2Jcleared\"}\n"
+            "{\"line\":\"started\",\"schema_version\":1}\n{\"line\":\"\\u001b[2Jcleared\",\"schema_version\":1}\n"
         );
     }
 
