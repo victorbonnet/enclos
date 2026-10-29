@@ -26,10 +26,11 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from, named every time so the widest is
-        /// never had by leaving it out: minimal (the runtime's own hosts),
-        /// mcp-only (those and the MCP servers you list) or assistant (the
-        /// public web) (design §7).
+        /// The policy it starts from, required so the widest is never
+        /// picked by leaving it out: minimal (only what is listed; from
+        /// `runtime install` on, the runtime's hosts), mcp-only (the same
+        /// for now, for assistants using remote MCP servers you allow) or
+        /// assistant (the public web) (design §7).
         #[arg(long)]
         template: TemplateName,
     },

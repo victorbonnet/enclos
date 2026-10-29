@@ -1279,6 +1279,23 @@ fn a_policy_naming_no_template_is_told_the_active_one() {
     );
     assert_eq!(err.exit_code(), 1);
     assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+
+    // `runtime install`, which resolves the file with the runtime's layer,
+    // says so too.
+    engine.layout.write_policy(name.as_str(), &after).unwrap();
+    let err = engine
+        .install_runtime(
+            &alice(),
+            &name,
+            crate::model::runtime::RuntimeKind::Hermes,
+            Confirm::DryRun,
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("its active policy is built on `assistant`"),
+        "{err}"
+    );
 }
 
 /// A limit the backend cannot enforce never reaches a program, even one

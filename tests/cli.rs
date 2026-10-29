@@ -461,7 +461,7 @@ fn a_sandbox_is_created_only_with_its_template_named() {
     let home = Home::new();
     home.init(1);
     let out = home.run(&["sandbox", "create", "home"]);
-    assert_ne!(out.code(), 0, "{}", out.stdout());
+    assert_eq!(out.code(), 1, "{}", out.stdout());
     assert!(out.stderr().contains("--template"), "{}", out.stderr());
     assert!(!home.root.join("sandboxes/home").exists());
 }
@@ -2405,7 +2405,7 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
     let out = home.run(&["status"]);
     assert_eq!(
         out.ok().stdout(),
-        "No sandboxes yet. Create one with `enclos sandbox create lab --template assistant` (or minimal, mcp-only).\n"
+        "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`.\n"
     );
     let out = home.run(&["status", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
