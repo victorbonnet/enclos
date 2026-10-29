@@ -1753,6 +1753,7 @@ cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
 [ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
+[ -f \"$HOME/hermes-after-fails\" ] && [ \"$5\" = secrets.command.enabled ] && exit 3
 if [ \"$1 $2\" = \"profile delete\" ] && [ ! -f \"$HOME/hermes-keeps\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
 fi
@@ -2174,6 +2175,28 @@ echo \"installed $*\" > \"$HOME/installed\"
             std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
             "profile create main --clone-from default\n-p main config set secrets.command.enabled false\n"
         );
+        // A clone whose copied `secrets.command` cannot be turned off would
+        // read the built-in agent's secrets: not recorded, and said how to
+        // finish by hand (ADR 0036).
+        std::fs::write(lab.home.join("hermes-after-fails"), "").unwrap();
+        let err = lab
+            .engine
+            .add_agent(&alice(), &lab.name, "other".parse().unwrap(), Confirm::Yes)
+            .unwrap_err();
+        assert!(matches!(err, Error::FailedAfter { .. }), "{err}");
+        assert!(
+            err.to_string().contains(
+                "enclos connect home -- hermes -p other config set secrets.command.enabled false"
+            ),
+            "{err}"
+        );
+        assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+        std::fs::remove_file(lab.home.join("hermes-after-fails")).unwrap();
+        std::fs::write(
+            lab.home.join("hermes-calls"),
+            "profile create main --clone-from default\n-p main config set secrets.command.enabled false\n",
+        )
+        .unwrap();
         // A name that is a command on the sandbox's PATH is refused.
         let err = lab
             .engine
@@ -2423,7 +2446,10 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(copy_left.is_none());
         assert_eq!(
             std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
-            format!("profile import {} --name main\n", staged.display())
+            format!(
+                "profile import {} --name main\n-p main config set secrets.command.enabled false\n",
+                staged.display()
+            )
         );
         assert_eq!(
             std::fs::read(lab.home.join("imported-main")).unwrap(),
@@ -2449,7 +2475,8 @@ echo \"installed $*\" > \"$HOME/installed\"
                 staged.display()
             )]
         );
-        assert_eq!(outcome("agent import session").len(), 1);
+        // The import, then the copied `secrets.command` turned off.
+        assert_eq!(outcome("agent import session").len(), 2);
         assert_eq!(
             outcome("agent add"),
             [format!(
@@ -2468,7 +2495,12 @@ echo \"installed $*\" > \"$HOME/installed\"
             .collect();
         assert_eq!(
             commands,
-            ["agent import", "agent import session", "agent add"]
+            [
+                "agent import",
+                "agent import session",
+                "agent import session",
+                "agent add"
+            ]
         );
 
         // Refused before the archive is read: a known name, and a name that
@@ -2524,7 +2556,10 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
         assert_eq!(
             std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap(),
-            format!("profile import {} --name main\n", staged.display())
+            format!(
+                "profile import {} --name main\n-p main config set secrets.command.enabled false\n",
+                staged.display()
+            )
         );
 
         // A failing import records nothing, leaves no copy, and says how
@@ -4044,11 +4079,155 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .unwrap();
         assert!(!file.exists());
         assert!(file.with_file_name(".env").exists());
+
+        // A value no secrets file can hold, granted to an agent: refused
+        // before anything is written, the sandbox's file kept as it was.
+        let bad: SecretRef = "home/main-bot".parse().unwrap();
+        let value = SecretValue::new("a${b}".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &bad, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        let env = file.with_file_name(".env");
+        std::fs::write(&env, "KEPT=\"1\"\n").unwrap();
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &ungranted, &granted, Confirm::Yes)
+            .unwrap();
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err();
+        assert!(
+            matches!(err.root(), Error::SecretsFileRefused { .. }),
+            "{err}"
+        );
+        assert!(!file.exists());
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), "KEPT=\"1\"\n");
     }
 
-    /// The sandbox's bot is set up with the runtime's own commands, once its
-    /// token is one of the sandbox's secrets the policy grants; the value
-    /// goes into no command.
+    /// `runtime configure` with settings only: the agent reads its own
+    /// secrets, and each setting names a secret only as a `${VAR}` the
+    /// policy grants it, never as the secret (ADR 0036).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_agent_is_given_settings_that_name_its_secrets() {
+        use crate::engine::Setting;
+        use crate::model::secret::{SecretRef, SecretValue};
+        use crate::secrets::InMemory;
+        let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+        let store = std::rc::Rc::new(InMemory::default());
+        let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+        assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+        let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        let set = |settings: &[&str]| {
+            let settings: Vec<Setting> = settings.iter().map(|s| s.parse().unwrap()).collect();
+            lab.engine
+                .configure_agent(&alice(), &lab.name, None, None, &settings, Confirm::Yes)
+        };
+        // Nothing asked: the agent reads its own secrets, and only that.
+        let configured = done(set(&[]).unwrap());
+        assert_eq!(configured.agent.as_str(), "default");
+        assert!(configured.settings.is_empty() && configured.channel.is_none());
+        assert_eq!(calls().lines().count(), 3, "{}", calls());
+        assert!(calls().contains("-p default config set secrets.command.enabled true"));
+
+        // A secret named by a variable the policy does not grant: refused,
+        // saying how to grant it, and nothing runs.
+        let runs = calls().lines().count();
+        let err = set(&["platforms.discord.token=${DISCORD_BOT_TOKEN}"]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("grants agent default no $DISCORD_BOT_TOKEN")
+                && err.to_string().contains("[secrets.agents.default]"),
+            "{err}"
+        );
+        // A secret written as itself, where the name says it is one.
+        let err = set(&["platforms.discord.token=123:abc"]).unwrap_err();
+        assert!(err.to_string().contains("looks like a secret"), "{err}");
+        assert_eq!(calls().lines().count(), runs, "{}", calls());
+
+        // Granted to the agent: set as written, the value never in a command.
+        let token: SecretRef = "home/discord".parse().unwrap();
+        let value = SecretValue::new("999:discord".into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+        let before = lab.engine.layout.read_policy("home").unwrap();
+        let after = format!(
+            "{before}\n[secrets.agents.default]\nenv = {{ DISCORD_BOT_TOKEN = \"secret:home/discord\" }}\n"
+        );
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .unwrap();
+        let configured = done(
+            set(&[
+                "platforms.discord.token=${DISCORD_BOT_TOKEN}",
+                "DISCORD_ALLOWED_USERS=111",
+            ])
+            .unwrap(),
+        );
+        assert_eq!(
+            configured.settings,
+            ["platforms.discord.token", "DISCORD_ALLOWED_USERS"]
+        );
+        assert!(
+            calls().ends_with(
+                "-p default config set platforms.discord.token ${DISCORD_BOT_TOKEN}\n-p default config set DISCORD_ALLOWED_USERS 111\n"
+            ),
+            "{}",
+            calls()
+        );
+        assert!(!calls().contains("999:discord"));
+    }
+
+    /// What the channel tests read of a bot `runtime configure` set up.
+    #[derive(Debug)]
+    struct Bot {
+        agent: crate::runtime::RuntimeAgentName,
+        token: String,
+        answers: Vec<crate::model::channel::ChannelUser>,
+        reachable: bool,
+    }
+
+    /// `runtime configure --channel`, with no other setting.
+    #[allow(clippy::too_many_arguments)]
+    fn configure_channel(
+        engine: &Engine,
+        by: &crate::model::audit::Actor,
+        name: &SandboxName,
+        agent: Option<&crate::model::agent::AgentName>,
+        channel: crate::model::channel::Channel,
+        token: Option<String>,
+        answers: &[crate::model::channel::ChannelUser],
+        confirm: Confirm,
+    ) -> crate::error::Result<Planned<Bot>> {
+        let request = crate::engine::ChannelRequest {
+            channel,
+            token,
+            answers: answers.to_vec(),
+        };
+        Ok(
+            match engine.configure_agent(by, name, agent, Some(request), &[], confirm)? {
+                Planned::DryRun(plan) => Planned::DryRun(plan),
+                Planned::Done(done) => {
+                    let bot = done.channel.expect("a channel was asked for");
+                    Planned::Done(Bot {
+                        agent: done.agent,
+                        token: bot.token,
+                        answers: bot.answers,
+                        reachable: bot.reachable,
+                    })
+                }
+            },
+        )
+    }
+
+    /// The built-in agent's bot is set up with the runtime's own commands,
+    /// once the policy grants it its token (ADR 0036); the value goes into
+    /// no command.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
@@ -4062,7 +4241,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
         let users: Vec<ChannelUser> = vec!["111".parse().unwrap(), "222".parse().unwrap()];
         let configure = |users: &[ChannelUser], confirm| {
-            lab.engine.configure_channel(
+            configure_channel(
+                &lab.engine,
                 &alice(),
                 &lab.name,
                 None,
@@ -4095,16 +4275,13 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let sandbox_wide = format!(
             "{before}\n[secrets]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
         );
-        lab.engine
+        let err = lab
+            .engine
             .policy_edit(&alice(), &lab.name, &before, &sandbox_wide, Confirm::Yes)
-            .unwrap();
-        let err = configure(&users, Confirm::Yes).unwrap_err();
+            .unwrap_err();
         assert!(
-            err.to_string()
-                .contains("to the whole sandbox, under [secrets]")
-                && err
-                    .to_string()
-                    .contains("move it to [secrets.agents.default]"),
+            matches!(&err, Error::Policy(e) if e.is_refused())
+                && err.to_string().contains("[secrets.agents.default]"),
             "{err}"
         );
         assert!(!calls().contains("config set"), "{}", calls());
@@ -4112,7 +4289,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             "{before}\n[secrets.agents.default]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/telegram\" }}\n"
         );
         lab.engine
-            .policy_edit(&alice(), &lab.name, &sandbox_wide, &after, Confirm::Yes)
+            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
             .unwrap();
 
         // A token Hermes's own setup left in plain text in the home is
@@ -4194,7 +4371,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .policy_edit(&alice(), &lab.name, &usual, &both, Confirm::Yes)
             .unwrap();
         let named = |token: &str| {
-            lab.engine.configure_channel(
+            configure_channel(
+                &lab.engine,
                 &alice(),
                 &lab.name,
                 None,
@@ -4317,18 +4495,17 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Ask)
             .unwrap();
         let users: Vec<ChannelUser> = vec!["111".parse().unwrap()];
-        let err = lab
-            .engine
-            .configure_channel(
-                &alice(),
-                &lab.name,
-                None,
-                Channel::Telegram,
-                None,
-                &users,
-                Confirm::Yes,
-            )
-            .unwrap_err();
+        let err = configure_channel(
+            &lab.engine,
+            &alice(),
+            &lab.name,
+            None,
+            Channel::Telegram,
+            None,
+            &users,
+            Confirm::Yes,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("enclos policy apply home"),
             "{err}"
@@ -4354,7 +4531,8 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let main: crate::model::agent::AgentName = "main".parse().unwrap();
         let users: Vec<ChannelUser> = vec!["111".parse().unwrap()];
         let configure = |agent: &crate::model::agent::AgentName| {
-            lab.engine.configure_channel(
+            configure_channel(
+                &lab.engine,
                 &alice(),
                 &lab.name,
                 Some(agent),

@@ -327,7 +327,29 @@ impl Engine {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
         validate_resources(policy, backend, crate::backend::max_files_per_process())?;
+        self.check_agent_secrets_delivered(name, policy)?;
         self.check_secrets_set(name, policy)
+    }
+
+    /// Refuses secrets granted to one agent where the sandbox's runtime has
+    /// no file to give them through (ADR 0036): they would reach no one.
+    /// Before a runtime is installed, they wait for one.
+    fn check_agent_secrets_delivered(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+        if policy.agent_secrets.is_empty() {
+            return Ok(());
+        }
+        let Some(kind) = self.record(name)?.runtime else {
+            return Ok(());
+        };
+        match crate::runtime::adapter(kind).secrets_folder_var() {
+            Some(_) => Ok(()),
+            None => Err(Error::Policy(crate::policy::PolicyError::Invalid {
+                problems: vec![crate::policy::Problem::Refused(format!(
+                    "secrets.agents: {} gives no agent secrets of its own; grant them under [secrets] instead",
+                    kind.display_name()
+                ))],
+            })),
+        }
     }
 
     /// The backend of sandbox `name`, as recorded, whose limits its policy
@@ -545,8 +567,8 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "stop giving it ${variable} (sessions started from now on)"
         ));
     }
-    let none = crate::model::policy::AgentSecrets::new();
-    let agents: std::collections::BTreeSet<&String> = old
+    let none = crate::model::policy::SecretGrants::new();
+    let agents: std::collections::BTreeSet<&crate::model::agent::AgentName> = old
         .agent_secrets
         .keys()
         .chain(new.agent_secrets.keys())
@@ -697,6 +719,35 @@ mod tests {
         assert!(
             bare.contains("[network]") && bare.contains("allow_add = [\"a.example.com\"]"),
             "{bare}"
+        );
+    }
+
+    /// What an agent is given, as it changes (ADR 0036): a new or other
+    /// secret says what it is given, a dropped one what it stops being.
+    #[test]
+    fn a_change_of_an_agents_secrets_says_what_it_is_given() {
+        let none = Policy::default();
+        let grant = |p: &mut Policy, secret: &str| {
+            p.agent_secrets
+                .entry("main".parse().unwrap())
+                .or_default()
+                .insert("T".into(), secret.parse().unwrap());
+        };
+        let mut given = none.clone();
+        grant(&mut given, "secret:home/bot");
+        assert_eq!(
+            differences(&none, &given, &[]),
+            ["give agent main secret home/bot as $T (its services started from now on)"]
+        );
+        let mut other = none.clone();
+        grant(&mut other, "secret:home/bot-two");
+        assert_eq!(
+            differences(&given, &other, &[]),
+            ["give agent main secret home/bot-two as $T (its services started from now on)"]
+        );
+        assert_eq!(
+            differences(&given, &none, &[]),
+            ["stop giving agent main $T (its services started from now on)"]
         );
     }
 

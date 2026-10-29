@@ -16,14 +16,32 @@ use crate::model::secret::{SecretRecord, SecretRef, SecretValue};
 use crate::runtime::adapter;
 
 /// What `secret set` did.
+/// One way a policy gives a secret: as `variable`, to the whole sandbox,
+/// or to `agent` alone (ADR 0036).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub variable: String,
+    pub agent: Option<crate::model::agent::AgentName>,
+}
+
+impl std::fmt::Display for Grant {
+    /// `$VAR`, or `$VAR for agent main`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.agent {
+            None => write!(f, "${}", self.variable),
+            Some(agent) => write!(f, "${} for agent {agent}", self.variable),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSet {
     /// False when it replaced the value of a secret already set.
     pub new: bool,
-    /// The variables the active policy gives it as.
-    pub granted_as: Vec<String>,
-    /// The variables the pending policy gives it as, if one waits.
-    pub pending_as: Vec<String>,
+    /// How the active policy gives it.
+    pub granted_as: Vec<Grant>,
+    /// How the pending policy gives it, if one waits.
+    pub pending_as: Vec<Grant>,
     /// How many sessions run with the value it had: they keep it until they
     /// restart.
     pub running: usize,
@@ -33,10 +51,10 @@ pub struct SecretSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretView {
     pub record: SecretRecord,
-    /// The variables the active policy gives it as.
-    pub granted_as: Vec<String>,
-    /// The variables the pending policy gives it as, when one waits.
-    pub pending_as: Option<Vec<String>>,
+    /// How the active policy gives it.
+    pub granted_as: Vec<Grant>,
+    /// How the pending policy gives it, when one waits.
+    pub pending_as: Option<Vec<Grant>>,
 }
 
 /// A secret `sandbox rm` could not remove from the secret store, which no
@@ -100,7 +118,8 @@ impl Engine {
                     .map(|(_, p)| granted_as(&p.policy, secret))
                     .unwrap_or_default();
                 let granted_as = granted_as(&view.snapshot.policy, secret);
-                let running = match granted_as.is_empty() {
+                // Only sessions take a secret granted to the whole sandbox.
+                let running = match granted_as.iter().all(|g| g.agent.is_some()) {
                     true => 0,
                     false => self.sessions_under_rules(&secret.sandbox)?.len(),
                 };
@@ -257,16 +276,16 @@ impl Engine {
                 format!("take the grant out with `enclos policy edit {sandbox}` first"),
             ),
         };
-        let mut variables: Vec<String> = active.into_iter().chain(pending).collect();
+        let mut variables: Vec<String> = active
+            .into_iter()
+            .chain(pending)
+            .map(|g| g.to_string())
+            .collect();
         variables.sort();
         variables.dedup();
         Err(Error::SecretGranted {
             secret: secret.clone(),
-            variables: variables
-                .iter()
-                .map(|v| format!("${v}"))
-                .collect::<Vec<_>>()
-                .join(", "),
+            variables: variables.join(", "),
             by: by.to_owned(),
             advice,
         })
@@ -294,7 +313,8 @@ impl Engine {
     }
 
     /// The variables a session of the sandbox starts with: each secret
-    /// `policy` grants, read from the secret store now, on the host.
+    /// `policy` grants the whole sandbox, read from the secret store now, on
+    /// the host; none an agent is granted (ADR 0036).
     pub(super) fn secret_env(&self, policy: &Policy) -> Result<Vec<(String, SecretValue)>> {
         self.granted_values(&policy.secrets)
     }
@@ -302,7 +322,7 @@ impl Engine {
     /// The values of `grants`, by variable, read from the secret store now.
     fn granted_values(
         &self,
-        grants: &crate::model::policy::AgentSecrets,
+        grants: &crate::model::policy::SecretGrants,
     ) -> Result<Vec<(String, SecretValue)>> {
         let mut env = Vec::new();
         for (variable, grant) in grants {
@@ -357,12 +377,20 @@ impl Engine {
             return Ok(values);
         };
         let folder = self.layout.sandbox_secrets_dir(name.as_str());
-        write_secrets_file(name, &folder, SANDBOX_SECRETS_FILE, &values)?;
-        let mut written = vec![SANDBOX_SECRETS_FILE.to_owned()];
+        let mut files = vec![(SANDBOX_SECRETS_FILE.to_owned(), values, Reader::Dotenv)];
         for (agent, grants) in &policy.agent_secrets {
             let file = format!("{agent}{}", crate::layout::AGENT_SECRETS_SUFFIX);
-            write_secrets_file(name, &folder, &file, &self.granted_values(grants)?)?;
-            written.push(file);
+            files.push((file, self.granted_values(grants)?, Reader::Command));
+        }
+        // Every value checked before any file is written, so a refused
+        // start leaves the files as they were.
+        for (_, values, _) in &files {
+            check_writable(name, values)?;
+        }
+        let mut written = Vec::new();
+        for (file, values, reader) in &files {
+            write_secrets_file(name, &folder, file, values, *reader)?;
+            written.push(file.clone());
         }
         // What an earlier start wrote for an agent no longer granted any.
         remove_files_but(&folder, &written)?;
@@ -426,51 +454,80 @@ fn remove_files_but(folder: &Path, kept: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The variables `policy` gives `secret` as: to the whole sandbox, then to
-/// each agent, said `VAR for agent main` (ADR 0036).
-fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<String> {
+/// How `policy` gives `secret`: to the whole sandbox, then to each agent
+/// (ADR 0036).
+fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<Grant> {
     let sandbox = policy
         .secrets
         .iter()
         .filter(|(_, g)| g.0 == *secret)
-        .map(|(v, _)| v.clone());
+        .map(|(v, _)| Grant {
+            variable: v.clone(),
+            agent: None,
+        });
     let agents = policy.agent_secrets.iter().flat_map(|(agent, grants)| {
         grants
             .iter()
             .filter(|(_, g)| g.0 == *secret)
-            .map(move |(v, _)| format!("{v} for agent {agent}"))
+            .map(move |(v, _)| Grant {
+                variable: v.clone(),
+                agent: Some(agent.clone()),
+            })
     });
     sandbox.chain(agents).collect()
 }
 
+/// Who reads a secrets file back, which decides how a value is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// The sandbox's `.env`, which python-dotenv and Hermes's own reader
+    /// (`agent.secret_scope.load_env_file`) both read: each value
+    /// double-quoted with its `\` and `"` escaped, which both take back as
+    /// it was (checked against Hermes 0.22.4's).
+    Dotenv,
+    /// An agent's file, which Hermes reads through its `secrets.command`
+    /// (`agent/secret_sources/command.py`, Hermes 0.22.5): it strips one
+    /// surrounding pair of quotes and undoes no escape, so each value is
+    /// double-quoted as it is.
+    Command,
+}
+
+/// Refuses a value holding a line break or `${`: every reader splits lines,
+/// and python-dotenv expands `${…}` with no escape for it, so the readers
+/// would take different values.
+fn check_writable(name: &SandboxName, values: &[(String, SecretValue)]) -> Result<()> {
+    let unreadable = |v: &SecretValue| {
+        let v = v.expose();
+        v.contains('\n') || v.contains('\r') || v.contains("${")
+    };
+    match values.iter().find(|(_, v)| unreadable(v)) {
+        Some((variable, _)) => Err(Error::SecretsFileRefused {
+            sandbox: name.to_string(),
+            why: format!(
+                "the secret given as ${variable} holds a line break or `${{`, which its secrets file cannot hold as it is; set a value without them with `enclos secret set`"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Writes `values` as `file` of `folder`, which only the user reads:
 /// the folder 0700, the file 0600, written whole beside it and then renamed
-/// over it. Each value is double-quoted with its `\` and `"` escaped, which
-/// python-dotenv and Hermes's own reader (`agent.secret_scope.load_env_file`)
-/// both read back as it was (checked against Hermes 0.22.4's). Refused,
-/// before anything is written: a value holding a line break or `${`, since
-/// Hermes's reader splits lines and python-dotenv expands `${…}` with no
-/// escape for it, so the two would read different values; and a folder
-/// that is a link, never followed.
+/// over it, each value as `reader` takes it back. Refused, before anything
+/// is written: a value [`check_writable`] refuses, and a folder that is a
+/// link, never followed.
 fn write_secrets_file(
     name: &SandboxName,
     folder: &Path,
     file: &str,
     values: &[(String, SecretValue)],
+    reader: Reader,
 ) -> Result<()> {
     let refused = |why: String| Error::SecretsFileRefused {
         sandbox: name.to_string(),
         why,
     };
-    let unreadable = |v: &SecretValue| {
-        let v = v.expose();
-        v.contains('\n') || v.contains('\r') || v.contains("${")
-    };
-    if let Some((variable, _)) = values.iter().find(|(_, v)| unreadable(v)) {
-        return Err(refused(format!(
-            "the secret given as ${variable} holds a line break or `${{`, which its secrets file cannot hold as it is; set a value without them with `enclos secret set`"
-        )));
-    }
+    check_writable(name, values)?;
     if std::fs::symlink_metadata(folder).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(refused(format!(
             "{} is a link, which secrets are never written through; remove it",
@@ -494,7 +551,7 @@ fn write_secrets_file(
         text.push_str(variable);
         text.push_str("=\"");
         for c in value.expose().chars() {
-            if c == '\\' || c == '"' {
+            if reader == Reader::Dotenv && (c == '\\' || c == '"') {
                 text.push('\\');
             }
             text.push(c);
@@ -541,11 +598,41 @@ mod tests {
             ("A".to_owned(), value("plain")),
             ("B".to_owned(), value("a'b\\c\"d$HOME #e")),
         ];
-        write_secrets_file(&home(), &folder, SANDBOX_SECRETS_FILE, &values).unwrap();
-        write_secrets_file(&home(), &folder, SANDBOX_SECRETS_FILE, &values).unwrap();
+        write_secrets_file(
+            &home(),
+            &folder,
+            SANDBOX_SECRETS_FILE,
+            &values,
+            Reader::Dotenv,
+        )
+        .unwrap();
+        write_secrets_file(
+            &home(),
+            &folder,
+            SANDBOX_SECRETS_FILE,
+            &values,
+            Reader::Dotenv,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(folder.join(".env")).unwrap();
         assert_eq!(text, "A=\"plain\"\nB=\"a'b\\\\c\\\"d$HOME #e\"\n");
         assert!(!folder.join(".env.new").exists());
+    }
+
+    /// An agent's file is read through Hermes's `secrets.command`, which
+    /// strips one surrounding pair of quotes and undoes no escape: each
+    /// value is written as it is, so what it reads is the value.
+    #[test]
+    fn an_agents_secrets_file_holds_each_value_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("secrets");
+        let values = vec![("B".to_owned(), value("a'b\\c\"d$HOME #e"))];
+        write_secrets_file(&home(), &folder, "main.env", &values, Reader::Command).unwrap();
+        let text = std::fs::read_to_string(folder.join("main.env")).unwrap();
+        assert_eq!(text, "B=\"a'b\\c\"d$HOME #e\"\n");
+        // Hermes's rule (`unquote_dotenv_value`): one surrounding pair off.
+        let (_, raw) = text.trim_end().split_once('=').unwrap();
+        assert_eq!(&raw[1..raw.len() - 1], "a'b\\c\"d$HOME #e");
     }
 
     /// A line break or `${` would be read differently by Hermes's two
@@ -560,6 +647,7 @@ mod tests {
                 &folder,
                 SANDBOX_SECRETS_FILE,
                 &[("T".to_owned(), value(bad))],
+                Reader::Dotenv,
             )
             .unwrap_err();
             assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
@@ -584,6 +672,7 @@ mod tests {
             &folder,
             SANDBOX_SECRETS_FILE,
             &[("T".to_owned(), value("v"))],
+            Reader::Dotenv,
         )
         .unwrap_err();
         assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");

@@ -98,7 +98,7 @@ enclos connect lab -- hermes -p main
 
 Hermes's export of `default` carries the agent's configuration, personality, skills, cron jobs and memories, and leaves out its secrets and login (`auth.json`, `.env`, the browser's data), its databases, logs and caches. Its `sessions/` folder comes along, but Hermes keeps conversation history in `state.db`, which this export leaves out. An export of a named agent (`hermes profile export scout`) leaves out the same secrets and the browser's data but carries its database, history and logs. That is Hermes's doing, by its code, and not shown by a prototype yet (design §14). enclos never looks inside the archive: it copies it beside the sandbox home, Hermes imports it inside the sandbox under its policy, and enclos records the agent with the archive's SHA-256 in the audit log, once when the copy is made and once with the record. `default` is the sandbox's own built-in agent, so your Mac's `default` comes in under another name, such as `main`. The archive must be a file of your own: not a link, and not under a sandbox's folder (`~/.enclos/sandboxes`), even through a link.
 
-Three things do not come in with the archive. Your login: enclos copies none in, so the agent should use the sandbox's, made with `enclos connect lab -- hermes -p default setup`. If its configuration names another provider, it asks for that login inside the sandbox; until enclos grants secrets per sandbox (milestone 2), values it needs, such as a bot token, go in its files inside the sandbox, with Hermes's own commands. Network grants: nothing in the archive widens the sandbox's policy, so what the agent reaches shows in `enclos net log lab` and what was refused in `enclos net denied lab`, where you decide. Your own Hermes: enclos never runs it, and never reads `~/.hermes` on its own.
+Three things do not come in with the archive. Your login: enclos copies none in, so the agent should use the sandbox's, made with `enclos connect lab -- hermes -p default setup`. If its configuration names another provider, it asks for that login inside the sandbox; values it needs, such as a bot token, are granted to it with `enclos policy edit lab` under `[secrets.agents.main]` and set with `enclos runtime configure lab/main --set KEY='${VAR}'`, never kept in its files. Network grants: nothing in the archive widens the sandbox's policy, so what the agent reaches shows in `enclos net log lab` and what was refused in `enclos net denied lab`, where you decide. Your own Hermes: enclos never runs it, and never reads `~/.hermes` on its own.
 
 Its cron jobs come along and start acting as soon as the sandbox's gateway runs, at once if `lab` is already started (`enclos sandbox start lab`). That they run there, and that the imported agent uses the sandbox's login, is still to verify (design §14). To take an agent back out, run the export inside the sandbox, where `connect` starts in the sandbox's home: `enclos connect lab -- hermes profile export main -o main.tar.gz` writes `~/.enclos/sandboxes/lab/home/main.tar.gz` on your Mac. Copy it to a folder of your own before importing it elsewhere: enclos refuses an archive under a sandbox's folder.
 
@@ -152,10 +152,33 @@ enclos sandbox stop lab      # every service, session and process of the sandbox
 enclos sandbox rm lab        # the sandbox and its home, with Hermes and its login
 ```
 
+## Give an agent a bot, or any secret it needs
+
+Secrets live in your Keychain, never in the sandbox's files. `enclos secret set lab/<name>` stores one, typed without echo; the policy grants it, with `enclos policy edit lab`, either to every session and service of the sandbox (`[secrets] env = { NAME = "secret:lab/<name>" }`) or to one agent alone (`[secrets.agents.main] env = { NAME = "secret:lab/<name>" }`). `enclos sandbox rm` removes the sandbox's secrets too.
+
+Each agent can have a Telegram bot of its own:
+
+```bash
+enclos secret set lab/main-telegram     # the bot's token, from @BotFather
+enclos policy edit lab                  # [secrets.agents.main]
+                                        # env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
+enclos runtime configure lab/main --channel telegram --allow-user <your Telegram id>
+enclos sandbox start lab                # the gateway serves every agent's bot
+```
+
+`enclos runtime configure lab ...`, with no agent, does the same for the built-in agent, `default`, whose grant goes under `[secrets.agents.default]`. A bot token is never granted to the whole sandbox: every agent would get it.
+
+Any other setting that needs a secret, such as another channel Hermes supports, works the same way without a command of its own: grant the secret to the agent, then name it as `${VAR}` in the setting, never as itself:
+
+```bash
+enclos runtime configure lab/main --set 'platforms.discord.token=${DISCORD_BOT_TOKEN}' --set DISCORD_ALLOWED_USERS=<id>
+```
+
+enclos refuses a variable the policy does not grant the agent, and a value that looks like a secret written as itself. Agents of a sandbox share its files, so a secret granted to one agent is kept apart from the others, not hidden from them.
+
 ## What does not work yet
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.
-- **Messaging:** each agent can have a Telegram bot of its own. Store its token with `enclos secret set lab/main-telegram`, grant it to that agent with `enclos policy edit lab` (`[secrets.agents.main] env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }`), then run `enclos runtime configure lab/main --channel telegram --allow-user <your Telegram id>`; `enclos runtime configure lab ...` does the same for the built-in agent, `default`, whose grant goes under `[secrets.agents.default]`. Start the sandbox with `enclos sandbox start lab` for its gateway to serve the bots. Agents of a sandbox share its files, so a bot token granted to one agent is kept apart from the others, not hidden from them. Secrets work already: `enclos secret set lab/<name>` stores one in the Keychain, and adding `[secrets] env = { NAME = "secret:lab/<name>" }` with `enclos policy edit lab` gives it to every session and service of the sandbox. `enclos sandbox rm` removes the sandbox's secrets too.
 
 ## If you used an earlier build
 

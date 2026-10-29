@@ -56,13 +56,20 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
 pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), PolicyError> {
     let mut problems = Vec::new();
     check_grants("secrets.env", &policy.secrets, sandbox, &mut problems);
-    for (agent, grants) in &policy.agent_secrets {
-        let at = format!("secrets.agents.{agent}.env");
-        if agent.parse::<crate::model::agent::AgentName>().is_err() {
-            problems.push(Problem::Malformed(format!(
-                "secrets.agents: `{agent}` is not an agent name: use a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
+    // A bot's token goes to the agent whose bot it is (ADR 0036): granted
+    // to the whole sandbox, it would reach every agent and win over each
+    // one's own, and the runtime would refuse the duplicates.
+    for channel in crate::model::channel::Channel::ALL {
+        let variable = channel.token_variable();
+        if policy.secrets.contains_key(variable) {
+            problems.push(Problem::Refused(format!(
+                "secrets.env.{variable}: a {} bot's token goes to the agent whose bot it is, under [secrets.agents.<agent>] (the built-in agent's: [secrets.agents.default]), not to the whole sandbox, which every agent receives (ADR 0036)",
+                channel.display_name()
             )));
         }
+    }
+    for (agent, grants) in &policy.agent_secrets {
+        let at = format!("secrets.agents.{agent}.env");
         check_grants(&at, grants, sandbox, &mut problems);
         // The sandbox's own grants reach every agent and win over an
         // agent's (ADR 0036): one variable cannot be both.
@@ -78,7 +85,7 @@ pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), Po
 /// Checks the grants of one `env` table, named `at` in what it says.
 fn check_grants(
     at: &str,
-    grants: &crate::model::policy::AgentSecrets,
+    grants: &crate::model::policy::SecretGrants,
     sandbox: &SandboxName,
     problems: &mut Vec<Problem>,
 ) {
@@ -594,7 +601,14 @@ mod tests {
             }
             validate_secrets(&policy, &home)
         };
-        assert!(grant(&[("TELEGRAM_BOT_TOKEN", "secret:home/telegram")]).is_ok());
+        assert!(grant(&[("OPENAI_API_KEY", "secret:home/openai")]).is_ok());
+        // A bot's token goes to an agent, never to the whole sandbox.
+        let bot = grant(&[("TELEGRAM_BOT_TOKEN", "secret:home/telegram")]).unwrap_err();
+        assert!(bot.is_refused(), "{bot}");
+        assert!(
+            bot.to_string().contains("[secrets.agents.default]"),
+            "{bot}"
+        );
         let other = grant(&[("TOKEN", "secret:lab/telegram")]).unwrap_err();
         assert!(other.is_refused(), "{other}");
         assert!(other.to_string().contains("sandbox lab"), "{other}");
@@ -615,7 +629,10 @@ mod tests {
             for (k, v) in sandbox {
                 policy.secrets.insert((*k).into(), v.parse().unwrap());
             }
-            let grants = policy.agent_secrets.entry(agent.into()).or_default();
+            let grants = policy
+                .agent_secrets
+                .entry(agent.parse().unwrap())
+                .or_default();
             for (k, v) in own {
                 grants.insert((*k).into(), v.parse().unwrap());
             }
@@ -639,12 +656,6 @@ mod tests {
         assert!(other.is_refused(), "{other}");
         let reserved = grant(&[], "main", &[("PATH", "secret:home/xy")]).unwrap_err();
         assert!(reserved.is_refused(), "{reserved}");
-        let unnamed = grant(&[], "Main_Bot", &bot).unwrap_err();
-        assert!(!unnamed.is_refused(), "{unnamed}");
-        assert!(
-            unnamed.to_string().contains("not an agent name"),
-            "{unnamed}"
-        );
     }
 
     struct Fixture {

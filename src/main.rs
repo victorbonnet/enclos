@@ -57,7 +57,7 @@ enum Command {
     Secret(cli::secret::SecretArgs),
     /// Check enclos's records against the host, or repair what it can.
     State(cli::state::StateArgs),
-    /// Install a runtime in a sandbox, or configure the sandbox's bot on a messaging channel.
+    /// Install a runtime in a sandbox, or configure an agent: its own secrets, its settings, a bot.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),

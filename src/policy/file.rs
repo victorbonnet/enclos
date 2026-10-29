@@ -58,7 +58,7 @@ fn as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::
 pub struct SecretsLayer {
     pub env: Option<std::collections::BTreeMap<String, SecretGrant>>,
     pub env_add: std::collections::BTreeMap<String, SecretGrant>,
-    pub agents: std::collections::BTreeMap<String, AgentSecretsLayer>,
+    pub agents: std::collections::BTreeMap<crate::model::agent::AgentName, AgentSecretsLayer>,
 }
 
 /// The secrets a layer grants one agent: `[secrets.agents.<agent>]`.

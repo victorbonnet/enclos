@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 
 use super::output;
-use enclos::engine::Engine;
+use enclos::engine::{ChannelRequest, Engine, Setting};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -31,23 +31,31 @@ enum RuntimeVerb {
         #[arg(long)]
         sandbox: SandboxName,
     },
-    /// Set up the sandbox's bot on a messaging channel, its token one of
-    /// the sandbox's secrets, which the policy grants.
+    /// Set an agent up with the runtime's own commands: it reads the
+    /// secrets the policy grants it under [secrets.agents.<agent>], then
+    /// each --set, then, with --channel, a bot (ADR 0036)
     Configure {
-        /// Whose bot it is: a sandbox, such as `home`, for its built-in
-        /// agent's, or one of its agents, such as `home/main`, for that
-        /// agent's own (ADR 0036).
+        /// The agent: a sandbox, such as `home`, for its built-in agent, or
+        /// one of its agents, such as `home/main`.
         target: ChannelTarget,
-        #[arg(long)]
-        channel: Channel,
-        /// The variable the policy grants the bot's token as; the
-        /// channel's usual one (TELEGRAM_BOT_TOKEN) when left out. Hermes
-        /// keeps only the usual one from the agents' commands.
-        #[arg(long, value_name = "VAR")]
+        /// A setting of the agent, as the runtime names it, such as
+        /// `platforms.discord.token=${DISCORD_BOT_TOKEN}`: a secret only as
+        /// `${VAR}`, which the policy grants the agent or the sandbox;
+        /// repeat it for each setting.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<Setting>,
+        /// A bot on this messaging channel, its token a secret the policy
+        /// grants the agent.
+        #[arg(long, requires = "allow_user")]
+        channel: Option<Channel>,
+        /// With --channel: the variable the policy grants the bot's token
+        /// as; the channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
+        /// Hermes keeps only the usual one from the agents' commands.
+        #[arg(long, value_name = "VAR", requires = "channel")]
         token_env: Option<String>,
-        /// Someone the bot answers: a Telegram user's numeric id; repeat it
-        /// for each person.
-        #[arg(long = "allow-user", value_name = "ID", required = true)]
+        /// With --channel: someone the bot answers, a Telegram user's
+        /// numeric id; repeat it for each person.
+        #[arg(long = "allow-user", value_name = "ID", requires = "channel")]
         allow_user: Vec<ChannelUser>,
     },
 }
@@ -57,11 +65,17 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
         RuntimeVerb::Install { runtime, sandbox } => (runtime, sandbox),
         RuntimeVerb::Configure {
             target,
+            set,
             channel,
             token_env,
             allow_user,
         } => {
-            return configure(engine, by, confirm, target, channel, token_env, &allow_user);
+            let channel = channel.map(|channel| ChannelRequest {
+                channel,
+                token: token_env,
+                answers: allow_user,
+            });
+            return configure(engine, by, confirm, target, channel, &set);
         }
     };
     let end = match engine.install_runtime(by, &sandbox, runtime, confirm)? {
@@ -158,53 +172,56 @@ fn configure(
     by: &Actor,
     confirm: Confirm,
     target: ChannelTarget,
-    channel: Channel,
-    token: Option<String>,
-    answers: &[ChannelUser],
+    channel: Option<ChannelRequest>,
+    settings: &[Setting],
 ) -> Result<u8> {
     let ChannelTarget { sandbox, agent } = target;
-    let set = match engine.configure_channel(
-        by,
-        &sandbox,
-        agent.as_ref(),
-        channel,
-        token,
-        answers,
-        confirm,
-    )? {
-        Planned::DryRun(plan) => {
-            output::show_plan(&plan);
-            return Ok(exit::OK);
-        }
-        Planned::Done(set) => set,
-    };
-    let shown = channel.display_name();
+    let done =
+        match engine.configure_agent(by, &sandbox, agent.as_ref(), channel, settings, confirm)? {
+            Planned::DryRun(plan) => {
+                output::show_plan(&plan);
+                return Ok(exit::OK);
+            }
+            Planned::Done(done) => done,
+        };
+    let agent = &done.agent;
     if output::json() {
         output::emit(&json!({
             "sandbox": sandbox.to_string(),
-            "agent": set.agent.to_string(),
-            "channel": channel.to_string(),
-            "token_variable": set.token.to_string(),
-            "answers": set.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "reachable": set.reachable,
-            "host": channel.host(),
+            "agent": agent.to_string(),
+            "settings": done.settings,
+            "channel": done.channel.as_ref().map(|bot| json!({
+                "channel": bot.channel.to_string(),
+                "token_variable": bot.token,
+                "answers": bot.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "reachable": bot.reachable,
+                "host": bot.channel.host(),
+            })),
         }));
         return Ok(exit::OK);
     }
     println!(
-        "Agent {sandbox}/{}'s {shown} bot is set up: its token is read from ${}, which the policy grants that agent, as its service starts, and it answers {} user(s). A running service restarts with it.",
-        set.agent,
-        set.token,
-        set.answers.len()
+        "Agent {sandbox}/{agent} reads the secrets the policy grants it under [secrets.agents.{agent}], from its services' next start."
     );
-    if !set.reachable {
+    if !done.settings.is_empty() {
+        println!("Set: {}.", done.settings.join(", "));
+    }
+    if let Some(bot) = &done.channel {
         println!(
-            "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
-            host = channel.host(),
+            "Its {} bot is set up: its token is read from ${}, and it answers {} user(s).",
+            bot.channel.display_name(),
+            bot.token,
+            bot.answers.len()
         );
+        if !bot.reachable {
+            println!(
+                "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
+                host = bot.channel.host(),
+            );
+        }
     }
     println!(
-        "If the sandbox is not started, start it with `enclos sandbox start {sandbox}`; then send the bot a message."
+        "A running service restarts with it; if the sandbox is not started, start it with `enclos sandbox start {sandbox}`."
     );
     Ok(exit::OK)
 }

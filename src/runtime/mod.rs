@@ -192,8 +192,8 @@ pub trait RuntimeAdapter {
     fn create_agent(&self, name: &AgentName) -> SandboxCommand;
     /// The runtime's own commands run in the sandbox right after
     /// [`create_agent`](Self::create_agent) made `name`, such as undoing
-    /// what it copied from another agent that is that agent's alone. `None`
-    /// to run (the default): nothing.
+    /// what it copied from another agent that is that agent's alone. An
+    /// empty list (the default): nothing to run.
     fn after_create_agent(&self, _name: &AgentName) -> Vec<SandboxCommand> {
         Vec::new()
     }
@@ -266,23 +266,41 @@ pub trait RuntimeAdapter {
     ) -> Option<(HomePath, &'static str)> {
         None
     }
-    /// The runtime's own commands that set up `agent`'s bot on `channel`,
-    /// run in the sandbox by `enclos runtime configure`: its token read
-    /// from the variable `token`, which the policy grants that agent (ADR
-    /// 0036) and which reaches it through `secrets_file`, the file
-    /// `enclos launch` writes its grants to while the services run, so that
-    /// enclos hands the runtime where the token is, never its value (ADR
-    /// 0022); and the people it answers. The people it answers come first
-    /// and the channel is turned on last, so a run that fails turns no bot
-    /// on. `None`: the runtime has no such channel.
-    fn channel(
+    /// The runtime's own commands that make `agent` read the secrets the
+    /// policy grants it from `secrets_file`, the file `enclos launch` writes
+    /// them to while the services run (ADR 0036), run in the sandbox by
+    /// `enclos runtime configure`. `None`: the runtime gives no agent
+    /// secrets of its own.
+    fn agent_secrets_source(
         &self,
-        _channel: Channel,
         _agent: &RuntimeAgentName,
-        _token: &str,
-        _answers: &[ChannelUser],
         _secrets_file: &Path,
     ) -> Option<Vec<SandboxCommand>> {
+        None
+    }
+    /// The runtime's own command that sets `agent`'s setting `key` to
+    /// `value`, as written: a secret there is a `${VAR}`, which the runtime
+    /// resolves from the agent's secrets, so that enclos hands it a name,
+    /// never a value (ADR 0022). `None`: the runtime has no such command.
+    fn set_setting(
+        &self,
+        _agent: &RuntimeAgentName,
+        _key: &str,
+        _value: &str,
+    ) -> Option<SandboxCommand> {
+        None
+    }
+    /// The settings that set up a bot on `channel`, in order, for
+    /// [`set_setting`](Self::set_setting): its token read from the variable
+    /// `token` as `${token}`, and the people it answers. The people it
+    /// answers come first and the channel is turned on last, so a run that
+    /// fails turns no bot on. `None`: the runtime has no such channel.
+    fn channel_settings(
+        &self,
+        _channel: Channel,
+        _token: &str,
+        _answers: &[ChannelUser],
+    ) -> Option<Vec<(String, String)>> {
         None
     }
 
