@@ -175,6 +175,31 @@ pub enum Error {
         file.display()
     )]
     PendingFileDiffers { sandbox: String, file: PathBuf },
+    #[error(
+        "sandbox `{sandbox}` has no policy v{version}: its versions are v1 to v{last}. `enclos policy history {sandbox}` lists them"
+    )]
+    NoSuchPolicyVersion {
+        sandbox: String,
+        version: u32,
+        last: u32,
+    },
+    /// `policy.toml` holds an edit not applied, which rollback or refresh
+    /// would overwrite.
+    #[error(
+        "{} holds an edit not applied, which `{command}` would overwrite. Apply it with `enclos policy edit {sandbox}` (closing the editor applies the file as it is), or drop it with `enclos policy discard {sandbox}`, which also drops a pending change; then run `{command}` again",
+        file.display()
+    )]
+    PolicyFileEdited {
+        sandbox: String,
+        file: PathBuf,
+        command: String,
+    },
+    /// The policy changed between what a command listed and the lock it
+    /// makes its change under.
+    #[error(
+        "the policy of sandbox `{sandbox}` changed while this command ran, so it changed nothing. Run it again: it lists what it would change from the policy as it is now"
+    )]
+    PolicyChangedMeanwhile { sandbox: String },
     /// A command that resolves `policy.toml` on its own, refused while a
     /// change waits: it would put the pending change in force without the
     /// restart it needs.
@@ -272,6 +297,9 @@ impl Error {
             | Error::PolicyFileChanged { .. }
             | Error::PendingFileDiffers { .. }
             | Error::PolicyPending { .. }
+            | Error::NoSuchPolicyVersion { .. }
+            | Error::PolicyFileEdited { .. }
+            | Error::PolicyChangedMeanwhile { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use toml_edit::{Array, DocumentMut, Item, Table};
 
 use super::Engine;
-use super::pending::{Recorded, Restarted};
+use super::pending::{Change, Recorded, Restarted};
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -51,8 +51,8 @@ pub struct PolicyApplied {
     pub changed: bool,
     /// What the change does besides the entry asked for, one sentence each:
     /// edits to `policy.toml` not applied yet, or a newer template or
-    /// built-in defaults. For `policy edit`, everything it changes from the
-    /// active policy.
+    /// built-in defaults. For `policy edit`, `rollback` and `refresh`,
+    /// everything it changes from the active policy.
     pub also: Vec<String>,
     pub outcome: ChangeOutcome,
 }
@@ -197,8 +197,15 @@ impl Engine {
                 if confirm == Confirm::Ask && !plan.also.is_empty() {
                     return Err(needs_confirmation(&entry, &plan.also));
                 }
-                let mut recorded =
-                    self.propose(lock, by, name, &overrides, &snapshot, Some(&entry))?;
+                let mut recorded = self.propose(
+                    lock,
+                    by,
+                    name,
+                    Change {
+                        entry: Some(&entry),
+                        ..Change::edit(&overrides, &snapshot)
+                    },
+                )?;
                 recorded.applied.also = plan.also;
                 Ok(recorded)
             },
@@ -241,19 +248,6 @@ impl Engine {
         })
     }
 
-    /// Resolves and checks `overrides`, writes them to `policy.toml`, then
-    /// records the snapshot as the active version.
-    pub(super) fn save_policy(
-        &self,
-        lock: &StateLock,
-        by: &Actor,
-        name: &SandboxName,
-        overrides: &str,
-    ) -> Result<PolicyVersion> {
-        let snapshot = self.checked_policy(name, overrides)?;
-        self.store_policy(lock, by, name, overrides, &snapshot)
-    }
-
     /// Resolves and checks `overrides` with `runtime`'s endpoints instead of
     /// the installed runtime's, writes them to `policy.toml`, then records
     /// the snapshot as the active version: while a runtime installs, before
@@ -267,7 +261,7 @@ impl Engine {
         runtime: Option<RuntimeKind>,
     ) -> Result<PolicyVersion> {
         let snapshot = self.checked_policy_with(name, overrides, runtime.map(adapter_layer))?;
-        self.store_policy(lock, by, name, overrides, &snapshot)
+        self.store_policy(lock, by, name, overrides, &snapshot, None)
     }
 
     /// `overrides` resolved and validated for this sandbox.
@@ -300,6 +294,7 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
         snapshot: &PolicySnapshot,
+        restores: Option<u32>,
     ) -> Result<PolicyVersion> {
         // A sandbox being created has no file yet: nothing to put back.
         let previous = match self.layout.read_policy(name.as_str()) {
@@ -320,7 +315,7 @@ impl Engine {
         {
             return Ok(active);
         }
-        match self.state.save_policy(lock, name, snapshot, by, None) {
+        match self.state.save_policy(lock, name, snapshot, by, restores) {
             Ok(version) => Ok(version),
             Err(e) => Err(match previous {
                 Some(previous) => self.restore_policy(name, &previous, e.into()),

@@ -91,9 +91,16 @@ pub trait StateStore: NetLogStore {
     ) -> Result<PolicyVersion>;
     /// The sandbox's active policy version and its snapshot.
     fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
+    /// Version `number` of the sandbox's policy and its snapshot.
+    fn policy_version(
+        &self,
+        name: &SandboxName,
+        number: u32,
+    ) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
     /// Makes `pending` the sandbox's pending policy, in place of any other;
     /// with `active`, that becomes a new active version first, in the same
-    /// transaction (design §7).
+    /// transaction (design §7). `restores` is the version a pending
+    /// rollback restores, which the version applying it records.
     fn save_pending(
         &self,
         lock: &StateLock,
@@ -101,6 +108,7 @@ pub trait StateStore: NetLogStore {
         pending: &PolicySnapshot,
         active: Option<&PolicySnapshot>,
         by: &Actor,
+        restores: Option<u32>,
     ) -> Result<(Option<PolicyVersion>, PendingPolicy)>;
     /// The sandbox's pending policy and its snapshot.
     fn pending_policy(&self, name: &SandboxName)

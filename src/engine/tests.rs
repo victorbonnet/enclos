@@ -1464,7 +1464,9 @@ mod runtime {
                     record.runtime = Some(RuntimeKind::Hermes);
                     engine.state.put(lock, &record)?;
                     let overrides = engine.layout.read_policy("home")?;
-                    engine.save_policy(lock, &alice(), &name, &overrides)
+                    engine.checked_policy(&name, &overrides).and_then(|s| {
+                        engine.store_policy(lock, &alice(), &name, &overrides, &s, None)
+                    })
                 },
             )
             .unwrap();
@@ -1507,7 +1509,9 @@ mod runtime {
                     |_| String::new(),
                     |lock| {
                         let overrides = engine.layout.read_policy("home")?;
-                        engine.save_policy(lock, &alice(), &name, &overrides)
+                        engine.checked_policy(&name, &overrides).and_then(|s| {
+                            engine.store_policy(lock, &alice(), &name, &overrides, &s, None)
+                        })
                     },
                 )
                 .unwrap();
@@ -6207,4 +6211,5 @@ mod listener {
     }
 }
 
+mod history;
 mod pending;
