@@ -130,8 +130,10 @@ pub fn remove(dir: &Path, root: &ProcessRef) -> io::Result<()> {
 /// The processes holding each named marker in `dir`, by file name, of those
 /// `lsof` can see (the user's; root's are not listed).
 pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
-    // No folder yet is no marker; a folder that cannot be read is not.
-    match std::fs::metadata(dir) {
+    // No folder yet is no marker; a folder that cannot be read is not: read
+    // here, since `lsof -w` hides its own failure to open the folder and
+    // answers as for one with nothing held.
+    match std::fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
         Ok(_) => {}

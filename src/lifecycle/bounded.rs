@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 /// this is reached only by one that hangs.
 pub const LIMIT: Duration = Duration::from_secs(5);
 
-/// `command`'s output, its input closed; past `limit`, it is ended (it is
-/// this process's own child) and the error says it did not answer.
+/// `command`'s output, its input closed; past `limit`, it is sent KILL (it
+/// is this process's own child), reaped apart, and the error says it did
+/// not answer.
 pub fn output_within(command: &mut Command, limit: Duration) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
@@ -46,8 +47,10 @@ pub fn output_within(command: &mut Command, limit: Duration) -> io::Result<Outpu
             break status;
         }
         if started.elapsed() >= limit {
+            // Not waited for here: one stuck in a call that does not end on
+            // KILL (a network mount) would hold the caller with it.
             let _ = child.kill();
-            let _ = child.wait();
+            std::thread::spawn(move || child.wait());
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("did not answer within {} s", limit.as_secs()),
