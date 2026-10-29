@@ -56,9 +56,11 @@ impl HomeFile {
 pub struct SandboxCommand(Vec<OsString>);
 
 /// `word` as a shell reads it back: quoted when it holds anything a shell
-/// would read otherwise, such as `${VAR}`, which it would expand.
+/// would read otherwise, such as `${VAR}`, which it would expand, or starts
+/// with `=`, which zsh expands to a command's path.
 fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
+        && !word.starts_with('=')
         && word
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
@@ -204,6 +206,13 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
+    /// The variable naming a folder whose `.env` the runtime's services
+    /// read into their own process: their secrets go there, not into their
+    /// environment, which any process of the user can read (ADR 0034).
+    /// `None` (the default): they get their secrets as variables.
+    fn secrets_folder_var(&self) -> Option<&'static str> {
+        None
+    }
     /// Files in the home the services read only as they start, for the
     /// built-in agent and `agents` (ADR 0031).
     fn settings_files(&self, _agents: &[RuntimeAgentName]) -> Vec<HomePath> {
@@ -236,6 +245,14 @@ pub trait RuntimeAdapter {
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
+        None
+    }
+    /// The file in the home where the runtime's own setup keeps a bot's
+    /// token for `channel` in plain text, as a `.env` line of the variable
+    /// it names: `runtime configure` refuses while it holds one, so that the
+    /// token the runtime's own setup writes for the built-in agent does not
+    /// sit readable in the home (ADR 0022). `None`: no such file.
+    fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
         None
     }
     /// The runtime's own commands that set up the sandbox's bot on

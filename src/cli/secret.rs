@@ -115,7 +115,7 @@ fn read_value(secret: &SecretRef) -> Result<SecretValue> {
             }
             Typed::TooLong => {
                 return Err(refused(&format!(
-                    "a value typed at a terminal is at most {MAX_TYPED} bytes; pipe a longer one in"
+                    "a value typed at a terminal is at most {MAX_TYPED} bytes"
                 )));
             }
             Typed::Control(key) => {

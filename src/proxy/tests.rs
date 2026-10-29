@@ -1260,36 +1260,53 @@ fn a_client_done_before_it_sent_anything_still_gets_the_servers_answer() {
     );
 }
 
+/// For a host name, a hello naming no server, or under ECH another, is
+/// closed, and nothing goes up (design §6).
 #[test]
-fn a_hello_with_no_name_or_ech_with_another_goes_through_and_one_with_its_own_is_checked() {
-    for (name, encrypted, seen) in [
-        (None, false, NameSeen::NoName),
+fn a_hello_with_no_name_or_ech_with_another_is_closed() {
+    for (name, encrypted, seen, reason) in [
+        (None, false, NameSeen::NoName, Reason::NoServerName),
         (
             Some("public.example.net"),
             true,
             NameSeen::Encrypted {
                 public: Some("public.example.net".into()),
             },
-        ),
-        // Browsers send an ECH extension of no use (GREASE) with the name
-        // they ask for: it is compared.
-        (
-            Some("api.example.com"),
-            true,
-            NameSeen::Name("api.example.com".into()),
+            Reason::EncryptedHello,
         ),
     ] {
         let (port, received) = upstream(b"pong");
         let proxy = api(port);
         let mut conn = tunnel(&proxy, "api.example.com", port);
-        let hello = hello::client_hello_bytes(name, encrypted, 16_384);
-        conn.write_all(&hello).unwrap();
-        assert_eq!(received.recv_timeout(PATIENCE).unwrap(), hello);
-        drop(conn);
+        conn.write_all(&hello::client_hello_bytes(name, encrypted, 16_384))
+            .unwrap();
+        assert!(closed_soon(&mut conn).is_empty());
+        assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
         let e = closed(&proxy);
-        assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None), "{seen:?}");
-        assert_eq!(e.name_seen, Some(seen));
+        assert_eq!(
+            (e.verdict, e.reason, e.name_seen, e.bytes_up),
+            (Verdict::Denied, Some(reason), Some(seen), 0)
+        );
     }
+}
+
+/// Browsers send an ECH extension of no use (GREASE) with the name they ask
+/// for: it is compared, and goes through.
+#[test]
+fn a_hello_with_ech_and_its_own_name_is_checked_and_goes_through() {
+    let (port, received) = upstream(b"pong");
+    let proxy = api(port);
+    let mut conn = tunnel(&proxy, "api.example.com", port);
+    let hello = hello::client_hello_bytes(Some("api.example.com"), true, 16_384);
+    conn.write_all(&hello).unwrap();
+    assert_eq!(
+        received.recv_timeout(PATIENCE).unwrap(),
+        hello
+    );
+    drop(conn);
+    let e = closed(&proxy);
+    assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None));
+    assert_eq!(e.name_seen, Some(NameSeen::Name("api.example.com".into())));
 }
 
 #[test]
