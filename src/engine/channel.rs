@@ -67,6 +67,24 @@ impl Engine {
                 ),
             });
         };
+        // A token the runtime's own setup wrote in plain text in the home,
+        // which any agent there reads: refused until it is removed.
+        if let Some((file, variable)) = runtime.channel_token_file(channel) {
+            let home = self.layout.sandbox_home(name.as_str());
+            let text = crate::runtime::home::read_text(&home, &file, 1 << 20).map_err(|e| {
+                Error::Session {
+                    what: format!("cannot look for a plain bot token in {file}: {e}"),
+                }
+            })?;
+            if text.is_some_and(|t| holds_variable(&t, variable)) {
+                return Err(Error::Session {
+                    what: format!(
+                        "{file} in sandbox {name} holds {variable} in plain text, as {shown}'s own setup writes it, where every agent of the sandbox reads it: remove that line ({}), then run `enclos runtime configure` again, which gives the token from the Keychain",
+                        home.join(file.as_path()).display()
+                    ),
+                });
+            }
+        }
         let view = self.policy(name)?;
         if !view.snapshot.policy.secrets.contains_key(&token) {
             let pending = view
@@ -82,6 +100,16 @@ impl Engine {
                         "the policy of sandbox {name} gives it no ${token}, the bot's token: store the token with `enclos secret set {name}/{channel}`, then with `enclos policy edit {name}` add `{token} = \"secret:{name}/{channel}\"` to the `env` of its [secrets] section"
                     ),
                 },
+            });
+        }
+        // The channel's usual variable, granted too, is the one the runtime
+        // reads first: the bot would be that token's, not `token`'s.
+        let usual = channel.token_variable();
+        if token != usual && view.snapshot.policy.secrets.contains_key(usual) {
+            return Err(Error::Session {
+                what: format!(
+                    "the policy of sandbox {name} also gives it ${usual}, which {shown} reads for the bot before ${token}, so the bot would be the one ${usual} names: take ${usual} out of its [secrets], or set the bot up with it (no --token-env)"
+                ),
             });
         }
         let reachable = Destination::parse(channel.host(), 443)
@@ -146,4 +174,34 @@ fn unreachable(name: &SandboxName, channel: Channel) -> String {
         "find that the policy does not let the bot reach {host}: allow it with `enclos policy allow {name} {host}`",
         host = channel.host()
     )
+}
+
+/// Whether the `.env` text `text` sets `variable` to something: a line
+/// `variable=...` or `export variable=...`, with a value that is not empty.
+fn holds_variable(text: &str, variable: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        line.strip_prefix(variable)
+            .and_then(|rest| rest.trim_start().strip_prefix('='))
+            .is_some_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "\"\"" && value != "''"
+            })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::holds_variable;
+
+    #[test]
+    fn a_dotenv_line_setting_the_variable_is_found() {
+        for set in ["T=abc", "  T = abc", "export T=\"abc\"", "a=1\nT='x'\n"] {
+            assert!(holds_variable(set, "T"), "{set:?}");
+        }
+        for unset in ["", "T=", "T=\"\"", "# T=abc", "TT=abc", "AT=abc", "T_X=abc"] {
+            assert!(!holds_variable(unset, "T"), "{unset:?}");
+        }
+    }
 }

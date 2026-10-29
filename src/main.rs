@@ -110,7 +110,10 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err}");
+            // Not `eprintln!`, which panics when stderr is closed (`2>&1 |
+            // head`), and would exit 101 rather than with the error's code.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "error: {err}");
             ExitCode::from(match exec {
                 true => exit::EXEC_FAILED,
                 false => err.exit_code(),
@@ -153,9 +156,9 @@ fn run(cli: Cli) -> Result<u8> {
 
 /// Whether a reader that left early, as `head` does, ends `command` as it
 /// ends any Unix tool, by SIGPIPE, not by a panic on the next print. Not for
-/// those that run the user's or a runtime's programs (`connect`, `runtime`,
-/// `agent`), keep running (`proxy`, `launch`), or handle a closed output
-/// themselves (`logs`).
+/// those that run the user's or a runtime's programs (`connect`, `exec`,
+/// `runtime`, `agent`), keep running (`proxy`, `launch`), or handle a closed
+/// output themselves (`logs`).
 fn ends_on_closed_output(command: &Command) -> bool {
     matches!(
         command,

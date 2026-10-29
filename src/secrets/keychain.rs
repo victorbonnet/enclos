@@ -3,9 +3,9 @@
 //! `<sandbox>/<name>`.
 //!
 //! An item `security` adds trusts `security` itself, so reading it back
-//! through `security` asks nothing, whichever program runs it, a service
-//! started by launchd included, and whatever enclos's own code signature is
-//! after an upgrade. Any program of the user can read it the same way: the
+//! through `security` asks nothing, whichever program runs it: shown for
+//! `exec` across two builds of enclos with different code signatures; for
+//! a service launchd starts, still to verify (design §14). Any program of the user can read it the same way: the
 //! Keychain keeps secrets away from sandboxes, which reach neither the
 //! security daemon nor the keychain files (design §5), not from the user's
 //! other programs (ADR 0014).
@@ -37,6 +37,11 @@ const NOT_FOUND: i32 = 44;
 /// How long a call to `security` may take: long past any answer, short of
 /// a wait on a dialog nobody sees.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// How long the look at whether the keychain is locked may take: it answers
+/// at once in a login session (exit 152 on macOS 26.5.2), but waits on a
+/// dialog where no session can show one, as on CI's runners, which a
+/// service must not wait out.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
 /// The longest line `security -i` reads as one command, its line ending
 /// included (macOS 26.5.2: a longer one runs as two).
 const MAX_LINE: usize = 4095;
@@ -88,6 +93,37 @@ impl Keychain {
         SecretError {
             what: format!("cannot {what} secret {secret} in the Keychain: {why}"),
             untouched: false,
+        }
+    }
+
+    /// Whether the keychain can be read without a dialog: `security
+    /// show-keychain-info` fails on a locked keychain, at once in a login
+    /// session (exit 152 on macOS 26.5.2, "Unable to obtain
+    /// authorization"); where it waits instead, as with no session to show
+    /// a dialog in, past [`LOCK_WAIT`] counts as locked too.
+    fn check_unlocked(&self) -> Result<(), SecretError> {
+        let which = match &self.file {
+            Some(file) => format!("keychain {}", file.display()),
+            None => "default keychain".to_owned(),
+        };
+        let fail = |why: String| SecretError {
+            what: format!("the {which} cannot be read without asking: {why}"),
+            untouched: true,
+        };
+        let out = run_for(
+            Command::new(SECURITY)
+                .arg("show-keychain-info")
+                .args(self.file_args()),
+            None,
+            LOCK_WAIT,
+        )
+        .map_err(|e| fail(format!("it is locked, or waits to be unlocked ({e})")))?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(fail(format!(
+                "it is locked ({})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
         }
     }
 
@@ -287,6 +323,10 @@ impl SecretStore for Keychain {
             .iter()
             .map(|f| (KEYCHAIN_VAR.to_owned(), f.display().to_string()))
             .collect()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        self.check_unlocked()
     }
 }
 
@@ -592,6 +632,41 @@ mod tests {
                 .arg(&self.file)
                 .status();
         }
+    }
+
+    /// A locked keychain is told apart, with no dialog, by the same call a
+    /// service makes before reading its secrets, and in no more than its
+    /// own short wait.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_locked_keychain_is_found_without_a_dialog() {
+        let keychain = ThrowawayKeychain::new();
+        let store = Keychain::new("enclos.test".into(), Some(keychain.file.clone()));
+        store.readable().unwrap();
+        let file = keychain.file.to_str().unwrap();
+        let security = |args: &[&str]| {
+            assert!(
+                Command::new(SECURITY)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        security(&["lock-keychain", file]);
+        let asked = std::time::Instant::now();
+        let err = store.readable().unwrap_err();
+        // At once in a login session; within the look's own wait where
+        // `security` waits on a dialog no session shows, as on CI.
+        assert!(
+            asked.elapsed() < LOCK_WAIT + Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(err.untouched);
+        assert!(err.what.contains("locked"), "{}", err.what);
+        security(&["unlock-keychain", "-p", "test", file]);
+        store.readable().unwrap();
     }
 
     #[cfg(target_os = "macos")]

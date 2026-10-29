@@ -36,14 +36,25 @@ pub enum Reason {
     /// whatever its destination: nothing to allow.
     PolicyUnreadable,
     /// Allowed, then closed by the proxy: no byte moved either way, or a
-    /// peer read nothing, for the idle limit (design §6).
+    /// peer read nothing, for the idle limit, or the client's first bytes
+    /// did not show a whole hello within 30 seconds (design §6).
     Idle,
     /// A tunnel whose TLS ClientHello asks for another server than the
     /// host it was opened for: closed by the server name check (design §6).
     NameMismatch,
-    /// A tunnel whose first bytes start a TLS handshake that does not read
-    /// as a ClientHello: closed, since the name it asks for is unknown.
+    /// A tunnel whose first bytes start a TLS record, or an SSLv2-format
+    /// hello, but do not read cleanly as one ClientHello within 64 KiB:
+    /// closed, since a server could read a name the proxy cannot.
     HelloUnreadable,
+    /// A tunnel opened for a host name whose TLS ClientHello names no
+    /// server: closed, since it would reach whichever site the address
+    /// serves by default (design §6). A tunnel opened for an address is not
+    /// refused for this: a client names no server for an address.
+    NoServerName,
+    /// A tunnel whose TLS ClientHello carries Encrypted Client Hello with a
+    /// visible name other than its host, or none: closed, since the name it
+    /// asks for cannot be compared (design §6).
+    EncryptedHello,
 }
 
 impl Reason {
@@ -59,6 +70,8 @@ impl Reason {
             Reason::Idle => "idle",
             Reason::NameMismatch => "name-mismatch",
             Reason::HelloUnreadable => "hello-unreadable",
+            Reason::NoServerName => "no-server-name",
+            Reason::EncryptedHello => "encrypted-hello",
         }
     }
 
@@ -73,7 +86,9 @@ impl Reason {
             Reason::PolicyUnreadable
             | Reason::BadRequest
             | Reason::NameMismatch
-            | Reason::HelloUnreadable => true,
+            | Reason::HelloUnreadable
+            | Reason::NoServerName
+            | Reason::EncryptedHello => true,
             Reason::NotAllowed
             | Reason::BlockedAddress
             | Reason::PrivateAddress
@@ -83,7 +98,7 @@ impl Reason {
         }
     }
 
-    const ALL: [Reason; 10] = [
+    const ALL: [Reason; 12] = [
         Reason::NotAllowed,
         Reason::BlockedAddress,
         Reason::PrivateAddress,
@@ -94,6 +109,8 @@ impl Reason {
         Reason::Idle,
         Reason::NameMismatch,
         Reason::HelloUnreadable,
+        Reason::NoServerName,
+        Reason::EncryptedHello,
     ];
 }
 
@@ -254,6 +271,8 @@ mod tests {
                 Reason::Idle => 7,
                 Reason::NameMismatch => 8,
                 Reason::HelloUnreadable => 9,
+                Reason::NoServerName => 10,
+                Reason::EncryptedHello => 11,
             }
         }
         for (i, reason) in Reason::ALL.into_iter().enumerate() {

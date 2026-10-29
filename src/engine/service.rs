@@ -525,7 +525,7 @@ impl Engine {
             args: args.to_vec(),
             // Read on the host, as the service starts, never written to the
             // service manager's file (ADR 0022).
-            env: self.secret_env(&snapshot.policy)?,
+            env: self.service_secrets(name, kind, service, &snapshot.policy)?,
             // Even when `enclos launch` is run by hand in a terminal: a
             // service outlives it.
             in_terminal: false,

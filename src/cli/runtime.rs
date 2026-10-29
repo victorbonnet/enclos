@@ -33,16 +33,17 @@ enum RuntimeVerb {
     /// the sandbox's secrets, which the policy grants.
     Configure {
         /// The sandbox, such as `home`. A bot of one agent's own
-        /// (`home/main`) is not possible with Hermes's gateway yet.
+        /// (`home/main`) is refused for now (ADR 0032, proposed).
         target: ChannelTarget,
         #[arg(long)]
         channel: Channel,
         /// The variable the policy grants the bot's token as; the
-        /// channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
+        /// channel's usual one (TELEGRAM_BOT_TOKEN) when left out. Hermes
+        /// keeps only the usual one from the agents' commands.
         #[arg(long, value_name = "VAR")]
         token_env: Option<String>,
-        /// Someone the bot answers: a Telegram user's numeric id; give it
-        /// once per person.
+        /// Someone the bot answers: a Telegram user's numeric id; repeat it
+        /// for each person.
         #[arg(long = "allow-user", value_name = "ID", required = true)]
         allow_user: Vec<ChannelUser>,
     },
@@ -139,7 +140,7 @@ fn configure(
                     "the sandbox's bot is agent {agent}'s already: set it up with `enclos runtime configure {sandbox} --channel {channel} ...`"
                 ),
                 false => format!(
-                    "enclos does not set up a bot of agent {agent}'s own: Hermes's gateway gives an agent other than the built-in one no token from its environment by the means it meant for tokens, and enclos keeps secrets out of the sandbox home (ADR 0022). Set up the sandbox's bot with `enclos runtime configure {sandbox} --channel {channel} ...`; see ADR 0032 (proposed)"
+                    "enclos does not set up a bot of agent {agent}'s own yet: a sandbox has one bot per channel, its built-in agent's (ADR 0032, proposed), until it is shown that Hermes's gateway gives another agent its own token (design §14). Set up the sandbox's bot with `enclos runtime configure {sandbox} --channel {channel} ...`"
                 ),
             },
         });
