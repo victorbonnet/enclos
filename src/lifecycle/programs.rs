@@ -57,7 +57,7 @@ fn whole(
     if !left.is_empty() {
         let pids: Vec<String> = left.iter().map(ToString::to_string).collect();
         return Err(ProgramsError(format!(
-            "{}, and its listing left out processes of this user it could read: {}",
+            "{status}, then {} looked at again, and its listings left out processes of this user it could read: {}",
             again.status,
             pids.join(", ")
         )));
@@ -85,13 +85,7 @@ fn list(only: Option<&[u32]>) -> Result<Listing, ProgramsError> {
     let out =
         super::bounded::output_within(lsof.args(["-d", "txt", "-Fpn"]), super::bounded::LIMIT)
             .map_err(|e| ProgramsError(e.to_string()))?;
-    // Asked for some processes, `lsof` lists none, and exits 1 saying
-    // nothing, when every one has gone.
-    let none_left = only.is_some()
-        && out.status.code() == Some(1)
-        && out.stdout.is_empty()
-        && out.stderr.is_empty();
-    let files = match none_left {
+    let files = match only.is_some() && all_gone(&out) {
         true => BTreeMap::new(),
         false => parse(&out)?,
     };
@@ -190,10 +184,19 @@ pub fn lsof_name(path: &Path) -> String {
     name
 }
 
+/// Asked for some processes (`-a -p`), `lsof` lists none, and exits 1
+/// saying nothing, when every one has gone; anything on stderr is a
+/// failure.
+fn all_gone(out: &Output) -> bool {
+    out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty()
+}
+
 /// What `lsof -d txt -Fpn` answered: a `p<pid>` line for each process, then
-/// an `n<name>` line for each of its program files. `lsof` itself is always
-/// listed, so an empty answer is a failure; it exits 1 when a process it
-/// listed went away meanwhile, which is not.
+/// an `n<name>` line for each of its program files. In a listing of every
+/// process `lsof` itself is listed, so an empty answer is a failure; asked
+/// for some processes, one that lists none is told apart first
+/// ([`all_gone`]). It exits 1 when a process it listed went away meanwhile,
+/// which is not.
 fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
     let text = String::from_utf8_lossy(&out.stdout);
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
@@ -380,9 +383,20 @@ pub(crate) mod tests {
         let (found, _) = check(&[], &[13]);
         let err = found.unwrap_err().to_string();
         assert!(
-            err.contains("left out processes of this user it could read: 13"),
+            err.contains("then exit status: 0 looked at again, and its listings left out processes of this user it could read: 13"),
             "{err}"
         );
+    }
+
+    /// Only an answer with nothing on stdout or stderr, exiting 1, says
+    /// every process asked for has gone.
+    #[test]
+    fn only_a_silent_empty_answer_says_all_have_gone() {
+        assert!(all_gone(&output(1, "", "")));
+        assert!(!all_gone(&output(1, "", "lsof: can't read")));
+        assert!(!all_gone(&output(0, "", "")));
+        assert!(!all_gone(&output(1, "p10\n", "")));
+        assert!(parse(&output(1, "", "lsof: can't read")).is_err());
     }
 
     /// Asked again for processes that have all gone, `lsof` lists none and
