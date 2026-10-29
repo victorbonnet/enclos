@@ -91,7 +91,7 @@ pub struct Compiled {
 }
 
 /// A program to run inside a sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Launch {
     pub program: OsString,
     pub args: Vec<OsString>,

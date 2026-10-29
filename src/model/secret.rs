@@ -137,9 +137,18 @@ impl fmt::Display for SecretGrant {
 }
 
 /// A secret's value: text an environment variable can hold, never empty.
-/// Nothing prints it: its `Debug` shows only that there is one.
-#[derive(Clone, PartialEq, Eq)]
+/// Nothing prints it: its `Debug` shows only that there is one. Not
+/// `Clone`, and its text is overwritten with zeros when it is dropped; the
+/// copies others make, such as a child's environment or a pipe's buffer,
+/// are not.
+#[derive(PartialEq, Eq)]
 pub struct SecretValue(String);
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidSecretValue {
@@ -194,6 +203,8 @@ pub fn reserved_variable(name: &str) -> bool {
         "UV_CACHE_DIR",
         "npm_config_cache",
         "NODE_USE_ENV_PROXY",
+        // Where Hermes's services find their secrets (ADR 0034).
+        "HERMES_MANAGED_DIR",
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",

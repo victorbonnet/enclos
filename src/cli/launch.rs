@@ -20,7 +20,17 @@ pub struct LaunchArgs {
 
 /// Runs one of the runtime's services in the sandbox until it exits.
 pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
-    let end = engine.launch(by, &args.sandbox, &args.service)?;
+    let end = match engine.launch(by, &args.sandbox, &args.service) {
+        Ok(end) => end,
+        // Exits 0, so that the service manager does not start it again to
+        // meet the same locked keychain every few seconds: the sandbox is
+        // marked failed, saying why, until `sandbox start`.
+        Err(e) if matches!(e.root(), Error::SecretsLocked { .. }) => {
+            let _ = writeln!(io::stderr(), "error: {e}");
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
     // Into the service's log, which `enclos logs` shows.
     super::connect::report_end(&args.sandbox, &end);
     Ok(service_exit(&end))

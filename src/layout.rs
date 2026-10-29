@@ -175,6 +175,14 @@ impl Layout {
         self.sandboxes_dir().join(name)
     }
 
+    /// Where a runtime that reads its secrets from a file finds them while
+    /// the sandbox's services run (ADR 0034): in the sandbox's folder,
+    /// which the sandbox reads but never writes, and no other sandbox
+    /// reads.
+    pub fn sandbox_secrets_dir(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("secrets")
+    }
+
     /// The sandbox's home folder: the runtime's home and the one place it may
     /// write by default.
     pub fn sandbox_home(&self, name: &str) -> PathBuf {

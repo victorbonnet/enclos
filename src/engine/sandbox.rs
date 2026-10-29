@@ -444,6 +444,11 @@ impl Engine {
                         for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
                             self.forget_marker(session);
                         }
+                        // What its services read their secrets from, once
+                        // nothing of it runs (ADR 0034).
+                        if record.state == SandboxState::Stopped {
+                            self.remove_secrets_file(name)?;
+                        }
                         Ok(report)
                     }
                     (Some(e), Ok(())) => Err(e),

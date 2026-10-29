@@ -91,6 +91,35 @@ impl Keychain {
         }
     }
 
+    /// Whether the keychain can be read without a dialog: `security
+    /// show-keychain-info` answers at once, with no dialog, and fails on a
+    /// locked keychain (exit 152 on macOS 26.5.2, "Unable to obtain
+    /// authorization").
+    fn check_unlocked(&self) -> Result<(), SecretError> {
+        let which = match &self.file {
+            Some(file) => format!("keychain {}", file.display()),
+            None => "login keychain".to_owned(),
+        };
+        let fail = |why: String| SecretError {
+            what: format!("the {which} cannot be read without asking: {why}"),
+            untouched: true,
+        };
+        let out = run(
+            Command::new(SECURITY)
+                .arg("show-keychain-info")
+                .args(self.file_args()),
+            None,
+        )
+        .map_err(fail)?;
+        match out.status.success() {
+            true => Ok(()),
+            false => Err(fail(format!(
+                "it is locked ({})",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+        }
+    }
+
     /// Refuses a keychain file that is not there, which `security` would
     /// answer as it answers an item that is not there.
     fn require_file(&self, what: &str, secret: &SecretRef) -> Result<(), SecretError> {
@@ -287,6 +316,10 @@ impl SecretStore for Keychain {
             .iter()
             .map(|f| (KEYCHAIN_VAR.to_owned(), f.display().to_string()))
             .collect()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        self.check_unlocked()
     }
 }
 

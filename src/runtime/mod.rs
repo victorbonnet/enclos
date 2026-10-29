@@ -190,6 +190,13 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
+    /// The variable naming a folder whose `.env` the runtime's services
+    /// read into their own process: their secrets go there, not into their
+    /// environment, which any process of the user can read (ADR 0034).
+    /// `None` (the default): they get their secrets as variables.
+    fn secrets_folder_var(&self) -> Option<&'static str> {
+        None
+    }
     /// Files in the home the services read only as they start, for the
     /// built-in agent and `agents` (ADR 0031).
     fn settings_files(&self, _agents: &[RuntimeAgentName]) -> Vec<HomePath> {

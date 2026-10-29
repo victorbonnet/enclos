@@ -245,6 +245,16 @@ pub enum Error {
         secret: crate::model::secret::SecretRef,
         variable: String,
     },
+    /// A service's secrets cannot be read without a dialog nobody would
+    /// see: the service is not started, and not started again.
+    #[error(
+        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; unlock it (logging in to the Mac does), then run `enclos sandbox start {sandbox}`"
+    )]
+    SecretsLocked {
+        sandbox: String,
+        service: String,
+        why: String,
+    },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -347,11 +357,23 @@ impl Error {
             | Error::SecretUnknown { .. }
             | Error::SecretGranted { .. }
             | Error::SecretMissing { .. }
+            | Error::SecretsLocked { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }
             | Error::WithContext { error, .. }
             | Error::FailedAfter { error, .. } => error.exit_code(),
+        }
+    }
+
+    /// The error under every context and cleanup wrapped around it.
+    pub fn root(&self) -> &Error {
+        match self {
+            Error::CleanupFailed { error, .. }
+            | Error::CleanupUnrecorded { error, .. }
+            | Error::WithContext { error, .. }
+            | Error::FailedAfter { error, .. } => error.root(),
+            other => other,
         }
     }
 }

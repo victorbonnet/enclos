@@ -4,7 +4,7 @@ status: accepted
 
 # Secrets are granted per sandbox, as environment variables at session start
 
-Supersedes [0011](0011-secrets-only-as-env-at-launch.md), which granted secrets per agent.
+Supersedes [0011](0011-secrets-only-as-env-at-launch.md), which granted secrets per agent. Amended by [0034](0034-a-service-reads-its-secrets-from-a-file-its-sandbox-alone-reads.md): a service whose runtime reads a secrets file gets them there, not in its environment.
 
 Decided; built in milestone 2 on macOS: secrets are stored in the Keychain, granted under `[secrets]`, and set up on the host when a session or service starts (design §12). libsecret and the `0600` file come with Linux.
 
