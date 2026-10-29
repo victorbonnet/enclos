@@ -178,21 +178,43 @@ fn backend(b: &BackendCheck) -> String {
         BackendState::Runs => "runs here".to_owned(),
     };
     let c = &b.capabilities;
+    let mut out = format!("  {}: {state}\n", b.kind);
     // Not a claim about this host when the backend is not on it.
-    let would = match b.state {
-        BackendState::Unavailable { .. } => "would enforce: ",
-        _ => "",
-    };
-    format!(
-        "  {}: {state}\n    {would}files {}; network {}; programs {}; limits {}; members {}\n",
-        b.kind,
-        enforced(&c.fs),
-        enforced(&c.network),
-        enforced(&c.exec),
-        enforced(&c.resources),
-        enforced(&c.members)
-    )
+    if let BackendState::Unavailable { .. } = b.state {
+        out += "    where it runs, it would enforce:\n";
+    }
+    for (what, e) in [
+        ("files", &c.fs),
+        ("network", &c.network),
+        ("programs", &c.exec),
+        ("limits", &c.resources),
+        ("members", &c.members),
+    ] {
+        out += &format!("    {what:<10}{}\n", hanging(&enforced(e), 14));
+    }
+    out
 }
+
+/// `text` wrapped at word boundaries to fit [`WIDTH`] columns once
+/// `indent` columns in, its later lines indented by `indent`, so a long
+/// note stays in its column rather than running back to the margin.
+fn hanging(text: &str, indent: usize) -> String {
+    let room = WIDTH.saturating_sub(indent).max(20);
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split(' ') {
+        match lines.last_mut() {
+            Some(line) if line.len() + 1 + word.len() <= room => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_owned()),
+        }
+    }
+    lines.join(&format!("\n{}", " ".repeat(indent)))
+}
+
+/// The columns doctor's text fits in: a terminal's usual width.
+const WIDTH: usize = 80;
 
 fn sandbox(s: &SandboxCheck) -> String {
     let name = &s.name;
@@ -325,7 +347,7 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
 fn enforced(e: &Enforcement) -> String {
     match e {
         Enforcement::Enforced => "enforced".to_owned(),
-        Enforcement::Partial { note } => format!("partly ({note})"),
+        Enforcement::Partial { note } => format!("partly: {note}"),
         Enforcement::Unsupported => "not enforced".to_owned(),
     }
 }
@@ -380,6 +402,48 @@ mod tests {
                 ran_file,
             },
         }
+    }
+
+    /// Each capability is a line of its own, its value in one column, and a
+    /// long note wraps within that column, never back to the margin.
+    #[test]
+    fn each_capability_is_a_line_and_a_long_note_keeps_its_column() {
+        let mut d = doctor(compiles());
+        d.backends[0].capabilities.members = Enforcement::Partial {
+            note: "markers its processes hold, the parent chain and process groups (ADR 0030); one that closes its marker and leaves its group and parent is not found".into(),
+        };
+        let shown = shown(&d);
+        assert!(
+            shown.contains("  seatbelt: runs here\n    files     enforced\n    network   enforced\n    programs  not enforced\n"),
+            "{shown}"
+        );
+        let members: Vec<&str> = shown
+            .lines()
+            .skip_while(|l| !l.starts_with("    members   partly: markers"))
+            .take_while(|l| !l.is_empty() && !l.starts_with("Sandboxes"))
+            .collect();
+        assert!(members.len() > 1, "{shown}");
+        for line in &members {
+            assert!(line.len() <= WIDTH, "{line:?}");
+        }
+        for line in &members[1..] {
+            assert!(line.starts_with(&" ".repeat(14)), "{line:?}");
+        }
+    }
+
+    /// A backend not on this host says what it would enforce, not what it
+    /// enforces here.
+    #[test]
+    fn a_backend_not_here_says_what_it_would_enforce() {
+        let mut d = doctor(compiles());
+        d.backends[0].state = BackendState::Unavailable {
+            reason: "not on this host".into(),
+        };
+        let shown = shown(&d);
+        assert!(
+            shown.contains("not usable here: not on this host\n    where it runs, it would enforce:\n    files     enforced\n"),
+            "{shown}"
+        );
     }
 
     /// What doctor could not look at is said, and nothing it did not
