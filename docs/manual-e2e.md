@@ -9,7 +9,7 @@ It takes about an hour, a quarter of it Hermes's installs. It uses a throwaway e
 You need:
 
 - An Apple silicon Mac on macOS 15 or later, logged in at its screen (the services run under your login session).
-- The build to test on your PATH: the release candidate's archive, or `cargo install --locked --path .` from the commit to release. `enclos --version` names it.
+- The build to test on your PATH: `cargo install --locked --path .` from a clone at the commit to release (the release archive is built only once the tag is pushed, after this test). `enclos --version` names it.
 - A model provider account Hermes supports, for its login.
 - Two Telegram bots made with [@BotFather](https://t.me/BotFather), each with its token, and your own Telegram user id (from [@userinfobot](https://t.me/userinfobot)).
 - An editor: `policy edit` opens `$VISUAL`, else `$EDITOR`, else `vi`.
@@ -23,11 +23,19 @@ export ENCLOS_HOME="$HOME/enclos-e2e"   # every command below uses this home
 Then, once:
 
 ```bash
-rm -rf "$ENCLOS_HOME"                    # start clean
 enclos --version
+enclos sandbox list                      # left from an earlier run of this test?
+```
+
+If an earlier run left sandboxes in this home, remove each first (`enclos sandbox stop <name>`, then `enclos --yes sandbox rm <name>`): that also removes their launchd job files and Keychain items, which deleting the folder would leave behind. Then:
+
+```bash
+rm -rf "$ENCLOS_HOME"                    # start clean
 ```
 
 enclos names its launchd jobs and Keychain items after the home (`enclos.<8 hex>.…`), so this home's never touch your own install's. A terminal shows text; piped (`| cat`), the same commands print JSON (§13).
+
+enclos never asks a question: a command that needs your confirmation, such as one that deletes something or ends a session you started, stops with exit 3 and says what it would do; run it again with `--yes` to do it, or with `--dry-run` to see the plan. The steps below show both.
 
 ## 1. Set up and look at an empty host
 
@@ -68,14 +76,14 @@ cat "$ENCLOS_HOME/sandboxes/lab/policy.toml"
 ```bash
 enclos --dry-run runtime install --sandbox lab hermes
 enclos runtime install --sandbox lab hermes          # about five minutes
-enclos connect lab -- hermes -p default setup        # provider, login, model
+enclos connect lab -- hermes -p default setup        # provider, login, model; skip its messaging sections
 enclos audit | grep -i runtime
 enclos doctor
 ```
 
 - [ ] The dry run lists the 13 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
 - [ ] The install ends `Hermes is installed in sandbox lab (policy v2)`; `enclos audit` has `runtime installer lab` and `runtime installed lab hermes`, and the installer's SHA-256 is in the first one's summary.
-- [ ] Setup runs in your terminal. When the login shows a URL, opening it in your browser on the Mac completes it.
+- [ ] Setup runs in your terminal. When the login shows a URL and a code, open the URL in your browser on the Mac and enter the code. Skip Hermes's own messaging setup: a token Hermes writes to `~/.hermes/.env` makes `runtime configure` refuse (§9).
 - [ ] `doctor` says `lab`'s next session compiles policy v2, and exits 0.
 
 ## 4. Agents
@@ -88,7 +96,8 @@ enclos agent list lab
 enclos connect lab -- hermes profile create helper   # made inside, not through enclos
 enclos agent list lab
 enclos agent add lab/helper
-enclos agent rm lab/scout                            # asks; answer y
+enclos agent rm lab/scout; echo "exit $?"           # needs confirmation
+enclos --yes agent rm lab/scout
 enclos agent rm lab/helper --keep-data --yes
 enclos agent list lab
 ```
@@ -96,9 +105,9 @@ enclos agent list lab
 - [ ] `agent list`: `lab/default  built in`, `lab/main`, `lab/scout`. `Bad_Name` is refused before anything runs (exit 1), with the naming rule.
 - [ ] After `profile create`, both the end of the `connect` session (on stderr) and `agent list` say `lab/helper: Hermes has this agent; enclos does not track it`, with the command to track it.
 - [ ] `agent add lab/helper` says `Tracked agent lab/helper, which Hermes already had`.
-- [ ] `agent rm lab/scout` shows what Hermes will delete and asks; then `Removed agent lab/scout and its files`. With `--keep-data`, only the record goes, and `helper` is reported untracked again.
+- [ ] `agent rm lab/scout` without `--yes` exits 3, saying it would delete the agent's files; with it, Hermes lists what it deletes, then `Removed agent lab/scout and its files`. With `--keep-data`, only the record goes, and `helper` is reported untracked again.
 
-If you have your own Hermes, bring an agent from it:
+If you have your own Hermes, bring an agent from it. Its cron jobs come along and run from the sandbox once its gateway runs, beside your own Hermes's: export a profile without scheduled jobs, or remove them in the sandbox right after (`enclos connect lab -- hermes -p mine cron list`).
 
 ```bash
 mkdir -p ~/exports && hermes profile export default -o ~/exports/mine.tar.gz
@@ -145,12 +154,13 @@ mkdir -p ~/enclos-e2e-work
 enclos policy edit lab          # set: write_add = ["/Users/<you>/enclos-e2e-work"]; save, quit
 enclos policy show lab | head -8
 enclos policy diff lab
-enclos policy apply lab         # asks; answer y
+enclos policy apply lab; echo "exit $?"   # ends the sleep: needs confirmation
+enclos --yes policy apply lab
 enclos policy history lab
 ```
 
 - [ ] The edit says `A change waits as the pending policy of sandbox lab`, since a session runs under the rules it changes; `policy diff` shows `let it write …/enclos-e2e-work`.
-- [ ] `policy apply` stops the sandbox, ending the `sleep` (its terminal says `ended by signal 15`), and it runs under the new version from then on; `history` lists every version, who made it and when.
+- [ ] `policy apply` without `--yes` exits 3, since it would end the `sleep` session you started; with it, it stops the sandbox, ending the `sleep` (its terminal says `ended by signal 15`), and the sandbox runs under the new version from then on; `history` lists every version, who made it and when.
 
 Discard, rollback, refresh:
 
@@ -159,15 +169,15 @@ enclos exec lab -- /bin/sleep 120 &       # a session again
 enclos policy edit lab                    # set write_add back to []
 enclos policy discard lab
 enclos policy show lab | head -8
+kill %1; enclos sandbox stop lab          # nothing runs: a change is in force at once
 enclos policy rollback lab --to 2
 enclos policy history lab
 enclos policy refresh lab
 enclos --yes policy refresh lab
-kill %1
 ```
 
 - [ ] `discard` drops the pending change; the folder is still writable in `policy show`.
-- [ ] `rollback --to 2` makes v2's policy a new version, listing what it takes back; `history` lists that new version (`--json` gives it `"restores": 2`).
+- [ ] With `lab` stopped, `rollback --to 2` makes v2's policy a new version at once, listing what it takes back; `history` lists that new version (`--json` gives it `"restores": 2`). While sessions run, a rollback that changes their rules waits as the pending policy instead, as an edit does.
 - [ ] `refresh` shows what resolving the policy again would change (usually nothing) and changes only with `--yes`.
 
 Refusals. Each must change nothing; `refused` exits 2, input that does not parse exits 1:
@@ -190,7 +200,7 @@ Then with `enclos policy edit lab`, one at a time; after each refusal, `enclos p
 
 - [ ] Loopback, link-local, `*` and `*.com` are refused (exit 2), each saying why; `not a host` is not a host name (exit 1).
 - [ ] Writing enclos's own home: refused, `would let the sandbox write enclos's own files`. CPU time: refused, a process may ignore SIGXCPU. Memory: refused, macOS refuses to set one. `open_files` above the Mac's ceiling: refused, naming the ceiling (`kern.maxfilesperproc`). Each exits 2 and keeps the edit for you.
-- [ ] `open_files = 256` is accepted, in force for sessions started from then on; `history` has no version for a refused change.
+- [ ] `open_files = 256` is accepted: a new version while `lab` is stopped, as it is after the rollback above (while sessions run, it would wait as the pending policy); `history` has no version for a refused change.
 
 Escape probes:
 
@@ -238,15 +248,19 @@ enclos net denied lab
 enclos secret set lab/demo                       # type a value; it does not echo
 printf 'other' | enclos secret set lab/piped
 enclos secret list lab
+enclos connect lab -- /usr/bin/true            # starts lab's services, so the grant below waits
 enclos policy edit lab                           # add at the end:  [secrets]
                                                  #                  env = { DEMO = "secret:lab/demo" }
+enclos --yes policy apply lab
 enclos exec lab -- /bin/sh -c 'test -n "$DEMO" && echo "DEMO is set"'
-enclos secret rm lab/piped                       # asks; answer y
+enclos secret rm lab/piped; echo "exit $?"       # needs confirmation
+enclos --yes secret rm lab/piped
 enclos secret list lab
 ```
 
 - [ ] `secret set` says where it stored the secret and that no session gets it until the policy grants it; `secret list` shows `not granted`, then `$DEMO` once granted, never a value.
-- [ ] Granting it while `lab`'s services run waits as a pending change, since they started without it: `enclos policy apply lab` restarts them into it (`policy edit --yes` does so at once). Then a session gets `DEMO`.
+- [ ] Granting it while `lab`'s services run waits as a pending change, since they started without it; `policy apply` restarts them into it (`policy edit --yes` does both at once). Then a session gets `DEMO` and prints `DEMO is set`.
+- [ ] `secret rm` without `--yes` exits 3, since the value is kept nowhere else.
 - [ ] The value is in your login Keychain: `security find-generic-password -s enclos.<8 hex> -a lab/demo` finds it (the hex is in the service names `sandbox show lab` prints, `enclos.<8 hex>.lab.gateway`); after `secret rm`, `lab/piped` is gone from both.
 
 ## 9. Telegram bots
@@ -255,13 +269,14 @@ The sandbox's bot, with the first token:
 
 ```bash
 enclos secret set lab/telegram
-enclos policy edit lab      # env = { DEMO = "secret:lab/demo", TELEGRAM_BOT_TOKEN = "secret:lab/telegram" }
+enclos --yes policy edit lab   # env = { DEMO = "secret:lab/demo", TELEGRAM_BOT_TOKEN = "secret:lab/telegram" }
 enclos runtime configure lab --channel telegram --allow-user <your id>
 enclos sandbox start lab
 enclos logs lab
 ```
 
-- [ ] `configure` sets up Hermes's Telegram channel; no file under `$ENCLOS_HOME/sandboxes/lab/home/.hermes` holds the token (`grep -rl "<the token's first 12 characters>" "$ENCLOS_HOME/sandboxes/lab/home/.hermes"` finds nothing).
+- [ ] `configure` sets up Hermes's Telegram channel. Without `--yes` on the edit above, the grant would wait as the pending policy and `configure` would refuse until `policy apply`.
+- [ ] Once the bot has answered (below), no file of this home holds the token but the secrets file: `grep -ral "<the part of the token after its colon>" "$ENCLOS_HOME" | grep -v /secrets/` finds nothing, the services' logs included.
 - [ ] While the gateway runs, `$ENCLOS_HOME/sandboxes/lab/secrets/.env` exists, `-rw-------` in a `drwx------` folder; after `enclos sandbox stop lab` it is gone. (`sandbox start lab` again after checking.)
 - [ ] Message the bot from your account: it answers. From an account not in `--allow-user`, it does not.
 - [ ] `enclos runtime configure lab/main --channel telegram --allow-user <your id>` is refused: enclos does not set up a bot of one agent's own yet (ADR 0032).
@@ -271,9 +286,9 @@ A second bot in a second sandbox:
 ```bash
 enclos sandbox create home2 --template assistant
 enclos runtime install --sandbox home2 hermes
-enclos connect home2 -- hermes -p default setup
+enclos connect home2 -- hermes -p default setup  # skip its messaging sections
 enclos secret set home2/telegram                  # the second token
-enclos policy edit home2    # [secrets] env = { TELEGRAM_BOT_TOKEN = "secret:home2/telegram" }
+enclos --yes policy edit home2   # [secrets] env = { TELEGRAM_BOT_TOKEN = "secret:home2/telegram" }
 enclos runtime configure home2 --channel telegram --allow-user <your id>
 enclos sandbox start home2
 enclos exec home2 -- /bin/cat "$ENCLOS_HOME/sandboxes/lab/secrets/.env"
@@ -298,7 +313,7 @@ enclos sandbox start lab home2
 - [ ] `show` lists the proxy and gateway sessions with their processes, and both services `running (pid …)`.
 - [ ] Changing `~/.hermes/config.yaml` inside the sandbox: the log says `~/.hermes/config.yaml changed: asked the gateway service to restart`.
 - [ ] `restart`, then `stop` and `start` with two names, each say what they did per sandbox.
-- [ ] Log out of the Mac and back in: `lab` and `home2` run again and the bots answer. After `enclos sandbox stop lab`, a logout and login leave it stopped.
+- [ ] Save your work in other apps (a logout quits them), then log out of the Mac and back in: `lab` and `home2` run again and the bots answer. After `enclos sandbox stop lab`, a logout and login leave it stopped.
 
 ## 11. State check and repair
 
@@ -384,18 +399,20 @@ enclos exec lab -- /usr/bin/pbpaste > /dev/null; echo "pbpaste exit $?"
 
 ```bash
 enclos sandbox stop lab scout tools home2
-enclos sandbox rm lab                       # asks; answer y
+enclos sandbox rm lab; echo "exit $?"       # needs confirmation
+enclos --yes sandbox rm lab
 enclos --yes sandbox rm scout
 enclos --yes sandbox rm tools
 enclos --yes sandbox rm home2
 enclos status
 launchctl list | grep "enclos\.<8 hex>\."
-security find-generic-password -s enclos.<8 hex> -a lab/demo
+ls ~/Library/LaunchAgents | grep "enclos\.<8 hex>\."
+security find-generic-password -s enclos.<8 hex> -a lab/telegram
 rm -rf "$ENCLOS_HOME" ~/enclos-e2e-work; unset ENCLOS_HOME
 ```
 
-- [ ] `sandbox rm` names what it deletes, the secrets with it, and asks; with `--yes` it does not.
-- [ ] `status` shows no sandbox; `launchctl list` shows no job of this home; `security` no longer finds the item (exit 44).
+- [ ] `sandbox rm` without `--yes` exits 3, naming the home and the secrets it would delete; with it, it removes them.
+- [ ] `status` shows no sandbox; neither `launchctl list` nor `~/Library/LaunchAgents` has a job of this home; `security` no longer finds the bot's token (exit 44).
 
 ## Known gaps: not findings
 
