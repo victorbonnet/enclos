@@ -207,7 +207,7 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
     assert_eq!(version.unwrap().version, 2);
     let (shown, stored) = store.pending_policy(&name).unwrap().unwrap();
     assert_eq!((&shown, &stored), (&saved, &pending));
-    assert_eq!(stored.overrides_text(), Some(pending.overrides.as_str()));
+    assert_eq!(stored.overrides_text(), pending.overrides_text());
     assert_eq!(store.active_policy(&name).unwrap().unwrap().1, live);
 
     // Applied only while it is still the one asked for.

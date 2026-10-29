@@ -57,17 +57,15 @@ pub fn append(
     append_version(tx, name, &snapshot.id, by, at, restores)
 }
 
-/// Stores `snapshot` unless an identical one is stored. One stored before
-/// snapshots kept their `policy.toml` gets its text: the same id means the
-/// same text.
+/// Stores `snapshot` unless an identical one is stored: the same id means
+/// the same inputs, so the same text.
 fn insert_snapshot(tx: &Transaction<'_>, snapshot: &PolicySnapshot) -> rusqlite::Result<()> {
     let inputs = serde_json::to_string(&snapshot.inputs).expect("policy inputs serialize");
     let policy = serde_json::to_string(&snapshot.policy).expect("policies serialize");
     tx.execute(
         "INSERT INTO policy_snapshots (id, inputs, policy, overrides) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT (id) DO UPDATE SET overrides = excluded.overrides
-             WHERE policy_snapshots.overrides = ''",
-        params![snapshot.id.0, inputs, policy, snapshot.overrides],
+         ON CONFLICT (id) DO NOTHING",
+        params![snapshot.id.0, inputs, policy, snapshot.overrides_text()],
     )?;
     Ok(())
 }
@@ -222,11 +220,11 @@ fn snapshot(
         serde_json::from_str(inputs).map_err(|e| corrupt(format!("snapshot inputs: {e}")))?;
     let policy: Policy =
         serde_json::from_str(policy).map_err(|e| corrupt(format!("snapshot policy: {e}")))?;
-    Ok(PolicySnapshot {
-        id,
-        inputs,
-        policy,
-        overrides,
+    let short = id.short().to_owned();
+    PolicySnapshot::new(id, inputs, policy, overrides).ok_or_else(|| {
+        corrupt(format!(
+            "snapshot {short}: the policy.toml it keeps is not the one its inputs name"
+        ))
     })
 }
 

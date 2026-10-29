@@ -7,7 +7,8 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 
 use enclos::engine::{
-    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyView, Restarted, TestReport,
+    ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyView, Restarted,
+    TestReport,
 };
 use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
@@ -32,7 +33,8 @@ enum PolicyVerb {
         #[arg(long)]
         pending: bool,
     },
-    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once.
+    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once, or
+    /// waits with a pending change it cannot be separated from.
     Allow {
         sandbox: SandboxName,
         destination: String,
@@ -219,6 +221,11 @@ fn print_allowed(
         (true, _) => println!(
             "Sandbox {sandbox} now allows {destination}: policy v{version}, in force at once."
         ),
+        // Waits with the pending policy, unless the policy in force
+        // allows it already (a pending change that dropped it, say).
+        (false, ChangeOutcome::Pending(_)) if engine.allows(sandbox, destination)? => println!(
+            "Sandbox {sandbox} allows {destination} under policy v{version}; the change waits with its pending policy."
+        ),
         (false, ChangeOutcome::Pending(_)) => println!(
             "Sandbox {sandbox} does not allow {destination} yet: the change waits with its pending policy, and policy v{version} stays in force."
         ),
@@ -239,14 +246,25 @@ fn print_allowed(
 /// that applied it went.
 fn print_outcome(engine: &Engine, sandbox: &SandboxName, applied: &PolicyApplied) -> Result<u8> {
     match &applied.outcome {
-        ChangeOutcome::InForce { dropped: Some(p) } => {
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Dropped(p)),
+        } => {
             println!(
-                "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
+                "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: the file is back to the policy in force.",
                 p.snapshot.short()
             );
             Ok(exit::OK)
         }
-        ChangeOutcome::InForce { dropped: None } => Ok(exit::OK),
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Applied(p)),
+        } => {
+            println!(
+                "The pending policy of sandbox {sandbox} (snapshot {}) is in force with this change: no session runs under rules it changes any more.",
+                p.snapshot.short()
+            );
+            Ok(exit::OK)
+        }
+        ChangeOutcome::InForce { pending: None } => Ok(exit::OK),
         ChangeOutcome::Pending(p) => {
             println!(
                 "A change waits as the pending policy of sandbox {sandbox} (snapshot {}): sessions run under rules it changes, and keep them until they restart.",
@@ -354,7 +372,9 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     write_private(&files.copy, &start).map_err(io(&files.copy))?;
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
-    if after == before {
+    // Saved unchanged, an edit records nothing, unless the file holds what
+    // the state does not record yet, such as a change made by hand.
+    if after == before && engine.policy_file_recorded(sandbox)? {
         forget_edit(&files);
         println!("No change to the policy of sandbox {sandbox}.");
         return Ok(exit::OK);

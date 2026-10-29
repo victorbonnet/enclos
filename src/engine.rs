@@ -24,7 +24,7 @@ mod tests;
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
-pub use policy::{ChangeOutcome, PolicyApplied, PolicyView, policy_differences};
+pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use probe::TestReport;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use runtime::home_files_script;

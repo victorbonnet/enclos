@@ -4,9 +4,9 @@
 use std::rc::Rc;
 
 use super::policy::with_sandbox;
-use super::sandbox::{Sleeping, put, session_of};
+use super::sandbox::{Sleeping, put, session_of, while_waiting};
 use super::*;
-use crate::engine::ChangeOutcome;
+use crate::engine::{ChangeOutcome, PendingEnd};
 use crate::model::policy::{NetMode, PendingPolicy};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
@@ -95,7 +95,7 @@ fn a_change_to_file_rules_applies_at_once_when_no_session_runs() {
             .unwrap(),
     );
     assert!(applied.changed, "{applied:?}");
-    assert_eq!(applied.outcome, ChangeOutcome::InForce { dropped: None });
+    assert_eq!(applied.outcome, ChangeOutcome::InForce { pending: None });
     assert_eq!(applied.version.version, 2);
     assert!(writes(&engine, &name, &work));
     assert!(engine.policy(&name).unwrap().pending.is_none());
@@ -242,7 +242,7 @@ fn discard_drops_the_pending_policy_and_keeps_the_file_it_replaces() {
     // The file is the active policy's: the network change stays, the grant
     // goes, and what the file held is kept beside it, for its owner only.
     let file = engine.layout.read_policy("home").unwrap();
-    assert_eq!(Some(file.as_str()), view.snapshot.overrides_text());
+    assert_eq!(file.as_str(), view.snapshot.overrides_text());
     assert!(
         file.contains("api.example.com") && !file.contains(&work),
         "{file}"
@@ -370,52 +370,22 @@ fn discard_writes_back_a_file_gone() {
     assert!(engine.policy(&name).unwrap().pending.is_none());
 }
 
-/// Empties the text the active snapshot keeps, as for one stored before
-/// snapshots kept their `policy.toml`.
-fn forget_active_text(engine: &Engine, name: &SandboxName) {
-    let id = engine.policy(name).unwrap().snapshot.id;
+/// A snapshot whose kept `policy.toml` is not the text its inputs name
+/// reads as a corrupt state, not as a snapshot without its text.
+#[test]
+fn a_snapshot_whose_text_is_not_the_one_its_inputs_name_is_corrupt() {
+    let (_dir, engine, name) = with_sandbox();
+    let id = engine.policy(&name).unwrap().snapshot.id;
     let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
     conn.execute(
         "UPDATE policy_snapshots SET overrides = '' WHERE id = ?1",
         [&id.0],
     )
     .unwrap();
-}
-
-#[test]
-fn without_the_active_policys_text_discard_changes_nothing_and_says_why() {
-    let (dir, engine, name) = with_sandbox();
-    let (_sleeping, _id) = running(&engine, &name);
-    let (_work, before, after) = grant_work(&dir, &engine);
-    make_pending(&engine, &name, &before, &after);
-    forget_active_text(&engine, &name);
-    for confirm in [Confirm::DryRun, Confirm::Ask] {
-        let err = engine.policy_discard(&alice(), &name, confirm).unwrap_err();
-        assert!(matches!(err, Error::PolicyTextUnknown { .. }), "{err}");
-    }
-    assert!(engine.policy(&name).unwrap().pending.is_some());
-    assert_eq!(engine.layout.read_policy("home").unwrap(), after);
-}
-
-#[test]
-fn without_the_active_policys_text_a_destination_waits_and_is_not_said_in_force() {
-    let (dir, engine, name) = with_sandbox();
-    let (_sleeping, _id) = running(&engine, &name);
-    let (_work, before, after) = grant_work(&dir, &engine);
-    make_pending(&engine, &name, &before, &after);
-    forget_active_text(&engine, &name);
-    let applied = done(
-        engine
-            .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
-            .unwrap(),
-    );
-    assert!(!applied.changed, "{applied:?}");
-    assert!(pending_of(&applied).is_some());
-    let view = engine.policy(&name).unwrap();
-    assert!(view.snapshot.policy.net.allow.is_empty());
-    assert_eq!(
-        view.pending.unwrap().1.policy.net.allow,
-        ["api.example.com"]
+    let err = engine.policy(&name).unwrap_err();
+    assert!(
+        err.to_string().contains("is not the one its inputs name"),
+        "{err}"
     );
 }
 
@@ -502,6 +472,228 @@ fn apply_refuses_a_file_that_no_longer_holds_the_pending_policy() {
     done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
 }
 
+/// What `policy apply` refuses, a file changed by hand while a change
+/// waits, is recorded by an edit saved unchanged, after which it applies.
+#[test]
+fn an_edit_saved_unchanged_records_a_file_changed_by_hand() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    assert!(engine.policy_file_recorded(&name).unwrap());
+    let by_hand = format!("{after}# by hand\n");
+    engine.layout.write_policy("home", &by_hand).unwrap();
+    assert!(!engine.policy_file_recorded(&name).unwrap());
+    let planned = engine
+        .policy_apply(&alice(), &name, Confirm::DryRun)
+        .unwrap_err();
+    assert!(
+        matches!(planned, Error::PendingFileDiffers { .. }),
+        "{planned}"
+    );
+    done(
+        engine
+            .policy_edit(&alice(), &name, &by_hand, &by_hand, Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(engine.policy_file_recorded(&name).unwrap());
+    done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
+}
+
+/// A destination the policy in force allows, and the pending change
+/// dropped, joins the pending change again: it was allowed all along, which
+/// `allows` tells the CLI.
+#[test]
+fn allowing_what_only_the_pending_change_dropped_leaves_it_allowed() {
+    let (dir, engine, name) = with_sandbox();
+    done(
+        engine
+            .policy_allow(&alice(), &name, "x.example.com", Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(engine.allows(&name, "x.example.com").unwrap());
+    assert!(engine.allows(&name, "X.Example.com").unwrap());
+    assert!(!engine.allows(&name, "y.example.com").unwrap());
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    let after = after.replace("\"x.example.com\"", "");
+    assert!(!after.contains("x.example.com"), "{after}");
+    make_pending(&engine, &name, &before, &after);
+    let applied = done(
+        engine
+            .policy_allow(&alice(), &name, "x.example.com", Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(!applied.changed, "{applied:?}");
+    let pending = pending_of(&applied).expect("waits");
+    assert!(engine.allows(&name, "x.example.com").unwrap());
+    let view = engine.policy(&name).unwrap();
+    let (now, snapshot) = view.pending.unwrap();
+    assert_eq!(&now, pending);
+    assert!(
+        snapshot
+            .policy
+            .net
+            .allow
+            .contains(&"x.example.com".to_owned())
+    );
+}
+
+/// The network part of a change that waits as a whole stays out of force
+/// when a network-only change follows: neither an edit of the mode nor a
+/// destination `policy allow` adds brings it along.
+#[test]
+fn the_network_part_of_a_mixed_change_stays_pending_through_later_network_changes() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    let mixed = after.replace("allow_add = []", "allow_add = [\"b.example.com\"]");
+    make_pending(&engine, &name, &before, &mixed);
+    let allowlist = mixed.replacen("[network]\n", "[network]\nmode = \"allowlist\"\n", 1);
+    assert_ne!(allowlist, mixed);
+    done(
+        engine
+            .policy_edit(&alice(), &name, &mixed, &allowlist, Confirm::Ask)
+            .unwrap(),
+    );
+    let view = engine.policy(&name).unwrap();
+    assert_eq!(view.version.version, 1);
+    assert_eq!(view.snapshot.policy.net.mode, NetMode::Public);
+    assert!(view.snapshot.policy.net.allow.is_empty(), "{view:?}");
+    let pending = &view.pending.as_ref().unwrap().1.policy.net;
+    assert_eq!(pending.mode, NetMode::Allowlist);
+    assert_eq!(pending.allow, ["b.example.com"]);
+
+    done(
+        engine
+            .policy_allow(&alice(), &name, "c.example.com", Confirm::Ask)
+            .unwrap(),
+    );
+    let view = engine.policy(&name).unwrap();
+    assert_eq!(view.snapshot.policy.net.allow, ["c.example.com"]);
+    assert_eq!(view.snapshot.policy.net.mode, NetMode::Public);
+    let pending = &view.pending.as_ref().unwrap().1.policy.net;
+    assert_eq!(pending.allow, ["b.example.com", "c.example.com"]);
+}
+
+/// Changes the active snapshot's stored rules, as a newer template or new
+/// built-in defaults would resolve its `policy.toml` differently.
+fn change_active_rules(engine: &Engine, name: &SandboxName, path: &str, value: &str) {
+    let id = engine.policy(name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = json_set(policy, ?1, json(?2)) WHERE id = ?3",
+        [path, value, &id.0],
+    )
+    .unwrap();
+}
+
+/// A destination goes in force alone only when the active policy's text
+/// resolves to the active policy and that destination: another difference,
+/// in what sessions keep or in the network, keeps it waiting.
+#[test]
+fn a_destination_waits_when_the_active_text_resolves_to_more_than_it() {
+    for (path, value) in [
+        ("$.fs.write", "[\"{home}\", \"/elsewhere\"]"),
+        ("$.net.allow", "[\"stale.example.com\"]"),
+    ] {
+        let (dir, engine, name) = with_sandbox();
+        let (_sleeping, _id) = running(&engine, &name);
+        let (_work, before, after) = grant_work(&dir, &engine);
+        make_pending(&engine, &name, &before, &after);
+        change_active_rules(&engine, &name, path, value);
+        let applied = done(
+            engine
+                .policy_allow(&alice(), &name, "api.example.com", Confirm::Ask)
+                .unwrap(),
+        );
+        assert!(!applied.changed, "{path}: {applied:?}");
+        let view = engine.policy(&name).unwrap();
+        assert_eq!(view.version.version, 1, "{path}");
+        let allow = &view.snapshot.policy.net.allow;
+        assert!(!allow.contains(&"api.example.com".to_owned()), "{path}");
+        let pending = &view.pending.as_ref().unwrap().1.policy.net.allow;
+        assert!(pending.contains(&"api.example.com".to_owned()), "{path}");
+    }
+}
+
+/// After a failed install, a change that waits keeps waiting, and the
+/// runtime's destinations, which the install put in force, are taken out.
+#[test]
+fn resolving_again_after_a_failed_install_takes_the_runtimes_destinations_out() {
+    let (dir, engine, name) = with_sandbox();
+    let file = engine.layout.read_policy("home").unwrap();
+    let with_runtime = engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                engine.save_policy_for_runtime(
+                    lock,
+                    &alice(),
+                    &name,
+                    &file,
+                    Some(crate::model::runtime::RuntimeKind::Hermes),
+                )
+            },
+        )
+        .unwrap();
+    assert_eq!(with_runtime.version, 2);
+    let chatgpt = "chatgpt.com".to_owned();
+    assert!(
+        engine
+            .policy(&name)
+            .unwrap()
+            .snapshot
+            .policy
+            .net
+            .allow
+            .contains(&chatgpt)
+    );
+    let (_sleeping, _id) = running(&engine, &name);
+    let (work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    let version = engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| engine.resolve_again(lock, &alice(), &name),
+        )
+        .unwrap();
+    assert_eq!(version.version, 3);
+    let view = engine.policy(&name).unwrap();
+    assert!(!view.snapshot.policy.net.allow.contains(&chatgpt));
+    let pending = &view.pending.as_ref().unwrap().1.policy;
+    assert!(pending.fs.write.contains(&work));
+    assert!(!pending.net.allow.contains(&chatgpt));
+}
+
+/// The proxy runs under no compiled policy: it keeps no rule a change
+/// could leave behind, so a change made while it runs is in force at once,
+/// and `policy apply` asks nothing for it.
+#[test]
+fn a_running_proxy_holds_no_change_back() {
+    let (dir, engine, name) = with_sandbox();
+    let sleeping = Sleeping::new();
+    let mut proxy = session_of(&engine, &name, sleeping.process());
+    proxy.kind = SessionKind::Proxy;
+    proxy.compiled = None;
+    put(&engine, &proxy);
+    let (work, before, after) = grant_work(&dir, &engine);
+    let applied = done(
+        engine
+            .policy_edit(&alice(), &name, &before, &after, Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(applied.changed, "{applied:?}");
+    assert_eq!(applied.version.version, 2);
+    assert!(writes(&engine, &name, &work));
+}
+
 /// Only the runtime's services run: they start again on their own, so
 /// nothing is asked.
 #[test]
@@ -518,6 +710,38 @@ fn apply_while_only_services_run_asks_nothing() {
     let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Ask).unwrap());
     assert_eq!(restarted.version.version, 2);
     assert!(writes(&engine, &name, &work));
+}
+
+/// A session started while `policy apply` waits for the lock, after it
+/// looked for sessions to stop, runs under the policy in force: the change
+/// waits, and the error says so.
+#[test]
+fn a_session_started_during_the_restart_keeps_the_change_pending() {
+    let (dir, engine, name) = with_sandbox();
+    let (running, _id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    make_pending(&engine, &name, &before, &after);
+    drop(running);
+    done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+    let sleeping = Sleeping::new();
+    let mut late = session_of(&engine, &name, sleeping.process());
+    late.compiled = Some("/compiled/at-launch.sb".into());
+    let err = while_waiting(
+        &engine,
+        || engine.policy_apply(&alice(), &name, Confirm::Yes),
+        |other, lock| {
+            other.state.put_session(lock, &late).unwrap();
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("started while it was being restarted"),
+        "{err}"
+    );
+    let view = engine.policy(&name).unwrap();
+    assert!(view.pending.is_some());
+    assert_eq!(view.version.version, 1);
 }
 
 /// A sandbox `home` whose services a fake service manager installed.
@@ -751,7 +975,12 @@ fn allow_once_the_sessions_ended_asks_before_putting_the_pending_change_in_force
             .unwrap(),
     );
     assert!(
-        matches!(applied.outcome, ChangeOutcome::InForce { dropped: Some(_) }),
+        matches!(
+            applied.outcome,
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Applied(_))
+            }
+        ),
         "{applied:?}"
     );
     assert!(engine.policy(&name).unwrap().pending.is_none());
@@ -770,7 +999,12 @@ fn an_edit_back_to_the_active_policy_drops_the_pending_one() {
             .unwrap(),
     );
     assert!(
-        matches!(applied.outcome, ChangeOutcome::InForce { dropped: Some(_) }),
+        matches!(
+            applied.outcome,
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(_))
+            }
+        ),
         "{applied:?}"
     );
     assert_eq!(applied.version.version, 1);
