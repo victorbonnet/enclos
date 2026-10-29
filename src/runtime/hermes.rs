@@ -290,6 +290,13 @@ impl RuntimeAdapter for Hermes {
             .collect()
     }
 
+    fn secrets_folder_var(&self) -> Option<&'static str> {
+        // Hermes loads `$HERMES_MANAGED_DIR/.env` into its own environment,
+        // last and with override, when the folder exists
+        // (`hermes_cli/managed_scope.py`, `env_loader._apply_managed_env`).
+        Some("HERMES_MANAGED_DIR")
+    }
+
     fn listener(&self) -> Option<RuntimeListener> {
         // Hermes 0.22.3's chat (CLI, TUI, stream-json) cannot run without the
         // gateway: it finds it, gets a ticket for its own agent (a Hermes
