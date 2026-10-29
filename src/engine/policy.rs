@@ -545,6 +545,29 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "stop giving it ${variable} (sessions started from now on)"
         ));
     }
+    let none = crate::model::policy::AgentSecrets::new();
+    let agents: std::collections::BTreeSet<&String> = old
+        .agent_secrets
+        .keys()
+        .chain(new.agent_secrets.keys())
+        .collect();
+    for agent in agents {
+        let was = old.agent_secrets.get(agent).unwrap_or(&none);
+        let now = new.agent_secrets.get(agent).unwrap_or(&none);
+        for (variable, grant) in now {
+            if was.get(variable) != Some(grant) {
+                found.push(format!(
+                    "give agent {agent} secret {} as ${variable} (its services started from now on)",
+                    grant.0
+                ));
+            }
+        }
+        for variable in was.keys().filter(|v| !now.contains_key(*v)) {
+            found.push(format!(
+                "stop giving agent {agent} ${variable} (its services started from now on)"
+            ));
+        }
+    }
     // Every field named, so one added is decided on here.
     let crate::model::policy::Resources {
         open_files: _,

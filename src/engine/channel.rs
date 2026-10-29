@@ -1,21 +1,24 @@
-//! The engine's messaging call (design §12): set up the sandbox's bot on a
-//! channel with the runtime's own commands, its token one of the sandbox's
-//! secrets.
+//! The engine's messaging call (design §12): set up an agent's bot on a
+//! channel with the runtime's own commands, its token a secret the policy
+//! grants that agent (ADR 0036).
 
 use super::Engine;
 use crate::error::{Error, Result};
+use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::proxy::decide::{Destination, allowed};
-use crate::runtime::adapter;
+use crate::runtime::{RuntimeAgentName, adapter};
 
 /// What `runtime configure --channel` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelSet {
     pub channel: Channel,
+    /// The agent whose bot it is.
+    pub agent: RuntimeAgentName,
     /// The variable the bot's token is read from.
     pub token: String,
     /// The people it answers, each once.
@@ -25,16 +28,18 @@ pub struct ChannelSet {
 }
 
 impl Engine {
-    /// Sets up the sandbox's bot on `channel` with the runtime's own
-    /// commands, for the agent the adapter gives it to (Hermes's built-in
-    /// one): its token read from `token` (the channel's usual variable when
-    /// none is named), which the active policy must grant, and the people
-    /// it answers. A running service restarts on its own once its settings
+    /// Sets up `agent`'s bot on `channel` with the runtime's own commands,
+    /// the runtime's built-in agent's when `None`: its token read from
+    /// `token` (the channel's usual variable when none is named), which the
+    /// active policy must grant that agent (ADR 0036), and the people it
+    /// answers. A running service restarts on its own once its settings
     /// change (ADR 0031).
+    #[allow(clippy::too_many_arguments)]
     pub fn configure_channel(
         &self,
         by: &Actor,
         name: &SandboxName,
+        agent: Option<&AgentName>,
         channel: Channel,
         token: Option<String>,
         answers: &[ChannelUser],
@@ -59,7 +64,48 @@ impl Engine {
                 what: "name who the bot answers with `--allow-user <id>`: enclos sets up no bot that answers anyone".to_owned(),
             });
         }
-        let Some(commands) = runtime.channel(channel, &token, &answers) else {
+        let builtin = runtime.builtin_agent();
+        let agent = match agent {
+            Some(a) if builtin.is_some_and(|b| b.as_str() == a.as_str()) => {
+                RuntimeAgentName::from(a)
+            }
+            Some(a) => {
+                if !self.agents(name)?.iter().any(|r| r.name == *a) {
+                    return Err(Error::Session {
+                        what: format!(
+                            "sandbox {name} has no agent {a} that enclos tracks: add it with `enclos agent add {name}/{a}` first"
+                        ),
+                    });
+                }
+                RuntimeAgentName::from(a)
+            }
+            None => match builtin.and_then(|b| RuntimeAgentName::new(b.as_str())) {
+                Some(b) => b,
+                None => {
+                    return Err(Error::Session {
+                        what: format!(
+                            "{shown} has no built-in agent: name the agent whose bot it is, as `{name}/<agent>`"
+                        ),
+                    });
+                }
+            },
+        };
+        let secrets_file = self
+            .layout
+            .agent_secrets_file(name.as_str(), agent.as_str());
+        if secrets_file
+            .to_str()
+            .is_none_or(|p| p.contains(['\'', '\n', '\r']))
+        {
+            return Err(Error::Session {
+                what: format!(
+                    "{} holds a quote or a line break, which the runtime's command that reads it cannot hold: set ENCLOS_HOME to a folder without them",
+                    secrets_file.display()
+                ),
+            });
+        }
+        let Some(commands) = runtime.channel(channel, &agent, &token, &answers, &secrets_file)
+        else {
             return Err(Error::Session {
                 what: format!(
                     "{shown} has no {} channel enclos can set up",
@@ -69,7 +115,7 @@ impl Engine {
         };
         // A token the runtime's own setup wrote in plain text in the home,
         // which any agent there reads: refused until it is removed.
-        if let Some((file, variable)) = runtime.channel_token_file(channel) {
+        if let Some((file, variable)) = runtime.channel_token_file(channel, &agent) {
             let home = self.layout.sandbox_home(name.as_str());
             let text = crate::runtime::home::read_text(&home, &file, 1 << 20).map_err(|e| {
                 Error::Session {
@@ -86,18 +132,38 @@ impl Engine {
             }
         }
         let view = self.policy(name)?;
-        if !view.snapshot.policy.secrets.contains_key(&token) {
+        let policy = &view.snapshot.policy;
+        let section = format!("[secrets.agents.{agent}]");
+        // Granted to the whole sandbox, the token would reach every agent,
+        // and win over each one's own (ADR 0036).
+        if policy.secrets.contains_key(&token) {
+            return Err(Error::Session {
+                what: format!(
+                    "the policy of sandbox {name} gives ${token} to the whole sandbox, under [secrets], which every agent receives and which wins over an agent's own: with `enclos policy edit {name}`, move it to {section} (ADR 0036)"
+                ),
+            });
+        }
+        let granted = |p: &crate::model::policy::Policy, variable: &str| {
+            p.agent_secrets
+                .get(agent.as_str())
+                .is_some_and(|g| g.contains_key(variable))
+        };
+        if !granted(policy, &token) {
             let pending = view
                 .pending
                 .as_ref()
-                .is_some_and(|(_, p)| p.policy.secrets.contains_key(&token));
+                .is_some_and(|(_, p)| granted(&p.policy, &token));
+            let secret = match agent.as_str() == builtin.map(|b| b.as_str()).unwrap_or_default() {
+                true => format!("{name}/{channel}"),
+                false => format!("{name}/{agent}-{channel}"),
+            };
             return Err(Error::Session {
                 what: match pending {
                     true => format!(
-                        "the pending policy of sandbox {name} gives it ${token}, the bot's token, but it is not in force yet: `enclos policy apply {name}` first"
+                        "the pending policy of sandbox {name} gives agent {agent} ${token}, the bot's token, but it is not in force yet: `enclos policy apply {name}` first"
                     ),
                     false => format!(
-                        "the policy of sandbox {name} gives it no ${token}, the bot's token: store the token with `enclos secret set {name}/{channel}`, then with `enclos policy edit {name}` add `{token} = \"secret:{name}/{channel}\"` to the `env` of its [secrets] section"
+                        "the policy of sandbox {name} gives agent {agent} no ${token}, the bot's token: store the token with `enclos secret set {secret}`, then with `enclos policy edit {name}` add `{token} = \"secret:{secret}\"` to the `env` of its {section} section"
                     ),
                 },
             });
@@ -105,10 +171,10 @@ impl Engine {
         // The channel's usual variable, granted too, is the one the runtime
         // reads first: the bot would be that token's, not `token`'s.
         let usual = channel.token_variable();
-        if token != usual && view.snapshot.policy.secrets.contains_key(usual) {
+        if token != usual && granted(policy, usual) {
             return Err(Error::Session {
                 what: format!(
-                    "the policy of sandbox {name} also gives it ${usual}, which {shown} reads for the bot before ${token}, so the bot would be the one ${usual} names: take ${usual} out of its [secrets], or set the bot up with it (no --token-env)"
+                    "the policy of sandbox {name} also gives agent {agent} ${usual}, which {shown} reads for the bot before ${token}, so the bot would be the one ${usual} names: take ${usual} out of its {section}, or set the bot up with it (no --token-env)"
                 ),
             });
         }
@@ -116,6 +182,7 @@ impl Engine {
             .is_ok_and(|dest| allowed(&view.snapshot.policy, &dest));
         let set = ChannelSet {
             channel,
+            agent: agent.clone(),
             token,
             answers,
             reachable,

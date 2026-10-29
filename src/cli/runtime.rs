@@ -9,7 +9,7 @@ use serde_json::json;
 
 use super::output;
 use enclos::engine::Engine;
-use enclos::error::{Error, Result, exit};
+use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
 use enclos::model::channel::{Channel, ChannelUser};
@@ -34,8 +34,9 @@ enum RuntimeVerb {
     /// Set up the sandbox's bot on a messaging channel, its token one of
     /// the sandbox's secrets, which the policy grants.
     Configure {
-        /// The sandbox, such as `home`. A bot of one agent's own
-        /// (`home/main`) is refused for now (ADR 0032, proposed).
+        /// Whose bot it is: a sandbox, such as `home`, for its built-in
+        /// agent's, or one of its agents, such as `home/main`, for that
+        /// agent's own (ADR 0036).
         target: ChannelTarget,
         #[arg(long)]
         channel: Channel,
@@ -126,8 +127,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
     Ok(exit::OK)
 }
 
-/// What `runtime configure` sets up: a sandbox's bot, or one an agent of
-/// it would have of its own, which is refused (ADR 0032, proposed).
+/// What `runtime configure` sets up: the bot of the sandbox's built-in
+/// agent, or of the agent named (ADR 0036).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChannelTarget {
     sandbox: SandboxName,
@@ -162,20 +163,15 @@ fn configure(
     answers: &[ChannelUser],
 ) -> Result<u8> {
     let ChannelTarget { sandbox, agent } = target;
-    if let Some(agent) = agent {
-        let builtin = engine.builtin_agent(&sandbox)?;
-        return Err(Error::Session {
-            what: match builtin.is_some_and(|b| b.as_str() == agent.as_str()) {
-                true => format!(
-                    "the sandbox's bot is agent {agent}'s already: set it up with `enclos runtime configure {sandbox} --channel {channel} ...`"
-                ),
-                false => format!(
-                    "enclos does not set up a bot of agent {agent}'s own yet: a sandbox has one bot per channel, its built-in agent's (ADR 0032, proposed), until it is shown that Hermes's gateway gives another agent its own token (design §14). Set up the sandbox's bot with `enclos runtime configure {sandbox} --channel {channel} ...`"
-                ),
-            },
-        });
-    }
-    let set = match engine.configure_channel(by, &sandbox, channel, token, answers, confirm)? {
+    let set = match engine.configure_channel(
+        by,
+        &sandbox,
+        agent.as_ref(),
+        channel,
+        token,
+        answers,
+        confirm,
+    )? {
         Planned::DryRun(plan) => {
             output::show_plan(&plan);
             return Ok(exit::OK);
@@ -186,6 +182,7 @@ fn configure(
     if output::json() {
         output::emit(&json!({
             "sandbox": sandbox.to_string(),
+            "agent": set.agent.to_string(),
             "channel": channel.to_string(),
             "token_variable": set.token.to_string(),
             "answers": set.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -195,7 +192,8 @@ fn configure(
         return Ok(exit::OK);
     }
     println!(
-        "Sandbox {sandbox}'s {shown} bot is set up: its token is read from ${} as its service starts, and it answers {} user(s). A running service restarts with it.",
+        "Agent {sandbox}/{}'s {shown} bot is set up: its token is read from ${}, which the policy grants that agent, as its service starts, and it answers {} user(s). A running service restarts with it.",
+        set.agent,
         set.token,
         set.answers.len()
     );

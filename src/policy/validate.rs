@@ -55,24 +55,50 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
 /// values.
 pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), PolicyError> {
     let mut problems = Vec::new();
-    for (variable, grant) in &policy.secrets {
-        if !is_variable_name(variable) {
+    check_grants("secrets.env", &policy.secrets, sandbox, &mut problems);
+    for (agent, grants) in &policy.agent_secrets {
+        let at = format!("secrets.agents.{agent}.env");
+        if agent.parse::<crate::model::agent::AgentName>().is_err() {
             problems.push(Problem::Malformed(format!(
-                "secrets.env: `{variable}` is not a variable name: use letters, digits and `_`, not starting with a digit"
-            )));
-        } else if reserved_variable(variable) {
-            problems.push(Problem::Refused(format!(
-                "secrets.env: `{variable}` is a variable enclos sets or passes on itself, or that changes how the sandbox runs; name the secret's variable otherwise"
+                "secrets.agents: `{agent}` is not an agent name: use a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
             )));
         }
-        if grant.0.sandbox != *sandbox {
+        check_grants(&at, grants, sandbox, &mut problems);
+        // The sandbox's own grants reach every agent and win over an
+        // agent's (ADR 0036): one variable cannot be both.
+        for variable in grants.keys().filter(|v| policy.secrets.contains_key(*v)) {
             problems.push(Problem::Refused(format!(
-                "secrets.env.{variable}: `{grant}` is a secret of sandbox {}; a sandbox is granted only its own (ADR 0022)",
-                grant.0.sandbox
+                "{at}.{variable}: `{variable}` is also granted to the whole sandbox under secrets.env, which every agent receives and which wins over an agent's own; grant it in one place (ADR 0036)"
             )));
         }
     }
     invalid_if_any(problems)
+}
+
+/// Checks the grants of one `env` table, named `at` in what it says.
+fn check_grants(
+    at: &str,
+    grants: &crate::model::policy::AgentSecrets,
+    sandbox: &SandboxName,
+    problems: &mut Vec<Problem>,
+) {
+    for (variable, grant) in grants {
+        if !is_variable_name(variable) {
+            problems.push(Problem::Malformed(format!(
+                "{at}: `{variable}` is not a variable name: use letters, digits and `_`, not starting with a digit"
+            )));
+        } else if reserved_variable(variable) {
+            problems.push(Problem::Refused(format!(
+                "{at}: `{variable}` is a variable enclos sets or passes on itself, or that changes how the sandbox runs; name the secret's variable otherwise"
+            )));
+        }
+        if grant.0.sandbox != *sandbox {
+            problems.push(Problem::Refused(format!(
+                "{at}.{variable}: `{grant}` is a secret of sandbox {}; a sandbox is granted only its own (ADR 0022)",
+                grant.0.sandbox
+            )));
+        }
+    }
 }
 
 /// Checks the limits a policy sets against what `backend` enforces (ADR
@@ -576,6 +602,49 @@ mod tests {
         assert!(reserved.is_refused(), "{reserved}");
         let malformed = grant(&[("1X", "secret:home/xy")]).unwrap_err();
         assert!(!malformed.is_refused(), "{malformed}");
+    }
+
+    /// An agent's grants follow the same rules, under an agent's name, and
+    /// a variable granted to the whole sandbox cannot be an agent's too,
+    /// since the sandbox's wins over the agent's (ADR 0036).
+    #[test]
+    fn an_agent_is_granted_its_sandboxs_secrets_under_a_variable_of_its_own() {
+        let home: SandboxName = "home".parse().unwrap();
+        let grant = |sandbox: &[(&str, &str)], agent: &str, own: &[(&str, &str)]| {
+            let mut policy = Policy::default();
+            for (k, v) in sandbox {
+                policy.secrets.insert((*k).into(), v.parse().unwrap());
+            }
+            let grants = policy.agent_secrets.entry(agent.into()).or_default();
+            for (k, v) in own {
+                grants.insert((*k).into(), v.parse().unwrap());
+            }
+            validate_secrets(&policy, &home)
+        };
+        let bot = [("TELEGRAM_BOT_TOKEN", "secret:home/main-bot")];
+        assert!(grant(&[("OPENAI_API_KEY", "secret:home/openai")], "main", &bot).is_ok());
+        let both = grant(
+            &[("TELEGRAM_BOT_TOKEN", "secret:home/telegram")],
+            "main",
+            &bot,
+        )
+        .unwrap_err();
+        assert!(both.is_refused(), "{both}");
+        assert!(
+            both.to_string()
+                .contains("secrets.agents.main.env.TELEGRAM_BOT_TOKEN"),
+            "{both}"
+        );
+        let other = grant(&[], "main", &[("T", "secret:lab/bot")]).unwrap_err();
+        assert!(other.is_refused(), "{other}");
+        let reserved = grant(&[], "main", &[("PATH", "secret:home/xy")]).unwrap_err();
+        assert!(reserved.is_refused(), "{reserved}");
+        let unnamed = grant(&[], "Main_Bot", &bot).unwrap_err();
+        assert!(!unnamed.is_refused(), "{unnamed}");
+        assert!(
+            unnamed.to_string().contains("not an agent name"),
+            "{unnamed}"
+        );
     }
 
     struct Fixture {

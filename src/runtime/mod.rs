@@ -190,6 +190,13 @@ pub trait RuntimeAdapter {
     /// enclos shows it, never runs it (ADR 0024).
     fn login(&self) -> String;
     fn create_agent(&self, name: &AgentName) -> SandboxCommand;
+    /// The runtime's own commands run in the sandbox right after
+    /// [`create_agent`](Self::create_agent) made `name`, such as undoing
+    /// what it copied from another agent that is that agent's alone. `None`
+    /// to run (the default): nothing.
+    fn after_create_agent(&self, _name: &AgentName) -> Vec<SandboxCommand> {
+        Vec::new()
+    }
     /// Where the runtime keeps an agent's files, relative to the sandbox
     /// home, for enclos's messages.
     fn agent_files(&self, name: &AgentName) -> String;
@@ -247,28 +254,34 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
         None
     }
-    /// The file in the home where the runtime's own setup keeps a bot's
-    /// token for `channel` in plain text, as a `.env` line of the variable
-    /// it names: `runtime configure` refuses while it holds one, so that the
-    /// token the runtime's own setup writes for the built-in agent does not
-    /// sit readable in the home (ADR 0022). `None`: no such file.
-    fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
+    /// The file in the home where the runtime's own setup keeps `agent`'s
+    /// bot token for `channel` in plain text, as a `.env` line of the
+    /// variable it names: `runtime configure` refuses while it holds one, so
+    /// that a token the runtime's own setup wrote does not sit readable in
+    /// the home (ADR 0022). `None`: no such file.
+    fn channel_token_file(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+    ) -> Option<(HomePath, &'static str)> {
         None
     }
-    /// The runtime's own commands that set up the sandbox's bot on
-    /// `channel`, run in the sandbox by `enclos runtime configure`: its
-    /// token read from the variable `token`, which the sandbox's policy
-    /// grants as a secret, so that enclos hands the runtime the variable's
-    /// name, never its value (ADR 0022), and the people it answers. The
-    /// people it answers come first and the channel is turned on last, so
-    /// a run that fails turns no bot on (one whose token alone turns it on,
-    /// such as Hermes's `TELEGRAM_BOT_TOKEN`, is on already).
-    /// `None`: the runtime has no such channel.
+    /// The runtime's own commands that set up `agent`'s bot on `channel`,
+    /// run in the sandbox by `enclos runtime configure`: its token read
+    /// from the variable `token`, which the policy grants that agent (ADR
+    /// 0036) and which reaches it through `secrets_file`, the file
+    /// `enclos launch` writes its grants to while the services run, so that
+    /// enclos hands the runtime where the token is, never its value (ADR
+    /// 0022); and the people it answers. The people it answers come first
+    /// and the channel is turned on last, so a run that fails turns no bot
+    /// on. `None`: the runtime has no such channel.
     fn channel(
         &self,
         _channel: Channel,
+        _agent: &RuntimeAgentName,
         _token: &str,
         _answers: &[ChannelUser],
+        _secrets_file: &Path,
     ) -> Option<Vec<SandboxCommand>> {
         None
     }

@@ -275,11 +275,15 @@ impl Engine {
     /// Refuses a policy granting a secret the sandbox does not have: every
     /// session would then fail to start.
     pub(super) fn check_secrets_set(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
-        if policy.secrets.is_empty() {
+        if policy.secrets.is_empty() && policy.agent_secrets.is_empty() {
             return Ok(());
         }
         let set = self.state.secrets(name)?;
-        for grant in policy.secrets.values() {
+        let grants = policy
+            .secrets
+            .values()
+            .chain(policy.agent_secrets.values().flat_map(|g| g.values()));
+        for grant in grants {
             if !set.iter().any(|s| s.secret == grant.0) {
                 return Err(Error::NoSuchSecret {
                     secret: grant.0.clone(),
@@ -292,8 +296,16 @@ impl Engine {
     /// The variables a session of the sandbox starts with: each secret
     /// `policy` grants, read from the secret store now, on the host.
     pub(super) fn secret_env(&self, policy: &Policy) -> Result<Vec<(String, SecretValue)>> {
+        self.granted_values(&policy.secrets)
+    }
+
+    /// The values of `grants`, by variable, read from the secret store now.
+    fn granted_values(
+        &self,
+        grants: &crate::model::policy::AgentSecrets,
+    ) -> Result<Vec<(String, SecretValue)>> {
         let mut env = Vec::new();
-        for (variable, grant) in &policy.secrets {
+        for (variable, grant) in grants {
             match self.secrets.get(&grant.0)? {
                 Some(value) => env.push((variable.clone(), value)),
                 None => {
@@ -311,8 +323,10 @@ impl Engine {
     /// runtime that reads them from a folder, the variable naming that
     /// folder, where they are written, so that they are never in the
     /// service's environment, which any process of the user can read (ADR
-    /// 0034); else the secrets themselves, as variables. A store that could
-    /// only be read through a dialog nobody sees refuses the start.
+    /// 0034); else the secrets themselves, as variables. Each agent's own
+    /// go to a file of its own in that folder (ADR 0036), and a runtime
+    /// with no such folder refuses them. A store that could only be read
+    /// through a dialog nobody sees refuses the start.
     pub(super) fn service_secrets(
         &self,
         name: &SandboxName,
@@ -320,7 +334,7 @@ impl Engine {
         service: &str,
         policy: &Policy,
     ) -> Result<Vec<(String, SecretValue)>> {
-        if policy.secrets.is_empty() {
+        if policy.secrets.is_empty() && policy.agent_secrets.is_empty() {
             self.remove_secrets_file(name)?;
             return Ok(Vec::new());
         }
@@ -331,10 +345,27 @@ impl Engine {
         })?;
         let values = self.secret_env(policy)?;
         let Some(var) = adapter(kind).secrets_folder_var() else {
+            if !policy.agent_secrets.is_empty() {
+                return Err(Error::SecretsFileRefused {
+                    sandbox: name.to_string(),
+                    why: format!(
+                        "{} reads no secrets of one agent's own, which the policy grants under [secrets.agents]; grant them under [secrets] instead",
+                        kind.display_name()
+                    ),
+                });
+            }
             return Ok(values);
         };
         let folder = self.layout.sandbox_secrets_dir(name.as_str());
-        write_secrets_file(name, &folder, &values)?;
+        write_secrets_file(name, &folder, SANDBOX_SECRETS_FILE, &values)?;
+        let mut written = vec![SANDBOX_SECRETS_FILE.to_owned()];
+        for (agent, grants) in &policy.agent_secrets {
+            let file = format!("{agent}{}", crate::layout::AGENT_SECRETS_SUFFIX);
+            write_secrets_file(name, &folder, &file, &self.granted_values(grants)?)?;
+            written.push(file);
+        }
+        // What an earlier start wrote for an agent no longer granted any.
+        remove_files_but(&folder, &written)?;
         // Not a secret, but where the secrets are.
         let named = SecretValue::new(folder.display().to_string())
             .expect("a folder's path is text with no NUL");
@@ -372,17 +403,47 @@ impl Engine {
     }
 }
 
-/// The variables `policy` gives `secret` as.
+/// The file of the secrets folder holding what the sandbox's grants give
+/// every agent (ADR 0034).
+const SANDBOX_SECRETS_FILE: &str = ".env";
+
+/// Removes the files of `folder` not named in `kept`.
+fn remove_files_but(folder: &Path, kept: &[String]) -> Result<()> {
+    let io = |path: &Path| {
+        let path = path.to_owned();
+        move |source| Error::from(LayoutError::Io { path, source })
+    };
+    for entry in std::fs::read_dir(folder).map_err(io(folder))? {
+        let path = entry.map_err(io(folder))?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !kept.iter().any(|k| k == name) {
+            std::fs::remove_file(&path).map_err(io(&path))?;
+        }
+    }
+    Ok(())
+}
+
+/// The variables `policy` gives `secret` as: to the whole sandbox, then to
+/// each agent, said `VAR for agent main` (ADR 0036).
 fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<String> {
-    policy
+    let sandbox = policy
         .secrets
         .iter()
         .filter(|(_, g)| g.0 == *secret)
-        .map(|(v, _)| v.clone())
-        .collect()
+        .map(|(v, _)| v.clone());
+    let agents = policy.agent_secrets.iter().flat_map(|(agent, grants)| {
+        grants
+            .iter()
+            .filter(|(_, g)| g.0 == *secret)
+            .map(move |(v, _)| format!("{v} for agent {agent}"))
+    });
+    sandbox.chain(agents).collect()
 }
 
-/// Writes `values` as the `.env` of `folder`, which only the user reads:
+/// Writes `values` as `file` of `folder`, which only the user reads:
 /// the folder 0700, the file 0600, written whole beside it and then renamed
 /// over it. Each value is double-quoted with its `\` and `"` escaped, which
 /// python-dotenv and Hermes's own reader (`agent.secret_scope.load_env_file`)
@@ -394,6 +455,7 @@ fn granted_as(policy: &Policy, secret: &SecretRef) -> Vec<String> {
 fn write_secrets_file(
     name: &SandboxName,
     folder: &Path,
+    file: &str,
     values: &[(String, SecretValue)],
 ) -> Result<()> {
     let refused = |why: String| Error::SecretsFileRefused {
@@ -439,8 +501,8 @@ fn write_secrets_file(
         }
         text.push_str("\"\n");
     }
-    let new = folder.join(".env.new");
-    let file = folder.join(".env");
+    let new = folder.join(format!("{file}.new"));
+    let file = folder.join(file);
     match std::fs::remove_file(&new) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -479,8 +541,8 @@ mod tests {
             ("A".to_owned(), value("plain")),
             ("B".to_owned(), value("a'b\\c\"d$HOME #e")),
         ];
-        write_secrets_file(&home(), &folder, &values).unwrap();
-        write_secrets_file(&home(), &folder, &values).unwrap();
+        write_secrets_file(&home(), &folder, SANDBOX_SECRETS_FILE, &values).unwrap();
+        write_secrets_file(&home(), &folder, SANDBOX_SECRETS_FILE, &values).unwrap();
         let text = std::fs::read_to_string(folder.join(".env")).unwrap();
         assert_eq!(text, "A=\"plain\"\nB=\"a'b\\\\c\\\"d$HOME #e\"\n");
         assert!(!folder.join(".env.new").exists());
@@ -493,8 +555,13 @@ mod tests {
         for bad in ["a${HOME}b", "line\nnext", "cr\rhere"] {
             let dir = tempfile::tempdir().unwrap();
             let folder = dir.path().join("secrets");
-            let err =
-                write_secrets_file(&home(), &folder, &[("T".to_owned(), value(bad))]).unwrap_err();
+            let err = write_secrets_file(
+                &home(),
+                &folder,
+                SANDBOX_SECRETS_FILE,
+                &[("T".to_owned(), value(bad))],
+            )
+            .unwrap_err();
             assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
             assert!(
                 err.to_string().contains("$T holds a line break or `${`"),
@@ -512,8 +579,13 @@ mod tests {
         std::fs::create_dir(&elsewhere).unwrap();
         let folder = dir.path().join("secrets");
         std::os::unix::fs::symlink(&elsewhere, &folder).unwrap();
-        let err =
-            write_secrets_file(&home(), &folder, &[("T".to_owned(), value("v"))]).unwrap_err();
+        let err = write_secrets_file(
+            &home(),
+            &folder,
+            SANDBOX_SECRETS_FILE,
+            &[("T".to_owned(), value("v"))],
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::SecretsFileRefused { .. }), "{err}");
         assert!(!elsewhere.join(".env").exists());
     }

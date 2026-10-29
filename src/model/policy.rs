@@ -22,12 +22,21 @@ pub struct Policy {
     /// before secrets existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secrets: std::collections::BTreeMap<String, super::secret::SecretGrant>,
+    /// Secrets granted to one agent each, by its name, then by variable
+    /// (ADR 0036): only its runtime's service receives them, through a file
+    /// of that agent's. Left out of the snapshot when empty, as `secrets`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agent_secrets: std::collections::BTreeMap<String, AgentSecrets>,
     /// Limits on the sandbox's processes, each fixed when it starts (and,
     /// for `memory` and `cpu`, on the sandbox as a whole). Left
     /// out of the snapshot when none is set, as secrets are.
     #[serde(default, skip_serializing_if = "Resources::is_unset")]
     pub resources: Resources,
 }
+
+/// The secrets one agent is granted, by the environment variable each is
+/// set as (ADR 0036).
+pub type AgentSecrets = std::collections::BTreeMap<String, super::secret::SecretGrant>;
 
 /// Limits on a sandbox (design §7): `open_files`, `file_size` and
 /// `cpu_seconds` on each of its processes, `memory` and `cpu` on the
@@ -350,6 +359,7 @@ impl Policy {
         self.fs == other.fs
             && self.net.listen == other.net.listen
             && self.secrets == other.secrets
+            && self.agent_secrets == other.agent_secrets
             && self.resources == other.resources
     }
 }

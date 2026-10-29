@@ -131,44 +131,89 @@ impl RuntimeAdapter for Hermes {
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
         // Hermes calls an agent a profile: each enclos agent is the Hermes
         // profile of the same name, created and selected with Hermes's
-        // own `profile` command and `-p` flag.
-        SandboxCommand::from_words(&[HERMES, "profile", "create", name.as_str()])
+        // own `profile` command and `-p` flag. Cloned from the built-in
+        // profile, so that it starts on the model and provider the
+        // sandbox's login is for, not Hermes's own default, which that
+        // login may not reach; Hermes leaves the bots behind
+        // (`--clone-from`, Hermes 0.22.5).
+        SandboxCommand::from_words(&[
+            HERMES,
+            "profile",
+            "create",
+            name.as_str(),
+            "--clone-from",
+            DEFAULT_PROFILE.as_str(),
+        ])
+    }
+
+    fn after_create_agent(&self, name: &AgentName) -> Vec<SandboxCommand> {
+        // The clone copies the built-in profile's `config.yaml`, and with it
+        // a `secrets.command` reading that profile's secrets file, its bot
+        // token included (ADR 0036): turned off, until `runtime configure`
+        // points it at this agent's own.
+        vec![SandboxCommand::from_words(&[
+            HERMES,
+            "-p",
+            name.as_str(),
+            "config",
+            "set",
+            "secrets.command.enabled",
+            "false",
+        ])]
     }
 
     fn agent_files(&self, name: &AgentName) -> String {
         format!("~/.hermes/profiles/{name}")
     }
 
-    fn channel_token_file(&self, channel: Channel) -> Option<(HomePath, &'static str)> {
-        // Hermes's setup writes the built-in agent's bot token to its
-        // `.env` (`save_env_value` in `hermes_cli/setup_platforms.py`).
-        Some((at(".hermes/.env"), channel.token_variable()))
+    fn channel_token_file(
+        &self,
+        channel: Channel,
+        agent: &RuntimeAgentName,
+    ) -> Option<(HomePath, &'static str)> {
+        // Hermes's setup writes a profile's bot token to its `.env`
+        // (`save_env_value` in `hermes_cli/setup_platforms.py`).
+        let file = match agent.as_str() == DEFAULT_PROFILE.as_str() {
+            true => ".hermes/.env".to_owned(),
+            false => format!(".hermes/profiles/{agent}/.env"),
+        };
+        Some((at(&file), channel.token_variable()))
     }
 
     fn channel(
         &self,
         channel: Channel,
+        agent: &RuntimeAgentName,
         token: &str,
         answers: &[ChannelUser],
+        secrets_file: &Path,
     ) -> Option<Vec<SandboxCommand>> {
-        // The default profile's bot (ADR 0032). Under Hermes's gateway,
-        // which serves every profile in one process, only that profile
-        // reads the gateway's environment; whether another can take its own
-        // token from the secrets file (ADR 0034), which Hermes applies to
-        // every profile's scope, is to verify (design §14).
-        let profile = DEFAULT_PROFILE.as_str();
+        // Each profile's own bot (ADR 0036). Hermes's gateway serves every
+        // profile in one process, and the sandbox's secrets file reaches
+        // them all alike, so a token there would be every profile's; a
+        // profile's own `secrets.command` gives what it prints to that
+        // profile alone (`agent/secret_sources/command.py`, Hermes 0.22.5),
+        // read here from the file `enclos launch` writes its grants to.
+        let profile = agent.as_str();
         let set = |key: &str, value: &str| {
             SandboxCommand::from_words(&[HERMES, "-p", profile, "config", "set", key, value])
         };
         let users: Vec<&str> = answers.iter().map(ChannelUser::as_str).collect();
+        // Run by Hermes through `/bin/sh -c`; the path is enclos's, quoted
+        // whole (the engine refuses one holding a quote or a line break).
+        let read = format!("cat '{}'", secrets_file.display());
         match channel {
             Channel::Telegram => Some(vec![
+                set("secrets.command.command", &read),
+                // What the file holds wins over the profile's own `.env`.
+                set("secrets.command.override_existing", "true"),
+                set("secrets.command.enabled", "true"),
                 // Not a secret: who may talk to the bot, in the profile's
                 // `.env`, where Hermes keeps it.
                 set("TELEGRAM_ALLOWED_USERS", &users.join(",")),
                 // Only the variable's name: Hermes resolves it from the
-                // environment as the gateway loads its settings (read in
-                // `hermes_cli/config.py`, `_expand_env_vars`).
+                // profile's secrets as the gateway loads its settings
+                // (`hermes_cli/config.py`, `_expand_env_vars`).
                 set("platforms.telegram.token", &format!("${{{token}}}")),
                 set("platforms.telegram.enabled", "true"),
             ]),
@@ -453,11 +498,22 @@ mod tests {
         );
     }
 
+    /// An agent's bot reads its token from that agent's own secrets file,
+    /// through its own `secrets.command` (ADR 0036), set up before the
+    /// people it answers and the bot turned on last.
     #[test]
-    fn telegram_is_the_default_profiles_with_its_token_read_from_the_environment() {
+    fn telegram_is_the_agents_own_with_its_token_read_from_its_secrets_file() {
         let users = ["111".parse().unwrap(), "222".parse().unwrap()];
+        let agent = RuntimeAgentName::new("main").unwrap();
+        let file = Path::new("/Users/alice/.enclos/sandboxes/home/secrets/main.env");
         let shown: Vec<String> = Hermes
-            .channel(Channel::Telegram, "TELEGRAM_BOT_TOKEN_MAIN", &users)
+            .channel(
+                Channel::Telegram,
+                &agent,
+                "TELEGRAM_BOT_TOKEN_MAIN",
+                &users,
+                file,
+            )
             .unwrap()
             .iter()
             .map(SandboxCommand::shown)
@@ -465,12 +521,52 @@ mod tests {
         assert_eq!(
             shown,
             [
-                "hermes -p default config set TELEGRAM_ALLOWED_USERS 111,222",
+                "hermes -p main config set secrets.command.command 'cat '\\''/Users/alice/.enclos/sandboxes/home/secrets/main.env'\\'''",
+                "hermes -p main config set secrets.command.override_existing true",
+                "hermes -p main config set secrets.command.enabled true",
+                "hermes -p main config set TELEGRAM_ALLOWED_USERS 111,222",
                 // Quoted, so a person who runs it as shown in a sandbox,
                 // where the secret is set, does not write its value.
-                "hermes -p default config set platforms.telegram.token '${TELEGRAM_BOT_TOKEN_MAIN}'",
-                "hermes -p default config set platforms.telegram.enabled true",
+                "hermes -p main config set platforms.telegram.token '${TELEGRAM_BOT_TOKEN_MAIN}'",
+                "hermes -p main config set platforms.telegram.enabled true",
             ]
+        );
+        // The built-in agent's plain-text token is in the home's `.env`,
+        // another agent's in its own folder's.
+        let default = RuntimeAgentName::new("default").unwrap();
+        assert_eq!(
+            Hermes
+                .channel_token_file(Channel::Telegram, &default)
+                .unwrap()
+                .0,
+            at(".hermes/.env")
+        );
+        assert_eq!(
+            Hermes
+                .channel_token_file(Channel::Telegram, &agent)
+                .unwrap()
+                .0,
+            at(".hermes/profiles/main/.env")
+        );
+    }
+
+    /// A new agent starts from the built-in agent's settings, its model
+    /// among them, and does not keep reading that agent's secrets file.
+    #[test]
+    fn a_new_agent_is_cloned_from_the_built_in_one_without_its_secrets() {
+        let main: AgentName = "main".parse().unwrap();
+        assert_eq!(
+            Hermes.create_agent(&main).shown(),
+            "hermes profile create main --clone-from default"
+        );
+        let after: Vec<String> = Hermes
+            .after_create_agent(&main)
+            .iter()
+            .map(SandboxCommand::shown)
+            .collect();
+        assert_eq!(
+            after,
+            ["hermes -p main config set secrets.command.enabled false"]
         );
     }
 
@@ -683,7 +779,14 @@ mod tests {
         );
         assert_eq!(
             Hermes.create_agent(&main),
-            SandboxCommand::from_words(&["hermes", "profile", "create", "main"])
+            SandboxCommand::from_words(&[
+                "hermes",
+                "profile",
+                "create",
+                "main",
+                "--clone-from",
+                "default"
+            ])
         );
         assert_eq!(
             Hermes.import_agent(&main, Path::new("/x/installers/agent-main.tar.gz")),

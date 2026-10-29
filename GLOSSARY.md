@@ -56,7 +56,7 @@ The software installed in a sandbox to run its agents, such as Hermes, Claude Co
 _Avoid_: agent (for the software), platform, program
 
 **Agent**:
-A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime may have a built-in agent; a runtime without several agents has only its built-in one.
+A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets, and may be granted secrets of its own, such as its bot's token. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime may have a built-in agent; a runtime without several agents has only its built-in one.
 _Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 
 **Built-in agent**:
@@ -80,7 +80,7 @@ A session whose end is not recorded though none of its members runs any more, be
 _Avoid_: stale session, zombie session
 
 **Secret**:
-A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
+A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key
 
 **Channel**:
