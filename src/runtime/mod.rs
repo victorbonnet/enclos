@@ -13,6 +13,7 @@ use std::path::Path;
 
 pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
+use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
 pub use home::HomePath;
 
@@ -54,6 +55,21 @@ impl HomeFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxCommand(Vec<OsString>);
 
+/// `word` as a shell reads it back: quoted when it holds anything a shell
+/// would read otherwise, such as `${VAR}`, which it would expand, or starts
+/// with `=`, which zsh expands to a command's path.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word.starts_with('=')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
+    match plain {
+        true => word.to_owned(),
+        false => format!("'{}'", word.replace('\'', "'\\''")),
+    }
+}
+
 impl SandboxCommand {
     pub fn new(words: Vec<OsString>) -> SandboxCommand {
         SandboxCommand(words)
@@ -71,7 +87,7 @@ impl SandboxCommand {
     pub fn shown(&self) -> String {
         self.0
             .iter()
-            .map(|w| w.to_string_lossy())
+            .map(|w| shell_word(&w.to_string_lossy()))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -229,6 +245,31 @@ pub trait RuntimeAdapter {
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
+        None
+    }
+    /// The file in the home where the runtime's own setup keeps a bot's
+    /// token for `channel` in plain text, as a `.env` line of the variable
+    /// it names: `runtime configure` refuses while it holds one, so that the
+    /// token the runtime's own setup writes for the built-in agent does not
+    /// sit readable in the home (ADR 0022). `None`: no such file.
+    fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
+        None
+    }
+    /// The runtime's own commands that set up the sandbox's bot on
+    /// `channel`, run in the sandbox by `enclos runtime configure`: its
+    /// token read from the variable `token`, which the sandbox's policy
+    /// grants as a secret, so that enclos hands the runtime the variable's
+    /// name, never its value (ADR 0022), and the people it answers. The
+    /// people it answers come first and the channel is turned on last, so
+    /// a run that fails turns no bot on (one whose token alone turns it on,
+    /// such as Hermes's `TELEGRAM_BOT_TOKEN`, is on already).
+    /// `None`: the runtime has no such channel.
+    fn channel(
+        &self,
+        _channel: Channel,
+        _token: &str,
+        _answers: &[ChannelUser],
+    ) -> Option<Vec<SandboxCommand>> {
         None
     }
 

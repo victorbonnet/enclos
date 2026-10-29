@@ -17,6 +17,7 @@ use super::{
     Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
+use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
 
 pub struct Hermes;
@@ -138,6 +139,42 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
+    fn channel_token_file(&self, channel: Channel) -> Option<(HomePath, &'static str)> {
+        // Hermes's setup writes the built-in agent's bot token to its
+        // `.env` (`save_env_value` in `hermes_cli/setup_platforms.py`).
+        Some((at(".hermes/.env"), channel.token_variable()))
+    }
+
+    fn channel(
+        &self,
+        channel: Channel,
+        token: &str,
+        answers: &[ChannelUser],
+    ) -> Option<Vec<SandboxCommand>> {
+        // The default profile's bot (ADR 0032). Under Hermes's gateway,
+        // which serves every profile in one process, only that profile
+        // reads the gateway's environment; whether another can take its own
+        // token from the secrets file (ADR 0034), which Hermes applies to
+        // every profile's scope, is to verify (design §14).
+        let profile = DEFAULT_PROFILE.as_str();
+        let set = |key: &str, value: &str| {
+            SandboxCommand::from_words(&[HERMES, "-p", profile, "config", "set", key, value])
+        };
+        let users: Vec<&str> = answers.iter().map(ChannelUser::as_str).collect();
+        match channel {
+            Channel::Telegram => Some(vec![
+                // Not a secret: who may talk to the bot, in the profile's
+                // `.env`, where Hermes keeps it.
+                set("TELEGRAM_ALLOWED_USERS", &users.join(",")),
+                // Only the variable's name: Hermes resolves it from the
+                // environment as the gateway loads its settings (read in
+                // `hermes_cli/config.py`, `_expand_env_vars`).
+                set("platforms.telegram.token", &format!("${{{token}}}")),
+                set("platforms.telegram.enabled", "true"),
+            ]),
+        }
+    }
+
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
         // Hermes's own delete, so whatever it keeps beside the profile
         // folder goes with it (what that is: to verify, design §14).
@@ -230,8 +267,14 @@ impl RuntimeAdapter for Hermes {
         // replacement that no session would hold.
         vec![RuntimeService {
             name: GATEWAY,
+            // As the built-in agent, whose home serves every agent: bare,
+            // Hermes would follow the profile a sandbox shell last chose
+            // with `hermes profile use` (`hermes_cli/main.py`), and serve
+            // only that one.
             command: SandboxCommand::from_words(&[
                 HERMES,
+                "-p",
+                DEFAULT_PROFILE.as_str(),
                 "gateway",
                 "run",
                 "--external-supervisor",
@@ -406,6 +449,27 @@ mod tests {
                 "~/.hermes/.env",
                 "~/.hermes/profiles/main/config.yaml",
                 "~/.hermes/profiles/main/.env",
+            ]
+        );
+    }
+
+    #[test]
+    fn telegram_is_the_default_profiles_with_its_token_read_from_the_environment() {
+        let users = ["111".parse().unwrap(), "222".parse().unwrap()];
+        let shown: Vec<String> = Hermes
+            .channel(Channel::Telegram, "TELEGRAM_BOT_TOKEN_MAIN", &users)
+            .unwrap()
+            .iter()
+            .map(SandboxCommand::shown)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "hermes -p default config set TELEGRAM_ALLOWED_USERS 111,222",
+                // Quoted, so a person who runs it as shown in a sandbox,
+                // where the secret is set, does not write its value.
+                "hermes -p default config set platforms.telegram.token '${TELEGRAM_BOT_TOKEN_MAIN}'",
+                "hermes -p default config set platforms.telegram.enabled true",
             ]
         );
     }
@@ -647,7 +711,14 @@ mod tests {
         assert_eq!(services[0].name.as_str(), "gateway");
         assert_eq!(
             services[0].command,
-            SandboxCommand::from_words(&["hermes", "gateway", "run", "--external-supervisor"])
+            SandboxCommand::from_words(&[
+                "hermes",
+                "-p",
+                "default",
+                "gateway",
+                "run",
+                "--external-supervisor"
+            ])
         );
     }
 }

@@ -155,7 +155,7 @@ enclos sandbox rm lab        # the sandbox and its home, with Hermes and its log
 ## What does not work yet
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.
-- **Messaging:** Telegram comes in milestone 2. Secrets work already: `enclos secret set lab/<name>` stores one in the Keychain, and adding `[secrets] env = { NAME = "secret:lab/<name>" }` with `enclos policy edit lab` gives it to every session and service of the sandbox. `enclos sandbox rm` removes the sandbox's secrets too.
+- **Messaging:** the sandbox's own Telegram bot is set up with `enclos runtime configure lab --channel telegram --allow-user <your Telegram id>`, once its token is a secret the policy grants as `TELEGRAM_BOT_TOKEN` (below); start the sandbox with `enclos sandbox start lab` for its gateway to serve the bot. A bot of one agent's own is not set up by enclos (ADR 0032, proposed), and no bot has answered under enclos yet. Secrets work already: `enclos secret set lab/<name>` stores one in the Keychain, and adding `[secrets] env = { NAME = "secret:lab/<name>" }` with `enclos policy edit lab` gives it to every session and service of the sandbox. `enclos sandbox rm` removes the sandbox's secrets too.
 
 ## If you used an earlier build
 

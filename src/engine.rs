@@ -5,6 +5,7 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
+mod channel;
 mod compile;
 mod history;
 mod import;
@@ -23,6 +24,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+pub use channel::ChannelSet;
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;

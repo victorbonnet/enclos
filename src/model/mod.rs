@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod channel;
 pub mod net;
 pub mod plan;
 pub mod policy;

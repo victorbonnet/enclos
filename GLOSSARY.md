@@ -50,7 +50,7 @@ _Avoid_: agent (for the software), platform, program
 
 **Agent**:
 A named identity of the sandbox's runtime, with its own configuration, memory, skills, sessions and channels. It shares the sandbox's runtime, policy, proxy and secrets. It is not a process and not a permission boundary: the runtime adapter decides how many processes run it, and the sandbox is the boundary. A runtime may have a built-in agent; a runtime without several agents has only its built-in one.
-_Avoid_: profile (Hermes's word for it), instance, persona, bot
+_Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 
 **Built-in agent**:
 The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
@@ -75,6 +75,14 @@ _Avoid_: stale session, zombie session
 **Secret**:
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key
+
+**Channel**:
+A messaging service, such as Telegram, through which a sandbox answers people.
+_Avoid_: platform, integration
+
+**Bot**:
+The account on a channel through which the sandbox's runtime answers people, such as a Telegram bot.
+_Avoid_: agent (an agent is the runtime's identity, not the account)
 
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
