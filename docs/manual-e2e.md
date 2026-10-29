@@ -190,13 +190,21 @@ enclos policy allow lab '*.com';          echo "exit $?"
 enclos policy allow lab 'not a host';     echo "exit $?"
 ```
 
-Then with `enclos policy edit lab`, one at a time; after each refusal, `enclos policy discard lab` drops the edit, which `policy edit` would otherwise open again:
+Then the refusals of an edit, one at a time. A refused edit is kept, and the next `policy edit` opens it again ("Continuing the edit kept in …"), refused lines included, so drop it each time:
 
-- `write_add = ["<the path echo $ENCLOS_HOME prints>"]`
-- add `[resources]` with `cpu_seconds = 60`
-- add `[resources]` with `memory = "1G"`
-- add `[resources]` with `open_files = 100000000`
-- add `[resources]` with `open_files = 256` (accepted)
+```bash
+enclos policy edit lab      # write_add = ["<the path echo $ENCLOS_HOME prints>"]
+enclos policy discard lab
+enclos policy edit lab      # add: [resources] then cpu_seconds = 60
+enclos policy discard lab
+enclos policy edit lab      # add: [resources] then memory = "1G"
+enclos policy discard lab
+enclos policy edit lab      # add: [resources] then open_files = 100000000
+enclos policy discard lab
+enclos policy edit lab      # add: [resources] then open_files = 256  (accepted)
+```
+
+Edit `policy.toml` only through `enclos policy edit`: saving the file in another editor records nothing, and neither `policy apply` nor a session sees it until `policy edit` does (`EDITOR=true enclos policy edit lab` records what the file holds as it is).
 
 - [ ] Loopback, link-local, `*` and `*.com` are refused (exit 2), each saying why; `not a host` is not a host name (exit 1).
 - [ ] Writing enclos's own home: refused, `would let the sandbox write enclos's own files`. CPU time: refused, a process may ignore SIGXCPU. Memory: refused, macOS refuses to set one. `open_files` above the Mac's ceiling: refused, naming the ceiling (`kern.maxfilesperproc`). Each exits 2 and keeps the edit for you.
