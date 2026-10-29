@@ -4184,6 +4184,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// What the channel tests read of a bot `runtime configure` set up.
+    #[cfg(target_os = "macos")]
     #[derive(Debug)]
     struct Bot {
         agent: crate::runtime::RuntimeAgentName,
@@ -4193,6 +4194,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// `runtime configure --channel`, with no other setting.
+    #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     fn configure_channel(
         engine: &Engine,
