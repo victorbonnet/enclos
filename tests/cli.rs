@@ -1455,6 +1455,50 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     assert!(audit().contains("ok: exit 3"), "{}", audit());
 }
 
+/// In this enclos's own group, as a terminal's job runs, a TERM sent to
+/// enclos alone is passed on to the program, whose end is recorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_passes_term_on_to_a_program_in_its_group() {
+    use std::os::unix::process::CommandExt;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let script = "trap 'exit 4' TERM; : > \"$HOME/trapped\"; /bin/sleep 10 & wait";
+    let trapped = home.root.join("sandboxes/home/home/trapped");
+    let mut connect = KillOnDrop(
+        home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let audit = || home.run(&["audit"]).ok().stdout();
+    assert!(
+        eventually(|| audit().contains("ok: session 2")),
+        "{}",
+        audit()
+    );
+    assert!(eventually(|| trapped.exists()), "the program set no trap");
+    // The enclos this test started, alone: not its group.
+    Command::new("/bin/kill")
+        .args(["-TERM", &connect.0.id().to_string()])
+        .status()
+        .unwrap();
+    let mut status = None;
+    assert!(eventually(|| {
+        status = connect.0.try_wait().unwrap();
+        status.is_some()
+    }));
+    assert_eq!(status.unwrap().code(), Some(4));
+    assert!(audit().contains("ok: exit 4"), "{}", audit());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_runtime_install_dry_run_starts_nothing() {

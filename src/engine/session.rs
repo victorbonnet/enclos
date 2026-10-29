@@ -25,6 +25,7 @@ use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
     Proc, Signal, Signalled, group_of, is_same, processes, reference_of_child, signal_group,
+    signal_process,
 };
 use crate::lifecycle::stop::{GRACE, Stopped, Survivor, Why, describe_survivors, stop};
 use crate::model::audit::Actor;
@@ -189,14 +190,19 @@ impl Engine {
             })?;
 
         // In a group of its own, the program hears of a signal only when
-        // this process passes it on, to the group it leads.
+        // this process passes it on, to the group it leads. In this
+        // process's group (a terminal's job), it hears the terminal's
+        // signals itself, but not a TERM sent to this process alone, which
+        // is passed on to the program.
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
             for signal in keep_waiting.received() {
-                if !own_group {
-                    continue;
-                }
-                match signal_group(&session.root, pgid, signal) {
+                let sent = match (own_group, signal) {
+                    (true, _) => signal_group(&session.root, pgid, signal),
+                    (false, Signal::Term) => signal_process(&session.root, signal),
+                    (false, _) => continue,
+                };
+                match sent {
                     Ok(Signalled::Sent | Signalled::Gone) => {}
                     Ok(other) => note(
                         notes,
@@ -272,7 +278,7 @@ impl Engine {
         let recorded = (|| -> Result<(SessionRecord, KeepWaiting)> {
             // Before the session is recorded, so that a failure here leaves
             // no session open for a program that is ended.
-            let keep_waiting = KeepWaiting::new(own_group)?;
+            let keep_waiting = KeepWaiting::new()?;
             let root = reference_of_child(&child)?;
             self.name_marker(name, marked, &root)?;
             let me = std::process::id();
@@ -1022,26 +1028,25 @@ pub(super) fn note(notes: &mut Vec<String>, note: String) {
     }
 }
 
-/// Keeps this process waiting for the program through Ctrl-C, Ctrl-\ and a
-/// hangup, as `system(3)` does. In a terminal they reach this process along
-/// with the program, which may handle them and go on; this process must
-/// outlive it to record the session's end. The program itself was started
-/// before, with the default handling, and keeps it. A program in a group
-/// of its own (no terminal: a script, CI) gets nothing from a terminal, so
-/// those signals, and TERM, are passed on to its group instead
-/// ([`KeepWaiting::received`]).
+/// Keeps this process waiting for the program through Ctrl-C, Ctrl-\, a
+/// hangup and TERM, as `system(3)` does for the first three. In a terminal
+/// they reach this process along with the program, which may handle them
+/// and go on; this process must outlive it to record the session's end.
+/// The program itself was started before, with the default handling, and
+/// keeps it. A program in a group of its own (no terminal: a script, CI)
+/// gets nothing from a terminal, so those signals are passed on to its
+/// group instead; a TERM sent to this process alone is passed on to the
+/// program either way ([`KeepWaiting::received`]).
 struct KeepWaiting(Vec<(Signal, Arc<AtomicBool>, signal_hook::SigId)>);
 
 impl KeepWaiting {
-    fn new(pass_on: bool) -> Result<Self> {
-        let mut caught = vec![
+    fn new() -> Result<Self> {
+        let caught = [
             (SIGINT, Signal::Int),
             (SIGQUIT, Signal::Quit),
             (SIGHUP, Signal::Hup),
+            (SIGTERM, Signal::Term),
         ];
-        if pass_on {
-            caught.push((SIGTERM, Signal::Term));
-        }
         let mut handled = Vec::new();
         for (number, signal) in caught {
             let flag = Arc::new(AtomicBool::new(false));
