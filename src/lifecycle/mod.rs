@@ -1,5 +1,6 @@
 //! Lifecycle: sessions, their members, and stopping them (design §8).
 
+pub mod bounded;
 pub mod listeners;
 pub mod marker;
 pub mod members;

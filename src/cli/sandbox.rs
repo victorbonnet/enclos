@@ -5,7 +5,9 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 use super::output;
-use enclos::engine::{Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport};
+use enclos::engine::{
+    Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport, printable_line,
+};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Plan, Planned};
@@ -28,8 +30,12 @@ enum SandboxVerb {
         /// The isolation technology.
         #[arg(long, default_value = "seatbelt")]
         backend: BackendKind,
-        /// The policy it starts from: minimal, mcp-only or assistant (design §7).
-        #[arg(long, default_value = enclos::policy::DEFAULT_TEMPLATE)]
+        /// The policy it starts from, required so the widest is never
+        /// picked by leaving it out: minimal (only what is listed; from
+        /// `runtime install` on, the runtime's hosts), mcp-only (the same
+        /// for now, for assistants using remote MCP servers you allow) or
+        /// assistant (the public web) (design §7).
+        #[arg(long)]
         template: TemplateName,
     },
     /// List sandboxes.
@@ -154,9 +160,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 output::emit(&shown);
                 return Ok(code);
             }
-            let services = engine.service_status(&name)?;
-            let agents = agents()?;
-            for (label, status) in services {
+            // Each part printed before the next is read, which can fail.
+            for (label, status) in engine.service_status(&name)? {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
                     ServiceStatus::Loaded => "loaded, not running".to_owned(),
@@ -164,7 +169,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 };
                 println!("  service {label}: {state}");
             }
-            if let Some((agents, notes)) = agents {
+            if let Some((agents, notes)) = agents()? {
                 let list: Vec<String> = agents.iter().map(|a| a.name.to_string()).collect();
                 println!(
                     "  agents: {}",
@@ -302,7 +307,9 @@ fn show_json(v: &SandboxView) -> Value {
 
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {
-        println!("No sandboxes yet. Create one with `enclos sandbox create <name>`.");
+        println!(
+            "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`."
+        );
         return;
     }
     let widest = |header: &str, cell: fn(&SandboxView) -> &str| {
@@ -407,8 +414,9 @@ fn print_show(v: &SandboxView) {
                 s.version
             );
         }
+        // A member's command is the sandbox's to write: shown escaped.
         for m in &view.members {
-            println!("    pid {:<7} {}", m.pid, m.command);
+            println!("{}", member_line(m.pid, &m.command));
         }
     }
 }
@@ -509,6 +517,11 @@ fn restart(
     name: &SandboxName,
     confirm: Confirm,
 ) -> Result<(u8, Value)> {
+    // Before anything stops: a policy whose limits enclos could not set
+    // would stop the sandbox and then not start it again.
+    if confirm != Confirm::DryRun {
+        engine.check_start_limits(name)?;
+    }
     match engine.stop_sandbox(by, name, confirm)? {
         Planned::DryRun(mut plan) => {
             // One plan: the stop's changes, then the start's.
@@ -603,7 +616,7 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
             eprintln!(
                 "  session {session}: pid {} {}: {}",
                 s.member.pid,
-                s.member.command,
+                printable_line(&s.member.command),
                 s.why.describe()
             );
         }
@@ -694,9 +707,22 @@ pub(super) fn print_started(
     Ok((code, value))
 }
 
+/// A member of a session, as `sandbox show` lists it: its command is the
+/// sandbox's to write, so shown escaped.
+fn member_line(pid: u32, command: &str) -> String {
+    format!("    pid {pid:<7} {}", printable_line(command))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_members_command_is_shown_escaped() {
+        let line = member_line(42, "a\u{1b}[31mb\u{202e}c\u{9b}d");
+        assert!(!line.contains(['\u{1b}', '\u{202e}', '\u{9b}']), "{line:?}");
+        assert!(line.starts_with("    pid 42 "), "{line:?}");
+    }
     use enclos::error::Error;
 
     fn names(list: &[&str]) -> Vec<SandboxName> {

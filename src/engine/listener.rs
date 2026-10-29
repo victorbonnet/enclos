@@ -242,8 +242,8 @@ impl Engine {
         Ok(Some((listener, step)))
     }
 
-    /// Makes sure the runtime's service listens before `connect` starts its
-    /// session (ADR 0028): Hermes's chat no longer starts a gateway of its
+    /// Makes sure the runtime's service listens before `connect` or `exec`
+    /// starts its session (ADR 0028): Hermes's chat no longer starts a gateway of its
     /// own, which could not reach it, and a session reaches the service only
     /// on the port it held when the session started. Starts the sandbox's
     /// services when its service is not installed and does not run, which
@@ -252,8 +252,8 @@ impl Engine {
     /// gives up sooner while no session of the service is open, as when it
     /// exits at once, and at once for what waiting does not fix (several
     /// ports, a port another process shares). A start that fails ends it
-    /// too: `connect` goes ahead either way, with why in `late`. One
-    /// `connect` of a sandbox at a time decides and waits, so two never
+    /// too: the session goes ahead either way, with why in `late`. One
+    /// session of a sandbox at a time decides and waits, so two never
     /// start its services at once. `None`: there was nothing to do.
     pub fn start_listener_service(
         &self,

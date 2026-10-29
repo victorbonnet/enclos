@@ -9,7 +9,9 @@
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+#[cfg(all(test, target_os = "macos"))]
+use std::process::Stdio;
+use std::process::{Command, Output};
 
 /// `lsof` could not say which program files the processes run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -20,15 +22,17 @@ pub struct ProgramsError(String);
 /// are not listed), by pid, each named as `lsof` writes it: compare one with
 /// a path through [`lsof_name`].
 pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
+    let before = readable_own()?;
     // `-b`: no call that can block, such as on a network mount that does not
     // answer, which would hold the state lock with it; `-w`: its warnings
     // about such a mount are not a failure to list the processes.
-    let out = Command::new("/usr/sbin/lsof")
-        .env("LC_ALL", "C")
-        .args(["-nP", "-b", "-w", "-d", "txt", "-Fpn"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| ProgramsError(e.to_string()))?;
+    let out = super::bounded::output_within(
+        Command::new("/usr/sbin/lsof")
+            .env("LC_ALL", "C")
+            .args(["-nP", "-b", "-w", "-d", "txt", "-Fpn"]),
+        super::bounded::LIMIT,
+    )
+    .map_err(|e| ProgramsError(e.to_string()))?;
     let files = parse(&out)?;
     // With `-w` a failure to read some processes can pass unsaid: a listing
     // without enclos itself, whose program is mapped, is not complete.
@@ -38,7 +42,81 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
             out.status
         )));
     }
+    // Nor one that left out another process of the user it could read,
+    // there before and after it looked: `-b`, `-w` and an exit of 1 could
+    // otherwise pass a part of the listing for the whole.
+    let left = left_out(&before, &readable_own()?, &files);
+    if !left.is_empty() {
+        let pids: Vec<String> = left.iter().map(ToString::to_string).collect();
+        return Err(ProgramsError(format!(
+            "{}, and its listing left out processes of this user it could read: {}",
+            out.status,
+            pids.join(", ")
+        )));
+    }
     Ok(files)
+}
+
+/// `P_SUGID` (`sys/proc.h`): a process that changed its user or group as
+/// it ran a set-user-id program, such as `/usr/bin/login`, which macOS lets
+/// no other process of the user look into, so `lsof` lists it not. A
+/// sandbox runs no such program: Seatbelt refuses to start a set-user-id
+/// one (design §5, shown for `crontab` and `at` on macOS 26.5.2).
+const P_SUGID: u32 = 0x100;
+
+/// The processes of this user, by effective user, that `lsof` can read:
+/// neither zombies nor `P_SUGID` ones.
+fn readable_own() -> Result<std::collections::BTreeSet<u32>, ProgramsError> {
+    let uid = rustix::process::geteuid().as_raw().to_string();
+    let out = super::bounded::output_within(
+        Command::new("/bin/ps")
+            .env("LC_ALL", "C")
+            .args(["-u", &uid, "-o", "pid=,flags=,stat="]),
+        super::bounded::LIMIT,
+    )
+    .map_err(|e| ProgramsError(format!("/bin/ps: {e}")))?;
+    if !out.status.success() {
+        return Err(ProgramsError(format!(
+            "/bin/ps {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    parse_readable(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `ps -o pid=,flags=,stat=` lines, as the pids `lsof` can read.
+fn parse_readable(text: &str) -> Result<std::collections::BTreeSet<u32>, ProgramsError> {
+    let mut pids = std::collections::BTreeSet::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut words = line.split_whitespace();
+        let fields = (words.next(), words.next(), words.next());
+        let (Some(pid), Some(flags), Some(stat)) = fields else {
+            return Err(ProgramsError(format!("unexpected ps line `{line}`")));
+        };
+        let pid: u32 = pid
+            .parse()
+            .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
+        let flags = u32::from_str_radix(flags, 16)
+            .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
+        if flags & P_SUGID == 0 && !stat.starts_with('Z') {
+            pids.insert(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// The pids readable both before and after the listing that it left out.
+fn left_out(
+    before: &std::collections::BTreeSet<u32>,
+    after: &std::collections::BTreeSet<u32>,
+    listed: &BTreeMap<u32, Vec<String>>,
+) -> Vec<u32> {
+    before
+        .intersection(after)
+        .filter(|p| !listed.contains_key(p))
+        .copied()
+        .collect()
 }
 
 /// `path` as `lsof` writes a file name in the C locale (macOS 26.5.2): a
@@ -188,6 +266,31 @@ pub(crate) mod tests {
         assert!(parse(&output(1, "p1\nn/x\n", "lsof: status error")).is_err());
         assert!(parse(&output(0, "pnot-a-pid\n", "")).is_err());
         assert!(parse(&output(1, "p1\nn/x\n", "")).is_ok());
+    }
+
+    /// A process `lsof` could read, there before and after it looked, and
+    /// left out makes the listing a part, not the whole; one gone meanwhile,
+    /// one set-user-id (`P_SUGID`) or a zombie does not.
+    #[test]
+    fn a_listing_that_leaves_out_a_readable_process_is_not_whole() {
+        let readable =
+            parse_readable("  10     4004 Ss\n  11 4004104 S\n  12     4004 Z\n  13     4004 S\n")
+                .unwrap();
+        assert_eq!(readable.into_iter().collect::<Vec<_>>(), [10, 13]);
+        assert!(parse_readable("x 4004 S\n").is_err());
+        let before = [10, 13, 14].into_iter().collect();
+        let after = [10, 13].into_iter().collect();
+        let mut listed = BTreeMap::new();
+        listed.insert(10, Vec::new());
+        assert_eq!(left_out(&before, &after, &listed), [13]);
+        listed.insert(13, Vec::new());
+        assert!(left_out(&before, &after, &listed).is_empty());
+    }
+
+    /// On this host, the whole listing leaves out no process it can read.
+    #[test]
+    fn the_listing_of_this_host_is_whole() {
+        program_files().unwrap();
     }
 
     /// A program in a folder whose name holds what `lsof` escapes is listed
