@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::super::{Launch, Probe, SandboxContext};
-use super::compile::{SERVICE_PARAM, TERMINAL_PARAM};
+use super::compile::{Baseline, SERVICE_PARAM, TERMINAL_PARAM};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -40,17 +40,24 @@ const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
 /// understand it.
 const FALLBACK_TERM: &str = "xterm-256color";
 
-/// Whether `sandbox-exec` runs `/usr/bin/true` under a Seatbelt policy that
-/// allows everything, with no variable of the user's, within
-/// [`TRY_RUN_WAIT`]. macOS 26.5.2 refuses it, `sandbox_apply: Operation not
-/// permitted` (exit 71), to a process in a sandbox whose policy denies a
-/// write, as every enclos sandbox's does (a test runs doctor under a policy
-/// that allows everything but one write, and finds `Operation not
-/// permitted`, exit 71); in one whose policy only allows
-/// everything it runs, exit 0 (by hand, macOS 26.5.2).
-pub fn try_run() -> Probe {
+/// Whether `sandbox-exec` runs `/usr/bin/true` under `baseline` alone, as
+/// every session's compiled policy starts, with no variable of the user's,
+/// within [`TRY_RUN_WAIT`]: on `(deny default)`, a macOS that rejects one of
+/// its allowances, or needs one it lacks to start a program, is found here,
+/// not at a session's start. Inside a sandbox whose policy denies a write,
+/// as every enclos sandbox's does, macOS 26.5.2 refuses to apply this
+/// policy, `sandbox_apply: Operation not permitted` (exit 71): a test runs
+/// doctor so, on either baseline. Inside one whose policy only allows
+/// everything, `(version 1)(allow default)` ran, exit 0 (by hand, macOS
+/// 26.5.2); this policy on `(deny default)` there is not shown.
+pub fn try_run(baseline: Baseline) -> Probe {
+    let policy = format!("(version 1)\n{}", baseline.text("enclos:doctor"));
+    let named = match baseline {
+        Baseline::DenyDefault => "(deny default)",
+        Baseline::AllowDefault => "(allow default)",
+    };
     let started = Command::new(SANDBOX_EXEC)
-        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .args(["-p", &policy, "/usr/bin/true"])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -108,10 +115,10 @@ pub fn try_run() -> Probe {
     Probe::Unavailable {
         reason: match said.is_empty() {
             true => format!(
-                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status})"
+                "{SANDBOX_EXEC} could not run /usr/bin/true under the {named} baseline alone ({status})"
             ),
             false => format!(
-                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status}): {said}"
+                "{SANDBOX_EXEC} could not run /usr/bin/true under the {named} baseline alone ({status}): {said}"
             ),
         },
     }

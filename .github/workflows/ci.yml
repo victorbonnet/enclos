@@ -50,6 +50,11 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked --all-features
+      # A release build refuses the comparison baseline (ADR 0006): checked
+      # on every change, not only when a tag is pushed.
+      - name: A release refuses the comparison baseline
+        if: runner.os == 'macOS'
+        run: cargo test --release --locked --test cli init_takes_allow_default_only_in_a_debug_build
 
   secrets:
     runs-on: ubuntu-latest

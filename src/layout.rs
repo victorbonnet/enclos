@@ -278,6 +278,12 @@ impl Layout {
         .try_for_each(|dir| create_dir(dir))
     }
 
+    /// The text of `config.toml`.
+    pub fn read_config(&self) -> Result<String, LayoutError> {
+        let path = self.config_file();
+        std::fs::read_to_string(&path).map_err(|source| LayoutError::Io { path, source })
+    }
+
     /// Writes `config.toml` unless it exists. Returns whether it wrote it.
     pub fn write_config(&self, contents: &str) -> Result<bool, LayoutError> {
         let path = self.config_file();
@@ -299,6 +305,28 @@ impl Layout {
             .and_then(|()| file.sync_all())
             .map_err(io_err)?;
         Ok(true)
+    }
+
+    /// Replaces `config.toml` in one step: written beside it, then renamed
+    /// over it, so a crash leaves the old or the new file.
+    pub fn replace_config(&self, contents: &str) -> Result<(), LayoutError> {
+        let path = self.config_file();
+        let tmp = path.with_extension("toml.new");
+        let io_err = |path: &Path| {
+            let path = path.to_owned();
+            move |source| LayoutError::Io { path, source }
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(io_err(&tmp))?;
+        file.write_all(contents.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, &path).map_err(io_err(&path))
     }
 
     /// Creates a sandbox's folder, its home, and the home's `tmp`, which

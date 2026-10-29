@@ -72,6 +72,21 @@ jobs:
           tar -xzf "dist/$ASSET" -C check
           test "$(check/enclos --version)" = "enclos $RELEASE_VERSION"
 
+      # The (allow default) comparison baseline is a debug build's only
+      # (ADR 0006): every test runs one, so only a release shows it refused.
+      - name: Check a release refuses the comparison baseline
+        run: |
+          binary="target/$TARGET/release/enclos"
+          ENCLOS_HOME="$(mktemp -d)" ENCLOS_SEATBELT_BASELINE=allow-default \
+            "$binary" --json init > init.json
+          python3 -c '
+          import json
+          init = json.load(open("init.json"))
+          assert init["default_backend"] is None, init
+          reasons = [u["reason"] for u in init["unavailable"] if u["backend"] == "seatbelt"]
+          assert reasons and "never a release" in reasons[0], init
+          '
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release

@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
-use enclos::engine::{Engine, InitReport};
+use enclos::engine::{ConfigBackend, Engine, InitReport};
 use enclos::error::{Result, exit};
 use enclos::layout::Layout;
 use enclos::model::audit::{Actor, AuditEntry, AuditResult, Since, VerifyReport};
@@ -374,6 +374,15 @@ fn init_json(planned: &Planned<InitReport>) -> serde_json::Value {
             "created": report.created.iter().map(|p| path(p)).collect::<Vec<_>>(),
             "schema": {"from": report.migration.from, "to": report.migration.to},
             "default_backend": report.default_backend.map(|k| k.to_string()),
+            "unavailable": report.unavailable.iter().map(|u| serde_json::json!({
+                "backend": u.backend.to_string(),
+                "reason": u.reason,
+            })).collect::<Vec<_>>(),
+            "config_backend": report.config_backend.as_ref().map(|c| match c {
+                ConfigBackend::Written(kind) => serde_json::json!({"state": "written", "backend": kind.to_string()}),
+                ConfigBackend::NotNamed(kind) => serde_json::json!({"state": "not_named", "backend": kind.to_string()}),
+                ConfigBackend::Unchecked(why) => serde_json::json!({"state": "unchecked", "why": why}),
+            }),
         }),
     }
 }
@@ -440,10 +449,32 @@ fn print_init(planned: Planned<InitReport>) {
                     report.migration.from, report.migration.to
                 );
             }
-            if report.created.contains(&config) {
-                match report.default_backend {
-                    Some(kind) => println!("Default backend: {kind}."),
-                    None => println!("No backend is available on this host yet."),
+            match report.default_backend {
+                Some(kind) if report.created.contains(&config) => {
+                    println!("Default backend: {kind}.");
+                }
+                Some(_) => match &report.config_backend {
+                    None => {}
+                    Some(ConfigBackend::Written(kind)) => println!(
+                        "Default backend: {kind}, now written to {}, written while none was available.",
+                        config.display()
+                    ),
+                    Some(ConfigBackend::NotNamed(kind)) => println!(
+                        "{} names no default backend, though {kind} is available now. Add `default_backend = \"{kind}\"` to it.",
+                        config.display()
+                    ),
+                    Some(ConfigBackend::Unchecked(why)) => println!(
+                        "{} was not checked for a default backend: {why}",
+                        config.display()
+                    ),
+                },
+                // Said at every run, with why, so that a setting that turned
+                // a backend off is seen at once, not at the first create.
+                None => {
+                    println!("No backend is available on this host yet:");
+                    for u in &report.unavailable {
+                        println!("  {}: {}", u.backend, u.reason);
+                    }
                 }
             }
         }

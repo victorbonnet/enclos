@@ -90,11 +90,70 @@ fn init_records_the_first_available_backend() {
     ]);
     let report = done(engine.init(&alice(), Confirm::Ask).unwrap());
     assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
+    assert_eq!(
+        report.unavailable,
+        [crate::engine::Unavailable {
+            backend: BackendKind::Libkrun,
+            reason: "no VM support".to_owned(),
+        }]
+    );
+    assert_eq!(report.config_backend, None);
     let config = std::fs::read_to_string(engine.layout.config_file()).unwrap();
     assert!(
         config.contains("default_backend = \"seatbelt\""),
         "{config}"
     );
+}
+
+/// A `config.toml` written while no backend was available gets the one
+/// available now, in place of init's own line for that; one changed by
+/// hand is said to name none and left; one that does not parse is said, and
+/// does not fail init.
+#[test]
+fn init_names_a_backend_in_a_config_written_while_none_was_available() {
+    use crate::engine::ConfigBackend;
+    let (_dir, mut engine) = engine_with(vec![Box::new(FakeBackend::unavailable(
+        BackendKind::Seatbelt,
+        "a bad setting",
+    ))]);
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.default_backend, None);
+    assert_eq!(report.config_backend, None);
+    let written = engine.layout.read_config().unwrap();
+    engine.backends = vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))];
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.default_backend, Some(BackendKind::Seatbelt));
+    assert!(report.unavailable.is_empty());
+    assert_eq!(
+        report.config_backend,
+        Some(ConfigBackend::Written(BackendKind::Seatbelt))
+    );
+    assert_eq!(
+        engine.layout.read_config().unwrap(),
+        crate::config::initial(Some(BackendKind::Seatbelt))
+    );
+    assert_ne!(engine.layout.read_config().unwrap(), written);
+    // Named now: nothing to say.
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(report.config_backend, None);
+
+    // Changed by hand: said, and left as it is.
+    let mine = "# mine\nschema_version = 1\n";
+    std::fs::write(engine.layout.config_file(), mine).unwrap();
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(
+        report.config_backend,
+        Some(ConfigBackend::NotNamed(BackendKind::Seatbelt))
+    );
+    assert_eq!(engine.layout.read_config().unwrap(), mine);
+
+    // Not TOML: said why, and init still succeeds.
+    std::fs::write(engine.layout.config_file(), "not = [toml").unwrap();
+    let report = done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let Some(ConfigBackend::Unchecked(why)) = &report.config_backend else {
+        panic!("{report:?}");
+    };
+    assert!(why.contains("does not parse"), "{why}");
 }
 
 #[test]
@@ -549,7 +608,14 @@ mod compile {
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
         let inputs = engine
-            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .probe_inputs(
+                &name,
+                &ctx,
+                None,
+                None,
+                Default::default(),
+                Default::default(),
+            )
             .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
@@ -625,7 +691,7 @@ mod compile {
         use crate::backend::Launch;
         use crate::backend::seatbelt::Seatbelt;
 
-        let (dir, engine) = engine_with(vec![Box::new(Seatbelt)]);
+        let (dir, engine) = engine_with(vec![Box::new(Seatbelt::default())]);
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "home".parse().unwrap();
         let spec = crate::engine::SandboxSpec {
@@ -650,7 +716,10 @@ mod compile {
             limits: Default::default(),
         };
         let ctx = engine.sandbox_context(&name, 41001);
-        let out = Seatbelt.wrap(&compiled, &ctx, &launch).output().unwrap();
+        let out = Seatbelt::default()
+            .wrap(&compiled, &ctx, &launch)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success());
         assert!(stderr.contains("Operation not permitted"), "{stderr}");
@@ -5144,7 +5213,13 @@ mod services {
         let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
         engine.start_sandbox(&alice(), &name).unwrap();
         for unit in fake.started.borrow().iter() {
+            // That alone: never the comparison baseline (ADR 0006).
             assert_eq!(unit.env, engine.layout.env(), "{}", unit.label);
+            assert!(
+                unit.env
+                    .iter()
+                    .all(|(k, _)| k != crate::backend::seatbelt::BASELINE_VAR)
+            );
         }
     }
 

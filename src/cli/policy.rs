@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::output;
 
+use enclos::backend::seatbelt::Baseline;
 use enclos::engine::{
     ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyDiff,
     PolicyHistory, PolicyView, Restarted, TestReport,
@@ -261,7 +262,7 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "verdict": verdict(sandbox, report, true),
         "probes": report.results.iter().map(|r| {
             let (outcome, why) = match &r.outcome {
-                Outcome::Closed => ("closed", None),
+                Outcome::Closed => ("closed", r.closed_by.map(|by| by.why().to_owned())),
                 Outcome::Open(why) => ("open", Some(why.clone())),
                 Outcome::Inconclusive(why) => ("inconclusive", Some(why.clone())),
                 Outcome::NotRun(why) => ("not_run", Some(why.clone())),
@@ -271,13 +272,17 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
                 "name": r.name,
                 "outcome": outcome,
                 "why": why,
-                "closed_by_platform": r.closed_by_platform,
+                "closed_by": r.closed_by.map(enclos::probes::ClosedBy::key),
             })
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,
         "not_here": report.not_here,
         "not_probed": NOT_PROBED,
         "listens": report.listens,
+        "baseline": match report.baseline {
+            Baseline::AllowDefault => "allow_default",
+            Baseline::DenyDefault => "deny_default",
+        },
     })
 }
 
@@ -951,8 +956,8 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
         let (mark, detail) = match &r.outcome {
             Outcome::Closed => (
                 "closed      ",
-                r.closed_by_platform
-                    .map(|why| format!("  ({why})"))
+                r.closed_by
+                    .map(|by| format!("  ({})", by.why()))
                     .unwrap_or_default(),
             ),
             Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
@@ -1016,10 +1021,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         false => format!("{text} above"),
     };
     if report.passed() {
-        let platform = match report.closed_by_platform() {
-            0 => String::new(),
-            n => format!(" ({n} by Seatbelt itself)"),
-        };
+        let platform = report.closed_apart();
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
@@ -1029,7 +1031,13 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
                 listed("inconclusive", "inconclusive")
             ),
         };
-        return format!("READY: no probe got out of sandbox {sandbox}: {shown}.");
+        let baseline = match report.baseline {
+            Baseline::AllowDefault => {
+                " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
+            }
+            Baseline::DenyDefault => "",
+        };
+        return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
     let mut why = Vec::new();
     if report.open() > 0 {
@@ -1047,7 +1055,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by an enclos rule, so the test showed nothing about the policy".to_owned());
+        why.push("no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules".to_owned());
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1073,12 +1081,13 @@ mod tests {
                     route: "writes",
                     name: "write outside the home".into(),
                     outcome,
-                    closed_by_platform: None,
+                    closed_by: None,
                 })
                 .collect(),
             host_services: false,
             not_here: Vec::new(),
             listens: false,
+            baseline: Baseline::DenyDefault,
         }
     }
 
@@ -1125,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             verdict(&lab, &report(Outcome::Inconclusive("x".into())), false),
-            "NOT READY: sandbox lab: no probe was shown closed by an enclos rule, so the test showed nothing about the policy."
+            "NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules."
         );
     }
 

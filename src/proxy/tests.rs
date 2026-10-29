@@ -262,9 +262,11 @@ fn an_allowed_tunnel_relays_bytes_and_is_logged() {
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     conn.write_all(b"ping").unwrap();
     assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"ping");
-    // Logged while it is still open.
+    // Logged while it is still open: with the bytes relayed so far, none or
+    // the upstream's answer, which may already be on its way.
     let open = proxy.log.wait_for(1);
-    assert_eq!((open[0].verdict, open[0].bytes_down), (Verdict::Allowed, 0));
+    assert_eq!(open[0].verdict, Verdict::Allowed);
+    assert!(matches!(open[0].bytes_down, 0 | 4), "{:?}", open[0]);
 
     let mut answer = String::new();
     conn.read_to_string(&mut answer).unwrap();

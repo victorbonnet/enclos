@@ -1,6 +1,7 @@
 //! The Seatbelt backend: macOS's sandbox, through `sandbox-exec` (ADR 0005).
-//! Milestone 1 compiles on the `(allow default)` baseline; ADR 0006 decides
-//! between it and `(deny default)` in milestone 2.
+//! Policies compile on the `(deny default)` baseline (ADR 0006); the
+//! `(allow default)` one milestone 1 used is kept only so tests can compare
+//! the two baselines.
 
 mod compile;
 #[cfg(all(test, target_os = "macos"))]
@@ -16,10 +17,46 @@ use super::{
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 
-pub use compile::tag;
+pub use compile::{BASELINE_VAR, Baseline, tag};
 pub use wrap::environment;
 
-pub struct Seatbelt;
+/// Seatbelt, compiling on one baseline for the whole process.
+pub struct Seatbelt {
+    /// [`Baseline::from_env`], read once: every policy compiled in a
+    /// process is on the same baseline, and a bad value fails each compile.
+    baseline: Result<Baseline, String>,
+}
+
+impl Seatbelt {
+    /// On the baseline [`BASELINE_VAR`] asks for.
+    pub fn from_env() -> Seatbelt {
+        Seatbelt {
+            baseline: Baseline::from_env(),
+        }
+    }
+}
+
+/// On `(deny default)`, whatever the environment says: the only other way
+/// to make one, and never on the comparison baseline.
+impl Default for Seatbelt {
+    fn default() -> Seatbelt {
+        Seatbelt {
+            baseline: Ok(Baseline::DenyDefault),
+        }
+    }
+}
+
+/// Says on stderr, once per process and so for the first sandbox only,
+/// that a program runs on the comparison baseline.
+fn say_allow_default(ctx: &SandboxContext) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        crate::notes::say(&format!(
+            "sandbox {} runs under a policy compiled from (allow default), as {BASELINE_VAR} asks: that baseline is only for comparing the two (ADR 0006)",
+            ctx.name
+        ));
+    });
+}
 
 impl Backend for Seatbelt {
     fn kind(&self) -> BackendKind {
@@ -32,6 +69,13 @@ impl Backend for Seatbelt {
                 reason: "Seatbelt exists only on macOS".to_owned(),
             };
         }
+        // A baseline asked for that is neither: no policy compiles, so the
+        // backend is not usable here, and doctor says why.
+        if let Err(reason) = &self.baseline {
+            return Probe::Unavailable {
+                reason: reason.clone(),
+            };
+        }
         if !Path::new(wrap::SANDBOX_EXEC).exists() {
             return Probe::Unavailable {
                 reason: format!("{} is missing", wrap::SANDBOX_EXEC),
@@ -40,8 +84,15 @@ impl Backend for Seatbelt {
         Probe::Available
     }
 
+    /// On the baseline every session here compiles from: a bad value is
+    /// unavailable already, and said by `probe`.
     fn try_run(&self) -> Probe {
-        wrap::try_run()
+        match &self.baseline {
+            Ok(baseline) => wrap::try_run(*baseline),
+            Err(reason) => Probe::Unavailable {
+                reason: reason.clone(),
+            },
+        }
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -61,10 +112,20 @@ impl Backend for Seatbelt {
     }
 
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
-        compile::compile(policy, ctx)
+        let baseline = self
+            .baseline
+            .clone()
+            .map_err(|reason| CompileError::Unsupported {
+                backend: BackendKind::Seatbelt,
+                reason,
+            })?;
+        compile::compile(policy, ctx, baseline)
     }
 
     fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
+        if self.baseline == Ok(Baseline::AllowDefault) {
+            say_allow_default(ctx);
+        }
         wrap::wrap(compiled, ctx, launch)
     }
 }

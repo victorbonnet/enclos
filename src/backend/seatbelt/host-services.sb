@@ -4,12 +4,16 @@
 ;; macOS 26 is noted beside it (prototype #5); escape probes (#13) check them.
 
 ;; LaunchServices: `open`, opening apps, documents and URLs. Shown: `open -g
-;; <url>` fails with -54 under this rule; denying the coreservicesd lookups
-;; alone did not stop it.
+;; <url>` fails with -54 under this rule on (allow default); denying the
+;; coreservicesd lookups alone did not stop it. On (deny default) the
+;; baseline first refuses something `open` needs, likely a lookup (-10661;
+;; not traced).
 (deny lsopen (with message "{tag}"))
 
 ;; Apple Events (osascript, scripting Terminal or any app). Shown: either rule
-;; alone makes an event to Finder fail with -600.
+;; alone makes an event to Finder fail with -600 on (allow default). On (deny
+;; default) the baseline first refuses something `osascript` needs to reach
+;; Finder, likely a lookup (-1728; not traced).
 (deny appleevent-send (with message "{tag}"))
 (deny mach-lookup (with message "{tag}")
   (global-name "com.apple.coreservices.appleevents"))
@@ -21,7 +25,9 @@
 
 ;; cfprefsd writes ~/Library/Preferences for the caller, which the write rules
 ;; never see. Shown: without this rule `defaults write` reached the user's own
-;; preferences although HOME pointed elsewhere. Reads stay allowed.
+;; preferences although HOME pointed elsewhere. Under (deny default)
+;; nothing allows `user-preference-read` or the cfprefsd lookups either (not
+;; probed); this rule keeps writes closed whatever the baseline.
 (deny user-preference-write (with message "{tag}"))
 
 ;; Synthetic keyboard and mouse events and the pasteboard. Shown: the lookups

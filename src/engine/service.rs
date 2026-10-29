@@ -365,6 +365,23 @@ impl Engine {
     /// manager does, INT or HUP), it stops the session's members and records
     /// the end, as failed when the program outlives that.
     pub fn launch(&self, by: &Actor, name: &SandboxName, service: &str) -> Result<SessionEnd> {
+        use crate::backend::seatbelt::{BASELINE_VAR, Baseline};
+        // A service runs only on `(deny default)` (ADR 0006): the job file
+        // never carries the comparison baseline, and one the service
+        // manager's own environment carries, or a hand-run `launch`, is
+        // refused here, before anything is recorded.
+        let why = match Baseline::from_env() {
+            Ok(Baseline::DenyDefault) => None,
+            Ok(Baseline::AllowDefault) => Some(format!("{BASELINE_VAR} asks for allow-default")),
+            Err(why) => Some(why),
+        };
+        if let Some(why) = why {
+            return Err(Error::Session {
+                what: format!(
+                    "{why}: a service runs only on (deny default) (`launchctl unsetenv {BASELINE_VAR}` unsets it in the service manager's environment)"
+                ),
+            });
+        }
         let ended = Arc::new(AtomicBool::new(false));
         let _ending = EndOn::new(&ended)?;
         self.launch_until(by, name, service, &ended)
