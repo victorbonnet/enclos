@@ -60,8 +60,8 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
 /// `P_SUGID` (`sys/proc.h`): a process that changed its user or group as
 /// it ran a set-user-id program, such as `/usr/bin/login`, which macOS lets
 /// no other process of the user look into, so `lsof` lists it not. A
-/// sandbox runs no such program: Seatbelt refuses to start one (`/bin/ps`,
-/// shown on macOS 26.5.2).
+/// sandbox runs no such program: Seatbelt refuses to start a set-user-id
+/// one (design §5, shown for `crontab` and `at` on macOS 26.5.2).
 const P_SUGID: u32 = 0x100;
 
 /// The processes of this user, by effective user, that `lsof` can read:

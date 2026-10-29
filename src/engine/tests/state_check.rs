@@ -740,6 +740,7 @@ fn a_gone_session_whose_markers_folder_is_gone_is_left() {
         if replaced {
             std::fs::write(&members, "").unwrap();
         }
+        set_state(&engine, &name, SandboxState::Running);
         let found = engine.state_check(None).unwrap();
         let gone = about(&found, &format!("session {id} is gone"));
         assert_eq!(gone.len(), 1, "{found:?}");
@@ -747,9 +748,63 @@ fn a_gone_session_whose_markers_folder_is_gone_is_left() {
             matches!(&gone[0].remedy, Remedy::Manual(m) if m.contains("`members` folder")),
             "{gone:?}"
         );
+        // Nor recorded stopped: a process of that session may still run.
+        assert_eq!(repairs(&found), Vec::<String>::new(), "{found:?}");
         repair(&engine, None);
         assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+        assert_eq!(state_of(&engine, &name), SandboxState::Running);
     }
+}
+
+/// A repair looks at the markers once more before it records an end: a
+/// process holding one now, as after a double fork the check's `ps` did not
+/// see, leaves every record as it was.
+#[test]
+fn a_repair_records_no_end_for_a_session_whose_marker_is_held_again() {
+    let (_dir, engine, name) = with_sandbox();
+    let session = session_of(&engine, &name, gone_process());
+    let id = put(&engine, &session);
+    let marker = engine
+        .markers(&name)
+        .join(crate::lifecycle::marker::name_of(&session.root));
+    std::fs::write(&marker, "").unwrap();
+    // This test's own process holds it.
+    let _held = std::fs::File::open(&marker).unwrap();
+    let lock = engine.state.lock().unwrap();
+    let repair = crate::engine::state_check::Repair::end_sessions(vec![id]);
+    let err = engine.repair_records(&lock, &name, &[&repair]).unwrap_err();
+    assert!(
+        err.to_string().contains("holding its marker again"),
+        "{err}"
+    );
+    drop(lock);
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// A `members` folder that cannot be read is no answer that no marker is
+/// held: the sandbox is named as one enclos cannot look at, and no session
+/// of it is ended.
+#[test]
+fn a_markers_folder_that_cannot_be_read_ends_no_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_dir, engine, name) = with_sandbox();
+    let id = put(&engine, &session_of(&engine, &name, gone_process()));
+    let members = engine.markers(&name);
+    std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let found = engine.state_check(None);
+    let repaired = engine.state_repair(&alice(), None);
+    std::fs::set_permissions(&members, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let found = found.unwrap();
+    assert!(
+        about(&found, &format!("session {id} is gone")).is_empty(),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|f| f.what.contains("members")),
+        "{found:?}"
+    );
+    drop(repaired);
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
 }
 
 /// Something in the sandboxes' folder that is not a folder, and no record
