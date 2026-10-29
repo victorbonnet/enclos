@@ -427,7 +427,12 @@ impl Engine {
             });
         }
         let overrides = self.layout.read_policy(name.as_str())?;
-        let snapshot = self.checked_policy_with(name, &overrides, Some(adapter_layer(kind)))?;
+        let snapshot = self.checked_policy_with(
+            name,
+            &overrides,
+            Some(adapter_layer(kind)),
+            self.recorded_backend(name)?,
+        )?;
         let layer = PolicyFile::parse(&format!("{kind} adapter"), runtime.endpoints())?;
         let expected: Vec<&str> = layer.network.allow_add.iter().map(String::as_str).collect();
         let added = layer

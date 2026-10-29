@@ -203,6 +203,15 @@ pub fn reserved_variable(name: &str) -> bool {
         "UV_CACHE_DIR",
         "npm_config_cache",
         "NODE_USE_ENV_PROXY",
+        // Read by the shell that sets a sandbox's limits, on the host.
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "IFS",
+        "CDPATH",
+        "GLOBIGNORE",
         // Where Hermes's services find their secrets (ADR 0034).
         "HERMES_MANAGED_DIR",
         "HTTP_PROXY",
@@ -219,6 +228,7 @@ pub fn reserved_variable(name: &str) -> bool {
         || name.starts_with("ENCLOS_")
         || name.starts_with("DYLD_")
         || name.starts_with("XDG_")
+        || name.starts_with("BASH_FUNC_")
 }
 
 /// Whether `name` is a variable name a shell reads: a letter or `_`, then
@@ -310,6 +320,17 @@ mod tests {
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
             "TZ",
+            // What the shell that sets the limits would read (`bash -p`
+            // reads none of them, and none can be granted either).
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
+            "PS4",
+            "IFS",
+            "CDPATH",
+            "GLOBIGNORE",
+            "BASH_FUNC_ulimit%%",
         ] {
             assert!(reserved_variable(reserved), "{reserved}");
         }

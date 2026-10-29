@@ -58,6 +58,11 @@ impl Resolve for FakeResolver {
     }
 }
 
+/// How long a test waits for what the proxy does on its own threads: long,
+/// since a test that passes waits only as long as it takes, and a CI runner
+/// busy with the whole suite can take seconds.
+const PATIENCE: Duration = Duration::from_secs(30);
+
 /// The records, and how many were finished.
 #[derive(Clone, Default)]
 struct MemoryLog(
@@ -114,12 +119,12 @@ impl MemoryLog {
         }
     }
 
-    /// Waits until the records are `done`, for at most five seconds.
+    /// Waits until the records are `done`, for at most [`PATIENCE`].
     fn wait_until(&self, done: impl Fn(&[NetEvent]) -> bool) -> Vec<NetEvent> {
         let start = Instant::now();
         loop {
             let events = self.0.lock().unwrap().clone();
-            if done(&events) || start.elapsed() > Duration::from_secs(5) {
+            if done(&events) || start.elapsed() > PATIENCE {
                 return events;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -256,10 +261,7 @@ fn an_allowed_tunnel_relays_bytes_and_is_logged() {
     );
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     conn.write_all(b"ping").unwrap();
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"ping"
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"ping");
     // Logged while it is still open.
     let open = proxy.log.wait_for(1);
     assert_eq!((open[0].verdict, open[0].bytes_down), (Verdict::Allowed, 0));
@@ -338,10 +340,7 @@ fn an_allowed_tunnel_is_served_even_when_its_record_cannot_be_written() {
     );
     assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
     conn.write_all(b"ping").unwrap();
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"ping"
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"ping");
 }
 
 #[test]
@@ -374,7 +373,7 @@ fn plain_http_is_forwarded_in_origin_form() {
         ),
     );
     assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
-    let head = String::from_utf8(received.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    let head = String::from_utf8(received.recv_timeout(PATIENCE).unwrap()).unwrap();
     assert!(
         head.starts_with("GET /weather?city=cali HTTP/1.1\r\n"),
         "{head}"
@@ -426,7 +425,7 @@ fn plain_http_exchange(writes: &[&str], then_close: bool) -> (String, String) {
     if then_close {
         let _ = conn.shutdown(std::net::Shutdown::Write);
     }
-    let all = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let all = received.recv_timeout(PATIENCE).unwrap();
     let mut reply = Vec::new();
     let _ = conn.read_to_end(&mut reply);
     (
@@ -485,7 +484,7 @@ fn a_tunnel_keeps_what_the_client_sent_with_its_connect() {
     )
     .unwrap();
     conn.shutdown(std::net::Shutdown::Write).unwrap();
-    let all = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    let all = received.recv_timeout(PATIENCE).unwrap();
     assert_eq!(all, b"hello, early");
 }
 
@@ -701,7 +700,7 @@ fn serving_ends_when_any_accept_thread_ends_even_by_panicking() {
     // Otherwise the other thread would serve its loopback alone, and the
     // dead one's port would be free for another program.
     assert!(
-        finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+        finished.recv_timeout(PATIENCE).is_ok(),
         "serving went on with one accept thread dead"
     );
 }
@@ -1096,7 +1095,7 @@ fn a_tunnel_whose_hello_names_its_host_goes_through_with_the_name_logged() {
     conn.write_all(b"more").unwrap();
     conn.shutdown(std::net::Shutdown::Write).unwrap();
     assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        received.recv_timeout(PATIENCE).unwrap(),
         [&hello[..], b"extra", b"more"].concat()
     );
     let mut answer = String::new();
@@ -1126,10 +1125,7 @@ fn a_hello_split_between_the_request_and_the_tunnel_goes_up_once() {
     std::thread::sleep(Duration::from_millis(50));
     conn.write_all(&hello[300..]).unwrap();
     conn.shutdown(std::net::Shutdown::Write).unwrap();
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        hello
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), hello);
 }
 
 #[test]
@@ -1227,10 +1223,7 @@ fn a_tunnel_whose_server_speaks_first_works_and_is_logged_as_not_tls() {
     }
     assert_eq!(banner, b"220 banner\r\n");
     conn.write_all(b"EHLO x\r\n").unwrap();
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        b"EHLO x\r\n"
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"EHLO x\r\n");
     let mut rest = String::new();
     conn.read_to_string(&mut rest).unwrap();
     assert_eq!(rest, "250 ok\r\n");
@@ -1288,7 +1281,7 @@ fn a_hello_with_no_name_or_ech_with_another_is_closed() {
         conn.write_all(&hello::client_hello_bytes(name, encrypted, 16_384))
             .unwrap();
         assert!(closed_soon(&mut conn).is_empty());
-        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+        assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
         let e = closed(&proxy);
         assert_eq!(
             (e.verdict, e.reason, e.name_seen, e.bytes_up),
@@ -1306,10 +1299,7 @@ fn a_hello_with_ech_and_its_own_name_is_checked_and_goes_through() {
     let mut conn = tunnel(&proxy, "api.example.com", port);
     let hello = hello::client_hello_bytes(Some("api.example.com"), true, 16_384);
     conn.write_all(&hello).unwrap();
-    assert_eq!(
-        received.recv_timeout(Duration::from_secs(5)).unwrap(),
-        hello
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), hello);
     drop(conn);
     let e = closed(&proxy);
     assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None));
@@ -1339,7 +1329,7 @@ fn a_tunnel_whose_tls_does_not_read_as_one_hello_is_closed() {
         let mut conn = tunnel(&proxy, "api.example.com", port);
         conn.write_all(&bytes).unwrap();
         assert!(closed_soon(&mut conn).is_empty());
-        assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+        assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
         let e = closed(&proxy);
         assert_eq!(
             (e.verdict, e.reason, e.name_seen, e.bytes_up),
@@ -1363,7 +1353,7 @@ fn a_hello_that_says_it_is_longer_than_the_cap_is_closed_at_once() {
     conn.write_all(&[0x16, 3, 1, 0xff, 0xff, 0x01, 0xff, 0xff, 0xff])
         .unwrap();
     closed_soon(&mut conn);
-    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
     let e = closed(&proxy);
     assert_eq!(
         (e.verdict, e.reason, e.bytes_up),
@@ -1392,7 +1382,7 @@ fn a_hello_that_never_ends_is_closed_at_the_cap() {
         sent += 16 * 1024 + 5;
     }
     closed_soon(&mut conn);
-    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
     let e = closed(&proxy);
     assert_eq!(
         (e.verdict, e.reason, e.bytes_up),
@@ -1416,7 +1406,7 @@ fn a_hello_left_half_sent_goes_idle_frees_its_place_and_sends_nothing() {
     let hello = hello::client_hello_bytes(Some("api.example.com"), false, 16_384);
     conn.write_all(&hello[..10]).unwrap();
     closed_soon(&mut conn);
-    assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), b"");
     let e = closed(&proxy);
     assert_eq!(
         (e.verdict, e.reason, e.name_seen, e.bytes_up),

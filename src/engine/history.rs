@@ -119,7 +119,7 @@ impl Engine {
         let text = target.overrides_text().to_owned();
         // Checked again as any policy stored: its paths as they are now, and
         // the secrets it grants, one of which may have been removed since.
-        self.check_policy(name, &target.policy)
+        self.check_policy(name, &target.policy, self.recorded_backend(name)?)
             .map_err(|error| Error::WithContext {
                 what: format!(
                     "v{to} of sandbox {name} cannot be restored as things are now: {error}"

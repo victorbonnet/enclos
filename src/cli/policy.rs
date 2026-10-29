@@ -238,6 +238,33 @@ fn print_rules(policy: &Policy) {
             "  listening: allowed on TCP, any port but enclos's proxy ports, on every address: what listens in this sandbox can serve the network"
         );
     }
+    let r = &policy.resources;
+    // Every field named, so one added is decided on here.
+    let enclos::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = r;
+    if !r.is_unset() {
+        println!("\nLimits (each process, from its start; memory and CPU share for the sandbox)");
+        if let Some(files) = r.open_files {
+            println!("  open files: {files}");
+        }
+        if let Some(seconds) = r.cpu_seconds {
+            println!("  CPU time:   {seconds} s");
+        }
+        if let Some(size) = r.file_size {
+            println!("  file size:  {size}");
+        }
+        if let Some(memory) = &r.memory {
+            println!("  memory:     {memory}");
+        }
+        if let Some(cpu) = &r.cpu {
+            println!("  CPU share:  {cpu}");
+        }
+    }
 }
 
 fn print_allowed(

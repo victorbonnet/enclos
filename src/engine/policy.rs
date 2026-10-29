@@ -8,15 +8,16 @@ use toml_edit::{Array, DocumentMut, Item, Table};
 
 use super::Engine;
 use super::pending::{Change, Recorded, Restarted};
+use crate::backend::LaunchLimits;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
-use crate::policy::validate::{ValidationContext, validate, validate_secrets};
+use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
 use crate::policy::{self, AdapterLayer, PolicyError, Problem};
 use crate::state::StateLock;
 
@@ -260,7 +261,9 @@ impl Engine {
         overrides: &str,
         runtime: Option<RuntimeKind>,
     ) -> Result<PolicyVersion> {
-        let snapshot = self.checked_policy_with(name, overrides, runtime.map(adapter_layer))?;
+        let backend = self.recorded_backend(name)?;
+        let snapshot =
+            self.checked_policy_with(name, overrides, runtime.map(adapter_layer), backend)?;
         self.store_policy(lock, by, name, overrides, &snapshot, None)
     }
 
@@ -270,7 +273,8 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
     ) -> Result<PolicySnapshot> {
-        self.checked_policy_with(name, overrides, self.adapter_layer(name)?)
+        let backend = self.recorded_backend(name)?;
+        self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
     }
 
     pub(super) fn checked_policy_with(
@@ -278,19 +282,66 @@ impl Engine {
         name: &SandboxName,
         overrides: &str,
         adapter: Option<AdapterLayer>,
+        backend: BackendKind,
     ) -> Result<PolicySnapshot> {
         let snapshot = policy::resolve(overrides, adapter.as_ref())?;
-        self.check_policy(name, &snapshot.policy)?;
+        self.check_policy(name, &snapshot.policy, backend)?;
         Ok(snapshot)
     }
 
     /// Every check a policy passes before it is stored, whichever command
-    /// stores it: its paths as they are now, the secrets it grants, and
-    /// that each of those is set.
-    pub(super) fn check_policy(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+    /// stores it: its paths as they are now, the secrets it grants, that
+    /// each of those is set, and its limits against `backend`, which the
+    /// caller names: the recorded one, or for `sandbox create`, before the
+    /// sandbox has a record, the one it is given. Never skipped.
+    pub(super) fn check_policy(
+        &self,
+        name: &SandboxName,
+        policy: &Policy,
+        backend: BackendKind,
+    ) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
+        validate_resources(policy, backend, crate::backend::max_files_per_process())?;
         self.check_secrets_set(name, policy)
+    }
+
+    /// The backend of sandbox `name`, as recorded, whose limits its policy
+    /// is checked against.
+    pub(super) fn recorded_backend(&self, name: &SandboxName) -> Result<BackendKind> {
+        Ok(self.record(name)?.backend)
+    }
+
+    /// The limits `policy`'s programs run under in sandbox `record`: checked
+    /// again against its backend, though stored checked, and against the
+    /// hard limits enclos itself runs under, so a session is refused before
+    /// anything runs, naming the limit and how to raise the hard one.
+    pub(super) fn launch_limits(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+        policy: &Policy,
+    ) -> Result<LaunchLimits> {
+        validate_resources(
+            policy,
+            record.backend,
+            crate::backend::max_files_per_process(),
+        )?;
+        let limits =
+            LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
+        if let Some(why) = crate::backend::unsettable(&limits) {
+            return Err(Error::Session { what: why });
+        }
+        Ok(limits)
+    }
+
+    /// Whether the sandbox's active policy could start a session or service
+    /// now, under its limits: for a command that stops the sandbox before
+    /// it starts it again, such as `sandbox restart`, to ask before
+    /// anything stops.
+    pub fn check_start_limits(&self, name: &SandboxName) -> Result<()> {
+        let record = self.record(name)?;
+        self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+        Ok(())
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
@@ -470,6 +521,49 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "stop giving it ${variable} (sessions started from now on)"
         ));
     }
+    // Every field named, so one added is decided on here.
+    let crate::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = &new.resources;
+    let (was, now) = (&old.resources, &new.resources);
+    for (what, before, after) in [
+        (
+            "the files a process holds open",
+            was.open_files.map(|n| n.to_string()),
+            now.open_files.map(|n| n.to_string()),
+        ),
+        (
+            "the size of a file a process writes",
+            was.file_size.map(|s| s.to_string()),
+            now.file_size.map(|s| s.to_string()),
+        ),
+        (
+            "a process's CPU time",
+            was.cpu_seconds.map(|s| format!("{s} s")),
+            now.cpu_seconds.map(|s| format!("{s} s")),
+        ),
+        (
+            "the sandbox's memory",
+            was.memory.clone(),
+            now.memory.clone(),
+        ),
+        (
+            "the sandbox's share of the CPU",
+            was.cpu.clone(),
+            now.cpu.clone(),
+        ),
+    ] {
+        if before != after {
+            found.push(match after {
+                Some(limit) => format!("limit {what} to {limit} (sessions started from now on)"),
+                None => format!("stop limiting {what} (sessions started from now on)"),
+            });
+        }
+    }
     found
 }
 
@@ -556,6 +650,37 @@ mod tests {
         assert!(
             bare.contains("[network]") && bare.contains("allow_add = [\"a.example.com\"]"),
             "{bare}"
+        );
+    }
+
+    #[test]
+    fn a_change_of_limits_says_what_each_becomes() {
+        let none = Policy::default();
+        let mut set = none.clone();
+        set.resources.open_files = Some(64);
+        set.resources.file_size = Some("1M".parse().unwrap());
+        set.resources.cpu_seconds = Some(600);
+        assert_eq!(
+            differences(&none, &set, &[]),
+            [
+                "limit the files a process holds open to 64 (sessions started from now on)",
+                "limit the size of a file a process writes to 1M (sessions started from now on)",
+                "limit a process's CPU time to 600 s (sessions started from now on)",
+            ]
+        );
+        let mut changed = set.clone();
+        changed.resources.open_files = Some(128);
+        assert_eq!(
+            differences(&set, &changed, &[]),
+            ["limit the files a process holds open to 128 (sessions started from now on)"]
+        );
+        assert_eq!(
+            differences(&set, &none, &[]),
+            [
+                "stop limiting the files a process holds open (sessions started from now on)",
+                "stop limiting the size of a file a process writes (sessions started from now on)",
+                "stop limiting a process's CPU time (sessions started from now on)",
+            ]
         );
     }
 

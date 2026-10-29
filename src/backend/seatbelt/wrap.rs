@@ -75,6 +75,7 @@ pub(super) fn wrap_in(
         .arg(compiled)
         .arg(&launch.program)
         .args(&launch.args);
+    let mut command = super::super::under_limits(command, &launch.limits);
     command.env_clear();
     // The secrets the policy grants first: what enclos sets or passes on
     // comes after them and so is never one of theirs, whatever the
@@ -245,6 +246,7 @@ mod tests {
             ],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let command = wrap_in(Path::new("/c.sb"), &ctx(), &launch, None);
         let env: std::collections::HashMap<_, _> = command
@@ -300,6 +302,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, None);
         let names: Vec<_> = command
@@ -327,6 +330,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: Some(61374),
+            limits: Default::default(),
         };
         let args = |launch: &Launch| -> Vec<String> {
             wrap_in(Path::new("/x.sb"), &ctx(), launch, None)
@@ -356,6 +360,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let terminal = Path::new("/dev/ttys004");
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, Some(terminal));
@@ -409,6 +414,7 @@ mod tests {
             env: vec![],
             in_terminal: false,
             service_port: None,
+            limits: Default::default(),
         };
         let command = wrap(Path::new("/x.sb"), &ctx(), &launch);
         let args: Vec<_> = command
