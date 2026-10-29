@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use super::output;
 
 use enclos::engine::{
-    ChangeOutcome, Discarded, EditFiles, Engine, PolicyApplied, PolicyDiff, PolicyHistory,
-    PolicyView, Restarted, TestReport,
+    ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyDiff,
+    PolicyHistory, PolicyView, Restarted, TestReport,
 };
 use enclos::error::{Error, Result, exit};
 use enclos::layout::LayoutError;
@@ -37,7 +37,8 @@ enum PolicyVerb {
         #[arg(long)]
         pending: bool,
     },
-    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once.
+    /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once, or
+    /// waits with a pending change it cannot be separated from.
     Allow {
         sandbox: SandboxName,
         destination: String,
@@ -56,7 +57,7 @@ enum PolicyVerb {
     Diff {
         sandbox: SandboxName,
         /// The version compared from: by default the active one when the
-        /// pending policy is compared, else the one before --to.
+        /// pending policy is compared, else the version before the one compared.
         #[arg(long, value_name = "VERSION")]
         from: Option<u32>,
         /// The version compared: by default the pending policy, when there
@@ -399,8 +400,16 @@ fn print_rules(policy: &Policy) {
         );
     }
     let r = &policy.resources;
+    // Every field named, so one added is decided on here.
+    let enclos::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = r;
     if !r.is_unset() {
-        println!("\nLimits (each process, from its start)");
+        println!("\nLimits (each process, from its start; memory and CPU share for the sandbox)");
         if let Some(files) = r.open_files {
             println!("  open files: {files}");
         }
@@ -409,6 +418,12 @@ fn print_rules(policy: &Policy) {
         }
         if let Some(size) = r.file_size {
             println!("  file size:  {size}");
+        }
+        if let Some(memory) = &r.memory {
+            println!("  memory:     {memory}");
+        }
+        if let Some(cpu) = &r.cpu {
+            println!("  CPU share:  {cpu}");
         }
     }
 }
@@ -437,6 +452,11 @@ fn print_allowed(
         (true, _) => println!(
             "Sandbox {sandbox} now allows {destination}: policy v{version}, in force at once."
         ),
+        // Waits with the pending policy, unless the policy in force
+        // allows it already (a pending change that dropped it, say).
+        (false, ChangeOutcome::Pending(_)) if engine.allows(sandbox, destination)? => println!(
+            "Sandbox {sandbox} allows {destination} under policy v{version}; the change waits with its pending policy."
+        ),
         (false, ChangeOutcome::Pending(_)) => println!(
             "Sandbox {sandbox} does not allow {destination} yet: the change waits with its pending policy, and policy v{version} stays in force."
         ),
@@ -462,10 +482,12 @@ fn print_outcome(
 ) -> Result<(u8, Value)> {
     let text = !output::json();
     match &applied.outcome {
-        ChangeOutcome::InForce { dropped: Some(p) } => {
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Dropped(p)),
+        } => {
             if text {
                 println!(
-                    "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: this change replaces it.",
+                    "The pending policy of sandbox {sandbox} (snapshot {}) is dropped: the file is back to the policy in force.",
                     p.snapshot.short()
                 );
             }
@@ -474,7 +496,21 @@ fn print_outcome(
                 json!({"in_force": true, "dropped_pending": pending_json(p)}),
             ))
         }
-        ChangeOutcome::InForce { dropped: None } => {
+        ChangeOutcome::InForce {
+            pending: Some(PendingEnd::Applied(p)),
+        } => {
+            if text {
+                println!(
+                    "The pending policy of sandbox {sandbox} (snapshot {}) is in force with this change: no session runs under rules it changes any more.",
+                    p.snapshot.short()
+                );
+            }
+            Ok((
+                exit::OK,
+                json!({"in_force": true, "dropped_pending": null, "applied_pending": pending_json(p)}),
+            ))
+        }
+        ChangeOutcome::InForce { pending: None } => {
             Ok((exit::OK, json!({"in_force": true, "dropped_pending": null})))
         }
         ChangeOutcome::Pending(p) => {
@@ -638,7 +674,7 @@ fn print_replaced(
         (ChangeOutcome::Pending(_), false) => {
             println!("Sandbox {sandbox} keeps policy v{version} for now.")
         }
-        (ChangeOutcome::InForce { dropped: None }, false) => {
+        (ChangeOutcome::InForce { pending: None }, false) => {
             println!("Sandbox {sandbox} already has that policy: v{version}, nothing changed.")
         }
         (_, false) => println!("Sandbox {sandbox} keeps policy v{version}."),
@@ -703,12 +739,7 @@ fn print_discarded(sandbox: &SandboxName, planned: Planned<Discarded>) {
 /// applied: refused, cut short, or a dry run) is opened again instead, as
 /// long as `policy.toml` is still the file it started from.
 fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) -> Result<u8> {
-    let view = engine.policy(sandbox)?;
-    // The text the latest policy was resolved from: a file that holds
-    // anything else holds an edit not applied, which closing the editor
-    // applies.
-    let recorded = view.latest().overrides_text().map(str::to_owned);
-    let file = view.file;
+    let file = engine.policy(sandbox)?.file;
     let files = engine.edit_files(sandbox);
     let io = |path: &Path| {
         let path = path.to_owned();
@@ -744,7 +775,10 @@ fn edit(engine: &Engine, by: &Actor, sandbox: &SandboxName, confirm: Confirm) ->
     write_private(&files.copy, &start).map_err(io(&files.copy))?;
     run_editor(&files.copy)?;
     let after = std::fs::read_to_string(&files.copy).map_err(io(&files.copy))?;
-    if after == before && recorded.as_deref().is_none_or(|r| r == after) {
+    // Saved unchanged, an edit records nothing, unless the file holds what
+    // the state does not record yet: an edit not applied, such as one made
+    // by hand, which closing the editor applies.
+    if after == before && engine.policy_file_recorded(sandbox)? {
         let left = forget_edit(&files);
         let code = edit_left_code(&left, exit::OK);
         if output::json() {

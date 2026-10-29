@@ -38,6 +38,8 @@ const HANDSHAKE: u8 = 0x16;
 /// The last TLS record type: heartbeat.
 const LAST_RECORD_TYPE: u8 = 0x18;
 const CLIENT_HELLO: u8 = 0x01;
+/// The message type of an SSLv2-format ClientHello, after its length.
+const SSL2_CLIENT_HELLO: u8 = 0x01;
 const SERVER_NAME: u16 = 0x0000;
 const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
 /// An `encrypted_client_hello` extension of the outer hello.
@@ -49,6 +51,15 @@ pub fn parse(bytes: &[u8]) -> FirstBytes {
     match bytes.first() {
         None => return FirstBytes::Incomplete { needed: 1 },
         Some(CHANGE_CIPHER_SPEC..=LAST_RECORD_TYPE) => {}
+        // An SSLv2-format ClientHello (a two-byte length with its high bit
+        // set, then CLIENT-HELLO): servers built on OpenSSL still take it
+        // for TLS up to 1.2, and it can name no server, so it is closed as
+        // unreadable rather than left alone as another protocol.
+        Some(first) if first & 0x80 != 0 => match bytes.get(2) {
+            None => return FirstBytes::Incomplete { needed: 3 },
+            Some(&SSL2_CLIENT_HELLO) => return FirstBytes::Unreadable,
+            Some(_) => return FirstBytes::NotTls,
+        },
         Some(_) => return FirstBytes::NotTls,
     }
     // The handshake message, gathered from the records it spans. A server
@@ -344,10 +355,36 @@ mod tests {
             &b"GET / HTTP/1.1\r\n"[..],
             b"SSH-2.0-OpenSSH\r\n",
             b"EHLO x\r\n",
-            &[0x80, 1],
+            &[0x80, 1, 2],
         ] {
             assert_eq!(parse(other), FirstBytes::NotTls, "{other:?}");
         }
+        // An SSLv2-format ClientHello names no server: closed, not let by.
+        assert_eq!(parse(&[0x80, 0x2e]), FirstBytes::Incomplete { needed: 3 });
+        assert_eq!(parse(&[0x80, 0x2e, 0x01, 3, 1]), FirstBytes::Unreadable);
+    }
+
+    /// Only an entry of type `host_name` names the server, as a server
+    /// reads it: an extension with one of another type alone is
+    /// unreadable, and beside a `host_name` it is skipped.
+    #[test]
+    fn only_a_host_name_entry_names_the_server() {
+        let entries = |list: &[(u8, &[u8])]| {
+            let mut names = Vec::new();
+            for (kind, name) in list {
+                names.push(*kind);
+                names.extend_from_slice(&(name.len() as u16).to_be_bytes());
+                names.extend_from_slice(name);
+            }
+            let mut data = (names.len() as u16).to_be_bytes().to_vec();
+            data.extend_from_slice(&names);
+            parse(&hello_with(&[(SERVER_NAME, data)], 10, 16_384))
+        };
+        assert_eq!(entries(&[(1, b"api.example.com")]), FirstBytes::Unreadable);
+        assert_eq!(
+            entries(&[(1, b"evil.example.com"), (0, b"api.example.com")]),
+            named("api.example.com")
+        );
     }
 
     #[test]

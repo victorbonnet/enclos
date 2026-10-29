@@ -37,7 +37,7 @@ pub struct Finding {
 pub enum Subject {
     Sandbox(SandboxName),
     /// An entry in the sandboxes' folder that no record names, by its name
-    /// as it is; shown escaped for a terminal.
+    /// read lossily as UTF-8; shown escaped for a terminal.
     Folder(String),
     /// A sandbox record that does not read, by the name stored in it, which
     /// may not be a sandbox's; shown escaped for a terminal.
@@ -86,6 +86,15 @@ impl Remedy {
 /// A change `state repair` makes; it reads as what it does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repair(Fix);
+
+#[cfg(test)]
+impl Repair {
+    /// Recording the end of `ids`, as a repair would, for a test of what
+    /// it looks at before it does.
+    pub(super) fn end_sessions(ids: Vec<SessionId>) -> Repair {
+        Repair(Fix::EndSessions(ids))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Fix {
@@ -238,7 +247,7 @@ impl Engine {
     /// Records the end of gone sessions and a sandbox stopped, when repairs
     /// say so, in one transaction, after which nothing can fail: a failure
     /// leaves every record as it was. Done whatever became of the file.
-    fn repair_records(
+    pub(super) fn repair_records(
         &self,
         lock: &StateLock,
         name: &SandboxName,
@@ -267,6 +276,29 @@ impl Engine {
         }
         // Listed before the commit, so that nothing after it can fail.
         let sessions = self.state.sessions(name, true)?;
+        // Looked at again, still under the lock: a process that double-
+        // forked after the check's `ps` holds a session's marker with no
+        // pid the check knew (ADR 0030). No signal follows from this look,
+        // so a pid reused meanwhile does no harm; a holder found leaves
+        // every record as it was.
+        let held = self.held(name)?;
+        let still: Vec<String> = sessions
+            .iter()
+            .filter(|s| ended.contains(&s.id))
+            .filter(|s| {
+                held.get(&crate::lifecycle::marker::name_of(&s.root))
+                    .is_some_and(|pids| !pids.is_empty())
+            })
+            .map(|s| s.id.to_string())
+            .collect();
+        if !still.is_empty() {
+            return Err(Error::Session {
+                what: format!(
+                    "session {} of sandbox {name} has a process holding its marker again, so no end was recorded; `enclos sandbox stop {name}` ends what runs",
+                    still.join(", ")
+                ),
+            });
+        }
         // Saves the record too, in the same transaction.
         self.state.end_sessions(lock, &ended, &record)?;
         for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
@@ -397,17 +429,13 @@ impl Engine {
                                 what,
                                 Remedy::Repairs(Repair(Fix::WritePolicy { text, pending })),
                             ),
-                            // The template the active policy is built on,
-                            // which `policy.toml` may have changed since the
-                            // sandbox was created.
+                            // No policy recorded: the template the sandbox
+                            // was created from.
                             None => push(
                                 what,
                                 Remedy::Manual(format!(
-                                    "enclos does not keep the text it came from: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
-                                    self.state.active_policy(name)?.map_or_else(
-                                        || record.created_from.clone(),
-                                        |(_, snapshot)| snapshot.inputs.template
-                                    )
+                                    "sandbox {name} has no policy recorded: write the file yourself (with only `extends = \"{}\"`, it keeps its template alone), then `enclos policy edit {name}`",
+                                    record.created_from
                                 )),
                             ),
                         }
@@ -425,14 +453,28 @@ impl Engine {
         }
 
         // Gone sessions: recorded open, and nothing of them runs. Markers are
-        // only looked for in a folder; with it gone or replaced, one may
-        // still be held, open, by a process `lsof` cannot find through it.
-        let markers_found = dir_found.is_some_and(|k| k.is_dir());
+        // only looked for in the folder `members/` they are in; with it, or
+        // the sandbox's folder, gone or replaced, one may still be held,
+        // open, by a process `lsof` cannot find through it. An open session
+        // made that folder as it started, so its absence is no answer.
+        let open = self.state.sessions(name, true)?;
+        let markers_dir = self.markers(name);
+        let markers_found = dir_found.is_some_and(|k| k.is_dir())
+            && match std::fs::symlink_metadata(&markers_dir) {
+                Ok(meta) => meta.is_dir(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => open.is_empty(),
+                Err(source) => {
+                    return Err(LayoutError::Io {
+                        path: markers_dir,
+                        source,
+                    }
+                    .into());
+                }
+            };
         let held = match markers_found {
             true => self.held(name)?,
             false => Default::default(),
         };
-        let open = self.state.sessions(name, true)?;
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();
         for session in &open {
@@ -458,7 +500,7 @@ impl Engine {
             let remedy = match markers_found {
                 true => Remedy::Repairs(Repair(Fix::EndSessions(gone.clone()))),
                 false => Remedy::Manual(format!(
-                    "enclos cannot look for their markers while its folder is gone or not a folder, so a process of theirs may still run: `enclos sandbox stop {name}` records their end"
+                    "enclos cannot look for their markers while its folder, or its `members` folder, is gone or not a folder, so a process of theirs may still run: `enclos sandbox stop {name}` records their end"
                 )),
             };
             push(what, remedy);
@@ -587,7 +629,8 @@ impl Engine {
                 )),
             );
         }
-        let live = open.len() > gone.len();
+        // Sessions whose markers could not be looked at may still run.
+        let live = open.len() > gone.len() || (!gone.is_empty() && !markers_found);
         // A process found running from its folder keeps it from being
         // recorded stopped: something of it may still run.
         if matches!(record.state, SandboxState::Running) && !live && installed.is_empty() {
@@ -611,15 +654,15 @@ impl Engine {
 
     /// The text `policy.toml` holds for the sandbox's latest snapshot, its
     /// pending one if a change waits, and whether it is pending; none when
-    /// the snapshot does not keep the text it was resolved from.
+    /// the sandbox has no policy recorded at all.
     fn latest_policy_text(&self, name: &SandboxName) -> Result<Option<(String, bool)>> {
         if let Some((_, snapshot)) = self.state.pending_policy(name)? {
-            return Ok(snapshot.overrides_text().map(|t| (t.to_owned(), true)));
+            return Ok(Some((snapshot.overrides_text().to_owned(), true)));
         }
         Ok(self
             .state
             .active_policy(name)?
-            .and_then(|(_, snapshot)| snapshot.overrides_text().map(|t| (t.to_owned(), false))))
+            .map(|(_, snapshot)| (snapshot.overrides_text().to_owned(), false)))
     }
 
     /// Entries in the sandboxes' folder that no record, by its `names`,

@@ -838,6 +838,9 @@ mod sandbox {
     }
 
     pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
+        // As a session's start makes it, for its marker, when it can (a
+        // test may have put something else there).
+        let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
         let lock = engine.state.lock().unwrap();
         engine.state.put_session(&lock, session).unwrap()
     }
@@ -3743,23 +3746,28 @@ cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
 [ \"$3\" = gateway ] || exit 0
 printf '%s' \"${TOKEN:-unset}\" > \"$HOME/gateway-token\"
+cat \"$HERMES_MANAGED_DIR/.env\" > \"$HOME/gateway-env\" 2>&1
 STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
     /// A service and a session read the secrets their policy grants as they
-    /// start; with one missing from the store, neither starts.
+    /// start: Hermes's gateway from the `.env` of a folder only its sandbox
+    /// reads, never in its environment, and a session as variables (ADR
+    /// 0034). With one missing from the store, neither starts; with the
+    /// store locked, the service does not, and the sandbox says why.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_service_and_a_session_get_the_secrets_their_policy_grants() {
         use crate::model::secret::{SecretRef, SecretValue};
         use crate::secrets::{InMemory, SecretStore};
+        use std::os::unix::fs::PermissionsExt;
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
         let store = std::rc::Rc::new(InMemory::default());
         let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
         assert!(done(lab.install(RECORDS_TOKEN, Confirm::Yes).unwrap()).installed);
         let token: SecretRef = "home/token".parse().unwrap();
-        let value = SecretValue::new("tok-123:abc".into()).unwrap();
+        let value = SecretValue::new("tok-123:a'b\\c".into()).unwrap();
         done(
             lab.engine
                 .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
@@ -3778,7 +3786,13 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .unwrap();
         assert_eq!(end.exit, 0, "{end:?}");
         let seen = std::fs::read_to_string(lab.home.join("gateway-token")).unwrap();
-        assert_eq!(seen, "tok-123:abc");
+        assert_eq!(seen, "unset", "the value is in the gateway's environment");
+        let file = std::fs::read_to_string(lab.home.join("gateway-env")).unwrap();
+        assert_eq!(file, "TOKEN=\"tok-123:a'b\\\\c\"\n");
+        let folder = lab.engine.layout.sandbox_secrets_dir("home");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&folder.join(".env")), 0o600);
 
         let records = vec![
             "/bin/sh".into(),
@@ -3791,7 +3805,29 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 .unwrap(),
         );
         let session = lab.home.join("session-token");
-        assert_eq!(std::fs::read_to_string(&session).unwrap(), "tok-123:abc");
+        assert_eq!(std::fs::read_to_string(&session).unwrap(), "tok-123:a'b\\c");
+        // A locked store: the gateway is not started, and the sandbox is
+        // marked failed, saying why.
+        store.1.set(true);
+        let err = lab
+            .engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap_err();
+        assert!(matches!(err.root(), Error::SecretsLocked { .. }), "{err}");
+        let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
+        assert!(
+            matches!(&record.state, crate::model::sandbox::SandboxState::Failed { reason } if reason.contains("locked")),
+            "{:?}",
+            record.state
+        );
+        store.1.set(false);
+        // Gone once the sandbox stops.
+        done(
+            lab.engine
+                .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+                .unwrap(),
+        );
+        assert!(!folder.exists());
 
         store.remove(&token).unwrap();
         std::fs::remove_file(&session).unwrap();
@@ -3806,6 +3842,22 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .launch_until(&alice(), &lab.name, "gateway", &ended)
             .unwrap_err();
         assert!(err.to_string().contains("$TOKEN"), "{err}");
+
+        // The grant taken out, a file an earlier start left (a crash, a
+        // logout) goes as the gateway starts again with no secrets.
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join(".env"), "TOKEN=\"stale\"\n").unwrap();
+        let now = lab.engine.layout.read_policy("home").unwrap();
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &now, &before, Confirm::Yes)
+            .unwrap();
+        // The stub's `cat` of the file then fails: what it found is that.
+        lab.engine
+            .launch_until(&alice(), &lab.name, "gateway", &ended)
+            .unwrap();
+        assert!(!folder.exists());
+        let found = std::fs::read_to_string(lab.home.join("gateway-env")).unwrap();
+        assert!(!found.contains("stale"), "{found}");
     }
 
     /// The sandbox's bot is set up with the runtime's own commands, once its
@@ -3858,6 +3910,24 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
             .unwrap();
 
+        // A token Hermes's own setup left in plain text in the home is
+        // refused until its line goes, though the policy grants one too.
+        let env = lab.home.join(".hermes/.env");
+        std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+        std::fs::write(
+            &env,
+            "TELEGRAM_ALLOWED_USERS=1\nTELEGRAM_BOT_TOKEN=999:plain\n",
+        )
+        .unwrap();
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds TELEGRAM_BOT_TOKEN in plain text"),
+            "{err}"
+        );
+        assert!(!calls().contains("config set"), "{}", calls());
+        std::fs::write(&env, "TELEGRAM_ALLOWED_USERS=1\n").unwrap();
+
         let Planned::DryRun(plan) = configure(&users, Confirm::DryRun).unwrap() else {
             panic!("a dry run configured the channel");
         };
@@ -3899,15 +3969,15 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         };
         assert_eq!(configured(&lab), 3, "{}", lab.audit());
 
-        // A variable of another name, granted too; one that cannot hold a
-        // token is refused for what it is.
-        let before = lab.engine.layout.read_policy("home").unwrap();
-        let after = before.replace(
+        // A variable of another name: refused while the usual one is
+        // granted too, which Hermes would read first.
+        let usual = lab.engine.layout.read_policy("home").unwrap();
+        let both = usual.replace(
             "TELEGRAM_BOT_TOKEN = ",
             "TELEGRAM_BOT_TOKEN_MAIN = \"secret:home/telegram\", TELEGRAM_BOT_TOKEN = ",
         );
         lab.engine
-            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .policy_edit(&alice(), &lab.name, &usual, &both, Confirm::Yes)
             .unwrap();
         let named = |token: &str| {
             lab.engine.configure_channel(
@@ -3919,6 +3989,28 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 Confirm::Yes,
             )
         };
+        let runs = calls().lines().count();
+        let err = named("TELEGRAM_BOT_TOKEN_MAIN").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("also gives it $TELEGRAM_BOT_TOKEN"),
+            "{err}"
+        );
+        // Granted alone, it sets the bot up; a token Hermes's setup left in
+        // the home under the usual name is refused for it too.
+        let alone = usual.replace("TELEGRAM_BOT_TOKEN = ", "TELEGRAM_BOT_TOKEN_MAIN = ");
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &both, &alone, Confirm::Yes)
+            .unwrap();
+        std::fs::write(&env, "TELEGRAM_BOT_TOKEN=999:plain\n").unwrap();
+        let err = named("TELEGRAM_BOT_TOKEN_MAIN").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds TELEGRAM_BOT_TOKEN in plain text"),
+            "{err}"
+        );
+        assert_eq!(calls().lines().count(), runs, "{}", calls());
+        std::fs::write(&env, "").unwrap();
         let set = done(named("TELEGRAM_BOT_TOKEN_MAIN").unwrap());
         assert_eq!(set.token, "TELEGRAM_BOT_TOKEN_MAIN");
         assert!(
@@ -3933,6 +4025,9 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 "{err}"
             );
         }
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &alone, &usual, Confirm::Yes)
+            .unwrap();
 
         // A command that fails stops the rest, and a later one names what
         // ran before it.
@@ -4669,11 +4764,23 @@ mod services {
         }
         let before = engine.layout.read_policy(name.as_str()).unwrap();
         let after = format!("{before}\n[resources]\nopen_files = {}\n", most + 1);
-        done(
-            engine
-                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
-                .unwrap(),
+        // Refused as the policy is stored.
+        let err = engine
+            .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.exit_code() == 2 && err.to_string().contains("kern.maxfilesperproc"),
+            "{err}"
         );
+        // And at start, for one stored past that, as by another build or on
+        // a host whose ceiling was higher.
+        let id = engine.policy(&name).unwrap().snapshot.id;
+        let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+        conn.execute(
+            "UPDATE policy_snapshots SET policy = json_set(policy, '$.resources.open_files', ?1) WHERE id = ?2",
+            rusqlite::params![(most + 1) as i64, id.0],
+        )
+        .unwrap();
         let err = engine.start_sandbox(&alice(), &name).unwrap_err();
         assert!(err.to_string().contains("kern.maxfilesperproc"), "{err}");
         assert!(fake.started.borrow().is_empty());

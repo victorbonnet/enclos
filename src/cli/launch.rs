@@ -20,10 +20,34 @@ pub struct LaunchArgs {
 
 /// Runs one of the runtime's services in the sandbox until it exits.
 pub fn run(engine: &Engine, by: &Actor, args: LaunchArgs) -> Result<u8> {
-    let end = engine.launch(by, &args.sandbox, &args.service)?;
+    let end = match engine.launch(by, &args.sandbox, &args.service) {
+        Ok(end) => end,
+        // Exits 0, so that the service manager does not start it again to
+        // meet the same locked keychain or refused secret every few
+        // seconds: the sandbox is marked failed, saying why, until `sandbox
+        // start`. Only once that is recorded: else it exits non-zero, and is
+        // started again.
+        Err(e) if waits_for_the_user(&e) => {
+            let _ = writeln!(io::stderr(), "error: {e}");
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
     // Into the service's log, which `enclos logs` shows.
     super::connect::report_end(&args.sandbox, &end);
     Ok(service_exit(&end))
+}
+
+/// Whether `error` is one only the user can fix, recorded as the sandbox's
+/// failure: not when a cleanup or its record failed around it.
+fn waits_for_the_user(error: &Error) -> bool {
+    match error {
+        Error::SecretsLocked { .. } | Error::SecretsFileRefused { .. } => true,
+        Error::WithContext { error, .. } | Error::FailedAfter { error, .. } => {
+            waits_for_the_user(error)
+        }
+        _ => false,
+    }
 }
 
 /// A service asked to restart exits non-zero, so the service manager starts
@@ -256,6 +280,34 @@ fn split_character_at(line: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exit 0 (not started again) only for what the user must fix, and only
+    /// when the sandbox was marked failed for it.
+    #[test]
+    fn only_a_recorded_wait_for_the_user_ends_the_service_for_good() {
+        let locked = || Error::SecretsLocked {
+            sandbox: "home".into(),
+            service: "gateway".into(),
+            why: "the login keychain cannot be read without asking".into(),
+        };
+        let refused = Error::SecretsFileRefused {
+            sandbox: "home".into(),
+            why: "a line break".into(),
+        };
+        assert!(waits_for_the_user(&locked()));
+        assert!(waits_for_the_user(&refused));
+        assert!(waits_for_the_user(&Error::FailedAfter {
+            error: Box::new(locked()),
+            done: "stopping an earlier gateway".into(),
+        }));
+        assert!(!waits_for_the_user(&Error::CleanupFailed {
+            error: Box::new(locked()),
+            left: "sandbox home not marked failed".into(),
+        }));
+        assert!(!waits_for_the_user(&Error::Session {
+            what: "anything else".into()
+        }));
+    }
 
     #[test]
     fn service_output_is_shown_escaped_line_by_line() {

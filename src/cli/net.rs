@@ -189,13 +189,20 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
             Reason::BadRequest
         ));
     }
-    if denied
-        .iter()
-        .any(|d| matches!(d.reason, Reason::NameMismatch | Reason::HelloUnreadable))
-    {
+    if denied.iter().any(|d| {
+        matches!(
+            d.reason,
+            Reason::NameMismatch
+                | Reason::HelloUnreadable
+                | Reason::NoServerName
+                | Reason::EncryptedHello
+        )
+    }) {
         out.push_str(&format!(
-            "{}, {}: the policy allowed the tunnel, but its TLS hello asked for another server than its destination, or could not be read, so the proxy closed it; there is nothing to allow. `enclos net log {sandbox}` shows the name it asked for, if any.\n",
+            "{}, {}, {}, {}: the policy allowed the tunnel, but its TLS hello asked for another server than its destination, named none, hid it under ECH, or could not be read, so the proxy closed it; there is nothing to allow. `enclos net log {sandbox}` shows the name it asked for, if any.\n",
             Reason::NameMismatch,
+            Reason::NoServerName,
+            Reason::EncryptedHello,
             Reason::HelloUnreadable
         ));
     }
@@ -243,13 +250,21 @@ mod tests {
 
     #[test]
     fn a_tunnel_closed_for_its_server_name_is_nothing_to_allow() {
-        let text = denied_text(&lab(), &[refused("api.example.com", Reason::NameMismatch)]);
-        assert!(
-            text.contains("api.example.com:443  name-mismatch"),
-            "{text}"
-        );
-        assert!(!text.contains("enclos policy allow"), "{text}");
-        assert!(text.contains("enclos net log lab"), "{text}");
+        for reason in [
+            Reason::NameMismatch,
+            Reason::NoServerName,
+            Reason::EncryptedHello,
+            Reason::HelloUnreadable,
+        ] {
+            let text = denied_text(&lab(), &[refused("api.example.com", reason)]);
+            assert!(
+                text.contains(&format!("api.example.com:443  {reason}")),
+                "{text}"
+            );
+            assert!(!text.contains("enclos policy allow"), "{text}");
+            assert!(text.contains("there is nothing to allow"), "{text}");
+            assert!(text.contains("enclos net log lab"), "{text}");
+        }
     }
 
     #[test]
