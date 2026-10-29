@@ -636,19 +636,18 @@ mod tests {
         }
     }
 
-    /// A locked keychain is told apart, with no dialog, by the same call a
-    /// service makes before reading its secrets, and in no more than its
-    /// own short wait.
+    /// A locked keychain is told apart by the same call a service makes
+    /// before reading its secrets, in no more than its own short wait.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_locked_keychain_is_found_without_a_dialog() {
-        // Locking a keychain can raise macOS's unlock dialog on a Mac with
-        // someone at its screen (macOS 26.5.2), so this runs on CI's runners,
-        // or where ENCLOS_KEYCHAIN_LOCK_TEST asks for it.
+    fn a_locked_keychain_is_found_within_the_short_wait() {
+        // On a Mac with someone at its screen, that call can show macOS's
+        // unlock dialog for the locked keychain (macOS 26.5.2), so this runs
+        // on CI's runners, or where ENCLOS_KEYCHAIN_LOCK_TEST asks for it.
         if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
             && std::env::var_os("ENCLOS_KEYCHAIN_LOCK_TEST").is_none()
         {
-            eprintln!("skipped: locking a keychain may show a dialog here");
+            eprintln!("skipped: the look at a locked keychain may show a dialog here");
             return;
         }
         let keychain = ThrowawayKeychain::new();
