@@ -4,6 +4,7 @@
 use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, put, session_of};
 use super::*;
+use crate::engine::pending::Change;
 use crate::engine::{ChangeOutcome, PendingEnd, Side};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
@@ -692,4 +693,222 @@ fn a_diff_from_another_version_compares_the_active_one_unless_asked() {
     assert_eq!((diff.from, diff.to), (1, Side::Version(1)));
     let err = engine.policy_diff(&name, None, Some(0)).unwrap_err();
     assert!(matches!(err, Error::NoSuchPolicyVersion { .. }), "{err}");
+}
+
+/// A pending rollback resolved again once a runtime is recorded keeps what
+/// it restores, and the version that applies it records it.
+#[test]
+fn a_pending_rollback_resolved_again_with_a_runtime_keeps_what_it_restores() {
+    let (dir, engine, name) = with_sandbox();
+    grant_v2(&dir, &engine, &name, "work");
+    let sleeping = running(&engine, &name);
+    done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Ask)
+            .unwrap(),
+    );
+    engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = engine.state.get(&name)?.unwrap();
+                record.runtime = Some(RuntimeKind::Hermes);
+                engine.state.put(lock, &record)?;
+                engine.resolve_again(lock, &alice(), &name)
+            },
+        )
+        .unwrap();
+    let (p, pending) = engine.policy(&name).unwrap().pending.unwrap();
+    assert!(pending.policy.net.allow.contains(&"chatgpt.com".to_owned()));
+    assert_eq!(p.restores, Some(1));
+    drop(sleeping);
+    let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
+    assert_eq!(restarted.version.restores, Some(1));
+}
+
+/// A change that brings rules of its own replaces a pending rollback: it
+/// restores nothing, and the version that applies it says so.
+#[test]
+fn a_pending_rollback_replaced_by_a_change_that_restarts_restores_nothing() {
+    let (dir, engine, name) = with_sandbox();
+    grant_v2(&dir, &engine, &name, "work");
+    let sleeping = running(&engine, &name);
+    done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Ask)
+            .unwrap(),
+    );
+    let more = dir.path().join("more");
+    std::fs::create_dir_all(&more).unwrap();
+    pending_edit(
+        &engine,
+        &name,
+        "write_add = []",
+        &format!("write_add = [\"{}\"]", more.display()),
+    );
+    assert_eq!(
+        engine.policy(&name).unwrap().pending.unwrap().0.restores,
+        None
+    );
+    drop(sleeping);
+    let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
+    assert_eq!(restarted.version.restores, None);
+}
+
+/// A pending change made while a rollback waits for the lock is never
+/// dropped without asking: the rollback changes nothing.
+#[test]
+fn a_pending_change_made_meanwhile_is_never_dropped_by_a_rollback() {
+    let (dir, engine, name) = with_sandbox();
+    grant_v2(&dir, &engine, &name, "work");
+    let _sleeping = running(&engine, &name);
+    let more = dir.path().join("more");
+    std::fs::create_dir_all(&more).unwrap();
+    let text = engine.layout.read_policy("home").unwrap().replace(
+        "write_add = [",
+        &format!("write_add = [\"{}\", ", more.display()),
+    );
+    let err = super::sandbox::while_waiting(
+        &engine,
+        || engine.policy_rollback(&alice(), &name, 1, Confirm::Ask),
+        |other, lock| {
+            let snapshot = other.checked_policy(&name, &text).unwrap();
+            other
+                .propose(lock, &alice(), &name, Change::edit(&text, &snapshot))
+                .unwrap();
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::PolicyChangedMeanwhile { .. }), "{err}");
+    assert!(engine.policy(&name).unwrap().pending.is_some());
+    assert_eq!(engine.layout.read_policy("home").unwrap(), text);
+}
+
+/// A refresh checks the policy it resolves on the paths as they are now:
+/// one that would reach enclos's own files is refused, and nothing changes.
+#[test]
+fn a_refresh_checks_the_paths_as_they_are_now() {
+    let (dir, engine, name) = with_sandbox();
+    let work = grant_v2(&dir, &engine, &name, "work");
+    allow(&engine, &name, "a.example.com");
+    std::fs::remove_dir(&work).unwrap();
+    std::os::unix::fs::symlink(&engine.layout.protected()[0], &work).unwrap();
+    let file = engine.layout.read_policy("home").unwrap();
+    let err = engine
+        .policy_refresh(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(err.to_string().contains("is not accepted"), "{err}");
+    assert_eq!(engine.policy(&name).unwrap().version.version, 3);
+    assert_eq!(engine.layout.read_policy("home").unwrap(), file);
+}
+
+/// A rollback in force at once drops a change pending: said as dropped,
+/// not as in force with it.
+#[test]
+fn a_rollback_in_force_at_once_drops_a_pending_change() {
+    let (dir, engine, name) = with_sandbox();
+    allow(&engine, &name, "a.example.com");
+    let _sleeping = running(&engine, &name);
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    pending_edit(
+        &engine,
+        &name,
+        "write_add = []",
+        &format!("write_add = [\"{}\"]", work.display()),
+    );
+    let applied = done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(
+        matches!(
+            applied.outcome,
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(_))
+            }
+        ),
+        "{applied:?}"
+    );
+    assert_eq!(applied.version.restores, Some(1));
+    assert!(engine.policy(&name).unwrap().pending.is_none());
+    let last = engine.audit(None).unwrap().pop().unwrap();
+    let message = last.finished.unwrap().outcome.message;
+    assert!(message.contains("dropping pending snapshot"), "{message}");
+}
+
+/// A pending rollback put in force by a destination, once its sessions
+/// ended, is recorded as restoring what it restores.
+#[test]
+fn a_pending_rollback_put_in_force_by_a_destination_records_what_it_restores() {
+    let (dir, engine, name) = with_sandbox();
+    grant_v2(&dir, &engine, &name, "work");
+    let sleeping = running(&engine, &name);
+    done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Ask)
+            .unwrap(),
+    );
+    drop(sleeping);
+    let applied = done(
+        engine
+            .policy_allow(&alice(), &name, "c.example.com", Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(
+        matches!(
+            applied.outcome,
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Applied(_))
+            }
+        ),
+        "{applied:?}"
+    );
+    assert_eq!(applied.version.restores, Some(1));
+}
+
+/// A refresh plans from one reading of the policy: a version made since,
+/// before it takes the lock, is never undone.
+#[test]
+fn a_change_made_meanwhile_is_never_undone_by_a_refresh() {
+    let (_dir, engine, name) = with_three_versions();
+    // The active snapshot stored with rules its text no longer resolves
+    // to, as from an older template: a refresh has something to do.
+    let id = engine.policy(&name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = json_set(policy, '$.net.allow', json('[]')) WHERE id = ?1",
+        [&id.0],
+    )
+    .unwrap();
+    let err = super::sandbox::while_waiting(
+        &engine,
+        || engine.policy_refresh(&alice(), &name, Confirm::Yes),
+        |other, lock| {
+            let text = other
+                .layout
+                .read_policy("home")
+                .unwrap()
+                .replace("allow_add = [", "allow_add = [\"c.example.com\", ");
+            let snapshot = other.checked_policy(&name, &text).unwrap();
+            other
+                .store_policy(lock, &alice(), &name, &text, &snapshot, None)
+                .unwrap();
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::PolicyChangedMeanwhile { .. }), "{err}");
+    let view = engine.policy(&name).unwrap();
+    assert!(
+        view.snapshot
+            .policy
+            .net
+            .allow
+            .contains(&"c.example.com".to_owned())
+    );
 }

@@ -35,6 +35,10 @@ pub(super) struct Change<'a> {
     pub entry: Option<&'a str>,
     /// The version a rollback restores.
     pub restores: Option<u32>,
+    /// Whether it replaces a pending change rather than joining it, as a
+    /// rollback and a refresh do: a pending rollback's `restores` is then
+    /// never carried over to it.
+    pub replaces: bool,
 }
 
 impl<'a> Change<'a> {
@@ -45,6 +49,7 @@ impl<'a> Change<'a> {
             snapshot,
             entry: None,
             restores: None,
+            replaces: false,
         }
     }
 }
@@ -145,9 +150,29 @@ impl Engine {
             snapshot,
             entry,
             restores,
+            replaces,
         } = change;
         let (active_version, active) = self.active_policy(name)?;
         let before = self.state.pending_policy(name)?;
+        // A pending rollback stays one when only network rules join it: the
+        // change is re-resolved with them (design §7), and the version that
+        // applies it, now or later, records what it restores.
+        let restores = match &before {
+            Some((p, s))
+                if restores.is_none() && !replaces && snapshot.policy.same_at_launch(&s.policy) =>
+            {
+                p.restores
+            }
+            _ => restores,
+        };
+        // What became of a pending policy when the change goes in force: one
+        // a change replaces is dropped, unless it is that change; one a
+        // change was made on (an edit, a destination) is in force with it.
+        let end_of_pending =
+            |p: PendingPolicy, s: &PolicySnapshot| match replaces && s.id != snapshot.id {
+                true => PendingEnd::Dropped(p),
+                false => PendingEnd::Applied(p),
+            };
         let in_force = |version: PolicyVersion,
                         changed: bool,
                         end: fn(PendingPolicy) -> PendingEnd| Recorded {
@@ -175,9 +200,18 @@ impl Engine {
         if snapshot.policy.same_at_launch(&active.policy)
             || self.sessions_under_rules(name)?.is_empty()
         {
-            // The file held the pending text, and the change is made on it.
             let version = self.store_policy(lock, by, name, overrides, snapshot, restores)?;
-            return Ok(in_force(version, true, PendingEnd::Applied));
+            return Ok(Recorded {
+                applied: PolicyApplied {
+                    version,
+                    changed: true,
+                    also: Vec::new(),
+                    outcome: ChangeOutcome::InForce {
+                        pending: before.map(|(p, s)| end_of_pending(p, &s)),
+                    },
+                },
+                restarts: false,
+            });
         }
         let base = before.as_ref().map_or(&active, |(_, s)| s);
         let restarts = !snapshot.policy.same_at_launch(&base.policy);
@@ -196,12 +230,6 @@ impl Engine {
                 outcome: ChangeOutcome::Pending(p),
             },
             restarts,
-        };
-        // A pending rollback stays one when only network rules join it: the
-        // change is re-resolved with them (design §7).
-        let restores = match (&before, restarts) {
-            (Some((p, _)), false) if restores.is_none() => p.restores,
-            _ => restores,
         };
         let previous = self.layout.read_policy(name.as_str())?;
         self.layout.write_policy(name.as_str(), overrides)?;
@@ -632,9 +660,11 @@ impl Engine {
 
     /// Once a runtime is recorded as installed, or after an install failed,
     /// resolves again what was resolved with another runtime's destinations:
-    /// the active policy and a pending one, each from its own `policy.toml`.
-    /// A pending rollback keeps
-    /// what it restores. An edit of the file not applied stays as it is.
+    /// the active policy and a pending one, each from its own `policy.toml`,
+    /// against this enclos's current inputs, whose difference from the
+    /// policy in force the install listed and asked about before it ran
+    /// (`plan_install`). A pending rollback keeps what it restores. An edit
+    /// of the file not applied stays as it is.
     pub(super) fn resolve_with_runtime(
         &self,
         lock: &StateLock,
@@ -978,6 +1008,16 @@ pub(super) fn change_summary(applied: &PolicyApplied) -> String {
             p.snapshot.short()
         ),
         (_, false) => "nothing changed".to_owned(),
+        (
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(p)),
+            },
+            true,
+        ) => format!(
+            "policy v{}, dropping pending snapshot {}{changes}",
+            applied.version.version,
+            p.snapshot.short()
+        ),
         (_, true) => format!("policy v{}{changes}", applied.version.version),
     }
 }

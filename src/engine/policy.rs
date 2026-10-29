@@ -51,8 +51,8 @@ pub struct PolicyApplied {
     pub changed: bool,
     /// What the change does besides the entry asked for, one sentence each:
     /// edits to `policy.toml` not applied yet, or a newer template or
-    /// built-in defaults. For `policy edit`, everything it changes from the
-    /// active policy.
+    /// built-in defaults. For `policy edit`, `rollback` and `refresh`,
+    /// everything it changes from the active policy.
     pub also: Vec<String>,
     pub outcome: ChangeOutcome,
 }

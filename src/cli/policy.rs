@@ -54,7 +54,7 @@ enum PolicyVerb {
     Diff {
         sandbox: SandboxName,
         /// The version compared from: by default the active one when the
-        /// pending policy is compared, else the one before --to.
+        /// pending policy is compared, else the version before the one compared.
         #[arg(long, value_name = "VERSION")]
         from: Option<u32>,
         /// The version compared: by default the pending policy, when there

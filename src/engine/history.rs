@@ -4,7 +4,7 @@
 
 use super::Engine;
 use super::pending::{Change, Recorded, change_summary};
-use super::policy::{ChangeOutcome, PolicyApplied, differences};
+use super::policy::{ChangeOutcome, PolicyApplied, PolicyView, differences};
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -128,6 +128,7 @@ impl Engine {
                 error: Box::new(error),
             }
         })?;
+        let view = self.policy(name)?;
         let replacement = Replacement {
             command: "policy rollback",
             target_name: format!("{name} v{to}"),
@@ -137,7 +138,7 @@ impl Engine {
             restores: Some(to),
             asks: false,
         };
-        self.replace_policy(by, name, replacement, confirm)
+        self.replace_policy(by, name, view, replacement, confirm)
     }
 
     /// Resolves the active policy's `policy.toml` again against this enclos's
@@ -182,7 +183,9 @@ impl Engine {
             restores: None,
             asks: true,
         };
-        self.replace_policy(by, name, replacement, confirm)
+        // The plan is made from `view`: a change made since it was read is
+        // refused under the lock, never undone.
+        self.replace_policy(by, name, view, replacement, confirm)
     }
 
     /// The snapshot of version `number`, or an error naming the versions.
@@ -210,6 +213,7 @@ impl Engine {
         &self,
         by: &Actor,
         name: &SandboxName,
+        view: PolicyView,
         r: Replacement<'_>,
         confirm: Confirm,
     ) -> Result<Planned<PolicyApplied>> {
@@ -222,7 +226,6 @@ impl Engine {
             restores,
             asks,
         } = r;
-        let view = self.policy(name)?;
         let changes = differences(&view.snapshot.policy, &target.policy, &[]);
         let dropped: Vec<String> = match &view.pending {
             Some((p, pending)) if pending.id != target.id => std::iter::once(format!(
@@ -238,14 +241,22 @@ impl Engine {
             Confirm::DryRun => {
                 let running = !self.sessions_under_rules(name)?.is_empty();
                 let waits = running && !target.policy.same_at_launch(&view.snapshot.policy);
-                let first = match (target.id == view.snapshot.id, waits) {
-                    (true, _) => format!(
+                // With --yes, only a change that brings rules the pending
+                // one does not restarts the sandbox (`restart_if_asked`).
+                let brings = !target.policy.same_at_launch(&view.latest().policy);
+                let first = match (target.id == view.snapshot.id, waits, brings) {
+                    (true, ..) => format!(
                         "{what}: it is the policy in force, v{}",
                         view.version.version
                     ),
-                    (false, false) => format!("{what}, as a new policy version in force at once"),
-                    (false, true) => format!(
+                    (false, false, _) => {
+                        format!("{what}, as a new policy version in force at once")
+                    }
+                    (false, true, true) => format!(
                         "{what} as the pending policy, since sessions run under rules it changes; with --yes, restart the sandbox to apply it"
+                    ),
+                    (false, true, false) => format!(
+                        "{what} as the pending policy, since sessions run under rules it changes; it brings none the pending change does not, so `enclos policy apply {name}` applies it"
                     ),
                 };
                 let mut plan = vec![first];
@@ -294,6 +305,7 @@ impl Engine {
                     name,
                     Change {
                         restores,
+                        replaces: true,
                         ..Change::edit(text, target)
                     },
                 )?;

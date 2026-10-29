@@ -186,7 +186,7 @@ pub enum Error {
     /// `policy.toml` holds an edit not applied, which rollback or refresh
     /// would overwrite.
     #[error(
-        "{} holds an edit not applied, which `{command}` would overwrite. Apply it with `enclos policy edit {sandbox}` (closing the editor applies the file as it is), or drop it with `enclos policy discard {sandbox}`, which also drops a pending change; then run `enclos {command}` again",
+        "{} holds an edit not applied, which `{command}` would overwrite. Apply it with `enclos policy edit {sandbox}` (closing the editor applies the file as it is), or drop it with `enclos policy discard {sandbox}`, which also drops a pending change; then run `{command}` again",
         file.display()
     )]
     PolicyFileEdited {
