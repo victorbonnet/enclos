@@ -175,7 +175,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                     "enclos copied no login in: the agent should use the sandbox's {kind} login, made with {login}. If it asks for one of its own, its configuration names another provider: change it with {kind}'s own commands inside the sandbox."
                 );
                 println!(
-                    "Until secrets are granted per sandbox (milestone 2), values such as a bot token go in the agent's files inside the sandbox."
+                    "Its secrets, such as a bot token, are granted with `enclos policy edit {sandbox}`, under [secrets.agents.{name}], and reach it once `enclos runtime configure {sandbox}/{name}` has set it up (ADR 0036), not kept in its files."
                 );
                 println!(
                     "Nothing in the archive widened the sandbox's policy: what the agent reaches shows in `enclos net log {sandbox}`, and what was refused in `enclos net denied {sandbox}`."

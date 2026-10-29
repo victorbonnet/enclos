@@ -10,7 +10,7 @@ use serde_json::json;
 
 use super::output;
 
-use enclos::engine::{Engine, SecretSet, SecretView};
+use enclos::engine::{Engine, Grant, SecretSet, SecretView};
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -56,8 +56,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                 (Planned::Done(set), true) => output::emit(&json!({
                     "secret": secret.to_string(),
                     "new": set.new,
-                    "granted_as": set.granted_as,
-                    "pending_as": set.pending_as,
+                    "granted_as": grants_json(&set.granted_as),
+                    "pending_as": grants_json(&set.pending_as),
                     "running_sessions_keep_old_value": set.running,
                 })),
                 (Planned::Done(set), false) => print_set(&secret, &set),
@@ -70,8 +70,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                     "sandbox": sandbox.to_string(),
                     "secrets": secrets.iter().map(|s| json!({
                         "name": s.record.secret.name.as_str(),
-                        "granted_as": s.granted_as,
-                        "pending_as": s.pending_as,
+                        "granted_as": grants_json(&s.granted_as),
+                        "pending_as": s.pending_as.as_deref().map(grants_json),
                         "updated_at": s.record.updated_at.to_string(),
                     })).collect::<Vec<_>>(),
                 })),
@@ -477,35 +477,63 @@ fn print_set(secret: &SecretRef, set: &SecretSet) {
         false => println!("Replaced the value of secret {secret} in the Keychain."),
     }
     let sandbox = &secret.sandbox;
-    let shown = |variables: &[String]| {
-        variables
+    let shown = |grants: &[&Grant]| {
+        grants
             .iter()
-            .map(|v| format!("${v}"))
+            .map(|g| g.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
-    match set.granted_as.as_slice() {
-        [] if !set.pending_as.is_empty() => println!(
-            "The pending policy gives it as {}, from `enclos policy apply {sandbox}`.",
-            shown(&set.pending_as)
-        ),
-        [] => println!(
-            "No session gets it until the policy grants it: `enclos policy edit {sandbox}`, under [secrets], as `env = {{ NAME = \"{}\" }}`.",
-            secret.in_policy()
-        ),
-        variables => {
+    let pending: Vec<&Grant> = set.pending_as.iter().collect();
+    let (sessions, agents): (Vec<&Grant>, Vec<&Grant>) =
+        set.granted_as.iter().partition(|g| g.agent.is_none());
+    if set.granted_as.is_empty() {
+        match pending.is_empty() {
+            false => println!(
+                "The pending policy gives it as {}, from `enclos policy apply {sandbox}`.",
+                shown(&pending)
+            ),
+            true => println!(
+                "No session gets it until the policy grants it: `enclos policy edit {sandbox}`, under [secrets] for every session, or [secrets.agents.<agent>] for one agent, as `env = {{ NAME = \"{}\" }}`.",
+                secret.in_policy()
+            ),
+        }
+        return;
+    }
+    if !agents.is_empty() {
+        // An agent's secret reaches its runtime's service alone, never a
+        // session (ADR 0036).
+        println!(
+            "The agents named get it from their services' next start, as {}.",
+            shown(&agents)
+        );
+    }
+    if !sessions.is_empty() {
+        println!(
+            "Sessions started from now on get it as {}.",
+            shown(&sessions)
+        );
+        if set.running > 0 {
             println!(
-                "Sessions started from now on get it as {}.",
-                shown(variables)
+                "{} running session(s) keep the value they started with; `enclos sandbox restart {sandbox}` gives them this one.",
+                set.running
             );
-            if set.running > 0 {
-                println!(
-                    "{} running session(s) keep the value they started with; `enclos sandbox restart {sandbox}` gives them this one.",
-                    set.running
-                );
-            }
         }
     }
+}
+
+/// How grants read in JSON: each `{"variable": …, "agent": …}`, the agent
+/// `null` for one granted to the whole sandbox.
+fn grants_json(grants: &[Grant]) -> Vec<serde_json::Value> {
+    grants
+        .iter()
+        .map(|g| {
+            json!({
+                "variable": g.variable,
+                "agent": g.agent.as_ref().map(|a| a.to_string()),
+            })
+        })
+        .collect()
 }
 
 fn print_list(sandbox: &SandboxName, secrets: &[SecretView]) {
@@ -517,11 +545,11 @@ fn print_list(sandbox: &SandboxName, secrets: &[SecretView]) {
     }
     println!("Secrets of sandbox {sandbox} (values are in the Keychain, never shown):");
     for s in secrets {
-        let shown = |vars: &[String]| match vars {
+        let shown = |grants: &[Grant]| match grants {
             [] => "not granted".to_owned(),
-            vars => vars
+            grants => grants
                 .iter()
-                .map(|v| format!("${v}"))
+                .map(|g| g.to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
         };

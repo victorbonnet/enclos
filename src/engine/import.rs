@@ -190,6 +190,22 @@ impl Engine {
                 return Err(with_copy_left(error, copy_left));
             }
         };
+        // As for an agent `agent add` makes: the archive's settings may name
+        // another agent's secrets, or a helper of the host's (ADR 0036).
+        for then in runtime.after_create_agent(&agent) {
+            let shown_then = then.shown();
+            let ended = self.run_in_sandbox(by, name, then, "agent import session")?;
+            if ended.exit != 0 {
+                let error = Error::FailedAfter {
+                    error: Box::new(failed(format!(
+                        "`{shown_then}` exited with {} in sandbox {name}: its output above says why. Run it with `enclos connect {name} -- {shown_then}`, then `enclos agent add {name}/{agent}`, which tracks the agent as it is",
+                        ended.exit
+                    ))),
+                    done: format!("importing agent {agent} into sandbox {name}"),
+                };
+                return Err(with_copy_left(error, copy_left));
+            }
+        }
         let how = Added::Imported {
             end,
             archive,

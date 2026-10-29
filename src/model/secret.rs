@@ -1,5 +1,6 @@
 //! Secrets (design §12, ADR 0022): values such as a bot token, kept on the
-//! host and granted to a whole sandbox through its policy.
+//! host and granted to a whole sandbox, or to one agent of it (ADR 0036),
+//! through its policy.
 
 use std::fmt;
 use std::str::FromStr;

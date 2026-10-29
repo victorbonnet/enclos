@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 /// The environment variable that overrides where enclos keeps its files.
 pub const HOME_VAR: &str = "ENCLOS_HOME";
 
+/// What follows an agent's name in its secrets file's name (ADR 0036).
+pub const AGENT_SECRETS_SUFFIX: &str = ".env";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     MacOs,
@@ -181,6 +184,13 @@ impl Layout {
     /// never writes, and no other sandbox reads.
     pub fn sandbox_secrets_dir(&self, name: &str) -> PathBuf {
         self.sandbox_dir(name).join("secrets")
+    }
+
+    /// The file of that folder holding what the policy grants one agent
+    /// (ADR 0036): `<agent>.env`, beside the sandbox's own `.env`.
+    pub fn agent_secrets_file(&self, name: &str, agent: &str) -> PathBuf {
+        self.sandbox_secrets_dir(name)
+            .join(format!("{agent}{AGENT_SECRETS_SUFFIX}"))
     }
 
     /// The sandbox's home folder: the runtime's home and the one place it may
