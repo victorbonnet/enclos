@@ -1,11 +1,19 @@
 # Sourced by the M3-02 bubblewrap prototype's scripts (design §14, issue #102).
 # Everything they run acts on the host (user namespaces, bubblewrap, sudo,
 # packages, planted files in the home), so they refuse to run anywhere but a
-# throwaway GitHub-hosted runner. Each check writes its result, as Markdown,
-# to $RESULTS_DIR, which the bwrap-prototype workflow uploads as an artifact.
+# throwaway GitHub-hosted runner, or a disposable VM for the manual steps in
+# README.md: there ENCLOS_PROTO_DISPOSABLE_VM=1 must be set and
+# systemd-detect-virt must report a VM, so bare metal is refused either way.
+# Each check writes its result, as Markdown, to $RESULTS_DIR, which the
+# bwrap-prototype workflow uploads as an artifact.
 
-if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then
-    echo "$(basename "$0") runs only on a GitHub-hosted runner (it acts on the host)" >&2
+if [ "${GITHUB_ACTIONS:-}" = true ] && [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
+    :
+elif [ "${ENCLOS_PROTO_DISPOSABLE_VM:-}" = 1 ] && virt=$(systemd-detect-virt --vm 2>/dev/null) \
+    && [ "$virt" != none ]; then
+    :
+else
+    echo "$(basename "$0") runs only on a GitHub-hosted runner or a disposable VM (it acts on the host)" >&2
     exit 2
 fi
 
