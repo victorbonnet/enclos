@@ -5829,6 +5829,7 @@ mod status {
             bytes_up: 0,
             bytes_down: 0,
             duration_ms: 0,
+            name_seen: None,
         }
     }
 

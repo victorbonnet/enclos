@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use enclos::engine::Engine;
 use enclos::error::{Result, exit};
 use enclos::model::audit::Since;
-use enclos::model::net::{DeniedDestination, NetEvent, Reason, Verdict, destination};
+use enclos::model::net::{DeniedDestination, NameSeen, NetEvent, Reason, Verdict, destination};
 use enclos::model::now;
 use enclos::model::sandbox::SandboxName;
 
@@ -52,20 +52,47 @@ fn print_log(events: &[NetEvent]) {
         println!("No connections yet.");
         return;
     }
+    // As wide as the longest verdict, such as `denied: name-mismatch`.
+    let wide = events
+        .iter()
+        .map(|e| verdict(e.verdict, e.reason).len())
+        .max()
+        .unwrap_or(0)
+        .max("VERDICT".len());
     println!(
-        "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
+        "{:<19}  {:<wide$}  {:<36}  {:<15}  {:>9}  {:>9}  SERVER NAME",
         "TIME (UTC)", "VERDICT", "DESTINATION", "ADDRESS", "UP", "DOWN"
     );
     for e in events {
         println!(
-            "{:<19}  {:<8}  {:<36}  {:<15}  {:>9}  {:>9}",
+            "{:<19}  {:<wide$}  {:<36}  {:<15}  {:>9}  {:>9}  {}",
             e.at.strftime("%Y-%m-%d %H:%M:%S"),
             verdict(e.verdict, e.reason),
             destination(&e.host, e.port),
             e.address.as_deref().unwrap_or("-"),
             bytes(e.bytes_up),
             bytes(e.bytes_down),
+            server_name(e),
         );
+    }
+}
+
+/// What a tunnel's first bytes showed of the server it asked for, as the
+/// log shows it (design §6, server name check). The name is kept escaped.
+fn server_name(e: &NetEvent) -> String {
+    match &e.name_seen {
+        Some(NameSeen::Name(name)) => name.clone(),
+        Some(NameSeen::Encrypted {
+            public: Some(public),
+        }) => format!("ECH, public name {public}"),
+        Some(NameSeen::Encrypted { public: None }) => "ECH".to_owned(),
+        Some(NameSeen::NoName) => "no name seen".to_owned(),
+        Some(NameSeen::NotTls) => "not TLS".to_owned(),
+        Some(NameSeen::Unreadable) => "unreadable hello".to_owned(),
+        Some(NameSeen::Incomplete) => "client stopped first".to_owned(),
+        // Plain HTTP, a refused request, a tunnel still open, or one whose
+        // client sent nothing.
+        None => "-".to_owned(),
     }
 }
 
@@ -114,6 +141,23 @@ fn denied_text(sandbox: &SandboxName, denied: &[DeniedDestination]) -> String {
             Reason::BadRequest
         ));
     }
+    if denied.iter().any(|d| {
+        matches!(
+            d.reason,
+            Reason::NameMismatch
+                | Reason::HelloUnreadable
+                | Reason::NoServerName
+                | Reason::EncryptedHello
+        )
+    }) {
+        out.push_str(&format!(
+            "{}, {}, {}, {}: the policy allowed the tunnel, but its TLS hello asked for another server than its destination, named none, hid it under ECH, or could not be read, so the proxy closed it; there is nothing to allow. `enclos net log {sandbox}` shows the name it asked for, if any.\n",
+            Reason::NameMismatch,
+            Reason::NoServerName,
+            Reason::EncryptedHello,
+            Reason::HelloUnreadable
+        ));
+    }
     if denied.iter().any(|d| d.reason == Reason::PolicyUnreadable) {
         out.push_str(&format!(
             "{}: the proxy could not read the sandbox's policy at those times, so it refused every destination; there is nothing to allow. See why with `enclos logs {sandbox}`.\n",
@@ -154,6 +198,63 @@ mod tests {
 
     fn lab() -> SandboxName {
         "lab".parse().unwrap()
+    }
+
+    #[test]
+    fn a_tunnel_closed_for_its_server_name_is_nothing_to_allow() {
+        for reason in [
+            Reason::NameMismatch,
+            Reason::NoServerName,
+            Reason::EncryptedHello,
+            Reason::HelloUnreadable,
+        ] {
+            let text = denied_text(&lab(), &[refused("api.example.com", reason)]);
+            assert!(
+                text.contains(&format!("api.example.com:443  {reason}")),
+                "{text}"
+            );
+            assert!(!text.contains("enclos policy allow"), "{text}");
+            assert!(text.contains("there is nothing to allow"), "{text}");
+            assert!(text.contains("enclos net log lab"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_log_shows_the_server_name_a_tunnel_asked_for() {
+        let event = |seen| NetEvent {
+            at: "2026-10-20T12:00:00Z".parse().unwrap(),
+            sandbox: lab(),
+            host: "api.example.com".into(),
+            port: 443,
+            method: "CONNECT".into(),
+            address: None,
+            verdict: Verdict::Allowed,
+            reason: None,
+            bytes_up: 0,
+            bytes_down: 0,
+            duration_ms: 0,
+            name_seen: seen,
+        };
+        for (seen, shown) in [
+            (
+                Some(NameSeen::Name("api.example.com".into())),
+                "api.example.com",
+            ),
+            (Some(NameSeen::NoName), "no name seen"),
+            (
+                Some(NameSeen::Encrypted {
+                    public: Some("public.example.net".into()),
+                }),
+                "ECH, public name public.example.net",
+            ),
+            (Some(NameSeen::Encrypted { public: None }), "ECH"),
+            (Some(NameSeen::NotTls), "not TLS"),
+            (Some(NameSeen::Unreadable), "unreadable hello"),
+            (Some(NameSeen::Incomplete), "client stopped first"),
+            (None, "-"),
+        ] {
+            assert_eq!(server_name(&event(seen)), shown);
+        }
     }
 
     #[test]
