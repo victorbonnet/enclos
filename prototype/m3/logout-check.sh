@@ -3,7 +3,7 @@
 # with and without lingering (design §14 and §15, M3-01). It logs in over
 # ssh to localhost, starts a unit, logs out, and looks again. It installs
 # sshd, changes lingering and ends sessions, so it runs only on a throwaway
-# GitHub-hosted runner, never on the user's machine.
+# GitHub-hosted runner, never on the user's host.
 set -u
 
 if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]; then

@@ -1,0 +1,74 @@
+# Milestone 3 prototype: the host survey
+
+Throwaway scripts that answer the milestone 3 questions in `docs/design.md` §14 (issue #102). Nothing here is enclos code. This first part, M3-01, surveys the target hosts: Landlock and its ABI, unprivileged user namespaces and AppArmor, the bubblewrap each distribution packages, the cgroup controllers delegated to the user, and `systemd --user` at logout.
+
+## Files
+
+| File | What it does |
+| --- | --- |
+| `survey.sh` | Prints one `key: value` line per fact. **Read-only**: it reads `/sys`, `/proc`, the kernel's build configuration, package versions and logind's properties; it runs no bubblewrap, creates no namespace and changes nothing, so it is safe on the user's own host. The Landlock ABI comes from `landlock_create_ruleset(NULL, 0, VERSION)`, which returns a number and restricts nothing. |
+| `bwrap-check.sh` | Runs bubblewrap as the user as installed, then with an AppArmor profile that lets `/usr/bin/bwrap` alone make user namespaces, then with AppArmor's restriction off, restoring each setting. **Acts on the host**: refuses to run outside a GitHub-hosted runner. |
+| `logout-check.sh` | Logs in over ssh to localhost, starts a `systemd --user` unit, logs out, and checks the unit and the user manager past logind's stop delay, without then with lingering. **Acts on the host** (installs sshd, changes lingering): refuses to run outside a GitHub-hosted runner. |
+| `.github/workflows/host-survey.yml` | Runs the three on `ubuntu-latest` and `ubuntu-24.04-arm`, on a pull request that touches this folder or by hand, and writes their output to the job summary. It does not gate merges. |
+
+## Results
+
+Each cell says where it comes from: **measured here** (on the one host available, below), **documented** (a page or file fetched on 2026-10-29, listed under Sources), or **to measure** (by the CI job above, or in a VM for what CI cannot show). Nothing in a "documented" cell has been run.
+
+The host measured: a Raspberry Pi 5 Model B Rev 1.1 on 64-bit Raspberry Pi OS (image "Raspberry Pi reference 2026-04-13", which reports itself as Debian 13 trixie in `os-release`), kernel `6.18.50+rpt-rpi-2712`, arm64, a desktop install (Wayland) reached over ssh, with lingering on. Measured with `survey.sh` and read-only commands only; bubblewrap was not run on it.
+
+Ubuntu 24.04's x86_64 and arm64 builds have the same values for every setting below in the kernel configuration and the same package versions, so they share a column; GitHub's runners use Azure kernels with a configuration of their own, so they have theirs.
+
+| | Ubuntu 24.04 (x86_64, arm64) | Debian 12 bookworm | Debian 13 trixie | Raspberry Pi OS (64-bit, this Pi) | GitHub runners (`ubuntu-latest`, `ubuntu-24.04-arm`) |
+| --- | --- | --- | --- | --- | --- |
+| Kernel | to measure (VM) | to measure (VM) | to measure (VM) | `6.18.50+rpt-rpi-2712` (measured here; `6.12.75` also installed) | `7.0.0-1017-azure` on x86_64, image 20261026.354.1 (documented [1]); `6.14.0-1017-azure` on arm64, 24.04.3 (documented [2], may lag the image) |
+| Landlock built (`CONFIG_SECURITY_LANDLOCK`) | `y` on amd64 and arm64 (documented [3]) | `y` (documented [4]) | `y` (documented [5]) | **not built**: `# CONFIG_SECURITY_LANDLOCK is not set` in all four installed kernel configurations (`6.12.75` and `6.18.50`, `-2712` and `-v8`) (measured here) | to measure (CI: `survey.sh`) |
+| Landlock in the default LSM list (`CONFIG_LSM`) | `landlock,lockdown,yama,integrity,apparmor` (documented [3]) | `landlock,lockdown,yama,loadpin,safesetid,integrity,apparmor,selinux,smack,tomoyo,bpf` (documented [4]) | as bookworm, plus `ipe` (documented [5]) | `CONFIG_LSM=""` (measured here) | to measure (CI) |
+| Active LSMs (`/sys/kernel/security/lsm`) | to measure (VM) | to measure (VM) | to measure (VM) | `capability` only; no `lsm=` on the command line (measured here) | to measure (CI) |
+| Landlock ABI | to measure (VM) | to measure (VM) | to measure (VM) | none: the call fails with `ENOSYS` (measured here) | to measure (CI) |
+| Unprivileged user namespaces in the kernel | `CONFIG_USER_NS=y` (documented [3]) | `CONFIG_USER_NS=y`; Debian's `kernel.unprivileged_userns_clone` defaults to 1, allowed (documented [4], [6]); the bubblewrap package also sets it to 1 (`/usr/lib/sysctl.d/50-bubblewrap.conf`, measured here on trixie's package) | as bookworm (documented [5], [6]) | `CONFIG_USER_NS=y`, `max_user_namespaces` 16035; Raspberry Pi's kernel has no `unprivileged_userns_clone` sysctl (measured here) | to measure (CI) |
+| AppArmor's restriction on unprivileged user namespaces | **on**: the `apparmor` package installs `/usr/lib/sysctl.d/10-apparmor.conf` with `kernel.apparmor_restrict_unprivileged_userns = 1` (documented [7]) | not set by Debian's `apparmor` 3.0.8 (documented [8]) | not set by Debian's `apparmor` 4.1.0, which installs the `unprivileged_userns` profile but no sysctl file (documented [8]) | none: AppArmor is built but not active (`apparmor.enabled=N`, not in the LSM list), and the sysctl does not exist (measured here) | the restriction is reported on, and `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` as the workaround (documented [9]); to measure (CI: `bwrap-check.sh`) |
+| AppArmor rule for `/usr/bin/bwrap` | none installed: `bwrap-userns-restrict` is in the source's `extras` and not in `apparmor.install` (documented [7]); a profile in Ubuntu's own form (`flags=(unconfined) { userns, }`, as for `chrome`) is what `bwrap-check.sh` tries | not needed while the restriction is off | not needed while the restriction is off | not needed (AppArmor inactive) | to measure (CI) |
+| bubblewrap runs as the user | expected refused while the restriction is on and no rule names it; to measure (VM) | to measure (VM) | to measure (VM) | not run here; nothing measured here stands in its way: user namespaces on, no AppArmor, `/usr/bin/bwrap` not setuid (`-rwxr-xr-x root`). Needs the user | to measure (CI: as installed, with a `userns` profile, with the restriction off) |
+| bubblewrap package | `0.9.0-1ubuntu0.3` (noble-updates and -security) (documented [10]) | `0.8.0-2+deb12u1` (documented [11]) | `0.12.0-1~deb13u1` (documented [11]) | `0.12.0-1~deb13u1`, installed, from Debian's trixie archive (measured here) | noble's (documented [10]); the job installs it |
+| cgroup controllers at the root | to measure (VM) | to measure (VM) | to measure (VM) | `cpuset cpu io pids`: **no `memory`**, which the firmware turns off (`cgroup_disable=memory` in the device tree's `bootargs`, not in `cmdline.txt`); the kernel has `CONFIG_MEMCG=y` (measured here). Raspberry Pi's kernel accepts `cgroup_enable=memory` to turn it back on (documented [12]; not tried) | to measure (CI) |
+| Controllers delegated to the user (`user@.service`) | `Delegate=pids memory cpu` in systemd's unit (documented [13]) | to measure (VM) | `Delegate=pids memory cpu` (measured here) | `cpu pids` reach the user manager: `memory` is delegated but absent (measured here) | to measure (CI) |
+| systemd | `255.4-1ubuntu8.18` on the x86_64 runner (documented [1]) | `252.39-1~deb12u2` (documented [14]) | `257.13-1~deb13u1` (documented [14]) | `257.13-1~deb13u1` (measured here) | as Ubuntu 24.04 |
+| `KillUserProcesses` | `no`: built with `-Ddefault-kill-user-processes=false` (documented [15]) | `no` (documented [16]) | `no` (documented [16]) | `false`, and no `logind.conf` override (measured here) | to measure (CI) |
+| `systemd --user` at the last logout | `user@.service` is kept after logout only for a lingering user (documented [17]); it stops `UserStopDelaySec` after the last session ends, 10 s by default (documented [17]); what happens to a sandbox's unit then: to measure (CI: `logout-check.sh`) | as Ubuntu (documented [17], systemd 257's manual; bookworm has 252); to measure (VM) | as Ubuntu (documented [17]); to measure (VM) | lingering on, `UserStopDelayUSec` 10 s (measured here); a logout without lingering was not tried, since it would change lingering on the user's host. Needs the user | to measure (CI: without and with lingering) |
+| glibc (for M3-21's oldest target) | `2.39-0ubuntu8.9` (documented [10]) | `2.36-9+deb12u14` (documented [11]) | `2.41-12+deb13u4` (documented [11]) | `2.41` (measured here) | as Ubuntu 24.04 |
+
+### What this shows
+
+- **Landlock is not in Raspberry Pi OS's kernel.** It is not active, and not even built: `CONFIG_SECURITY_LANDLOCK` is unset in every Raspberry Pi kernel installed (6.12 and 6.18, Pi 4 and Pi 5 builds), so no `lsm=` boot option can turn it on. ADR 0004 asked for this check before the backend is built. On a stock Raspberry Pi OS, the bubblewrap backend as designed (Landlock applied first inside) cannot run, and the milestone 3 acceptance scenario's Pi host fails its step 1. What to do instead is a decision (design §15).
+- **The memory controller is off on the Pi** by the firmware's own boot arguments, so a `memory` limit cannot be held by a session's cgroup there unless the user adds `cgroup_enable=memory`; `cpu` and `pids` are delegated.
+- **Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor and ships no rule for bubblewrap**, so bubblewrap is expected to fail there as installed; whether a profile naming `/usr/bin/bwrap` is enough is what `bwrap-check.sh` tries on the runners. Debian turns neither the restriction nor a bwrap rule on.
+- **The oldest bubblewrap among the targets is Debian 12's 0.8.0**, then Ubuntu 24.04's 0.9.0. Whether each has every option the backend uses waits for M3-02's list of options.
+
+## To measure
+
+- **In CI** (the `host-survey` workflow, both runners): every "to measure (CI)" cell. Its first run is the result for the runners, and the table and design §14 are updated from it.
+- **In a VM** (Ubuntu 24.04 x86_64 and arm64, Debian 12 and 13): `survey.sh` for the "to measure (VM)" cells, then `bwrap-check.sh`'s steps by hand (it refuses outside a runner by design).
+- **On the Pi, with the user**: whether bubblewrap runs as the user, and a logout without lingering, both of which act on the user's host.
+
+## Sources
+
+Fetched on 2026-10-29.
+
+1. GitHub Actions runner images, `images/ubuntu/Ubuntu2404-Readme.md` (image 20261026.354.1): <https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md>
+2. GitHub partner runner images (arm64), `images/Ubuntu2404-Readme.md`: <https://github.com/actions/partner-runner-images/blob/main/images/Ubuntu2404-Readme.md>
+3. Ubuntu noble kernel, `debian.master/config/annotations`: <https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/noble/plain/debian.master/config/annotations>
+4. Debian kernel 6.1 (bookworm), `debian/config/config`: <https://salsa.debian.org/kernel-team/linux/-/raw/debian/6.1/bookworm/debian/config/config>
+5. Debian kernel 6.12 (trixie), `debian/config/config`: <https://salsa.debian.org/kernel-team/linux/-/raw/debian/6.12/trixie/debian/config/config>
+6. Debian's kernel patch `add-sysctl-to-disallow-unprivileged-CLONE_NEWUSER-by-default.patch` (`unprivileged_userns_clone = 1`), on both branches above: <https://salsa.debian.org/kernel-team/linux/-/raw/debian/6.12/trixie/debian/patches/debian/add-sysctl-to-disallow-unprivileged-CLONE_NEWUSER-by-default.patch>
+7. Ubuntu's `apparmor` package, noble-updates: `debian/usr/lib/sysctl.d/10-apparmor.conf`, `debian/apparmor.install`, `profiles/apparmor.d/chrome` and `profiles/apparmor/profiles/extras/`: <https://git.launchpad.net/ubuntu/+source/apparmor/tree/?h=applied/ubuntu/noble-updates>
+8. Debian's `apparmor` package, tag `debian/4.1.0-1`, `debian/apparmor.install` and `debian/` (no sysctl file): <https://salsa.debian.org/apparmor-team/apparmor/-/tree/debian/4.1.0-1/debian>; versions from <https://qa.debian.org/madison.php?package=apparmor>
+9. actions/runner-images issue #10443, "ubuntu-24.04 Error during unshare(...): Operation not permitted" (closed), with the sysctl workaround; the PR to apply it in the image, #11489, was closed: <https://github.com/actions/runner-images/issues/10443>
+10. Launchpad, published sources for `bubblewrap` and `glibc` in Ubuntu: <https://launchpad.net/ubuntu/+source/bubblewrap>, <https://launchpad.net/ubuntu/+source/glibc>
+11. Debian madison for `bubblewrap` and `glibc`: <https://qa.debian.org/madison.php?package=bubblewrap>, <https://qa.debian.org/madison.php?package=glibc>
+12. raspberrypi/linux PR #6524, "cgroup: Add cgroup_enable option" (merged 2024-12-09): <https://github.com/raspberrypi/linux/pull/6524>
+13. Ubuntu's `systemd` package, noble-updates, `units/user@.service.in`: <https://git.launchpad.net/ubuntu/+source/systemd/plain/units/user@.service.in?h=applied/ubuntu/noble-updates>
+14. Debian madison for `systemd`: <https://qa.debian.org/madison.php?package=systemd>
+15. Ubuntu's `systemd` package, noble-updates, `debian/rules`: <https://git.launchpad.net/ubuntu/+source/systemd/plain/debian/rules?h=applied/ubuntu/noble-updates>
+16. Debian's `systemd` package, `debian/rules` on the `debian/bookworm` and `debian/trixie` branches: <https://salsa.debian.org/systemd-team/systemd/-/raw/debian/trixie/debian/rules>
+17. `logind.conf(5)` (`KillUserProcesses=`, `UserStopDelaySec=`) and `loginctl(1)` (`enable-linger`), systemd 257's manual pages as installed on the Pi.

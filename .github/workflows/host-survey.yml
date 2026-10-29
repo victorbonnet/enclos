@@ -3,7 +3,7 @@ name: host-survey
 # Milestone 3's host survey (prototype/m3/, design §14) on GitHub's Ubuntu
 # runners: the read-only survey, then the checks that act on the host
 # (bubblewrap under AppArmor's settings, `systemd --user` at logout), which
-# run only on these throwaway machines. It reports; it does not gate merges.
+# run only on these throwaway runners. It reports; it does not gate merges.
 on:
   workflow_dispatch:
   pull_request:
