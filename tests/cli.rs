@@ -4282,7 +4282,8 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // The folder the launch agents probe writes in, as a Mac has it.
     std::fs::create_dir_all(home._dir.path().join("Library/LaunchAgents")).unwrap();
@@ -4480,7 +4481,8 @@ fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     home.run(&["policy", "allow", "home", "example.com", "--yes"])
         .ok();
@@ -4514,7 +4516,8 @@ fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
 fn a_service_refuses_any_baseline_but_deny_default() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     for (value, why) in [
         ("allow-default", "asks for allow-default"),
         ("x", "it takes `deny-default` or `allow-default`"),

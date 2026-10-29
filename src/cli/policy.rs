@@ -1055,7 +1055,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by something enclos compiles, so the test showed nothing about the policy".to_owned());
+        why.push("no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules".to_owned());
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1134,7 +1134,7 @@ mod tests {
         );
         assert_eq!(
             verdict(&lab, &report(Outcome::Inconclusive("x".into())), false),
-            "NOT READY: sandbox lab: no probe was shown closed by something enclos compiles, so the test showed nothing about the policy."
+            "NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules."
         );
     }
 
