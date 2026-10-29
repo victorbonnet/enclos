@@ -165,22 +165,24 @@ impl Engine {
     ) -> Result<SessionEnd> {
         let command = command.into_words();
         let summary = |(session, ..): &(SessionRecord, _, _, _)| format!("session {}", session.id);
-        // Which process group the program starts in (design §8). When this
-        // command leads its group, as a terminal's job does, that group:
-        // the program keeps the terminal, and this process, which leads the
-        // group, is not a member. Run by something else without a terminal
-        // (a script, CI), a group made for the program. Otherwise (a
-        // terminal, but not a job of its own, as in a shell's pipeline) the
-        // caller's group, which is not the session's: the session then has
-        // no group, only the processes the program starts. A terminal on any
-        // of the standard streams counts: with input piped in, the output
-        // still goes to the terminal, whose Ctrl-C must reach the program.
+        // Which process group the program starts in (design §8). Without a
+        // terminal (a script, CI, a supervisor, whether or not this process
+        // leads its group), a group made for the program, to which this
+        // process passes every signal it catches. In a terminal, when this
+        // command leads its group, as a terminal's job does, that group: the
+        // program keeps the terminal, and this process, which leads the
+        // group, is not a member. Otherwise (a terminal, but not a job of
+        // its own, as in a shell's pipeline) the caller's group, which is
+        // not the session's: the session then has no group, only the
+        // processes the program starts. A terminal on any of the standard
+        // streams counts: with input piped in, the output still goes to the
+        // terminal, whose Ctrl-C must reach the program.
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
         let in_terminal = std::io::stdin().is_terminal()
             || std::io::stdout().is_terminal()
             || std::io::stderr().is_terminal();
-        let own_group = !leads_group && !in_terminal;
+        let own_group = !in_terminal;
         self.wait_service_proxy(name)?;
         let (session, mut child, keep_waiting, unreachable) =
             self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
@@ -190,10 +192,9 @@ impl Engine {
             })?;
 
         // In a group of its own, the program hears of a signal only when
-        // this process passes it on, to the group it leads. In this
-        // process's group (a terminal's job), it hears the terminal's
-        // signals itself, but not a TERM sent to this process alone, which
-        // is passed on to the program.
+        // this process passes it on, to the group it leads. In a terminal,
+        // it hears the terminal's signals itself, but not a TERM sent to
+        // this process alone, which is passed on to the program.
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
             for signal in keep_waiting.received() {
@@ -202,14 +203,13 @@ impl Engine {
                     (false, Signal::Term) => signal_process(&session.root, signal),
                     (false, _) => continue,
                 };
-                match sent {
-                    Ok(Signalled::Sent | Signalled::Gone) => {}
-                    Ok(other) => note(
-                        notes,
-                        format!("could not pass {} on: {other:?}", signal.name()),
-                    ),
-                    Err(e) => note(notes, format!("could not pass {} on: {e}", signal.name())),
-                }
+                let why = match sent {
+                    Ok(Signalled::Sent | Signalled::Gone) => continue,
+                    Ok(Signalled::NotLeader) => "the program no longer leads its group".to_owned(),
+                    Ok(Signalled::Failed(why)) => why,
+                    Err(e) => e.to_string(),
+                };
+                note(notes, format!("could not pass {} on: {why}", signal.name()));
             }
         };
         let waited = self.wait_session(&session, &mut child, None, &mut pass_on)?;
@@ -1029,7 +1029,7 @@ pub(super) fn note(notes: &mut Vec<String>, note: String) {
 }
 
 /// Keeps this process waiting for the program through Ctrl-C, Ctrl-\, a
-/// hangup and TERM, as `system(3)` does for the first three. In a terminal
+/// hangup and TERM, as `system(3)` does for the first two. In a terminal
 /// they reach this process along with the program, which may handle them
 /// and go on; this process must outlive it to record the session's end.
 /// The program itself was started before, with the default handling, and
