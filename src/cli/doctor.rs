@@ -74,7 +74,7 @@ fn sandbox(s: &SandboxCheck) -> String {
         }
         NextSession::Unknown { why } => {
             out += &format!(
-                "  {name}: enclos could not tell whether its next session can start: {why}\n"
+                "  {name}: enclos could not tell whether its active policy compiles: {why}\n"
             );
         }
         NextSession::Fails { error } => {
@@ -247,7 +247,7 @@ mod tests {
             ..compiles()
         }));
         assert!(
-            shown.contains("home: enclos could not tell whether its next session can start: cannot read its active policy: the database is busy"),
+            shown.contains("home: enclos could not tell whether its active policy compiles: cannot read its active policy: the database is busy"),
             "{shown}"
         );
         assert!(!shown.contains("does not run here"), "{shown}");
