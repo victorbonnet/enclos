@@ -1309,3 +1309,20 @@ fn apply_refuses_limits_before_anything_stops() {
     assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [id]);
     assert!(engine.policy(&name).unwrap().pending.is_some());
 }
+
+/// What `sandbox restart` asks before it stops anything: whether the policy
+/// in force could start again under its limits.
+#[test]
+fn a_start_is_checked_before_a_restart_stops_anything() {
+    let (_dir, engine, name) = with_sandbox();
+    engine.check_start_limits(&name).unwrap();
+    let id = engine.policy(&name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = json_set(policy, '$.resources.open_files', 99999999) WHERE id = ?1",
+        [&id.0],
+    )
+    .unwrap();
+    let err = engine.check_start_limits(&name).unwrap_err();
+    assert!(err.to_string().contains("open_files"), "{err}");
+}

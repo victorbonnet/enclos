@@ -125,8 +125,12 @@ pub struct LaunchLimits {
 
 impl LaunchLimits {
     /// The limits of `resources`, which the caller has checked for the
-    /// backend: one it sets that no backend enforces is the caller's bug.
-    pub(crate) fn of_checked(resources: &crate::model::policy::Resources) -> LaunchLimits {
+    /// backend: one set that no backend enforces is refused here too, in
+    /// every build, never dropped, so a backend that comes to accept one
+    /// must be given it here first.
+    pub(crate) fn of_checked(
+        resources: &crate::model::policy::Resources,
+    ) -> Result<LaunchLimits, String> {
         // Every field named, so one added is decided on here.
         let crate::model::policy::Resources {
             open_files,
@@ -135,13 +139,14 @@ impl LaunchLimits {
             memory,
             cpu,
         } = resources;
-        debug_assert!(
-            file_size.is_none() && cpu_seconds.is_none() && memory.is_none() && cpu.is_none(),
-            "launched with a limit no backend enforces: {resources:?}"
-        );
-        LaunchLimits {
-            open_files: *open_files,
+        if file_size.is_some() || cpu_seconds.is_some() || memory.is_some() || cpu.is_some() {
+            return Err(format!(
+                "a limit no backend enforces reached a launch: {resources:?}"
+            ));
         }
+        Ok(LaunchLimits {
+            open_files: *open_files,
+        })
     }
 
     /// The file descriptors a process may hold, if limited.
@@ -275,11 +280,15 @@ mod limits_tests {
         read.args(["-c", "ulimit -Hn"]);
         let out = under_limits(read, &files(over)).output().unwrap();
         if out.status.code() == Some(125) {
-            // Under a hard limit below `over`, as unsettable says first.
+            // Under a hard limit below `over`, as unsettable says first;
+            // the ceiling itself is not shown on this host.
             assert!(
                 unsettable(&files(over))
                     .unwrap()
                     .contains("hard limit enclos runs under")
+            );
+            eprintln!(
+                "skipped: this test's hard limit is below {over}, so kern.maxfilesperproc ({most}) was not shown to hold"
             );
             return;
         }
@@ -309,6 +318,7 @@ mod limits_tests {
             open_files: Some(n),
             ..Default::default()
         })
+        .unwrap()
     }
 
     #[test]
@@ -427,6 +437,39 @@ mod limits_tests {
         for value in ["64", "16"] {
             assert!(!probe(value).status.success(), "{value:?} reads closed");
         }
+    }
+
+    /// macOS refuses a memory limit: `ulimit -v`, `-d` and `-m` fail.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_refuses_a_memory_limit() {
+        for flag in ["-v", "-d", "-m"] {
+            let out = Command::new("/bin/bash")
+                .args(["-p", "-c", &format!("ulimit {flag} 100000")])
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "ulimit {flag} was set");
+        }
+    }
+
+    /// macOS checks a file size limit against where an appending write
+    /// starts, from the start of the file each process opened: separate
+    /// processes each appending under 1 KiB grow a file past it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn appends_of_separate_processes_grow_a_file_past_its_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        let script = format!(
+            "ulimit -f 1; for i in $(seq 50); do /bin/sh -c 'head -c 100 /dev/zero >> \"$1\"' sh '{}'; done",
+            file.display()
+        );
+        let _ = Command::new("/bin/bash")
+            .args(["-p", "-c", &script])
+            .status()
+            .unwrap();
+        let size = std::fs::metadata(&file).unwrap().len();
+        assert!(size > 1024, "{size} bytes, held to 1 KiB");
     }
 
     /// Why Seatbelt refuses `cpu_seconds` (ADR 0033): a process that

@@ -495,9 +495,10 @@ impl Engine {
     ) -> Result<Restarted> {
         // Before anything stops, and again under the lock below.
         self.check_pending_file(name, pending)?;
-        // Nor is a policy put in force whose limits no service could start
-        // under: refused here, before anything stops, as `sandbox start`
-        // refuses it before anything is removed.
+        // Nor is a policy put in force whose limits enclos could not set
+        // (above its own hard limit or kern.maxfilesperproc): refused here,
+        // before anything stops, as `sandbox start` refuses it before
+        // anything is removed.
         if let Some((_, snapshot)) = self.state.pending_policy(name)? {
             self.launch_limits(&self.record(name)?, &snapshot.policy)?;
         }

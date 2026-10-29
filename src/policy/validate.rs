@@ -183,17 +183,17 @@ fn refusals(
             }
             if let Some(size) = r.file_size {
                 refused.push(("file_size", format!(
-                    "resources.file_size = {size}: the Seatbelt backend cannot hold a file to a size, since macOS checks the limit against the start of a file opened to append, so each new process may append past it (shown on macOS 26.5.2); leave it out"
+                    "resources.file_size = {size}: the Seatbelt backend cannot hold a file to a size, since macOS checks the limit against the start of a file opened to append, so each new process may append past it; leave it out"
                 )));
             }
             if let Some(memory) = &r.memory {
                 refused.push(("memory", format!(
-                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process (shown on macOS 26.5.2); leave it out. Linux's backend is designed to hold one"
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. Linux's backend is designed to hold one"
                 )));
             }
             if let Some(seconds) = r.cpu_seconds {
                 refused.push(("cpu_seconds", format!(
-                    "resources.cpu_seconds = {seconds}: the Seatbelt backend cannot hold a process to its CPU time, since macOS sends SIGXCPU once, which a process may ignore and then run on, its children with it (shown on macOS 26.5.2); leave it out"
+                    "resources.cpu_seconds = {seconds}: the Seatbelt backend cannot hold a process to its CPU time, since macOS sends SIGXCPU, which a process may ignore and then run on; leave it out"
                 )));
             }
             if let Some(cpu) = &r.cpu {

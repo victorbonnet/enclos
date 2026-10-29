@@ -326,11 +326,22 @@ impl Engine {
             record.backend,
             crate::backend::max_files_per_process(),
         )?;
-        let limits = LaunchLimits::of_checked(&policy.resources);
+        let limits =
+            LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
         if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });
         }
         Ok(limits)
+    }
+
+    /// Whether the sandbox's active policy could start a session or service
+    /// now, under its limits: for a command that stops the sandbox before
+    /// it starts it again, such as `sandbox restart`, to ask before
+    /// anything stops.
+    pub fn check_start_limits(&self, name: &SandboxName) -> Result<()> {
+        let record = self.record(name)?;
+        self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+        Ok(())
     }
 
     /// Writes the file first, so the active version never runs ahead of it:
@@ -510,6 +521,14 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "stop giving it ${variable} (sessions started from now on)"
         ));
     }
+    // Every field named, so one added is decided on here.
+    let crate::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = &new.resources;
     let (was, now) = (&old.resources, &new.resources);
     for (what, before, after) in [
         (
@@ -526,6 +545,16 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             "a process's CPU time",
             was.cpu_seconds.map(|s| format!("{s} s")),
             now.cpu_seconds.map(|s| format!("{s} s")),
+        ),
+        (
+            "the sandbox's memory",
+            was.memory.clone(),
+            now.memory.clone(),
+        ),
+        (
+            "the sandbox's share of the CPU",
+            was.cpu.clone(),
+            now.cpu.clone(),
         ),
     ] {
         if before != after {
