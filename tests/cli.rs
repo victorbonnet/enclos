@@ -456,6 +456,7 @@ impl Drop for TestKeychain {
 
 /// `runtime configure` sets up the sandbox's bot, never an agent's own
 /// (ADR 0032): naming an agent is refused, and nothing is recorded.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_bot_of_an_agents_own_is_refused() {
     let home = Home::new();
