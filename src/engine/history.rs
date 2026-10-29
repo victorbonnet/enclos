@@ -323,19 +323,17 @@ impl Engine {
 
     /// Refuses when `policy.toml` holds anything but the text `latest`, the
     /// pending or else the active policy, was resolved from: an edit not
-    /// applied, which putting back another file would lose. Without that
-    /// text (a snapshot stored before snapshots kept it), nothing tells an
-    /// edit apart, and nothing is refused.
+    /// applied, which putting back another file would lose. Compared by the
+    /// hash its inputs name, so it holds also when the snapshot does not
+    /// keep the text.
     fn refuse_unapplied_edit(
         &self,
         name: &SandboxName,
         latest: &PolicySnapshot,
         command: &str,
     ) -> Result<()> {
-        let Some(expected) = latest.overrides_text() else {
-            return Ok(());
-        };
-        if self.layout.read_policy(name.as_str())? == expected {
+        let file = self.layout.read_policy(name.as_str())?;
+        if crate::policy::sha256_hex(file.as_bytes()) == latest.inputs.overrides {
             return Ok(());
         }
         Err(Error::PolicyFileEdited {

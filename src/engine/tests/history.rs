@@ -197,6 +197,36 @@ fn a_rollback_over_an_edit_not_applied_is_refused() {
     assert_eq!(engine.policy(&name).unwrap().version.version, 3);
 }
 
+/// The active snapshot's text unknown, the file is still compared, by
+/// the hash the snapshot's inputs name: an edit is refused, the same file
+/// is not.
+#[test]
+fn an_edit_not_applied_is_refused_when_the_active_text_is_unknown() {
+    let (_dir, engine, name) = with_three_versions();
+    let id = engine.policy(&name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET overrides = '' WHERE id = ?1",
+        [&id.0],
+    )
+    .unwrap();
+    let text = engine.layout.read_policy("home").unwrap();
+    engine
+        .layout
+        .write_policy("home", &format!("{text}# a note\n"))
+        .unwrap();
+    let err = engine
+        .policy_rollback(&alice(), &name, 1, Confirm::Yes)
+        .unwrap_err();
+    assert!(matches!(err, Error::PolicyFileEdited { .. }), "{err}");
+    engine.layout.write_policy("home", &text).unwrap();
+    done(
+        engine
+            .policy_rollback(&alice(), &name, 1, Confirm::Yes)
+            .unwrap(),
+    );
+}
+
 #[test]
 fn a_rollback_to_a_version_whose_policy_toml_is_unknown_says_so() {
     let (_dir, engine, name) = with_three_versions();
