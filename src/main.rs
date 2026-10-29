@@ -139,8 +139,7 @@ fn main() -> ExitCode {
             code
         }
     };
-    let expected = cli::output::output() == Output::Document;
-    ExitCode::from(written(code, exec, expected))
+    ExitCode::from(written(code, exec))
 }
 
 /// Tells a usage error as the command would print (design §10), and exits:
@@ -165,7 +164,12 @@ fn usage_error(err: &clap::Error) -> ExitCode {
         flag("--text"),
         std::io::stdout().is_terminal(),
     );
-    let error = || cli::output::error_text(err.render().to_string().trim(), code);
+    // clap's rendering starts `error: `, which a message never does.
+    let error = || {
+        let rendered = err.render().to_string();
+        let message = rendered.trim();
+        cli::output::error_text(message.strip_prefix("error: ").unwrap_or(message), code)
+    };
     match (code, output) {
         (exit::OK, _) | (_, Output::Text) => {
             let _ = err.print();
@@ -173,18 +177,21 @@ fn usage_error(err: &clap::Error) -> ExitCode {
         (_, Output::Document) => cli::output::emit(&error()),
         (_, Output::OnStderr) => say(&cli::output::line(&error())),
     }
-    // Help and the version are text, piped or not: no document is owed.
-    ExitCode::from(written(code, exec, false))
+    // Help and the version are text, piped or not: no document is owed,
+    // and none is, as the output was never set.
+    ExitCode::from(written(code, exec))
 }
 
 /// `code`, unless the JSON document could not be written, a second was
-/// refused, or none was printed though one was `expected`, all bugs of
-/// enclos but the first: that is a failure whatever the command did, and
-/// the message says what it did, and the error the document held, so that
-/// it is not run again blindly. As JSON on stderr, as enclos's notes are
-/// there.
-fn written(code: u8, exec: bool, expected: bool) -> u8 {
-    use cli::output::Sent;
+/// refused, or a command that prints one printed none, all bugs of enclos
+/// but the first. That fails the command: with its own code, and so its
+/// kind, when it failed (2 stays refused), else 1, and 125 for `exec`. The
+/// message says what the command did, and the error the document held, so
+/// that it is not run again blindly. As JSON on stderr, as enclos's notes
+/// are there.
+fn written(code: u8, exec: bool) -> u8 {
+    use cli::output::{Output, Sent};
+    let expected = cli::output::output() == Output::Document;
     let failed = match exec {
         true => exit::EXEC_FAILED,
         false => code.max(exit::ERROR),

@@ -101,7 +101,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                     Planned::Done(report) if output::json() => {
                         let code = test_code(&report);
                         output::conclude(test_json(&sandbox, &report), code, || {
-                            verdict(&sandbox, &report)
+                            verdict(&sandbox, &report, true)
                         })
                     }
                     Planned::Done(report) => print_test(&sandbox, &report),
@@ -258,7 +258,7 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
     json!({
         "sandbox": sandbox.to_string(),
         "ready": report.passed(),
-        "verdict": verdict(sandbox, report),
+        "verdict": verdict(sandbox, report, true),
         "probes": report.results.iter().map(|r| {
             let (outcome, why) = match &r.outcome {
                 Outcome::Closed => ("closed", None),
@@ -995,20 +995,26 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
     println!();
     match report.passed() {
         true => {
-            println!("{}", verdict(sandbox, report));
+            println!("{}", verdict(sandbox, report, false));
             exit::OK
         }
         false => {
-            eprintln!("{}", verdict(sandbox, report));
+            eprintln!("{}", verdict(sandbox, report, false));
             exit::ERROR
         }
     }
 }
 
 /// Whether the sandbox is ready, in one line: READY when the test passed,
-/// with what it showed, or NOT READY with every reason it did not.
-fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
+/// with what it showed, or NOT READY with every reason it did not. Each
+/// probe is listed above it in text, and in the document's `probes` in
+/// `json`.
+fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
     let total = report.results.len();
+    let listed = |text: &str, value: &str| match json {
+        true => format!("\"{value}\" in probes"),
+        false => format!("{text} above"),
+    };
     if report.passed() {
         let platform = match report.closed_by_platform() {
             0 => String::new(),
@@ -1017,9 +1023,10 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
-                "{} of {total} shown closed{platform}, {} could not be checked on this Mac (inconclusive above), none open",
+                "{} of {total} shown closed{platform}, {} could not be checked on this Mac ({}), none open",
                 report.closed(),
-                report.inconclusive()
+                report.inconclusive(),
+                listed("inconclusive", "inconclusive")
             ),
         };
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.");
@@ -1027,14 +1034,16 @@ fn verdict(sandbox: &SandboxName, report: &TestReport) -> String {
     let mut why = Vec::new();
     if report.open() > 0 {
         why.push(format!(
-            "{} of {total} probes got out (OPEN above)",
-            report.open()
+            "{} of {total} probes got out ({})",
+            report.open(),
+            listed("OPEN", "open")
         ));
     }
     if report.not_run() > 0 {
         why.push(format!(
-            "{} could not run or be checked, so their routes were not tested (NOT RUN above)",
-            report.not_run()
+            "{} could not run or be checked, so their routes were not tested ({})",
+            report.not_run(),
+            listed("NOT RUN", "not_run")
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
@@ -1078,13 +1087,14 @@ mod tests {
         let lab: SandboxName = "lab".parse().unwrap();
         let closed = || Outcome::Closed;
         assert_eq!(
-            verdict(&lab, &reports(vec![closed(), closed()])),
+            verdict(&lab, &reports(vec![closed(), closed()]), false),
             "READY: no probe got out of sandbox lab: all 2 shown closed."
         );
         assert_eq!(
             verdict(
                 &lab,
-                &reports(vec![closed(), closed(), Outcome::Inconclusive("x".into())])
+                &reports(vec![closed(), closed(), Outcome::Inconclusive("x".into())]),
+                false
             ),
             "READY: no probe got out of sandbox lab: 2 of 3 shown closed, 1 could not be checked on this Mac (inconclusive above), none open."
         );
@@ -1095,12 +1105,26 @@ mod tests {
                     closed(),
                     Outcome::Open("x".into()),
                     Outcome::NotRun("y".into())
-                ])
+                ]),
+                false
             ),
             "NOT READY: sandbox lab: 1 of 3 probes got out (OPEN above); 1 could not run or be checked, so their routes were not tested (NOT RUN above). Do not use it until this is fixed."
         );
+        // In JSON, nothing is above: the verdict points at `probes`.
         assert_eq!(
-            verdict(&lab, &report(Outcome::Inconclusive("x".into()))),
+            verdict(
+                &lab,
+                &reports(vec![
+                    closed(),
+                    Outcome::Open("x".into()),
+                    Outcome::NotRun("y".into())
+                ]),
+                true
+            ),
+            "NOT READY: sandbox lab: 1 of 3 probes got out (\"open\" in probes); 1 could not run or be checked, so their routes were not tested (\"not_run\" in probes). Do not use it until this is fixed."
+        );
+        assert_eq!(
+            verdict(&lab, &report(Outcome::Inconclusive("x".into())), false),
             "NOT READY: sandbox lab: no probe was shown closed by an enclos rule, so the test showed nothing about the policy."
         );
     }

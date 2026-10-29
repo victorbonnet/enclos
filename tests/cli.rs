@@ -50,9 +50,9 @@ impl Home {
         Run(self.piped(args).output().unwrap())
     }
 
-    /// The JSON document a piped run printed.
-    /// The JSON document a piped run printed, whose `error` agrees with
-    /// its exit code: there exactly when it fails, with that code.
+    /// The JSON document a piped run printed, which says its schema
+    /// version, and whose `error` agrees with its exit code: there exactly
+    /// when it fails, with that code.
     fn json(&self, args: &[&str]) -> (i32, serde_json::Value) {
         let out = self.run_piped(args);
         let doc: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap_or_else(|e| {
@@ -62,6 +62,7 @@ impl Home {
                 out.stderr()
             )
         });
+        assert_eq!(doc["schema_version"], 1, "{args:?}: {doc}");
         let code = out.code();
         assert_eq!(
             code == 0,
@@ -579,6 +580,42 @@ fn a_sandbox_removed_with_a_secret_left_exits_1() {
         "{}",
         out.stderr()
     );
+
+    // In JSON, the result with an `error` beside it.
+    let keychain = TestKeychain::new(&home);
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
+    let mut set = home
+        .command(&["secret", "set", "lab/xy"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    set.stdin.take().unwrap().write_all(b"v\n").unwrap();
+    Run(set.wait_with_output().unwrap()).ok();
+    Command::new("/usr/bin/security")
+        .arg("delete-keychain")
+        .arg(&keychain.0)
+        .status()
+        .unwrap();
+    let out = Run(home
+        .piped(&["--yes", "sandbox", "rm", "lab"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    let doc: serde_json::Value = serde_json::from_str(&out.stdout()).unwrap();
+    assert_eq!(doc["removed"], true, "{doc}");
+    assert_eq!(doc["secrets_left"][0]["secret"], "lab/xy", "{doc}");
+    assert!(
+        doc["secrets_left"][0]["why"]
+            .as_str()
+            .is_some_and(|w| w.contains("security delete-generic-password")),
+        "{doc}"
+    );
+    assert_eq!(doc["error"]["exit_code"], 1, "{doc}");
 }
 
 #[cfg(target_os = "macos")]
@@ -2413,6 +2450,69 @@ fn a_reader_that_left_ends_agent_list_quietly() {
     assert_eq!(out.status.signal(), Some(13), "{:?} {stderr}", out.status);
 }
 
+/// The other listings a reader may leave early, in text: each ends by
+/// SIGPIPE, not by a panic. The reader is gone before enclos starts.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reader_that_left_ends_every_listing_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    for args in [
+        &["audit"][..],
+        &["status"],
+        &["policy", "history", "home"],
+        &["policy", "show", "home"],
+        &["net", "log", "home"],
+        &["state", "check"],
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = home.command(args).stdout(writer).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert_eq!(
+            out.status.signal(),
+            Some(13),
+            "{args:?}: {:?} {stderr}",
+            out.status
+        );
+    }
+}
+
+/// Paths no other test runs piped each print one document, which agrees
+/// with the exit code (`Home::json`).
+#[cfg(target_os = "macos")]
+#[test]
+fn the_rarer_commands_print_one_document_piped() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
+    let (code, planned) = home.json(&[
+        "--dry-run",
+        "runtime",
+        "install",
+        "--sandbox",
+        "home",
+        "hermes",
+    ]);
+    assert_eq!(code, 0, "{planned}");
+    assert_eq!(planned["dry_run"], true, "{planned}");
+    let (code, audit) = home.json(&["audit", "--since", "1h"]);
+    assert_eq!(code, 0, "{audit}");
+    let (code, removed) = home.json(&["--dry-run", "secret", "rm", "home/nosuch"]);
+    assert!(code == 0 || removed.get("error").is_some(), "{removed}");
+    let (code, removed) = home.json(&["--yes", "sandbox", "rm", "lab"]);
+    assert_eq!(code, 0, "{removed}");
+    assert_eq!(removed["removed"], true, "{removed}");
+}
+
 /// Records Hermes as the runtime of sandbox `name` without installing it,
 /// and gives back a way to make a Hermes profile in the sandbox home as
 /// `hermes profile create` would, so the agent commands have something to
@@ -3514,11 +3614,12 @@ fn exec_output_stays_its_commands_when_piped() {
     ]);
     assert_eq!(out.code(), 7, "{}", out.stderr());
     assert_eq!(out.stdout(), "hi\n");
-    // Every word of enclos's own there is a JSON line.
+    // Every word of enclos's own there is a JSON line, which says its
+    // schema version.
     assert!(
-        out.stderr()
-            .lines()
-            .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
+        out.stderr().lines().all(|l| {
+            serde_json::from_str::<serde_json::Value>(l).is_ok_and(|l| l["schema_version"] == 1)
+        }),
         "{}",
         out.stderr()
     );
@@ -3960,11 +4061,16 @@ fn logs_in_json_are_json_lines() {
     let out = home.run_piped(&["--json", "logs", "home"]);
     assert_eq!(out.code(), 0);
     assert_eq!(out.stdout(), "");
+    // The hint is a library note, said as JSON as the command's own are.
+    let note: serde_json::Value = serde_json::from_str(out.stderr().trim())
+        .unwrap_or_else(|e| panic!("{e}: {}", out.stderr()));
     assert!(
-        out.stderr().contains("no service logs yet"),
-        "{}",
-        out.stderr()
+        note["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("no service logs yet")),
+        "{note}"
     );
+    assert_eq!(note["schema_version"], 1, "{note}");
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     // A C1 control and a bidirectional one, which JSON leaves alone: the
@@ -3978,6 +4084,7 @@ fn logs_in_json_are_json_lines() {
         .lines()
         .map(|l| {
             let doc: serde_json::Value = serde_json::from_str(l).unwrap();
+            assert_eq!(doc["schema_version"], 1, "{doc}");
             doc["line"].as_str().unwrap().to_owned()
         })
         .collect();

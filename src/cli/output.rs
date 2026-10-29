@@ -69,8 +69,8 @@ static DOCUMENT: OnceLock<Mutex<File>> = OnceLock::new();
 
 /// How `command`, by its word, prints: JSON with `--json`, which wins over
 /// `--text`; else text with `--text` or in a terminal, and JSON when piped,
-/// but for the commands in [`RUNS_A_PROGRAM`], whose JSON is only on
-/// stderr and only with `--json`. The same for a parsed command and for a
+/// but for the commands in [`RUNS_A_PROGRAM`], which print JSON only with
+/// `--json`, and then mostly on stderr (see [`Output::OnStderr`]). The same for a parsed command and for a
 /// usage error, which is told as the command would print.
 pub fn decide(command: &str, json: bool, text: bool, stdout_is_terminal: bool) -> Output {
     let runs = RUNS_A_PROGRAM.contains(&command);
@@ -190,8 +190,9 @@ pub fn conclude(result: Value, code: u8, message: impl FnOnce() -> String) -> u8
 /// next. A field added keeps it.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// `value` with its `schema_version`, when it is an object, as everything
-/// enclos prints as JSON is.
+/// `value`, an object as everything enclos prints as JSON is, with its
+/// `schema_version`. Anything else is a bug, which a debug build panics on;
+/// a release prints it as it is.
 fn versioned(value: &Value) -> std::borrow::Cow<'_, Value> {
     match value {
         Value::Object(fields) => {
@@ -199,7 +200,10 @@ fn versioned(value: &Value) -> std::borrow::Cow<'_, Value> {
             fields.insert("schema_version".into(), SCHEMA_VERSION.into());
             std::borrow::Cow::Owned(Value::Object(fields))
         }
-        _ => std::borrow::Cow::Borrowed(value),
+        _ => {
+            debug_assert!(false, "enclos prints JSON objects only: {value}");
+            std::borrow::Cow::Borrowed(value)
+        }
     }
 }
 
@@ -233,8 +237,8 @@ pub fn line(value: &Value) -> String {
 /// Mongolian vowel separator, the word joiner and invisible operators, the
 /// variation selectors, the interlinear annotation characters and the tag
 /// characters. JSON escapes only the C0 controls itself, and a sandbox
-/// writes some of what a document holds, such as its log lines and its
-/// processes' commands. Such characters only ever appear inside strings,
+/// writes some of what a document holds, such as its services' logs and
+/// its processes' commands. Such characters only ever appear inside strings,
 /// so this changes no value.
 pub fn for_terminal(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -277,9 +281,8 @@ pub fn path(p: &Path) -> Value {
     Value::String(p.to_string_lossy().into_owned())
 }
 
-/// An error as JSON: its message, what kind of failure it is, and the exit
-/// code it gives (the command's, or a part's, such as one sandbox's in
-/// `sandboxes`), which for `exec` is 125 whatever the kind.
+/// The command's error as JSON: its message, its kind, from the error
+/// itself, and `code`, which for `exec` is 125 whatever the kind.
 pub fn error(err: &Error, code: u8) -> Value {
     json!({"error": error_body(&err.to_string(), kind(err.exit_code()), code)})
 }
@@ -308,7 +311,8 @@ pub fn with_error(mut result: Value, code: u8, message: impl FnOnce() -> String)
 }
 
 /// `result` with `err` beside it as its `error`, and the code it gives: a
-/// part of a command that failed, kept with what it did.
+/// part of a command that failed, such as one sandbox's in `sandboxes`,
+/// kept with what it did.
 pub fn with_failure(mut result: Value, err: &Error) -> (u8, Value) {
     debug_assert!(
         result.is_object() && result.get("error").is_none(),

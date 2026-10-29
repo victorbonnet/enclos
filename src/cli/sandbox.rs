@@ -160,9 +160,8 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 output::emit(&shown);
                 return Ok(code);
             }
-            let services = engine.service_status(&name)?;
-            let agents = agents()?;
-            for (label, status) in services {
+            // Each part printed before the next is read, which can fail.
+            for (label, status) in engine.service_status(&name)? {
                 let state = match status {
                     ServiceStatus::Running { pid } => format!("running (pid {pid})"),
                     ServiceStatus::Loaded => "loaded, not running".to_owned(),
@@ -170,7 +169,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 };
                 println!("  service {label}: {state}");
             }
-            if let Some((agents, notes)) = agents {
+            if let Some((agents, notes)) = agents()? {
                 let list: Vec<String> = agents.iter().map(|a| a.name.to_string()).collect();
                 println!(
                     "  agents: {}",
@@ -417,7 +416,7 @@ fn print_show(v: &SandboxView) {
         }
         // A member's command is the sandbox's to write: shown escaped.
         for m in &view.members {
-            println!("    pid {:<7} {}", m.pid, printable_line(&m.command));
+            println!("{}", member_line(m.pid, &m.command));
         }
     }
 }
@@ -708,9 +707,22 @@ pub(super) fn print_started(
     Ok((code, value))
 }
 
+/// A member of a session, as `sandbox show` lists it: its command is the
+/// sandbox's to write, so shown escaped.
+fn member_line(pid: u32, command: &str) -> String {
+    format!("    pid {pid:<7} {}", printable_line(command))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_members_command_is_shown_escaped() {
+        let line = member_line(42, "a\u{1b}[31mb\u{202e}c\u{9b}d");
+        assert!(!line.contains(['\u{1b}', '\u{202e}', '\u{9b}']), "{line:?}");
+        assert!(line.starts_with("    pid 42 "), "{line:?}");
+    }
     use enclos::error::Error;
 
     fn names(list: &[&str]) -> Vec<SandboxName> {
