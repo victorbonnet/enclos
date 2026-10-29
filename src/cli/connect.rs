@@ -19,7 +19,7 @@ use super::output::note;
 use clap::Args;
 
 use enclos::engine::Engine;
-use enclos::engine::{Left, ServiceWait, SessionEnd};
+use enclos::engine::{Left, ServiceWait, SessionEnd, printable_line};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
@@ -137,7 +137,7 @@ pub fn report_end(sandbox: &SandboxName, end: &SessionEnd) {
         Left::Running(left) => {
             let pids: Vec<String> = left
                 .iter()
-                .map(|m| format!("{} ({})", m.pid, m.command))
+                .map(|m| format!("{} ({})", m.pid, printable_line(&m.command)))
                 .collect();
             say!(
                 "enclos: the command exited, but it left {} processes running in {shown}: {}. {stays_open}; `enclos sandbox show {}` lists them.",

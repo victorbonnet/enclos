@@ -5,7 +5,9 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 use super::output;
-use enclos::engine::{Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport};
+use enclos::engine::{
+    Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport, printable_line,
+};
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Plan, Planned};
@@ -413,8 +415,9 @@ fn print_show(v: &SandboxView) {
                 s.version
             );
         }
+        // A member's command is the sandbox's to write: shown escaped.
         for m in &view.members {
-            println!("    pid {:<7} {}", m.pid, m.command);
+            println!("    pid {:<7} {}", m.pid, printable_line(&m.command));
         }
     }
 }
@@ -614,7 +617,7 @@ pub(super) fn print_stop(name: &SandboxName, report: &StopReport) -> (u8, Value)
             eprintln!(
                 "  session {session}: pid {} {}: {}",
                 s.member.pid,
-                s.member.command,
+                printable_line(&s.member.command),
                 s.why.describe()
             );
         }

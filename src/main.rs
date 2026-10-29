@@ -316,21 +316,28 @@ fn run(cli: Cli) -> Result<u8> {
 /// as it ends any Unix tool, by SIGPIPE, not by a panic on the next print.
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
-/// `exec`, `runtime`, `agent`), keep running (`proxy`, `launch`), or handle
-/// a closed output themselves (`logs`).
+/// `exec`, `runtime`, and the `agent` verbs but `list`), keep running
+/// (`proxy`, `launch`), or handle a closed output themselves (`logs`). No
+/// arm takes the rest, so a new command is placed here to build.
 fn ends_on_closed_output(command: &Command) -> bool {
-    matches!(
-        command,
+    match command {
         Command::Init
-            | Command::Doctor
-            | Command::Audit(_)
-            | Command::Sandbox(_)
-            | Command::Policy(_)
-            | Command::Secret(_)
-            | Command::State(_)
-            | Command::Net(_)
-            | Command::Status(_)
-    )
+        | Command::Doctor
+        | Command::Audit(_)
+        | Command::Sandbox(_)
+        | Command::Policy(_)
+        | Command::Secret(_)
+        | Command::State(_)
+        | Command::Net(_)
+        | Command::Status(_) => true,
+        Command::Agent(args) => args.runs_no_program(),
+        Command::Connect(_)
+        | Command::Exec(_)
+        | Command::Runtime(_)
+        | Command::Proxy(_)
+        | Command::Launch(_)
+        | Command::Logs(_) => false,
+    }
 }
 
 /// The words of a command line before its `--`, as text: only those can be
