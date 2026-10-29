@@ -838,6 +838,8 @@ mod sandbox {
     }
 
     pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
+        // As a session's start makes it, for its marker.
+        std::fs::create_dir_all(engine.markers(&session.sandbox)).unwrap();
         let lock = engine.state.lock().unwrap();
         engine.state.put_session(&lock, session).unwrap()
     }

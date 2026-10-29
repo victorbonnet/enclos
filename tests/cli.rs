@@ -2951,7 +2951,8 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
 fn state_check_and_repair_compare_the_records_with_the_host() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let out = home.run(&["state", "check"]);
     assert!(
         out.ok().stdout().contains("match the host"),

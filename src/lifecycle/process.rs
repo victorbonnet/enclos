@@ -32,13 +32,14 @@ impl PsError {
 /// Runs `ps`, reading dates in UTC and the C locale, so that a start time
 /// reads the same whoever asks.
 fn ps(args: &[&str]) -> Result<Output, PsError> {
-    Command::new("/bin/ps")
-        .env("TZ", "UTC0")
-        .env("LC_ALL", "C")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| PsError(e.to_string()))
+    super::bounded::output_within(
+        Command::new("/bin/ps")
+            .env("TZ", "UTC0")
+            .env("LC_ALL", "C")
+            .args(args),
+        super::bounded::LIMIT,
+    )
+    .map_err(|e| PsError(format!("/bin/ps: {e}")))
 }
 
 /// The five words of `lstart`, one space apart. `ps` pads a day before the
