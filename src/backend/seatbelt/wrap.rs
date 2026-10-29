@@ -279,11 +279,8 @@ pub fn environment(ctx: &SandboxContext) -> Vec<(String, String)> {
         ("UV_CACHE_DIR", format!("{home}/.cache/uv")),
         ("npm_config_cache", format!("{home}/.npm")),
         ("ENCLOS_SANDBOX", ctx.name.to_string()),
-        // No browser opens from a sandbox: a program that would open one
-        // (Python's `webbrowser`, gh) runs this instead, which prints
-        // the URL and succeeds, rather than trying one browser after
-        // another through Apple Events, which the policy refuses, each
-        // refusal printing macOS's own errors.
+        // Print the URL instead of trying each browser through Apple
+        // Events, which the policy refuses noisily.
         ("BROWSER", "/bin/echo".to_owned()),
     ];
     // curl reads only the lowercase forms; Node's fetch needs NODE_USE_ENV_PROXY.
