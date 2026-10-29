@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use super::PolicyError;
 use crate::model::policy::{NetLog, NetMode, Policy, TemplateName};
+use crate::model::secret::SecretGrant;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +20,17 @@ pub struct PolicyFile {
     pub filesystem: FsLayer,
     #[serde(default)]
     pub network: NetLayer,
+    #[serde(default)]
+    pub secrets: SecretsLayer,
+}
+
+/// The secrets a layer grants, by environment variable: `env` replaces what
+/// the layers below grant, and `env_add` adds to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SecretsLayer {
+    pub env: Option<std::collections::BTreeMap<String, SecretGrant>>,
+    pub env_add: std::collections::BTreeMap<String, SecretGrant>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -66,6 +78,9 @@ impl PolicyFile {
         if self.network.log.is_some() {
             found.push("network.log");
         }
+        if self.secrets != SecretsLayer::default() {
+            found.push("secrets");
+        }
         found
     }
 
@@ -109,6 +124,15 @@ impl PolicyFile {
         if let Some(listen) = self.network.listen {
             policy.net.listen = listen;
         }
+        if let Some(env) = &self.secrets.env {
+            policy.secrets.clone_from(env);
+        }
+        policy.secrets.extend(
+            self.secrets
+                .env_add
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
     }
 }
 
@@ -183,6 +207,32 @@ mod tests {
         )
         .unwrap();
         assert!(layer.beyond_destinations().is_empty());
+    }
+
+    #[test]
+    fn secrets_are_granted_by_variable_and_an_adapter_grants_none() {
+        let mut policy = Policy::default();
+        PolicyFile::parse(
+            "a",
+            "[secrets]\nenv = { A = \"secret:home/aa\", B = \"secret:home/bb\" }",
+        )
+        .unwrap()
+        .apply(&mut policy);
+        PolicyFile::parse("b", "[secrets]\nenv_add = { B = \"secret:home/cc\" }")
+            .unwrap()
+            .apply(&mut policy);
+        assert_eq!(policy.secrets["A"].to_string(), "secret:home/aa");
+        assert_eq!(policy.secrets["B"].to_string(), "secret:home/cc");
+        PolicyFile::parse("c", "[secrets]\nenv = {}")
+            .unwrap()
+            .apply(&mut policy);
+        assert!(policy.secrets.is_empty());
+        let layer = PolicyFile::parse("adapter", "[secrets]\nenv_add = { X = \"secret:home/xx\" }")
+            .unwrap();
+        assert_eq!(layer.beyond_destinations(), ["secrets"]);
+        // A grant that names no secret is refused as the file is read.
+        let err = PolicyFile::parse("d", "[secrets]\nenv = { X = \"home/x\" }").unwrap_err();
+        assert!(err.to_string().contains("secret:<sandbox>/<name>"), "{err}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! (design §8, §10).
 
 use super::Engine;
+use super::secrets::SecretLeft;
 use super::service::IfUnrecorded;
 use super::session::{Held, marked_in};
 use crate::error::{Error, Result};
@@ -443,6 +444,10 @@ impl Engine {
                         for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
                             self.forget_marker(session);
                         }
+                        // What its services read their secrets from, once
+                        // its services are removed, however its sessions
+                        // ended (ADR 0034).
+                        self.remove_secrets_file(name)?;
                         Ok(report)
                     }
                     (Some(e), Ok(())) => Err(e),
@@ -459,15 +464,16 @@ impl Engine {
         .map(Planned::Done)
     }
 
-    /// Removes a stopped sandbox: its record and history, and its folder
-    /// unless `keep_data`. Deleting data asks for confirmation first.
+    /// Removes a stopped sandbox: its record and history, its secrets, and
+    /// its folder unless `keep_data`. Deleting data or secrets asks for
+    /// confirmation first. Returns the secrets it could not remove.
     pub fn remove_sandbox(
         &self,
         by: &Actor,
         name: &SandboxName,
         keep_data: bool,
         confirm: Confirm,
-    ) -> Result<Planned<()>> {
+    ) -> Result<Planned<Vec<SecretLeft>>> {
         let gone = self.require_stopped(name)?;
         let dir = self.layout.sandbox_dir(name.as_str());
         let what = if keep_data {
@@ -475,6 +481,9 @@ impl Engine {
         } else {
             "delete its folder and home"
         };
+        // Its secrets go with it, kept data or not: their record goes with
+        // the sandbox's, and their values are kept nowhere else.
+        let secrets = self.state.secrets(name)?.len();
         match confirm {
             Confirm::DryRun => {
                 let mut changes: Vec<String> = gone
@@ -482,40 +491,91 @@ impl Engine {
                     .map(|id| format!("record the end of session {id}, whose processes are gone"))
                     .collect();
                 changes.push(format!("remove sandbox {name}: {what} ({})", dir.display()));
+                if secrets > 0 {
+                    changes.push(format!(
+                        "remove its {secrets} secret(s) from the secret store"
+                    ));
+                }
                 return Ok(Planned::DryRun(Plan {
                     changes,
                     ..Plan::default()
                 }));
             }
-            Confirm::Ask if !keep_data => {
+            Confirm::Ask if !keep_data || secrets > 0 => {
                 return Err(Error::NeedsConfirmation {
-                    what: format!("deleting sandbox {name} and its home"),
+                    what: match (keep_data, secrets) {
+                        (false, 0) => format!("deleting sandbox {name} and its home"),
+                        (false, n) => format!(
+                            "deleting sandbox {name}, its home and its {n} secret(s), whose values are kept nowhere else"
+                        ),
+                        (true, n) => format!(
+                            "removing sandbox {name} and its {n} secret(s), whose values are kept nowhere else"
+                        ),
+                    },
                 });
             }
             _ => {}
         }
-        self.write(
+        let (_, secrets_left) = self.write(
             by,
             "sandbox rm",
             Some(name.to_string()),
-            |gone: &Vec<SessionId>| format!("{what}{}", ended_gone(gone)),
+            |(gone, left): &(Vec<SessionId>, Vec<SecretLeft>)| {
+                let left = match left.as_slice() {
+                    [] => String::new(),
+                    left => format!(
+                        "; could not remove from the secret store: {}",
+                        left.iter()
+                            .map(|l| l.secret.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                format!("{what}{}{left}", ended_gone(gone))
+            },
             |lock| {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
                 let gone = self.require_stopped(name)?;
+                // Kept data or not, the file its services read their
+                // secrets from goes before the record (ADR 0034).
+                self.remove_secrets_file(name)?;
+                let secrets = self.state.secrets(name)?;
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
-                if !keep_data && dir.exists() {
-                    std::fs::remove_dir_all(&dir).map_err(|source| LayoutError::Io {
+                let left = self.forget_secrets(&secrets);
+                if !keep_data
+                    && dir.exists()
+                    && let Err(source) = std::fs::remove_dir_all(&dir)
+                {
+                    let error = Error::from(LayoutError::Io {
                         path: dir.clone(),
                         source,
-                    })?;
+                    });
+                    let removed = secrets.len() - left.len();
+                    let not = match left.as_slice() {
+                        [] => String::new(),
+                        left => format!(
+                            ", though not these: {}",
+                            left.iter()
+                                .map(|l| l.why.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    };
+                    return Err(Error::FailedAfter {
+                        error: Box::new(error),
+                        done: format!(
+                            "removing the record of sandbox {name} and {removed} of its secret(s){not}{}",
+                            ended_gone(&gone)
+                        ),
+                    });
                 }
-                Ok(gone)
+                Ok((gone, left))
             },
         )?;
-        Ok(Planned::Done(()))
+        Ok(Planned::Done(secrets_left))
     }
 
     /// Refuses a sandbox with services installed or sessions running, saying

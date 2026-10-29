@@ -3,7 +3,6 @@
 //! while the user is logged in. `sandbox start` installs them, so they come
 //! back at each login; `sandbox stop` removes them.
 
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Child;
@@ -23,7 +22,6 @@ use crate::model::audit::{Actor, Outcome};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
-use crate::policy::sha256_hex;
 use crate::runtime::{RuntimeService, ServiceName, adapter};
 use crate::service::{LABEL_PREFIX, ServiceError, ServiceLabel, ServiceStatus, ServiceUnit};
 
@@ -64,20 +62,7 @@ impl Engine {
     /// folder, with links and `.` resolved, so that every spelling of the
     /// folder names the same services.
     fn label_prefix(&self, name: &SandboxName) -> Result<String> {
-        let data = self.layout.data();
-        let data = match std::fs::canonicalize(data) {
-            Ok(data) => data,
-            // Missing, the folder has no sandboxes, so no services either.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => data.to_owned(),
-            Err(source) => {
-                return Err(LayoutError::Io {
-                    path: data.to_owned(),
-                    source,
-                }
-                .into());
-            }
-        };
-        let install = &sha256_hex(data.as_os_str().as_bytes())[..8];
+        let install = self.layout.install_id()?;
         Ok(format!("{LABEL_PREFIX}{install}.{name}."))
     }
 
@@ -238,7 +223,12 @@ impl Engine {
                                     ],
                                 },
                                 log: self.log_file(name, unit),
-                                env: self.layout.env(),
+                                env: self
+                                    .layout
+                                    .env()
+                                    .into_iter()
+                                    .chain(self.secrets.env())
+                                    .collect(),
                                 stop_timeout: STOP_TIMEOUT,
                             })
                         })
@@ -527,7 +517,9 @@ impl Engine {
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
-            env: Vec::new(),
+            // Read on the host, as the service starts, never written to the
+            // service manager's file (ADR 0022).
+            env: self.service_secrets(name, kind, service, &snapshot.policy)?,
             // Even when `enclos launch` is run by hand in a terminal: a
             // service outlives it.
             in_terminal: false,

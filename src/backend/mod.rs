@@ -91,12 +91,15 @@ pub struct Compiled {
 }
 
 /// A program to run inside a sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Launch {
     pub program: OsString,
     pub args: Vec<OsString>,
-    /// Variables set on top of the sandbox's environment.
-    pub env: Vec<(String, String)>,
+    /// The secrets its policy grants, by variable, or, for a service whose
+    /// runtime reads them from a file, the variable naming that file's
+    /// folder (ADR 0034); set before the sandbox's own environment, which
+    /// they never replace.
+    pub env: Vec<(String, crate::model::secret::SecretValue)>,
     /// Whether the program runs in the terminal enclos runs in, as a
     /// session does: the backend then lets it open that terminal by name. A
     /// service or a probe never does, whatever terminal enclos runs in.

@@ -7,6 +7,7 @@ pub mod plan;
 pub mod policy;
 pub mod runtime;
 pub mod sandbox;
+pub mod secret;
 pub mod session;
 
 /// A point in time, stored and printed in RFC 3339 (UTC).

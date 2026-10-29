@@ -223,6 +223,29 @@ fn the_sandbox_reads_but_cannot_write_its_own_installers_folder() {
     )));
 }
 
+/// Where a runtime's services read their secrets (ADR 0034): the sandbox
+/// reads the file, and can neither change nor remove it, nor make the
+/// folder, or a link in its place, before enclos writes it.
+#[test]
+fn the_sandbox_reads_but_cannot_write_its_own_secrets_folder() {
+    let w = world();
+    let folder = w.ctx.dir.join("secrets");
+    let dir = folder.display().to_string();
+    assert!(!w.sh(&format!("mkdir '{dir}'")));
+    assert!(!w.sh(&format!("ln -s \"$HOME\" '{dir}'")));
+    assert!(!folder.exists() && std::fs::symlink_metadata(&folder).is_err());
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join(".env");
+    std::fs::write(&file, "T=\"v\"\n").unwrap();
+    let path = file.display().to_string();
+    assert!(w.sh(&format!("cat '{path}'")));
+    assert!(!w.sh(&format!("echo x > '{path}'")));
+    assert!(!w.sh(&format!("rm '{path}'")));
+    assert!(!w.sh(&format!("mv '{path}' '{dir}/moved'")));
+    assert!(!w.sh(&format!("echo x > '{dir}/new'")));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "T=\"v\"\n");
+}
+
 #[test]
 fn the_network_reaches_only_the_proxy_port() {
     let w = world();
@@ -588,6 +611,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         other_terminal: None,
         target: None,
         tag: 7,
+        keychain_item: Err("not probed here".into()),
     };
     let output = |mut command: Command| {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -743,6 +767,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         other_terminal: None,
         target: None,
         tag: 7,
+        keychain_item: Err("not probed here".into()),
     };
     let folders: Vec<_> = crate::probes::probes(&inputs)
         .into_iter()

@@ -10,7 +10,6 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{PendingPolicy, PolicyInputs, PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::SandboxName;
-use crate::policy::validate::validate;
 
 /// Every version of a sandbox's policy, and what waits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,16 +117,15 @@ impl Engine {
         self.require_sandbox(name)?;
         let target = self.version_snapshot(name, to)?;
         let text = target.overrides_text().to_owned();
-        // Its paths are checked again as they are now, as any policy stored.
-        validate(&target.policy, &self.validation_context(name)).map_err(|e| {
-            let error = Error::from(e);
-            Error::WithContext {
+        // Checked again as any policy stored: its paths as they are now, and
+        // the secrets it grants, one of which may have been removed since.
+        self.check_policy(name, &target.policy)
+            .map_err(|error| Error::WithContext {
                 what: format!(
-                    "v{to} of sandbox {name} cannot be restored on the paths as they are now: {error}"
+                    "v{to} of sandbox {name} cannot be restored as things are now: {error}"
                 ),
                 error: Box::new(error),
-            }
-        })?;
+            })?;
         let view = self.policy(name)?;
         let replacement = Replacement {
             command: "policy rollback",
@@ -299,6 +297,8 @@ impl Engine {
                     });
                 }
                 self.refuse_unapplied_edit(name, latest.latest(), command)?;
+                // `secret rm` may have removed a secret it grants meanwhile.
+                self.check_secrets_set(name, &target.policy)?;
                 let mut recorded = self.propose(
                     lock,
                     by,

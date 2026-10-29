@@ -276,6 +276,35 @@ fn a_pending_policy_waits_beside_the_active_one_until_applied_or_dropped() {
 }
 
 #[test]
+fn a_secret_set_again_keeps_when_it_was_made_and_goes_with_its_sandbox() {
+    use crate::model::audit::Actor;
+    use crate::model::secret::SecretRef;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+    store
+        .create_sandbox(&lock, &record("home"), &snap, &by)
+        .unwrap();
+    let secret: SecretRef = "home/telegram".parse().unwrap();
+    assert!(store.put_secret(&lock, &secret).unwrap());
+    let first = store.secrets(&name).unwrap().remove(0);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert!(!store.put_secret(&lock, &secret).unwrap());
+    let again = store.secrets(&name).unwrap().remove(0);
+    assert_eq!(again.created_at, first.created_at);
+    assert!(again.updated_at > first.updated_at, "{again:?}");
+    store.remove(&lock, &name).unwrap();
+    assert!(store.secrets(&name).unwrap().is_empty());
+    assert!(!store.remove_secret(&lock, &secret).unwrap());
+}
+
+#[test]
 fn a_new_sandbox_and_its_first_policy_are_recorded_together_or_not_at_all() {
     use crate::model::audit::Actor;
     let (_dir, store) = store();
