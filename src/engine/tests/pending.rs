@@ -1258,6 +1258,46 @@ fn a_change_of_limits_while_a_session_runs_waits_for_the_restart() {
     assert_eq!(next, crate::backend::LaunchLimits::default());
 }
 
+/// A `policy.toml` whose `extends` line is gone is refused with the
+/// template the active policy is built on, and changes nothing.
+#[test]
+fn a_policy_naming_no_template_is_told_the_active_one() {
+    let (_dir, engine, name) = with_sandbox();
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = before.replace("extends = \"assistant\"\n", "");
+    assert_ne!(before, after);
+    let err = engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap_err();
+    let said = err.to_string();
+    assert!(said.contains("names no template"), "{said}");
+    assert!(
+        said.contains(
+            "its active policy is built on `assistant`, which `extends = \"assistant\"` keeps"
+        ),
+        "{said}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+
+    // `runtime install`, which resolves the file with the runtime's layer,
+    // says so too.
+    engine.layout.write_policy(name.as_str(), &after).unwrap();
+    let err = engine
+        .install_runtime(
+            &alice(),
+            &name,
+            crate::model::runtime::RuntimeKind::Hermes,
+            Confirm::DryRun,
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("its active policy is built on `assistant`"),
+        "{err}"
+    );
+}
+
 /// A limit the backend cannot enforce never reaches a program, even one
 /// stored without the checks a stored policy passes: the limits are
 /// checked again where a program is launched.

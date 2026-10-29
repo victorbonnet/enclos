@@ -17,12 +17,13 @@ use file::PolicyFile;
 /// The built-in defaults every template builds on.
 pub const DEFAULTS: &str = include_str!("templates/defaults.toml");
 
-/// The templates this build of enclos ships (design §7). Milestone 1 has the
-/// one Hermes uses.
-const TEMPLATES: &[(&str, &str)] = &[("assistant", include_str!("templates/assistant.toml"))];
-
-/// The template a new sandbox gets unless told otherwise.
-pub const DEFAULT_TEMPLATE: &str = "assistant";
+/// The templates this build of enclos ships (design §7). `coding` comes
+/// with the runtimes it is for.
+const TEMPLATES: &[(&str, &str)] = &[
+    ("minimal", include_str!("templates/minimal.toml")),
+    ("mcp-only", include_str!("templates/mcp-only.toml")),
+    ("assistant", include_str!("templates/assistant.toml")),
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -30,6 +31,10 @@ pub enum PolicyError {
     Parse { layer: String, reason: String },
     #[error("unknown template `{0}`: this enclos has {names}", names = template_names().join(", "))]
     UnknownTemplate(String),
+    // Never a default: a sandbox made from `minimal` whose line is dropped
+    // would otherwise reach the public web without anyone saying so.
+    #[error("`policy.toml` names no template: add `extends = \"<template>\"`, where this enclos has {names}", names = template_names().join(", "))]
+    NoTemplate,
     #[error("a template cannot extend another; `{0}` names `extends`")]
     NestedTemplate(String),
     #[error(
@@ -149,12 +154,7 @@ pub fn resolve(
     adapter: Option<&AdapterLayer>,
 ) -> Result<PolicySnapshot, PolicyError> {
     let sandbox = PolicyFile::parse("policy.toml", overrides)?;
-    let template_name = match &sandbox.extends {
-        Some(name) => name.clone(),
-        None => DEFAULT_TEMPLATE
-            .parse()
-            .expect("the default template name is valid"),
-    };
+    let template_name = sandbox.extends.clone().ok_or(PolicyError::NoTemplate)?;
     let template_text = template(&template_name)
         .ok_or_else(|| PolicyError::UnknownTemplate(template_name.to_string()))?;
     let template_layer = PolicyFile::parse(&format!("`{template_name}` template"), template_text)?;
@@ -269,6 +269,76 @@ mod tests {
         assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
         assert!(snap.policy.net.allow.is_empty());
         assert_eq!(snap.id.0.len(), 64);
+    }
+
+    #[test]
+    fn minimal_and_mcp_only_reach_only_what_is_listed() {
+        for name in ["minimal", "mcp-only"] {
+            let template: TemplateName = name.parse().unwrap();
+            let snap = resolve(&initial_overrides("lab", &template), None).unwrap();
+            assert_eq!(snap.inputs.template.as_str(), name);
+            assert_eq!(
+                snap.policy.net.mode,
+                crate::model::policy::NetMode::Allowlist
+            );
+            assert!(snap.policy.net.allow.is_empty(), "{name}");
+            assert_eq!(snap.policy.fs.write, ["{home}"]);
+            // The defaults' deny list holds under every template.
+            assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
+        }
+        assert_eq!(template_names(), ["minimal", "mcp-only", "assistant"]);
+    }
+
+    /// `minimal` and `mcp-only` are `assistant` with the public web closed:
+    /// the same writes, deny list and listening, and nothing else apart.
+    #[test]
+    fn minimal_and_mcp_only_differ_from_assistant_only_in_the_network_mode() {
+        let assistant = resolve(&overrides(""), None).unwrap().policy;
+        assert_eq!(assistant.net.mode, crate::model::policy::NetMode::Public);
+        for name in ["minimal", "mcp-only"] {
+            let template: TemplateName = name.parse().unwrap();
+            let mut closed = resolve(&initial_overrides("home", &template), None)
+                .unwrap()
+                .policy;
+            closed.net.mode = crate::model::policy::NetMode::Public;
+            assert_eq!(closed, assistant, "{name}");
+        }
+    }
+
+    /// Under `minimal`, a Hermes sandbox reaches the hosts Hermes needs to
+    /// install, log in and run, and may listen, as the Hermes adapter's
+    /// layer sets.
+    #[test]
+    fn minimal_with_hermes_reaches_the_adapter_endpoints() {
+        use crate::runtime::RuntimeAdapter;
+        let hermes = AdapterLayer {
+            runtime: "hermes".into(),
+            version: "2".into(),
+            text: crate::runtime::hermes::Hermes.endpoints().into(),
+        };
+        let template: TemplateName = "minimal".parse().unwrap();
+        let snap = resolve(&initial_overrides("lab", &template), Some(&hermes)).unwrap();
+        assert_eq!(
+            snap.policy.net.mode,
+            crate::model::policy::NetMode::Allowlist
+        );
+        for host in ["chatgpt.com", "auth.openai.com", "github.com"] {
+            assert!(snap.policy.net.allow.contains(&host.to_owned()), "{host}");
+        }
+        assert!(snap.policy.net.listen);
+    }
+
+    /// A `policy.toml` that names no template is refused, never resolved
+    /// over a default the file does not say.
+    #[test]
+    fn a_policy_naming_no_template_is_refused() {
+        let text = overrides("").replace("extends = \"assistant\"\n", "");
+        assert!(!text.contains("extends"));
+        let err = resolve(&text, None).unwrap_err();
+        assert!(matches!(err, PolicyError::NoTemplate), "{err}");
+        assert!(!err.is_refused());
+        let said = err.to_string();
+        assert!(said.contains("minimal, mcp-only, assistant"), "{said}");
     }
 
     // The list repeats entries of `defaults.toml` on purpose: it guards against

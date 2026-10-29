@@ -1,0 +1,18 @@
+# Assistants working on outside data through remote MCP servers (design
+# §7): the sandbox writes only to its own home and reaches only what is
+# listed, through the sandbox's proxy, which logs every connection. From
+# `enclos runtime install` on, that is the runtime adapter's endpoints (for
+# Hermes: its install sources and the ChatGPT-subscription provider).
+# List each MCP endpoint's host with `enclos policy allow`, such as
+# `enclos policy allow community mcp.example.org`: nothing beyond the
+# adapter's endpoints and what you allow is reachable. Then tell the runtime
+# of the endpoint with its own commands, through `enclos connect`, until
+# `runtime configure --mcp-add` does both. The same rules as `minimal` for
+# now, until program rules come (design §7).
+
+[filesystem]
+write = ["{home}"]
+
+[network]
+mode = "allowlist"
+allow = []

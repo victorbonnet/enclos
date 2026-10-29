@@ -277,6 +277,27 @@ impl Engine {
         self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
     }
 
+    /// A `policy.toml` that names no template, said with the one the active
+    /// policy is built on: picking another template could open what the
+    /// sandbox's own template closed.
+    fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
+        if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
+            return error;
+        }
+        match self.state.active_policy(name) {
+            Ok(Some((_, active))) => {
+                let template = &active.inputs.template;
+                Error::WithContext {
+                    what: format!(
+                        "{error}; its active policy is built on `{template}`, which `extends = \"{template}\"` keeps"
+                    ),
+                    error: Box::new(error),
+                }
+            }
+            _ => error,
+        }
+    }
+
     pub(super) fn checked_policy_with(
         &self,
         name: &SandboxName,
@@ -284,7 +305,10 @@ impl Engine {
         adapter: Option<AdapterLayer>,
         backend: BackendKind,
     ) -> Result<PolicySnapshot> {
-        let snapshot = policy::resolve(overrides, adapter.as_ref())?;
+        // Every path that resolves a policy.toml says which template the
+        // sandbox has when the file names none (`runtime install` too).
+        let snapshot = policy::resolve(overrides, adapter.as_ref())
+            .map_err(|e| self.with_active_template(name, e.into()))?;
         self.check_policy(name, &snapshot.policy, backend)?;
         Ok(snapshot)
     }
@@ -632,8 +656,8 @@ mod tests {
         assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
         // An inline or dotted network table is edited where it is.
         for text in [
-            "network = { allow_add = [\"a.example.com\"] }\n",
-            "network.allow_add = [\"a.example.com\"]\n",
+            "extends = \"assistant\"\nnetwork = { allow_add = [\"a.example.com\"] }\n",
+            "extends = \"assistant\"\nnetwork.allow_add = [\"a.example.com\"]\n",
         ] {
             let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
             let parsed = policy::resolve(&updated, None).unwrap();
