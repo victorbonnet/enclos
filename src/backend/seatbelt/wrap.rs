@@ -280,7 +280,7 @@ pub fn environment(ctx: &SandboxContext) -> Vec<(String, String)> {
         ("npm_config_cache", format!("{home}/.npm")),
         ("ENCLOS_SANDBOX", ctx.name.to_string()),
         // No browser opens from a sandbox: a program that would open one
-        // (Python's `webbrowser`, gh, git) runs this instead, which prints
+        // (Python's `webbrowser`, gh) runs this instead, which prints
         // the URL and succeeds, rather than trying one browser after
         // another through Apple Events, which the policy refuses, each
         // refusal printing macOS's own errors.
