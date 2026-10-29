@@ -3008,8 +3008,18 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let home = lab.home.clone();
         let audit = lab.engine.layout.audit_log();
         let edit = std::thread::spawn(move || {
+            // The gateway runs, and `launch` has recorded it: the audit made
+            // read-only fails the restart, not the start's own entry.
+            let log = crate::audit::jsonl::JsonlAuditLog::new(&audit);
+            let launched = || {
+                use crate::audit::AuditLog;
+                log.entries(&Default::default())
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.intent.command == "launch" && e.finished.is_some())
+            };
             let start = std::time::Instant::now();
-            while !home.join("gateway-up").exists() {
+            while !home.join("gateway-up").exists() || !launched() {
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(30),
                     "no gateway"
@@ -3573,8 +3583,17 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             let pids_file = pids_file.clone();
             let markers = markers.clone();
             std::thread::spawn(move || {
+                // The stub gateway runs, and `launch` has named its marker
+                // after it.
+                let named = || {
+                    std::fs::read_dir(&markers).is_ok_and(|mut files| {
+                        files.any(|f| {
+                            f.is_ok_and(|f| f.file_name().to_string_lossy().starts_with("root-"))
+                        })
+                    })
+                };
                 let start = Instant::now();
-                while !pids_file.exists() {
+                while !pids_file.exists() || !named() {
                     assert!(
                         start.elapsed() < Duration::from_secs(30),
                         "the stub gateway did not start"
