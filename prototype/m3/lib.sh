@@ -56,4 +56,5 @@ compile_policy() {
 
 # One section of a result file: a heading, then lines of text.
 section() { printf '\n## %s\n\n' "$1"; }
-fence() { printf '```\n'; cat; printf '```\n'; }
+# The text in a fence, ending in a newline even when the input does not.
+fence() { printf '```\n'; sed -e '$a\'; printf '```\n'; }

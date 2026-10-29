@@ -78,7 +78,7 @@ probes+=(
     "io_uring"
     "kill $sleeper"
     "ptrace $sleeper"
-    "environ $marker"
+    "environ $marker $sleeper"
     "connect-tcp 127.0.0.1 18999"
     "connect-tcp 1.1.1.1 443"
     "dns example.com"
@@ -137,7 +137,7 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
-    echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent). At 0 the kernel refuses TIOCSTI to every unprivileged process (EIO), so neither seccomp nor --new-session is shown by these rows; that needs a host with the setting at 1 (a VM)."
+    echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent). At 0 the kernel refuses TIOCSTI to every unprivileged process (EIO). seccomp runs before the ioctl, so EPERM where the others read EIO shows the filter matched; whether --new-session alone refuses it needs a host with the setting at 1 (a VM)."
     echo
     python3 -I "$M3/table.py" "${tcols[@]}"
     section "A file left in the sandbox's /tmp"

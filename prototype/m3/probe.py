@@ -184,19 +184,30 @@ def p_ptrace(pid):
     return err(ctypes.get_errno()), ""
 
 
-def p_environ(marker):
+def p_environ(marker, pid=None):
     """Whether any process's start-up environment this side can read holds
-    the marker the host's process was started with."""
-    seen = 0
-    for pid in filter(str.isdigit, os.listdir("/proc")):
+    the marker the host's process was started with. With the pid of that
+    process, its own environ is tried first, so a refusal names its error."""
+    target = ""
+    if pid is not None:
         try:
             with open(f"/proc/{pid}/environ", "rb") as f:
                 if marker.encode() in f.read():
                     return "ok", f"marker read in /proc/{pid}/environ"
+                target = f"/proc/{pid}/environ read, marker not in it; "
+        except OSError as e:
+            target = f"/proc/{pid}/environ: {err(e.errno)}; "
+    pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    seen = 0
+    for p in pids:
+        try:
+            with open(f"/proc/{p}/environ", "rb") as f:
+                if marker.encode() in f.read():
+                    return "ok", f"{target}marker read in /proc/{p}/environ"
             seen += 1
         except OSError:
             continue
-    return "absent", f"marker in none of the {seen} environments readable"
+    return "absent", f"{target}{len(pids)} processes listed, {seen} environments readable, marker in none"
 
 
 def p_connect_unix(path, kind="stream"):
