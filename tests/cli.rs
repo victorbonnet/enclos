@@ -454,6 +454,33 @@ impl Drop for TestKeychain {
     }
 }
 
+/// `runtime configure` sets up the sandbox's bot, never an agent's own
+/// (ADR 0032): naming an agent is refused, and nothing is recorded.
+#[test]
+fn a_bot_of_an_agents_own_is_refused() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let lines = home.audit_lines().len();
+    let out = home.run(&[
+        "runtime",
+        "configure",
+        "home/main",
+        "--channel",
+        "telegram",
+        "--allow-user",
+        "1",
+    ]);
+    assert_ne!(out.code(), 0, "{}", out.stdout());
+    assert!(
+        out.stderr()
+            .contains("does not set up a bot of agent main's own"),
+        "{}",
+        out.stderr()
+    );
+    assert_eq!(home.audit_lines().len(), lines);
+}
+
 /// A secret `sandbox rm` cannot remove from the store makes it exit 1, so a
 /// script sees it, naming the secret and how to remove it by hand.
 #[cfg(target_os = "macos")]

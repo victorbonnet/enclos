@@ -56,9 +56,11 @@ impl HomeFile {
 pub struct SandboxCommand(Vec<OsString>);
 
 /// `word` as a shell reads it back: quoted when it holds anything a shell
-/// would read otherwise, such as `${VAR}`, which it would expand.
+/// would read otherwise, such as `${VAR}`, which it would expand, or starts
+/// with `=`, which zsh expands to a command's path.
 fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
+        && !word.starts_with('=')
         && word
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
@@ -247,8 +249,9 @@ pub trait RuntimeAdapter {
     }
     /// The file in the home where the runtime's own setup keeps a bot's
     /// token for `channel` in plain text, as a `.env` line of the variable
-    /// it names: `runtime configure` refuses while it holds one, so that no
-    /// token sits readable in the home (ADR 0022). `None`: no such file.
+    /// it names: `runtime configure` refuses while it holds one, so that the
+    /// token the runtime's own setup writes for the built-in agent does not
+    /// sit readable in the home (ADR 0022). `None`: no such file.
     fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
         None
     }

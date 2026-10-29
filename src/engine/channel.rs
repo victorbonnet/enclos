@@ -102,6 +102,16 @@ impl Engine {
                 },
             });
         }
+        // The channel's usual variable, granted too, is the one the runtime
+        // reads first: the bot would be that token's, not `token`'s.
+        let usual = channel.token_variable();
+        if token != usual && view.snapshot.policy.secrets.contains_key(usual) {
+            return Err(Error::Session {
+                what: format!(
+                    "the policy of sandbox {name} also gives it ${usual}, which {shown} reads for the bot before ${token}, so the bot would be the one ${usual} names: take ${usual} out of its [secrets], or set the bot up with it (no --token-env)"
+                ),
+            });
+        }
         let reachable = Destination::parse(channel.host(), 443)
             .is_ok_and(|dest| allowed(&view.snapshot.policy, &dest));
         let set = ChannelSet {

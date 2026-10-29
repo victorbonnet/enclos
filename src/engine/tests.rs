@@ -3845,15 +3845,15 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         };
         assert_eq!(configured(&lab), 3, "{}", lab.audit());
 
-        // A variable of another name, granted too; one that cannot hold a
-        // token is refused for what it is.
-        let before = lab.engine.layout.read_policy("home").unwrap();
-        let after = before.replace(
+        // A variable of another name: refused while the usual one is
+        // granted too, which Hermes would read first.
+        let usual = lab.engine.layout.read_policy("home").unwrap();
+        let both = usual.replace(
             "TELEGRAM_BOT_TOKEN = ",
             "TELEGRAM_BOT_TOKEN_MAIN = \"secret:home/telegram\", TELEGRAM_BOT_TOKEN = ",
         );
         lab.engine
-            .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
+            .policy_edit(&alice(), &lab.name, &usual, &both, Confirm::Yes)
             .unwrap();
         let named = |token: &str| {
             lab.engine.configure_channel(
@@ -3865,6 +3865,28 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 Confirm::Yes,
             )
         };
+        let runs = calls().lines().count();
+        let err = named("TELEGRAM_BOT_TOKEN_MAIN").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("also gives it $TELEGRAM_BOT_TOKEN"),
+            "{err}"
+        );
+        // Granted alone, it sets the bot up; a token Hermes's setup left in
+        // the home under the usual name is refused for it too.
+        let alone = usual.replace("TELEGRAM_BOT_TOKEN = ", "TELEGRAM_BOT_TOKEN_MAIN = ");
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &both, &alone, Confirm::Yes)
+            .unwrap();
+        std::fs::write(&env, "TELEGRAM_BOT_TOKEN=999:plain\n").unwrap();
+        let err = named("TELEGRAM_BOT_TOKEN_MAIN").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds TELEGRAM_BOT_TOKEN in plain text"),
+            "{err}"
+        );
+        assert_eq!(calls().lines().count(), runs, "{}", calls());
+        std::fs::write(&env, "").unwrap();
         let set = done(named("TELEGRAM_BOT_TOKEN_MAIN").unwrap());
         assert_eq!(set.token, "TELEGRAM_BOT_TOKEN_MAIN");
         assert!(
@@ -3879,6 +3901,9 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 "{err}"
             );
         }
+        lab.engine
+            .policy_edit(&alice(), &lab.name, &alone, &usual, Confirm::Yes)
+            .unwrap();
 
         // A command that fails stops the rest, and a later one names what
         // ran before it.
