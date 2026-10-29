@@ -1299,10 +1299,7 @@ fn a_hello_with_ech_and_its_own_name_is_checked_and_goes_through() {
     let mut conn = tunnel(&proxy, "api.example.com", port);
     let hello = hello::client_hello_bytes(Some("api.example.com"), true, 16_384);
     conn.write_all(&hello).unwrap();
-    assert_eq!(
-        received.recv_timeout(PATIENCE).unwrap(),
-        hello
-    );
+    assert_eq!(received.recv_timeout(PATIENCE).unwrap(), hello);
     drop(conn);
     let e = closed(&proxy);
     assert_eq!((e.verdict, e.reason), (Verdict::Allowed, None));
