@@ -133,8 +133,12 @@ compile_policy  # the full mode's, without --new-session, for the record
     section "Probes"
     echo "\`ok\` means the operation succeeded; an error name means it was refused with that error."
     echo
+    echo "Where the host column already refuses, the row shows nothing about the sandbox: read \`bpf\`, \`perf_event_open\` and \`userfaultfd\` against the host's sysctls in 00-setup.md, and what seccomp adds against the bubblewrap-only column, since the filter's errno (EPERM) is also the kernel's."
+    echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
+    echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent). At 0 the kernel refuses TIOCSTI to every unprivileged process (EIO), so neither seccomp nor --new-session is shown by these rows; that needs a host with the setting at 1 (a VM)."
+    echo
     python3 -I "$M3/table.py" "${tcols[@]}"
     section "A file left in the sandbox's /tmp"
     printf -- '- %s\n' "${left[@]}"

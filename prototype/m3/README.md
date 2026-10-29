@@ -117,8 +117,8 @@ A bubblewrap sandbox built as the backend would build it (design §5, ADR 0004, 
 | A file the sandbox leaves in its `/tmp` is not in the host's | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
 | The home and workspace cannot be renamed from inside | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
 | A program in the workspace: refused with Landlock, runs without (ADR 0037) | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
-| The seccomp list refused (keyctl, bpf, perf_event_open, userfaultfd, mount, io_uring, namespaces), and what bubblewrap alone already refuses | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
-| TIOCSTI refused by seccomp without `--new-session`; refused by `--new-session` alone | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
+| The seccomp list refused (keyctl, bpf, perf_event_open, userfaultfd, mount, io_uring, namespaces), and what bubblewrap alone already refuses | `sandbox-check.sh` (a call the runner's sysctls already refuse on the host, such as `bpf` under `unprivileged_bpf_disabled`, is inconclusive) | to measure (CI) | to measure (CI) | |
+| TIOCSTI refused by seccomp without `--new-session`; refused by `--new-session` alone | `sandbox-check.sh` (shows nothing where the runner's `dev.tty.legacy_tiocsti` is 0, which refuses it to everyone) | to measure (CI) | to measure (CI) | a kernel with `legacy_tiocsti` at 1: to measure (VM) |
 | No user namespace inside (`--disable-userns`, then seccomp) | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
 | Processes outside hidden: signal 0, ptrace, another process's start-up environment | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |
 | The host's loopback, the network and DNS out of reach | `sandbox-check.sh` | to measure (CI) | to measure (CI) | |

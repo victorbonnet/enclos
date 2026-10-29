@@ -140,6 +140,14 @@ def apply_seccomp(spec):
     f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
     skipped = []
     for name in spec["deny"]:
+        # libseccomp knows every name on every architecture, and silently
+        # drops a rule for a call this one lacks (a negative number here).
+        try:
+            if seccomp.resolve_syscall(seccomp.Arch.NATIVE, name) < 0:
+                skipped.append(name)
+                continue
+        except (RuntimeError, ValueError, TypeError, AttributeError):
+            pass
         try:
             f.add_rule(refuse, name)
         except (RuntimeError, ValueError, OSError):
