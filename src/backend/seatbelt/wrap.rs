@@ -311,6 +311,31 @@ mod tests {
         assert!(env["PATH"].contains(":/usr/bin:/bin"));
     }
 
+    /// Set before what enclos sets, a secret never replaces one of its
+    /// variables, whatever the validation of a policy let through.
+    #[test]
+    fn a_secret_never_replaces_a_variable_enclos_sets() {
+        let value = |v: &str| crate::model::secret::SecretValue::new(v.to_owned()).unwrap();
+        let launch = Launch {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: vec![
+                ("HOME".to_owned(), value("/elsewhere")),
+                ("TOKEN".to_owned(), value("t")),
+            ],
+            in_terminal: false,
+            service_port: None,
+            limits: Default::default(),
+        };
+        let command = wrap_in(Path::new("/c.sb"), &ctx(), &launch, None);
+        let env: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+            .collect();
+        assert_eq!(env["HOME"], "/Users/alice/.enclos/sandboxes/home/home");
+        assert_eq!(env["TOKEN"], "t");
+    }
+
     #[test]
     fn no_secret_is_given_as_a_variable_enclos_sets_or_passes_on() {
         let set = environment(&ctx()).into_iter().map(|(name, _)| name);

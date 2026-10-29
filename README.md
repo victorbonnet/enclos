@@ -10,7 +10,7 @@ Agents such as Hermes install tools, run code and reach the network on their own
 
 - **Files:** it writes only to its own home. It reads broadly, except a deny list of sensitive paths such as `~/.ssh`, cloud credentials and other tools' logins, keychains, password managers, browser data, mail and Apple apps' data, shell history, the configuration of your own assistant tools on the host (`~/.hermes`, `~/.claude`, `~/.codex` and others), other sandboxes and enclos's own files. Agents in the same sandbox share its home and can read each other's files. Agents in the same sandbox share its home and can read each other's files.
 - **Network:** its only way out is its own proxy, which logs every connection it decides on (as long as enclos can write its state) and never connects to your Mac's own services, your local network or cloud metadata addresses. An agent may reach the public web (ports 80 and 443) by default, or only the domains you list if you set its policy to allowlist mode. You review what was refused and allow what you trust, without a restart.
-- **The rest of your Mac:** opening apps, Apple Events, launchd jobs, preferences, the pasteboard and signals to other processes are blocked.
+- **The rest of your Mac:** opening apps, Apple Events, launchd jobs, preferences, the pasteboard and signals to other processes are blocked. One thing macOS lets every process of yours do, sandboxed or not: read the environment variables your other programs started with (Apple's own programs aside). Don't keep secrets in exported shell variables while sandboxes run. enclos gives a Hermes gateway its secrets through a file no other sandbox reads; a `connect` or `exec` session still gets them as variables, which other sandboxes can read while it runs.
 - **A record:** every command that changes something is written to a hash-chained audit log.
 
 enclos protects against accidental damage by agents you mostly trust ([threat model](docs/adr/0014-threat-model-accidental-damage.md)). It is not a defense against malicious code exploiting the kernel.
@@ -42,7 +42,7 @@ On an Apple silicon Mac running macOS 15 or later, with an account with a model 
 ```bash
 curl -fsSL https://enclos.dev/install.sh | bash
 enclos init
-enclos sandbox create lab
+enclos sandbox create lab --template assistant   # the public web; minimal for only Hermes's hosts
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider, its login, a model
 enclos agent add lab/main

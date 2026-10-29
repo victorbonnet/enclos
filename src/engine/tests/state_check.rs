@@ -179,36 +179,6 @@ fn a_lost_policy_file_is_written_again_from_the_active_policy() {
     assert_eq!(engine.state_check(None).unwrap(), []);
 }
 
-/// A lost `policy.toml` whose text enclos does not keep is named, with the
-/// template the active policy is built on, not the one the sandbox was
-/// created from.
-#[test]
-fn a_lost_policy_file_without_its_text_names_the_active_template() {
-    let (_dir, engine, name) = with_sandbox();
-    let minimal: crate::model::policy::TemplateName = "minimal".parse().unwrap();
-    let mut snapshot =
-        crate::policy::resolve(&crate::policy::initial_overrides("home", &minimal), None).unwrap();
-    // The text stored no longer matches the hash its inputs name.
-    snapshot.overrides.push_str("# changed\n");
-    let lock = engine.state.lock().unwrap();
-    engine
-        .state
-        .save_policy(&lock, &name, &snapshot, &alice(), None)
-        .unwrap();
-    drop(lock);
-    std::fs::remove_file(engine.layout.policy_file(name.as_str())).unwrap();
-    let found = engine.state_check(Some(&name)).unwrap();
-    assert_eq!(repairs(&found), Vec::<String>::new());
-    let lost = about(&found, "policy.toml is gone");
-    let [lost] = lost.as_slice() else {
-        panic!("{found:?}");
-    };
-    let Remedy::Manual(how) = &lost.remedy else {
-        panic!("{lost:?}");
-    };
-    assert!(how.contains("`extends = \"minimal\"`"), "{how}");
-}
-
 /// While a change waits, `policy.toml` holds the pending policy's text, and
 /// that is what comes back.
 #[test]
@@ -755,6 +725,31 @@ fn a_gone_session_of_a_sandbox_whose_folder_is_gone_is_left() {
     );
     repair(&engine, None);
     assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// The same with only the folder the markers are in gone, or replaced by
+/// a file: `lsof` would find no holder there, which says nothing, so the
+/// session is left for a person.
+#[test]
+fn a_gone_session_whose_markers_folder_is_gone_is_left() {
+    for replaced in [false, true] {
+        let (_dir, engine, name) = with_sandbox();
+        let id = put(&engine, &session_of(&engine, &name, gone_process()));
+        let members = engine.markers(&name);
+        let _ = std::fs::remove_dir_all(&members);
+        if replaced {
+            std::fs::write(&members, "").unwrap();
+        }
+        let found = engine.state_check(None).unwrap();
+        let gone = about(&found, &format!("session {id} is gone"));
+        assert_eq!(gone.len(), 1, "{found:?}");
+        assert!(
+            matches!(&gone[0].remedy, Remedy::Manual(m) if m.contains("`members` folder")),
+            "{gone:?}"
+        );
+        repair(&engine, None);
+        assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+    }
 }
 
 /// Something in the sandboxes' folder that is not a folder, and no record

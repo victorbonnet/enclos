@@ -80,7 +80,17 @@ pub fn validate_secrets(policy: &Policy, sandbox: &SandboxName) -> Result<(), Po
 /// macOS keeps for each process, open files; a process may ignore SIGXCPU
 /// and run past its CPU time, macOS refuses a memory limit, does not hold
 /// appends to a file size limit, and enclos has no means for a CPU share.
-pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), PolicyError> {
+///
+/// `most_open_files` is the host's own ceiling on the files one process
+/// holds (macOS's `kern.maxfilesperproc`), when it is known: a value above
+/// it is refused when the policy is stored, not first found at launch.
+/// A limit the backend refuses is only refused, never also called written
+/// wrong: no value of it would be accepted.
+pub fn validate_resources(
+    policy: &Policy,
+    backend: BackendKind,
+    most_open_files: Option<u64>,
+) -> Result<(), PolicyError> {
     let r = &policy.resources;
     // Every field named, so one added is decided on here.
     let crate::model::policy::Resources {
@@ -91,12 +101,18 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
         cpu: _,
     } = r;
     let mut problems = Vec::new();
+    let refused = refusals(r, backend, most_open_files);
+    let accepted = |name: &str| {
+        !refused
+            .iter()
+            .any(|(field, _)| *field == name || *field == "resources")
+    };
     for (name, value) in [
         ("open_files", r.open_files),
         ("file_size", r.file_size.map(|s| s.0)),
         ("cpu_seconds", r.cpu_seconds),
     ] {
-        if value == Some(0) {
+        if accepted(name) && value == Some(0) {
             problems.push(Problem::Malformed(format!(
                 "resources.{name}: 0 would leave the sandbox unusable; set at least 1, or leave it out"
             )));
@@ -112,6 +128,7 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
         ("file_size", r.file_size.map(|s| s.0), 1024, 1 << 50),
     ] {
         if let Some(value) = value
+            && accepted(name)
             && value != 0
             && !(least..=most).contains(&value)
         {
@@ -130,44 +147,69 @@ pub fn validate_resources(policy: &Policy, backend: BackendKind) -> Result<(), P
     // A whole number of KiB, the unit of `ulimit -f`, for a backend that
     // sets it that way: a size of no whole KiB could only be cut, and one
     // under 1K would become `ulimit -f 0`, stopping every write.
-    if r.file_size
-        .is_some_and(|s| s.0 != 0 && !s.0.is_multiple_of(1024))
+    if accepted("file_size")
+        && r.file_size
+            .is_some_and(|s| s.0 != 0 && !s.0.is_multiple_of(1024))
     {
         problems.push(Problem::Malformed(format!(
             "resources.file_size = {}: write a whole number of KiB, such as `512K` or `1G`",
             r.file_size.expect("set")
         )));
     }
+    problems.extend(refused.into_iter().map(|(_, why)| Problem::Refused(why)));
+    invalid_if_any(problems)
+}
+
+/// The limits `backend` refuses, each with the field it is about (or
+/// `resources` for all of them) and why: one it cannot enforce as written,
+/// or above the host's own ceiling.
+fn refusals(
+    r: &crate::model::policy::Resources,
+    backend: BackendKind,
+    most_open_files: Option<u64>,
+) -> Vec<(&'static str, String)> {
+    let mut refused = Vec::new();
     match backend {
         BackendKind::Seatbelt => {
+            if let (Some(files), Some(most)) = (r.open_files, most_open_files)
+                && files > most
+            {
+                refused.push((
+                    "open_files",
+                    format!(
+                        "resources.open_files = {files}: above the {most} files macOS lets any process hold (kern.maxfilesperproc), so a process would be stopped there, not where the policy says; lower it to {most} or less"
+                    ),
+                ));
+            }
             if let Some(size) = r.file_size {
-                problems.push(Problem::Refused(format!(
-                    "resources.file_size = {size}: the Seatbelt backend cannot hold a file to a size, since macOS checks the limit against the start of a file opened to append, so each new process may append past it (shown on macOS 26.5.2); leave it out"
+                refused.push(("file_size", format!(
+                    "resources.file_size = {size}: the Seatbelt backend cannot hold a file to a size, since macOS checks the limit against the start of a file opened to append, so each new process may append past it; leave it out"
                 )));
             }
             if let Some(memory) = &r.memory {
-                problems.push(Problem::Refused(format!(
-                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process (shown on macOS 26.5.2); leave it out. Linux's backend is designed to hold one"
+                refused.push(("memory", format!(
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. Linux's backend is designed to hold one"
                 )));
             }
             if let Some(seconds) = r.cpu_seconds {
-                problems.push(Problem::Refused(format!(
-                    "resources.cpu_seconds = {seconds}: the Seatbelt backend cannot hold a process to its CPU time, since macOS sends SIGXCPU once, which a process may ignore and then run on, its children with it (shown on macOS 26.5.2); leave it out"
+                refused.push(("cpu_seconds", format!(
+                    "resources.cpu_seconds = {seconds}: the Seatbelt backend cannot hold a process to its CPU time, since macOS sends SIGXCPU, which a process may ignore and then run on; leave it out"
                 )));
             }
             if let Some(cpu) = &r.cpu {
-                problems.push(Problem::Refused(format!(
+                refused.push(("cpu", format!(
                     "resources.cpu = {cpu}: the Seatbelt backend cannot hold a sandbox to a share of the CPU, for which enclos has no means on macOS; leave it out"
                 )));
             }
         }
         // No other backend is built yet: none enforces a limit.
-        other if !r.is_unset() => problems.push(Problem::Refused(format!(
-            "resources: the {other} backend enforces no limit yet; leave [resources] out"
-        ))),
+        other if !r.is_unset() => refused.push((
+            "resources",
+            format!("resources: the {other} backend enforces no limit yet; leave [resources] out"),
+        )),
         _ => {}
     }
-    invalid_if_any(problems)
+    refused
 }
 
 /// The write checks of [`validate`] alone, on the paths as they are now: run
@@ -383,10 +425,10 @@ mod tests {
     fn a_limit_seatbelt_cannot_enforce_is_refused() {
         let mut policy = Policy::default();
         policy.resources.open_files = Some(256);
-        assert!(validate_resources(&policy, BackendKind::Seatbelt).is_ok());
+        assert!(validate_resources(&policy, BackendKind::Seatbelt, None).is_ok());
         // A process may ignore SIGXCPU and run on: refused.
         policy.resources.cpu_seconds = Some(3600);
-        let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+        let err = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
         assert!(
             err.is_refused() && err.to_string().contains("SIGXCPU"),
             "{err}"
@@ -394,23 +436,43 @@ mod tests {
         policy.resources.cpu_seconds = None;
         // macOS does not hold appends to a file size: refused.
         policy.resources.file_size = Some("1G".parse().unwrap());
-        let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+        let err = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
         assert!(
             err.is_refused() && err.to_string().contains("append"),
             "{err}"
         );
         policy.resources.file_size = None;
         policy.resources.open_files = Some(0);
-        let zero = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+        let zero = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
         assert!(!zero.is_refused(), "{zero}");
         policy.resources.open_files = None;
-        // Sizes are whole KiB: `ulimit -f` takes nothing smaller.
-        for bytes in [1500, 512] {
+        // A limit the backend refuses is only refused, whatever its value:
+        // no advice to fix a field no value of which is accepted.
+        for bytes in [0, 1500, 512] {
             policy.resources.file_size = Some(crate::model::policy::ByteSize(bytes));
-            let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
-            assert!(err.to_string().contains("whole number of KiB"), "{err}");
+            let err = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
+            assert!(err.is_refused(), "{err}");
+            assert!(!err.to_string().contains("whole number of KiB"), "{err}");
+            assert!(!err.to_string().contains("set at least"), "{err}");
         }
         policy.resources.file_size = None;
+        policy.resources.cpu_seconds = Some(0);
+        let err = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
+        assert!(
+            err.is_refused() && !err.to_string().contains("set at least"),
+            "{err}"
+        );
+        policy.resources.cpu_seconds = None;
+        // Above the host's own ceiling: refused when the policy is stored.
+        policy.resources.open_files = Some(70_000);
+        let err = validate_resources(&policy, BackendKind::Seatbelt, Some(61_440)).unwrap_err();
+        assert!(
+            err.is_refused() && err.to_string().contains("kern.maxfilesperproc"),
+            "{err}"
+        );
+        policy.resources.open_files = Some(61_440);
+        assert!(validate_resources(&policy, BackendKind::Seatbelt, Some(61_440)).is_ok());
+        policy.resources.open_files = None;
         // Bounds: too few files to start, a value macOS reads as no limit,
         // a size it refuses to set.
         let bounded = |r: crate::model::policy::Resources| {
@@ -418,7 +480,7 @@ mod tests {
                 resources: r,
                 ..Default::default()
             };
-            validate_resources(&p, BackendKind::Seatbelt)
+            validate_resources(&p, BackendKind::Seatbelt, None)
         };
         let files = |n| crate::model::policy::Resources {
             open_files: Some(n),
@@ -429,13 +491,12 @@ mod tests {
         assert!(bounded(files(1 << 20)).is_ok());
         assert!(bounded(files((1 << 20) + 1)).is_err());
         assert!(bounded(files(i64::MAX as u64)).is_err());
-        // A size past the bounds is said as it would be written.
+        // A size past the bounds: refused, as any size is on Seatbelt.
         let big = crate::model::policy::Resources {
             file_size: Some(crate::model::policy::ByteSize(1 << 51)),
             ..Default::default()
         };
-        let err = bounded(big).unwrap_err().to_string();
-        assert!(err.contains("2048T") || err.contains("from 1K to"), "{err}");
+        assert!(bounded(big).unwrap_err().is_refused());
         let cpu = crate::model::policy::Resources {
             cpu_seconds: Some(i64::MAX as u64),
             ..Default::default()
@@ -450,15 +511,15 @@ mod tests {
         let mut some = Policy::default();
         some.resources.open_files = Some(256);
         assert!(
-            validate_resources(&some, BackendKind::Bubblewrap)
+            validate_resources(&some, BackendKind::Bubblewrap, None)
                 .unwrap_err()
                 .is_refused()
         );
-        assert!(validate_resources(&Policy::default(), BackendKind::Bubblewrap).is_ok());
+        assert!(validate_resources(&Policy::default(), BackendKind::Bubblewrap, None).is_ok());
         for (memory, cpu) in [(Some("2G"), None), (None, Some("2.0"))] {
             policy.resources.memory = memory.map(str::to_owned);
             policy.resources.cpu = cpu.map(str::to_owned);
-            let err = validate_resources(&policy, BackendKind::Seatbelt).unwrap_err();
+            let err = validate_resources(&policy, BackendKind::Seatbelt, None).unwrap_err();
             assert!(err.is_refused(), "{err}");
             assert!(err.to_string().contains("Seatbelt"), "{err}");
         }

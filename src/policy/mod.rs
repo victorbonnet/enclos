@@ -25,9 +25,6 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("assistant", include_str!("templates/assistant.toml")),
 ];
 
-/// The template a new sandbox gets unless told otherwise.
-pub const DEFAULT_TEMPLATE: &str = "assistant";
-
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
     #[error("cannot read the {layer} policy: {reason}")]
@@ -197,12 +194,13 @@ pub fn resolve(
         }),
         overrides: sha256_hex(overrides.as_bytes()),
     };
-    Ok(PolicySnapshot {
-        id: snapshot_id(&inputs, &policy),
+    Ok(PolicySnapshot::new(
+        snapshot_id(&inputs, &policy),
         inputs,
         policy,
-        overrides: overrides.to_owned(),
-    })
+        overrides.to_owned(),
+    )
+    .expect("the inputs name the text's own hash"))
 }
 
 /// The SHA-256 of a policy and its inputs, over their JSON form.

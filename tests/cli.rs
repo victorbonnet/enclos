@@ -454,6 +454,93 @@ impl Drop for TestKeychain {
     }
 }
 
+/// A sandbox's template is named every time: the widest one, `assistant`,
+/// is never had by leaving it out.
+#[test]
+fn a_sandbox_is_created_only_with_its_template_named() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "home"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(out.stderr().contains("--template"), "{}", out.stderr());
+    assert!(!home.root.join("sandboxes/home").exists());
+}
+
+/// `runtime configure` sets up the sandbox's bot, never an agent's own
+/// (ADR 0032): naming an agent is refused, and nothing is recorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_bot_of_an_agents_own_is_refused() {
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let lines = home.audit_lines().len();
+    let out = home.run(&[
+        "runtime",
+        "configure",
+        "home/main",
+        "--channel",
+        "telegram",
+        "--allow-user",
+        "1",
+    ]);
+    assert_ne!(out.code(), 0, "{}", out.stdout());
+    assert!(
+        out.stderr()
+            .contains("does not set up a bot of agent main's own"),
+        "{}",
+        out.stderr()
+    );
+    assert_eq!(home.audit_lines().len(), lines);
+}
+
+/// A secret `sandbox rm` cannot remove from the store makes it exit 1, so a
+/// script sees it, naming the secret and how to remove it by hand.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sandbox_removed_with_a_secret_left_exits_1() {
+    use std::io::Write;
+    let home = Home::new();
+    let keychain = TestKeychain::new(&home);
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let mut set = home
+        .command(&["secret", "set", "home/xy"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    set.stdin.take().unwrap().write_all(b"v\n").unwrap();
+    Run(set.wait_with_output().unwrap()).ok();
+    // The keychain gone from under it: the item cannot be removed.
+    Command::new("/usr/bin/security")
+        .arg("delete-keychain")
+        .arg(&keychain.0)
+        .status()
+        .unwrap();
+    let out = Run(home
+        .command(&["--yes", "sandbox", "rm", "home"])
+        .env("ENCLOS_KEYCHAIN", &keychain.0)
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stdout().contains("Removed sandbox home"),
+        "{}",
+        out.stdout()
+    );
+    assert!(out.stderr().contains("home/xy"), "{}", out.stderr());
+    assert!(
+        out.stderr().contains("security delete-generic-password"),
+        "{}",
+        out.stderr()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
@@ -476,7 +563,8 @@ fn a_secret_set_from_the_input_reaches_the_sessions_its_policy_grants_it_to() {
         Run(child.wait_with_output().unwrap())
     };
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
 
     let out = run(&["secret", "set", "home/telegram"], Some(b"tok-123:abc\n"));
@@ -588,7 +676,8 @@ fn a_secret_with_no_keychain_to_hold_it_is_refused() {
     use std::io::Write;
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let missing = home._dir.path().join("none.keychain-db");
     let mut cmd = home.command(&["secret", "set", "home/telegram"]);
     cmd.env("ENCLOS_KEYCHAIN", &missing)
@@ -615,7 +704,8 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
 
     let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "echo out; exit 7"]);
@@ -713,6 +803,38 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
         "{}",
         out.stderr()
     );
+
+    // A command that cannot be started exits 71, as `sandbox-exec` says.
+    let out = home.run(&["exec", "home", "--", "/nonexistent"]);
+    assert_eq!(out.code(), 71, "{}", out.stderr());
+    assert!(out.stderr().contains("execvp"), "{}", out.stderr());
+
+    // A closed stderr (`2>&1 | head`) changes no exit code: neither the
+    // command's, said on stderr, nor enclos's own failure.
+    for (args, code) in [
+        (
+            &[
+                "exec",
+                "home",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 1; kill -TERM $$",
+            ][..],
+            143,
+        ),
+        (&["exec", "nope", "--", "/bin/ls"][..], 125),
+    ] {
+        let mut child = home
+            .command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{args:?}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -720,7 +842,8 @@ fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
 fn policy_history_diff_rollback_and_refresh() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     home.run(&["policy", "allow", "home", "a.example.com"]).ok();
     home.run(&["policy", "allow", "home", "b.example.com"]).ok();
 
@@ -792,7 +915,8 @@ fn policy_history_diff_rollback_and_refresh() {
 fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let edit = |script: &str| {
         let mut cmd = home.command(&["policy", "edit", "home"]);
         cmd.env_remove("VISUAL")
@@ -918,7 +1042,7 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
 fn a_seatbelt_sandbox_is_refused_off_macos() {
     let home = Home::new();
     home.init(1);
-    let out = home.run(&["sandbox", "create", "home"]);
+    let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
     assert_eq!(out.code(), 2, "{}", out.stderr());
     assert!(out.stderr().contains("cannot run"), "{}", out.stderr());
     assert!(
@@ -943,9 +1067,11 @@ fn column_starts(line: &str) -> Vec<usize> {
 fn sandbox_list_lines_up_its_columns_for_names_of_any_length() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "ab"]).ok();
+    home.run(&["sandbox", "create", "ab", "--template", "assistant"])
+        .ok();
     let long = "a-name-longer-than-twenty-letters";
-    home.run(&["sandbox", "create", long]).ok();
+    home.run(&["sandbox", "create", long, "--template", "assistant"])
+        .ok();
     let out = home.run(&["sandbox", "list"]);
     let text = out.ok().stdout();
     let lines: Vec<&str> = text.lines().collect();
@@ -984,7 +1110,7 @@ fn a_sandbox_runs_a_command_under_seatbelt_and_its_proxy_and_stops() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    let out = home.run(&["sandbox", "create", "home"]);
+    let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
     out.ok();
     assert!(
         out.stdout().contains("Created sandbox home"),
@@ -1052,8 +1178,10 @@ fn every_escape_probe_fails_in_a_new_sandbox() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
-    home.run(&["sandbox", "create", "lab"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // Fake sensitive files at default deny-list paths in this test's own
     // HOME, so that the default deny list is probed wherever this runs, and
@@ -1281,7 +1409,8 @@ fn a_route_that_gets_through_fails_the_policy_test() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // Allowing the destination and port a proxy probe asks for opens that
     // route: the proxy lets the request through and answers 502, as the name
@@ -1317,7 +1446,8 @@ fn policy_test_fails_when_the_sandbox_home_is_unusable() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // A home no probe can run in.
     let sandbox_home = home.root.join("sandboxes/home/home");
@@ -1339,7 +1469,8 @@ fn policy_test_fails_when_the_sandbox_home_is_unusable() {
 fn a_policy_test_dry_run_starts_and_records_nothing() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let before = home.audit_lines().len();
     let out = home.run(&["policy", "test", "home", "--host-services", "--dry-run"]);
     let plan = out.ok().stdout();
@@ -1368,7 +1499,8 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
 
     // The command exits at once and leaves a short sleep in its group, with
@@ -1407,7 +1539,8 @@ fn a_session_opens_the_terminal_it_runs_in_by_name() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // `script` runs enclos in a terminal of its own, never this test's.
     let script = r#"t=$(/usr/bin/tty) && : < "$t" && : >> "$t" && echo own-by-name"#;
@@ -1429,7 +1562,8 @@ fn connect_refuses_a_port_another_program_listens_on() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let port = proxy_port(&home);
     // Another program takes the sandbox's proxy port first, on either
@@ -1510,7 +1644,8 @@ fn a_proxy_that_died_is_replaced_and_stop_works_from_another_time_zone() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
 
     // A long command: its connect, the parent of the proxy it started,
@@ -1564,7 +1699,8 @@ fn stop_ends_an_interactive_shell_and_its_jobs() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     // An empty .zshrc, so zsh does not ask a new user to set it up.
     std::fs::write(home.root.join("sandboxes/home/home/.zshrc"), "").unwrap();
@@ -1640,7 +1776,8 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
 
     // Without a terminal the program runs in a group of its own: the INT
@@ -1680,12 +1817,124 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     assert!(audit().contains("ok: exit 3"), "{}", audit());
 }
 
+/// Leading its own group without a terminal, as under a supervisor or
+/// `setsid`, enclos still gives the program a group of its own and passes
+/// on an INT sent to it alone; the program's end is recorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_leading_its_group_passes_signals_on() {
+    use std::os::unix::process::CommandExt;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let script = "trap 'exit 4' INT; : > \"$HOME/trapped\"; /bin/sleep 10 & wait";
+    let trapped = home.root.join("sandboxes/home/home/trapped");
+    let mut connect = KillOnDrop(
+        home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let audit = || home.run(&["audit"]).ok().stdout();
+    assert!(
+        eventually(|| audit().contains("ok: session 2")),
+        "{}",
+        audit()
+    );
+    assert!(eventually(|| trapped.exists()), "the program set no trap");
+    // The enclos this test started, alone: not its group.
+    Command::new("/bin/kill")
+        .args(["-INT", &connect.0.id().to_string()])
+        .status()
+        .unwrap();
+    let mut status = None;
+    assert!(eventually(|| {
+        status = connect.0.try_wait().unwrap();
+        status.is_some()
+    }));
+    assert_eq!(status.unwrap().code(), Some(4));
+    assert!(audit().contains("ok: exit 4"), "{}", audit());
+}
+
+/// In a terminal (here `script(1)`'s), the program runs in the terminal's
+/// foreground group, also with its input piped in, and a TERM sent to
+/// enclos alone, as by `kill`, reaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn in_a_terminal_the_program_is_in_the_foreground_and_hears_term() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _stop = StopOnDrop(&home, "home");
+    let sandbox_home = home.root.join("sandboxes/home/home");
+    let in_terminal = |line: &str| {
+        let mut cmd = Command::new("/usr/bin/script");
+        cmd.args(["-q", "/dev/null", "/bin/sh", "-c", line])
+            .env("ENCLOS_HOME", &home.root)
+            .env("HOME", home._dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        KillOnDrop(cmd.spawn().unwrap())
+    };
+    let enclos = env!("CARGO_BIN_EXE_enclos");
+    let read = |name: &str| std::fs::read_to_string(sandbox_home.join(name)).ok();
+
+    // Input piped in, output to the terminal: the foreground group.
+    let program = "echo $$ > \"$HOME/pid\"; /bin/sleep 5";
+    let _first = in_terminal(&format!(
+        "echo x | {enclos} exec home -- /bin/sh -c '{program}'"
+    ));
+    assert!(eventually(|| read("pid").is_some()));
+    let pid = read("pid").unwrap().trim().to_owned();
+    let groups = Command::new("/bin/ps")
+        .args(["-o", "pgid=,tpgid=", "-p", &pid])
+        .output()
+        .unwrap();
+    let groups = String::from_utf8_lossy(&groups.stdout).to_string();
+    let ids: Vec<&str> = groups.split_whitespace().collect();
+    assert_eq!(ids.len(), 2, "{groups}");
+    assert_eq!(ids[0], ids[1], "not the foreground group: {groups}");
+
+    // A TERM sent to enclos alone, the program's parent.
+    let program = "echo $PPID > \"$HOME/enclos\"; trap \"exit 4\" TERM; /bin/sleep 10 & wait";
+    let _second = in_terminal(&format!("{enclos} connect home -- /bin/sh -c '{program}'"));
+    assert!(eventually(|| read("enclos").is_some()));
+    let parent = read("enclos").unwrap().trim().to_owned();
+    // The process the program names is the enclos this test started.
+    let comm = Command::new("/bin/ps")
+        .args(["-o", "comm=", "-p", &parent])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&comm.stdout)
+            .trim()
+            .ends_with("enclos")
+    );
+    Command::new("/bin/kill")
+        .args(["-TERM", &parent])
+        .status()
+        .unwrap();
+    let audit = || home.run(&["audit"]).ok().stdout();
+    assert!(eventually(|| audit().contains("ok: exit 4")), "{}", audit());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_runtime_install_dry_run_starts_nothing() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let before = home.audit_lines().len();
     let out = home.run(&[
         "runtime",
@@ -1721,7 +1970,8 @@ fn a_runtime_install_dry_run_starts_nothing() {
 fn agent_commands_need_a_runtime_and_their_dry_runs_change_nothing() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let before = home.audit_lines().len();
     // Without a runtime, nothing to add to: said before anything runs.
     let out = home.run(&["agent", "add", "home/main", "--dry-run"]);
@@ -1769,7 +2019,8 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let port = proxy_port(&home);
     let port_arg = port.to_string();
@@ -1846,7 +2097,8 @@ fn a_recording_proxy_records_itself_once_it_holds_the_port_and_stop_ends_it() {
 fn logs_of_a_sandbox_without_services_say_how_to_start_it() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let out = home.run(&["logs", "home"]);
     out.ok();
     assert!(
@@ -1866,7 +2118,8 @@ fn logs_of_a_sandbox_without_services_say_how_to_start_it() {
 fn logs_show_what_the_services_printed_escaped() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let logs = home.root.join("sandboxes/home/logs");
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(
@@ -1892,8 +2145,10 @@ fn logs_show_what_the_services_printed_escaped() {
 fn start_and_stop_take_several_sandboxes() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
-    home.run(&["sandbox", "create", "lab"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
 
     let out = home.run(&["sandbox", "start", "home", "lab", "--dry-run"]);
     out.ok();
@@ -1943,7 +2198,8 @@ fn a_reader_that_left_ends_a_listing_quietly() {
     let home = Home::new();
     home.init(1);
     for name in ["home", "lab"] {
-        home.run(&["sandbox", "create", name]).ok();
+        home.run(&["sandbox", "create", name, "--template", "assistant"])
+            .ok();
     }
     let mut child = home
         .command(&["sandbox", "list"])
@@ -1984,7 +2240,8 @@ fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
 fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let make = record_hermes(&home, "home");
     make("scout");
     make("my_bot");
@@ -2073,7 +2330,8 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
 fn agent_add_from_an_archive_imports_it_and_its_dry_run_copies_nothing() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _make = record_hermes(&home, "home");
     let archive = home.root.join("main.tar.gz");
     std::fs::write(&archive, b"an export").unwrap();
@@ -2120,7 +2378,8 @@ fn connect_reports_untracked_agents_on_stderr_without_the_untrackable_names() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let _make = record_hermes(&home, "home");
 
@@ -2146,7 +2405,7 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
     let out = home.run(&["status"]);
     assert_eq!(
         out.ok().stdout(),
-        "No sandboxes yet. Create one with `enclos sandbox create lab`.\n"
+        "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`.\n"
     );
     let out = home.run(&["status", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&out.ok().stdout()).unwrap();
@@ -2176,8 +2435,10 @@ fn status_without_sandboxes_says_how_to_make_one_and_names_an_unknown_sandbox() 
 fn status_shows_each_sandbox_its_agents_and_what_to_do() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
-    home.run(&["sandbox", "create", "spare"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    home.run(&["sandbox", "create", "spare", "--template", "assistant"])
+        .ok();
     let make = record_hermes(&home, "home");
     make("scout");
     make("gone");
@@ -2272,7 +2533,8 @@ fn a_secret_typed_at_a_terminal_is_one_line_read_whole() {
     let home = Home::new();
     let keychain = TestKeychain::new(&home);
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let at_terminal = |name: &str, keys: &[u8]| {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
         grantpt(&master).unwrap();
@@ -2436,7 +2698,8 @@ fn policy_versions(home: &Home) -> usize {
 fn a_limit_seatbelt_cannot_hold_is_refused_and_nothing_is_stored() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let policy = home.root.join("sandboxes/home/policy.toml");
     let clean = std::fs::read_to_string(&policy).unwrap();
     // `policy edit` keeps the refused file, so the file as created is put
@@ -2470,7 +2733,8 @@ fn a_sandbox_runs_under_its_open_file_limit() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     let policy = home.root.join("sandboxes/home/policy.toml");
     let clean = std::fs::read_to_string(&policy).unwrap();
@@ -2534,7 +2798,8 @@ fn a_limit_above_enclos_own_hard_limit_stops_the_session() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let _stop = StopOnDrop(&home, "home");
     edit_limits(&home, "open_files = 64").ok();
     let out = Run(Command::new("/bin/bash")
@@ -2629,7 +2894,8 @@ fn a_sandbox_from_minimal_or_mcp_only_reaches_only_what_is_listed() {
 fn a_sandbox_is_listed_and_shown_with_its_active_template() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "lab"]).ok();
+    home.run(&["sandbox", "create", "lab", "--template", "assistant"])
+        .ok();
     let mut edit = home.command(&["policy", "edit", "lab"]);
     edit.env_remove("VISUAL").env(
         "EDITOR",
@@ -2657,7 +2923,10 @@ fn a_sandbox_is_listed_and_shown_with_its_active_template() {
 fn an_unknown_template_is_refused_with_the_ones_there_are() {
     let home = Home::new();
     home.init(1);
-    let help = home.run(&["sandbox", "create", "--help"]).ok().stdout();
+    let help = home
+        .run(&["sandbox", "create", "--help", "--template", "assistant"])
+        .ok()
+        .stdout();
     for name in enclos::policy::template_names() {
         assert!(help.contains(name), "{name}: {help}");
     }
@@ -2682,7 +2951,8 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
 fn state_check_and_repair_compare_the_records_with_the_host() {
     let home = Home::new();
     home.init(1);
-    home.run(&["sandbox", "create", "home"]).ok();
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
     let out = home.run(&["state", "check"]);
     assert!(
         out.ok().stdout().contains("match the host"),

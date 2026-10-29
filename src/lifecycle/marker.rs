@@ -19,7 +19,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+#[cfg(test)]
+use std::process::Stdio;
+use std::process::{Child, Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::session::ProcessRef;
@@ -136,13 +138,14 @@ pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerErro
     }
     // `-w`: a warning about another file system (an unreachable network
     // mount) is not a failure to look at this folder.
-    let out = Command::new("/usr/sbin/lsof")
-        .env("LC_ALL", "C")
-        .args(["-nP", "-w", "-Fpn", "+d"])
-        .arg(dir)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| MarkerError::Lsof(e.to_string()))?;
+    let out = super::bounded::output_within(
+        Command::new("/usr/sbin/lsof")
+            .env("LC_ALL", "C")
+            .args(["-nP", "-w", "-Fpn", "+d"])
+            .arg(dir),
+        super::bounded::LIMIT,
+    )
+    .map_err(|e| MarkerError::Lsof(e.to_string()))?;
     parse(&out)
 }
 
