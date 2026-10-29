@@ -275,12 +275,11 @@ impl Engine {
     ) -> Result<PolicySnapshot> {
         let backend = self.recorded_backend(name)?;
         self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
-            .map_err(|error| self.with_active_template(name, error))
     }
 
     /// A `policy.toml` that names no template, said with the one the active
-    /// policy is built on: picking another, such as the default, could open
-    /// what the sandbox's template closed.
+    /// policy is built on: picking another template could open what the
+    /// sandbox's own template closed.
     fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
         if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
             return error;
@@ -306,7 +305,10 @@ impl Engine {
         adapter: Option<AdapterLayer>,
         backend: BackendKind,
     ) -> Result<PolicySnapshot> {
-        let snapshot = policy::resolve(overrides, adapter.as_ref())?;
+        // Every path that resolves a policy.toml says which template the
+        // sandbox has when the file names none (`runtime install` too).
+        let snapshot = policy::resolve(overrides, adapter.as_ref())
+            .map_err(|e| self.with_active_template(name, e.into()))?;
         self.check_policy(name, &snapshot.policy, backend)?;
         Ok(snapshot)
     }

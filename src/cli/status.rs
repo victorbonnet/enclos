@@ -41,7 +41,7 @@ pub fn run(engine: &Engine, args: StatusArgs) -> Result<u8> {
 fn print(view: &StatusView, now: Timestamp, user_home: Option<&str>) {
     if view.sandboxes.is_empty() && view.unlisted.is_empty() {
         println!(
-            "No sandboxes yet. Create one with `enclos sandbox create lab --template assistant` (or minimal, mcp-only)."
+            "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`."
         );
         return;
     }

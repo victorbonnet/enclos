@@ -168,7 +168,7 @@ main() {
     printf '\nAnother enclos comes first on your PATH: %s\n' "$found"
     printf 'Remove it (for one built with cargo: cargo uninstall enclos), or put %s first.\n' "$prefix/bin"
   fi
-  printf '\nNext:\n  enclos init\n  enclos sandbox create lab\n  enclos runtime install hermes --sandbox lab\n'
+  printf '\nNext:\n  enclos init\n  enclos sandbox create lab --template assistant\n  enclos runtime install hermes --sandbox lab\n'
 }
 
 main "$@"
