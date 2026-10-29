@@ -139,6 +139,12 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
+    fn channel_token_file(&self, channel: Channel) -> Option<(HomePath, &'static str)> {
+        // Hermes's setup writes the built-in agent's bot token to its
+        // `.env` (`hermes_cli/setup.py`, 0.22.4).
+        Some((at(".hermes/.env"), channel.token_variable()))
+    }
+
     fn channel(
         &self,
         channel: Channel,

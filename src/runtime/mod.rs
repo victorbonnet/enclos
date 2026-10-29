@@ -245,6 +245,13 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
         None
     }
+    /// The file in the home where the runtime's own setup keeps a bot's
+    /// token for `channel` in plain text, as a `.env` line of the variable
+    /// it names: `runtime configure` refuses while it holds one, so that no
+    /// token sits readable in the home (ADR 0022). `None`: no such file.
+    fn channel_token_file(&self, _channel: Channel) -> Option<(HomePath, &'static str)> {
+        None
+    }
     /// The runtime's own commands that set up the sandbox's bot on
     /// `channel`, run in the sandbox by `enclos runtime configure`: its
     /// token read from the variable `token`, which the sandbox's policy

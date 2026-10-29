@@ -3786,6 +3786,24 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .policy_edit(&alice(), &lab.name, &before, &after, Confirm::Yes)
             .unwrap();
 
+        // A token Hermes's own setup left in plain text in the home is
+        // refused until its line goes, though the policy grants one too.
+        let env = lab.home.join(".hermes/.env");
+        std::fs::create_dir_all(env.parent().unwrap()).unwrap();
+        std::fs::write(
+            &env,
+            "TELEGRAM_ALLOWED_USERS=1\nTELEGRAM_BOT_TOKEN=999:plain\n",
+        )
+        .unwrap();
+        let err = configure(&users, Confirm::Yes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds TELEGRAM_BOT_TOKEN in plain text"),
+            "{err}"
+        );
+        assert!(!calls().contains("config set"), "{}", calls());
+        std::fs::write(&env, "TELEGRAM_ALLOWED_USERS=1\n").unwrap();
+
         let Planned::DryRun(plan) = configure(&users, Confirm::DryRun).unwrap() else {
             panic!("a dry run configured the channel");
         };
