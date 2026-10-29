@@ -529,12 +529,19 @@ fn forward(
             event.reason = Some(reason);
             // Said here too, so the proxy's log keeps it should its record
             // not be written.
+            let name = checked.seen.name().unwrap_or("none");
             eprintln!(
-                "enclos proxy: closed a tunnel to {}: {}",
+                "enclos proxy: closed a tunnel to {}: {} ({reason})",
                 destination(&event.host, event.port),
-                match checked.seen.name() {
-                    Some(name) => format!("its TLS hello asks for {name} ({reason})"),
-                    None => format!("its TLS hello cannot be read ({reason})"),
+                match reason {
+                    Reason::NameMismatch => format!("its TLS hello asks for {name}"),
+                    Reason::NoServerName => "its TLS hello names no server".to_owned(),
+                    Reason::EncryptedHello => {
+                        format!(
+                            "its TLS hello hides the name it asks for under ECH, public name {name}"
+                        )
+                    }
+                    _ => "its TLS hello cannot be read".to_owned(),
                 }
             );
         }
@@ -1045,6 +1052,31 @@ mod tests {
             Some(Reason::EncryptedHello)
         );
         assert_eq!(refused(ech("api.example.com"), "api.example.com"), None);
+        // ECH with no visible name: the name asked for is all inside, so it
+        // is closed, for an address too.
+        let ech_no_name = || FirstBytes::ClientHello {
+            server_name: None,
+            encrypted: true,
+        };
+        for host in ["93.184.215.14", "api.example.com"] {
+            assert_eq!(
+                refused(ech_no_name(), host),
+                Some(Reason::EncryptedHello),
+                "{host}"
+            );
+        }
+        // A tunnel opened for an address matches no host name.
+        let named = |name: &str| FirstBytes::ClientHello {
+            server_name: Some(name.to_owned()),
+            encrypted: false,
+        };
+        for host in ["93.184.215.14", "[2606:4700::1]"] {
+            assert_eq!(
+                refused(named("evil.example.com"), host),
+                Some(Reason::NameMismatch),
+                "{host}"
+            );
+        }
     }
 
     /// A client that keeps sending a byte now and then, never a whole
