@@ -41,7 +41,7 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 
 `enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
 
-The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged as long as enclos can write its state. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, set `mode = "allowlist"` under `[network]` in its `policy.toml` (`enclos policy show lab` says which file). The edit takes effect with your next `enclos policy allow lab <host>`, which lists it among the changes and asks first; a command that applies an edit on its own comes in milestone 2. The hosts Hermes needs to install, log in and run stay allowed, and `enclos policy show lab` lists them.
+The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged as long as enclos can write its state. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, run `enclos policy edit lab`, which opens a copy of its `policy.toml` in your editor (`$VISUAL`, else `$EDITOR`, else `vi`), and set `mode = "allowlist"` under `[network]`; the edit applies when the editor closes. A change to what the sandbox may write or listen on, made while sessions run in it, waits as its pending policy until `enclos policy apply lab` restarts the sandbox (or run `policy edit` with `--yes` to restart at once); `enclos policy discard lab` drops it. The hosts Hermes needs to install, log in and run stay allowed, and `enclos policy show lab` lists them.
 
 ## Add agents
 
@@ -156,7 +156,6 @@ enclos sandbox rm lab        # the sandbox and its home, with Hermes and its log
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.
 - **Messaging and secrets:** Telegram and secrets from the Keychain come in milestone 2.
-- **Pending policies:** a policy change applies at once or not at all; saving one for later comes in milestone 2.
 
 ## If you used an earlier build
 

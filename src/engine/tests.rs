@@ -727,7 +727,7 @@ mod sandbox {
     /// Runs `work` while another command holds the state lock: `work`
     /// passes its checks and waits, then `meanwhile` changes the state
     /// before the lock is released.
-    fn while_waiting<T>(
+    pub(super) fn while_waiting<T>(
         engine: &Engine,
         work: impl FnOnce() -> T,
         meanwhile: impl FnOnce(&Engine, &crate::state::StateLock) + Send,
@@ -771,7 +771,11 @@ mod sandbox {
     }
 
     /// An interactive session of sandbox `name` whose program is `root`.
-    fn session_of(engine: &Engine, name: &SandboxName, root: ProcessRef) -> SessionRecord {
+    pub(super) fn session_of(
+        engine: &Engine,
+        name: &SandboxName,
+        root: ProcessRef,
+    ) -> SessionRecord {
         SessionRecord {
             id: SessionId(0),
             sandbox: name.clone(),
@@ -799,10 +803,10 @@ mod sandbox {
     }
 
     /// A `sleep` this test started, ended and reaped when dropped.
-    struct Sleeping(std::process::Child);
+    pub(super) struct Sleeping(std::process::Child);
 
     impl Sleeping {
-        fn new() -> Sleeping {
+        pub(super) fn new() -> Sleeping {
             Sleeping(
                 std::process::Command::new("/bin/sleep")
                     .arg("30")
@@ -811,7 +815,7 @@ mod sandbox {
             )
         }
 
-        fn process(&self) -> ProcessRef {
+        pub(super) fn process(&self) -> ProcessRef {
             reference(self.0.id()).unwrap().unwrap()
         }
     }
@@ -830,7 +834,7 @@ mod sandbox {
         engine.state.put(&lock, &record).unwrap();
     }
 
-    fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
+    pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
         let lock = engine.state.lock().unwrap();
         engine.state.put_session(&lock, session).unwrap()
     }
@@ -6202,3 +6206,5 @@ mod listener {
         assert_eq!(outside_proxy_range(61374), Ok(61374));
     }
 }
+
+mod pending;

@@ -115,7 +115,7 @@ pub enum Error {
     /// The active policy's write checks, run again on the paths as they are
     /// when it is compiled, no longer pass.
     #[error(
-        "the active policy of sandbox `{sandbox}` no longer passes enclos's write checks on the paths as they are now, so enclos will not compile it. If a link on the way changed, point it back; or edit {} and apply it with `enclos policy allow {sandbox} <destination>`, which applies the edit too. {source}",
+        "the active policy of sandbox `{sandbox}` no longer passes enclos's write checks on the paths as they are now, so enclos will not compile it. If a link on the way changed, point it back; or change {} with `enclos policy edit {sandbox}`. {source}",
         policy_file.display()
     )]
     ActivePolicyInvalid {
@@ -151,6 +151,37 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
+    #[error(
+        "sandbox `{sandbox}` has no pending policy: changes that need no restart are in force already. `enclos policy show {sandbox}` shows its policy"
+    )]
+    NoPendingPolicy { sandbox: String },
+    /// The pending policy changed between reading it and applying it.
+    #[error(
+        "the pending policy of sandbox `{sandbox}` changed or was dropped while it was being applied. `enclos policy show {sandbox}` shows what waits now"
+    )]
+    PendingChanged { sandbox: String },
+    /// `policy.toml` changed since the edit of a copy of it began.
+    #[error(
+        "{} changed since your edit of sandbox `{sandbox}` began, so the edit was not applied: it would undo that change. Your edit stays in policy.toml.edit beside it: compare the two and put what you want in your edit, then copy policy.toml over policy.toml.edit.base and run `enclos policy edit {sandbox}`, which opens your edit again; or `enclos policy discard {sandbox}` drops it",
+        file.display()
+    )]
+    PolicyFileChanged { sandbox: String, file: PathBuf },
+    /// `policy.toml` no longer holds the text the pending policy was
+    /// resolved from: put in force, it would be a policy the file does not
+    /// describe, and the next change, which resolves the file, would drop
+    /// what the file lacks.
+    #[error(
+        "{} no longer holds the pending policy of sandbox `{sandbox}`, so it was not applied. `enclos policy edit {sandbox}`, saved, makes what the file holds the pending change; `enclos policy discard {sandbox}` drops it and puts back the file of the policy in force",
+        file.display()
+    )]
+    PendingFileDiffers { sandbox: String, file: PathBuf },
+    /// A command that resolves `policy.toml` on its own, refused while a
+    /// change waits: it would put the pending change in force without the
+    /// restart it needs.
+    #[error(
+        "sandbox `{sandbox}` has a pending policy change, which needs a restart. Apply it first with `enclos policy apply {sandbox}`, or drop it with `enclos policy discard {sandbox}`"
+    )]
+    PolicyPending { sandbox: String },
     /// The command changes something the user must confirm first.
     #[error(
         "{what} needs confirmation: run it again with --yes, or with --dry-run to see the plan"
@@ -236,6 +267,11 @@ impl Error {
             | Error::Service(_)
             | Error::Processes(_)
             | Error::Markers(_)
+            | Error::NoPendingPolicy { .. }
+            | Error::PendingChanged { .. }
+            | Error::PolicyFileChanged { .. }
+            | Error::PendingFileDiffers { .. }
+            | Error::PolicyPending { .. }
             | Error::Unrecorded { .. } => exit::ERROR,
             Error::CleanupFailed { error, .. }
             | Error::CleanupUnrecorded { error, .. }

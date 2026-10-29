@@ -12,7 +12,7 @@ use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
-use crate::model::policy::{PolicySnapshot, PolicyVersion};
+use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
@@ -80,7 +80,7 @@ pub trait StateStore: NetLogStore {
 
     /// Stores `snapshot` unless an identical one is stored, appends a policy
     /// version pointing to it, and makes that version the sandbox's active
-    /// policy (ADR 0018).
+    /// policy (ADR 0018). Any pending policy is dropped with it.
     fn save_policy(
         &self,
         lock: &StateLock,
@@ -91,6 +91,31 @@ pub trait StateStore: NetLogStore {
     ) -> Result<PolicyVersion>;
     /// The sandbox's active policy version and its snapshot.
     fn active_policy(&self, name: &SandboxName) -> Result<Option<(PolicyVersion, PolicySnapshot)>>;
+    /// Makes `pending` the sandbox's pending policy, in place of any other;
+    /// with `active`, that becomes a new active version first, in the same
+    /// transaction (design §7).
+    fn save_pending(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        pending: &PolicySnapshot,
+        active: Option<&PolicySnapshot>,
+        by: &Actor,
+    ) -> Result<(Option<PolicyVersion>, PendingPolicy)>;
+    /// The sandbox's pending policy and its snapshot.
+    fn pending_policy(&self, name: &SandboxName)
+    -> Result<Option<(PendingPolicy, PolicySnapshot)>>;
+    /// Drops the sandbox's pending policy; false when it had none.
+    fn discard_pending(&self, lock: &StateLock, name: &SandboxName) -> Result<bool>;
+    /// Makes the pending policy, if it is still `expected`, a new active
+    /// version recorded as made by `by`; `None` when it is not.
+    fn apply_pending(
+        &self,
+        lock: &StateLock,
+        name: &SandboxName,
+        expected: &SnapshotId,
+        by: &Actor,
+    ) -> Result<Option<PolicyVersion>>;
     /// Every policy version of the sandbox, oldest first.
     fn policy_history(&self, name: &SandboxName) -> Result<Vec<PolicyVersion>>;
 
