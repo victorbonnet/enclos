@@ -3027,3 +3027,110 @@ fn state_check_and_repair_compare_the_records_with_the_host() {
     );
     assert!(!out.stdout().contains("repaired:"), "{}", out.stdout());
 }
+
+/// `doctor` runs a program in Seatbelt, checks each sandbox's next session,
+/// and names a compiled file that no longer holds what its policy compiled
+/// to; it exits 1 when a next session cannot start.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok().stdout().contains("seatbelt: runs here"),
+        "{}",
+        out.stdout()
+    );
+    assert!(out.stdout().contains("not initialized"), "{}", out.stdout());
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("home: its next session compiles policy v1"),
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        out.stdout().contains("no session has run"),
+        "{}",
+        out.stdout()
+    );
+    // `exec` starts the proxy: stopped when the test ends.
+    let _stop = StopOnDrop(&home, "home");
+    home.run(&["exec", "home", "--", "/usr/bin/true"]).ok();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok().stdout().contains("policy v1 compiles as it did"),
+        "{}",
+        out.stdout()
+    );
+    // The file the session ran under, changed after it was written.
+    let compiled = home.root.join("sandboxes/home/compiled");
+    let file = std::fs::read_dir(&compiled)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "sb"))
+        .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    std::fs::write(
+        &file,
+        format!("{text}(deny file-read* (literal \"/earlier\"))\n"),
+    )
+    .unwrap();
+    let out = home.run(&["doctor"]);
+    assert!(
+        out.ok()
+            .stdout()
+            .contains("it was changed after it was written"),
+        "{}",
+        out.stdout()
+    );
+    assert!(
+        out.stdout()
+            .contains("      - (deny file-read* (literal \"/earlier\"))"),
+        "{}",
+        out.stdout()
+    );
+    // With its home gone, its next session cannot start.
+    std::fs::remove_dir_all(home.root.join("sandboxes/home/home")).unwrap();
+    let out = home.run(&["doctor"]);
+    assert_eq!(out.code(), 1, "{}", out.stdout());
+    assert!(
+        out.stdout()
+            .contains("its active policy cannot be compiled"),
+        "{}",
+        out.stdout()
+    );
+}
+
+/// In a sandbox whose policy has a deny rule, as every enclos sandbox's
+/// has, macOS refuses Seatbelt to the programs it runs (exit 71), and doctor
+/// says so.
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_in_a_sandbox_says_seatbelt_refused_to_run() {
+    let home = Home::new();
+    let inner = home.command(&["doctor"]);
+    let mut outer = std::process::Command::new("/usr/bin/sandbox-exec");
+    outer
+        .args([
+            "-p",
+            "(version 1)(allow default)(deny file-write* (literal \"/enclos-doctor-test\"))",
+        ])
+        .arg(inner.get_program())
+        .args(inner.get_args())
+        .envs(inner.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))));
+    let out = outer.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("seatbelt: on this host, and it refused to run a program"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Operation not permitted"), "{stdout}");
+    assert!(stdout.contains("exit status: 71"), "{stdout}");
+}

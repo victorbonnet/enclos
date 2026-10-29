@@ -250,6 +250,10 @@ pub trait Backend {
     fn kind(&self) -> BackendKind;
     /// Checks, without side effects, whether this backend works on this host.
     fn probe(&self) -> Probe;
+    /// Whether a program runs in the backend, asked once `probe` passed: a
+    /// host can have it and still refuse it. Starts a process; only `enclos
+    /// doctor` calls it.
+    fn try_run(&self) -> Probe;
     fn capabilities(&self) -> Capabilities;
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;

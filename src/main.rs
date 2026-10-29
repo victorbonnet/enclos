@@ -33,6 +33,8 @@ struct Cli {
 enum Command {
     /// Create the enclos folders, state database and audit log. Safe to run again.
     Init,
+    /// Say whether this host runs each backend, whether each sandbox's active policy compiles as its next session would compile it, and which compiled policies enclos now writes differently. Exits 1 when no backend runs, enclos's records cannot be read, or for a sandbox its backend does not run, its next session cannot compile its policy, or doctor could not look at all of it.
+    Doctor,
     /// List audit entries, or verify the audit log.
     Audit(AuditArgs),
     /// Create, list, show, start, stop, restart or remove sandboxes.
@@ -130,6 +132,7 @@ fn run(cli: Cli) -> Result<u8> {
             print_init(engine.init(&current_actor(), confirm)?);
             Ok(exit::OK)
         }
+        Command::Doctor => cli::doctor::run(&engine),
         Command::Audit(AuditArgs { verb: None, since }) => {
             print_entries(&engine.audit(since)?, since.is_some());
             Ok(exit::OK)
@@ -163,6 +166,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
     matches!(
         command,
         Command::Init
+            | Command::Doctor
             | Command::Audit(_)
             | Command::Sandbox(_)
             | Command::Policy(_)

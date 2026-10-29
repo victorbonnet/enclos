@@ -7,6 +7,7 @@
 
 mod channel;
 mod compile;
+mod doctor;
 mod history;
 mod import;
 mod listener;
@@ -26,6 +27,10 @@ mod status;
 mod tests;
 
 pub use channel::ChannelSet;
+pub use doctor::{
+    BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
+    NextSession, RanFile, Running, SandboxCheck, Sandboxes,
+};
 pub use history::{PolicyDiff, PolicyHistory, Side};
 pub use import::{Archive, LeftCopy};
 pub use listener::ServiceWait;

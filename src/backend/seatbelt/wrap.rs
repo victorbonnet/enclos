@@ -11,9 +11,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use super::super::{Launch, SandboxContext};
+use super::super::{Launch, Probe, SandboxContext};
 use super::compile::{SERVICE_PARAM, TERMINAL_PARAM};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -39,6 +39,86 @@ const SYSTEM_TERMINFO: &str = "/usr/share/terminfo";
 /// can find; terminals that bring their own (Ghostty's `xterm-ghostty`)
 /// understand it.
 const FALLBACK_TERM: &str = "xterm-256color";
+
+/// Whether `sandbox-exec` runs `/usr/bin/true` under a Seatbelt policy that
+/// allows everything, with no variable of the user's, within
+/// [`TRY_RUN_WAIT`]. macOS 26.5.2 refuses it, `sandbox_apply: Operation not
+/// permitted` (exit 71), to a process in a sandbox whose policy denies a
+/// write, as every enclos sandbox's does (a test runs doctor under a policy
+/// that allows everything but one write, and finds `Operation not
+/// permitted`, exit 71); in one whose policy only allows
+/// everything it runs, exit 0 (by hand, macOS 26.5.2).
+pub fn try_run() -> Probe {
+    let started = Command::new(SANDBOX_EXEC)
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match started {
+        Ok(child) => child,
+        Err(e) => {
+            return Probe::Unavailable {
+                reason: format!("cannot run {SANDBOX_EXEC}: {e}"),
+            };
+        }
+    };
+    // Read as it is written, so that a full pipe never holds it up.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut said = String::new();
+        let read = stderr.map(|mut s| std::io::Read::read_to_string(&mut s, &mut said));
+        (said, read)
+    });
+    let deadline = std::time::Instant::now() + TRY_RUN_WAIT;
+    let status = loop {
+        let failed = match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            Ok(None) => format!(
+                "{SANDBOX_EXEC} did not finish /usr/bin/true within {} s",
+                TRY_RUN_WAIT.as_secs()
+            ),
+            Err(e) => format!("cannot wait for {SANDBOX_EXEC}: {e}"),
+        };
+        // Its own child: stopped and reaped.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Probe::Unavailable { reason: failed };
+    };
+    if status.success() {
+        return Probe::Available;
+    }
+    let (said, read) = reader.join().unwrap_or_else(|_| {
+        (
+            String::new(),
+            Some(Err(std::io::Error::other("its reader failed"))),
+        )
+    });
+    let mut said = said.trim().to_owned();
+    if let Some(Err(e)) = read {
+        said = format!("{said} (its stderr could not be read: {e})")
+            .trim()
+            .to_owned();
+    }
+    Probe::Unavailable {
+        reason: match said.is_empty() {
+            true => format!(
+                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status})"
+            ),
+            false => format!(
+                "{SANDBOX_EXEC} could not run /usr/bin/true under a policy that allows everything ({status}): {said}"
+            ),
+        },
+    }
+}
+
+/// How long [`try_run`] waits for `/usr/bin/true`, which takes milliseconds.
+const TRY_RUN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn wrap(compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
     let terminal = match launch.in_terminal {
