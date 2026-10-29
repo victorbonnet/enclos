@@ -4691,11 +4691,23 @@ mod services {
         }
         let before = engine.layout.read_policy(name.as_str()).unwrap();
         let after = format!("{before}\n[resources]\nopen_files = {}\n", most + 1);
-        done(
-            engine
-                .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
-                .unwrap(),
+        // Refused as the policy is stored.
+        let err = engine
+            .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+            .unwrap_err();
+        assert!(
+            err.exit_code() == 2 && err.to_string().contains("kern.maxfilesperproc"),
+            "{err}"
         );
+        // And at start, for one stored past that, as by another build or on
+        // a host whose ceiling was higher.
+        let id = engine.policy(&name).unwrap().snapshot.id;
+        let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+        conn.execute(
+            "UPDATE policy_snapshots SET policy = json_set(policy, '$.resources.open_files', ?1) WHERE id = ?2",
+            rusqlite::params![(most + 1) as i64, id.0],
+        )
+        .unwrap();
         let err = engine.start_sandbox(&alice(), &name).unwrap_err();
         assert!(err.to_string().contains("kern.maxfilesperproc"), "{err}");
         assert!(fake.started.borrow().is_empty());

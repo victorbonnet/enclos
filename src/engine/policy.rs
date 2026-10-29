@@ -302,7 +302,7 @@ impl Engine {
     ) -> Result<()> {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
-        validate_resources(policy, backend)?;
+        validate_resources(policy, backend, crate::backend::max_files_per_process())?;
         self.check_secrets_set(name, policy)
     }
 
@@ -321,7 +321,11 @@ impl Engine {
         record: &crate::model::sandbox::SandboxRecord,
         policy: &Policy,
     ) -> Result<LaunchLimits> {
-        validate_resources(policy, record.backend)?;
+        validate_resources(
+            policy,
+            record.backend,
+            crate::backend::max_files_per_process(),
+        )?;
         let limits = LaunchLimits::of_checked(&policy.resources);
         if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });

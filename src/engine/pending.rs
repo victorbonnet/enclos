@@ -495,6 +495,12 @@ impl Engine {
     ) -> Result<Restarted> {
         // Before anything stops, and again under the lock below.
         self.check_pending_file(name, pending)?;
+        // Nor is a policy put in force whose limits no service could start
+        // under: refused here, before anything stops, as `sandbox start`
+        // refuses it before anything is removed.
+        if let Some((_, snapshot)) = self.state.pending_policy(name)? {
+            self.launch_limits(&self.record(name)?, &snapshot.policy)?;
+        }
         let services = self.has_services(name)?;
         let stopped = match self.stops_to_restart(name)? {
             true => match self.stop_sandbox(by, name, Confirm::Yes) {

@@ -1285,3 +1285,27 @@ fn a_stored_limit_the_backend_cannot_enforce_is_refused_at_launch() {
         assert!(err.to_string().contains(why), "{why}: {err}");
     }
 }
+
+/// A pending policy whose limits no service could start under is refused
+/// before anything stops: the session runs on, and the change waits.
+#[test]
+fn apply_refuses_limits_before_anything_stops() {
+    let (dir, engine, name) = with_sandbox();
+    let (_sleeping, id) = running(&engine, &name);
+    let (_work, before, after) = grant_work(&dir, &engine);
+    let pending = make_pending(&engine, &name, &before, &after);
+    // Stored past validation, as a policy stored by another build would be.
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = json_set(policy, '$.resources.open_files', 99999999) WHERE id = ?1",
+        [&pending.snapshot.0],
+    )
+    .unwrap();
+    let err = engine
+        .policy_apply(&alice(), &name, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("open_files"), "{err}");
+    let open = engine.state.sessions(&name, true).unwrap();
+    assert_eq!(open.iter().map(|s| s.id).collect::<Vec<_>>(), [id]);
+    assert!(engine.policy(&name).unwrap().pending.is_some());
+}
