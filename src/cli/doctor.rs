@@ -333,6 +333,7 @@ fn enforced(e: &Enforcement) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclos::backend::seatbelt::Baseline;
     use enclos::backend::{Capabilities, Enforcement};
     use enclos::engine::{Running, Written};
     use enclos::model::sandbox::BackendKind;
@@ -415,7 +416,7 @@ mod tests {
             drift: vec![change(
                 RanFile::There {
                     written: Written::AsWritten {
-                        on_allow_default: false,
+                        baseline: Some(Baseline::DenyDefault),
                     },
                     lines: Lines::Changed(vec![
                         LineChange::Removed("(old)".into()),
@@ -452,7 +453,7 @@ mod tests {
             drift: vec![change(
                 RanFile::There {
                     written: Written::AsWritten {
-                        on_allow_default: true,
+                        baseline: Some(Baseline::AllowDefault),
                     },
                     lines: Lines::TooLong,
                 },

@@ -4382,6 +4382,18 @@ fn every_escape_probe_fails_under_allow_by_default_too() {
                 };
                 assert_eq!(p["closed_by"], by, "{baseline}: {p}");
             }
+            // A setuid program is Seatbelt's own refusal, on either
+            // baseline, and said so.
+            if p["route"] == "at" {
+                assert_eq!(p["outcome"], "closed", "{baseline}: {p}");
+                assert_eq!(p["closed_by"], "seatbelt", "{baseline}: {p}");
+                assert!(
+                    p["why"]
+                        .as_str()
+                        .is_some_and(|w| w.contains("Seatbelt itself refuses")),
+                    "{baseline}: {p}"
+                );
+            }
         }
         doc["probes"]
             .as_array()
@@ -4518,6 +4530,7 @@ fn a_service_refuses_any_baseline_but_deny_default() {
     home.init(1);
     home.run(&["sandbox", "create", "home", "--template", "assistant"])
         .ok();
+    let audited = home.audit_lines().len();
     for (value, why) in [
         ("allow-default", "asks for allow-default"),
         ("x", "it takes `deny-default` or `allow-default`"),
@@ -4537,8 +4550,55 @@ fn a_service_refuses_any_baseline_but_deny_default() {
             out.stderr()
         );
     }
+    // Refused before anything is recorded.
+    assert_eq!(home.audit_lines().len(), audited);
     let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
     assert!(show.contains("no sessions running"), "{show}");
+    // Asked for by name, the shipped baseline passes that check: what
+    // stops this launch is something else (the sandbox has no runtime).
+    let out = Run(home
+        .command(&["launch", "home", "gateway"])
+        .env("ENCLOS_SEATBELT_BASELINE", "deny-default")
+        .output()
+        .unwrap());
+    assert!(
+        !out.stderr()
+            .contains("a service runs only on (deny default)"),
+        "{}",
+        out.stderr()
+    );
+}
+
+/// Only a debug build takes the comparison baseline: a release refuses it
+/// as it starts, and says so (CI runs this test in a release build too).
+#[cfg(target_os = "macos")]
+#[test]
+fn init_takes_allow_default_only_in_a_debug_build() {
+    let home = Home::new();
+    let out = Run(home
+        .piped(&["--json", "init"])
+        .env("ENCLOS_SEATBELT_BASELINE", "allow-default")
+        .output()
+        .unwrap());
+    let init: serde_json::Value =
+        serde_json::from_str(&out.stdout()).unwrap_or_else(|e| panic!("{e}: {}", out.stderr()));
+    let seatbelt = init["unavailable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["backend"] == "seatbelt");
+    match cfg!(debug_assertions) {
+        true => assert!(seatbelt.is_none(), "{init}"),
+        false => {
+            assert!(
+                seatbelt.is_some_and(|u| u["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("never a release"))),
+                "{init}"
+            );
+            assert!(init["default_backend"].is_null(), "{init}");
+        }
+    }
 }
 
 /// `policy test home`, with the host-service probes where CI asks for them.

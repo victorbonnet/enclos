@@ -934,8 +934,7 @@ mod tests {
         assert!(release.contains("never a release"), "{release}");
     }
 
-    /// A compiled text says its baseline on its third line, and only there:
-    /// a path holding the same words further down changes nothing.
+    /// A compiled text says its baseline on its third line, and only there.
     #[test]
     fn a_compiled_text_says_its_baseline() {
         let base = Path::new("/nonexistent-enclos-test");
@@ -986,6 +985,11 @@ mod tests {
         p.net.listen = true;
         let text = compile(&p, &ctx(base), Baseline::DenyDefault).unwrap().text;
         assert_eq!(allowances(&text), REVIEWED_ALLOWANCES, "{text}");
+        // Nothing the list above cannot see: an `(import "system.sb")`
+        // would bring Apple's allowances, a macro hidden ones.
+        for form in ["(import", "(define", "(debug", "(macro"] {
+            assert!(!text.contains(form), "{form} in:\n{text}");
+        }
     }
 
     /// The deny-default block, then writes, terminals, the home's reads,

@@ -44,12 +44,12 @@ const FALLBACK_TERM: &str = "xterm-256color";
 /// every session's compiled policy starts, with no variable of the user's,
 /// within [`TRY_RUN_WAIT`]: on `(deny default)`, a macOS that rejects one of
 /// its allowances, or needs one it lacks to start a program, is found here,
-/// not at a session's start. macOS 26.5.2 refuses any, `sandbox_apply:
-/// Operation not permitted` (exit 71), to a process in a sandbox whose
-/// policy denies a write, as every enclos sandbox's does (a test runs doctor
-/// under a policy that allows everything but one write, and finds
-/// `Operation not permitted`, exit 71); in one whose
-/// policy only allows everything it runs, exit 0 (by hand, macOS 26.5.2).
+/// not at a session's start. Inside a sandbox whose policy denies a write,
+/// as every enclos sandbox's does, macOS 26.5.2 refuses to apply this
+/// policy, `sandbox_apply: Operation not permitted` (exit 71): a test runs
+/// doctor so, on either baseline. Inside one whose policy only allows
+/// everything, `(version 1)(allow default)` ran, exit 0 (by hand, macOS
+/// 26.5.2); this policy on `(deny default)` there is not shown.
 pub fn try_run(baseline: Baseline) -> Probe {
     let policy = format!("(version 1)\n{}", baseline.text("enclos:doctor"));
     let named = match baseline {

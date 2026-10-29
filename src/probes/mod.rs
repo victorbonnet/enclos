@@ -1180,7 +1180,7 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         ),
         Expect::AppleEventBlocked(refusal) if output.contains(refusal) => Outcome::Closed,
         Expect::AppleEventBlocked(refusal) => Outcome::Inconclusive(format!(
-            "the event failed, but not with the refusal Seatbelt gives ({refusal}): {}",
+            "the event failed, but not with the refusal expected on this baseline, {refusal}: {}",
             last_line(output)
         )),
     }
@@ -1548,7 +1548,8 @@ mod tests {
         for p in all(dir.path()) {
             let setuid = matches!(p.route, "crontab" | "at");
             // On `(deny default)`, as these inputs say, the host services
-            // the baseline refuses to look up are the baseline's.
+            // the baseline refuses something of (likely a lookup; not
+            // traced) are the baseline's.
             let by = match p.route {
                 "crontab" | "at" => Some(ClosedBy::Seatbelt),
                 "launchservices" | "apple events" => Some(ClosedBy::Baseline),

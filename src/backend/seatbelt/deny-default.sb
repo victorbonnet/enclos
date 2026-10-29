@@ -53,4 +53,9 @@
   ;; Certificate trust, for TLS through the Security framework: the Hermes
   ;; installer's downloads failed with OSStatus -26276 without it.
   (global-name "com.apple.trustd.agent"))
+;; The notification center's shared memory, read only: libinfo reads its
+;; notification states there, and the shell workload failed without it
+;; (prototype/adr-0006/README.md). Posting needs the lookup refused above.
+;; Whether a sandbox learns of a host notification by reading a state here
+;; is not probed.
 (allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))

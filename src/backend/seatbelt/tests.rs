@@ -1009,8 +1009,8 @@ fn the_sandbox_signals_its_own_processes() {
     assert!(w.sh(&format!("/usr/bin/perl -e '{group}'")));
 }
 
-/// Under `(deny default)` the baseline refuses the lookups LaunchServices
-/// and Apple Events need, so the host-service probes close on what that
+/// Under `(deny default)` the baseline refuses something LaunchServices
+/// and Apple Events need (likely a lookup; not traced), so the host-service probes close on what that
 /// makes the tools say; under `(allow default)` the policy's own rules
 /// refuse them. Only where host-service probes may run (CI): were a rule
 /// not to hold, Finder would open a folder.

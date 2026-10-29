@@ -153,10 +153,10 @@ pub enum Written {
     /// was changed after it was written. Said whether or not it now matches
     /// what the version compiles to.
     Edited,
-    /// As enclos wrote it; `on_allow_default` when that was on the `(allow
-    /// default)` comparison baseline (ADR 0006), which only a debug build
-    /// compiles: the change then includes that baseline.
-    AsWritten { on_allow_default: bool },
+    /// As enclos wrote it, on `baseline`, `None` when its text names
+    /// neither: on the `(allow default)` comparison baseline (ADR 0006),
+    /// which only a debug build compiles, the change includes that baseline.
+    AsWritten { baseline: Option<Baseline> },
 }
 
 impl Written {
@@ -166,7 +166,7 @@ impl Written {
 
     pub fn on_allow_default(self) -> bool {
         self == Written::AsWritten {
-            on_allow_default: true,
+            baseline: Some(Baseline::AllowDefault),
         }
     }
 }
@@ -473,8 +473,7 @@ impl Engine {
                     written: match edited {
                         true => Written::Edited,
                         false => Written::AsWritten {
-                            on_allow_default: Baseline::of_compiled(&before)
-                                == Some(Baseline::AllowDefault),
+                            baseline: Baseline::of_compiled(&before),
                         },
                     },
                     lines: lines_between(&before, &text),

@@ -56,8 +56,9 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route the `(deny default)` baseline closed, on a
-    /// lookup it refuses before the rule the probe tests is reached.
+    /// Closed probes whose route the `(deny default)` baseline closed, on
+    /// something it refuses the tool before the rule the probe tests is
+    /// reached (likely a lookup; not traced).
     pub fn closed_by_baseline(&self) -> usize {
         self.count_closed(|r| r.closed_by == Some(ClosedBy::Baseline))
     }
