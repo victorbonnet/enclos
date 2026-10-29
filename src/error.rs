@@ -224,6 +224,10 @@ pub mod exit {
     /// cannot run (ADR 0009).
     pub const REFUSED: u8 = 2;
     pub const NEEDS_CONFIRMATION: u8 = 3;
+    /// `enclos exec` failed before, around or after its command, which
+    /// would otherwise be told apart from the command's own 1, 2 or 3 only
+    /// by what it printed; as `env` and `docker run` do.
+    pub const EXEC_FAILED: u8 = 125;
 }
 
 /// What enclos found at a sandbox home's path instead of a real folder.

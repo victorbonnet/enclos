@@ -1,4 +1,6 @@
-//! Interactive sessions: `enclos connect` (design §8, "Starting a session").
+//! Sessions started from the CLI: `enclos connect`, `enclos exec`, and the
+//! installers and agent commands enclos runs in the user's terminal (design
+//! §8, "Starting a session").
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -11,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
 use super::Engine;
 use super::listener::ConnectStep;
@@ -21,7 +23,10 @@ use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
-use crate::lifecycle::process::{Proc, group_of, is_same, processes, reference_of_child};
+use crate::lifecycle::process::{
+    Proc, Signal, Signalled, group_of, is_same, processes, reference_of_child, signal_group,
+    signal_process,
+};
 use crate::lifecycle::stop::{GRACE, Stopped, Survivor, Why, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -104,6 +109,37 @@ impl Engine {
             .map(Planned::Done)
     }
 
+    /// Runs one command in the sandbox as an exec session, with this
+    /// process's input and output, and returns when it exits: for a script
+    /// or another program, as `connect` is for a person. An interactive
+    /// session (`connect`, an installer, an agent command) holds back a
+    /// runtime's settings restart (ADR 0031); an exec session does not.
+    pub fn exec(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: Vec<OsString>,
+        confirm: Confirm,
+    ) -> Result<Planned<SessionEnd>> {
+        if command.is_empty() {
+            return Err(Error::Session {
+                what: "no command to run: give one after `--`, such as `enclos exec lab -- ls`"
+                    .into(),
+            });
+        }
+        if confirm == Confirm::DryRun {
+            return self.plan_connect(name, &command).map(Planned::DryRun);
+        }
+        self.run_in_sandbox_as(
+            by,
+            name,
+            SandboxCommand::new(command),
+            "exec",
+            SessionKind::Exec,
+        )
+        .map(Planned::Done)
+    }
+
     /// Runs `command` in the sandbox, in this terminal, as a recorded
     /// session (design §8 steps 1-6), and returns when it exits.
     pub(super) fn run_in_sandbox(
@@ -113,28 +149,77 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
+        self.run_in_sandbox_as(by, name, command, audit_name, SessionKind::Interactive)
+    }
+
+    /// Runs `command` in the sandbox as a recorded session of `kind`, with
+    /// this process's input and output (design §8 steps 1-6), and returns
+    /// when it exits.
+    fn run_in_sandbox_as(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        kind: SessionKind,
+    ) -> Result<SessionEnd> {
         let command = command.into_words();
         let summary = |(session, ..): &(SessionRecord, _, _, _)| format!("session {}", session.id);
-        // Which process group the program starts in (design §8). When this
-        // command leads its group, as a terminal's job does, that group:
-        // the program keeps the terminal, and this process, which leads the
-        // group, is not a member. Run by something else without a terminal
-        // (a script, CI), a group made for the program. Otherwise (a
-        // terminal, but not a job of its own) the caller's group, which is
+        // Which process group the program starts in (design §8). Without a
+        // terminal (a script, CI, a supervisor, whether or not this process
+        // leads its group), a group made for the program, to which this
+        // process passes every signal it catches. In a terminal, when this
+        // command leads its group, as a terminal's job does, that group: the
+        // program keeps the terminal, and this process, which leads the
+        // group, is not a member. Otherwise (a terminal, but not a job of
+        // its own, as in a shell's pipeline) the caller's group, which is
         // not the session's: the session then has no group, only the
-        // processes the program starts.
+        // processes the program starts. A terminal on any of the standard
+        // streams counts: with input piped in, the output still goes to the
+        // terminal, whose Ctrl-C must reach the program.
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
-        let own_group = !leads_group && !std::io::stdin().is_terminal();
+        let in_terminal = std::io::stdin().is_terminal()
+            || std::io::stdout().is_terminal()
+            || std::io::stderr().is_terminal();
+        let own_group = !in_terminal;
         self.wait_service_proxy(name)?;
-        let (session, mut child, _keep_waiting, unreachable) =
+        let (session, mut child, keep_waiting, unreachable) =
             self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
-                let started = self.start_in_sandbox(lock, name, &command, own_group, leads_group);
+                let started =
+                    self.start_in_sandbox(lock, name, &command, own_group, leads_group, kind);
                 self.failed_on_error(lock, name, audit_name, started)
             })?;
 
-        let waited = self.wait_session(&session, &mut child, None, &mut |_| {})?;
-        let mut end = self.finish_session(by, "session end", &session, waited)?;
+        // In a group of its own, the program hears of a signal only when
+        // this process passes it on, to the group it leads. In a terminal,
+        // it hears the terminal's signals itself, but not a TERM sent to
+        // this process alone, which is passed on to the program.
+        let pgid = child.id();
+        let mut pass_on = |notes: &mut Vec<String>| {
+            for signal in keep_waiting.received() {
+                let sent = match (own_group, signal) {
+                    (true, _) => signal_group(&session.root, pgid, signal),
+                    (false, Signal::Term) => signal_process(&session.root, signal),
+                    (false, _) => continue,
+                };
+                let why = match sent {
+                    Ok(Signalled::Sent | Signalled::Gone) => continue,
+                    Ok(Signalled::NotLeader) => "the program no longer leads its group".to_owned(),
+                    Ok(Signalled::Failed(why)) => why,
+                    Err(e) => e.to_string(),
+                };
+                note(notes, format!("could not pass {} on: {why}", signal.name()));
+            }
+        };
+        let waited = self.wait_session(&session, &mut child, None, &mut pass_on)?;
+        let exit = waited.status;
+        let mut end = self
+            .finish_session(by, "session end", &session, waited)
+            .map_err(|error| Error::WithContext {
+                what: format!("{error} (the command itself ended: {exit})"),
+                error: Box::new(error),
+            })?;
         // Why the session could not reach its runtime's service (ADR 0028),
         // which explains a runtime's own "connection failed".
         end.notes.extend(unreachable);
@@ -150,6 +235,7 @@ impl Engine {
         command: &[OsString],
         own_group: bool,
         leads_group: bool,
+        kind: SessionKind,
     ) -> Result<(SessionRecord, Child, KeepWaiting, Option<String>)> {
         let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),
@@ -199,7 +285,7 @@ impl Engine {
             let mut session = SessionRecord {
                 id: SessionId(0),
                 sandbox: name.clone(),
-                kind: SessionKind::Interactive,
+                kind,
                 service: None,
                 version: version.version,
                 snapshot: snapshot.id,
@@ -942,30 +1028,51 @@ pub(super) fn note(notes: &mut Vec<String>, note: String) {
     }
 }
 
-/// Keeps this process waiting for the program through Ctrl-C, Ctrl-\ and a
-/// hangup, as `system(3)` does. In a terminal they reach this process along
-/// with the program, which may handle them and go on; this process must
-/// outlive it to record the session's end. The program itself was started
-/// before, with the default handling, and keeps it.
-struct KeepWaiting(Vec<signal_hook::SigId>);
+/// Keeps this process waiting for the program through Ctrl-C, Ctrl-\, a
+/// hangup and TERM, as `system(3)` does for the first two. In a terminal
+/// they reach this process along with the program, which may handle them
+/// and go on; this process must outlive it to record the session's end.
+/// The program itself was started before, with the default handling, and
+/// keeps it. A program in a group of its own (no terminal: a script, CI)
+/// gets nothing from a terminal, so those signals are passed on to its
+/// group instead; a TERM sent to this process alone is passed on to the
+/// program either way ([`KeepWaiting::received`]).
+struct KeepWaiting(Vec<(Signal, Arc<AtomicBool>, signal_hook::SigId)>);
 
 impl KeepWaiting {
     fn new() -> Result<Self> {
-        let mut ids = Vec::new();
-        for signal in [SIGINT, SIGQUIT, SIGHUP] {
-            let id = signal_hook::flag::register(signal, Arc::new(AtomicBool::new(false)))
-                .map_err(|e| Error::Session {
-                    what: format!("cannot keep waiting through signal {signal}: {e}"),
-                })?;
-            ids.push(id);
+        let caught = [
+            (SIGINT, Signal::Int),
+            (SIGQUIT, Signal::Quit),
+            (SIGHUP, Signal::Hup),
+            (SIGTERM, Signal::Term),
+        ];
+        let mut handled = Vec::new();
+        for (number, signal) in caught {
+            let flag = Arc::new(AtomicBool::new(false));
+            let id = signal_hook::flag::register(number, Arc::clone(&flag)).map_err(|e| {
+                Error::Session {
+                    what: format!("cannot keep waiting through signal {number}: {e}"),
+                }
+            })?;
+            handled.push((signal, flag, id));
         }
-        Ok(KeepWaiting(ids))
+        Ok(KeepWaiting(handled))
+    }
+
+    /// The signals this process received since the last call.
+    fn received(&self) -> Vec<Signal> {
+        self.0
+            .iter()
+            .filter(|(_, flag, _)| flag.swap(false, Ordering::Relaxed))
+            .map(|(signal, ..)| *signal)
+            .collect()
     }
 }
 
 impl Drop for KeepWaiting {
     fn drop(&mut self) {
-        for id in self.0.drain(..) {
+        for (_, _, id) in self.0.drain(..) {
             signal_hook::low_level::unregister(id);
         }
     }

@@ -39,6 +39,8 @@ enum Command {
     Sandbox(cli::sandbox::SandboxArgs),
     /// Open a shell, or run a command, inside a sandbox.
     Connect(cli::connect::ConnectArgs),
+    /// Run one command inside a sandbox, for a script or another program; exits with its code.
+    Exec(cli::connect::ExecArgs),
     /// Install a runtime in a sandbox.
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
@@ -81,11 +83,12 @@ fn main() -> ExitCode {
         Err(err) => {
             let _ = err.print();
             // Help and version go to stdout and succeed; usage errors are
-            // errors (exit 1), since exit 2 means refused by policy.
-            return ExitCode::from(if err.use_stderr() {
-                exit::ERROR
-            } else {
-                exit::OK
+            // errors (exit 1), since exit 2 means refused by policy, or 125
+            // for `exec`, whose 1 is its command's.
+            return ExitCode::from(match err.use_stderr() {
+                false => exit::OK,
+                true if names_exec(std::env::args_os().skip(1)) => exit::EXEC_FAILED,
+                true => exit::ERROR,
             });
         }
     };
@@ -97,11 +100,20 @@ fn main() -> ExitCode {
             Arc::new(AtomicBool::new(true)),
         );
     }
+    // `exec` exits with its command's code, so its own failures take one
+    // no command gives them by convention (design §10).
+    let exec = matches!(cli.command, Command::Exec(_));
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::from(err.exit_code())
+            // Not `eprintln!`, which panics when stderr is closed (`2>&1 |
+            // head`), and would exit 101 rather than with the error's code.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "error: {err}");
+            ExitCode::from(match exec {
+                true => exit::EXEC_FAILED,
+                false => err.exit_code(),
+            })
         }
     }
 }
@@ -124,6 +136,7 @@ fn run(cli: Cli) -> Result<u8> {
         }) => Ok(print_verify(&engine.verify_audit()?)),
         Command::Sandbox(args) => cli::sandbox::run(&engine, &current_actor(), confirm, args),
         Command::Connect(args) => cli::connect::run(&engine, &current_actor(), confirm, args),
+        Command::Exec(args) => cli::connect::exec(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
@@ -137,9 +150,9 @@ fn run(cli: Cli) -> Result<u8> {
 
 /// Whether a reader that left early, as `head` does, ends `command` as it
 /// ends any Unix tool, by SIGPIPE, not by a panic on the next print. Not for
-/// those that run the user's or a runtime's programs (`connect`, `runtime`,
-/// `agent`), keep running (`proxy`, `launch`), or handle a closed output
-/// themselves (`logs`).
+/// those that run the user's or a runtime's programs (`connect`, `exec`,
+/// `runtime`, `agent`), keep running (`proxy`, `launch`), or handle a closed
+/// output themselves (`logs`).
 fn ends_on_closed_output(command: &Command) -> bool {
     matches!(
         command,
@@ -150,6 +163,14 @@ fn ends_on_closed_output(command: &Command) -> bool {
             | Command::Net(_)
             | Command::Status(_)
     )
+}
+
+/// Whether `args`, the command line after the program, run `exec`: its
+/// first word that is not a flag, as the only flags before a command are
+/// `--yes` and `--dry-run`.
+fn names_exec(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.find(|a| !a.to_string_lossy().starts_with('-'))
+        .is_some_and(|a| a == "exec")
 }
 
 /// The user and host recorded in audit entries.
@@ -321,6 +342,22 @@ mod tests {
         about
             .split(|c: char| !c.is_alphanumeric() && c != '-')
             .any(|w| w == word)
+    }
+
+    #[test]
+    fn a_usage_error_of_exec_is_told_from_other_commands() {
+        let args = |words: &[&str]| {
+            words
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert!(super::names_exec(args(&["exec", "lab"]).into_iter()));
+        assert!(super::names_exec(args(&["--yes", "exec"]).into_iter()));
+        assert!(!super::names_exec(
+            args(&["connect", "lab", "--", "exec"]).into_iter()
+        ));
+        assert!(!super::names_exec(args(&[]).into_iter()));
     }
 
     #[test]

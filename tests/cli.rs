@@ -419,6 +419,145 @@ fn editor(home: &Home, script: &str) -> String {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn exec_runs_one_command_with_its_input_and_exits_with_its_code() {
+    use std::io::Write;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let out = home.run(&["exec", "home", "--", "/bin/sh", "-c", "echo out; exit 7"]);
+    assert_eq!(out.code(), 7, "stderr: {}", out.stderr());
+    assert_eq!(out.stdout(), "out\n");
+    // Its input is the caller's: a script can pipe into it.
+    let mut child = home
+        .command(&["exec", "home", "--", "/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped in\n")
+        .unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.ok().stdout(), "piped in\n");
+
+    // A command a signal ended exits as a shell says it: 128 plus the signal.
+    let out = home.run(&[
+        "exec",
+        "home",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo a; kill -TERM $$",
+    ]);
+    assert_eq!(out.code(), 143, "{}", out.stderr());
+    assert_eq!(out.stdout(), "a\n");
+    assert!(
+        out.stderr().contains("ended by signal 15"),
+        "{}",
+        out.stderr()
+    );
+
+    // A TERM sent to enclos reaches the command, in a group of its own
+    // without a terminal, and enclos records its end.
+    let child = home
+        .command(&["exec", "home", "--", "/bin/sleep", "30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    assert!(eventually(|| {
+        home.run(&["sandbox", "show", "home"])
+            .stdout()
+            .contains("/bin/sleep")
+    }));
+    let show = home.run(&["sandbox", "show", "home"]).ok().stdout();
+    assert!(show.contains(" exec: "), "{show}");
+    Command::new("/bin/kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    let out = Run(child.wait_with_output().unwrap());
+    assert_eq!(out.code(), 143, "{}", out.stderr());
+    assert!(
+        !home
+            .run(&["sandbox", "show", "home"])
+            .ok()
+            .stdout()
+            .contains("/bin/sleep")
+    );
+
+    // Each is a session of its own, audited as `exec`; a dry run and a
+    // usage error record nothing.
+    let lines = home.audit_lines().len();
+    let out = home.run(&["exec", "home"]);
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    let out = home.run(&["exec", "Bad_Name", "--", "/bin/ls"]);
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert_eq!(home.run(&["exec", "--help"]).code(), 0);
+    let out = home.run(&["--dry-run", "exec", "home", "--", "/bin/ls"]);
+    assert!(
+        out.ok().stdout().contains("Would run `/bin/ls`"),
+        "{}",
+        out.stdout()
+    );
+    assert_eq!(home.audit_lines().len(), lines);
+    let audit = home.run(&["audit"]).ok().stdout();
+    assert_eq!(audit.matches("exec home").count(), 4, "{audit}");
+
+    // When enclos itself fails, it exits 125, which tells its failure apart
+    // from the command's own 1, 2 or 3.
+    let out = home.run(&["exec", "nope", "--", "/bin/ls"]);
+    assert_eq!(out.code(), 125, "{}", out.stderr());
+    assert!(
+        out.stderr().contains("no sandbox named `nope`"),
+        "{}",
+        out.stderr()
+    );
+
+    // A command that cannot be started exits 71, as `sandbox-exec` says.
+    let out = home.run(&["exec", "home", "--", "/nonexistent"]);
+    assert_eq!(out.code(), 71, "{}", out.stderr());
+    assert!(out.stderr().contains("execvp"), "{}", out.stderr());
+
+    // A closed stderr (`2>&1 | head`) changes no exit code: neither the
+    // command's, said on stderr, nor enclos's own failure.
+    for (args, code) in [
+        (
+            &[
+                "exec",
+                "home",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 1; kill -TERM $$",
+            ][..],
+            143,
+        ),
+        (&["exec", "nope", "--", "/bin/ls"][..], 125),
+    ] {
+        let mut child = home
+            .command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(child.stderr.take());
+        assert_eq!(child.wait().unwrap().code(), Some(code), "{args:?}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn policy_history_diff_rollback_and_refresh() {
     let home = Home::new();
     home.init(1);
@@ -1312,9 +1451,12 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     let _stop = StopOnDrop(&home, "home");
 
     // Without a terminal the program runs in a group of its own: the INT
-    // sent below reaches this enclos alone, as a terminal's Ctrl-C reaches
-    // it beside a program that handles it and goes on.
-    let script = "/bin/sleep 2; exit 3";
+    // sent below reaches this enclos alone, which outlives it and passes it
+    // on to the program, which handles it and exits 3.
+    // It says when its trap is set: an INT passed on before would end it
+    // as INT does, 130, not 3.
+    let script = "trap 'exit 3' INT; : > \"$HOME/trapped\"; /bin/sleep 10 & wait";
+    let trapped = home.root.join("sandboxes/home/home/trapped");
     let mut connect = KillOnDrop(
         home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
             .stdin(Stdio::null())
@@ -1330,6 +1472,7 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
         "{}",
         audit()
     );
+    assert!(eventually(|| trapped.exists()), "the program set no trap");
     // The enclos this test started.
     Command::new("/bin/kill")
         .args(["-INT", &connect.0.id().to_string()])
@@ -1342,6 +1485,115 @@ fn connect_outlives_ctrl_c_and_records_the_programs_end() {
     }));
     assert_eq!(status.unwrap().code(), Some(3));
     assert!(audit().contains("ok: exit 3"), "{}", audit());
+}
+
+/// Leading its own group without a terminal, as under a supervisor or
+/// `setsid`, enclos still gives the program a group of its own and passes
+/// on an INT sent to it alone; the program's end is recorded.
+#[cfg(target_os = "macos")]
+#[test]
+fn connect_leading_its_group_passes_signals_on() {
+    use std::os::unix::process::CommandExt;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+
+    let script = "trap 'exit 4' INT; : > \"$HOME/trapped\"; /bin/sleep 10 & wait";
+    let trapped = home.root.join("sandboxes/home/home/trapped");
+    let mut connect = KillOnDrop(
+        home.command(&["connect", "home", "--", "/bin/sh", "-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let audit = || home.run(&["audit"]).ok().stdout();
+    assert!(
+        eventually(|| audit().contains("ok: session 2")),
+        "{}",
+        audit()
+    );
+    assert!(eventually(|| trapped.exists()), "the program set no trap");
+    // The enclos this test started, alone: not its group.
+    Command::new("/bin/kill")
+        .args(["-INT", &connect.0.id().to_string()])
+        .status()
+        .unwrap();
+    let mut status = None;
+    assert!(eventually(|| {
+        status = connect.0.try_wait().unwrap();
+        status.is_some()
+    }));
+    assert_eq!(status.unwrap().code(), Some(4));
+    assert!(audit().contains("ok: exit 4"), "{}", audit());
+}
+
+/// In a terminal (here `script(1)`'s), the program runs in the terminal's
+/// foreground group, also with its input piped in, and a TERM sent to
+/// enclos alone, as by `kill`, reaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn in_a_terminal_the_program_is_in_the_foreground_and_hears_term() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home"]).ok();
+    let _stop = StopOnDrop(&home, "home");
+    let sandbox_home = home.root.join("sandboxes/home/home");
+    let in_terminal = |line: &str| {
+        let mut cmd = Command::new("/usr/bin/script");
+        cmd.args(["-q", "/dev/null", "/bin/sh", "-c", line])
+            .env("ENCLOS_HOME", &home.root)
+            .env("HOME", home._dir.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        KillOnDrop(cmd.spawn().unwrap())
+    };
+    let enclos = env!("CARGO_BIN_EXE_enclos");
+    let read = |name: &str| std::fs::read_to_string(sandbox_home.join(name)).ok();
+
+    // Input piped in, output to the terminal: the foreground group.
+    let program = "echo $$ > \"$HOME/pid\"; /bin/sleep 5";
+    let _first = in_terminal(&format!(
+        "echo x | {enclos} exec home -- /bin/sh -c '{program}'"
+    ));
+    assert!(eventually(|| read("pid").is_some()));
+    let pid = read("pid").unwrap().trim().to_owned();
+    let groups = Command::new("/bin/ps")
+        .args(["-o", "pgid=,tpgid=", "-p", &pid])
+        .output()
+        .unwrap();
+    let groups = String::from_utf8_lossy(&groups.stdout).to_string();
+    let ids: Vec<&str> = groups.split_whitespace().collect();
+    assert_eq!(ids.len(), 2, "{groups}");
+    assert_eq!(ids[0], ids[1], "not the foreground group: {groups}");
+
+    // A TERM sent to enclos alone, the program's parent.
+    let program = "echo $PPID > \"$HOME/enclos\"; trap \"exit 4\" TERM; /bin/sleep 10 & wait";
+    let _second = in_terminal(&format!("{enclos} connect home -- /bin/sh -c '{program}'"));
+    assert!(eventually(|| read("enclos").is_some()));
+    let parent = read("enclos").unwrap().trim().to_owned();
+    // The process the program names is the enclos this test started.
+    let comm = Command::new("/bin/ps")
+        .args(["-o", "comm=", "-p", &parent])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&comm.stdout)
+            .trim()
+            .ends_with("enclos")
+    );
+    Command::new("/bin/kill")
+        .args(["-TERM", &parent])
+        .status()
+        .unwrap();
+    let audit = || home.run(&["audit"]).ok().stdout();
+    assert!(eventually(|| audit().contains("ok: exit 4")), "{}", audit());
 }
 
 #[cfg(target_os = "macos")]

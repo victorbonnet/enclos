@@ -203,6 +203,9 @@ pub enum Signal {
     Term,
     Kill,
     Usr1,
+    Int,
+    Quit,
+    Hup,
 }
 
 impl Signal {
@@ -211,6 +214,9 @@ impl Signal {
             Signal::Term => "TERM",
             Signal::Kill => "KILL",
             Signal::Usr1 => "USR1",
+            Signal::Int => "INT",
+            Signal::Quit => "QUIT",
+            Signal::Hup => "HUP",
         }
     }
 }

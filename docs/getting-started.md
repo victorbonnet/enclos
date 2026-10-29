@@ -67,9 +67,9 @@ enclos connect lab -- hermes -p scout    # the same agent, without the wrapper
 enclos connect lab                       # a shell in the sandbox, for anything else
 ```
 
-enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it.
+enclos does not need to know how a runtime picks an agent: whatever its documentation shows, put `enclos connect lab --` in front of it. From a script, or anything else that is not you at a terminal, use `enclos exec lab -- <command>`: it runs one command as a session of its own, with the input and output it is given, and exits with the command's code, or with 125 when enclos itself fails. Like `connect`, it first starts the sandbox's services when the runtime needs them; enclos's own messages go to stderr.
 
-Until you run the sandbox (below), only what you run in `connect` runs: the Hermes gateway, which serves scheduled jobs and messaging for every agent, is not running yet.
+The first `connect` or `exec` starts the sandbox's services, the Hermes gateway among them, since Hermes's own clients need it: it serves scheduled jobs and messaging for every agent. They come back at each login until `enclos sandbox stop lab`.
 
 Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
 
