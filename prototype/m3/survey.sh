@@ -3,7 +3,7 @@
 # it reads /sys, /proc, the kernel's build configuration, package versions
 # and systemd's settings, and prints one `key: value` line per fact. It runs
 # no bubblewrap, creates no namespace, changes no setting and signals
-# nothing, so it is safe on any host, the user's own included.
+# nothing, so it is safe on any host.
 #
 # The Landlock ABI comes from landlock_create_ruleset(NULL, 0,
 # LANDLOCK_CREATE_RULESET_VERSION), which only returns a number: it creates
@@ -21,8 +21,6 @@ say os "${PRETTY_NAME:-unknown}"
 [ -r /etc/rpi-issue ] && say rpi_issue "$(head -1 /etc/rpi-issue)"
 say arch "$(uname -m)"
 say kernel "$(uname -r)"
-model=$(first /proc/device-tree/model)
-[ -n "$model" ] && say model "$model"
 say glibc "$(getconf GNU_LIBC_VERSION 2>/dev/null || echo unknown)"
 
 # --- Landlock
