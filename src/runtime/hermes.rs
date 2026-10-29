@@ -139,17 +139,23 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
+    fn channel_token_file(&self, channel: Channel) -> Option<(HomePath, &'static str)> {
+        // Hermes's setup writes the built-in agent's bot token to its
+        // `.env` (`save_env_value` in `hermes_cli/setup_platforms.py`).
+        Some((at(".hermes/.env"), channel.token_variable()))
+    }
+
     fn channel(
         &self,
         channel: Channel,
         token: &str,
         answers: &[ChannelUser],
     ) -> Option<Vec<SandboxCommand>> {
-        // The default profile's bot. Under Hermes's gateway, which serves
-        // every profile in one process, only that profile reads the
-        // gateway's environment; another takes a token only from a file in
-        // its own folder (read in `agent/secret_scope.py`, Hermes 0.22.4),
-        // which enclos never writes (ADR 0022).
+        // The default profile's bot (ADR 0032). Under Hermes's gateway,
+        // which serves every profile in one process, only that profile
+        // reads the gateway's environment; whether another can take its own
+        // token from the secrets file (ADR 0034), which Hermes applies to
+        // every profile's scope, is to verify (design §14).
         let profile = DEFAULT_PROFILE.as_str();
         let set = |key: &str, value: &str| {
             SandboxCommand::from_words(&[HERMES, "-p", profile, "config", "set", key, value])
@@ -288,6 +294,13 @@ impl RuntimeAdapter for Hermes {
                 ["config.yaml", ".env"].map(|name| folder.child(name).expect("a plain file name"))
             })
             .collect()
+    }
+
+    fn secrets_folder_var(&self) -> Option<&'static str> {
+        // Hermes loads `$HERMES_MANAGED_DIR/.env` into its own environment,
+        // last and with override, when the folder exists
+        // (`hermes_cli/managed_scope.py`, `env_loader._apply_managed_env`).
+        Some("HERMES_MANAGED_DIR")
     }
 
     fn listener(&self) -> Option<RuntimeListener> {

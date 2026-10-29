@@ -22,6 +22,11 @@ pub trait SecretStore {
     fn env(&self) -> Vec<(String, String)> {
         Vec::new()
     }
+    /// Whether values can be read now without asking anyone: a locked
+    /// keychain would ask to be unlocked, in a dialog nobody may see.
+    fn readable(&self) -> Result<(), SecretError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -77,20 +82,30 @@ impl Unavailable {
     }
 }
 
+/// A copy of `value`, which is not `Clone`: a store in memory keeps its own.
+#[cfg(test)]
+fn copy(value: &SecretValue) -> SecretValue {
+    SecretValue::new(value.expose().to_owned()).expect("a value already checked")
+}
+
 /// A store in memory, for tests of other components.
 #[cfg(test)]
 #[derive(Default)]
-pub struct InMemory(pub std::cell::RefCell<std::collections::BTreeMap<SecretRef, SecretValue>>);
+pub struct InMemory(
+    pub std::cell::RefCell<std::collections::BTreeMap<SecretRef, SecretValue>>,
+    /// Set, it answers as a locked keychain does: not readable.
+    pub std::cell::Cell<bool>,
+);
 
 #[cfg(test)]
 impl SecretStore for InMemory {
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
-        self.0.borrow_mut().insert(secret.clone(), value.clone());
+        self.0.borrow_mut().insert(secret.clone(), copy(value));
         Ok(())
     }
 
     fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
-        Ok(self.0.borrow().get(secret).cloned())
+        Ok(self.0.borrow().get(secret).map(copy))
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
@@ -99,6 +114,16 @@ impl SecretStore for InMemory {
 
     fn whereabouts(&self, secret: &SecretRef) -> String {
         format!("{secret} in memory")
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        match self.1.get() {
+            true => Err(SecretError {
+                what: "the store in memory is locked".to_owned(),
+                untouched: true,
+            }),
+            false => Ok(()),
+        }
     }
 }
 
@@ -122,5 +147,9 @@ impl<T: SecretStore> SecretStore for std::rc::Rc<T> {
 
     fn env(&self) -> Vec<(String, String)> {
         (**self).env()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        (**self).readable()
     }
 }
