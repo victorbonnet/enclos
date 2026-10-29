@@ -271,40 +271,51 @@ enclos secret list lab
 - [ ] `secret rm` without `--yes` exits 3, since the value is kept nowhere else.
 - [ ] The value is in your login Keychain: `security find-generic-password -s enclos.<8 hex> -a lab/demo` finds it (the hex is in the service names `sandbox show lab` prints, `enclos.<8 hex>.lab.gateway`); after `secret rm`, `lab/piped` is gone from both.
 
-## 9. Telegram bots
+## 9. Telegram bots and agent settings
 
-The sandbox's bot, with the first token:
+Two bots in `lab`, one for the built-in agent and one for `main`, each granted to its agent alone (ADR 0036). First give each agent a prefix, so a reply says which agent wrote it:
 
 ```bash
-enclos secret set lab/telegram
-enclos --yes policy edit lab   # env = { DEMO = "secret:lab/demo", TELEGRAM_BOT_TOKEN = "secret:lab/telegram" }
+enclos connect lab -- /bin/sh -c 'echo "Start every reply with [default]." >> ~/.hermes/SOUL.md'
+enclos connect lab -- /bin/sh -c 'echo "Start every reply with [main]." >> ~/.hermes/profiles/main/SOUL.md'
+enclos secret set lab/telegram          # the first token
+enclos secret set lab/main-telegram     # the second token
+enclos policy edit lab                  # add at the end:
+                                        #   [secrets.agents.default]
+                                        #   env = { TELEGRAM_BOT_TOKEN = "secret:lab/telegram" }
+                                        #   [secrets.agents.main]
+                                        #   env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
+enclos --yes policy apply lab
+enclos policy show lab | grep -A3 '^Secrets'
+enclos secret list lab
 enclos runtime configure lab --channel telegram --allow-user <your id>
-enclos sandbox start lab
-enclos logs lab
+enclos runtime configure lab/main --channel telegram --allow-user <your id>
+enclos logs lab | grep -i telegram
 ```
 
-- [ ] `configure` sets up Hermes's Telegram channel. Without `--yes` on the edit above, the grant would wait as the pending policy and `configure` would refuse until `policy apply`.
-- [ ] Once the bot has answered (below), no file of this home holds the token but the secrets file: `grep -ral "<the part of the token after its colon>" "$ENCLOS_HOME" | grep -v /secrets/` finds nothing, the services' logs included.
-- [ ] While the gateway runs, `$ENCLOS_HOME/sandboxes/lab/secrets/.env` exists, `-rw-------` in a `drwx------` folder; after `enclos sandbox stop lab` it is gone. (`sandbox start lab` again after checking.)
-- [ ] Message the bot from your account: it answers. From an account not in `--allow-user`, it does not.
-- [ ] `enclos runtime configure lab/main --channel telegram --allow-user <your id>` is refused: enclos does not set up a bot of one agent's own yet (ADR 0032).
+- [ ] In the editor, put the first token under `[secrets]` first and save: it is refused, saying a bot's token goes under `[secrets.agents.default]`, and the editor opens again for you to move it.
+- [ ] `policy show` lists `$DEMO = secret:lab/demo  (every session and agent)`, then `$TELEGRAM_BOT_TOKEN` twice, `(agent default)` and `(agent main)`; `secret list` gives `telegram` as `$TELEGRAM_BOT_TOKEN for agent default` and `main-telegram` as `… for agent main`.
+- [ ] Each `configure` says `Agent lab/<agent> reads the secrets the policy grants it under [secrets.agents.<agent>]`, then that its Telegram bot is set up, its token read from `$TELEGRAM_BOT_TOKEN`, answering 1 user. Without `policy apply` first, it refuses until the grant is in force. (Run on a stopped sandbox, Hermes also prints `helper failed … no secrets applied` for each command: the agent's secrets file exists only while the services run. Harmless.)
+- [ ] The gateway's log has two Telegram connections and no `same credential` refusal.
+- [ ] Message each bot from your account: each answers, the first with `[default]`, the second with `[main]`. From an account not in `--allow-user`, neither does.
+- [ ] While the gateway runs, `$ENCLOS_HOME/sandboxes/lab/secrets/` holds `.env`, `default.env` and `main.env`, each `-rw-------` in a `drwx------` folder, and only `main.env` holds the second token; after `enclos sandbox stop lab` the files are gone. (`sandbox start lab` again after checking.)
+- [ ] Once the bots have answered, no file of this home holds a token but the secrets files: `grep -ral "<the part of a token after its colon>" "$ENCLOS_HOME" | grep -v /secrets/` finds nothing, for each token, the services' logs included.
+- [ ] From another sandbox: `enclos exec scout -- /bin/cat "$ENCLOS_HOME/sandboxes/lab/secrets/main.env"` and `enclos exec scout -- /bin/ls "$ENCLOS_HOME/sandboxes/lab/home"` both say `Operation not permitted`.
 
-A second bot in a second sandbox:
+Any other setting works the same way, a secret named only as `${VAR}`:
 
 ```bash
-enclos sandbox create home2 --template assistant
-enclos runtime install --sandbox home2 hermes
-enclos connect home2 -- hermes -p default setup  # skip its messaging sections
-enclos secret set home2/telegram                  # the second token
-enclos --yes policy edit home2   # [secrets] env = { TELEGRAM_BOT_TOKEN = "secret:home2/telegram" }
-enclos runtime configure home2 --channel telegram --allow-user <your id>
-enclos sandbox start home2
-enclos exec home2 -- /bin/cat "$ENCLOS_HOME/sandboxes/lab/secrets/.env"
-enclos exec home2 -- /bin/ls "$ENCLOS_HOME/sandboxes/lab/home"
+enclos runtime configure lab/main --set 'e2e.demo=${DEMO}'
+enclos connect lab -- /usr/bin/grep -n e2e -A1 .hermes/profiles/main/config.yaml
+enclos runtime configure lab/main --set 'e2e.token=${NOT_GRANTED}'; echo "exit $?"
+enclos runtime configure lab/main --set 'e2e.token=12345:abcdef'; echo "exit $?"
+enclos runtime configure lab/nosuch --set 'e2e.demo=${DEMO}'; echo "exit $?"
+enclos --dry-run runtime configure lab/main --set 'e2e.demo=${DEMO}'
 ```
 
-- [ ] Both bots answer, each from its own sandbox; `net log lab` and `net log home2` each show only their own gateway's connections.
-- [ ] From `home2`, `lab`'s secrets file and home: `Operation not permitted`.
+- [ ] The first says `Set: e2e.demo.`; the agent's `config.yaml` has `demo: ${DEMO}`, not the value.
+- [ ] A variable the policy grants neither `main` nor the whole sandbox is refused; so is `e2e.token` with no `${…}`, which `looks like a secret`; so is an agent enclos does not track, with the `agent add` command to track it. Each exits 1 and changes nothing.
+- [ ] The dry run lists the `hermes -p main config set …` commands it would run, and runs none.
 
 ## 10. Services
 
@@ -314,14 +325,14 @@ enclos logs lab -f                         # Ctrl-C to stop
 enclos connect lab -- /bin/sh -c 'echo "# e2e" >> ~/.hermes/config.yaml'
 enclos logs lab | grep changed
 enclos sandbox restart lab
-enclos sandbox stop lab home2
-enclos sandbox start lab home2
+enclos sandbox stop lab scout
+enclos sandbox start lab scout
 ```
 
 - [ ] `show` lists the proxy and gateway sessions with their processes, and both services `running (pid …)`.
 - [ ] Changing `~/.hermes/config.yaml` inside the sandbox: the log says `~/.hermes/config.yaml changed: asked the gateway service to restart`.
 - [ ] `restart`, then `stop` and `start` with two names, each say what they did per sandbox.
-- [ ] Save your work in other apps (a logout quits them), then log out of the Mac and back in: `lab` and `home2` run again and the bots answer. After `enclos sandbox stop lab`, a logout and login leave it stopped.
+- [ ] Save your work in other apps (a logout quits them), then log out of the Mac and back in: `lab` and `scout` run again and both bots answer. After `enclos sandbox stop lab`, a logout and login leave it stopped.
 
 ## 11. State check and repair
 
@@ -406,21 +417,21 @@ enclos exec lab -- /usr/bin/pbpaste > /dev/null; echo "pbpaste exit $?"
 ## 15. Remove everything
 
 ```bash
-enclos sandbox stop lab scout tools home2
+enclos sandbox stop lab scout tools
 enclos sandbox rm lab; echo "exit $?"       # needs confirmation
 enclos --yes sandbox rm lab
 enclos --yes sandbox rm scout
 enclos --yes sandbox rm tools
-enclos --yes sandbox rm home2
 enclos status
 launchctl list | grep "enclos\.<8 hex>\."
 ls ~/Library/LaunchAgents | grep "enclos\.<8 hex>\."
 security find-generic-password -s enclos.<8 hex> -a lab/telegram
+security find-generic-password -s enclos.<8 hex> -a lab/main-telegram
 rm -rf "$ENCLOS_HOME" ~/enclos-e2e-work; unset ENCLOS_HOME
 ```
 
 - [ ] `sandbox rm` without `--yes` exits 3, naming the home and the secrets it would delete; with it, it removes them.
-- [ ] `status` shows no sandbox; neither `launchctl list` nor `~/Library/LaunchAgents` has a job of this home; `security` no longer finds the bot's token (exit 44).
+- [ ] `status` shows no sandbox; neither `launchctl list` nor `~/Library/LaunchAgents` has a job of this home; `security` no longer finds either bot's token (exit 44 each).
 
 ## Known gaps: not findings
 
@@ -429,5 +440,5 @@ These are stated in the design and the release notes, so a test that shows them 
 - Another process of yours can read a sandbox's start-up environment, and a sandbox can list your Mac's processes (design §5). Secrets reach Hermes's gateway through its secrets file instead.
 - Hermes's browser tools do not start in a sandbox.
 - CPU time, memory and file size limits are refused: Seatbelt cannot hold them.
-- A bot of one agent's own is not set up (ADR 0032).
+- Agents of one sandbox share its files: an agent's secrets reach it alone, but another agent of the same sandbox can read its secrets file (ADR 0036). Isolation is per sandbox.
 - Linux is milestone 3.
