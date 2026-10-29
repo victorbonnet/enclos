@@ -22,7 +22,8 @@ pub struct Policy {
     /// before secrets existed.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub secrets: std::collections::BTreeMap<String, super::secret::SecretGrant>,
-    /// Limits on each process of the sandbox, fixed when it starts. Left
+    /// Limits on the sandbox's processes, each fixed when it starts (and,
+    /// for `memory` and `cpu`, on the sandbox as a whole). Left
     /// out of the snapshot when none is set, as secrets are.
     #[serde(default, skip_serializing_if = "Resources::is_unset")]
     pub resources: Resources,

@@ -1533,7 +1533,8 @@ mod tests {
         i.limits = crate::backend::LaunchLimits::of_checked(&crate::model::policy::Resources {
             open_files: Some(256),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let list = probes(&i);
         let limits: Vec<(&str, &str)> = list
             .iter()

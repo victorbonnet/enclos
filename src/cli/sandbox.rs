@@ -330,6 +330,11 @@ fn stop(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Re
 }
 
 fn restart(engine: &Engine, by: &Actor, name: &SandboxName, confirm: Confirm) -> Result<u8> {
+    // Before anything stops: a policy whose limits enclos could not set
+    // would stop the sandbox and then not start it again.
+    if confirm != Confirm::DryRun {
+        engine.check_start_limits(name)?;
+    }
     match engine.stop_sandbox(by, name, confirm)? {
         Planned::DryRun(plan) => {
             plan.changes.iter().for_each(|c| println!("Would {c}."));

@@ -239,8 +239,16 @@ fn print_rules(policy: &Policy) {
         );
     }
     let r = &policy.resources;
+    // Every field named, so one added is decided on here.
+    let enclos::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = r;
     if !r.is_unset() {
-        println!("\nLimits (each process, from its start)");
+        println!("\nLimits (each process, from its start; memory and CPU share for the sandbox)");
         if let Some(files) = r.open_files {
             println!("  open files: {files}");
         }
@@ -249,6 +257,12 @@ fn print_rules(policy: &Policy) {
         }
         if let Some(size) = r.file_size {
             println!("  file size:  {size}");
+        }
+        if let Some(memory) = &r.memory {
+            println!("  memory:     {memory}");
+        }
+        if let Some(cpu) = &r.cpu {
+            println!("  CPU share:  {cpu}");
         }
     }
 }
