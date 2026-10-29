@@ -706,3 +706,93 @@ fn a_file_on_the_allow_default_baseline_is_said_so() {
     std::fs::write(&ran, format!("{text}(edited)\n")).unwrap();
     assert_eq!(flag(&engine), (false, true));
 }
+
+/// Secrets in the runtime's settings, for the built-in agent and every
+/// other: a value in plain text and a reference the policy does not grant
+/// are found, a file that is a link is not read, and no value is kept.
+#[test]
+fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
+    use crate::engine::{Held, SettingsFinding};
+    use crate::model::runtime::RuntimeKind;
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::runtime::HomePath;
+    use crate::secrets::InMemory;
+    let (_dir, engine, name) = with_sandbox();
+    let engine = engine.with_secrets(Box::new(InMemory::default()));
+    // No runtime yet: nothing to look at.
+    assert!(check_of(&engine.doctor(), &name).settings.is_empty());
+
+    engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = engine.state.get(&name)?.unwrap();
+                record.runtime = Some(RuntimeKind::Hermes);
+                Ok(engine.state.put(lock, &record)?)
+            },
+        )
+        .unwrap();
+    let secret: SecretRef = "home/openrouter".parse().unwrap();
+    let value = SecretValue::new("sk-granted".into()).unwrap();
+    done(
+        engine
+            .secret_set(&alice(), &secret, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets]\nenv = {{ OPENROUTER_API_KEY = \"secret:home/openrouter\" }}\n"
+    );
+    engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap();
+
+    let home = engine.layout.sandbox_home("home");
+    let main = home.join(".hermes/profiles/main");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::write(
+        home.join(".hermes/.env"),
+        "OPENROUTER_API_KEY=sk-plain\nTELEGRAM_ALLOWED_USERS=1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".hermes/config.yaml"),
+        "model:\n  api_key: ${OPENROUTER_API_KEY}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        main.join("config.yaml"),
+        "platforms:\n  slack:\n    bot_token: ${SLACK_BOT_TOKEN}\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", main.join(".env")).unwrap();
+
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    let at = |p: &str| HomePath::new(p).unwrap();
+    assert_eq!(
+        check.settings,
+        [
+            SettingsFinding::Plain {
+                file: at(".hermes/.env"),
+                line: 1,
+                held: Held::Variable("OPENROUTER_API_KEY".into()),
+                granted: true,
+            },
+            SettingsFinding::NotGranted {
+                file: at(".hermes/profiles/main/config.yaml"),
+                line: 3,
+                variable: "SLACK_BOT_TOKEN".into(),
+            },
+        ]
+    );
+    assert!(
+        check.unreadable.iter().any(|u| u
+            == "did not look for secrets in ~/.hermes/profiles/main/.env: ~/.hermes/profiles/main/.env is a link"),
+        "{check:?}"
+    );
+    assert!(!format!("{doctor:?}").contains("sk-plain"));
+}

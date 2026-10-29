@@ -21,6 +21,7 @@ mod sandbox;
 mod secrets;
 mod service;
 mod session;
+mod settings_secrets;
 mod state_check;
 mod status;
 #[cfg(test)]
@@ -44,6 +45,7 @@ pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
+pub use settings_secrets::{Held, SettingsFinding};
 pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,

@@ -1,10 +1,11 @@
-//! `enclos doctor`: what keeps enclos from working on this host, and which
-//! compiled policies enclos now writes differently (design §10).
+//! `enclos doctor`: what keeps enclos from working on this host, which
+//! compiled policies enclos now writes differently, and secrets in a
+//! runtime's settings (design §10).
 
 use enclos::backend::Enforcement;
 use enclos::engine::{
-    BackendCheck, BackendState, Doctor, Drift, DriftKind, Engine, LineChange, Lines, MAX_LINES,
-    NextSession, RanFile, SandboxCheck, Sandboxes,
+    BackendCheck, BackendState, Doctor, Drift, DriftKind, Engine, Held, LineChange, Lines,
+    MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
 
@@ -118,6 +119,45 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                 found
             })
             .collect();
+        let settings: Vec<_> = s
+            .settings
+            .iter()
+            .map(|f| match f {
+                SettingsFinding::Plain {
+                    file,
+                    line,
+                    held: Held::Variable(variable),
+                    granted,
+                } => json!({
+                    "kind": "plain",
+                    "file": file.to_string(),
+                    "line": line,
+                    "variable": variable,
+                    "granted": granted,
+                }),
+                SettingsFinding::Plain {
+                    file,
+                    line,
+                    held: Held::Key(key),
+                    ..
+                } => json!({
+                    "kind": "plain",
+                    "file": file.to_string(),
+                    "line": line,
+                    "key": key,
+                }),
+                SettingsFinding::NotGranted {
+                    file,
+                    line,
+                    variable,
+                } => json!({
+                    "kind": "not_granted",
+                    "file": file.to_string(),
+                    "line": line,
+                    "variable": variable,
+                }),
+            })
+            .collect();
         json!({
             "name": s.name.to_string(),
             "backend": s.backend.to_string(),
@@ -125,6 +165,7 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             "next_session": next,
             "last_version": s.last_version,
             "drift": drift,
+            "settings": settings,
             "unreadable": s.unreadable,
         })
     };
@@ -254,6 +295,9 @@ fn sandbox(s: &SandboxCheck) -> String {
     for drift in &s.drift {
         out += &drift_lines(name.as_str(), drift);
     }
+    for finding in &s.settings {
+        out += &settings_line(name.as_str(), finding);
+    }
     for what in &s.unreadable {
         out += &format!("    enclos could not look: {what}\n");
     }
@@ -344,6 +388,46 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
     out
 }
 
+/// A secret found in the runtime's settings, and what to do about it. Only
+/// names: doctor never prints a value.
+fn settings_line(name: &str, finding: &SettingsFinding) -> String {
+    let store = format!("store it with `enclos secret set {name}/<secret>`");
+    let grant = format!("grant it with `enclos policy edit {name}`");
+    match finding {
+        SettingsFinding::Plain {
+            file,
+            line,
+            held: Held::Variable(variable),
+            granted: true,
+        } => format!(
+            "    {file}, line {line}, holds {variable} in plain text, which the policy already grants as a secret: remove the line\n"
+        ),
+        SettingsFinding::Plain {
+            file,
+            line,
+            held: Held::Variable(variable),
+            granted: false,
+        } => format!(
+            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {grant} as {variable}, then remove the line\n"
+        ),
+        SettingsFinding::Plain {
+            file,
+            line,
+            held: Held::Key(key),
+            ..
+        } => format!(
+            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {grant} as a variable, then set `{key}` to `${{VARIABLE}}` with the runtime's own command\n"
+        ),
+        SettingsFinding::NotGranted {
+            file,
+            line,
+            variable,
+        } => format!(
+            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant, so nothing enclos gives the sandbox sets it: {store}, then {grant} as {variable}\n"
+        ),
+    }
+}
+
 fn enforced(e: &Enforcement) -> String {
     match e {
         Enforcement::Enforced => "enforced".to_owned(),
@@ -388,6 +472,7 @@ mod tests {
             },
             last_version: Some(2),
             drift: Vec::new(),
+            settings: Vec::new(),
             unreadable: Vec::new(),
         }
     }
@@ -603,6 +688,64 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("until restarted").count(), 0, "{shown}");
+    }
+
+    /// Each secret found in the runtime's settings is a line naming the file,
+    /// the line and what to do, in text and in JSON.
+    #[test]
+    fn secrets_in_the_runtimes_settings_are_said_by_name() {
+        use enclos::runtime::HomePath;
+        let env = HomePath::new(".hermes/.env").unwrap();
+        let config = HomePath::new(".hermes/config.yaml").unwrap();
+        let doctor = doctor(SandboxCheck {
+            settings: vec![
+                SettingsFinding::Plain {
+                    file: env.clone(),
+                    line: 3,
+                    held: Held::Variable("OPENROUTER_API_KEY".into()),
+                    granted: false,
+                },
+                SettingsFinding::Plain {
+                    file: env,
+                    line: 4,
+                    held: Held::Variable("TELEGRAM_BOT_TOKEN".into()),
+                    granted: true,
+                },
+                SettingsFinding::Plain {
+                    file: config.clone(),
+                    line: 7,
+                    held: Held::Key("token".into()),
+                    granted: false,
+                },
+                SettingsFinding::NotGranted {
+                    file: config,
+                    line: 9,
+                    variable: "SLACK_BOT_TOKEN".into(),
+                },
+            ],
+            ..compiles()
+        });
+        let shown = shown(&doctor);
+        for expected in [
+            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it with `enclos policy edit home` as OPENROUTER_API_KEY, then remove the line\n",
+            "    ~/.hermes/.env, line 4, holds TELEGRAM_BOT_TOKEN in plain text, which the policy already grants as a secret: remove the line\n",
+            "    ~/.hermes/config.yaml, line 7, holds `token` in plain text",
+            "then set `token` to `${VARIABLE}` with the runtime's own command\n",
+            "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        // A secret found is reported, not a problem.
+        assert!(!doctor.has_problems());
+        let json = json(&doctor);
+        let settings = &json["records"]["sandboxes"][0]["settings"];
+        assert_eq!(settings[0]["kind"], "plain", "{json}");
+        assert_eq!(settings[0]["file"], "~/.hermes/.env", "{json}");
+        assert_eq!(settings[0]["variable"], "OPENROUTER_API_KEY", "{json}");
+        assert_eq!(settings[1]["granted"], true, "{json}");
+        assert_eq!(settings[2]["key"], "token", "{json}");
+        assert_eq!(settings[3]["kind"], "not_granted", "{json}");
+        assert_eq!(json["problems"], false, "{json}");
     }
 
     /// A sandbox whose backend does not run here is never said to compile
