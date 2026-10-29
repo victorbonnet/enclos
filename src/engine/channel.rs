@@ -3,6 +3,7 @@
 //! secrets.
 
 use super::Engine;
+use super::settings_secrets::dotenv_line;
 use crate::error::{Error, Result};
 use crate::model::audit::Actor;
 use crate::model::channel::{Channel, ChannelUser};
@@ -179,16 +180,9 @@ fn unreachable(name: &SandboxName, channel: Channel) -> String {
 /// Whether the `.env` text `text` sets `variable` to something: a line
 /// `variable=...` or `export variable=...`, with a value that is not empty.
 fn holds_variable(text: &str, variable: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        line.strip_prefix(variable)
-            .and_then(|rest| rest.trim_start().strip_prefix('='))
-            .is_some_and(|value| {
-                let value = value.trim();
-                !value.is_empty() && value != "\"\"" && value != "''"
-            })
-    })
+    text.lines()
+        .filter_map(dotenv_line)
+        .any(|(name, value)| name == variable && !matches!(value, "" | "\"\"" | "''"))
 }
 
 #[cfg(test)]

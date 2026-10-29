@@ -17,7 +17,8 @@ use crate::state::StateLock;
 const READ_EVERY: Duration = Duration::from_secs(2);
 /// Hermes's setup writes `.env` and `config.yaml` one after the other.
 const SETTLE: Duration = Duration::from_secs(5);
-const MAX_SETTINGS: u64 = 1024 * 1024;
+/// The largest settings file read, here and by `doctor`.
+pub(super) const MAX_SETTINGS: u64 = 1024 * 1024;
 /// Doubled after each failure, so one that lasts does not fill the audit log.
 const RETRY: Duration = Duration::from_secs(60);
 const RETRY_MAX: Duration = Duration::from_secs(64 * 60);

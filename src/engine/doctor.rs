@@ -5,7 +5,8 @@
 //! policies are kept by their content, so an upgrade that changes what
 //! enclos adds when it compiles a policy writes a new file at the next
 //! session start, without asking (ADR 0018); this is where that change is
-//! shown.
+//! shown. It also looks for secrets in the runtime's settings files in the
+//! sandbox home (ADR 0036, proposed).
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -15,6 +16,7 @@ use std::path::PathBuf;
 use super::Engine;
 use super::compile::compiled_stem;
 use super::session::marked_in;
+use super::settings_secrets::SettingsFinding;
 use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
@@ -86,6 +88,9 @@ pub struct SandboxCheck {
     /// Each file its last or a running session ran under that its policy
     /// version compiles differently from now.
     pub drift: Vec<Drift>,
+    /// Secrets in plain text, or not granted, in its runtime's settings
+    /// files: reported, not a problem.
+    pub settings: Vec<SettingsFinding>,
     /// What enclos could not look at for it: what is above may then be
     /// incomplete.
     pub unreadable: Vec<String>,
@@ -207,8 +212,8 @@ impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
     /// enclos's records cannot be read, or a sandbox's backend does not
     /// run, its next session cannot compile its policy, or enclos could not
-    /// look at all of it. A compiled policy that changed is reported, not a
-    /// problem.
+    /// look at all of it. A compiled policy that changed, and a secret found
+    /// in a runtime's settings, are reported, not problems.
     pub fn has_problems(&self) -> bool {
         let sandbox = |s: &SandboxCheck| {
             !s.backend_runs()
@@ -297,8 +302,11 @@ impl Engine {
             },
             last_version: None,
             drift: Vec::new(),
+            settings: Vec::new(),
             unreadable: Vec::new(),
         };
+        // Whatever its backend: the home is read on the host.
+        check.settings = self.settings_secrets(record, &mut check.unreadable);
         let sessions = match self.state.sessions(name, false) {
             Ok(sessions) => sessions,
             Err(e) => {
