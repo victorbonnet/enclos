@@ -5,6 +5,7 @@ then starts the relay, confined like the rest, and runs the command.
 
     python3 -I inside.py --compiled compiled.json [--landlock auto|off]
         [--seccomp on|off] [--relay] [--setns-net-fd N] [--close-fd N]...
+        [--service-forward FD PORT_FILE] [--service-relay PORT SOCKET]
         -- command...
 
 For M3-03, --setns-net-fd enters the sandbox's network namespace from a
@@ -12,6 +13,15 @@ descriptor its holder gave (nsjoin.py's `userns` ways, where bubblewrap kept
 CAP_SYS_ADMIN in the holder's user namespace), then drops every capability,
 before Landlock and seccomp, which refuses setns. --close-fd closes the
 holder's descriptors so the command never holds them.
+
+For M3-03's option 2 (nsjoin.py's `relay` way), where every session has its
+own network namespace: in the service's session, --service-forward accepts
+on a Unix socket the host made and passed in as FD (in the sandbox's run/
+folder, which the sandbox cannot write) and forwards each connection to
+127.0.0.1 at the port the host wrote in PORT_FILE, also in run/, after it
+read the port from the service's own listeners. In every other session,
+--service-relay listens on 127.0.0.1:PORT and forwards each connection to
+that socket, as the proxy's relay does.
 
 Landlock goes through its three system calls with ctypes (stdlib only);
 seccomp through libseccomp's Python binding (`python3-seccomp`). Each line it
@@ -201,6 +211,47 @@ def apply_seccomp(spec):
     say(f"seccomp=applied deny={len(spec['deny']) - len(skipped)}{note}")
 
 
+def start_service_forward(fd, port_file):
+    """In the service's session: each connection on the host's Unix socket
+    to 127.0.0.1 at the port the host recorded."""
+    srv = socket.socket(fileno=fd)
+
+    def one(conn):
+        try:
+            with open(port_file) as f:
+                port = int(f.read().strip())
+            up = socket.create_connection(("127.0.0.1", port), timeout=10)
+            up.settimeout(None)
+        except (OSError, ValueError):
+            conn.close()
+            return
+        relay.pump(conn, up)
+
+    if os.fork() == 0:
+        import threading
+        try:
+            while True:
+                conn, _ = srv.accept()
+                threading.Thread(target=one, args=(conn,), daemon=True).start()
+        finally:
+            os._exit(0)
+    srv.close()
+    say(f"service-forward=fd {fd} -> 127.0.0.1:<port in {port_file}>")
+
+
+def start_service_relay(port, path):
+    """In every other session: 127.0.0.1:port to the service's socket."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(64)
+    if os.fork() == 0:
+        relay.serve(srv, path)
+        os._exit(0)
+    srv.close()
+    say(f"service-relay=127.0.0.1:{port} -> {path}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--compiled", required=True)
@@ -209,6 +260,8 @@ def main():
     p.add_argument("--relay", action="store_true")
     p.add_argument("--setns-net-fd", type=int)
     p.add_argument("--close-fd", type=int, action="append", default=[])
+    p.add_argument("--service-forward", nargs=2, metavar=("FD", "PORT_FILE"))
+    p.add_argument("--service-relay", nargs=2, metavar=("PORT", "SOCKET"))
     p.add_argument("command", nargs=argparse.REMAINDER)
     o = p.parse_args()
     cmd = o.command[1:] if o.command[:1] == ["--"] else o.command
@@ -244,6 +297,10 @@ def main():
             os._exit(0)
         srv.close()
         say(f"relay=127.0.0.1:{r['port']} -> {r['socket']}")
+    if o.service_forward:
+        start_service_forward(int(o.service_forward[0]), o.service_forward[1])
+    if o.service_relay:
+        start_service_relay(int(o.service_relay[0]), o.service_relay[1])
     os.execvp(cmd[0], cmd)
 
 

@@ -19,11 +19,13 @@ COMPILED = ["--ro-bind", "/", "/", "--unshare-user", "--disable-userns", "--unsh
 
 
 class Join(unittest.TestCase):
-    def test_own_changes_nothing(self):
+    def test_own_and_relay_change_nothing(self):
         self.assertEqual(nsjoin.join(COMPILED, "own"), ([], COMPILED, []))
+        self.assertEqual(nsjoin.join(COMPILED, "relay"), ([], COMPILED, []))
 
-    def test_every_joined_way_shares_the_network_and_closes_the_descriptors(self):
-        for way in nsjoin.WAYS[1:]:
+    def test_every_shared_way_shares_the_network_and_closes_the_descriptors(self):
+        self.assertEqual(sorted(nsjoin.SHARED + ["own", "relay"]), sorted(nsjoin.WAYS))
+        for way in nsjoin.SHARED:
             prefix, args, inside = nsjoin.join(COMPILED, way)
             self.assertNotIn("--unshare-net", args, way)
             for fd in ("10", "11", "12"):
@@ -61,6 +63,16 @@ class Join(unittest.TestCase):
         _, args, _ = nsjoin.join(COMPILED, "userns-subpid")
         self.assertIn("--unshare-pid", args)
         self.assertIn("--pidns", args)
+
+    def test_userns_net_joins_the_user_namespace_alone_and_keeps_its_own_pids(self):
+        prefix, args, inside = nsjoin.join(COMPILED, "userns-net")
+        self.assertEqual(prefix, [])
+        self.assertEqual(args[:4], ["--userns", "10", "--cap-add", "CAP_SYS_ADMIN"])
+        self.assertNotIn("--pidns", args)
+        self.assertIn("--unshare-pid", args)
+        for flag in ("--unshare-user", "--disable-userns", "--unshare-net"):
+            self.assertNotIn(flag, args)
+        self.assertEqual(inside[:2], ["--setns-net-fd", "12"])
 
     def test_an_unknown_way_is_refused(self):
         with self.assertRaises(ValueError):

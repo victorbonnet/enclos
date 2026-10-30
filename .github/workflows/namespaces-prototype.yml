@@ -3,7 +3,8 @@ name: namespaces-prototype
 # Milestone 3's namespaces experiment (prototype/m3/, design §15 and §14,
 # M3-03) on GitHub's Ubuntu runners: whether every session of a sandbox can
 # share one network and PID namespace that enclos made first, what that
-# changes, and whether Hermes's clients find a gateway in another session.
+# changes, what refuses each way of joining, and whether Hermes's clients
+# find a gateway in another session.
 # Every check acts on the host, so they run only on these throwaway runners.
 # Each writes its result to m3-results/, uploaded as the job's artifact and
 # shown in its summary. It reports; it does not gate merges.
@@ -38,6 +39,9 @@ jobs:
       - name: Namespaces per session or per sandbox
         if: always()
         run: bash prototype/m3/namespaces-check.sh
+      - name: What refuses joining a holder's namespaces
+        if: always()
+        run: bash prototype/m3/ns-diagnose.sh
       - name: Hermes's clients and a gateway in another session
         if: always()
         run: bash prototype/m3/hermes-ns-check.sh

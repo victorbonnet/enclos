@@ -11,12 +11,18 @@
 # the gateway before it needs a model) and hermes-discover.py. No account is
 # logged in, so the chat is expected to stop at the model; what matters is
 # whether it got past the gateway, and whether it started a gateway of its
-# own (ADR 0028, Consequences), counted from the host before and after.
+# own (ADR 0028, Consequences), counted from the host before and after and
+# read in Hermes's gateway-starts.log.
 #
 #   own          each session its own network and PID namespaces (control)
-#   nsenter      one network namespace, each session its own PIDs
-#   nsenter-pid  one network and one PID namespace
-#   userns       one network and one PID namespace, bubblewrap joining them
+#   userns-net   one network namespace, the holder's, joined with bubblewrap's
+#                --userns and inside.py's setns; each session its own PIDs
+#                (option 1a)
+#   relay        each session its own namespaces; the gateway's port, read
+#                from the host, relayed through run/service.sock (option 2)
+#
+# The first run's nsenter and --pidns ways failed at start (README.md), so
+# they are not run again here; ns-diagnose.sh looks at why.
 #
 # Acts on the host (runs bubblewrap, makes namespaces, installs Hermes in the
 # home): CI only.
@@ -26,7 +32,7 @@ out="$RESULTS_DIR/60-hermes-namespaces.md"
 tmp="$RESULTS_DIR/hermes-namespaces"
 mkdir -p "$tmp"
 installer_url="https://hermes-agent.nousresearch.com/install.sh"  # src/runtime/hermes.rs
-WAYS=(own nsenter nsenter-pid userns)
+WAYS=(own userns-net relay)
 
 python3 -I "$M3/unix-proxy.py" --socket "$PROXY_SOCK" --learn --log "$tmp/proxy.jsonl" \
     >"$tmp/proxy.out" 2>&1 &
@@ -63,7 +69,14 @@ py=$(head -1 "$SBX_HOME/.local/bin/hermes" 2>/dev/null | sed -n 's/^#!\([^ ]*pyt
     fi
 } >"$tmp/source.txt"
 
-gateways() { ps -eo pid=,args= | grep -E '[g]ateway run' | grep -v -E 'bwrap|nsenter|timeout|sbx-ns' ; }
+# Hermes's gateway, found two ways from the host: the processes holding a
+# port on 127.0.0.1 in the ephemeral range in its network namespace (as ADR
+# 0028 has enclos find it), and the processes whose command line names
+# Hermes and its gateway (ns-procs.py leaves the launchers out, which the
+# first run's count did not). gateway-starts.log, in the home, is Hermes's
+# own record of each gateway start.
+starts() { wc -l <"$SBX_HOME/.hermes/gateway-starts.log" 2>/dev/null || echo 0; }
+by_name() { python3 -I "$M3/ns-procs.py" match hermes gateway | sed "s#$SBX_HOME#~#g" | cut -c1-200; }
 summary=()
 for way in "${WAYS[@]}"; do
     start_holder A
@@ -71,53 +84,65 @@ for way in "${WAYS[@]}"; do
     hA=$(cat "$A/pid" 2>/dev/null)
     started+=("$(cat "$A/bwrap.pid")")
     relay=()
-    [ "$way" = own ] && relay=(SBX_RELAY=1)
+    case $way in own|relay) relay=(SBX_RELAY=1) ;; esac
+    gwrole=()
+    [ "$way" = relay ] && gwrole=(SBX_SERVICE_FORWARD=1)
+    rm -f "$SBX_HOME/.hermes/gateway.sock" "$SBX_RUN/service.sock" "$SBX_RUN/service.port"
     sess=(env SBX_JOIN="$way" SBX_HOLDER="$A/holder.sock" "${relay[@]}" timeout 600 "$M3/sbx-ns.sh" --)
-    rm -f "$SBX_HOME/.hermes/gateway.sock"
+    starts_before=$(starts)
 
-    "${sess[@]}" /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec hermes -p default gateway run --external-supervisor -v' \
+    env "${gwrole[@]}" "${sess[@]:1}" /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec hermes -p default gateway run --external-supervisor -v' \
         </dev/null >"$tmp/$way-gateway.log" 2>&1 &
     gw=$!
     started+=($gw)
     for _ in $(seq 90); do [ -S "$SBX_HOME/.hermes/gateway.sock" ] && break; sleep 1; done
     sleep 10
-    before=$(gateways)
-    # The gateway's loopback listeners, read from the host: in holder A's
-    # network namespace, or (own) in the gateway's own.
-    gwpid=$(echo "$before" | awk 'NR==1 {print $1}')
-    nspid=$hA
-    [ "$way" = own ] && nspid=$gwpid
-    listeners=$(python3 -I -c '
-import socket, struct, sys
-try:
-    lines = open(f"/proc/{sys.argv[1]}/net/tcp").read().splitlines()[1:]
-except OSError as e:
-    sys.exit(f"unreadable ({e.strerror})")
-for line in lines:
-    local, state = line.split()[1], line.split()[3]
-    if state == "0A":
-        addr, port = local.split(":")
-        ip = socket.inet_ntoa(struct.pack("<I", int(addr, 16)))
-        print(f"{ip}:{int(port, 16)}", end=" ")
-' "${nspid:-none}" 2>&1)
 
-    "${sess[@]}" /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; timeout 120 hermes -z "Reply with exactly one word: ok"' \
+    # A process in the gateway's network namespace: holder A's when shared,
+    # else the deepest of the gateway session's processes with a listener
+    # in the ephemeral range.
+    nspid=""
+    if [ "$way" = userns-net ]; then
+        nspid=$hA
+    else
+        for p in $(python3 -I "$M3/ns-procs.py" descendants "$gw"); do
+            if [ -n "$(python3 -I "$M3/ns-listeners.py" "$p" --ephemeral 2>/dev/null)" ]; then nspid=$p; break; fi
+        done
+    fi
+    listeners=$(python3 -I "$M3/ns-listeners.py" "${nspid:-none}" --ephemeral 2>&1 | tr '\t\n' ' ;')
+    port=$(python3 -I "$M3/ns-listeners.py" "${nspid:-none}" --ephemeral --port-only 2>/dev/null)
+    named_before=$(by_name)
+    chatrole=()
+    if [ "$way" = relay ] && [ -n "$port" ]; then
+        echo "$port" >"$SBX_RUN/service.port"
+        chatrole=(SBX_SERVICE_PORT="$port")
+    fi
+
+    env "${chatrole[@]}" "${sess[@]:1}" /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; timeout 120 hermes -z "Reply with exactly one word: ok"' \
         </dev/null >"$tmp/$way-chat.log" 2>&1
     chat=$?
-    "${sess[@]}" "$py" -I "$M3/hermes-discover.py" "$src" </dev/null >"$tmp/$way-discover.log" 2>&1
+    env "${chatrole[@]}" "${sess[@]:1}" "$py" -I "$M3/hermes-discover.py" "$src" </dev/null >"$tmp/$way-discover.log" 2>&1
     sleep 5
-    after=$(gateways)
+    named_after=$(by_name)
+    starts_after=$(starts)
+    listeners_after=$(python3 -I "$M3/ns-listeners.py" "${nspid:-none}" --ephemeral 2>&1 | tr '\t\n' ' ;')
     {
         echo "### \`$way\`"
         echo
         echo "gateway.sock: $([ -S "$SBX_HOME/.hermes/gateway.sock" ] && echo present || echo absent)"
         echo
-        echo "Listening on 127.0.0.1 in the gateway's network namespace (host pid ${nspid:-none}): ${listeners:-none}"
+        echo "The gateway session's launch: $(grep -h '^inside:\|^bwrap:\|^nsenter:' "$tmp/$way-gateway.log" | tr '\n' ' ')"
         echo
-        echo "Gateway processes on the host, before the chat:"
-        echo "${before:-none}" | sed "s#$SBX_HOME#~#g" | cut -c1-160 | fence
+        echo "Ports on 127.0.0.1 in the ephemeral range in the gateway's network namespace (host pid ${nspid:-none}), with their holders: before the chat ${listeners:-none}; after ${listeners_after:-none}"
+        echo
+        echo "The port given to the chat's session: ${port:-none} ($([ "$way" = relay ] && echo "relayed through run/service.sock" || echo "not relayed"))"
+        echo
+        echo "Processes naming Hermes and its gateway, before the chat:"
+        echo "${named_before:-none}" | fence
         echo "after the chat and the discovery:"
-        echo "${after:-none}" | sed "s#$SBX_HOME#~#g" | cut -c1-160 | fence
+        echo "${named_after:-none}" | fence
+        echo "gateway-starts.log: $starts_before lines before the gateway, $starts_after after the chat; its last lines:"
+        tail -5 "$SBX_HOME/.hermes/gateway-starts.log" 2>&1 | fence
         echo "The chat (exit $chat), its last 40 lines:"
         grep -v '^inside:' "$tmp/$way-chat.log" | tail -40 | sed "s#$SBX_HOME#~#g" | cut -c1-200 | fence
         echo "What inside.py applied to the chat's session: $(grep -h '^inside:' "$tmp/$way-chat.log" | tr '\n' ' ')"
@@ -125,12 +150,12 @@ for line in lines:
         echo "hermes-discover.py:"
         grep -v '^inside:' "$tmp/$way-discover.log" | sed "s#$SBX_HOME#~#g" | cut -c1-200 | head -80 | fence
         echo "The gateway's output, lines naming a client, a ticket, a socket or a port:"
-        grep -inE 'client|ticket|socket|listen|port|websocket|lock|already' "$tmp/$way-gateway.log" \
+        grep -inE 'client|ticket|socket|listen|port|websocket|lock|already|attach' "$tmp/$way-gateway.log" \
             | sed "s#$SBX_HOME#~#g" | cut -c1-200 | head -40 | fence
         echo "Hermes's gateway files in its home:"
         ls -la "$SBX_HOME/.hermes" 2>&1 | grep -i gateway | fence
     } >"$tmp/$way.md"
-    summary+=("| \`$way\` | $(echo "$before" | grep -c .) | $(echo "$after" | grep -c .) | exit $chat |")
+    summary+=("| \`$way\` | ${port:-none} | $(echo "$named_before" | grep -c .) | $(echo "$named_after" | grep -c .) | $((starts_after - starts_before)) | exit $chat: $(grep -v '^inside:' "$tmp/$way-chat.log" | tail -1 | tr '|' ' ' | cut -c1-100) |")
 
     # End the gateway session and holder this check started; in a shared
     # PID namespace, whatever the chat started there ends with the holder.
@@ -147,8 +172,10 @@ done
     section "How a client finds its gateway, in Hermes's source"
     sed "s#$SBX_HOME#~#g" "$tmp/source.txt" | fence
     section "Each way"
-    echo "| way | gateways before the chat | after | chat |"
-    echo "| --- | --- | --- | --- |"
+    echo "\"port\": the gateway's one port on 127.0.0.1 in the ephemeral range, read from the host. \"named\": processes whose command line names Hermes and its gateway, launchers left out, before and after the chat. \"starts\": lines added to Hermes's gateway-starts.log by the gateway and the chat."
+    echo
+    echo "| way | port | named before | named after | starts | chat |"
+    echo "| --- | --- | --- | --- | --- | --- |"
     printf '%s\n' "${summary[@]}"
     echo
     for way in "${WAYS[@]}"; do [ -e "$tmp/$way.md" ] && cat "$tmp/$way.md"; done
