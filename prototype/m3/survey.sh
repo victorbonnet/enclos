@@ -82,6 +82,9 @@ say systemd.user_unit_delegate "$(systemctl cat user@.service 2>/dev/null | sed 
 # --- systemd --user at logout
 say systemd.version "$(systemctl --version 2>/dev/null | head -1)"
 say logind.linger "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo 'unknown (no session)')"
-lp() { busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager "$1" 2>/dev/null | cut -d' ' -f2- || echo unknown; }
+lp() {
+    value=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager "$1" 2>/dev/null) || { echo unknown; return; }
+    printf '%s\n' "$value" | cut -d' ' -f2-
+}
 say logind.KillUserProcesses "$(lp KillUserProcesses)"
 say logind.UserStopDelayUSec "$(lp UserStopDelayUSec)"
