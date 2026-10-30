@@ -34,11 +34,12 @@ jobs:
         run: python3 -I prototype/m3/test_relay.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
-      - name: Landlock proc O_TRUNC regression
-        run: python3 -I prototype/m3/test_oom.py
       - name: Files, programs and system calls
         if: always()
         run: bash prototype/m3/sandbox-check.sh
+      - name: OOM-score writes under Landlock
+        if: always()
+        run: bash prototype/m3/oom-check.sh
       - name: The host's Unix sockets
         if: always()
         run: bash prototype/m3/sockets-check.sh

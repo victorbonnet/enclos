@@ -14,6 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compile as comp  # noqa: E402
+import inside
 import wrap
 from unittest.mock import patch
 
@@ -124,6 +125,12 @@ class CompileTest(Case):
         self.assertEqual(s["ioctl"]["TIOCSTI"], 0x5412)
         self.assertEqual(s["clone_flags"]["CLONE_NEWUSER"], 0x10000000)
         self.assertEqual(s["enosys"], ["clone3"])
+
+    def test_the_proc_rule_holds_truncate_only_when_asked(self):
+        rules = self.compiled()["landlock"]
+        for asked, granted in [(False, 0), (True, inside.TRUNCATE)]:
+            rights = dict(inside.landlock_grants(rules, asked))["/proc"]
+            self.assertEqual(rights & inside.TRUNCATE, granted)
 
     def test_a_deny_entry_outside_the_home_is_refused(self):
         with self.assertRaises(SystemExit):

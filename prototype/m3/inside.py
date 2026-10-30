@@ -4,7 +4,7 @@ rules where the kernel has Landlock (ADR 0037), then the seccomp filter,
 then starts the relay, confined like the rest, and runs the command.
 
     python3 -I inside.py --compiled compiled.json [--landlock auto|off]
-        [--seccomp on|off] [--relay] -- command...
+        [--seccomp on|off] [--proc-truncate] [--relay] -- command...
 
 Landlock goes through its three system calls with ctypes (stdlib only);
 seccomp through libseccomp's Python binding (`python3-seccomp`). Each line it
@@ -79,7 +79,24 @@ def landlock_abi():
     return r, None
 
 
-def apply_landlock(rules):
+def landlock_grants(rules, proc_truncate=False):
+    """(path, rights) for each rule. `proc_truncate` adds TRUNCATE to the /proc
+    rule, for oom-check.sh to compare; the draft rules leave it out."""
+    grants = []
+    for path in rules["read"]:
+        grants.append((path, READ))
+    for path in rules["execute"]:
+        grants.append((path, READ | EXECUTE))
+    for path in rules["write"]:
+        grants.append((path, READ | WRITE))
+    for path in rules["devices"]:
+        grants.append((path, READ | WRITE_FILE | TRUNCATE | IOCTL_DEV))
+    for path in rules["proc_write"]:
+        grants.append((path, READ | WRITE_FILE | (TRUNCATE if proc_truncate else 0)))
+    return grants
+
+
+def apply_landlock(rules, proc_truncate=False):
     abi, err = landlock_abi()
     if abi is None:
         say(f"landlock=missing ({err}): writes held by bubblewrap's mounts alone")
@@ -96,19 +113,8 @@ def apply_landlock(rules):
     if fd < 0:
         sys.exit(f"inside: landlock_create_ruleset: {os.strerror(ctypes.get_errno())}")
 
-    grants = []
-    for path in rules["read"]:
-        grants.append((path, READ))
-    for path in rules["execute"]:
-        grants.append((path, READ | EXECUTE))
-    for path in rules["write"]:
-        grants.append((path, READ | WRITE))
-    for path in rules["devices"]:
-        grants.append((path, READ | WRITE_FILE | TRUNCATE | IOCTL_DEV))
-    for path in rules["proc_write"]:
-        grants.append((path, READ | WRITE_FILE | TRUNCATE))
     added = []
-    for path, access in grants:
+    for path, access in landlock_grants(rules, proc_truncate):
         try:
             pfd = os.open(path, os.O_PATH | os.O_CLOEXEC)
         except FileNotFoundError:
@@ -169,6 +175,7 @@ def main():
     p.add_argument("--compiled", required=True)
     p.add_argument("--landlock", choices=["auto", "off"], default="auto")
     p.add_argument("--seccomp", choices=["on", "off"], default="on")
+    p.add_argument("--proc-truncate", action="store_true")
     p.add_argument("--relay", action="store_true")
     p.add_argument("command", nargs=argparse.REMAINDER)
     o = p.parse_args()
@@ -179,7 +186,7 @@ def main():
         compiled = json.load(f)
 
     if o.landlock == "auto":
-        apply_landlock(compiled["landlock"])
+        apply_landlock(compiled["landlock"], o.proc_truncate)
     else:
         say("landlock=off (asked)")
     if o.seccomp == "on":
