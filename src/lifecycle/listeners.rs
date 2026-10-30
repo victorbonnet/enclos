@@ -7,7 +7,6 @@
 //! only ever what `lsof` or `/proc` said.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
