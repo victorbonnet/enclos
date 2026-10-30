@@ -40,6 +40,9 @@ that owns it. So the ways tried are:
 import argparse
 import json
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wrap import arguments
 
 FD_USER, FD_PID, FD_NET = 10, 11, 12
 WAYS = ["own", "nsenter", "nsenter-pid", "nsenter-userns", "userns", "userns-subpid",
@@ -97,7 +100,7 @@ def main(argv=None):
     inside = o.inside[1:] if o.inside[:1] == ["--"] else o.inside
     with open(o.compiled) as f:
         compiled = json.load(f)
-    prefix, args, extra = join(compiled["bwrap"], o.join)
+    prefix, args, extra = join(arguments(compiled), o.join)
     # inside is `python3 -I inside.py <its options> -- command...`: the extra
     # options go before its `--`.
     cut = inside.index("--") if "--" in inside else len(inside)

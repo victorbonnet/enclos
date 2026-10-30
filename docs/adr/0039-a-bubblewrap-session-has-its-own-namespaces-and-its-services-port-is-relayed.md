@@ -14,7 +14,9 @@ Design §15 preferred one network and PID namespace per sandbox, joined by every
 
 The refusals were the same with AppArmor's restriction on unprivileged user namespaces turned off, and the kernel logged no denial. A process holding every capability in the user namespace the holder handed out was still refused the network and PID namespaces, so they belong to another user namespace.
 
-Decision (proposed):
+Review correction: the original holder used `--dev /dev`, so bubblewrap nested its user namespace and exported the wrong owner for the network/PID namespaces. Those EPERM results do not establish that one namespace per sandbox is unavailable. The corrected holder drops `--dev /dev` and the full join-plus-bubblewrap experiment is rerun; the following proposal remains provisional pending those results.
+
+Decision (proposed, not accepted):
 
 - **Namespaces per session.** Every session, a service's included, keeps its own network, PID and IPC namespaces, as M3-02 compiled them.
 - **The service's port, relayed.** For a runtime that declares a listening service:

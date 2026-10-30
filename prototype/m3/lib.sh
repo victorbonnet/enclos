@@ -72,7 +72,7 @@ start_holder() {
     rm -rf "$dir"
     mkdir -p "$dir"
     bwrap --unshare-user --unshare-pid --unshare-net --die-with-parent \
-        --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind "$dir" "$dir" \
+        --ro-bind / / --proc /proc --tmpfs /tmp --bind "$dir" "$dir" \
         --info-fd 3 \
         -- /usr/bin/python3 -I "$M3/ns-holder.py" --socket "$dir/holder.sock" --info "$dir/info.json" \
         --relay "$RELAY_PORT" "$PROXY_SOCK" \

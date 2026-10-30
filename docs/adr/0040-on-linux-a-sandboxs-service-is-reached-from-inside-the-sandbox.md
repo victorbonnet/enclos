@@ -22,3 +22,5 @@ Reason: the network namespace that keeps the sandbox off the host's loopback and
 - On Linux, Hermes's dashboard cannot be opened in the host's browser until milestone 4.1. A browser inside the sandbox, or a client in a `connect` session, reaches it.
 - 0028's consequence that a listener bound to every address serves the host's network does not hold on Linux. Within the sandbox's sessions, listening stays open, as 0028 says.
 - macOS behaves as 0028 says; this ADR changes nothing there.
+
+Enforcement limitation: the prototype does not enforce `listen=false` against `bind` or `listen`; its seccomp filter permits both. A private network namespace limits reachability but is not enforcement of that field. Production must report it unenforced and refuse it unless explicitly accepted under ADR 0009, until a tested restriction exists. Only sandbox-visible data-plane sockets under `run/<sandbox>/visible/` may be mounted; proxy control and authoritative port records remain host-only.
