@@ -24,6 +24,12 @@ expect 'exit 0' 'seccomp\.self_filters: .*'
 expect 'exit 0' 'kconfig\.SECCOMP: .*'
 expect 'exit 0' 'kconfig\.SECCOMP_FILTER: .*'
 
+# lp(): logind's answer, and `unknown` when it cannot be asked
+expect 'echo "b false"' 'logind\.KillUserProcesses: false'
+expect 'echo "t 10000000"' 'logind\.UserStopDelayUSec: 10000000'
+expect 'exit 1' 'logind\.KillUserProcesses: unknown'
+expect 'exit 1' 'logind\.UserStopDelayUSec: unknown'
+
 # bwrap-check.sh must refuse here, before it runs anything
 if env -u GITHUB_ACTIONS -u RUNNER_ENVIRONMENT sh "$here/bwrap-check.sh" 2>/dev/null; then
     echo "bwrap-check.sh ran outside a GitHub-hosted runner" >&2
