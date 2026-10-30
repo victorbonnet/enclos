@@ -269,3 +269,8 @@ fi
     { tail -3 "$tmp/setup.log"; cat "$tmp/ssh.log" 2>/dev/null; } | fence
 } >"$out"
 cat "$out"
+
+# The Chat tab's control pair needs this check's proxy and second user gone.
+finish
+trap - EXIT
+exec bash "$M3/dashboard-chat-check.sh"
