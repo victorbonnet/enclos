@@ -10,13 +10,16 @@ page holds is used and never printed.
     python3 -I host-client.py hold BASE PATH OUT [--seconds N]
     python3 -I host-client.py chat BASE
     python3 -I host-client.py pty BASE
+    python3 -I host-client.py pty-chat BASE OUT [--prompt TEXT]
     python3 -I host-client.py raw BASE OUT [--path PATH]
     python3 -I host-client.py token BASE OUT
 
 `hold` opens a WebSocket and writes to OUT what became of it. `chat` opens
 Hermes's chat over /api/ws (session.create, then prompt.submit) and says how
 far it got. `pty` drives the terminal on /api/pty as the page does: a size, then
-typed text, which must come back. `raw` sends one request and keeps every byte
+typed text, which must come back. `pty-chat` types a real prompt there and keeps
+all the terminal showed, raw in OUT and as text in OUT.txt, split at the prompt;
+the session token is taken out of both. `raw` sends one request and keeps every byte
 of the answer in OUT, for a check that a refused client got nothing. `token`
 writes the page's session token to OUT, the one place it is written.
 """
@@ -120,6 +123,9 @@ def frames(s, buf, seconds):
     while True:
         while (frame := wsmini.decode(buf)) is not None:
             buf = buf[frame[2]:]
+            if frame[0] == wsmini.PING:  # a server closes a client that stays silent
+                s.sendall(wsmini.encode(frame[1], wsmini.PONG, mask=os.urandom(4)))
+                continue
             yield frame[0], frame[1]
         left = end - time.monotonic()
         if left <= 0:
@@ -143,6 +149,43 @@ def page_token(base):
     return (m := TOKEN.search(body)) and m.group(1)
 
 
+def turn_end(kind, payload, last):
+    """What stopped the turn: an `error` event's text, else the text of the
+    `message.complete` that ended it, else what was known. A session.info
+    frame is not an answer, whatever words it holds."""
+    if not isinstance(payload, dict):
+        return last
+    if kind == "error":
+        return str(payload.get("message") or payload.get("error") or payload)[:200]
+    if kind == "message.complete" and not last:
+        return str(payload.get("text") or payload.get("rendered") or "")[:200]
+    return last
+
+
+def pty_chat(base, out, prompt):
+    """The page's order, then a real prompt and Enter, as the Chat tab sends."""
+    token = page_token(base)
+    status, s, rest = ws_open(base, with_token("/api/pty", token))
+    if " 101 " not in status + " ":
+        return line("terminal: /api/pty", "refused", status[:60])
+    line("terminal: /api/pty", "ok", "101")
+    send(s, "\x1b[RESIZE:120;40]")
+    before = b"".join(body for _, body in frames(s, rest, 30))
+    send(s, prompt + "\r")
+    after = b"".join(body for _, body in frames(s, b"", 45))
+    s.close()
+
+    def clean(data):
+        text = data.decode("utf-8", "replace")
+        return text.replace(token, "<token>") if token else text
+    with open(out, "w") as f:
+        f.write(clean(before) + "\n=== after the prompt ===\n" + clean(after))
+    with open(out + ".txt", "w") as f:
+        f.write(plain(clean(before)) + "\n=== after the prompt ===\n" + plain(clean(after)) + "\n")
+    line("terminal: before the prompt", "ok" if before else "none", f"{len(before)} bytes")
+    line("terminal: after the prompt", "ok" if after else "none", f"{len(after)} bytes")
+
+
 def chat(base):
     """Hermes's newline-free JSON-RPC over /api/ws, as far as an install with no
     account goes: the reply to each call, then the events of the turn."""
@@ -163,9 +206,7 @@ def chat(base):
             kind = msg.get("params", {}).get("type", "?")
             if kind not in events:
                 events.append(kind)
-            text = json.dumps(msg.get("params", {}).get("payload", ""))
-            if "error" in kind or "provider" in text.lower():
-                last = text[:100]
+            last = turn_end(kind, msg.get("params", {}).get("payload"), last)
         elif msg.get("id") == 1:
             sid = msg.get("result", {}).get("session_id")
             line("chat: session.create", "ok" if sid else "refused",
@@ -180,7 +221,7 @@ def chat(base):
             line("chat: prompt.submit", "refused" if error else "ok", str(error)[:80] if error else "accepted")
     s.close()
     line("chat: events of the turn", "ok" if events else "none", " ".join(events)[:100])
-    line("chat: what stopped it", "seen" if last else "none", last)
+    line("chat: what stopped it", "seen" if last else "none", last.replace("\t", " ").replace("\n", " "))
     if not submitted and sid:
         line("chat: prompt.submit", "none", "no reply")
 
@@ -314,12 +355,13 @@ def hold(base, path, out, seconds):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["check", "get", "hold", "chat", "pty", "raw", "token"])
+    p.add_argument("command", choices=["check", "get", "hold", "chat", "pty", "pty-chat", "raw", "token"])
     p.add_argument("base")
     p.add_argument("rest", nargs="*")
     p.add_argument("--ws", action="append", default=[])
     p.add_argument("--seconds", type=int, default=120)
     p.add_argument("--path", default="/")
+    p.add_argument("--prompt", default="Reply with exactly one word: ok")
     o = p.parse_args()
     if o.command == "check":
         check(o.base, o.ws)
@@ -329,6 +371,8 @@ def main():
         chat(o.base)
     elif o.command == "pty":
         pty(o.base)
+    elif o.command == "pty-chat":
+        pty_chat(o.base, o.rest[0], o.prompt)
     elif o.command == "raw":
         raw(o.base, o.rest[0], o.path)
     elif o.command == "token":

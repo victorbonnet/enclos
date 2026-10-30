@@ -72,6 +72,37 @@ class Terminal(unittest.TestCase):
         self.assertEqual(client.plain(out), "> enclosmark")
 
 
+class TurnEnd(unittest.TestCase):
+    def test_an_error_event_is_what_stopped_the_turn(self):
+        client = load("host-client")
+        self.assertEqual(client.turn_end("error", {"message": "no provider"}, "earlier"), "no provider")
+
+    def test_a_session_info_frame_never_is(self):
+        client = load("host-client")
+        self.assertEqual(client.turn_end("session.info", {"provider": "", "model": ""}, ""), "")
+
+    def test_a_completed_message_counts_only_with_no_error(self):
+        client = load("host-client")
+        self.assertEqual(client.turn_end("message.complete", {"text": "ok"}, ""), "ok")
+        self.assertEqual(client.turn_end("message.complete", {"text": "ok"}, "no provider"), "no provider")
+
+
+class Connections(unittest.TestCase):
+    def test_only_established_clients_of_that_port_are_listed(self):
+        conns = load("ns-conns")
+        head = "  sl local rem st tx rx tr retr uid timeout inode\n"
+        loop = "0100007F"
+
+        def row(local, remote, state, inode):
+            return f" 0: {local} {remote} {state} 0:0 0:0 0 1001 0 {inode} 1\n"
+        text = head + (row(f"{loop}:23BF", "00000000:0000", "0A", 1)    # the listener, 9151
+                       + row(f"{loop}:9C40", f"{loop}:23BF", "01", 2)   # a client
+                       + row(f"{loop}:23BF", f"{loop}:9C40", "01", 3)   # the server's end
+                       + row(f"{loop}:9C41", f"{loop}:23BF", "06", 4)   # gone
+                       + row(f"{loop}:9C42", f"{loop}:46A0", "01", 5))  # the relay's port
+        self.assertEqual(conns.clients(text, 0x23BF), [(0x9C40, "2")])
+
+
 class Listeners(unittest.TestCase):
     def test_another_sessions_port_is_left_out(self):
         listeners = load("ns-listeners")

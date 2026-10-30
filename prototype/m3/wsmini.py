@@ -9,7 +9,7 @@ import os
 import struct
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-TEXT, CLOSE = 1, 8
+TEXT, CLOSE, PING, PONG = 1, 8, 9, 10
 
 
 def accept_key(key):
