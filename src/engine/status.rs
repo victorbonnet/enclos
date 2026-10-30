@@ -339,7 +339,9 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
     let mut found = Vec::new();
     for (pid, address) in shown {
         let Some((at, command)) = members.get(&pid) else {
-            return Fact::CannotTell(format!("a look answered for pid {pid}, which was not asked"));
+            return Fact::CannotTell(format!(
+                "a look answered for pid {pid}, which was not asked"
+            ));
         };
         match is_same(at) {
             Ok(true) => found.push(NetworkListener {
