@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use super::super::{CompileError, Compiled, SandboxContext};
+use super::super::{Baseline, CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, PORT_FIRST, PORT_LAST};
 use crate::policy::paths::{FsPaths, PathContext, is_within, real_path};
@@ -38,17 +38,6 @@ const DENY_DEFAULT_START: &str = "(deny default (with message \"enclos:";
 /// before ADR 0006 was accepted: `allow-default`. Only so tests can compare
 /// the two baselines, not a setting: see [`Baseline::parse`].
 pub const BASELINE_VAR: &str = "ENCLOS_SEATBELT_BASELINE";
-
-/// What a compiled policy does with an operation none of its rules names
-/// (ADR 0006).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Baseline {
-    /// `(deny default)`, then the reviewed allowances of `deny-default.sb`.
-    #[default]
-    DenyDefault,
-    /// `(allow default)`, as before ADR 0006: only for comparing the two.
-    AllowDefault,
-}
 
 impl Baseline {
     /// What [`BASELINE_VAR`] asks for: [`Baseline::parse`] of its value,

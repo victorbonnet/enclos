@@ -9,7 +9,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use super::super::{Backend, Launch, SandboxContext};
+use super::Baseline;
 use super::Seatbelt;
+use super::probes::SeatbeltProbes;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::policy::file::PolicyFile;
@@ -335,7 +337,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
     let v6 = TcpListener::bind(("::1", 0)).is_ok();
     // Each probe as `policy test` runs it: the sandbox, then the control.
     let judged = |w: &World, listen: bool| -> Vec<(String, Outcome)> {
-        crate::probes::listen_probes(listen, proxy)
+        super::probes::listen_probes(listen, proxy)
             .into_iter()
             .filter(|p| v6 || !p.name.ends_with("[::1]"))
             .map(|p| {
@@ -648,11 +650,9 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
-        keychain_item: Err("not probed here".into()),
         limits: Default::default(),
     };
     let output = |mut command: Command| {
@@ -660,7 +660,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         (out.status.success(), text(&out.stdout), text(&out.stderr))
     };
-    probes(&inputs)
+    probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
         .filter(|p| ["renames", "clones"].contains(&p.route))
         .map(|p| {
@@ -807,14 +807,12 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
-        keychain_item: Err("not probed here".into()),
         limits: Default::default(),
     };
-    let folders: Vec<_> = crate::probes::probes(&inputs)
+    let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
         .filter(|p| p.route == "writable folders")
         .collect();
@@ -1035,10 +1033,10 @@ fn the_host_services_close_on_the_baseline_and_on_the_rules() {
     for (compiled, opened, sent) in [
         (
             &w.compiled,
-            crate::probes::LS_LOOKUP_REFUSED,
-            crate::probes::AE_LOOKUP_REFUSED,
+            super::probes::LS_LOOKUP_REFUSED,
+            super::probes::AE_LOOKUP_REFUSED,
         ),
-        (&allow, crate::probes::LS_REFUSED, crate::probes::AE_REFUSED),
+        (&allow, super::probes::LS_REFUSED, super::probes::AE_REFUSED),
     ] {
         let (ok, out) = run_under(&w, compiled, open);
         assert!(!ok && out.contains(opened), "{}: {out}", compiled.display());

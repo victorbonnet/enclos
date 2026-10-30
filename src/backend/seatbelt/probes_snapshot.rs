@@ -5,17 +5,15 @@
 
 use std::path::Path;
 
-use crate::probes::{
-    Expect, HOST_SERVICE_ROUTES, HostCheck, KeychainItem, NOT_PROBED, Probe, ProbeInputs, Proof,
-    host_service_probes, not_here, probes,
-};
+use crate::probes::{Expect, HostCheck, OwnProbes, Probe, ProbeInputs, Proof, not_here, probes};
 
 use super::Baseline;
+use super::probes::{HOST_SERVICE_ROUTES, KeychainItem, NOT_PROBED, SeatbeltProbes};
 
 const EXPECTED: &str = include_str!("probes.snapshot");
 
 /// A host that has something for every probe to find, under `dir`.
-fn inputs(dir: &Path, baseline: Baseline, listen: bool) -> ProbeInputs {
+fn inputs(dir: &Path, listen: bool) -> ProbeInputs {
     let user = dir.join("user");
     let data = user.join(".enclos");
     let sandbox = data.join("sandboxes/home");
@@ -74,15 +72,9 @@ fn inputs(dir: &Path, baseline: Baseline, listen: bool) -> ProbeInputs {
         host_sockets: vec![user.join("agent.sock")],
         proxy_port: 41001,
         listen,
-        baseline,
         target: Some(4242),
         other_terminal: Some("/dev/ttys042".into()),
         tag: 7,
-        keychain_item: Ok(KeychainItem {
-            service: "enclos.abc.probe".into(),
-            account: "home/probe".into(),
-            file: Some(user.join("probe.keychain-db")),
-        }),
         limits: crate::backend::LaunchLimits::of_checked(&crate::model::policy::Resources {
             open_files: Some(256),
             ..Default::default()
@@ -94,10 +86,10 @@ fn inputs(dir: &Path, baseline: Baseline, listen: bool) -> ProbeInputs {
 fn expect(expect: &Expect) -> String {
     match expect {
         Expect::Fails => "fails".to_owned(),
-        Expect::FailsWith(text) => format!("fails with {text}"),
+        Expect::FailsWith(refusal) => format!("fails with {}", refusal.shown()),
         Expect::OutputLacks(text) => format!("output lacks {text}"),
-        Expect::IntoItself => "into itself".to_owned(),
-        Expect::AppleEventBlocked(text) => format!("apple event blocked: {text}"),
+        Expect::IntoItself { .. } => "into itself".to_owned(),
+        Expect::Own(reading) => reading.label.to_owned(),
     }
 }
 
@@ -116,8 +108,7 @@ fn proof(proof: &Proof) -> String {
 fn host(check: &HostCheck) -> String {
     match check {
         HostCheck::File(path) => format!("the file {}", path.display()),
-        HostCheck::LaunchdJob(label) => format!("the launchd job {label}"),
-        HostCheck::PreferencesDomain(d) => format!("the preferences domain {d}"),
+        HostCheck::Tool(tool) => tool.what.clone(),
         HostCheck::Target => "the signal probe's target".to_owned(),
     }
 }
@@ -147,17 +138,23 @@ fn snapshot() -> String {
         ("allow default, listening", Baseline::AllowDefault, true),
     ] {
         let at = dir.path().join(name.replace([' ', ','], "-"));
-        let i = inputs(&at, baseline, listen);
+        let i = inputs(&at, listen);
+        let mut own = SeatbeltProbes::on(baseline);
+        own.keychain_item = Ok(KeychainItem {
+            service: "enclos.abc.probe".into(),
+            account: "home/probe".into(),
+            file: Some(i.user_home.join("probe.keychain-db")),
+        });
         text.push_str(&format!("## {name}\n"));
-        for p in probes(&i) {
+        for p in probes(&i, &own) {
             text.push_str(&render(&p));
         }
         text.push_str("### host services\n");
-        for p in host_service_probes(&i) {
+        for p in own.host_services(&i) {
             text.push_str(&render(&p));
         }
         text.push_str("### not here\n");
-        for line in not_here(&i) {
+        for line in not_here(&i, &own) {
             text.push_str(&format!("{line}\n"));
         }
         text = text.replace(&at.display().to_string(), "<dir>");

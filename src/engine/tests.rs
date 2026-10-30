@@ -617,14 +617,7 @@ mod compile {
         grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
         let ctx = engine.sandbox_context(&name, 41001);
         let inputs = engine
-            .probe_inputs(
-                &name,
-                &ctx,
-                None,
-                None,
-                Default::default(),
-                Default::default(),
-            )
+            .probe_inputs(&name, &ctx, None, None, Default::default())
             .unwrap();
         let home = ctx.home.canonicalize().unwrap();
         assert_eq!(inputs.home, home);
@@ -632,7 +625,10 @@ mod compile {
             inputs.workspaces,
             [user.join("a"), user.join("b"), user.join("later")]
         );
-        let names: Vec<String> = crate::probes::probes(&inputs)
+        let own = FakeBackend::available(BackendKind::Seatbelt)
+            .own_probes(None)
+            .unwrap();
+        let names: Vec<String> = crate::probes::probes(&inputs, own.as_ref())
             .into_iter()
             .filter(|p| p.route == "writable folders")
             .map(|p| p.name)
@@ -653,6 +649,60 @@ mod compile {
         assert!(
             matches!(&missing[0].outcome, crate::probes::Outcome::NotRun(why) if why.contains("create it on the host"))
         );
+    }
+
+    /// A backend with no probes of its own runs the shared set through its
+    /// `wrap`: the fake holds nothing back, so a write and a signal get out
+    /// and read open, on what the host sees.
+    #[test]
+    fn a_fake_backend_s_probes_run_through_the_shared_set() {
+        use crate::backend::{Launch, LaunchLimits};
+        use crate::probes::{Outcome, probes};
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let backend = engine.backend_of(&name).unwrap();
+        let own = backend.own_probes(Some("fake policy for home\n")).unwrap();
+        assert_eq!(own.baseline(), None);
+        // This test's own child, the signal probe's target.
+        let mut target = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let ctx = engine.sandbox_context(&name, 41001);
+        let inputs = engine
+            .probe_inputs(
+                &name,
+                &ctx,
+                Some(target.id()),
+                None,
+                LaunchLimits::default(),
+            )
+            .unwrap();
+        let list = probes(&inputs, own.as_ref());
+        assert!(own.host_services(&inputs).is_empty());
+        for route in ["writes", "signals"] {
+            let probe = list.iter().find(|p| p.route == route).unwrap();
+            let got = crate::engine::probe::run_probe(
+                probe,
+                |script| {
+                    let launch = Launch {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), script.into()],
+                        env: Vec::new(),
+                        in_terminal: false,
+                        service_port: None,
+                        limits: LaunchLimits::default(),
+                    };
+                    backend
+                        .wrap(std::path::Path::new("unused"), &ctx, &launch)
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                },
+                &mut target,
+            );
+            assert!(matches!(got, Outcome::Open(_)), "{route}: {got:?}");
+        }
+        let _ = target.kill();
+        let _ = target.wait();
     }
 
     #[test]

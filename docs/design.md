@@ -322,6 +322,7 @@ pub trait Backend {
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled>;   // pure; adds protected paths and host-service blocks
     fn prepare(&self, sb: &SandboxRecord, compiled: &Compiled) -> Result<()>;
     fn wrap(&self, sb: &SandboxRecord, session: &SessionRecord, cmd: &Command) -> Result<Command>;
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;   // its escape probes and refusals
     fn members(&self, sb: &SandboxRecord) -> Result<Vec<Member>>;
     fn signal_members(&self, sb: &SandboxRecord, signal: StopSignal) -> Result<()>;   // Term | Kill
     fn denials(&self, sb: &SandboxRecord, since: Timestamp) -> Result<Vec<Denial>>;
@@ -331,7 +332,7 @@ pub trait Backend {
 }
 ```
 
-Escape probes are not part of the backend: `probes/` builds them and the engine runs each through the backend's `wrap`. They are macOS commands today; the bubblewrap backend will bring its own set.
+The escape probes come in two parts, and the engine runs each through the backend's `wrap`. `probes/` builds those every backend runs: reads of the deny list, writes outside the home, other sandboxes, enclos's files, folders that cannot move, the proxy, a direct connection and DNS on port 53, host sockets, signals, terminals and limits. Each backend adds its own through `own_probes`, and says there what its refusals look like, which is what those probes are judged by: Seatbelt's are the host services, the Keychain, the pasteboard, `clonefileat`, mDNSResponder, `at` and `crontab`, and the bind and `[::1]` probes that test its loopback rule. No bubblewrap backend exists yet, so nothing has run the shared set on Linux, and its commands are still written for macOS's paths where the two differ.
 
 **Egress proxy**
 
@@ -490,8 +491,8 @@ src/
   policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       sessions.rs  stop.rs
-  probes/          mod.rs (escape probes for `policy test`, run by engine/probe.rs)
-  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, denials.rs}
+  probes/          mod.rs (the escape probes every backend runs for `policy test`, run by engine/probe.rs)
+  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, probes.rs, host-services.sb, members.rs, denials.rs}
   proxy/           decide.rs (pure checks)  request.rs  server.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs

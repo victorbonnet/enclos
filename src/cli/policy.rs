@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::output;
 
-use enclos::backend::seatbelt::Baseline;
+use enclos::backend::Baseline;
 use enclos::engine::{
     ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyDiff,
     PolicyHistory, PolicyView, Restarted, TestReport,
@@ -21,7 +21,7 @@ use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::policy::{NetMode, PendingPolicy, Policy, PolicyVersion};
 use enclos::model::sandbox::SandboxName;
-use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
+use enclos::probes::Outcome;
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -277,11 +277,12 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,
         "not_here": report.not_here,
-        "not_probed": NOT_PROBED,
+        "not_probed": report.notes.not_probed,
         "listens": report.listens,
         "baseline": match report.baseline {
-            Baseline::AllowDefault => "allow_default",
-            Baseline::DenyDefault => "deny_default",
+            Some(Baseline::AllowDefault) => Some("allow_default"),
+            Some(Baseline::DenyDefault) => Some("deny_default"),
+            None => None,
         },
     })
 }
@@ -1000,10 +1001,10 @@ fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
         };
         line(format!("  {mark}  {:<16} {}{detail}", r.route, r.name));
     }
-    if !report.host_services {
+    if !report.host_services && !report.notes.host_service_routes.is_empty() {
         line(format!(
             "Host-service routes ({}) were not probed; CI probes them with --host-services.",
-            HOST_SERVICE_ROUTES.join(", ")
+            report.notes.host_service_routes.join(", ")
         ));
     }
     if !report.not_here.is_empty() {
@@ -1012,10 +1013,12 @@ fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
             report.not_here.join("; ")
         ));
     }
-    line(format!(
-        "No probe tries these routes yet: {}.",
-        NOT_PROBED.join(", ")
-    ));
+    if !report.notes.not_probed.is_empty() {
+        line(format!(
+            "No probe tries these routes yet: {}.",
+            report.notes.not_probed.join(", ")
+        ));
+    }
     if report.listens {
         line("Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.".to_owned());
     }
@@ -1044,17 +1047,18 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
-                "{} of {total} shown closed{platform}, {} could not be checked on this Mac ({}), none open",
+                "{} of {total} shown closed{platform}, {} could not be checked on {} ({}), none open",
                 report.closed(),
                 report.inconclusive(),
+                report.notes.host,
                 listed("inconclusive", "inconclusive")
             ),
         };
         let baseline = match report.baseline {
-            Baseline::AllowDefault => {
+            Some(Baseline::AllowDefault) => {
                 " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
             }
-            Baseline::DenyDefault => "",
+            Some(Baseline::DenyDefault) | None => "",
         };
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
@@ -1074,7 +1078,10 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules".to_owned());
+        why.push(format!(
+            "no probe was shown closed by its route's rule{}, so the test showed nothing about the policy's rules",
+            report.notes.only_apart
+        ));
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1086,6 +1093,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclos::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, NOTES};
     use enclos::probes::ProbeResult;
 
     fn report(outcome: Outcome) -> TestReport {
@@ -1106,7 +1114,8 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            baseline: Baseline::DenyDefault,
+            baseline: Some(Baseline::DenyDefault),
+            notes: NOTES,
         }
     }
 
@@ -1174,7 +1183,6 @@ mod tests {
     /// probes were split per backend (M3-06): text, verdict and JSON.
     #[test]
     fn the_seatbelt_report_is_as_it_was() {
-        use enclos::probes::ClosedBy;
         let row = |route, name: &str, outcome, closed_by| ProbeResult {
             route,
             name: name.to_owned(),
@@ -1183,17 +1191,12 @@ mod tests {
         };
         let ready = vec![
             row("writes", "write outside the home", Outcome::Closed, None),
-            row(
-                "at",
-                "list the `at` queue",
-                Outcome::Closed,
-                Some(ClosedBy::Seatbelt),
-            ),
+            row("at", "list the `at` queue", Outcome::Closed, Some(ITSELF)),
             row(
                 "launchservices",
                 "open a folder through LaunchServices",
                 Outcome::Closed,
-                Some(ClosedBy::Baseline),
+                Some(BEFORE_THE_RULE),
             ),
         ];
         let mut mixed = ready.clone();
@@ -1236,7 +1239,8 @@ mod tests {
                 host_services,
                 not_here,
                 listens,
-                baseline,
+                baseline: Some(baseline),
+                notes: NOTES,
             };
             got.push_str(&test_text(&lab, &report));
             got.push_str(&verdict(&lab, &report, false));

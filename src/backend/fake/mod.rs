@@ -9,6 +9,7 @@ use super::{
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
+use crate::probes::{OwnProbes, Refusal, ReportNotes};
 
 /// The variable that tells a program the fake runs whether it was launched
 /// in enclos's terminal (`Launch::in_terminal`): `true` or `false`.
@@ -20,6 +21,35 @@ pub const SERVICE_PORT: &str = "ENCLOS_FAKE_SERVICE_PORT";
 
 /// The name of a path the fake refuses to compile a write to.
 pub const UNCOMPILABLE: &str = "uncompilable";
+
+/// The fake's probes: the shared set alone, with no baseline.
+pub struct FakeProbes;
+
+impl OwnProbes for FakeProbes {
+    fn name(&self) -> &'static str {
+        "the fake"
+    }
+
+    /// As a backend refuses that leaves paths out of the sandbox and mounts
+    /// the rest read-only.
+    fn refusal(&self) -> Refusal {
+        Refusal::any_of(&[
+            "No such file or directory",
+            "Read-only file system",
+            "Permission denied",
+        ])
+    }
+
+    fn notes(&self) -> ReportNotes {
+        ReportNotes {
+            host: "this host",
+            folder_moves: "renames",
+            only_apart: "",
+            host_service_routes: &[],
+            not_probed: &[],
+        }
+    }
+}
 
 pub struct FakeBackend {
     kind: BackendKind,
@@ -136,6 +166,10 @@ impl Backend for FakeBackend {
         );
         command.current_dir(&ctx.home);
         command
+    }
+
+    fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
+        Ok(Box::new(FakeProbes))
     }
 }
 
