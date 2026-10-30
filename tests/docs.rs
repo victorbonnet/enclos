@@ -117,3 +117,24 @@ fn no_open_decision_is_left_on_the_verdict() {
     assert!(!design.contains("| What `policy test` reports"));
     assert!(!design.contains("gives no verdict"));
 }
+
+#[test]
+fn the_lingering_row_holds_the_evidence_and_its_recommendation() {
+    let design = design();
+    let row = design
+        .lines()
+        .find(|line| line.starts_with("| Sandboxes on a headless Linux host"))
+        .expect("§15's row on lingering");
+    for text in [
+        "without lingering the unit goes with the user manager",
+        "with lingering it survives",
+        "on x86_64",
+        "on arm64",
+        "`Linger` was already `yes`",
+        "`gone` is what the script prints when the manager is inactive",
+        "Recommendation: enclos never turns lingering on itself;",
+    ] {
+        assert!(row.contains(text), "{text}");
+    }
+    assert!(design.contains("| Where bubblewrap comes from (milestone 3) |"));
+}
