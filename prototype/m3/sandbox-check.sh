@@ -2,8 +2,9 @@
 # The prototype sandbox's files, programs and system calls (design §14,
 # M3-02): broad reads with the deny list not mounted, writes to the home and
 # the workspace only, the home and workspace unmovable, programs run from the
-# workspace, the seccomp list, other processes and their start-up
-# environment, the host's loopback and DNS. Each probe runs on the host as
+# workspace, the seccomp list, other processes (whether /proc/<pid> exists is
+# the control: the host's own read of a process's environ never worked), the
+# host's loopback and DNS. Each probe runs on the host as
 # its control, then in the sandbox in five modes:
 #
 #   bubblewrap only        no Landlock, no seccomp: what the mounts and
@@ -39,8 +40,7 @@ cp /usr/bin/true "$WORK/true-copy"
 printf '#!/bin/sh\necho ran\n' >"$WORK/hello.sh"
 chmod +x "$WORK/hello.sh"
 
-marker="enclos-proto-marker-$$"
-env ENCLOS_PROTO_MARKER="$marker" sleep 900 &
+sleep 900 &
 sleeper=$!
 python3 -I -m http.server --bind 127.0.0.1 18999 >/dev/null 2>&1 &
 listener=$!
@@ -85,7 +85,6 @@ probes+=(
     "kill $sleeper"
     "ptrace $sleeper"
     "exists /proc/$sleeper"
-    "environ $marker $sleeper"
     "connect-tcp 127.0.0.1 18999"
     "connect-tcp 1.1.1.1 443"
     "dns example.com"

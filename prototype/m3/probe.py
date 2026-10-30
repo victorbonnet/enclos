@@ -193,32 +193,6 @@ def p_ptrace(pid):
     return err(ctypes.get_errno()), ""
 
 
-def p_environ(marker, pid=None):
-    """Whether any process's start-up environment this side can read holds
-    the marker the host's process was started with. With the pid of that
-    process, its own environ is tried first, so a refusal names its error."""
-    target = ""
-    if pid is not None:
-        try:
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                if marker.encode() in f.read():
-                    return "ok", f"marker read in /proc/{pid}/environ"
-                target = f"/proc/{pid}/environ read, marker not in it; "
-        except OSError as e:
-            target = f"/proc/{pid}/environ: {err(e.errno)}; "
-    pids = [p for p in os.listdir("/proc") if p.isdigit()]
-    seen = 0
-    for p in pids:
-        try:
-            with open(f"/proc/{p}/environ", "rb") as f:
-                if marker.encode() in f.read():
-                    return "ok", f"{target}marker read in /proc/{p}/environ"
-            seen += 1
-        except OSError:
-            continue
-    return "absent", f"{target}{len(pids)} processes listed, {seen} environments readable, marker in none"
-
-
 def p_connect_unix(path, kind="stream"):
     t = {"stream": socket.SOCK_STREAM, "dgram": socket.SOCK_DGRAM,
          "seqpacket": socket.SOCK_SEQPACKET}[kind]
@@ -255,7 +229,7 @@ PROBES = {
     "exec": p_exec, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
     "mount": p_mount, "keyctl": p_keyctl, "bpf": p_bpf, "perf_event_open": p_perf,
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,
-    "ptrace": p_ptrace, "environ": p_environ, "connect-unix": p_connect_unix,
+    "ptrace": p_ptrace, "connect-unix": p_connect_unix,
     "connect-tcp": p_connect_tcp, "dns": p_dns,
 }
 

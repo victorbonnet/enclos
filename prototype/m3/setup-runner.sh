@@ -24,9 +24,7 @@ try() { bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all --die-with-par
         echo "python3-seccomp: $(dpkg-query -W -f '${Version}' python3-seccomp)"
         echo "lsm.active: $(cat /sys/kernel/security/lsm 2>/dev/null)"
         echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent)"
-        # The second run's environ probe got EACCES on the host for a process
-        # the check itself started: these say whether a label or /proc's
-        # mount options explain it.
+        # What confines the job, for reading the host's column of the probes.
         echo "job's AppArmor label: $(cat /proc/self/attr/current 2>&1)"
         echo "/proc mount: $(awk '$2 == "/proc" {print $4}' /proc/mounts)"
         echo "kernel.yama.ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo absent)"
