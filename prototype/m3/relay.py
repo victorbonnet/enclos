@@ -30,6 +30,16 @@ def pump(a, b):
         b.close()
 
 
+def read_port(path):
+    """The port in a file the host wrote, or None when there is no valid one."""
+    try:
+        with open(path) as f:
+            port = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
 def one(conn, path):
     up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:

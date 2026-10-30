@@ -3,13 +3,14 @@ process, and which processes hold each (M3-03), read from the host as ADR
 0028 has enclos read its service's port: from /proc/<pid>/net/tcp, matched to
 the holders' socket descriptors in /proc/*/fd.
 
-    python3 -I ns-listeners.py PID [--ephemeral] [--port-only]
+    python3 -I ns-listeners.py PID [--ephemeral] [--held-by PID,...] [--port-only]
 
 One line per port: the port, then each holder as pid:comm, or
 `holders unreadable` when no descriptor of the user's processes could be
 read. --ephemeral keeps the ports in the system's ephemeral range, where a
-bind on port 0 lands; --port-only prints the port alone when exactly one
-port is left, and nothing otherwise.
+bind on port 0 lands; --held-by keeps the ports those processes hold, since in
+a shared network namespace another session can listen there too; --port-only
+prints the port alone when exactly one port is left, and nothing otherwise.
 """
 
 import os
@@ -51,6 +52,14 @@ def holders(inodes):
     return held, unreadable
 
 
+def held_only(ports, held, pids):
+    """The ports in `ports` (port: inode) one of `pids` holds, given `held`
+    (inode: the set of "pid:comm" holders)."""
+    want = {str(p) for p in pids}
+    return {port: inode for port, inode in ports.items()
+            if any(h.split(":")[0] in want for h in held.get(inode, ()))}
+
+
 def main():
     pid = sys.argv[1]
     ephemeral = "--ephemeral" in sys.argv
@@ -62,6 +71,9 @@ def main():
     if ephemeral:
         lo, hi = map(int, open("/proc/sys/net/ipv4/ip_local_port_range").read().split())
         ports = {p: i for p, i in ports.items() if lo <= p <= hi}
+    if "--held-by" in sys.argv:
+        pids = [p for p in sys.argv[sys.argv.index("--held-by") + 1].split(",") if p]
+        ports = held_only(ports, holders(set(ports.values()))[0], pids)
     if port_only:
         if len(ports) == 1:
             print(next(iter(ports)))

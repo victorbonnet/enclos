@@ -4,7 +4,8 @@ name: namespaces-prototype
 # M3-03) on GitHub's Ubuntu runners: whether every session of a sandbox can
 # share one network and PID namespace that enclos made first, what that
 # changes, what refuses each way of joining, and whether Hermes's clients
-# find a gateway in another session.
+# find a gateway in another session, what restarts do to open sessions, and
+# the host's path to a sandbox's service.
 # Every check acts on the host, so they run only on these throwaway runners.
 # Each writes its result to m3-results/, uploaded as the job's artifact and
 # shown in its summary. It reports; it does not gate merges.
@@ -34,6 +35,7 @@ jobs:
         run: |
           python3 -I prototype/m3/test_compile.py
           python3 -I prototype/m3/test_nsjoin.py
+          python3 -I prototype/m3/test_host_path.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
       - name: Namespaces per session or per sandbox
@@ -45,6 +47,9 @@ jobs:
       - name: Hermes's clients and a gateway in another session
         if: always()
         run: bash prototype/m3/hermes-ns-check.sh
+      - name: The host's path to a sandbox's service
+        if: always()
+        run: bash prototype/m3/dashboard-check.sh
       - name: Summary
         if: always()
         run: |

@@ -60,7 +60,8 @@ section() { printf '\n## %s\n\n' "$1"; }
 fence() { printf '```\n'; sed -e '$a\'; printf '```\n'; }
 
 # M3-03's holder of a sandbox's namespaces (ns-holder.py), with the
-# sandbox's relay to $PROXY_SOCK.
+# sandbox's relay to $PROXY_SOCK and the host's way in: <folder>/host-relay.sock
+# to the port the host writes in <folder>/service.port.
 #
 # start_holder NAME: a holder for sandbox NAME in its own folder, which no
 # session mounts (it is under ~/.enclos, on the deny list). Sets HOLDER to
@@ -75,7 +76,7 @@ start_holder() {
         --ro-bind / / --proc /proc --tmpfs /tmp --bind "$dir" "$dir" \
         --info-fd 3 \
         -- /usr/bin/python3 -I "$M3/ns-holder.py" --socket "$dir/holder.sock" --info "$dir/info.json" \
-        --relay "$RELAY_PORT" "$PROXY_SOCK" \
+        --relay "$RELAY_PORT" "$PROXY_SOCK" --host-relay "$dir/host-relay.sock" "$dir/service.port" \
         3>"$dir/bwrap-info.json" >"$dir/holder.out" 2>&1 &
     echo $! >"$dir/bwrap.pid"
     for _ in $(seq 50); do [ -e "$dir/info.json" ] && break; sleep 0.2; done
