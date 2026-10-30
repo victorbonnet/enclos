@@ -47,8 +47,8 @@ def p_read(path):
         if os.path.isdir(path):
             return "ok", f"{len(os.listdir(path))} entries"
         with open(path, "rb") as f:
-            f.read(1)
-        return "ok", "read"
+            n = len(f.read(64))
+        return "ok", f"read, {n} bytes"
     except OSError as e:
         return err(e.errno), ""
 
@@ -66,6 +66,15 @@ def p_write(path):
     os.close(fd)
     os.unlink(path)
     return "ok", "created and removed"
+
+
+def p_open_write(path):
+    """Open an existing file to write, changing nothing."""
+    try:
+        os.close(os.open(path, os.O_WRONLY))
+    except OSError as e:
+        return err(e.errno), ""
+    return "ok", "opened to write"
 
 
 def p_leave(path):
@@ -242,7 +251,7 @@ def p_dns(name):
 
 
 PROBES = {
-    "read": p_read, "exists": p_exists, "write": p_write, "leave": p_leave,
+    "read": p_read, "exists": p_exists, "write": p_write, "open-write": p_open_write, "leave": p_leave,
     "exec": p_exec, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
     "mount": p_mount, "keyctl": p_keyctl, "bpf": p_bpf, "perf_event_open": p_perf,
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,

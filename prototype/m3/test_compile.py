@@ -17,6 +17,30 @@ import wrap
 from unittest.mock import patch
 
 
+def view(args, path):
+    """What the sandbox sees at `path` once bubblewrap has run `args`: the
+    last mount made at or above it, as (option, writable)."""
+    mounts = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--bind", "--ro-bind", "--ro-bind-try"):
+            mounts.append([a, args[i + 1], args[i + 2], a == "--bind"])
+            i += 3
+        elif a == "--tmpfs":
+            mounts.append([a, None, args[i + 1], True])
+            i += 2
+        elif a == "--remount-ro":
+            [m for m in mounts if m[2] == args[i + 1]][-1][3] = False
+            i += 2
+        else:
+            i += 1
+    for option, _, dest, writable in reversed(mounts):
+        if comp.under(path, dest):
+            return option, writable
+    raise AssertionError(f"nothing mounted at {path}")
+
+
 class CompileTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -65,7 +89,7 @@ class CompileTest(unittest.TestCase):
     def test_the_sandbox_writes_its_home_and_workspaces_only(self):
         c = self.compiled()
         home = f"{self.sbx}/home"
-        self.assertEqual(self.pairs(c["bwrap"], "--bind"), [home, f"{self.h}/proj"])
+        self.assertEqual(self.pairs(c["bwrap"], "--bind"), [f"{self.h}/proj", home])
         self.assertIn(f"{self.sbx}/run/visible", self.pairs(c["bwrap"], "--ro-bind"))
         self.assertEqual(c["landlock"]["write"][:2], [home, f"{self.h}/proj"])
         self.assertIn(home, c["landlock"]["execute"])
@@ -93,10 +117,17 @@ class CompileTest(unittest.TestCase):
                        "--out", os.path.join(self.tmp.name, "x.json")])
 
 
-    def test_workspace_cannot_cover_deny(self):
-        for workspace in [self.h, f"{self.h}/dev", f"{self.h}/dev/work/child"]:
-            with self.subTest(workspace=workspace), self.assertRaises(SystemExit):
-                self.compiled("--workspace", workspace, "--deny", f"{self.h}/dev/work")
+    def test_a_grant_at_or_inside_a_deny_entry_is_refused(self):
+        deny = f"{self.h}/dev/work"
+        for option in ["--workspace", "--read-only"]:
+            for grant in [deny, f"{deny}/child"]:
+                with self.subTest(option=option, grant=grant), self.assertRaises(SystemExit):
+                    self.compiled(option, grant, "--deny", deny)
+
+    def test_a_grant_through_a_link_into_a_deny_entry_is_refused(self):
+        os.symlink(".ssh", f"{self.h}/keys")
+        with self.assertRaises(SystemExit):
+            self.compiled("--workspace", f"{self.h}/keys")
 
     def test_compile_does_not_list_home(self):
         with patch.object(comp.os, "listdir", side_effect=AssertionError("compile IO")):
@@ -110,6 +141,78 @@ class CompileTest(unittest.TestCase):
         self.assertIn("--ro-bind-try", wrap.arguments(c))
         os.unlink(f"{self.h}/new-at-launch")
         self.assertNotIn(f"{self.h}/new-at-launch", wrap.arguments(c))
+
+
+class DenyInsideAGrantTest(CompileTest):
+    """Design §5: a grant may hold a deny entry; the entry stays hidden and
+    the rest of the grant stays as granted."""
+
+    def setUp(self):
+        super().setUp()
+        for d in ["dev/work", "dev/other", "dev/deep/er/secret"]:
+            os.makedirs(f"{self.h}/{d}")
+        open(f"{self.h}/dev/token", "w").close()
+
+    def test_a_folder_denied_inside_a_workspace(self):
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/work")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/work"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/dev/work/old-file"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/dev"), ("--bind", True))
+        self.assertEqual(view(args, f"{h}/dev/other"), ("--bind", True))
+        self.assertEqual(view(args, f"{h}/dev/new-file"), ("--bind", True))
+        self.assertEqual(view(args, h), ("--tmpfs", False))
+
+    def test_a_file_denied_inside_a_workspace(self):
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/token")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/token"), ("--ro-bind", False))
+        self.assertIn("/dev/null", self.pairs(args, "--ro-bind"))
+        self.assertEqual(view(args, f"{h}/dev/other"), ("--bind", True))
+
+    def test_a_deny_entry_deep_inside_a_workspace_inside_a_masked_folder(self):
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev/deep", "--deny", f"{h}/dev/deep/er/secret",
+                             "--deny", f"{h}/dev/work")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/deep/er/secret"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/dev/deep/er"), ("--bind", True))
+        self.assertEqual(view(args, f"{h}/dev"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/dev/other"), ("--ro-bind-try", False))
+        self.assertNotIn(f"{h}/dev/work", self.pairs(args, "--ro-bind-try"))
+
+    def test_a_deny_entry_inside_a_read_only_grant(self):
+        h = self.h
+        args = self.compiled("--read-only", f"{h}/dev", "--deny", f"{h}/dev/work",
+                             "--deny", f"{h}/dev/token")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/work"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/dev/token"), ("--ro-bind", False))
+        self.assertEqual(view(args, f"{h}/dev/other"), ("--ro-bind", False))
+
+    def test_a_workspace_reached_through_a_link_still_hides_what_it_holds(self):
+        h = self.h
+        os.symlink("dev", f"{h}/d")
+        args = self.compiled("--workspace", f"{h}/d", "--deny", f"{h}/dev/work")["bwrap"]
+        self.assertEqual(view(args, f"{h}/d/work"), ("--tmpfs", False))
+
+    def test_the_users_whole_home_as_a_workspace(self):
+        h = self.h
+        args = self.compiled("--workspace", h)["bwrap"]
+        self.assertEqual(view(args, f"{h}/new-file"), ("--bind", True))
+        self.assertEqual(view(args, f"{h}/.ssh"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/.enclos"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{self.sbx}/home"), ("--bind", True))
+        self.assertEqual(view(args, f"{self.sbx}/compiled"), ("--ro-bind", False))
+
+    def test_a_deny_entry_that_does_not_exist_cannot_be_made_in_a_workspace(self):
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/not-yet")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/not-yet"), ("--tmpfs", False))
+
+    def test_a_deny_entry_that_does_not_exist_in_a_read_only_grant_needs_no_mount(self):
+        # bubblewrap could not make its mount point there, and nothing can make the path.
+        h = self.h
+        args = self.compiled("--read-only", f"{h}/dev", "--deny", f"{h}/dev/not-yet")["bwrap"]
+        self.assertEqual(view(args, f"{h}/dev/not-yet"), ("--ro-bind", False))
 
 
 if __name__ == "__main__":

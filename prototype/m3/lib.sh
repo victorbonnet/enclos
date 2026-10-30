@@ -42,6 +42,8 @@ DENY=(
     "$H/.local/share/keyrings"
     "$H/.password-store"
     "$H/.enclos"
+    "$WORK/denied-folder"                  # inside a workspace (design §5):
+    "$WORK/denied-file"                    # hidden, the workspace still writable
 )
 
 # Compile the prototype's policy into $SBX_COMPILED/compiled.json. Extra

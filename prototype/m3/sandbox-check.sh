@@ -24,10 +24,12 @@ mkdir -p "$tmp"
 planted=()
 for d in "${DENY[@]}"; do
     [ "$d" = "$H/.enclos" ] && continue
+    [ "$d" = "$WORK/denied-file" ] && continue
     mkdir -p "$d"
     echo planted >"$d/enclos-proto-planted"
     planted+=("$d/enclos-proto-planted")
 done
+echo planted >"$WORK/denied-file"
 other="$H/.enclos/sandboxes/other/home"
 mkdir -p "$other"
 echo planted >"$other/enclos-proto-planted"
@@ -48,6 +50,10 @@ sleep 1
 probes=()
 for f in "${planted[@]}"; do probes+=("read $f"); done
 probes+=(
+    "read $WORK/denied-file"
+    "write $WORK/denied-folder/enclos-proto-w"
+    "open-write $WORK/denied-file"
+    "rename $WORK/denied-folder"
     "exists $H/.ssh"
     "read $other/enclos-proto-planted"
     "exists $H/.enclos/sandboxes/other"

@@ -7,12 +7,14 @@ sandbox. Pure: home entries are enumerated by wrap.py at session launch, so it
 is safe on any host; test_compile.py runs it on a temporary folder.
 
     python3 -I compile.py --host-home H --sandbox-dir D --workspace W \\
-        --deny H/.ssh ... [--new-session] --out compiled.json
+        [--read-only R] --deny H/.ssh ... [--new-session] --out compiled.json
 
 The deny list is not mounted: every folder that holds a denied path gets an
 empty tmpfs, then each of its other entries is bound back read-only, so a
 denied path does not exist in the sandbox (ENOENT), not merely empty. Entries
 made on the host after the session starts do not appear in such a folder.
+A grant is the real folder, so a denied path inside one cannot be left out:
+it is masked after the grant's bind, and exists there, empty.
 """
 
 import argparse
@@ -64,9 +66,10 @@ def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def hide(folder, denied, args, remount):
+def hide(folder, denied, grants, args, remount):
     """Mount an empty tmpfs on `folder`, then bind back every entry that is
-    neither denied nor on the way to a denied path."""
+    neither denied nor on the way to a denied path. A grant is bound whole
+    later, so what it holds is masked after that bind, not here."""
     args += ["--tmpfs", folder]
     remount.append(folder)
     for name in sorted(os.listdir(folder)):
@@ -75,8 +78,8 @@ def hide(folder, denied, args, remount):
             continue
         if os.path.islink(path):
             args += ["--symlink", os.readlink(path), path]
-        elif os.path.isdir(path) and any(under(d, path) for d in denied):
-            hide(path, denied, args, remount)
+        elif os.path.isdir(path) and path not in grants and any(under(d, path) for d in denied):
+            hide(path, denied, grants, args, remount)
         else:
             args += ["--ro-bind-try", path, path]
 
@@ -90,30 +93,31 @@ def compile_policy(o):
         if not under(d, o.host_home) or d == o.host_home:
             sys.exit(f"compile.py: deny entry {d} is not under {o.host_home}")
 
-    for w in o.workspace:
-        grant = os.path.realpath(w)
+    # Design §5: a grant at or inside a deny entry is an error; one that holds
+    # a deny entry is fine, and the entry stays hidden (wrap.py masks it).
+    for g in o.workspace + o.read_only:
+        grant = os.path.realpath(g)
         for d in denied:
-            deny = os.path.realpath(d)
-            if under(deny, grant) or under(grant, deny):
-                sys.exit(f"compile.py: workspace {w} overlaps denied path {d}")
+            if under(grant, os.path.realpath(d)):
+                sys.exit(f"compile.py: grant {g} is at or inside denied path {d}")
 
     args = ["--ro-bind", "/", "/"]  # broad reads (ADR 0015)
-    remount = []
     if denied:
         args += ["@HOME_MASK@"]
     args += ["--dev", "/dev", "--proc", "/proc"]
     for t in OWN_TMPFS:
         args += ["--tmpfs", t]
-    args += ["--bind", home, home]
     for w in o.workspace:
         args += ["--bind", w, w]
+    for r in o.read_only:
+        args += ["--ro-bind", r, r]
+    args += ["@GRANT_MASK@"]
+    # After the masks: a denial that holds the sandbox's folder leaves its home
+    # out (design §5), and the two below are the sandbox's own too.
+    args += ["--bind", home, home]
     # The proxy's socket and the compiled policy, read-only: connecting to a
     # socket needs no write access to its mount (ADR 0004).
     args += ["--ro-bind", run, run, "--ro-bind", compiled, compiled]
-    # The tmpfs that hide denied paths were writable while bubblewrap made
-    # mount points in them; nothing may write there afterwards.
-    for r in remount:
-        args += ["--remount-ro", r]
     args += [
         "--unshare-user", "--disable-userns",
         "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
@@ -141,7 +145,12 @@ def compile_policy(o):
 
     return {
         "bwrap": args,
-        "home_mask": {"home": o.host_home, "denied": sorted(denied)},
+        "home_mask": {
+            "home": o.host_home,
+            "denied": sorted(denied),
+            "grants": [{"path": g, "write": True} for g in o.workspace]
+            + [{"path": g, "write": False} for g in o.read_only],
+        },
         "landlock": {
             "read": ["/"],
             "execute": EXEC_SYSTEM + [home],
@@ -166,6 +175,7 @@ def main(argv=None):
     p.add_argument("--host-home", required=True)
     p.add_argument("--sandbox-dir", required=True)
     p.add_argument("--workspace", action="append", default=[])
+    p.add_argument("--read-only", action="append", default=[])
     p.add_argument("--deny", action="append", default=[])
     p.add_argument("--relay-port", type=int, default=18080)
     p.add_argument("--new-session", action="store_true")
