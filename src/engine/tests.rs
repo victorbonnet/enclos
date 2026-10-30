@@ -917,11 +917,8 @@ mod sandbox {
 
     pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
         // As a session's start makes it, for its marker, when it can (a
-        // test may have put something else there): on macOS, where the
-        // markers are looked for with `lsof`.
-        if cfg!(target_os = "macos") {
-            let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
-        }
+        // test may have put something else there).
+        let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
         let lock = engine.state.lock().unwrap();
         engine.state.put_session(&lock, session).unwrap()
     }
@@ -7078,9 +7075,7 @@ mod status {
 }
 
 /// The runtime's own service, whose port the sandbox's sessions reach (ADR
-/// 0028). macOS only: the lookup reads `lsof` and `sysctl` at their macOS
-/// paths, and the stand-in gateways are `perl`.
-#[cfg(target_os = "macos")]
+/// 0028). The stand-in gateways are `perl`.
 mod listener {
     use super::policy::with_sandbox;
     use super::*;
