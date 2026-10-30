@@ -10,7 +10,7 @@ use crate::model::Timestamp;
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::SandboxName;
-use crate::proxy::{ActivePolicy, Proxy, listen};
+use crate::proxy::{ActivePolicy, Listener, Proxy, listen};
 use crate::state::sqlite::SqliteStateStore;
 
 impl Engine {
@@ -67,7 +67,7 @@ impl Engine {
         // an error, so the service manager starts the proxy again.
         Err(Error::ProxyStopped {
             sandbox: name.to_string(),
-            source: Arc::new(proxy).serve_all(listeners),
+            source: Arc::new(proxy).serve_all(listeners.into_iter().map(Listener::from).collect()),
         })
     }
 }
