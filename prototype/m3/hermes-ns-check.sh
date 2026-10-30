@@ -14,15 +14,17 @@
 # own (ADR 0028, Consequences), counted from the host before and after and
 # read in Hermes's gateway-starts.log.
 #
+# Then, in `nsenter`, with a session left open (ns-open-session.py): a chat, a
+# gateway restart and a chat on the new port, a chat with no gateway running,
+# then a holder restart. Each step goes to hermes-namespaces/restart.md.
+#
 #   own          each session its own network and PID namespaces (control)
-#   userns-net   one network namespace, the holder's, joined with bubblewrap's
-#                --userns and inside.py's setns; each session its own PIDs
-#                (option 1a)
+#   nsenter      one network namespace, the holder's, entered with nsenter
+#                before bubblewrap; each session its own PIDs (the decided way)
 #   relay        each session its own namespaces; the gateway's port, read
 #                from the host, relayed through run/service.sock (option 2)
 #
-# The first run's nsenter and --pidns ways failed at start (README.md), so
-# they are not run again here; ns-diagnose.sh looks at why.
+# The third run measured the shared ways and rejected the others (README.md).
 #
 # Acts on the host (runs bubblewrap, makes namespaces, installs Hermes in the
 # home): CI only.
@@ -32,7 +34,7 @@ out="$RESULTS_DIR/60-hermes-namespaces.md"
 tmp="$RESULTS_DIR/hermes-namespaces"
 mkdir -p "$tmp"
 installer_url="https://hermes-agent.nousresearch.com/install.sh"  # src/runtime/hermes.rs
-WAYS=(own userns-net relay)
+WAYS=(own nsenter relay)
 
 python3 -I "$M3/unix-proxy.py" --socket "$PROXY_SOCK" --learn --log "$tmp/proxy.jsonl" \
     >"$tmp/proxy.out" 2>&1 &
@@ -102,7 +104,7 @@ for way in "${WAYS[@]}"; do
     # else the deepest of the gateway session's processes with a listener
     # in the ephemeral range.
     nspid=""
-    if [ "$way" = userns-net ]; then
+    if [ "$way" = nsenter ]; then
         nspid=$hA
     else
         for p in $(python3 -I "$M3/ns-procs.py" descendants "$gw"); do
@@ -164,6 +166,94 @@ for way in "${WAYS[@]}"; do
     sleep 3
 done
 
+# --- restarts, with one session of the sandbox left open
+r="$tmp/restart.md"
+chat='export PATH="$HOME/.local/bin:$PATH"; timeout 120 hermes -z "Reply with exactly one word: ok"'
+listening() { python3 -I "$M3/ns-listeners.py" "$1" --ephemeral --port-only 2>/dev/null; }
+# gateway_up HOLDER_DIR HOLDER_PID OLD_PORT: a gateway in a new session of that
+# holder; sets gw and port once a port other than OLD_PORT listens.
+gateway_up() {
+    join_cmd "$1"
+    "${JOINED[@]}" /bin/bash -c 'export PATH="$HOME/.local/bin:$PATH"; exec hermes -p default gateway run --external-supervisor -v' \
+        </dev/null >>"$tmp/restart-gateway.log" 2>&1 &
+    gw=$!
+    started+=($gw)
+    port=""
+    for _ in $(seq 90); do
+        port=$(listening "$2")
+        [ -n "$port" ] && [ "$port" != "$3" ] && break
+        port=""
+        sleep 1
+    done
+}
+# step TITLE: the chat in the open session, and what it left.
+step() {
+    local before after out code
+    before=$(starts)
+    out=$(ask "$O" 150 /bin/bash -c "$chat")
+    code=$?
+    sleep 3
+    after=$(starts)
+    {
+        echo "### $1"
+        echo
+        echo "Exit $code; gateway-starts.log gained $((after - before)); the port in the sandbox's namespace now: $(listening "$hA"); gateway alive: $([ -d "/proc/$gw" ] && echo yes || echo no)"
+        echo
+        echo "Processes naming Hermes and its gateway:"
+        { by_name || true; } | fence
+        echo "The chat's last lines:"
+        echo "$out" | grep -v '^inside:' | tail -6 | sed "s#$SBX_HOME#~#g" | cut -c1-200 | fence
+    } >>"$r"
+}
+echo "## A gateway restart and a holder restart, with a session open (nsenter)" >"$r"
+echo >>"$r"
+rm -f "$SBX_HOME/.hermes/gateway.sock"
+start_holder A
+A=$HOLDER
+hA=$(cat "$A/pid" 2>/dev/null)
+started+=("$(cat "$A/bwrap.pid")")
+gateway_up "$A" "$hA" ""
+first=$port
+O="$SBX_HOME/open-hermes"
+open_session "$O" SBX_JOIN=nsenter SBX_HOLDER="$A/holder.sock" || echo "The open session did not start." >>"$r"
+started+=($OPEN_PID)
+echo "Gateway on port ${first:-none}." >>"$r"
+echo >>"$r"
+step "The first gateway"
+kill "$gw" 2>/dev/null
+wait "$gw" 2>/dev/null
+sleep 2
+gateway_up "$A" "$hA" "$first"
+echo "A new session of the gateway, port ${port:-none} (was ${first:-none}). gateway.sock, the same path in the home, is what a client reads first." >>"$r"
+echo >>"$r"
+step "The restarted gateway, from the session left open"
+kill "$gw" 2>/dev/null
+wait "$gw" 2>/dev/null
+sleep 2
+step "No gateway running"
+# If the chat started a gateway of its own there is a port already: that is the
+# one the next step finds, and its row above says so.
+port=$(listening "$hA")
+[ -n "$port" ] || gateway_up "$A" "$hA" ""
+kill "$(cat "$A/bwrap.pid")" 2>/dev/null
+sleep 2
+echo "The holder stopped. Its relay went with it, so a model call would have no way out." >>"$r"
+echo >>"$r"
+step "Holder stopped, gateway in the same namespace"
+start_holder A2
+A2=$HOLDER
+started+=("$(cat "$A2/bwrap.pid")")
+join_cmd "$A2"
+new=$("${JOINED[@]}" /bin/bash -c "$chat" </dev/null 2>&1)
+{
+    echo "### A new session of a new holder, the gateway left behind in the old namespace"
+    echo
+    echo "$new" | grep -v '^inside:' | tail -6 | sed "s#$SBX_HOME#~#g" | cut -c1-200 | fence
+} >>"$r"
+touch "$O/stop"
+kill "$gw" "$(cat "$A2/bwrap.pid")" 2>/dev/null
+sleep 2
+
 {
     echo "# Hermes's clients and a gateway in another session ($(uname -m))"
     section "Hermes"
@@ -179,6 +269,7 @@ done
     printf '%s\n' "${summary[@]}"
     echo
     for way in "${WAYS[@]}"; do [ -e "$tmp/$way.md" ] && cat "$tmp/$way.md"; done
+    cat "$r"
     section "Endpoints the proxy saw (host:port verdict)"
     python3 -I -c '
 import json, sys, collections
