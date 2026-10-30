@@ -36,6 +36,7 @@ jobs:
           python3 -I prototype/m3/test_compile.py
           python3 -I prototype/m3/test_nsjoin.py
           python3 -I prototype/m3/test_host_path.py
+          python3 -I prototype/m3/test_peerowner.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
       - name: Namespaces per session or per sandbox
