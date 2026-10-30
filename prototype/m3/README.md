@@ -289,22 +289,32 @@ From run [41073883978](https://github.com/victorbonnet/enclos/actions/runs/41073
 
 **Not shown by this run:** Hermes under `nsenter`; what restarts do to open sessions; that `--disable-userns` holds in a joined session without seccomp behind it; a kernel without Landlock.
 
-#### The next run: `enclos dashboard` (pending)
+#### The fifth run: `enclos dashboard`
 
-**Pending run: nothing in this list is measured yet.** The owner's answer to the fourth run: the dashboard stays, opened by a command the user runs, whose listener serves only that user. `dashboard-cmd.py` stands in for the command: it starts `hermes dashboard --no-open` as a recorded session, reads the port that session holds from the host, opens the listener at the reserved port, prints the URL, and on Ctrl-C ends both and records the end. A second run on the sandbox refuses, naming the first. `enclos status` names the command and gives no URL. On a remote host the command runs over ssh with `-L`. Pure parts are tested anywhere; these need a runner, and `dashboard-cmd-check.sh` writes `75-dashboard-cmd.md`, with `dashboard-cmd/verdicts.tsv` giving expected and measured for each row.
+From run [41121124650](https://github.com/victorbonnet/enclos/actions/runs/41121124650), on PR #114: both jobs passed, on `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (arm64), with the runners and Hermes of the fourth run. `dashboard-cmd.py` stands in for `enclos dashboard <sandbox>`; `dashboard-cmd-check.sh` wrote `75-dashboard-cmd.md`. **41 of 41 verdicts passed on both, but one thing they did not look at fails: see the first row.** The namespaces and Hermes results repeat the fourth run's on both. The two columns are the same apart from ports, pids, timestamps and the numbers given.
 
-| Question | Artifact (`dashboard-cmd/`) |
-| --- | --- |
-| Page, assets, WebSockets through the listener | `path.tsv` |
-| The terminal on `/api/pty`: output, and typed text coming back | `terminal.tsv` |
-| The chat with no account: `session.create`, `prompt.submit`, the turn's events and what stops it. A model's reply is not shown | `chat.tsv` |
-| Wrong Host 400, wrong Origin 403, no token 403 on `hermes dashboard` | `path.tsv` |
-| A second user refused, no bytes and no token, on the page and `/api/pty`, with a control that its network works | `other-page.tsv`, `other-pty.tsv`, `other-get.tsv`, `other-control.tsv` |
-| The same user served, the token in the answer, as the control | `same-user.tsv` |
-| `ssh -L`: this user served, the second user refused, with a control on its tunnel | `tunnel.tsv`, `tunnel-terminal.tsv`, `tunnel-other.tsv`, `tunnel-other-control.tsv`, `ssh.log` |
-| A second run refused, naming the first | `second.out` |
-| SIGINT leaves no listener, session or dashboard process, then a clean rerun | `snapshot-before.txt`, `snapshot-during.txt`, `snapshot-after.txt`, `processes-during.txt`, `audit.jsonl`, `third.out` |
-| What `status` says | `status.txt` |
+| Question | `ubuntu-latest` (x86_64) | `ubuntu-24.04-arm` (arm64) |
+| --- | --- | --- |
+| **The terminal's own connection to its backend** | **Refused, not covered by a verdict.** The proxy logged 30 `GET http://127.0.0.1:9119` denied (`blocked-address`), in two bursts of about 35 s, each while `/api/pty` was open and at no other time. Hermes gives the terminal's process `HERMES_TUI_GATEWAY_URL`, a `ws://127.0.0.1:<port>/api/ws` address, and the session sets `NODE_USE_ENV_PROXY=1` with `NO_PROXY` empty. So the terminal's process very likely dials its backend through the proxy, which refuses loopback, and retries. The terminal's text was not kept past 60 characters, so what it showed the user is not known. **A chat through the dashboard's terminal is not shown working, and is expected to fail as things stand.** | The same, 31 denied. |
+| Page and assets through the listener and through `ssh -L` | 200 (1385 bytes), 10 of 10 assets (1.3 MB), `/api/status` and `/api/auth/me` 200. | same |
+| `/api/ws` from the host | 101. `session.create` gives a session, `prompt.submit` is accepted, and the turn's events include `error` and `message.complete`. No model reply, since CI has no account. The row meant to say what stopped it caught a `session.info` frame, so the error's text is not recorded. This is the check's client on the host, not the page's chat. | same, events in another order |
+| `/api/pty` | 101, 2507 bytes of output (Hermes's banner). Typed text comes back (67 bytes), which shows the input box echoing, not that the terminal has a backend. | 2539 and 89 bytes. |
+| Host and Origin on `hermes dashboard` | Wrong Host 400 on HTTP, 403 on a WebSocket; wrong Origin 403; no token 403; `localhost` and the host's port accepted. | same |
+| A second user | Refused on `/` and `/api/pty`: 0 bytes, connection reset, no token in what it got. The listener logged `refused … owner 1002` 4 times, and served owner 1001 62 times. Control: that user's plain connection to another local server is served. | same |
+| The same user | Served, with the token in the answer, the control of the row above. | same |
+| `ssh -L` | As this user: page, WebSocket and typed text served. As the second user: refused, 0 bytes, no token, while that user's tunnel to a plain server works. | same |
+| A second run | Exit 3, naming the first's pid, session, start and URL. The first still serves. | same |
+| SIGINT | Exit 0. No process of the session left, no listener on the reserved port, port 9119 gone from the namespace, the host's refusing clients, no port file or record left, `dashboard-end` audited. A later run starts. The holder and its relay stay. | same |
+| `status` | Names `enclos dashboard proto` and `ssh`, gives no URL. | same |
+
+**Limits, by construction, not measured.**
+
+- The chat row shows no model reply. No account in CI.
+- The listener runs inside the command, so it cannot outlive it; it is not in the proxy service.
+- Root is refused like any other uid; a unit test shows that, not a run.
+- A client that half-closes at once, its row no longer established, is refused.
+- `/proc/net/tcp` is not an atomic snapshot, so a row can rarely be missed: that connection is refused and a browser retries.
+- `hermes dashboard` ran with no gateway beside it here, and through no gateway restart.
 
 #### The fourth run
 
