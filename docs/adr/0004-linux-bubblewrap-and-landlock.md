@@ -4,6 +4,8 @@ status: accepted
 
 # Linux: bubblewrap with Landlock and seccomp
 
+Qualified by [0037](0037-landlock-where-the-kernel-has-it.md) (proposed): where the kernel has no Landlock, the backend runs without it, its writes held by bubblewrap's mounts alone, and declares the weaker control on which programs can run.
+
 On Linux, the sandbox is built with bubblewrap: a mount namespace where denied paths are simply not mounted, a network namespace with no network except a Unix socket to the sandbox's proxy, Landlock to restrict writes and which programs can run, seccomp to block dangerous system calls, and cgroups (through `systemd-run --user`) for CPU and memory limits.
 
 ## Considered options

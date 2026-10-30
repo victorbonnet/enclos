@@ -1,0 +1,46 @@
+name: host-survey
+
+# Milestone 3's host survey (prototype/m3/, design §14) on GitHub's Ubuntu
+# runners: the read-only survey, then the checks that act on the host
+# (bubblewrap under AppArmor's settings, `systemd --user` at logout), which
+# run only on these throwaway runners. It reports; it does not gate merges.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "prototype/m3/**"
+      - ".github/workflows/host-survey.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  survey:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+      - name: The survey's own tests
+        run: sh prototype/m3/test_survey.sh
+      - name: Survey (read-only)
+        run: sh prototype/m3/survey.sh | tee -a survey.txt
+      - name: bubblewrap as an unprivileged user
+        run: sh prototype/m3/bwrap-check.sh | tee -a survey.txt
+      - name: systemd --user at logout
+        run: sh prototype/m3/logout-check.sh | tee -a survey.txt
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.os }}"
+            echo '```'
+            cat survey.txt
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
