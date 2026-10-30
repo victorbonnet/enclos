@@ -9,6 +9,16 @@ fn design() -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/design.md")).unwrap()
 }
 
+fn adr(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/adr")
+        .join(name);
+    fs::read_to_string(path).unwrap()
+}
+
+const ADR_0037: &str = "0037-landlock-where-the-kernel-has-it.md";
+const ADR_0038: &str = "0038-a-memory-limit-the-host-cannot-hold-runs-unapplied-once-accepted.md";
+
 /// The file names under `docs/adr/` whose front matter says `status: proposed`.
 fn proposed_adrs() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/adr");
@@ -49,4 +59,17 @@ fn a_line_citing_a_proposed_adr_says_it_is_proposed() {
         .filter(|line| !line.to_lowercase().contains("proposed"))
         .collect();
     assert!(unmarked.is_empty(), "{unmarked:#?}");
+}
+
+#[test]
+fn adr_0038_gives_the_verdict_on_a_field_not_enforced() {
+    let adr = adr(ADR_0038);
+    for rule in [
+        "`READY, 1 field not enforced: memory (accepted)`",
+        "`ready: true` and a `not_enforced` list with each field, reason and acceptance",
+        "no recorded acceptance, or whose acceptance no longer matches the field's value, is `NOT READY`",
+        "A host with no Landlock and no `[exec]` section stays `READY` and prints one line naming the degraded control",
+    ] {
+        assert!(adr.contains(rule), "{rule}");
+    }
 }
