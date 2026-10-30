@@ -131,6 +131,7 @@ def compile_policy(o):
         "home_mask": {
             "home": o.host_home,
             "denied": sorted(denied),
+            "empty_file": os.path.join(compiled, "empty"),
             "grants": [{"path": g, "write": True} for g in o.workspace]
             + [{"path": g, "write": False} for g in o.read_only],
         },

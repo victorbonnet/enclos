@@ -242,7 +242,9 @@ class DenyInsideAGrantTest(Case):
         h = self.h
         args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/token")["bwrap"]
         self.assertEqual(view(args, f"{h}/dev/token"), ("--ro-bind", False))
-        self.assertIn("/dev/null", self.pairs(args, "--ro-bind"))
+        i = args.index(f"{h}/dev/token")
+        self.assertEqual(args[i - 1], f"{self.sbx}/compiled/empty")
+        self.assertNotIn("/dev/null", args)
         self.assertEqual(view(args, f"{h}/dev/other"), ("--bind", True))
 
     def test_a_deny_entry_deep_inside_a_workspace_inside_a_masked_folder(self):

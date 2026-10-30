@@ -82,9 +82,12 @@ def hide(folder, denied, entries, args, remount):
 
 
 def mask_in_grants(mask, listing, args, remount):
-    """Mask each denied path a grant holds, after the grant's bind (design §5).
-    A path that does not exist gets a mount point in a writable grant, or the
-    sandbox could make it there; a read-only grant cannot take one, and the
+    """Mask each denied path a grant holds, after the grant's bind (design §5):
+    a read-only empty tmpfs for a folder, the sandbox's read-only empty file
+    for a file. Not /dev/null: bubblewrap's binds are nodev, so it could not
+    be opened, and a device on a read-only mount still takes writes. A path
+    that does not exist gets the tmpfs in a writable grant, or the sandbox
+    could make it there; a read-only grant cannot take a mount point, and the
     sandbox cannot make the path."""
     for path, writable in masked_in_grants(mask, listing["resolved"]):
         kind = listing["kinds"].get(path)
@@ -92,7 +95,7 @@ def mask_in_grants(mask, listing, args, remount):
             args += ["--tmpfs", path]
             remount.append(path)
         elif kind == "file":
-            args += ["--ro-bind", "/dev/null", path]
+            args += ["--ro-bind", mask["empty_file"], path]
 
 
 def arguments(compiled, listing):

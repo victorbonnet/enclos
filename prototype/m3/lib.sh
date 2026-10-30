@@ -53,6 +53,7 @@ compile_policy() {
         --relay-port "$RELAY_PORT" --out "$SBX_COMPILED/compiled.json")
     local d
     for d in "${DENY[@]}"; do args+=(--deny "$d"); done
+    : >"$SBX_COMPILED/empty"               # what masks a denied file (wrap.py)
     python3 -I "$M3/compile.py" "${args[@]}" "$@"
 }
 
