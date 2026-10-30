@@ -256,6 +256,8 @@ Design §15's row on network and PID namespaces, and its §14 item on the runtim
 | `ns-open-session.py` | A session left open: runs commands the check gives it (`lib.sh`'s `open_session` and `ask`), so a check sees what an open session sees across a restart. |
 | `dashboard-check.sh` | The host's path to a sandbox's service, below: a stand-in, then Hermes's gateway port and `hermes dashboard`. |
 | `host-listen.py`, `host-client.py`, `ns-webservice.py`, `wsmini.py`, `test_host_path.py` | The listener on the host's loopback; a client that does what a browser does; a stand-in with a page, an asset and a WebSocket; WebSocket frames on the standard library; tests of the pure parts, which run anywhere. `ns-listeners.py --held-by` reads a port by who holds it. |
+| `dashboard-cmd.py`, `dashboard-cmd-check.sh`, `test_dashboard_cmd.py` | A stand-in for `enclos dashboard <sandbox>`, its check end to end, and tests of its pure parts. |
+| `peerowner.py`, `test_peerowner.py` | Whose socket a connection comes from, read from `/proc/net/tcp` and `tcp6`, failing closed, and its tests on fixture tables. `host-listen.py` closes any other user's connection before a byte reaches the service. |
 | `.github/workflows/namespaces-prototype.yml` | Runs the checks on `ubuntu-latest` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
 
 ### Results
@@ -286,6 +288,23 @@ From run [41073883978](https://github.com/victorbonnet/enclos/actions/runs/41073
 **Decided from this (the owner's decision; ADR 0039 and 0040 are still as written):** one network namespace per sandbox, held by a holder and joined the `nsenter` way; each session keeps its own PID and IPC namespaces. Rejected: `nsenter-pid`, whose sessions listed the host's processes, and the `userns` ways, which need `CAP_SYS_ADMIN` during setup.
 
 **Not shown by this run:** Hermes under `nsenter`; what restarts do to open sessions; that `--disable-userns` holds in a joined session without seccomp behind it; a kernel without Landlock.
+
+#### The next run: `enclos dashboard` (pending)
+
+**Pending run: nothing in this list is measured yet.** The owner's answer to the fourth run: the dashboard stays, opened by a command the user runs, whose listener serves only that user. `dashboard-cmd.py` stands in for the command: it starts `hermes dashboard --no-open` as a recorded session, reads the port that session holds from the host, opens the listener at the reserved port, prints the URL, and on Ctrl-C ends both and records the end. A second run on the sandbox refuses, naming the first. `enclos status` names the command and gives no URL. On a remote host the command runs over ssh with `-L`. Pure parts are tested anywhere; these need a runner, and `dashboard-cmd-check.sh` writes `75-dashboard-cmd.md`, with `dashboard-cmd/verdicts.tsv` giving expected and measured for each row.
+
+| Question | Artifact (`dashboard-cmd/`) |
+| --- | --- |
+| Page, assets, WebSockets through the listener | `path.tsv` |
+| The terminal on `/api/pty`: output, and typed text coming back | `terminal.tsv` |
+| The chat with no account: `session.create`, `prompt.submit`, the turn's events and what stops it. A model's reply is not shown | `chat.tsv` |
+| Wrong Host 400, wrong Origin 403, no token 403 on `hermes dashboard` | `path.tsv` |
+| A second user refused, no bytes and no token, on the page and `/api/pty`, with a control that its network works | `other-page.tsv`, `other-pty.tsv`, `other-get.tsv`, `other-control.tsv` |
+| The same user served, the token in the answer, as the control | `same-user.tsv` |
+| `ssh -L`: this user served, the second user refused, with a control on its tunnel | `tunnel.tsv`, `tunnel-terminal.tsv`, `tunnel-other.tsv`, `tunnel-other-control.tsv`, `ssh.log` |
+| A second run refused, naming the first | `second.out` |
+| SIGINT leaves no listener, session or dashboard process, then a clean rerun | `snapshot-before.txt`, `snapshot-during.txt`, `snapshot-after.txt`, `processes-during.txt`, `audit.jsonl`, `third.out` |
+| What `status` says | `status.txt` |
 
 #### The fourth run
 
