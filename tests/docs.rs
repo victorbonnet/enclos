@@ -90,3 +90,23 @@ fn principle_6_gives_the_proposed_verdict() {
     assert!(principle.contains("`READY, 1 field not enforced: memory (accepted)`"));
     assert!(principle.contains("no longer matches the field's value, it is `NOT READY`"));
 }
+
+#[test]
+fn acceptance_steps_2_and_5_agree_on_the_verdict() {
+    let design = design();
+    let step = |start: &str| {
+        design
+            .lines()
+            .skip_while(|line| !line.starts_with("**Acceptance scenario (milestone 3).**"))
+            .find(|line| line.starts_with(start))
+            .unwrap()
+            .to_owned()
+    };
+    assert!(
+        step("2. **The same policy.**")
+            .contains("`READY, 1 field not enforced: memory (accepted)`")
+    );
+    let escape = step("5. **Escape probes.**");
+    assert!(escape.contains("is NOT READY"));
+    assert!(escape.contains("one line naming the missing Landlock"));
+}
