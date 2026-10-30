@@ -257,6 +257,8 @@ Design §15's row on network and PID namespaces, and its §14 item on the runtim
 | `dashboard-check.sh` | The host's path to a sandbox's service, below: a stand-in, then Hermes's gateway port and `hermes dashboard`. |
 | `host-listen.py`, `host-client.py`, `ns-webservice.py`, `wsmini.py`, `test_host_path.py` | The listener on the host's loopback; a client that does what a browser does; a stand-in with a page, an asset and a WebSocket; WebSocket frames on the standard library; tests of the pure parts, which run anywhere. `ns-listeners.py --held-by` reads a port by who holds it. |
 | `dashboard-cmd.py`, `dashboard-cmd-check.sh`, `test_dashboard_cmd.py` | A stand-in for `enclos dashboard <sandbox>`, its check end to end, and tests of its pure parts. |
+| `dashboard-chat-check.sh`, `browser-chat.py`, `ns-conns.py` | The Chat tab as a control pair; a real Chromium driven through the listener; who holds a connection to a port, read from the host. |
+| `test_adr_status.py` | ADRs 0037 to 0040 stay proposed. CI runs it through `test_nsjoin.py`. |
 | `peerowner.py`, `test_peerowner.py` | Whose socket a connection comes from, read from `/proc/net/tcp` and `tcp6`, failing closed, and its tests on fixture tables. `host-listen.py` closes any other user's connection before a byte reaches the service. |
 | `.github/workflows/namespaces-prototype.yml` | Runs the checks on `ubuntu-latest` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
 
@@ -288,6 +290,22 @@ From run [41073883978](https://github.com/victorbonnet/enclos/actions/runs/41073
 **Decided from this (the owner's decision; ADR 0039 and 0040 are still as written):** one network namespace per sandbox, held by a holder and joined the `nsenter` way; each session keeps its own PID and IPC namespaces. Rejected: `nsenter-pid`, whose sessions listed the host's processes, and the `userns` ways, which need `CAP_SYS_ADMIN` during setup.
 
 **Not shown by this run:** Hermes under `nsenter`; what restarts do to open sessions; that `--disable-userns` holds in a joined session without seccomp behind it; a kernel without Landlock.
+
+#### The next run: the Chat tab, a control pair (pending)
+
+**Pending run: nothing in this list is measured yet.** The fifth run's first row is what this tests. `dashboard-chat-check.sh`, started last by `dashboard-cmd-check.sh`, runs one round twice through the stand-in: `as-is`, the dashboard's session as it is, and `fixed`, that session alone with `NO_PROXY=127.0.0.1,localhost,::1` and `no_proxy` (`--no-proxy-loopback`). No other session changes. It writes `76-dashboard-chat.md`, whose first line reads the pair, and each verdict in `dashboard-chat/verdicts.tsv` is what a working dashboard must do, so `as-is` rows are expected to fail if the proxy is the cause.
+
+| Question | Artifact (`dashboard-chat/`, for `as-is` and `fixed`) |
+| --- | --- |
+| No loopback denial in the proxy log while the terminal is used | `proxy.jsonl`, `<round>-measures.tsv` |
+| The terminal program's backend connection is established: who holds a connection to the dashboard's port, read from the host | `<round>-connections.txt` |
+| The terminal program's environment, and the address it was given | `<round>-environment.txt` |
+| The whole terminal, and the answer to a typed prompt | `<round>-terminal`, `<round>-terminal.txt`, `<round>-terminal.tsv` |
+| The Chat tab in a real Chromium: the page's own socket, its frames, a typed prompt, a screenshot | `<round>-browser.txt`, `<round>-browser.png`, `<round>-browser.tsv`, `<round>-browser.err` |
+| What stops the turn: an `error` event's text | `<round>-chat.tsv` |
+| What the dashboard logged | `<round>-gui-log.txt`, `<round>-session.log` |
+
+A model's reply stays out of reach, since CI has no account: an answer here is Hermes saying what is missing.
 
 #### The fifth run: `enclos dashboard`
 
