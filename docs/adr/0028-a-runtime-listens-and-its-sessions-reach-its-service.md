@@ -4,6 +4,8 @@ status: accepted
 
 # A runtime may listen in its sandbox, and the sandbox's sessions reach its service's port
 
+Amended for the bubblewrap backend by [0040](0040-on-linux-a-sandboxs-service-is-reached-from-inside-the-sandbox.md) (proposed): on Linux the service's listener is reached from inside the sandbox alone, and its port is relayed to the sandbox's sessions ([0039](0039-a-bubblewrap-session-has-its-own-namespaces-and-its-services-port-is-relayed.md), proposed).
+
 Hermes 0.22.3's gateway binds a TCP listener on `127.0.0.1:0` when it starts, for its session WebSocket (`/api/ws`) and its dashboard, and exits if the bind is refused. Its chat (CLI, TUI, stream-json) never runs on its own: it finds the gateway, gets a ticket for its own agent (a Hermes profile) over the gateway's Unix socket in the home, and dials the port the gateway gives; it starts a gateway if none runs, and fails with no fallback when it cannot reach one. The compiled policy's `(deny network*)` refuses both the bind and the dial, so neither the gateway nor any chat works in a sandbox (issue #64). enclos adapts to Hermes as it ships.
 
 Opening outbound loopback (`localhost:*`) would let the chat dial its gateway, and also every other loopback service: other sandboxes' proxies, and with them their policies, other sandboxes' gateways, and the user's own tools. That is the loopback exception §6 rules out.
