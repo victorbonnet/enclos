@@ -5,8 +5,9 @@
 # refuses the namespace calls, so Chromium's own sandbox is expected not to
 # start. It uses the Chromium Hermes's installer left in the sandbox's home
 # (hermes-check.sh runs first); if there is none, Playwright's, installed in
-# the sandbox's home through the relay. On the host as the control, then in
-# each sandbox mode, driven over the DevTools protocol (cdp-load.py). A proxy in --learn mode on the host. CI or a guarded disposable VM only.
+# the sandbox's home through the relay. It runs on the host as the control,
+# then in each sandbox mode, driven over the DevTools protocol (cdp-load.py),
+# with a proxy in --learn mode on the host. CI or a guarded disposable VM only.
 set -u
 source "$(dirname "$0")/lib.sh"
 out="$RESULTS_DIR/50-chromium.md"
