@@ -5,6 +5,15 @@ use crate::backend::fake::FakeBackend;
 use crate::error::{Error, HomeFound};
 use crate::model::audit::AuditResult;
 
+/// The shell `connect` runs when given no command, as a plan shows it.
+fn default_shell() -> String {
+    crate::backend::environment::shell_command()
+        .iter()
+        .map(|word| word.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn alice() -> Actor {
     Actor {
         user: "alice".into(),
@@ -1445,9 +1454,9 @@ mod sandbox {
             panic!("a dry run connected");
         };
         assert!(
-            plan.changes
-                .last()
-                .is_some_and(|c| c.starts_with("run `/bin/zsh -l` in sandbox home")),
+            plan.changes.last().is_some_and(
+                |c| c.starts_with(&format!("run `{}` in sandbox home", default_shell()))
+            ),
             "{plan:?}"
         );
         assert_eq!(
@@ -5222,8 +5231,8 @@ mod services {
         assert_eq!(
             dry_run(&engine, &name),
             [
-                "wait for the gateway of sandbox home to listen",
-                "run `/bin/zsh -l` in sandbox home under policy v1"
+                "wait for the gateway of sandbox home to listen".to_owned(),
+                format!("run `{}` in sandbox home under policy v1", default_shell())
             ]
         );
         let (waited, said) = wait_for_gateway(&engine, &name);

@@ -4,6 +4,7 @@
 //! full shape in design §9 (prepare, members, denials, ...) as the commands
 //! that use it arrive.
 
+pub mod environment;
 #[cfg(test)]
 pub mod fake;
 pub mod seatbelt;
