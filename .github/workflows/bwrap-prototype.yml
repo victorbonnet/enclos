@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: The compile step's tests (no host access)
         run: python3 -I prototype/m3/test_compile.py
+      - name: The relay's tests (loopback sockets, no host access)
+        run: python3 -I prototype/m3/test_relay.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
       - name: Landlock proc O_TRUNC regression

@@ -1,33 +1,39 @@
-# PROTOTYPE ONLY: blocking sendall and paired close on EOF are not production safe.
-# M3-09 must implement bounded backpressure and independent half-closes,
-# with large simultaneous bidirectional transfer and request-half-close tests.
 """The relay (design §5, Linux networking; M3-09 builds the real one): accepts
 TCP connections on a listening socket inside the sandbox and forwards each to
 the proxy's Unix socket, and nothing else. inside.py makes the listening
-socket on 127.0.0.1 and calls serve() in a child process."""
+socket on 127.0.0.1 and calls serve() in a child process.
 
-import select
+One thread per direction, so a direction blocked on a slow reader never holds
+up the other, and the kernel's socket buffers are the only buffering. An EOF
+ends one direction only. README.md says what M3-09 may take from this."""
+
 import socket
 import threading
 
 
-def pump(a, b):
-    socks = [a, b]
+def forward(src, dst, peer_gone):
     try:
-        while True:
-            readable, _, _ = select.select(socks, [], [], 600)
-            if not readable:
-                return
-            for s in readable:
-                data = s.recv(65536)
-                if not data:
-                    return
-                (b if s is a else a).sendall(data)
+        while data := src.recv(65536):
+            dst.sendall(data)
+        dst.shutdown(socket.SHUT_WR)
     except OSError:
-        pass
-    finally:
-        a.close()
-        b.close()
+        peer_gone()
+
+
+def pump(a, b):
+    def peer_gone():  # wakes the other direction, which may be blocked
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    back = threading.Thread(target=forward, args=(b, a, peer_gone), daemon=True)
+    back.start()
+    forward(a, b, peer_gone)
+    back.join()
+    a.close()
+    b.close()
 
 
 def one(conn, path):
