@@ -233,14 +233,12 @@ sleep 1
 
 # --- restarts, with one session of the sandbox left open
 log="$tmp/restarts.txt"
-joined() {
-    env SBX_JOIN=nsenter SBX_HOLDER="$1/holder.sock" timeout 900 "$M3/sbx-ns.sh" -- "${@:2}"
-}
 # stand_in N: a service in a session of $A; sets svc and port.
 stand_in() {
     local out="$SBX_HOME/ns-service-restart.json"
     rm -f "$out"
-    joined "$A" /usr/bin/python3 -I "$M3/ns-service.py" --name "R$1" --marker "restart-$1" \
+    join_cmd "$A"
+    "${JOINED[@]}" /usr/bin/python3 -I "$M3/ns-service.py" --name "R$1" --marker "restart-$1" \
         --out "$out" --seconds 800 >"$tmp/restart-svc-$1.out" 2>&1 &
     svc=$!
     started+=($svc)
@@ -261,7 +259,8 @@ new() {
     shift
     {
         echo "new session:"
-        joined "$h" /usr/bin/python3 -I "$M3/probe.py" "$@"
+        join_cmd "$h"
+        "${JOINED[@]}" /usr/bin/python3 -I "$M3/probe.py" "$@"
     } 2>&1 | grep -v '^inside:' >>"$log"
 }
 : >"$log"

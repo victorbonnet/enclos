@@ -84,6 +84,13 @@ start_holder() {
     HOLDER="$dir"
 }
 
+# join_cmd HOLDER_DIR: sets JOINED to the start of a command that runs as a
+# session joined to that holder the decided way. An array, not a function, so
+# `"${JOINED[@]}" command &` leaves $! at timeout, which passes a TERM on.
+join_cmd() {
+    JOINED=(env SBX_JOIN=nsenter SBX_HOLDER="$1/holder.sock" timeout 1200 "$M3/sbx-ns.sh" --)
+}
+
 # A session left open across restarts (ns-open-session.py).
 #
 # open_session DIR ENV=VALUE...: a session with that environment (SBX_JOIN and
