@@ -11,10 +11,9 @@ tmp="$RESULTS_DIR/options"
 mkdir -p "$tmp"
 
 compile_policy --new-session
-mapfile -t used < <(python3 -I -c '
-import json, sys
-print("\n".join(sorted({a for a in json.load(open(sys.argv[1]))["bwrap"] if a.startswith("--")})))
-' "$SBX_COMPILED/compiled.json")
+# The wrap step's output: the options of the masks are not in the compiled file.
+mapfile -t used < <(python3 -I "$M3/wrap.py" "$SBX_COMPILED/compiled.json" \
+    | tr '\0' '\n' | grep -- '^--' | sort -u)
 
 images=(debian:bookworm ubuntu:24.04 debian:trixie)
 for img in "${images[@]}"; do
