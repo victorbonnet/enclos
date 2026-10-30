@@ -2,19 +2,20 @@
 
 Turns the prototype's policy into what the bubblewrap backend applies:
 bubblewrap's arguments, the Landlock rules and the seccomp filter, written as
-one JSON file that sbx.sh hands to bubblewrap and inside.py reads inside the
-sandbox. Pure: home entries are enumerated by wrap.py at session launch, so it
-is safe on any host; test_compile.py runs it on a temporary folder.
+one JSON file that wrap.py finishes and inside.py reads inside the sandbox.
+Pure: it reads nothing of the host, not a folder's entries and not a link, so
+its output can be cached with the policy snapshot. What depends on the host
+at a session's start is wrap.py's, marked here by @HOME_MASK@ and @GRANT_MASK@.
 
     python3 -I compile.py --host-home H --sandbox-dir D --workspace W \\
         [--read-only R] --deny H/.ssh ... [--new-session] --out compiled.json
 
-The deny list is not mounted: every folder that holds a denied path gets an
-empty tmpfs, then each of its other entries is bound back read-only, so a
-denied path does not exist in the sandbox (ENOENT), not merely empty. Entries
-made on the host after the session starts do not appear in such a folder.
-A grant is the real folder, so a denied path inside one cannot be left out:
-it is masked after the grant's bind, and exists there, empty.
+The deny list is not mounted (wrap.py): every folder that holds a denied path
+gets an empty tmpfs, then each of its other entries is bound back read-only,
+so a denied path does not exist in the sandbox (ENOENT), not merely empty.
+Entries made on the host after the session starts do not appear in such a
+folder. A grant is the real folder, so a denied path inside one cannot be left
+out: it is masked after the grant's bind, and exists there, empty.
 """
 
 import argparse
@@ -66,24 +67,6 @@ def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def hide(folder, denied, grants, args, remount):
-    """Mount an empty tmpfs on `folder`, then bind back every entry that is
-    neither denied nor on the way to a denied path. A grant is bound whole
-    later, so what it holds is masked after that bind, not here."""
-    args += ["--tmpfs", folder]
-    remount.append(folder)
-    for name in sorted(os.listdir(folder)):
-        path = os.path.join(folder, name)
-        if path in denied:
-            continue
-        if os.path.islink(path):
-            args += ["--symlink", os.readlink(path), path]
-        elif os.path.isdir(path) and path not in grants and any(under(d, path) for d in denied):
-            hide(path, denied, grants, args, remount)
-        else:
-            args += ["--ro-bind-try", path, path]
-
-
 def compile_policy(o):
     home = os.path.join(o.sandbox_dir, "home")
     run = os.path.join(o.sandbox_dir, "run", "visible")
@@ -94,11 +77,11 @@ def compile_policy(o):
             sys.exit(f"compile.py: deny entry {d} is not under {o.host_home}")
 
     # Design §5: a grant at or inside a deny entry is an error; one that holds
-    # a deny entry is fine, and the entry stays hidden (wrap.py masks it).
+    # a deny entry is fine, and the entry stays hidden (wrap.py masks it). As
+    # written here; wrap.py checks them again resolved, at each session's start.
     for g in o.workspace + o.read_only:
-        grant = os.path.realpath(g)
         for d in denied:
-            if under(grant, os.path.realpath(d)):
+            if under(os.path.normpath(g), d):
                 sys.exit(f"compile.py: grant {g} is at or inside denied path {d}")
 
     args = ["--ro-bind", "/", "/"]  # broad reads (ADR 0015)

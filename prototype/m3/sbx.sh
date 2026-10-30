@@ -4,8 +4,9 @@
 #   [SBX_LANDLOCK=auto|off] [SBX_SECCOMP=on|off] [SBX_RELAY=1] [SBX_NEW_SESSION=1] \
 #       sbx.sh -- command...
 #
-# It compiles the policy (compile.py), runs bubblewrap with the compiled
-# arguments, and inside it inside.py, which applies Landlock where the kernel
+# It compiles the policy (compile.py), lists the host and finishes bubblewrap's
+# arguments (wrap.py, which a cached policy would go through at each session's
+# start), runs bubblewrap, and inside it inside.py, which applies Landlock where the kernel
 # has it and SBX_LANDLOCK is not off (ADR 0037), then seccomp, then starts
 # the relay when SBX_RELAY=1, then runs the command.
 set -u

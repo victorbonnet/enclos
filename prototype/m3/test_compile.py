@@ -1,10 +1,11 @@
-"""Tests of the prototype's compile step, on a temporary folder standing in
+"""Tests of the prototype's compile and wrap steps, on a temporary folder standing in
 for the home. They read and write nothing else and run no bubblewrap, so
 they run anywhere:
 
     python3 -I prototype/m3/test_compile.py
 """
 
+import argparse
 import json
 import os
 import sys
@@ -28,7 +29,9 @@ def view(args, path):
             mounts.append([a, args[i + 1], args[i + 2], a == "--bind"])
             i += 3
         elif a == "--tmpfs":
-            mounts.append([a, None, args[i + 1], True])
+            # The sandbox's own /tmp is left out: the test's home may be under it.
+            if args[i + 1] not in comp.OWN_TMPFS:
+                mounts.append([a, None, args[i + 1], True])
             i += 2
         elif a == "--remount-ro":
             [m for m in mounts if m[2] == args[i + 1]][-1][3] = False
@@ -41,7 +44,7 @@ def view(args, path):
     raise AssertionError(f"nothing mounted at {path}")
 
 
-class CompileTest(unittest.TestCase):
+class Case(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         h = self.h = os.path.join(self.tmp.name, "home")
@@ -63,12 +66,23 @@ class CompileTest(unittest.TestCase):
                    "--deny", f"{self.h}/.enclos", "--out", out, *extra])
         with open(out) as f:
             c = json.load(f)
-            c["bwrap"] = wrap.arguments(c)
+            c["bwrap"] = wrap.arguments(c, wrap.read_host(c))
             return c
+
+    def bare(self, *extra):
+        """The compiled policy, before the wrap step."""
+        out = f"{self.tmp.name}/bare.json"
+        comp.main(["--host-home", self.h, "--sandbox-dir", self.sbx, "--workspace", f"{self.h}/proj",
+                   "--deny", f"{self.h}/.ssh", "--deny", f"{self.h}/.config/google-chrome",
+                   "--out", out, *extra])
+        with open(out) as f:
+            return json.load(f)
 
     def pairs(self, args, option):
         return [args[i + 1] for i, a in enumerate(args) if a == option]
 
+
+class CompileTest(Case):
     def test_denied_paths_are_not_mounted(self):
         args = self.compiled()["bwrap"]
         binds = self.pairs(args, "--ro-bind-try")
@@ -129,21 +143,75 @@ class CompileTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.compiled("--workspace", f"{self.h}/keys")
 
-    def test_compile_does_not_list_home(self):
-        with patch.object(comp.os, "listdir", side_effect=AssertionError("compile IO")):
-            out = f"{self.tmp.name}/pure.json"
-            comp.main(["--host-home", self.h, "--sandbox-dir", self.sbx,
-                       "--deny", f"{self.h}/.ssh", "--out", out])
-        with open(out) as f:
-            c = json.load(f)
+    def test_compile_reads_nothing_of_the_host(self):
+        refused = AssertionError("compile read the host")
+        with patch.object(comp.os, "listdir", side_effect=refused), \
+                patch.object(comp.os, "scandir", side_effect=refused), \
+                patch.object(comp.os, "readlink", side_effect=refused), \
+                patch.object(comp.os, "lstat", side_effect=refused), \
+                patch.object(comp.os, "stat", side_effect=refused):
+            c = comp.compile_policy(argparse.Namespace(
+                host_home=self.h, sandbox_dir=self.sbx, workspace=[f"{self.h}/proj"], read_only=[],
+                deny=[f"{self.h}/.ssh"], relay_port=18080, new_session=False))
+        self.assertIn("@HOME_MASK@", c["bwrap"])
+        self.assertIn("@GRANT_MASK@", c["bwrap"])
+
+    def test_wrap_uses_only_the_listing_it_is_given(self):
+        h = self.h
+        c = self.bare()
+        listing = {
+            "entries": {h: {"stubbed": None, "stub-link": "there", ".ssh": None, ".config": None},
+                        f"{h}/.config": {"other": None}},
+            "resolved": {p: p for p in c["home_mask"]["denied"] + [f"{h}/proj"]},
+            "kinds": {},
+        }
+        with patch.object(wrap.os, "listdir", side_effect=AssertionError("wrap listed the host")):
+            args = wrap.arguments(c, listing)
+        binds = self.pairs(args, "--ro-bind-try")
+        self.assertEqual(binds, [f"{h}/.config/other", f"{h}/stubbed"])
+        self.assertNotIn(f"{h}/notes.txt", binds)
+        self.assertIn("there", self.pairs(args, "--symlink"))
+        self.assertNotIn("@HOME_MASK@", args)
+        self.assertNotIn("@GRANT_MASK@", args)
+
+    def test_the_listing_is_taken_at_each_session_start(self):
+        c = self.bare()
         open(f"{self.h}/new-at-launch", "w").close()
-        self.assertIn(f"{self.h}/new-at-launch", wrap.arguments(c))
-        self.assertIn("--ro-bind-try", wrap.arguments(c))
+        self.assertIn(f"{self.h}/new-at-launch", wrap.arguments(c, wrap.read_host(c)))
         os.unlink(f"{self.h}/new-at-launch")
-        self.assertNotIn(f"{self.h}/new-at-launch", wrap.arguments(c))
+        self.assertNotIn(f"{self.h}/new-at-launch", wrap.arguments(c, wrap.read_host(c)))
+
+    def test_an_entry_deleted_after_compile_leaves_a_valid_command(self):
+        h = self.h
+        c = self.bare()
+        for gone in [f"{h}/notes.txt", f"{h}/link"]:
+            os.unlink(gone)
+        os.rmdir(f"{h}/.config/other")
+        os.rmdir(f"{h}/.config/google-chrome")
+        os.rmdir(f"{h}/.config")
+        args = wrap.arguments(c, wrap.read_host(c))
+        self.assertNotIn(f"{h}/notes.txt", args)
+        self.assertEqual(self.pairs(args, "--tmpfs")[0], h)
+        self.assertNotIn(f"{h}/.config", args)
+
+    def test_an_entry_deleted_after_the_listing_is_bound_with_try(self):
+        c = self.bare()
+        listing = wrap.read_host(c)
+        os.unlink(f"{self.h}/notes.txt")
+        args = wrap.arguments(c, listing)
+        self.assertEqual(args[args.index(f"{self.h}/notes.txt") - 1], "--ro-bind-try")
+        for i, a in enumerate(args):
+            if a == "--ro-bind":
+                self.assertNotEqual(args[i + 1], f"{self.h}/notes.txt")
+
+    def test_a_folder_that_cannot_be_listed_stops_the_session(self):
+        c = self.bare()
+        with patch.object(wrap.os, "listdir", side_effect=PermissionError), \
+                self.assertRaises(PermissionError):
+            wrap.read_host(c)
 
 
-class DenyInsideAGrantTest(CompileTest):
+class DenyInsideAGrantTest(Case):
     """Design §5: a grant may hold a deny entry; the entry stays hidden and
     the rest of the grant stays as granted."""
 
