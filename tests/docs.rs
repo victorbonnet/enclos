@@ -110,3 +110,10 @@ fn acceptance_steps_2_and_5_agree_on_the_verdict() {
     assert!(escape.contains("is NOT READY"));
     assert!(escape.contains("one line naming the missing Landlock"));
 }
+
+#[test]
+fn no_open_decision_is_left_on_the_verdict() {
+    let design = design();
+    assert!(!design.contains("| What `policy test` reports"));
+    assert!(!design.contains("gives no verdict"));
+}
