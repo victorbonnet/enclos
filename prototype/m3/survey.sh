@@ -2,8 +2,8 @@
 # Host survey for milestone 3 (design §14, issue #102, M3-01). Read-only:
 # it reads /sys, /proc, the kernel's build configuration, package versions
 # and systemd's settings, and prints one `key: value` line per fact. It runs
-# no bubblewrap, creates no namespace, changes no setting and signals
-# nothing, so it is safe on any host.
+# no bubblewrap, creates no namespace, installs no seccomp filter, changes no
+# setting and signals nothing, so it is safe on any host.
 #
 # The Landlock ABI comes from landlock_create_ruleset(NULL, 0,
 # LANDLOCK_CREATE_RULESET_VERSION), which only returns a number: it creates
@@ -47,6 +47,15 @@ r = libc.syscall(444, None, ctypes.c_size_t(0), ctypes.c_uint32(1))
 print(r if r >= 0 else "none (" + os.strerror(ctypes.get_errno()) + ")")
 ' 2>/dev/null || echo "unknown (no python3)")
 say landlock.abi "$abi"
+
+# --- seccomp (what the kernel offers; the filter itself is not tried here)
+status_field() { sed -n "s/^$1:[[:space:]]*//p" /proc/self/status; }
+say kconfig.SECCOMP "$(or_absent "$(kconf CONFIG_SECCOMP)")"
+say kconfig.SECCOMP_FILTER "$(or_absent "$(kconf CONFIG_SECCOMP_FILTER)")"
+say seccomp.actions_avail "$(or_absent "$(first /proc/sys/kernel/seccomp/actions_avail)")"
+# Absent from /proc/self/status on a kernel built without seccomp
+say seccomp.self_mode "$(or_absent "$(status_field Seccomp)")"
+say seccomp.self_filters "$(or_absent "$(status_field Seccomp_filters)")"
 
 # --- user namespaces and AppArmor
 say userns.max_user_namespaces "$(or_absent "$(first /proc/sys/user/max_user_namespaces)")"

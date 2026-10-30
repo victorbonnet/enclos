@@ -27,6 +27,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
+      - name: The survey's own tests
+        run: sh prototype/m3/test_survey.sh
       - name: Survey (read-only)
         run: sh prototype/m3/survey.sh | tee -a survey.txt
       - name: bubblewrap as an unprivileged user
