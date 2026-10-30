@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::output;
 
-use enclos::backend::seatbelt::Baseline;
+use enclos::backend::Baseline;
 use enclos::engine::{
     ChangeOutcome, Discarded, EditFiles, Engine, PendingEnd, PolicyApplied, PolicyDiff,
     PolicyHistory, PolicyView, Restarted, TestReport,
@@ -21,7 +21,7 @@ use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::policy::{NetMode, PendingPolicy, Policy, PolicyVersion};
 use enclos::model::sandbox::SandboxName;
-use enclos::probes::{HOST_SERVICE_ROUTES, NOT_PROBED, Outcome};
+use enclos::probes::Outcome;
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -277,11 +277,12 @@ fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         }).collect::<Vec<_>>(),
         "host_services_probed": report.host_services,
         "not_here": report.not_here,
-        "not_probed": NOT_PROBED,
+        "not_probed": report.notes.not_probed,
         "listens": report.listens,
         "baseline": match report.baseline {
-            Baseline::AllowDefault => "allow_default",
-            Baseline::DenyDefault => "deny_default",
+            Some(Baseline::AllowDefault) => Some("allow_default"),
+            Some(Baseline::DenyDefault) => Some("deny_default"),
+            None => None,
         },
     })
 }
@@ -963,51 +964,7 @@ fn run_editor(path: &Path) -> Result<()> {
 }
 
 fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
-    println!("Escape probes in sandbox {sandbox}: each tries one way out and must fail.");
-    for r in &report.results {
-        let (mark, detail) = match &r.outcome {
-            Outcome::Closed => (
-                "closed      ",
-                r.closed_by
-                    .map(|by| format!("  ({})", by.why()))
-                    .unwrap_or_default(),
-            ),
-            Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
-            Outcome::Inconclusive(why) => ("inconclusive", format!("  ({why})")),
-            Outcome::NotRun(why) => ("NOT RUN     ", format!("  <- {why}")),
-        };
-        println!("  {mark}  {:<16} {}{detail}", r.route, r.name);
-    }
-    if !report.host_services {
-        println!(
-            "Host-service routes ({}) were not probed; CI probes them with --host-services.",
-            HOST_SERVICE_ROUTES.join(", ")
-        );
-    }
-    if !report.not_here.is_empty() {
-        println!(
-            "Not probed, as it is not on this host: {}.",
-            report.not_here.join("; ")
-        );
-    }
-    println!(
-        "No probe tries these routes yet: {}.",
-        NOT_PROBED.join(", ")
-    );
-    if report.listens {
-        println!(
-            "Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network."
-        );
-    }
-    println!(
-        "Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists."
-    );
-    if report.inconclusive() > 0 {
-        println!(
-            "{} probes were inconclusive: they failed for a reason other than the policy, so they show nothing about it.",
-            report.inconclusive()
-        );
-    }
+    print!("{}", test_text(sandbox, report));
     // Last, after a blank line, so it is what the user reads.
     println!();
     match report.passed() {
@@ -1020,6 +977,59 @@ fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
             exit::ERROR
         }
     }
+}
+
+/// The text report, every line of it but the verdict.
+fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    let mut line = |said: String| writeln!(text, "{said}").expect("a String takes any text");
+    line(format!(
+        "Escape probes in sandbox {sandbox}: each tries one way out and must fail."
+    ));
+    for r in &report.results {
+        let (mark, detail) = match &r.outcome {
+            Outcome::Closed => (
+                "closed      ",
+                r.closed_by
+                    .map(|by| format!("  ({})", by.why()))
+                    .unwrap_or_default(),
+            ),
+            Outcome::Open(why) => ("OPEN        ", format!("  <- {why}")),
+            Outcome::Inconclusive(why) => ("inconclusive", format!("  ({why})")),
+            Outcome::NotRun(why) => ("NOT RUN     ", format!("  <- {why}")),
+        };
+        line(format!("  {mark}  {:<16} {}{detail}", r.route, r.name));
+    }
+    if !report.host_services && !report.notes.host_service_routes.is_empty() {
+        line(format!(
+            "Host-service routes ({}) were not probed; CI probes them with --host-services.",
+            report.notes.host_service_routes.join(", ")
+        ));
+    }
+    if !report.not_here.is_empty() {
+        line(format!(
+            "Not probed, as it is not on this host: {}.",
+            report.not_here.join("; ")
+        ));
+    }
+    if !report.notes.not_probed.is_empty() {
+        line(format!(
+            "No probe tries these routes yet: {}.",
+            report.notes.not_probed.join(", ")
+        ));
+    }
+    if report.listens {
+        line("Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.".to_owned());
+    }
+    line("Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.".to_owned());
+    if report.inconclusive() > 0 {
+        line(format!(
+            "{} probes were inconclusive: they failed for a reason other than the policy, so they show nothing about it.",
+            report.inconclusive()
+        ));
+    }
+    text
 }
 
 /// Whether the sandbox is ready, in one line: READY when the test passed,
@@ -1037,17 +1047,18 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         let shown = match report.closed() == total {
             true => format!("all {total} shown closed{platform}"),
             false => format!(
-                "{} of {total} shown closed{platform}, {} could not be checked on this Mac ({}), none open",
+                "{} of {total} shown closed{platform}, {} could not be checked on {} ({}), none open",
                 report.closed(),
                 report.inconclusive(),
+                report.notes.host,
                 listed("inconclusive", "inconclusive")
             ),
         };
         let baseline = match report.baseline {
-            Baseline::AllowDefault => {
+            Some(Baseline::AllowDefault) => {
                 " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
             }
-            Baseline::DenyDefault => "",
+            Some(Baseline::DenyDefault) | None => "",
         };
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
@@ -1067,7 +1078,10 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
         ));
     }
     if report.open() == 0 && report.not_run() == 0 {
-        why.push("no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules".to_owned());
+        why.push(format!(
+            "no probe was shown closed by its route's rule{}, so the test showed nothing about the policy's rules",
+            report.notes.only_apart
+        ));
     }
     let stop = match report.open() > 0 {
         true => " Do not use it until this is fixed.",
@@ -1079,6 +1093,7 @@ fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclos::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, NOTES};
     use enclos::probes::ProbeResult;
 
     fn report(outcome: Outcome) -> TestReport {
@@ -1099,7 +1114,8 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            baseline: Baseline::DenyDefault,
+            baseline: Some(Baseline::DenyDefault),
+            notes: NOTES,
         }
     }
 
@@ -1161,5 +1177,82 @@ mod tests {
         ] {
             assert_eq!(print_test(&home, &report(failing)), exit::ERROR);
         }
+    }
+
+    /// The report of each kind of test on Seatbelt, as it was before the
+    /// probes were split per backend (M3-06): text, verdict and JSON.
+    #[test]
+    fn the_seatbelt_report_is_as_it_was() {
+        let row = |route, name: &str, outcome, closed_by| ProbeResult {
+            route,
+            name: name.to_owned(),
+            outcome,
+            closed_by,
+        };
+        let ready = vec![
+            row("writes", "write outside the home", Outcome::Closed, None),
+            row("at", "list the `at` queue", Outcome::Closed, Some(ITSELF)),
+            row(
+                "launchservices",
+                "open a folder through LaunchServices",
+                Outcome::Closed,
+                Some(BEFORE_THE_RULE),
+            ),
+        ];
+        let mut mixed = ready.clone();
+        mixed.push(row(
+            "crontab",
+            "read the crontab",
+            Outcome::Inconclusive("it fails outside the sandbox too".into()),
+            None,
+        ));
+        let mut failing = mixed.clone();
+        failing.push(row(
+            "network",
+            "a direct connection, around the proxy",
+            Outcome::Open("it succeeded: ".into()),
+            None,
+        ));
+        failing.push(row(
+            "dns",
+            "DNS on port 53",
+            Outcome::NotRun("could not run it".into()),
+            None,
+        ));
+        let only_apart = vec![ready[1].clone()];
+        let lab: SandboxName = "lab".parse().unwrap();
+        let mut got = String::new();
+        for (results, host_services, not_here, listens, baseline) in [
+            (ready, true, vec![], false, Baseline::DenyDefault),
+            (
+                mixed,
+                false,
+                vec!["keychain (no login keychain here)".to_owned()],
+                true,
+                Baseline::AllowDefault,
+            ),
+            (failing, false, vec![], false, Baseline::DenyDefault),
+            (only_apart, false, vec![], false, Baseline::DenyDefault),
+        ] {
+            let report = TestReport {
+                results,
+                host_services,
+                not_here,
+                listens,
+                baseline: Some(baseline),
+                notes: NOTES,
+            };
+            got.push_str(&test_text(&lab, &report));
+            got.push_str(&verdict(&lab, &report, false));
+            got.push('\n');
+            got.push_str(&serde_json::to_string_pretty(&test_json(&lab, &report)).unwrap());
+            got.push_str("\n\n");
+        }
+        if std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some() {
+            let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli/policy-test.snapshot");
+            std::fs::write(file, &got).unwrap();
+            return;
+        }
+        assert_eq!(got, include_str!("policy-test.snapshot"));
     }
 }
