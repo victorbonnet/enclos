@@ -11,9 +11,13 @@ pub mod decide;
 mod hello;
 pub mod request;
 mod server;
+mod stream;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -22,6 +26,8 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::SandboxName;
 use crate::net::addr::{AddrClass, classify};
 use crate::state::{NetLogStore, StateStore};
+
+pub use stream::Listener;
 
 /// The descriptors a proxy keeps for itself: the standard streams, its
 /// listeners, the state database.
@@ -193,6 +199,25 @@ pub fn listen(port: u16) -> Result<Vec<TcpListener>, ListenError> {
     }
     listeners.push(bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))?);
     Ok(listeners)
+}
+
+/// The proxy's listener on the Unix socket at `path`, whose folder exists.
+/// A socket already there is taken over if nothing answers on it, as after
+/// a proxy that was killed. Anything else there, or a proxy answering, is
+/// an error.
+pub fn listen_unix(path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            let left = std::fs::symlink_metadata(path)?.file_type().is_socket()
+                && UnixStream::connect(path).is_err();
+            if !left {
+                return Err(e);
+            }
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)
+        }
+        bound => bound,
+    }
 }
 
 #[cfg(test)]
