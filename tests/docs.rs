@@ -78,3 +78,15 @@ fn adr_0038_gives_the_verdict_on_a_field_not_enforced() {
 fn adr_0037_points_to_the_verdict_in_adr_0038() {
     assert!(adr(ADR_0037).contains("`policy test`'s verdict follows 0038's rule"));
 }
+
+#[test]
+fn principle_6_gives_the_proposed_verdict() {
+    let design = design();
+    let principle = design
+        .lines()
+        .find(|line| line.starts_with("6. **Never claim isolation"))
+        .expect("§1's principle 6");
+    assert!(principle.contains("Proposed for a field the host does not enforce"));
+    assert!(principle.contains("`READY, 1 field not enforced: memory (accepted)`"));
+    assert!(principle.contains("no longer matches the field's value, it is `NOT READY`"));
+}
