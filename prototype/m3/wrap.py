@@ -118,9 +118,10 @@ def arguments(compiled, listing):
             args.append(arg)
     # The tmpfs that hide denied paths were writable while bubblewrap made
     # mount points in them; nothing may write there afterwards. Only those:
-    # a tmpfs at a grant's own path is gone under the grant's bind.
+    # a tmpfs at a grant's own path is gone under the grant's bind, whichever
+    # name the grant reaches it by.
     for folder in remount:
-        if folder not in grants:
+        if folder not in {resolved[g] for g in grants}:
             args += ["--remount-ro", folder]
     return args
 

@@ -271,6 +271,12 @@ class DenyInsideAGrantTest(Case):
         args = self.compiled("--workspace", f"{h}/d", "--deny", f"{h}/dev/work")["bwrap"]
         self.assertEqual(view(args, f"{h}/d/work"), ("--tmpfs", False))
 
+    def test_no_remount_lands_on_a_workspace_reached_through_a_link(self):
+        h = self.h
+        os.symlink("dev", f"{h}/d")
+        args = self.compiled("--workspace", f"{h}/d", "--deny", f"{h}/dev/work")["bwrap"]
+        self.assertNotIn(f"{h}/dev", self.pairs(args, "--remount-ro"))
+
     def test_the_users_whole_home_as_a_workspace(self):
         h = self.h
         args = self.compiled("--workspace", h)["bwrap"]
