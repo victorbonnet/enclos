@@ -1,8 +1,8 @@
-# Milestone 3 prototype: the host survey
+# Milestone 3 prototype: the host survey and the bubblewrap sandbox
 
-Throwaway scripts that answer the milestone 3 questions in `docs/design.md` §14 (issue #102). Nothing here is enclos code. This first part, M3-01, surveys the target hosts: Landlock and its ABI, unprivileged user namespaces and AppArmor, the bubblewrap each distribution packages, the cgroup controllers delegated to the user, and `systemd --user` at logout.
+Throwaway scripts that answer the milestone 3 questions in `docs/design.md` §14 (issue #102). Nothing here is enclos code. The first part, M3-01, surveys the target hosts: Landlock and its ABI, unprivileged user namespaces and AppArmor, the bubblewrap each distribution packages, the cgroup controllers delegated to the user, and `systemd --user` at logout. The second, M3-02, builds a bubblewrap sandbox as the backend would and probes it: see [M3-02: the bubblewrap prototype](#m3-02-the-bubblewrap-prototype) below.
 
-## Files
+## Files (M3-01)
 
 | File | What it does |
 | --- | --- |
@@ -13,7 +13,7 @@ Throwaway scripts that answer the milestone 3 questions in `docs/design.md` §14
 
 ## Results
 
-Each cell says where it comes from: **measured (Raspberry Pi OS arm64)** (on the install described below), **documented** (a page or file fetched on 2026-10-29, listed under Sources), or **to measure** (by the CI job above, in a VM for what CI cannot show, or on Raspberry Pi OS for what needs its kernel). Nothing in a "documented" cell has been run.
+Each cell says where it comes from: **measured (Raspberry Pi OS arm64)** (on the install described below), **measured (CI)** (a run of a workflow on GitHub's runners, named in the cell), **documented** (a page or file fetched on 2026-10-29, listed under Sources), or **to measure** (by the CI job above, in a VM for what CI cannot show, or on Raspberry Pi OS for what needs its kernel). Nothing in a "documented" cell has been run.
 
 The install measured: 64-bit Raspberry Pi OS (image "Raspberry Pi reference 2026-04-13", which reports itself as Debian 13 trixie in `os-release`), kernel `6.18.50+rpt-rpi-2712`, arm64. Initially measured read-only. Review follow-up: harmless `bwrap --ro-bind / / /usr/bin/true` exits 0; seccomp actions available: `kill_process kill_thread trap errno user_notif trace log allow`. This shows basic startup, not the full prototype filter or isolation probes.
 
@@ -77,3 +77,146 @@ Fetched on 2026-10-29.
 17. `logind.conf(5)` (`KillUserProcesses=`, `UserStopDelaySec=`) and `loginctl(1)` (`enable-linger`), systemd 257's manual pages, as packaged in Debian trixie and read on Raspberry Pi OS.
 18. raspberrypi/linux `kernel/cgroup/cgroup.c` and `mm/memcontrol.c` on `rpi-6.12.y` (`5bd564aa`) and `rpi-6.18.y` (`b3495ea4`): <https://github.com/raspberrypi/linux/blob/rpi-6.18.y/kernel/cgroup/cgroup.c>, <https://github.com/raspberrypi/linux/blob/rpi-6.18.y/mm/memcontrol.c>
 19. The kernel's Landlock documentation, `Documentation/userspace-api/landlock.rst` ("Boot time configuration": `lsm=landlock,[...]`): <https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/landlock.rst>
+
+## M3-02: the bubblewrap prototype
+
+A bubblewrap sandbox built as the backend would build it (design §5, ADR 0004, ADR 0037), and probed: broad reads with the deny list not mounted, writes to the home and a workspace only, Landlock and seccomp applied by a small program run first inside, the relay from `127.0.0.1:<port>` to a proxy on a Unix socket, the host's Unix sockets, Hermes's installer and Chromium. Nothing here is enclos code; the compile step, the program run inside and the relay are drafts of M3-13, M3-14 and M3-09.
+
+**Where it runs.** Every check acts on the host (it runs bubblewrap, makes user namespaces, plants files in the home, installs packages, changes an AppArmor setting), so `lib.sh` refuses to run anywhere but a GitHub-hosted runner, or a VM for the manual steps below: there `ENCLOS_PROTO_DISPOSABLE_VM=1` must be set and `systemd-detect-virt --vm` must name a hypervisor, so a machine that is not a VM is refused either way. The `bwrap-prototype` workflow runs the checks on `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm` (arm64), on a pull request that touches this folder or by hand. Each check writes a Markdown result to `m3-results/`; the job shows them in its summary and uploads the folder as the artifact `m3-results-<runner>`.
+
+### Files (M3-02)
+
+| File | What it does |
+| --- | --- |
+| `compile.py` | The compile step: the prototype's policy (the user's home, the sandbox's folder, a workspace, the deny list) becomes bubblewrap's arguments, the Landlock rules and the seccomp filter, in one JSON file. Pure: dynamic folder listing happens in `wrap.py` at launch, with `--ro-bind-try` for disappearing entries. |
+| `test_compile.py` | Tests of `compile.py` on a temporary folder: denied paths not mounted, the folders that hide them read-only after every mount, writes to the home and workspaces only, the namespaces, the seccomp list, a deny entry outside the home refused. Runs anywhere (`python3 -I prototype/m3/test_compile.py`), and first in the workflow. |
+| `inside.py` | The program bubblewrap runs first inside: applies the Landlock rules where the kernel has Landlock (through its system calls, with ctypes), then the seccomp filter (libseccomp's Python binding, `python3-seccomp`), then starts the relay and runs the command. `--landlock off` and `--seccomp off` leave either out, to show what each adds. |
+| `relay.py` | The relay: each TCP connection on `127.0.0.1:<port>` inside the sandbox forwarded to the proxy's Unix socket, and nothing else. |
+| `unix-proxy.py` | The milestone 1 prototype's proxy (`../m1/proxy.py`) served on the sandbox's Unix socket: same allowlist, `--learn` mode and JSON log. |
+| `sbx.sh` | Runs a command in the sandbox: compiles, runs bubblewrap, then `inside.py`. `SBX_LANDLOCK=off`, `SBX_SECCOMP=off`, `SBX_RELAY=1`, `SBX_NEW_SESSION=1`. |
+| `probe.py` | The probes, each printing the probe, `ok` or the error's name, and a detail; run on the host as their control, then in the sandbox. Writes are undone, a ptrace attach is detached at once, and the only signal is signal 0. |
+| `pty-run.py`, `table.py`, `lib.sh` | A terminal of its own for the TIOCSTI probe; the result tables; what the scripts share, the guard included. |
+| `setup-runner.sh` | Installs bubblewrap and what the checks use, and finds the least setting that lets bubblewrap run under AppArmor (none, a `userns` profile for `/usr/bin/bwrap`, or the restriction off). |
+| `sandbox-check.sh` | Files, programs and system calls, in five modes: the host; bubblewrap only; with seccomp but no Landlock (what ADR 0037 runs where the kernel has none); with Landlock but no seccomp; full. TIOCSTI also with `--new-session`. |
+| `sockets-check.sh` | Every Unix socket the host lists (`/proc/net/unix`), named and abstract, connected to from the host and from the sandbox: the runner as it is, then with an X server (Xvfb), a session bus, GNOME Keyring, an ssh agent, a socket in the home and an abstract socket added. |
+| `relay-check.sh` | curl, Python `urllib`, `httpx` and `requests`, pip, uv, git, Node `fetch` and npm through the relay, with no DNS in the sandbox, and a destination the allowlist leaves out. |
+| `hermes-check.sh` | Hermes's installer in the sandbox through the relay and a proxy in `--learn` mode: endpoints, `sudo` or system packages, `hermes --version`. |
+| `chromium-check.sh` | A headless Chromium (Hermes's, or Playwright's when Hermes left none) loading a page, with its own sandbox off: over the DevTools protocol (`cdp-load.py`) on the host as the control and in each sandbox mode through the relay; with `--dump-dom` on the host and in full mode, for comparison; and in full mode with its own sandbox on. |
+| `cdp-load.py` | Loads one page over `--remote-debugging-pipe` (create a target, attach, navigate, wait for the load event, read the title), as browser tools drive Chromium. |
+| `options-check.sh` | Whether Debian 12's, Ubuntu 24.04's and Debian 13's bubblewrap have every option the compiled arguments use, from each one's `bwrap --help` in a container of that distribution. |
+| `.github/workflows/bwrap-prototype.yml` | Runs the above on both Ubuntu runners and uploads `m3-results/`. It does not gate merges. |
+
+### Results
+
+From the first three `bwrap-prototype` runs, on PR #113: in each, both jobs passed, on `ubuntu-latest` (Ubuntu 24.04.5, x86_64) and `ubuntu-24.04-arm` (Ubuntu 24.04.5, arm64), both on kernel `7.0.0-1017-azure`, with bubblewrap 0.9.0, Landlock ABI 8, `python3-seccomp` 2.5.5 and Node 22.23.4. A job that passed means the scripts ran, not that every probe closed: each row below says what the output shows. "Same on both" means the two runners gave the same result, apart from process ids and temporary names. "to measure (VM)" and "to measure (Raspberry Pi OS)" cells are still to run. Later runs, after script changes, gave the same results as the first for every row they did not change: setup, files, sockets, relay, Hermes's installer (same SHA-256) and options. The second run's new results are in the environ and Chromium rows. The third, with Chromium driven over the DevTools protocol (`cdp-load.py`) and the job's AppArmor label and `/proc`'s mount options recorded, adds to the same two rows.
+
+**Modes.** The probes ran on the host as their control, then in the sandbox with bubblewrap only, with seccomp but no Landlock (ADR 0037's path), with Landlock but no seccomp, and with both ("full"). `inside.py` reported `landlock=applied abi=8 handled=0xffff scoped=0x3` (17 rules on x86_64, 15 on arm64, where `/lib32` and `/libx32` do not exist) and `seccomp=applied deny=35` on x86_64, `deny=32` on arm64, naming the three calls arm64 lacks (`ioperm`, `iopl`, `uselib`).
+
+| Question (design §14) | Check | `ubuntu-latest` (x86_64) | `ubuntu-24.04-arm` (arm64) | Elsewhere |
+| --- | --- | --- | --- | --- |
+| The setting bubblewrap needs on the runners | `setup-runner.sh` | As installed it fails (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`). An AppArmor profile for `/usr/bin/bwrap` holding `userns,` is enough; the restriction stays on. | same | Ubuntu 24.04 desktop: to measure (VM) |
+| A denied path does not exist in the sandbox, the rest of the home reads | `sandbox-check.sh` | Each planted file under `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/google-chrome`, `~/.local/share/keyrings` and `~/.password-store`, and another sandbox's folder: ENOENT in all four modes, while the host reads them. `~/.ssh` itself does not exist inside. A file in the home outside the list, `/etc/os-release` and the checkout read in every mode. | same | |
+| Writes in the home and workspace work; elsewhere they are refused | `sandbox-check.sh` | Writes in the sandbox's home and the workspace succeed in all four modes. In the rest of the home, the checkout, `compiled/` and `run/` they get EROFS in all four, so bubblewrap's mounts alone refuse them, with Landlock or without. `/var/tmp` and `/tmp` are writable, being the sandbox's own tmpfs. | same | |
+| A file the sandbox leaves in its `/tmp` is not in the host's | `sandbox-check.sh` | Not in the host's `/tmp` after any of the four modes. | same | |
+| The home and workspace cannot be renamed from inside | `sandbox-check.sh` | Renaming either: EROFS in all four modes, because their parent is read-only; the host renames both. Removing them was not probed. | same | |
+| A program in the workspace: refused with Landlock, runs without (ADR 0037) | `sandbox-check.sh` | A copy of `/usr/bin/true` and a shell script in the workspace: EACCES with Landlock, both with and without seccomp; they run without it. The same copy in the sandbox's home runs in every mode, as the draft rules allow. | same | |
+| The seccomp list refused, and what bubblewrap alone already refuses | `sandbox-check.sh` | The filter, not the kernel, refused these: they succeed (or fail differently) on the host and with bubblewrap only, and get EPERM in both modes with seccomp. `keyctl` (ok → EPERM), `bpf` (EINVAL → EPERM), `perf_event_open` (EACCES → EPERM), `userfaultfd` and `io_uring_setup` (ok → EPERM), `unshare(CLONE_NEWUSER)` (ENOSPC from `--disable-userns` → EPERM). `mount` gets EPERM with bubblewrap only, so bubblewrap already refuses it. `unshare` of a mount or network namespace gets EPERM on the host too, so those rows show nothing about the filter. The other calls on the list were not probed one by one. | same | |
+| TIOCSTI refused without `--new-session`; refused by `--new-session` alone | `sandbox-check.sh` | The runner's kernel has `dev.tty.legacy_tiocsti` = 0, which refuses TIOCSTI to every unprivileged process, so the host, bubblewrap only, Landlock only and `--new-session` all read EIO. With seccomp it reads EPERM, which shows the filter matches the ioctl, as seccomp runs first. Whether TIOCSTI would otherwise get through, and whether `--new-session` alone refuses it, are not shown. | same | a kernel with `legacy_tiocsti` at 1: to measure (VM) |
+| No user namespace inside (`--disable-userns`, then seccomp) | `sandbox-check.sh` | `unshare(CLONE_NEWUSER)`: ENOSPC from bubblewrap's `--disable-userns` without seccomp, and EPERM with it; the host makes one. | same | |
+| Processes outside hidden: signal 0, ptrace, another process's start-up environment | `sandbox-check.sh` (environ: script fixed) | Signal 0 and ptrace to a process the check started on the host: ESRCH in all four modes, so it is not in the sandbox's PID namespace. The host signals it, and its ptrace gets EPERM from Yama (`ptrace_scope` 1). **Environ.** In the second and third runs, opening that process's `/proc/<pid>/environ` from the sandbox gets ENOENT in all four modes. The sandbox's `/proc` lists 2 processes, its own, where the host lists 161 to 174. So a process outside is not there to read. The host control still does not read the marker: opening the same file gets EACCES, though the check itself started that process as the same user, and only the probe's own environment is readable on the host. The third run rules out two explanations: the job runs `unconfined` by AppArmor, and `/proc` is mounted without `hidepid` (`rw,nosuid,nodev,noexec,relatime`). Why the runner refuses it is still not known, so reading a process's environment is never shown working. What is shown is that the sandbox cannot even find a process outside. Other sessions of the same sandbox are a different question, for M3-03's namespaces. |
+| The host's loopback, the network and DNS out of reach | `sandbox-check.sh` | A listener on the host's 127.0.0.1: ECONNREFUSED; `1.1.1.1:443`: ENETUNREACH; `getaddrinfo`: fails ("Temporary failure in name resolution"). All four modes; the host reaches all three. | same | |
+| Host Unix sockets reachable from the sandbox, server install | `sockets-check.sh` | None. The runner lists 44 named and abstract sockets; the user connects to 28 of them on the host, among them the system bus, Docker's, snapd's, systemd-resolved's, journald's and, under `/run/user/1001`, the user's bus, `systemd --user`'s private socket and gpg-agent's. Every named one is under `/run`, `/var/run` or `/tmp`, and is ENOENT in the sandbox, with Landlock and without. | same | Debian, Raspberry Pi OS Lite: to measure (VM) |
+| Host Unix sockets reachable from the sandbox, desktop install | `sockets-check.sh` (Xvfb, a session bus, GNOME Keyring, an ssh agent) | Only the check's own socket in the home, `~/enclos-proto-sock`, outside the deny list, is reached, with Landlock and without, as §5 expects for sockets in the home. X11's `/tmp/.X11-unix/X99`, the session bus in `/tmp`, the ssh agent's socket in `/tmp` and GNOME Keyring's `/run/user/1001/keyring/control`: ENOENT. | same | a real desktop session (Wayland, PipeWire, a graphical login): to measure (VM) |
+| Abstract sockets out of reach | `sockets-check.sh` | The runner's (`@/org/kernel/linux/storage/multipathd`, `@ISCSIADM_ABSTRACT_NAMESPACE`), X11's `@/tmp/.X11-unix/X99` and the check's own: ECONNREFUSED in both modes, without Landlock too, so the network namespace closes them. | same | |
+| The clients through the relay, with no DNS; a destination not allowed refused | `relay-check.sh` | Full mode and without Landlock: `getaddrinfo` fails; curl, Python `urllib`, `httpx` and `requests`, `pip install` into a venv, `uv pip compile`, `git ls-remote`, Node 22's `fetch` with `NODE_USE_ENV_PROXY=1` (which prints that its proxy agent is experimental) and `npm view` all succeed. curl to `example.org`, which the allowlist leaves out, gets the proxy's 403 (curl exit 56), and the proxy logged it as denied. The mode without Landlock reused the venv the first mode made, so its `pip install` found everything installed. | same | |
+| Hermes's installer: endpoints, `sudo` or system packages, `hermes` runs | `hermes-check.sh` | Full mode, with a proxy in `--learn` mode: the installer (SHA-256 `abf33860…7209`) exits 0 in 95 s. The log names no `sudo`, no `apt` and no refusal. Then `hermes --version`: Hermes Agent v0.22.5, Python 3.14.9, installed under the sandbox's home (3.0 GB, 1.4 GB of it in `~/.hermes/tools`). Endpoints: `hermes-agent.nousresearch.com`, `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, `releases.astral.sh`, `pypi.org`, `files.pythonhosted.org`, `nodejs.org`, `registry.npmjs.org`, `cdn.playwright.dev`, `storage.googleapis.com` (the Chrome for Testing build). | Same, in 80 s, with one difference: the browser comes from `playwright.download.prss.microsoft.com` (Playwright's Chromium build), not `storage.googleapis.com`. | Whether the `mktemp` shim is needed: not probed |
+| The device-code login and a model call through the relay | manual, below | cannot run in CI (needs an account) | cannot run in CI | to measure (VM) |
+| Chromium with its own sandbox, and with `--no-sandbox` | `chromium-check.sh` | **With its own sandbox off, Chromium loads a page in the sandbox, driven over the DevTools protocol.** The Chromium is the one Hermes's installer left, Chrome for Testing 145.0.7632.6. In the third run, `cdp-load.py` connects over `--remote-debugging-pipe`, opens a tab, navigates to `https://example.com/`, gets the load event, and reads the title (`Example Domain`) within 2 s, in every mode: on the host (straight out), with bubblewrap only, with seccomp, with Landlock, and in full mode (the sandbox modes through the relay; the proxy logged CONNECTs to `example.com` during them). **With its own sandbox on** it aborts at start in every run (exit 134, `FATAL: zygote_host_impl_linux.cc:128 No usable sandbox!`): the sandbox makes no user namespace and has no setuid helper, so Chromium must run with `--no-sandbox` in it. **`--dump-dom` is an artefact of the check:** with `--headless --dump-dom` Chromium never returns within 120 s, on the host with no sandbox just as in the sandbox, in all three runs, while the same build loads the same page over the DevTools protocol in a second. It measured nothing about the sandbox. **The renderer OOM-score refusals:** with Landlock, and only then (with or without seccomp), Chromium logs `Failed to adjust OOM score of renderer … Permission denied` for each renderer (6 in the DevTools-protocol load). The page loads all the same, so they do not stop it. What they cost is Chromium's ranking of its own processes for the kernel's out-of-memory killer, which it uses to have a renderer killed before the browser; that was not exercised, and which Landlock rule refuses the write is not established. | Same with Playwright's Chromium 145.0.7632.0: loaded in under 2 s in every mode (5 OOM-score refusals with Landlock); exit 134 with its own sandbox; `--dump-dom` hangs on the host and in full mode. | Hermes's browser tool driving it (agent-browser, its own flags, real pages and actions), and Chromium under memory pressure: to measure (VM) |
+| Hermes, its installer, uv, Node and Chromium run under the seccomp filter | the three above, full mode | The installer, `hermes --version`, pip, uv, git, Node and npm ran under it, and Chromium (with its own sandbox off) loaded a page under it over the DevTools protocol. | same | Hermes's own browser tool under it: to measure (VM) |
+| Each distribution's bubblewrap has every option used | `options-check.sh` | Every option the compiled arguments use, `--disable-userns`, `--remount-ro`, `--clearenv` and `--new-session` among them, is in the `bwrap --help` of Debian 12's 0.8.0-2+deb12u1, Ubuntu 24.04's 0.9.0-1ubuntu0.3 and Debian 13's 0.12.0-1~deb13u1. | same (`--symlink` not in the list there, as the runner's home had no link to rebuild) | |
+| A kernel without Landlock: the mounts alone hold the writes, a program in the home runs | `sandbox-check.sh` without Landlock | On a kernel that has Landlock, switched off by `inside.py`: every write outside the home and workspace gets EROFS, and programs in the workspace and the home run. | same | a kernel without it: to measure (Raspberry Pi OS; or a VM booted with Landlock left out of `lsm=`) |
+| What Landlock and seccomp refusals leave for the user to read | none yet | | | to measure (VM) |
+
+### What this shows, and what it does not
+
+- **The sandbox holds on both runners.** Broad reads with the deny list not mounted (ENOENT), writes refused everywhere but the home and workspace, an empty network with no DNS, the host's sockets out of reach (all of a server install's, and those a runner can start of a desktop's), abstract sockets closed, processes outside hidden. All of it holds with bubblewrap alone; Landlock and seccomp are not needed for any of it. This is shown on Ubuntu 24.04 runners with an Azure kernel only.
+- **What Landlock adds** in these probes is the execute control: a program in the workspace is refused with it and runs without it (ADR 0037). Writes get EROFS from the mounts before Landlock is reached, so these probes do not show Landlock's write rules refusing anything by themselves.
+- **What seccomp adds** is `keyctl`, `bpf`, `perf_event_open`, `userfaultfd`, io_uring, a user namespace and TIOCSTI's ioctl. Which of these matter beyond what the runner's own sysctls refuse depends on the host.
+- **Chromium runs in the sandbox with its own sandbox off**, on both runners, in every mode: a page loads over the DevTools protocol, as browser tools drive it. Its own sandbox cannot start there. `--dump-dom` hangs on the host too, so its failures were the check's, not the sandbox's.
+- **Sockets in the home are reached**, as §5 says, so each needs a deny-list entry (M3-07).
+- **Surprises.**
+  - The `--no-sandbox` Chromium left running by `--dump-dom` reached Google's update, Safe Browsing, GCM and component services through the proxy (`update.googleapis.com`, `safebrowsing.googleapis.com` about 8 MB, `android.clients.google.com`, `edgedl.me.gvt1.com`, `redirector.gvt1.com`, `www.google.com`). An allowlist sandbox would refuse them, and a public-mode one lets them through.
+  - Hermes's installer took its Chromium from a different host on each architecture (above).
+  - Inside the sandbox, Chromium tried the system bus at `/run/dbus/system_bus_socket` and found no socket there (ENOENT), which shows the masking against a real program.
+- **Still open:**
+  - Hermes's browser tool itself driving Chromium in the sandbox (agent-browser's flags, real pages, clicks and forms), and Chromium under memory pressure without its OOM-score adjustments, in a VM;
+  - why the runner's host refuses to read a same-user process's environment (not AppArmor, not `hidepid`); the sandbox, for its part, does not see the process;
+  - TIOCSTI with `--new-session` alone;
+  - a real desktop session's sockets;
+  - a kernel without Landlock;
+  - the login and a model call;
+  - what a refusal leaves for the user to read.
+
+### Manual steps for a VM: the login and a model call
+
+These need an account, so they cannot run in CI. In a disposable VM (Ubuntu 24.04 or Debian 13, x86_64 or arm64), with this repository checked out:
+
+1. `export ENCLOS_PROTO_DISPOSABLE_VM=1`, then `bash prototype/m3/setup-runner.sh`, which installs the packages and finds the AppArmor setting, and `bash prototype/m3/hermes-check.sh`, which installs Hermes in the sandbox's home (`~/.enclos/sandboxes/proto/home`).
+2. Start the proxy in `--learn` mode on the sandbox's socket: `python3 -I prototype/m3/unix-proxy.py --socket ~/.enclos/sandboxes/proto/run/proxy.sock --learn --log login.jsonl &`
+3. Open a shell in the sandbox, full mode, with the relay: `SBX_RELAY=1 prototype/m3/sbx.sh -- /bin/bash`. Its first lines say what `inside.py` applied.
+4. In it, `export PATH="$HOME/.local/bin:$PATH"`, then the device-code login, as the milestone 1 prototype ran it: `hermes auth add openai-codex --no-browser`. Open the URL it prints on another machine and enter the code.
+5. A model call: `hermes -z "Reply with exactly one word: ok" --provider openai-codex -m <a model the account offers>`.
+6. Record, in the results table above: whether each step worked, the endpoints from `login.jsonl` (host, port, verdict), and whatever refused, never the code or a token.
+7. Then the same in the mode without Landlock (`SBX_LANDLOCK=off`), and, for a desktop install, `bash prototype/m3/sockets-check.sh` from a graphical login.
+
+### Draft: what M3-13 compiles
+
+**Still a draft: measured in part.** This is what `compile.py` and `inside.py` produce; `compile.py` is the reference if the two disagree. What the run on PR #113 showed, on both Ubuntu runners, is in the results above. In short:
+
+- **The arguments:** bubblewrap 0.9.0 accepted them as they are, with the AppArmor profile, and every option is in 0.8.0, 0.9.0 and 0.12.0.
+- **Landlock:** the rules applied on ABI 8, and the execute rule refused programs in the workspace. Its write rules were not shown refusing anything on their own, since the mounts refuse first.
+- **seccomp:** the filter refused the calls probed: `keyctl`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, a user namespace and TIOCSTI. The rest of the list was not probed one by one.
+- **Chromium:** with its own sandbox off, it loaded a page over the DevTools protocol in full mode on both runners (results above). With Landlock, its renderer OOM-score writes are refused; the page loads regardless.
+
+**bubblewrap's arguments**, in this order (bubblewrap applies them in order):
+
+| Arguments | Why |
+| --- | --- |
+| `--ro-bind / /` | Broad reads (ADR 0015). |
+| for each folder that holds a denied path, from the home down: `--tmpfs <folder>`, then `--ro-bind-try <entry> <entry>` for each of its other entries (`--symlink` for a link) | The deny list not mounted: a denied path does not exist. An entry made on the host after the session starts does not appear in such a folder; the alternative, an empty tmpfs or `/dev/null` over each denied path, keeps the rest live but leaves the path there, empty. |
+| `--dev /dev`, `--proc /proc` | The sandbox's own devices and, with its own PID namespace, its own processes. |
+| `--tmpfs /tmp`, `--tmpfs /var/tmp`, `--tmpfs /run`, `--tmpfs /dev/shm` | Its own, empty temporary places; they hide `/run/user/<uid>` (the session bus, `systemd --user`, Wayland), the system bus, systemd-resolved, the Docker socket and `/tmp/.X11-unix`. |
+| `--bind <sandbox home> <same>`, `--bind <workspace> <same>` | The only writable places besides the above. |
+| `--ro-bind <sandbox>/run/visible <same>`, `--ro-bind <sandbox>/compiled <same>` | The proxy's socket (connecting needs no write access to its mount, ADR 0004) and the compiled policy `inside.py` reads. M3-13 adds the sandbox's `secrets/` folder here, read-only, for this sandbox alone (ADR 0034). |
+| `--remount-ro <folder>` for each tmpfs made to hide a denied path | They were writable while bubblewrap made mount points in them. |
+| `--unshare-user --disable-userns` | A user namespace for the sandbox, and none made inside it. |
+| `--unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try` | Its own processes, an empty network (loopback only), IPC, host name and cgroup view. Whether a sandbox's sessions share one network and PID namespace is M3-03's question. |
+| `--die-with-parent` | Ends with the session. |
+| `--new-session` (option) | Its own session, no controlling terminal: closes TIOCSTI, and costs an interactive shell its job control. Measured with and without above. |
+| `--clearenv`, `--setenv` for `HOME`, `PATH`, `TMPDIR`, `LANG`, `TERM`, the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY` and lower case, to the relay), `NO_PROXY` empty, `NODE_USE_ENV_PROXY=1`, `ENCLOS_PROXY_SOCKET` | The emptied environment. |
+| `--chdir <sandbox home>` | |
+
+**Landlock rules**, applied by `inside.py` where the kernel has Landlock (ADR 0037). Every right of the kernel's ABI is handled (ABI 1's thirteen, `REFER` from ABI 2, `TRUNCATE` from 3, `IOCTL_DEV` from 5), so whatever no rule grants is refused:
+
+| Beneath | Rights |
+| --- | --- |
+| `/` | read files, read folders |
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/opt`, `/snap` (those that exist), and the sandbox's home | read, execute |
+| the sandbox's home, each workspace, `/tmp`, `/var/tmp`, `/dev/shm` | read, write files, make and remove files and folders, sockets, FIFOs and links, `REFER`, `TRUNCATE` (not execute in the workspaces and temporary places) |
+| `/dev` | read, write files, `TRUNCATE`, `IOCTL_DEV` |
+| `/proc` | read, write files (the sandbox's own processes). Not enough for Chromium's writes to its renderers' `oom_score_adj`, refused with Landlock, and only then (`Permission denied`). Pages load regardless; which rule refuses the writes, and whether M3-13 should allow them, is open. |
+| scopes (ABI 6) | abstract Unix sockets and signals limited to the sandbox |
+
+Not used: Landlock's network rights (the network namespace holds the network), and the Unix-socket right of ABI 9 (design §5), whose value the prototype does not set. Programs run from the home because the runtime installs itself there; a policy's `[exec]` section would narrow that.
+
+**The seccomp filter**, applied by `inside.py` after Landlock; anything not listed is allowed, and a system call of another architecture's ABI (such as 32-bit x86 on x86_64) ends the process, libseccomp's default:
+
+- refused with `EPERM`: `keyctl`, `add_key`, `request_key`; `bpf`, `perf_event_open`, `userfaultfd`; `mount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`; `setns`; `kexec_load`, `kexec_file_load`, `init_module`, `finit_module`, `delete_module`, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `ioperm`, `iopl`, `open_by_handle_at`, `uselib`; `io_uring_setup`, `io_uring_enter`, `io_uring_register` (seccomp does not see io_uring's operations). Calls not on an architecture (`ioperm`, `iopl` on arm64) are skipped, and `inside.py` says which.
+- `ioctl` refused with `EPERM` when its request's low 32 bits are `TIOCSTI` (`0x5412`) or `TIOCLINUX` (`0x541C`).
+- `unshare` and `clone` refused with `EPERM` when their flags hold any of `CLONE_NEWNS`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWIPC`, `CLONE_NEWUTS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`.
+- `clone3` refused with `ENOSYS`, since its flags are in memory seccomp cannot read; the C library then falls back to `clone`.
+- `ptrace` is not refused: the PID namespace leaves nothing outside to trace (the probe tries a host process), and debuggers inside keep working.
+
+The errno is a choice for M3-14: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
+
+Review corrections: compile rejects any workspace that covers or lies under a deny, including `~/dev` with deny `~/dev/work`; `wrap.py` enumerates home entries per launch without changing the cached compiled snapshot. Only `run/visible/` is mounted; proxy control and authoritative service state stay outside. `listen=false` is **not enforced** by this prototype; production must refuse it until verified (design §7). The relay is a throwaway unsafe draft, not M3-09 implementation material: blocking sends and closing both directions at EOF require replacement with bounded backpressure/half-close handling and stress tests. Chromium’s `--no-sandbox` mode has no browser-internal isolation and relies entirely on enclos. `/proc` grants now include TRUNCATE; `test_oom.py` compares legacy and corrected `sh -c "echo 0 > /proc/self/oom_score_adj"` in isolated children, CI only where Landlock exists. Historical OOM findings above describe the earlier rules.
