@@ -13,10 +13,12 @@ signal sent is signal 0, which checks a process exists and delivers nothing.
 
 import ctypes
 import errno
+import fcntl
 import os
 import platform
 import select
 import socket
+import struct
 import subprocess
 import sys
 
@@ -344,6 +346,46 @@ def p_fds():
     return ("held", " ".join(held)) if held else ("none", "")
 
 
+def p_setns_net():
+    """Joining the network namespace this process is already in: the call
+    still needs CAP_SYS_ADMIN in the user namespace that owns it."""
+    fd = os.open("/proc/self/ns/net", os.O_RDONLY)
+    try:
+        os.setns(fd, os.CLONE_NEWNET)
+        return "ok", "joined"
+    except OSError as e:
+        return err(e.errno), ""
+    finally:
+        os.close(fd)
+
+
+def p_net_admin():
+    """Setting loopback's flags to what they are: needs CAP_NET_ADMIN in the
+    user namespace that owns the network namespace, and changes nothing."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        req = fcntl.ioctl(s, 0x8913, struct.pack("16sh14x", b"lo", 0))  # SIOCGIFFLAGS
+        fcntl.ioctl(s, 0x8914, req)  # SIOCSIFFLAGS
+        return "ok", "set"
+    except OSError as e:
+        return err(e.errno), ""
+    finally:
+        s.close()
+
+
+def p_status():
+    """What the kernel holds of this process's confinement."""
+    want = ("NoNewPrivs", "Seccomp", "CapEff", "CapBnd")
+    with open("/proc/self/status") as f:
+        found = dict(line.split(":\t", 1) for line in f if ":\t" in line)
+    return "ok", " ".join(f"{k}={found[k].strip()}" for k in want if k in found)
+
+
+def p_max_userns():
+    with open("/proc/sys/user/max_user_namespaces") as f:
+        return "ok", f.read().strip()
+
+
 def p_nsopen(path):
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -362,7 +404,8 @@ PROBES = {
     "connect-tcp": p_connect_tcp, "dns": p_dns,
     "netns": p_netns, "find": p_find, "peer-kill": p_peer_kill, "peer-ptrace": p_peer_ptrace,
     "peer-environ": p_peer_environ, "listen-tcp": p_listen_tcp, "http": p_http, "fds": p_fds,
-    "nsopen": p_nsopen,
+    "nsopen": p_nsopen, "setns-net": p_setns_net, "net-admin": p_net_admin, "status": p_status,
+    "max-userns": p_max_userns,
 }
 
 

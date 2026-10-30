@@ -83,3 +83,38 @@ start_holder() {
         "$dir/bwrap-info.json" >"$dir/pid" 2>/dev/null
     HOLDER="$dir"
 }
+
+# A session left open across restarts (ns-open-session.py).
+#
+# open_session DIR ENV=VALUE...: a session with that environment (SBX_JOIN and
+# so on), waiting for commands in DIR, in the sandbox's home so both sides
+# see it. Sets OPEN_PID, for the caller's list of what it started. Not run in
+# a subshell, which would take the session with it.
+open_session() {
+    local dir="$1"
+    shift
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    env "$@" timeout 1800 "$M3/sbx-ns.sh" -- /usr/bin/python3 -I "$M3/ns-open-session.py" "$dir" \
+        </dev/null >"$dir.log" 2>&1 &
+    OPEN_PID=$!
+    for _ in $(seq 100); do [ -e "$dir/ready" ] && return 0; sleep 0.2; done
+    return 1
+}
+
+# ask DIR SECONDS command...: runs the command in that open session, prints
+# its output and returns its exit code, or says it had no answer.
+ask() {
+    local dir="$1" wait="$2" n
+    shift 2
+    n=$(find "$dir" -name '*.exit' | wc -l)
+    python3 -I -c 'import json, sys; json.dump(sys.argv[1:], sys.stdout)' "$@" >"$dir/$n.new"
+    mv "$dir/$n.new" "$dir/$n.cmd"
+    for _ in $(seq $((wait * 5))); do [ -e "$dir/$n.exit" ] && break; sleep 0.2; done
+    if [ ! -e "$dir/$n.exit" ]; then
+        echo "no answer from the open session in $wait s"
+        return 124
+    fi
+    cat "$dir/$n.out"
+    return "$(cat "$dir/$n.exit")"
+}

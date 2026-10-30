@@ -18,21 +18,31 @@
 # other session of A relays that port; B is given no relay, as a sandbox
 # without the service, but reaches the socket only because it shares run/.
 #
+# Then, for the `nsenter` way, the one decided on: what still holds in a joined
+# session with each layer off in turn (--disable-userns, the seccomp filter,
+# capabilities), and what a service, proxy or holder restart does to a session
+# left open (ns-open-session.py), and to a new one.
+#
 # Acts on the host (runs bubblewrap, makes namespaces): CI only.
 set -u
 source "$(dirname "$0")/lib.sh"
 out="$RESULTS_DIR/50-namespaces.md"
 tmp="$RESULTS_DIR/namespaces"
 mkdir -p "$tmp"
-WAYS=(own nsenter nsenter-pid nsenter-userns userns userns-subpid userns-net relay)
+# The rejected ways stay in nsjoin.py; the third run measured them (README.md).
+WAYS=(own nsenter relay)
 HOST_PORT=18999
 
 # --- the proxy every sandbox's relay reaches, and a listener on the host
 allow="$tmp/allow.txt"
 echo example.com >"$allow"
-python3 -I "$M3/unix-proxy.py" --socket "$PROXY_SOCK" --allow "$allow" --log "$tmp/proxy.jsonl" \
-    >"$tmp/proxy.out" 2>&1 &
-started=($!)
+start_proxy() {
+    python3 -I "$M3/unix-proxy.py" --socket "$PROXY_SOCK" --allow "$allow" --log "$tmp/proxy.jsonl" \
+        >>"$tmp/proxy.out" 2>&1 &
+    proxy=$!
+}
+start_proxy
+started=($proxy)
 python3 -I -m http.server --bind 127.0.0.1 "$HOST_PORT" >/dev/null 2>&1 &
 started+=($!)
 # Only what this script started is ever signalled.
@@ -197,6 +207,109 @@ print(s["loopback"], s["any"], s["abstract"], s["namespaces"]["net"])' "$svcjson
     done
 done
 
+# --- what still holds in a joined session, each layer off in turn
+holds=("status" "max-userns" "unshare user" "unshare mount" "unshare net" "mount" "keyctl" "bpf"
+    "perf_event_open" "userfaultfd" "io_uring" "setns-net" "net-admin" "fds")
+start_holder A; A=$HOLDER
+started+=("$(cat "$A/bwrap.pid")")
+python3 -I "$M3/probe.py" "${holds[@]}" >"$tmp/holds-host.tsv" 2>&1
+holds_cols=("host=$tmp/holds-host.tsv")
+# holds_in LABEL WAY LANDLOCK SECCOMP
+holds_in() {
+    env SBX_JOIN="$2" SBX_HOLDER="$A/holder.sock" SBX_LANDLOCK="$3" SBX_SECCOMP="$4" \
+        timeout 120 "$M3/sbx-ns.sh" -- /usr/bin/python3 -I "$M3/probe.py" "${holds[@]}" \
+        >"$tmp/holds-$1.tsv" 2>"$tmp/holds-$1.err"
+    echo "exit $?" >>"$tmp/holds-$1.err"
+    holds_cols+=("$1=$tmp/holds-$1.tsv")
+}
+holds_in own-full own auto on
+holds_in own-no-seccomp own auto off
+holds_in nsenter-full nsenter auto on
+holds_in nsenter-no-landlock nsenter off on
+holds_in nsenter-no-seccomp nsenter auto off
+holds_in nsenter-neither nsenter off off
+kill "$(cat "$A/bwrap.pid")" 2>/dev/null
+sleep 1
+
+# --- restarts, with one session of the sandbox left open
+log="$tmp/restarts.txt"
+joined() {
+    env SBX_JOIN=nsenter SBX_HOLDER="$1/holder.sock" timeout 900 "$M3/sbx-ns.sh" -- "${@:2}"
+}
+# stand_in N: a service in a session of $A; sets svc and port.
+stand_in() {
+    local out="$SBX_HOME/ns-service-restart.json"
+    rm -f "$out"
+    joined "$A" /usr/bin/python3 -I "$M3/ns-service.py" --name "R$1" --marker "restart-$1" \
+        --out "$out" --seconds 800 >"$tmp/restart-svc-$1.out" 2>&1 &
+    svc=$!
+    started+=($svc)
+    for _ in $(seq 100); do [ -e "$out" ] && break; sleep 0.2; done
+    port=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["loopback"])' "$out")
+}
+# step TITLE: a heading in the log. seen PROBE...: those probes in the open
+# session. new HOLDER PROBE...: the same in a new session of that holder.
+step() { printf '\n## %s\n' "$1" >>"$log"; }
+seen() {
+    {
+        echo "open session (pid $open alive: $([ -d "/proc/$open" ] && echo yes || echo no)):"
+        ask "$O" 45 /usr/bin/python3 -I "$M3/probe.py" "$@"
+    } 2>&1 | grep -v '^inside:' >>"$log"
+}
+new() {
+    local h="$1"
+    shift
+    {
+        echo "new session:"
+        joined "$h" /usr/bin/python3 -I "$M3/probe.py" "$@"
+    } 2>&1 | grep -v '^inside:' >>"$log"
+}
+: >"$log"
+start_holder A; A=$HOLDER
+started+=("$(cat "$A/bwrap.pid")")
+stand_in 1
+old=$port
+O="$SBX_HOME/open-restarts"
+open_session "$O" SBX_JOIN=nsenter SBX_HOLDER="$A/holder.sock" || echo "the open session did not start" >>"$log"
+open=$OPEN_PID
+started+=($open)
+
+step "before any restart"
+seen netns "connect-tcp 127.0.0.1 $port" "http https://example.com/"
+
+step "service restarted, so its port changes"
+kill "$svc" 2>/dev/null
+wait "$svc" 2>/dev/null
+stand_in 2
+echo "old port $old, new port $port" >>"$log"
+seen "connect-tcp 127.0.0.1 $old" "connect-tcp 127.0.0.1 $port"
+
+step "proxy stopped"
+kill "$proxy" 2>/dev/null
+wait "$proxy" 2>/dev/null
+seen "http https://example.com/" "connect-tcp 127.0.0.1 $RELAY_PORT"
+step "proxy started again, same socket"
+start_proxy
+started+=($proxy)
+sleep 1
+seen "http https://example.com/"
+new "$A" "http https://example.com/"
+
+step "holder stopped"
+kill "$(cat "$A/bwrap.pid")" 2>/dev/null
+sleep 2
+echo "service alive: $([ -d "/proc/$svc" ] && echo yes || echo no)" >>"$log"
+seen netns "connect-tcp 127.0.0.1 $port" "http https://example.com/" "listen-tcp 127.0.0.1 $RELAY_PORT"
+step "a new holder: a new network namespace"
+start_holder A2; A2=$HOLDER
+started+=("$(cat "$A2/bwrap.pid")")
+new "$A2" netns "connect-tcp 127.0.0.1 $port" "http https://example.com/"
+seen netns "http https://example.com/" "connect-unix $A2/holder.sock"
+echo "service alive: $([ -d "/proc/$svc" ] && echo yes || echo no)" >>"$log"
+touch "$O/stop"
+kill "$svc" "$(cat "$A2/bwrap.pid")" 2>/dev/null
+sed -i -e "s/ $old\t/ <old port>\t/; s/ $port\t/ <service>\t/" "$log"
+
 {
     echo "# Namespaces per session or per sandbox ($(uname -m))"
     section "Controls on the host"
@@ -209,6 +322,16 @@ done
     echo "| way | mode | service | same | listens in A | outlives | port from the host |"
     echo "| --- | --- | --- | --- | --- | --- | --- |"
     printf '%s\n' "${summary[@]}"
+    section "What still holds in a joined session"
+    echo "\`status\` is the probe's own \`/proc/self/status\`. With seccomp off, \`unshare user\` shows \`--disable-userns\` alone (ENOSPC from it, as in M3-02); \`setns-net\` and \`net-admin\` show the session has no capability over the sandbox's network namespace."
+    echo
+    python3 -I "$M3/table.py" "${holds_cols[@]}"
+    echo
+    echo "Launches: $(grep -h '^exit\|^bwrap:\|^nsenter:' "$tmp"/holds-*.err | sort | uniq -c | tr '\n' ';')"
+    section "Restarts with a session open"
+    echo "The \`nsenter\` way, full mode. Each probe line: probe, result, detail."
+    echo
+    fence <"$log"
     section "Probes, by way and mode"
     echo "\`ok\` means the operation succeeded; an error name means it was refused with that error. \`find\` and the \`peer-\` rows look for the service by its marker; \`listen-tcp <relay port>\` shows whether a session could start a relay of its own; \`http\` goes through the proxy variables, to the relay."
     echo
