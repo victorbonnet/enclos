@@ -1,3 +1,6 @@
+# PROTOTYPE ONLY: blocking sendall and paired close on EOF are not production safe.
+# M3-09 must implement bounded backpressure and independent half-closes,
+# with large simultaneous bidirectional transfer and request-half-close tests.
 """The relay (design §5, Linux networking; M3-09 builds the real one): accepts
 TCP connections on a listening socket inside the sandbox and forwards each to
 the proxy's Unix socket, and nothing else. inside.py makes the listening

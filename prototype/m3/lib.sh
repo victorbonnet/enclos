@@ -25,7 +25,7 @@ mkdir -p "$RESULTS_DIR"
 H="$(cd ~ && pwd -P)"                      # the user's own home, read broadly
 SBX="$H/.enclos/sandboxes/proto"           # the sandbox's folder (protected)
 SBX_HOME="$SBX/home"
-SBX_RUN="$SBX/run"
+SBX_RUN="$SBX/run/visible"
 SBX_COMPILED="$SBX/compiled"
 WORK="$H/proto-workspace"                  # one workspace, bound writable
 PROXY_SOCK="$SBX_RUN/proxy.sock"

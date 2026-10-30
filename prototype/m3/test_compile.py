@@ -13,6 +13,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compile as comp  # noqa: E402
+import wrap
+from unittest.mock import patch
 
 
 class CompileTest(unittest.TestCase):
@@ -36,14 +38,16 @@ class CompileTest(unittest.TestCase):
                    "--deny", f"{self.h}/.ssh", "--deny", f"{self.h}/.config/google-chrome",
                    "--deny", f"{self.h}/.enclos", "--out", out, *extra])
         with open(out) as f:
-            return json.load(f)
+            c = json.load(f)
+            c["bwrap"] = wrap.arguments(c)
+            return c
 
     def pairs(self, args, option):
         return [args[i + 1] for i, a in enumerate(args) if a == option]
 
     def test_denied_paths_are_not_mounted(self):
         args = self.compiled()["bwrap"]
-        binds = self.pairs(args, "--ro-bind")
+        binds = self.pairs(args, "--ro-bind-try")
         h = self.h
         self.assertEqual(self.pairs(args, "--tmpfs")[:2], [h, f"{h}/.config"])
         for denied in [".ssh", ".config/google-chrome", ".enclos"]:
@@ -62,7 +66,7 @@ class CompileTest(unittest.TestCase):
         c = self.compiled()
         home = f"{self.sbx}/home"
         self.assertEqual(self.pairs(c["bwrap"], "--bind"), [home, f"{self.h}/proj"])
-        self.assertIn(f"{self.sbx}/run", self.pairs(c["bwrap"], "--ro-bind"))
+        self.assertIn(f"{self.sbx}/run/visible", self.pairs(c["bwrap"], "--ro-bind"))
         self.assertEqual(c["landlock"]["write"][:2], [home, f"{self.h}/proj"])
         self.assertIn(home, c["landlock"]["execute"])
         self.assertNotIn(f"{self.h}/proj", c["landlock"]["execute"])
@@ -87,6 +91,25 @@ class CompileTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             comp.main(["--host-home", self.h, "--sandbox-dir", self.sbx, "--deny", "/etc/shadow",
                        "--out", os.path.join(self.tmp.name, "x.json")])
+
+
+    def test_workspace_cannot_cover_deny(self):
+        for workspace in [self.h, f"{self.h}/dev", f"{self.h}/dev/work/child"]:
+            with self.subTest(workspace=workspace), self.assertRaises(SystemExit):
+                self.compiled("--workspace", workspace, "--deny", f"{self.h}/dev/work")
+
+    def test_compile_does_not_list_home(self):
+        with patch.object(comp.os, "listdir", side_effect=AssertionError("compile IO")):
+            out = f"{self.tmp.name}/pure.json"
+            comp.main(["--host-home", self.h, "--sandbox-dir", self.sbx,
+                       "--deny", f"{self.h}/.ssh", "--out", out])
+        with open(out) as f:
+            c = json.load(f)
+        open(f"{self.h}/new-at-launch", "w").close()
+        self.assertIn(f"{self.h}/new-at-launch", wrap.arguments(c))
+        self.assertIn("--ro-bind-try", wrap.arguments(c))
+        os.unlink(f"{self.h}/new-at-launch")
+        self.assertNotIn(f"{self.h}/new-at-launch", wrap.arguments(c))
 
 
 if __name__ == "__main__":

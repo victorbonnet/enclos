@@ -78,6 +78,7 @@ probes+=(
     "io_uring"
     "kill $sleeper"
     "ptrace $sleeper"
+    "exists /proc/$sleeper"
     "environ $marker $sleeper"
     "connect-tcp 127.0.0.1 18999"
     "connect-tcp 1.1.1.1 443"
