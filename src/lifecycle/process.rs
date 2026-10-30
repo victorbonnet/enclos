@@ -133,7 +133,9 @@ pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
         .map_err(|_| PsError(format!("unexpected group `{pgid}`")))
 }
 
-/// A process as one listing shows it.
+/// A process as one listing shows it. `command` is what `ps` calls `comm`, to
+/// show to the user and never to compare: a path on macOS, and on Linux the
+/// program's file name cut at 15 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proc {
     pub pid: u32,
@@ -260,7 +262,8 @@ pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled,
 }
 
 /// Targets `kill` reads as more than one process of a session: 0 is the
-/// caller's own group and -1 every process the user owns; 1 is launchd.
+/// caller's own group and -1 every process the user owns; 1 is launchd or
+/// init.
 fn never_signalled(target: i64) -> bool {
     target.abs() <= 1
 }
@@ -363,6 +366,22 @@ mod tests {
             let err = listed(&out).unwrap_err();
             assert!(err.to_string().contains(says), "{err}");
         }
+    }
+
+    /// procps cuts a program's name at 15 characters, so a command is for
+    /// showing only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_program_name_is_listed_cut_at_15_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("a-program-with-a-long-name");
+        std::fs::copy("/bin/sleep", &long).unwrap();
+        let mut child = Command::new(&long).arg("30").spawn().unwrap();
+        let listed = processes().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = listed.iter().find(|p| p.pid == child.id()).unwrap();
+        assert_eq!(found.command, "a-program-with-");
     }
 
     #[test]
