@@ -289,7 +289,7 @@ impl Engine {
 
     /// The program started as the sandbox's proxy, for tests that stand one
     /// in.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn with_exe(mut self, exe: PathBuf) -> Engine {
         self.exe = Some(exe);
         self
@@ -297,7 +297,7 @@ impl Engine {
 
     /// The same engine stopping a session's members with `stop`, for tests
     /// of members that outlive being stopped.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn with_stop_members(mut self, stop: StopMembers) -> Engine {
         self.stop_members = stop;
         self

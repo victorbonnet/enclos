@@ -712,10 +712,11 @@ impl Engine {
     }
 
     /// `session`, with the processes holding its marker added to those it
-    /// tracked (ADR 0030). The processes are listed before `lsof` looks: a
-    /// holder that exits in between, its pid reused, is then listed with
-    /// its own start time and fails the same-process check before a signal,
-    /// where the other order would name the process that reused the pid.
+    /// tracked (ADR 0030). The processes are listed before the look at who
+    /// holds it: a holder that exits in between, its pid reused, is then
+    /// listed with its own start time and fails the same-process check
+    /// before a signal, where the other order would name the process that
+    /// reused the pid.
     pub(super) fn marked(&self, session: &SessionRecord) -> Result<SessionRecord> {
         Ok(self.marked_listed(session)?.1)
     }

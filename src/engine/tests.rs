@@ -1595,13 +1595,10 @@ mod runtime {
     use crate::model::agent::{AgentName, AgentRecord};
     use crate::model::runtime::RuntimeKind;
     use crate::runtime::RuntimeAgentName;
-    #[cfg(target_os = "macos")]
     use crate::runtime::{
         HomeFile, Installer, RuntimeAdapter, SandboxCommand, Unreadable, hermes::Hermes,
     };
-    #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(target_os = "macos")]
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1686,7 +1683,6 @@ mod runtime {
         );
     }
 
-    #[cfg(target_os = "macos")]
     /// Hermes's adapter with an installer of the test's own: `url` is a
     /// `file://` URL to it and `sha256` its hash, which the audit entry should
     /// name.
@@ -1695,7 +1691,6 @@ mod runtime {
         sha256: String,
     }
 
-    #[cfg(target_os = "macos")]
     impl TestRuntime {
         fn new(dir: &Path, script: &str) -> TestRuntime {
             let installer = dir.join("install.sh");
@@ -1709,7 +1704,6 @@ mod runtime {
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl RuntimeAdapter for TestRuntime {
         fn kind(&self) -> RuntimeKind {
             RuntimeKind::Hermes
@@ -1749,7 +1743,6 @@ mod runtime {
         }
     }
 
-    #[cfg(target_os = "macos")]
     /// An installer that puts a `hermes` stub on the sandbox's PATH, which
     /// records its calls in the home and fails while `hermes-fails` exists.
     const INSTALLS: &str = "#!/bin/sh
@@ -1770,7 +1763,9 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 echo \"installed $*\" > \"$HOME/installed\"
 ";
 
-    #[cfg(target_os = "macos")]
+    /// The number of `SIGUSR1`, which differs between the two systems.
+    const USR1: i32 = if cfg!(target_os = "macos") { 30 } else { 10 };
+
     /// Engine tests start real proxies on this host's ports: one at a time,
     /// with every other test run of this user too.
     static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
@@ -1779,7 +1774,6 @@ echo \"installed $*\" > \"$HOME/installed\"
     /// loop asks again: another test's child, forked while this test held
     /// the state lock, holds a copy of its descriptor until it execs, and so
     /// the lock, a moment after this test dropped it.
-    #[cfg(target_os = "macos")]
     fn answered<T>(mut ask: impl FnMut() -> Option<T>) -> Option<T> {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1791,7 +1785,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         }
     }
 
-    #[cfg(target_os = "macos")]
     /// A sandbox whose proxy is a listener this test stands in (`nc`), so
     /// that sessions can run through the fake backend; stopped when dropped,
     /// so the listener never outlives the test.
@@ -1802,7 +1795,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         home: PathBuf,
     }
 
-    #[cfg(target_os = "macos")]
     impl Lab {
         fn new() -> Lab {
             Lab::with_services(None)
@@ -1903,14 +1895,12 @@ echo \"installed $*\" > \"$HOME/installed\"
         }
     }
 
-    #[cfg(target_os = "macos")]
     impl Drop for Lab {
         fn drop(&mut self) {
             let _ = self.engine.stop_sandbox(&alice(), &self.name, Confirm::Yes);
         }
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1944,7 +1934,6 @@ echo \"installed $*\" > \"$HOME/installed\"
 
     /// `policy.toml` keeping listening off wins over the adapter, and the
     /// plan says Hermes's gateway then cannot start (ADR 0028).
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_install_says_when_policy_toml_keeps_listening_off() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1973,7 +1962,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_installer_not_served_over_https_is_not_downloaded() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2011,7 +1999,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(!lab.audit().contains("runtime install"), "{}", lab.audit());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn any_installer_runs_and_the_audit_names_its_hash() {
         // Whatever version the runtime serves (ADR 0029): the entry names
@@ -2047,7 +2034,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_installer_that_fails_leaves_the_sandbox_as_before() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2073,7 +2059,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(lab.home.join("bin/mktemp").is_file());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_reinstall_that_fails_keeps_the_runtime_and_its_destinations() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2102,7 +2087,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_proxy_a_session_started_writes_where_enclos_logs_reads() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2114,7 +2098,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(text.contains("fake proxy on port "), "{text}");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_install_records_the_runtime_once_its_installer_exits_0_and_agents_follow() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2265,7 +2248,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(err.to_string().contains("has no agent `main`"), "{err}");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn removing_an_agent_runs_the_runtimes_delete_then_removes_the_record() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2371,7 +2353,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 2);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded() {
         use sha2::{Digest, Sha256};
@@ -2594,7 +2575,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert_eq!(outcome("agent add").len(), 1);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_install_with_unapplied_policy_edits_asks_first() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3022,7 +3002,6 @@ echo \"installed $*\" > \"$HOME/installed\"
         assert!(AgentDiff::compare(&both, &[tracked("main")], Some(default)).is_clean());
     }
 
-    #[cfg(target_os = "macos")]
     /// An installer whose `hermes gateway run` starts a second process and
     /// waits, writing both pids to `gateway-pids` in the home.
     const GATEWAY: &str = "#!/bin/sh
@@ -3038,7 +3017,6 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
-    #[cfg(target_os = "macos")]
     /// An installer whose `hermes gateway run` starts a second process,
     /// writes both pids to `gateway-pids` in the home, and exits 0 a moment
     /// later, leaving the second running.
@@ -3057,7 +3035,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
     /// A gateway that exits 75 on USR1, as Hermes's does.
-    #[cfg(target_os = "macos")]
     const RESTARTS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\" \"$HOME/.hermes\"
 printf 'model: a\\n' > \"$HOME/.hermes/config.yaml\"
@@ -3073,7 +3050,6 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_service_restarts_once_its_runtime_settings_change() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3109,7 +3085,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(open_service_sessions(&lab).is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_settings_restart_that_could_not_be_recorded_is_asked_again() {
         use std::os::unix::fs::PermissionsExt;
@@ -3167,7 +3142,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
         use std::os::unix::process::CommandExt;
@@ -3237,12 +3211,11 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let status = service.wait().unwrap();
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(30)
+            Some(USR1)
         );
         assert!(lab.audit().contains("service restart"), "{}", lab.audit());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_exec_session_does_not_hold_back_a_settings_restart() {
         use std::os::unix::process::CommandExt;
@@ -3296,13 +3269,12 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         let status = service.wait().unwrap();
         assert_eq!(
             std::os::unix::process::ExitStatusExt::signal(&status),
-            Some(30)
+            Some(USR1)
         );
         exec.kill().unwrap();
         exec.wait().unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_settings_restart_waits_until_no_one_is_connected() {
         use std::os::unix::process::CommandExt;
@@ -3367,7 +3339,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     /// A runtime whose gateway records whether it was launched in enclos's
     /// terminal, and exits.
-    #[cfg(target_os = "macos")]
     const RECORDS_TERMINAL: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -3378,7 +3349,6 @@ STUB
 chmod 700 \"$HOME/.local/bin/hermes\"
 ";
 
-    #[cfg(target_os = "macos")]
     fn pids_in(file: &Path) -> Vec<u32> {
         std::fs::read_to_string(file)
             .unwrap()
@@ -3387,7 +3357,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .collect()
     }
 
-    #[cfg(target_os = "macos")]
     fn assert_gone(pids: &[u32]) {
         for pid in pids {
             let running = crate::lifecycle::process::reference(*pid).unwrap();
@@ -3395,7 +3364,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         }
     }
 
-    #[cfg(target_os = "macos")]
     fn open_service_sessions(lab: &Lab) -> Vec<crate::model::session::SessionRecord> {
         lab.engine
             .state
@@ -3412,7 +3380,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// can tell: `show` lists it, `status` counts the session as running,
     /// and `sandbox stop` ends it and removes the marker. Before markers it
     /// was not even seen.
-    #[cfg(target_os = "macos")]
     #[test]
     fn stop_ends_a_process_that_left_its_session_by_a_double_fork() {
         use std::time::{Duration, Instant};
@@ -3502,7 +3469,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// that neither its group nor its parent proves the session's. It holds
     /// the marker, so the look after the first stop proves it, and it is
     /// stopped too instead of surviving (ADR 0030).
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_child_forked_while_stopping_is_stopped_through_its_marker() {
         use std::os::unix::process::CommandExt;
@@ -3674,7 +3640,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_runtime_service_told_to_end_stops_its_runtime_and_records_the_end() {
         use std::time::{Duration, Instant};
@@ -3742,7 +3707,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(lab.audit().contains("service end"), "{}", lab.audit());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn what_a_runtime_service_leaves_running_is_stopped_when_it_exits() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3761,7 +3725,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(open_service_sessions(&lab).is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_launch_that_succeeds_after_one_that_failed_marks_the_sandbox_running() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3793,7 +3756,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_service_is_never_launched_in_enclos_s_terminal() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3812,7 +3774,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// A runtime whose gateway records the service port it was given.
-    #[cfg(target_os = "macos")]
     const RECORDS_SERVICE_PORT: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -3825,7 +3786,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     /// A runtime whose gateway records its open-file limit, and whether a
     /// variable of enclos's own environment reached it.
-    #[cfg(target_os = "macos")]
     const RECORDS_LIMITS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -3838,7 +3798,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     /// A service and a session start under the policy's limits, and only
     /// the sandbox's variables reach them through the shell that sets them.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_service_and_a_session_run_under_the_policys_limits() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -3872,7 +3831,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// A runtime whose gateway records the secret it was given as $TOKEN.
-    #[cfg(target_os = "macos")]
     const RECORDS_TOKEN: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -3889,7 +3847,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// reads, never in its environment, and a session as variables (ADR
     /// 0034). With one missing from the store, neither starts; with the
     /// store locked, the service does not, and the sandbox says why.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_service_and_a_session_get_the_secrets_their_policy_grants() {
         use crate::model::secret::{SecretRef, SecretValue};
@@ -3997,7 +3954,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// the secrets folder, never to the sandbox's `.env` every agent reads,
     /// nor to a session (ADR 0036); it stays granted until the policy takes
     /// it out, and the file goes with the grant.
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_agents_secrets_go_to_a_file_of_its_own_and_to_no_session() {
         use crate::model::secret::{SecretRef, SecretValue};
@@ -4115,7 +4071,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// `runtime configure` with settings only: the agent reads its own
     /// secrets, and each setting names a secret only as a `${VAR}` the
     /// policy grants it, never as the secret (ADR 0036).
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_agent_is_given_settings_that_name_its_secrets() {
         use crate::engine::Setting;
@@ -4190,7 +4145,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// What the channel tests read of a bot `runtime configure` set up.
-    #[cfg(target_os = "macos")]
     #[derive(Debug)]
     struct Bot {
         agent: crate::runtime::RuntimeAgentName,
@@ -4200,7 +4154,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     }
 
     /// `runtime configure --channel`, with no other setting.
-    #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     fn configure_channel(
         engine: &Engine,
@@ -4236,7 +4189,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// The built-in agent's bot is set up with the runtime's own commands,
     /// once the policy grants it its token (ADR 0036); the value goes into
     /// no command.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_channel_is_set_up_with_the_runtimes_commands_once_its_token_is_granted() {
         use crate::model::channel::{Channel, ChannelUser};
@@ -4473,7 +4425,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     /// A token granted only by the pending policy waits for it: nothing
     /// runs before `policy apply`.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_channel_whose_token_is_only_pending_is_refused() {
         use crate::model::channel::{Channel, ChannelUser};
@@ -4526,7 +4477,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
     /// An agent's own bot (ADR 0036): set up for an agent the sandbox has,
     /// its token granted to that agent alone, and read from that agent's
     /// secrets file; the built-in agent's grant is not that agent's.
-    #[cfg(target_os = "macos")]
     #[test]
     fn an_agent_is_given_a_bot_of_its_own() {
         use crate::model::channel::{Channel, ChannelUser};
@@ -4612,7 +4562,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
 
     /// A session is given the port its gateway listens on, and says why when
     /// it is given none; the gateway's own launch is given none (ADR 0028).
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_session_is_given_its_gateways_port_and_the_gateway_none() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4662,7 +4611,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_launch_ends_a_service_session_whose_launch_was_killed() {
         let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4683,7 +4631,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert!(open_service_sessions(&lab).is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     /// Records an open session of the runtime service `service` whose
     /// program is `root`, as a `launch` would have.
     fn record_service_session(
@@ -4720,7 +4667,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             .unwrap()
     }
 
-    #[cfg(target_os = "macos")]
     /// A `sleep` this test starts in a process group of its own, standing in
     /// for the runtime of a service whose `launch` was killed: still running,
     /// with nothing waiting for it but this test.
@@ -4735,7 +4681,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         (child, root)
     }
 
-    #[cfg(target_os = "macos")]
     /// Waits for the stub gateway to write its pids, runs `then`, then sets
     /// `ended`.
     fn end_once_started(
@@ -4760,7 +4705,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         })
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_launch_stops_a_live_session_of_its_service_before_starting_another() {
         use std::sync::Arc;
@@ -4828,7 +4772,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         other.wait().unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_runtime_that_outlives_being_told_to_end_is_audited_and_its_session_stays_open() {
         use crate::lifecycle::stop::{Stopped, Survivor, Why};
@@ -4884,7 +4827,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert_gone(&started);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_runtime_enclos_cannot_stop_is_audited_and_its_session_stays_open() {
         use crate::lifecycle::process::PsError;
@@ -4923,7 +4865,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         assert_gone(&started);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_launch_refuses_to_start_beside_an_earlier_session_that_does_not_stop() {
         use crate::lifecycle::stop::{Stopped, Survivor, Why};
@@ -5007,7 +4948,6 @@ chmod 700 \"$HOME/.local/bin/hermes\"
         stubborn.wait().unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
         use crate::model::session::SessionKind;
@@ -5481,7 +5421,6 @@ mod services {
     /// A gateway whose session is open but which binds its listener only a
     /// second later, as one still starting: a `connect` then waits for it,
     /// and never starts the services again, which would stop it (ADR 0028).
-    #[cfg(target_os = "macos")]
     #[test]
     fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
         let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
