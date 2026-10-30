@@ -73,3 +73,8 @@ fn adr_0038_gives_the_verdict_on_a_field_not_enforced() {
         assert!(adr.contains(rule), "{rule}");
     }
 }
+
+#[test]
+fn adr_0037_points_to_the_verdict_in_adr_0038() {
+    assert!(adr(ADR_0037).contains("`policy test`'s verdict follows 0038's rule"));
+}
