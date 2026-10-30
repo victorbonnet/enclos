@@ -4,6 +4,8 @@
 //! the two baselines.
 
 mod compile;
+#[cfg(test)]
+mod probes_snapshot;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 mod wrap;
