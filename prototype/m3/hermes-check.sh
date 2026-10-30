@@ -47,15 +47,7 @@ vst=$?
     section "hermes --version"
     grep -v '^inside:' "$tmp/version.log" | tail -20 | fence
     section "Endpoints the proxy saw (host:port verdict)"
-    python3 -I -c '
-import json, sys, collections
-seen = collections.Counter()
-for line in open(sys.argv[1]):
-    e = json.loads(line)
-    seen[(e.get("host"), e.get("port"), e.get("verdict"), e.get("reason", ""))] += 1
-for (h, p, v, r), n in sorted(seen.items(), key=str):
-    print(f"- {h}:{p} {v} {r} ({n})")
-' "$tmp/proxy.jsonl"
+    python3 -I "$M3/proxy-summary.py" "$tmp/proxy.jsonl"
     section "Lines of the install log naming sudo, apt or a refusal"
     grep -inE 'sudo|apt(-get)?|permission denied|read-only|operation not permitted|not found' "$tmp/install.log" \
         | head -60 | cut -c1-200 | fence

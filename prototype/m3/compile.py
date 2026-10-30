@@ -3,7 +3,7 @@
 Turns the prototype's policy into what the bubblewrap backend applies:
 bubblewrap's arguments, the Landlock rules and the seccomp filter, written as
 one JSON file that sbx.sh hands to bubblewrap and inside.py reads inside the
-sandbox. Pure apart from listing the folders that hold a denied path, so it
+sandbox. Pure: home entries are enumerated by wrap.py at session launch, so it
 is safe on any host; test_compile.py runs it on a temporary folder.
 
     python3 -I compile.py --host-home H --sandbox-dir D --workspace W \\
@@ -78,22 +78,29 @@ def hide(folder, denied, args, remount):
         elif os.path.isdir(path) and any(under(d, path) for d in denied):
             hide(path, denied, args, remount)
         else:
-            args += ["--ro-bind", path, path]
+            args += ["--ro-bind-try", path, path]
 
 
 def compile_policy(o):
     home = os.path.join(o.sandbox_dir, "home")
-    run = os.path.join(o.sandbox_dir, "run")
+    run = os.path.join(o.sandbox_dir, "run", "visible")
     compiled = os.path.join(o.sandbox_dir, "compiled")
     denied = {os.path.normpath(d) for d in o.deny}
     for d in denied:
         if not under(d, o.host_home) or d == o.host_home:
             sys.exit(f"compile.py: deny entry {d} is not under {o.host_home}")
 
+    for w in o.workspace:
+        grant = os.path.realpath(w)
+        for d in denied:
+            deny = os.path.realpath(d)
+            if under(deny, grant) or under(grant, deny):
+                sys.exit(f"compile.py: workspace {w} overlaps denied path {d}")
+
     args = ["--ro-bind", "/", "/"]  # broad reads (ADR 0015)
     remount = []
     if denied:
-        hide(o.host_home, denied, args, remount)
+        args += ["@HOME_MASK@"]
     args += ["--dev", "/dev", "--proc", "/proc"]
     for t in OWN_TMPFS:
         args += ["--tmpfs", t]
@@ -134,6 +141,7 @@ def compile_policy(o):
 
     return {
         "bwrap": args,
+        "home_mask": {"home": o.host_home, "denied": sorted(denied)},
         "landlock": {
             "read": ["/"],
             "execute": EXEC_SYSTEM + [home],

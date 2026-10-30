@@ -32,6 +32,8 @@ jobs:
         run: python3 -I prototype/m3/test_compile.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
+      - name: Landlock proc O_TRUNC regression
+        run: python3 -I prototype/m3/test_oom.py
       - name: Files, programs and system calls
         if: always()
         run: bash prototype/m3/sandbox-check.sh

@@ -63,14 +63,6 @@ done
     section "Clients through the relay"
     python3 -I "$M3/table.py" "full=$tmp/full.tsv" "no Landlock=$tmp/nolandlock.tsv"
     section "What the proxy logged (host, verdict, reason)"
-    python3 -I -c '
-import json, sys, collections
-seen = collections.Counter()
-for line in open(sys.argv[1]):
-    e = json.loads(line)
-    seen[(e.get("host"), e.get("port"), e.get("verdict"), e.get("reason", ""))] += 1
-for (h, p, v, r), n in sorted(seen.items(), key=str):
-    print(f"- {h}:{p} {v} {r} ({n})")
-' "$tmp/proxy.jsonl"
+    python3 -I "$M3/proxy-summary.py" "$tmp/proxy.jsonl"
 } >"$out"
 cat "$out"

@@ -106,7 +106,7 @@ def apply_landlock(rules):
     for path in rules["devices"]:
         grants.append((path, READ | WRITE_FILE | TRUNCATE | IOCTL_DEV))
     for path in rules["proc_write"]:
-        grants.append((path, READ | WRITE_FILE))
+        grants.append((path, READ | WRITE_FILE | TRUNCATE))
     added = []
     for path, access in grants:
         try:

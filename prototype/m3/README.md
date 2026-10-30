@@ -88,7 +88,7 @@ A bubblewrap sandbox built as the backend would build it (design §5, ADR 0004, 
 
 | File | What it does |
 | --- | --- |
-| `compile.py` | The compile step: the prototype's policy (the user's home, the sandbox's folder, a workspace, the deny list) becomes bubblewrap's arguments, the Landlock rules and the seccomp filter, in one JSON file. Pure apart from listing the folders that hold a denied path. |
+| `compile.py` | The compile step: the prototype's policy (the user's home, the sandbox's folder, a workspace, the deny list) becomes bubblewrap's arguments, the Landlock rules and the seccomp filter, in one JSON file. Pure: dynamic folder listing happens in `wrap.py` at launch, with `--ro-bind-try` for disappearing entries. |
 | `test_compile.py` | Tests of `compile.py` on a temporary folder: denied paths not mounted, the folders that hide them read-only after every mount, writes to the home and workspaces only, the namespaces, the seccomp list, a deny entry outside the home refused. Runs anywhere (`python3 -I prototype/m3/test_compile.py`), and first in the workflow. |
 | `inside.py` | The program bubblewrap runs first inside: applies the Landlock rules where the kernel has Landlock (through its system calls, with ctypes), then the seccomp filter (libseccomp's Python binding, `python3-seccomp`), then starts the relay and runs the command. `--landlock off` and `--seccomp off` leave either out, to show what each adds. |
 | `relay.py` | The relay: each TCP connection on `127.0.0.1:<port>` inside the sandbox forwarded to the proxy's Unix socket, and nothing else. |
@@ -183,11 +183,11 @@ These need an account, so they cannot run in CI. In a disposable VM (Ubuntu 24.0
 | Arguments | Why |
 | --- | --- |
 | `--ro-bind / /` | Broad reads (ADR 0015). |
-| for each folder that holds a denied path, from the home down: `--tmpfs <folder>`, then `--ro-bind <entry> <entry>` for each of its other entries (`--symlink` for a link) | The deny list not mounted: a denied path does not exist. An entry made on the host after the session starts does not appear in such a folder; the alternative, an empty tmpfs or `/dev/null` over each denied path, keeps the rest live but leaves the path there, empty. |
+| for each folder that holds a denied path, from the home down: `--tmpfs <folder>`, then `--ro-bind-try <entry> <entry>` for each of its other entries (`--symlink` for a link) | The deny list not mounted: a denied path does not exist. An entry made on the host after the session starts does not appear in such a folder; the alternative, an empty tmpfs or `/dev/null` over each denied path, keeps the rest live but leaves the path there, empty. |
 | `--dev /dev`, `--proc /proc` | The sandbox's own devices and, with its own PID namespace, its own processes. |
 | `--tmpfs /tmp`, `--tmpfs /var/tmp`, `--tmpfs /run`, `--tmpfs /dev/shm` | Its own, empty temporary places; they hide `/run/user/<uid>` (the session bus, `systemd --user`, Wayland), the system bus, systemd-resolved, the Docker socket and `/tmp/.X11-unix`. |
 | `--bind <sandbox home> <same>`, `--bind <workspace> <same>` | The only writable places besides the above. |
-| `--ro-bind <sandbox>/run <same>`, `--ro-bind <sandbox>/compiled <same>` | The proxy's socket (connecting needs no write access to its mount, ADR 0004) and the compiled policy `inside.py` reads. M3-13 adds the sandbox's `secrets/` folder here, read-only, for this sandbox alone (ADR 0034). |
+| `--ro-bind <sandbox>/run/visible <same>`, `--ro-bind <sandbox>/compiled <same>` | The proxy's socket (connecting needs no write access to its mount, ADR 0004) and the compiled policy `inside.py` reads. M3-13 adds the sandbox's `secrets/` folder here, read-only, for this sandbox alone (ADR 0034). |
 | `--remount-ro <folder>` for each tmpfs made to hide a denied path | They were writable while bubblewrap made mount points in them. |
 | `--unshare-user --disable-userns` | A user namespace for the sandbox, and none made inside it. |
 | `--unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try` | Its own processes, an empty network (loopback only), IPC, host name and cgroup view. Whether a sandbox's sessions share one network and PID namespace is M3-03's question. |
@@ -218,3 +218,5 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 - `ptrace` is not refused: the PID namespace leaves nothing outside to trace (the probe tries a host process), and debuggers inside keep working.
 
 The errno is a choice for M3-14: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
+
+Review corrections: compile rejects any workspace that covers or lies under a deny, including `~/dev` with deny `~/dev/work`; `wrap.py` enumerates home entries per launch without changing the cached compiled snapshot. Only `run/visible/` is mounted; proxy control and authoritative service state stay outside. `listen=false` is **not enforced** by this prototype; production must refuse it until verified (design §7). The relay is a throwaway unsafe draft, not M3-09 implementation material: blocking sends and closing both directions at EOF require replacement with bounded backpressure/half-close handling and stress tests. Chromium’s `--no-sandbox` mode has no browser-internal isolation and relies entirely on enclos. `/proc` grants now include TRUNCATE; `test_oom.py` compares legacy and corrected `sh -c "echo 0 > /proc/self/oom_score_adj"` in isolated children, CI only where Landlock exists. Historical OOM findings above describe the earlier rules.
