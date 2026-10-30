@@ -879,6 +879,8 @@ const DENIED_FAKES: &[&str] = &[
     ".local/share/atuin/history.db",
     ".password-store/bank.gpg",
     ".gemini/oauth_creds.json",
+    ".config/google-chrome/Default/Cookies",
+    ".local/share/keyrings/login.keyring",
     ".local/share/opencode/auth.json",
     "Library/HTTPStorages/com.example.app/httpstorages.sqlite",
     "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",

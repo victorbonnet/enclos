@@ -244,6 +244,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// What [`a_policy_file_resolves_to_the_same_policy_on_every_system`]'s
+    /// file resolves to; regenerate only for a change meant to show in every
+    /// sandbox's policy.
+    const RESOLVED: &str = include_str!("resolved.snapshot");
+
     /// A new sandbox's `policy.toml` with `allow_add` set to `allow`.
     fn overrides(allow: &str) -> String {
         initial_overrides("home", &"assistant".parse().unwrap())
@@ -400,12 +405,63 @@ mod tests {
             "~/Library/Calendars",
             "~/Library/Group Containers/group.com.apple.calendar",
             "~/Pictures/Photos Library.photoslibrary",
+            // The same kinds of data where Linux keeps them
+            "~/.local/share/com.vercel.cli",
+            "~/.local/share/keyrings",
+            "~/.local/share/kwalletd",
+            "~/.config/google-chrome",
+            "~/.config/google-chrome-beta",
+            "~/.config/google-chrome-unstable",
+            "~/.config/google-chrome-canary",
+            "~/.config/chromium",
+            "~/.config/BraveSoftware",
+            "~/.config/microsoft-edge",
+            "~/.config/vivaldi",
+            "~/.config/opera",
+            "~/.mozilla",
+            "~/.config/mozilla",
+            "~/snap/firefox",
+            "~/snap/chromium",
+            "~/.thunderbird",
+            "~/snap/thunderbird",
+            "~/.config/evolution",
+            "~/.local/share/evolution",
+            "~/.config/1Password",
+            "~/.config/Bitwarden",
+            "~/.config/Bitwarden CLI",
+            "~/.config/Proton Pass",
+            "~/.config/keepassxc",
+            "~/.config/Claude",
+            "~/.config/Cursor",
+            // What starts programs for the user outside the sandbox
+            "~/.config/systemd/user",
+            "~/.local/share/systemd/user",
+            "~/.config/autostart",
+            // Rootless containers' sockets, logins and storage
+            "/run/user",
+            "~/.config/containers",
+            "~/.local/share/containers",
+            "~/.local/share/docker",
         ] {
             assert!(
                 snap.policy.fs.read_deny.contains(&entry.to_owned()),
                 "{entry} is not denied"
             );
         }
+    }
+
+    // Linux and macOS both run this against one file, so a difference between
+    // the systems fails on one of them.
+    #[test]
+    fn a_policy_file_resolves_to_the_same_policy_on_every_system() {
+        let snap = resolve(&overrides("\"api.example.com\""), None).unwrap();
+        let resolved = serde_json::to_string_pretty(&snap.policy).unwrap();
+        if std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some() {
+            let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/policy/resolved.snapshot");
+            std::fs::write(file, format!("{resolved}\n")).unwrap();
+        }
+        assert_eq!(resolved.trim_end(), RESOLVED.trim_end());
     }
 
     #[test]
