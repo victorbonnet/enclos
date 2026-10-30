@@ -65,6 +65,13 @@ class Page(unittest.TestCase):
         self.assertEqual(client.with_token("/w?x=1", "t"), "/w?x=1&token=t")
 
 
+class Terminal(unittest.TestCase):
+    def test_typed_text_is_found_among_control_sequences(self):
+        client = load("host-client")
+        out = "\x1b[2J\x1b[1;1H\x1b]0;title\x07> \x1b[1menclos\x1b[0mmark\r\n"
+        self.assertEqual(client.plain(out), "> enclosmark")
+
+
 class Listeners(unittest.TestCase):
     def test_another_sessions_port_is_left_out(self):
         listeners = load("ns-listeners")

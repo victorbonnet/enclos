@@ -8,8 +8,17 @@ page holds is used and never printed.
     python3 -I host-client.py check BASE [--ws PATH]...
     python3 -I host-client.py get BASE
     python3 -I host-client.py hold BASE PATH OUT [--seconds N]
+    python3 -I host-client.py chat BASE
+    python3 -I host-client.py pty BASE
+    python3 -I host-client.py raw BASE OUT [--path PATH]
+    python3 -I host-client.py token BASE OUT
 
-`hold` opens a WebSocket and writes to OUT what became of it.
+`hold` opens a WebSocket and writes to OUT what became of it. `chat` opens
+Hermes's chat over /api/ws (session.create, then prompt.submit) and says how
+far it got. `pty` drives the terminal on /api/pty as the page does: a size, then
+typed text, which must come back. `raw` sends one request and keeps every byte
+of the answer in OUT, for a check that a refused client got nothing. `token`
+writes the page's session token to OUT, the one place it is written.
 """
 
 import argparse
@@ -27,6 +36,15 @@ import wsmini  # noqa: E402
 
 TOKEN = re.compile(r'__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"')
 ASSET = re.compile(r'(?:src|href)="((?:/|\./|assets/)[^"#]+)"')
+
+
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-Z\\\\^_])")
+MARK = "enclosmark"
+
+
+def plain(text):
+    """Terminal output as text: control sequences out, whitespace closed up."""
+    return " ".join(ANSI.sub("", text).split())
 
 
 def line(spec, result, detail=""):
@@ -94,6 +112,117 @@ def first_frame(s, rest, wait=5):
     except TimeoutError:
         return f"no frame in {wait} s"
     return f"frame opcode {frame[0]}, {len(frame[1])} bytes"
+
+
+def frames(s, buf, seconds):
+    """Yields (opcode, body) until `seconds` pass or the socket closes."""
+    end = time.monotonic() + seconds
+    while True:
+        while (frame := wsmini.decode(buf)) is not None:
+            buf = buf[frame[2]:]
+            yield frame[0], frame[1]
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        s.settimeout(left)
+        try:
+            data = s.recv(65536)
+        except TimeoutError:
+            return
+        if not data:
+            return
+        buf += data
+
+
+def send(s, text):
+    s.sendall(wsmini.encode(text.encode(), mask=os.urandom(4)))
+
+
+def page_token(base):
+    body = get(base, "/")[2].decode("utf-8", "replace")
+    return (m := TOKEN.search(body)) and m.group(1)
+
+
+def chat(base):
+    """Hermes's newline-free JSON-RPC over /api/ws, as far as an install with no
+    account goes: the reply to each call, then the events of the turn."""
+    status, s, rest = ws_open(base, with_token("/api/ws", page_token(base)))
+    if " 101 " not in status + " ":
+        return line("chat: /api/ws", "refused", status[:60])
+    line("chat: /api/ws", "ok", "101")
+    send(s, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {}}))
+    sid, submitted, events, last = None, False, [], ""
+    for opcode, body in frames(s, rest, 45):
+        if opcode != wsmini.TEXT:
+            continue
+        try:
+            msg = json.loads(body)
+        except ValueError:
+            continue
+        if msg.get("method") == "event":
+            kind = msg.get("params", {}).get("type", "?")
+            if kind not in events:
+                events.append(kind)
+            text = json.dumps(msg.get("params", {}).get("payload", ""))
+            if "error" in kind or "provider" in text.lower():
+                last = text[:100]
+        elif msg.get("id") == 1:
+            sid = msg.get("result", {}).get("session_id")
+            line("chat: session.create", "ok" if sid else "refused",
+                 "a session" if sid else str(msg.get("error"))[:80])
+            if not sid:
+                break
+            send(s, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "prompt.submit",
+                                "params": {"session_id": sid, "text": "Reply with exactly one word: ok"}}))
+        elif msg.get("id") == 2:
+            submitted = True
+            error = msg.get("error")
+            line("chat: prompt.submit", "refused" if error else "ok", str(error)[:80] if error else "accepted")
+    s.close()
+    line("chat: events of the turn", "ok" if events else "none", " ".join(events)[:100])
+    line("chat: what stopped it", "seen" if last else "none", last)
+    if not submitted and sid:
+        line("chat: prompt.submit", "none", "no reply")
+
+
+def pty(base):
+    """The page's order: a size, then keys; the text typed must come back."""
+    status, s, rest = ws_open(base, with_token("/api/pty", page_token(base)))
+    if " 101 " not in status + " ":
+        return line("terminal: /api/pty", "refused", status[:60])
+    line("terminal: /api/pty", "ok", "101")
+    send(s, "\x1b[RESIZE:120;40]")
+    seen = b""
+    for _, body in frames(s, rest, 25):
+        seen += body
+    line("terminal: output", "ok" if seen else "none", f"{len(seen)} bytes: {plain(seen.decode('utf-8', 'replace'))[:60]}")
+    send(s, MARK)
+    typed = b""
+    for _, body in frames(s, b"", 8):
+        typed += body
+    s.close()
+    line("terminal: typed text comes back", "ok" if MARK in plain(typed.decode("utf-8", "replace")) else "none",
+         f"{len(typed)} bytes after typing")
+
+
+def raw(base, out, path):
+    u = urllib.parse.urlsplit(base)
+    got = b""
+    try:
+        s = socket.create_connection((u.hostname, u.port), timeout=15)
+        try:
+            s.sendall(f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\nConnection: close\r\n\r\n".encode())
+            while data := s.recv(65536):
+                got += data
+        finally:
+            s.close()
+    except OSError as e:
+        with open(out, "wb") as f:
+            f.write(got)
+        return line(f"raw GET {path}", "served" if got else "refused", f"{len(got)} bytes, then {type(e).__name__}")
+    with open(out, "wb") as f:
+        f.write(got)
+    line(f"raw GET {path}", "served" if got else "refused", f"{len(got)} bytes")
 
 
 def with_token(path, token):
@@ -185,16 +314,26 @@ def hold(base, path, out, seconds):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["check", "get", "hold"])
+    p.add_argument("command", choices=["check", "get", "hold", "chat", "pty", "raw", "token"])
     p.add_argument("base")
     p.add_argument("rest", nargs="*")
     p.add_argument("--ws", action="append", default=[])
     p.add_argument("--seconds", type=int, default=120)
+    p.add_argument("--path", default="/")
     o = p.parse_args()
     if o.command == "check":
         check(o.base, o.ws)
     elif o.command == "hold":
         hold(o.base, o.rest[0], o.rest[1], o.seconds)
+    elif o.command == "chat":
+        chat(o.base)
+    elif o.command == "pty":
+        pty(o.base)
+    elif o.command == "raw":
+        raw(o.base, o.rest[0], o.path)
+    elif o.command == "token":
+        with open(o.rest[0], "w") as f:
+            f.write(page_token(o.base) or "")
     else:
         try:
             status, _, body = get(o.base, "/")
