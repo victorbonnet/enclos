@@ -13,6 +13,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nsjoin  # noqa: E402
+from test_adr_status import StayProposed  # noqa: E402,F401  CI runs this file; it runs that test too
 
 COMPILED = ["--ro-bind", "/", "/", "--unshare-user", "--disable-userns", "--unshare-pid",
             "--unshare-net", "--unshare-ipc", "--die-with-parent", "--chdir", "/h"]
