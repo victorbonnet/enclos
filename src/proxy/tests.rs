@@ -248,6 +248,25 @@ fn send(addr: std::net::SocketAddr, request: &str) -> (TcpStream, String) {
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 #[test]
+fn the_limits_are_sized_from_the_descriptors_the_proxy_was_given() {
+    // launchd's limit, which they fill as they did when it was the only one.
+    assert_eq!(limits_for(Some(256)), (100, 32));
+    // systemd's usual soft limit.
+    assert_eq!(limits_for(Some(1024)), (431, 137));
+    // Past it, or without any limit, threads are what must stay bounded.
+    assert_eq!(limits_for(Some(1 << 20)), limits_for(Some(1024)));
+    assert_eq!(limits_for(None), limits_for(Some(1024)));
+    // Each fits what is left, whatever the limit.
+    for descriptors in 32..=1024 {
+        let (connections, lookups) = limits_for(Some(descriptors));
+        let used = 2 * connections as u64 + lookups as u64;
+        assert!(used + OWN_DESCRIPTORS <= descriptors, "{descriptors}");
+    }
+    // Too few to share still serves one of each.
+    assert_eq!(limits_for(Some(8)), (1, 1));
+}
+
+#[test]
 fn an_allowed_tunnel_relays_bytes_and_is_logged() {
     let (port, received) = upstream(b"pong");
     let proxy = start(

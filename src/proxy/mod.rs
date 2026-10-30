@@ -23,16 +23,32 @@ use crate::model::sandbox::SandboxName;
 use crate::net::addr::{AddrClass, classify};
 use crate::state::{NetLogStore, StateStore};
 
-/// The most client connections a proxy serves at once. Each holds a thread,
-/// two while it relays, and two file descriptors; launchd starts services
-/// with a limit of 256 descriptors, which these and `MAX_LOOKUPS` stay
-/// within.
-const MAX_CONNECTIONS: usize = 100;
+/// The descriptors a proxy keeps for itself: the standard streams, its
+/// listeners, the state database.
+const OWN_DESCRIPTORS: u64 = 24;
 
-/// The most name lookups that run at once, counting those the proxy stopped
-/// waiting for, which go on until the host's resolver returns. Each holds a
-/// thread, and possibly a descriptor while the resolver waits.
-const MAX_LOOKUPS: usize = 32;
+/// The most descriptors a proxy plans for, however many the service manager
+/// gives it: its connections and lookups also hold threads, which nothing
+/// else bounds.
+const MOST_DESCRIPTORS: u64 = 1024;
+
+/// The most client connections a proxy serves at once, and the most name
+/// lookups that run at once, for a process limited to `descriptors` (none:
+/// no limit). A connection holds a thread, two while it relays, and two
+/// descriptors. A lookup, which counts until the host's resolver returns
+/// even if the proxy stopped waiting for it, holds a thread, and possibly a
+/// descriptor while the resolver waits. Connections and lookups share what
+/// is left after [`OWN_DESCRIPTORS`] at the rate of 100 to 32, which fills
+/// the 256 launchd gives a service, and neither is ever none.
+fn limits_for(descriptors: Option<u64>) -> (usize, usize) {
+    const SHARE: u64 = 2 * 100 + 32;
+    let left = descriptors
+        .unwrap_or(MOST_DESCRIPTORS)
+        .min(MOST_DESCRIPTORS)
+        .saturating_sub(OWN_DESCRIPTORS);
+    let share = |rate: u64| ((left * rate / SHARE) as usize).max(1);
+    (share(100), share(32))
+}
 
 /// How long resolving a destination's name and connecting to its addresses
 /// may take in all.
@@ -107,6 +123,10 @@ impl Proxy {
         policy: Box<dyn PolicySource>,
         log: Box<dyn NetLogStore + Send + Sync>,
     ) -> Proxy {
+        // The soft limit is the one a descriptor hits: what the service
+        // manager gave, as the proxy never raises it.
+        let descriptors = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+        let (max_connections, max_lookups) = limits_for(descriptors);
         Proxy {
             sandbox,
             policy,
@@ -115,8 +135,8 @@ impl Proxy {
             classify,
             connect_timeout: CONNECT_TIMEOUT,
             idle_timeout: IDLE_TIMEOUT,
-            max_connections: MAX_CONNECTIONS,
-            max_lookups: MAX_LOOKUPS,
+            max_connections,
+            max_lookups,
             lookups: Arc::new(AtomicUsize::new(0)),
             lookups_full: AtomicBool::new(false),
             open: Arc::new(AtomicUsize::new(0)),
