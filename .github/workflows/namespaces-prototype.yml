@@ -1,0 +1,60 @@
+name: namespaces-prototype
+
+# Milestone 3's namespaces experiment (prototype/m3/, design §15 and §14,
+# M3-03) on GitHub's Ubuntu runners: whether every session of a sandbox can
+# share one network and PID namespace that enclos made first, what that
+# changes, what refuses each way of joining, and whether Hermes's clients
+# find a gateway in another session.
+# Every check acts on the host, so they run only on these throwaway runners.
+# Each writes its result to m3-results/, uploaded as the job's artifact and
+# shown in its summary. It reports; it does not gate merges.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "prototype/m3/**"
+      - ".github/workflows/namespaces-prototype.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  namespaces:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      RESULTS_DIR: ${{ github.workspace }}/m3-results
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The compile and join steps' tests (no host access)
+        run: |
+          python3 -I prototype/m3/test_compile.py
+          python3 -I prototype/m3/test_nsjoin.py
+      - name: Set up the runner (packages, AppArmor setting for bubblewrap)
+        run: bash prototype/m3/setup-runner.sh
+      - name: Namespaces per session or per sandbox
+        if: always()
+        run: bash prototype/m3/namespaces-check.sh
+      - name: What refuses joining a holder's namespaces
+        if: always()
+        run: bash prototype/m3/ns-diagnose.sh
+      - name: Hermes's clients and a gateway in another session
+        if: always()
+        run: bash prototype/m3/hermes-ns-check.sh
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "# ${{ matrix.os }}"
+            cat m3-results/*.md
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: m3-namespaces-${{ matrix.os }}
+          path: m3-results/

@@ -95,6 +95,10 @@ _Avoid_: agent (an agent is the runtime's identity, not the account)
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
 
+**Relay**:
+On Linux, the part of enclos inside a session that listens on the session's own 127.0.0.1 and passes each connection to a Unix socket outside it: the sandbox's proxy, or its runtime's listening service.
+_Avoid_: forwarder, port forward, tunnel (the proxy's word for a connection it carries)
+
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
 _Avoid_: child, worker

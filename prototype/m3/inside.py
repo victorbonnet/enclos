@@ -4,7 +4,24 @@ rules where the kernel has Landlock (ADR 0037), then the seccomp filter,
 then starts the relay, confined like the rest, and runs the command.
 
     python3 -I inside.py --compiled compiled.json [--landlock auto|off]
-        [--seccomp on|off] [--relay] -- command...
+        [--seccomp on|off] [--relay] [--setns-net-fd N] [--close-fd N]...
+        [--service-forward FD PORT_FILE] [--service-relay PORT SOCKET]
+        -- command...
+
+For M3-03, --setns-net-fd enters the sandbox's network namespace from a
+descriptor its holder gave (nsjoin.py's `userns` ways, where bubblewrap kept
+CAP_SYS_ADMIN in the holder's user namespace), then drops every capability,
+before Landlock and seccomp, which refuses setns. --close-fd closes the
+holder's descriptors so the command never holds them.
+
+For M3-03's option 2 (nsjoin.py's `relay` way), where every session has its
+own network namespace: in the service's session, --service-forward accepts
+on a Unix socket the host made and passed in as FD (in the sandbox's run/
+folder, which the sandbox cannot write) and forwards each connection to
+127.0.0.1 at the port the host wrote in PORT_FILE, also in run/, after it
+read the port from the service's own listeners. In every other session,
+--service-relay listens on 127.0.0.1:PORT and forwards each connection to
+that socket, as the proxy's relay does.
 
 Landlock goes through its three system calls with ctypes (stdlib only);
 seccomp through libseccomp's Python binding (`python3-seccomp`). Each line it
@@ -31,6 +48,9 @@ SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
 CREATE_RULESET_VERSION = 1
 RULE_PATH_BENEATH = 1
 PR_SET_NO_NEW_PRIVS = 38
+PR_CAPBSET_DROP = 24
+PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
+LINUX_CAPABILITY_VERSION_3 = 0x20080522
 
 # Filesystem rights (include/uapi/linux/landlock.h).
 EXECUTE = 1 << 0
@@ -133,6 +153,33 @@ def apply_landlock(rules):
     say(f"landlock=applied abi={abi} handled=0x{handled:x} scoped=0x{scoped:x} rules={len(added)}")
 
 
+def capabilities():
+    with open("/proc/self/status") as f:
+        return " ".join(line.split()[0] + line.split()[1] for line in f
+                        if line.startswith(("CapEff", "CapPrm", "CapBnd", "CapAmb")))
+
+
+def enter_netns(fd):
+    """Enter the network namespace, then drop every capability: the
+    ambient set, the bounding set where allowed, then capset to nothing."""
+    before = os.readlink("/proc/self/ns/net")
+    try:
+        os.setns(fd, os.CLONE_NEWNET)
+    except OSError as e:
+        sys.exit(f"inside: setns(net): {errno.errorcode.get(e.errno, e.errno)}")
+    after = os.readlink("/proc/self/ns/net")
+    libc.prctl(PR_CAP_AMBIENT, ctypes.c_ulong(PR_CAP_AMBIENT_CLEAR_ALL), ctypes.c_ulong(0),
+               ctypes.c_ulong(0), ctypes.c_ulong(0))
+    for cap in range(64):
+        libc.prctl(PR_CAPBSET_DROP, ctypes.c_ulong(cap), ctypes.c_ulong(0), ctypes.c_ulong(0),
+                   ctypes.c_ulong(0))
+    header = struct.pack("=Ii", LINUX_CAPABILITY_VERSION_3, 0)
+    data = bytes(24)  # two __user_cap_data_struct, all zero
+    if libc.capset(header, data) != 0:
+        sys.exit(f"inside: capset: {os.strerror(ctypes.get_errno())}")
+    say(f"netns=joined {before} -> {after}; capabilities after: {capabilities()}")
+
+
 def apply_seccomp(spec):
     import seccomp  # python3-seccomp
 
@@ -164,12 +211,57 @@ def apply_seccomp(spec):
     say(f"seccomp=applied deny={len(spec['deny']) - len(skipped)}{note}")
 
 
+def start_service_forward(fd, port_file):
+    """In the service's session: each connection on the host's Unix socket
+    to 127.0.0.1 at the port the host recorded."""
+    srv = socket.socket(fileno=fd)
+
+    def one(conn):
+        try:
+            with open(port_file) as f:
+                port = int(f.read().strip())
+            up = socket.create_connection(("127.0.0.1", port), timeout=10)
+            up.settimeout(None)
+        except (OSError, ValueError):
+            conn.close()
+            return
+        relay.pump(conn, up)
+
+    if os.fork() == 0:
+        import threading
+        try:
+            while True:
+                conn, _ = srv.accept()
+                threading.Thread(target=one, args=(conn,), daemon=True).start()
+        finally:
+            os._exit(0)
+    srv.close()
+    say(f"service-forward=fd {fd} -> 127.0.0.1:<port in {port_file}>")
+
+
+def start_service_relay(port, path):
+    """In every other session: 127.0.0.1:port to the service's socket."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(64)
+    if os.fork() == 0:
+        relay.serve(srv, path)
+        os._exit(0)
+    srv.close()
+    say(f"service-relay=127.0.0.1:{port} -> {path}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--compiled", required=True)
     p.add_argument("--landlock", choices=["auto", "off"], default="auto")
     p.add_argument("--seccomp", choices=["on", "off"], default="on")
     p.add_argument("--relay", action="store_true")
+    p.add_argument("--setns-net-fd", type=int)
+    p.add_argument("--close-fd", type=int, action="append", default=[])
+    p.add_argument("--service-forward", nargs=2, metavar=("FD", "PORT_FILE"))
+    p.add_argument("--service-relay", nargs=2, metavar=("PORT", "SOCKET"))
     p.add_argument("command", nargs=argparse.REMAINDER)
     o = p.parse_args()
     cmd = o.command[1:] if o.command[:1] == ["--"] else o.command
@@ -178,6 +270,13 @@ def main():
     with open(o.compiled) as f:
         compiled = json.load(f)
 
+    if o.setns_net_fd is not None:
+        enter_netns(o.setns_net_fd)
+    for fd in o.close_fd:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     if o.landlock == "auto":
         apply_landlock(compiled["landlock"])
     else:
@@ -198,6 +297,10 @@ def main():
             os._exit(0)
         srv.close()
         say(f"relay=127.0.0.1:{r['port']} -> {r['socket']}")
+    if o.service_forward:
+        start_service_forward(int(o.service_forward[0]), o.service_forward[1])
+    if o.service_relay:
+        start_service_relay(int(o.service_relay[0]), o.service_relay[1])
     os.execvp(cmd[0], cmd)
 
 
