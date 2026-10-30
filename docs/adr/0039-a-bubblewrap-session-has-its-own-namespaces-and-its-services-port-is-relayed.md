@@ -32,6 +32,14 @@ Reason:
 - It keeps what the per-session namespaces were shown to hold. Each session sees only its own processes, so another session's signals, ptrace and start-up environment are out of reach. Abstract sockets stay within the session.
 - It keeps 0028's rule that a session reaches its sandbox's service port and no other port.
 
+## To confirm: the holder's service
+
+To confirm, not decided. The M3-03 prototype's later runs joined one network namespace per sandbox, held by a holder (`prototype/m3/README.md`), and this ADR's rewrite for that waits for the dashboard's results. Should that hold, the proposal is:
+
+- The holder is a service of its own, `enclos.<install>.<sandbox>.holder`.
+- `connect` installs the holder service when it is not installed, also for a runtime with no service, and it stays until `sandbox stop`.
+- A runtime that declares a service named `holder` is refused. The code for that is M3-16's.
+
 ## Considered options
 
 - **One network and PID namespace per sandbox, joined by every session:** sessions would reach their service as on macOS, and every other port the sandbox listens on. It was refused in every way tried, and why the holder's namespaces belong to another user namespace was not established. A holder made without bubblewrap's nested user namespace, or one that starts each session's bubblewrap itself, was not tried. Should either be shown working, a new ADR can supersede this one.
