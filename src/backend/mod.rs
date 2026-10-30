@@ -16,6 +16,18 @@ use std::process::Command;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::probes::OwnProbes;
+
+/// What a compiled policy does with an operation none of its rules names
+/// (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Baseline {
+    /// `(deny default)`, then the reviewed allowances of `deny-default.sb`.
+    #[default]
+    DenyDefault,
+    /// `(allow default)`, as before ADR 0006: only for comparing the two.
+    AllowDefault,
+}
 
 /// Whether a backend can run on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +272,10 @@ pub trait Backend {
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
     /// The command that runs `launch` inside the sandbox under `compiled`.
     fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
+    /// Its own escape probes and how it refuses, for a sandbox compiled to
+    /// `compiled`, or on a dry run, which compiles nothing, for none. Says
+    /// why not when that text is not what it compiles.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;
 }
 
 /// Every backend this build of enclos ships, in order of preference.

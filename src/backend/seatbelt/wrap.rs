@@ -7,8 +7,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use super::super::{Launch, Probe, SandboxContext, environment};
-use super::compile::{Baseline, SERVICE_PARAM, TERMINAL_PARAM};
+use super::super::{Baseline, Launch, Probe, SandboxContext, environment};
+use super::compile::{SERVICE_PARAM, TERMINAL_PARAM};
 
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 

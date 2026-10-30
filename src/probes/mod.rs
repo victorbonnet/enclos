@@ -6,7 +6,7 @@
 //! first, which shows the route works there (the same read, listing or
 //! connection with its output discarded, the same open for writing of a file
 //! that matters, which writes nothing, a check that a folder is writable, or,
-//! for a host service whose use outside would act on this Mac, a read-only
+//! for a host service whose use outside would act on the host, a read-only
 //! check that the service is there). When the control fails too, the probe is
 //! inconclusive, not closed: `crontab -l` fails anyway for an account
 //! without a crontab, and a connection fails anyway on a host that is
@@ -15,110 +15,143 @@
 //! must answer the same request from the host.
 //!
 //! Each probe's script prints a marker before anything else, so a sandbox
-//! that never ran it (`sandbox-exec` refusing the compiled policy) is not
+//! that never ran it (a backend refusing the compiled policy) is not
 //! taken for a refusal.
 //!
-//! A few routes are closed by Seatbelt itself, whatever the compiled policy
-//! says: it refuses to run setuid programs such as `crontab` and `at`, even
-//! under a bare `(allow default)`. Others are closed under `(deny default)`
-//! by the baseline before the rule they test is reached: LaunchServices and
-//! Apple Events at least, where the baseline refuses something the tool
-//! needs (which operation is not traced; a lookup is likely). Those probes
-//! carry a note saying so ([`ClosedBy`]), which the report repeats, so that
-//! their being closed is not read as proof of the route's own rule.
-//!
-//! The probes of [`probes`] are harmless even when a rule does not hold. The
-//! ones of [`host_service_probes`] could act on the host if they succeeded
-//! (opening a folder in Finder, an Apple Event, a launchd job, a preferences
-//! write, a file in `~/Library/LaunchAgents`): they run only with
-//! `--host-services`, which CI's macOS runners ask for. A launchd job,
-//! preferences domain or file they leave is checked from the host and
-//! removed; LaunchServices and the Apple Event leave nothing to check, so
-//! they count as closed only with a refusal Seatbelt gives: on `(allow
-//! default)` the rule's own (-54, -600), and on `(deny default)` only what
-//! the baseline's refusal makes the tool say (-10661, -1728); the rule's
-//! there reads inconclusive, as it would mean the baseline let the tool
-//! through.
+//! Every backend runs the probes of [`probes`], and adds its own through
+//! [`OwnProbes`], which also says what its refusals look like. They are
+//! harmless even when a rule does not hold; a backend's host-service probes
+//! ([`OwnProbes::host_services`]) could act on the host if they succeeded,
+//! and run only with `--host-services`.
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::seatbelt::Baseline;
+use crate::backend::Baseline;
+use crate::layout::Layout;
+use crate::model::sandbox::SandboxName;
 use crate::policy::paths::is_within;
+
+/// What a program says when a backend refuses it: any one of these texts,
+/// each the backend's own: one backend may refuse in one way, another by
+/// what it leaves out of the sandbox, in several.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal(Vec<String>);
+
+impl Refusal {
+    pub fn any_of(texts: &[&str]) -> Refusal {
+        Refusal(texts.iter().map(|t| (*t).to_owned()).collect())
+    }
+
+    fn is_in(&self, output: &str) -> bool {
+        self.0.iter().any(|text| output.contains(text.as_str()))
+    }
+
+    /// As the report says it.
+    pub fn shown(&self) -> String {
+        self.0.join(" or ")
+    }
+
+    /// A `case` pattern that matches an output with any of the texts.
+    fn case_pattern(&self) -> String {
+        let each: Vec<String> = self.0.iter().map(|text| format!("*'{text}'*")).collect();
+        each.join("|")
+    }
+}
+
+/// A backend's own reading of a probe's result, for what the shared readings
+/// of [`Expect`] do not cover. Told apart by its label.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnReading {
+    pub label: &'static str,
+    /// From whether the script succeeded and what it printed. Closed here
+    /// is not yet proof: [`outcome`] adds the host check and the control.
+    pub read: fn(bool, &str) -> Outcome,
+}
+
+impl PartialEq for OwnReading {
+    fn eq(&self, other: &OwnReading) -> bool {
+        self.label == other.label
+    }
+}
+
+impl Eq for OwnReading {}
 
 /// How a probe's own result is read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expect {
     /// Closed when the script fails.
     Fails,
-    /// Closed when it fails with this text in its output: a refusal
-    /// Seatbelt was shown to give, a rule's, the platform's own for setuid
-    /// programs, or what the baseline's refusal makes a tool say. Any other
-    /// failure is inconclusive.
-    FailsWith(&'static str),
+    /// Closed when it fails with one of these texts in its output: a refusal
+    /// the backend was shown to give. Any other failure is inconclusive.
+    FailsWith(Refusal),
     /// Closed when the output does not contain this text.
     OutputLacks(&'static str),
     /// A folder renamed or cloned into itself, which the filesystem refuses
     /// (`Invalid argument`; a volume that cannot clone refuses a clone with
     /// another error), so nothing moves or is copied even when the rule does
-    /// not hold. Closed on Seatbelt's refusal (`Operation not permitted`),
-    /// which comes first; the filesystem's means the call got past Seatbelt:
-    /// open. Any other failure is inconclusive. The control is the same call
-    /// on the host, which works when the filesystem refuses it there.
-    IntoItself,
-    /// An Apple Event to Finder. An answer, a refusal by TCC (-1743) or a
-    /// wait on Finder (-1712) all mean the event left the sandbox: open
-    /// (ADR 0016). Closed when the output has this text: the policy rule's
-    /// refusal ([`AE_REFUSED`]) on `(allow default)`, and on `(deny
-    /// default)` what `osascript` says when the baseline refuses what it
-    /// needs to reach Finder ([`AE_LOOKUP_REFUSED`]). Any other failure is
-    /// inconclusive.
-    AppleEventBlocked(&'static str),
+    /// not hold. Closed on the backend's refusal, which comes first; the
+    /// filesystem's means the call got past `backend`: open. Any other
+    /// failure is inconclusive. The control is the same call on the host,
+    /// which works when the filesystem refuses it there.
+    IntoItself {
+        refusal: Refusal,
+        backend: &'static str,
+    },
+    /// Read by the backend.
+    Own(OwnReading),
 }
 
-/// What `osascript` says when the policy's rule refuses the event.
-pub const AE_REFUSED: &str = "(-600)";
-/// What `osascript` says when the `(deny default)` baseline refuses what it
-/// needs to reach Finder, likely its lookup (macOS 15 and 26, CI; not
-/// traced): `Can’t get application
-/// "Finder". (-1728)`. Finder's own -1728, `Finder got an error: Can’t get
-/// …`, means the event reached it, and does not match.
-pub const AE_LOOKUP_REFUSED: &str = "application \"Finder\". (-1728)";
-/// What `open` says when the policy's `lsopen` rule refuses it.
-pub const LS_REFUSED: &str = "error -54 ";
-/// What `open` says when the `(deny default)` baseline refuses what it needs
-/// of LaunchServices, likely its lookup (macOS 15 and 26, CI; not traced).
-pub const LS_LOOKUP_REFUSED: &str = "Code=-10661";
-
-/// Why a closed probe shows no rule of its route.
+/// What closes a route apart from a rule of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClosedBy {
-    /// Seatbelt itself, whatever the compiled policy says.
-    Seatbelt,
-    /// The `(deny default)` baseline, which refuses something the tool
+pub enum Closer {
+    /// The backend itself, whatever the compiled policy says.
+    Backend,
+    /// The compiled policy's baseline, which refuses something the tool
     /// needs before the operation the route's rule refuses is tried.
     Baseline,
 }
 
+/// Why a closed probe shows no rule of its route, in the backend's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedBy {
+    pub closer: Closer,
+    key: &'static str,
+    by: &'static str,
+    why: &'static str,
+}
+
 impl ClosedBy {
+    /// `key` names it in a JSON report, `by` in a count (`1 by ...`), and
+    /// `why` is what the report says of each probe it closed.
+    pub const fn new(
+        closer: Closer,
+        key: &'static str,
+        by: &'static str,
+        why: &'static str,
+    ) -> ClosedBy {
+        ClosedBy {
+            closer,
+            key,
+            by,
+            why,
+        }
+    }
+
     /// Its name in a JSON report.
     pub fn key(self) -> &'static str {
-        match self {
-            ClosedBy::Seatbelt => "seatbelt",
-            ClosedBy::Baseline => "baseline",
-        }
+        self.key
+    }
+
+    /// How a count of what it closed says it.
+    pub fn by(self) -> &'static str {
+        self.by
     }
 
     /// What the report says of it.
     pub fn why(self) -> &'static str {
-        match self {
-            ClosedBy::Seatbelt => SETUID_REFUSED,
-            ClosedBy::Baseline => LOOKUP_REFUSED,
-        }
+        self.why
     }
 }
-
-/// Under `(deny default)`, the baseline refuses first.
-const LOOKUP_REFUSED: &str = "on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes";
 
 /// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
 /// module makes one, and each is harmless whatever the policy says.
@@ -126,7 +159,7 @@ const LOOKUP_REFUSED: &str = "on (deny default) the baseline refuses something t
 pub struct HostScript(String);
 
 impl HostScript {
-    fn new(script: impl Into<String>) -> HostScript {
+    pub(crate) fn new(script: impl Into<String>) -> HostScript {
         HostScript(script.into())
     }
 
@@ -152,14 +185,30 @@ pub enum Proof {
     OnlyTheProxy { control: HostScript },
 }
 
+/// Something on the host that a host tool looks up and removes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCheck {
+    /// What it is, as the report says it.
+    pub what: String,
+    pub program: &'static str,
+    /// `program`'s arguments to look it up: it succeeds when it is there,
+    /// and says `absent` when it is not.
+    pub look: Vec<String>,
+    pub absent: &'static str,
+    /// `program`'s arguments to remove it.
+    pub remove: Vec<String>,
+    /// How the user removes it if that failed.
+    pub by_hand: String,
+}
+
 /// What the host checks, before the probe and after it, and removes if the
 /// probe left it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostCheck {
     /// A file the probe tries to create outside the sandbox.
     File(PathBuf),
-    LaunchdJob(String),
-    PreferencesDomain(String),
+    /// Something a backend's own probe tries to leave.
+    Tool(ToolCheck),
     /// The process the host started for the signal probe: ended by TERM if
     /// the signal got out.
     Target,
@@ -174,19 +223,11 @@ pub struct Probe {
     pub script: String,
     pub proof: Proof,
     pub host: Option<HostCheck>,
-    /// What closes the route apart from a rule of its own: Seatbelt itself
-    /// (no rule is tested), or the `(deny default)` baseline (before the
-    /// rule is reached).
+    /// What closes the route apart from a rule of its own: the backend
+    /// itself (no rule is tested), or the baseline (before the rule is
+    /// reached).
     pub closed_by: Option<ClosedBy>,
 }
-
-/// Seatbelt refuses to run a setuid program whatever the compiled policy
-/// says: shown on macOS 26.5.2, with read-only commands, under
-/// `sandbox-exec -p '(version 1)(allow default)'` alone, where the shell
-/// reports `/bin/sh: /usr/bin/atq: Operation not permitted` (and the same for
-/// `crontab -l` and `at -l`).
-const SETUID_REFUSED: &str =
-    "Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -229,41 +270,77 @@ impl ProbeResult {
     }
 }
 
-/// The routes of [`host_service_probes`], as the report names them.
-pub const HOST_SERVICE_ROUTES: &[&str] = &[
-    "launchservices",
-    "apple events",
-    "launchd",
-    "preferences",
-    "launch agents",
-];
-
-/// Routes of design §5 and ADR 0016 that no probe tries yet. `policy test`
-/// names them, so that a test that passed is not read as covering them.
-pub const NOT_PROBED: &[&str] = &[
-    "bootstrapping or loading a launchd job",
-    "installing a crontab",
-    "submitting an `at` job",
-    "registering a login item",
-    "posting synthetic input events",
-    "writing the pasteboard",
-    "typing into the terminal (TIOCSTI)",
-];
-
-/// A Keychain item the host stores for the probe that tries to read one from
-/// inside the sandbox, and removes after. Its value is
-/// [`KEYCHAIN_PROBE_VALUE`], which `security` prints as
-/// [`KEYCHAIN_PROBE_HEX`], since enclos stores values as hex.
+/// What a report says of a backend's probes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeychainItem {
-    pub service: String,
-    pub account: String,
-    /// The keychain file, when it is not the user's default one.
-    pub file: Option<PathBuf>,
+pub struct ReportNotes {
+    /// The host, as a sentence says it.
+    pub host: &'static str,
+    /// What moves a folder that cannot move, as the probes try it.
+    pub folder_moves: &'static str,
+    /// Who else can close a probe, for a test where nothing else did: `,
+    /// only by ... if any`, or nothing.
+    pub only_apart: &'static str,
+    /// The routes of [`OwnProbes::host_services`].
+    pub host_service_routes: &'static [&'static str],
+    /// Routes of design §5 and ADR 0016 that no probe tries yet. `policy
+    /// test` names them, so that a test that passed is not read as covering
+    /// them.
+    pub not_probed: &'static [&'static str],
 }
 
-pub const KEYCHAIN_PROBE_VALUE: &str = "enclos-probe";
-const KEYCHAIN_PROBE_HEX: &str = "656e636c6f732d70726f6265";
+/// What a backend adds to the probes every backend runs, and how it refuses.
+/// Each method places its probes in the list, so that a report reads route
+/// by route.
+pub trait OwnProbes {
+    /// The backend's name, as a sentence says it.
+    fn name(&self) -> &'static str;
+    /// What its refusals look like.
+    fn refusal(&self) -> Refusal;
+    /// What a report says of its probes.
+    fn notes(&self) -> ReportNotes;
+    /// The baseline the probes run under, for a backend that has one.
+    fn baseline(&self) -> Option<Baseline> {
+        None
+    }
+    /// Sets up on the host what its probes need, once they will run; what
+    /// it returns is held until the test ends, and undoes that when dropped.
+    fn set_up(&mut self, _layout: &Layout, _name: &SandboxName) -> Box<dyn std::any::Any> {
+        Box::new(())
+    }
+    /// Stands in for [`OwnProbes::set_up`] on a dry run, only to count the
+    /// probes.
+    fn count_only(&mut self, _name: &SandboxName) {}
+    /// Probes of a folder that cannot move, beside its rename.
+    fn of_folder(&self, _folder: &Path, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// Network probes, after the shared ones.
+    fn network(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// DNS probes, after the shared one.
+    fn dns(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// Probes that come after the terminals, before the limits.
+    fn before_limits(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// Probes that come last.
+    fn last(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// The probes that could act on the host if a rule did not hold: CI and
+    /// VMs only (`--host-services`). Their controls only check that the
+    /// service is there; they never use it.
+    fn host_services(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// What its probes leave out because it is not on this host.
+    fn not_here(&self, _i: &ProbeInputs) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 /// What the probes are built from.
 #[derive(Debug, Clone)]
@@ -295,9 +372,6 @@ pub struct ProbeInputs {
     pub proxy_port: u16,
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028).
     pub listen: bool,
-    /// The baseline of the compiled policy the probes run under: on `(deny
-    /// default)` it refuses what it does not allow before a route's rule.
-    pub baseline: Baseline,
     /// The process the host started for the signal probe; none when nothing
     /// will run (a dry run), and then there is no signal probe.
     pub target: Option<u32>,
@@ -307,11 +381,6 @@ pub struct ProbeInputs {
     pub other_terminal: Option<PathBuf>,
     /// Makes names of things a probe might create unique.
     pub tag: u32,
-    /// The item the host stored for the "read a keychain item" probe, or
-    /// why none could be stored (Linux, no default keychain, a store that
-    /// failed), and then that probe is not run. A dry run on macOS gets a
-    /// placeholder, only to count it.
-    pub keychain_item: Result<KeychainItem, String>,
     /// The limits the sandbox's processes run under, each of which gets a
     /// probe.
     pub limits: crate::backend::LaunchLimits,
@@ -322,7 +391,7 @@ pub fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-fn probe(
+pub(crate) fn probe(
     route: &'static str,
     name: impl Into<String>,
     script: impl Into<String>,
@@ -342,12 +411,9 @@ fn probe(
     }
 }
 
-/// What a shell prints when Seatbelt refuses to open a file.
-const REFUSED: &str = "Operation not permitted";
-
 /// A probe whose control is the same script, run on the host: it only reads
 /// or connects, and its output is discarded.
-fn same_outside(route: &'static str, name: impl Into<String>, script: &str) -> Probe {
+pub(crate) fn same_outside(route: &'static str, name: impl Into<String>, script: &str) -> Probe {
     probe(route, name, script, Expect::Fails, script)
 }
 
@@ -363,7 +429,7 @@ fn read_probe(route: &'static str, path: &Path) -> Probe {
 
 /// A probe that writes `file`, controlled by whether its folder is writable
 /// on the host, and checked by whether the file appeared.
-fn write_probe(route: &'static str, name: &str, file: PathBuf) -> Probe {
+pub(crate) fn write_probe(route: &'static str, name: &str, file: PathBuf) -> Probe {
     let folder = file.parent().unwrap_or(&file);
     let mut write = probe(
         route,
@@ -379,9 +445,9 @@ fn write_probe(route: &'static str, name: &str, file: PathBuf) -> Probe {
 /// A probe that opens an existing regular `file` for writing and writes
 /// nothing, so that it changes nothing even if the rule does not hold: for
 /// files that matter, such as the sandbox's `policy.toml`. Opening for
-/// writing is what Seatbelt's write rules refuse (`file-write-data`); a read
-/// deny alone does not. Its control is the same open on the host, so a
-/// failure with another cause (a flag, TCC) is inconclusive; it opens only a
+/// writing is what a write rule refuses; a read deny alone does not. Its
+/// control is the same open on the host, so a failure with another cause (a
+/// flag, TCC) is inconclusive; it opens only a
 /// file that is still there, as `>>` creates one that is not. Built only for
 /// a regular file: opening a FIFO would wait for a reader. If the file is
 /// removed between the control and the probe and the rule does not hold, the
@@ -395,80 +461,6 @@ fn open_for_writing_probe(route: &'static str, name: &str, file: &Path) -> Probe
         Expect::Fails,
         format!("test -f {file} && true >> {file}"),
     )
-}
-
-/// A loopback address a bind probe tries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Loopback {
-    V4,
-    V6,
-}
-
-impl Loopback {
-    fn shown(self) -> &'static str {
-        match self {
-            Loopback::V4 => "127.0.0.1",
-            Loopback::V6 => "[::1]",
-        }
-    }
-}
-
-/// A script that binds TCP `port` on `at` and exits at once: it never
-/// listens, so nothing can connect even if the bind is allowed. Port 0 lets
-/// the system choose one. `perl` ships with macOS and prints the error it
-/// gets, Seatbelt's `Operation not permitted` included, after `bind: `, so
-/// a refusal of anything else is not taken for the bind's.
-fn bind_script(at: Loopback, port: u16) -> String {
-    let (family, address) = match at {
-        Loopback::V4 => (
-            "AF_INET",
-            format!("sockaddr_in({port}, inet_aton(\"127.0.0.1\"))"),
-        ),
-        Loopback::V6 => (
-            "AF_INET6",
-            format!("pack_sockaddr_in6({port}, inet_pton(AF_INET6, \"::1\"))"),
-        ),
-    };
-    format!(
-        "/usr/bin/perl -MSocket=:all -e 'socket(my $s, {family}, SOCK_STREAM, 0) or die \"socket: $!\\n\"; bind($s, {address}) or die \"bind: $!\\n\"'"
-    )
-}
-
-/// What a bind Seatbelt refused prints.
-const BIND_REFUSED: &str = "bind: Operation not permitted";
-
-/// Listening (ADR 0028), on 127.0.0.1 and on `[::1]`. Without `listen`, no
-/// TCP bind at all. With it, any port but the proxy range, so the probes bind
-/// the sandbox's own proxy port: Seatbelt refuses before the port is found
-/// in use, so the bind is refused the same way while the proxy holds it,
-/// where the host would get `Address already in use`. The control is a bind
-/// of the same address on a port the system chooses, on the host: where
-/// `[::1]` is not configured it fails, and that probe is inconclusive. That
-/// listening itself is open when allowed is said by the report, not shown
-/// as closed.
-pub(crate) fn listen_probes(listen: bool, proxy_port: u16) -> Vec<Probe> {
-    [Loopback::V4, Loopback::V6]
-        .into_iter()
-        .map(|at| {
-            let (name, port) = match listen {
-                false => (format!("bind a TCP port on {}", at.shown()), 0),
-                true => (
-                    format!(
-                        "bind the sandbox's proxy port, {proxy_port}, on {}",
-                        at.shown()
-                    ),
-                    proxy_port,
-                ),
-            };
-            probe(
-                "network",
-                name,
-                bind_script(at, port),
-                Expect::FailsWith(BIND_REFUSED),
-                bind_script(at, 0),
-            )
-        })
-        .collect()
 }
 
 /// Whether a probe can read or write `path` without waiting: a folder or a
@@ -492,67 +484,48 @@ fn denied_under_grant_probe(path: &Path, tag: u32) -> Probe {
     }
 }
 
-/// A setuid program, which Seatbelt refuses to run whatever the compiled
-/// policy says: closed by the platform, which the report says. Closed only
-/// on the shell's own refusal to run `program` (`refusal`), so that a
-/// program that ran and then failed is not taken for it.
-fn setuid_probe(
-    route: &'static str,
-    name: &str,
-    program: &str,
-    args: &str,
-    refusal: &'static str,
-) -> Probe {
-    let script = format!("{program} {args}");
-    let mut setuid = probe(route, name, &script, Expect::FailsWith(refusal), &script);
-    setuid.closed_by = Some(ClosedBy::Seatbelt);
-    setuid
-}
-
-/// The user's LaunchAgents folder, which launchd loads at login.
-fn launch_agents(i: &ProbeInputs) -> PathBuf {
-    i.user_home.join("Library/LaunchAgents")
-}
-
-/// The text of EPERM, which Seatbelt returns when a rule refuses a change;
-/// the probes below check that nothing else on their paths returns it.
-const NOT_PERMITTED: &str = "Operation not permitted";
-
 /// A change to a folder itself that the file system refuses anyway (a
 /// folder that is not empty cannot be removed, nor moved inside itself), so
-/// the probe changes nothing whether the rule holds or not. Seatbelt checks
-/// before the file system does, so only `Operation not permitted` is the
-/// policy's refusal; any other answer means the policy let the change
-/// through, which the script reports as a success, so the probe reads as
-/// open. `prepare` runs first, and if it fails the probe is inconclusive,
-/// never closed. The control runs the same on the host, where the change
-/// must fail without that refusal: then the refusal inside is the
-/// policy's, not a file flag's or another rule's.
-fn folder_probe(name: impl Into<String>, prepare: Option<String>, change: String) -> Probe {
+/// the probe changes nothing whether the rule holds or not. The backend
+/// checks before the file system does, so only its refusal is the policy's;
+/// any other answer means the policy let the change through, which the
+/// script reports as a success, so the probe reads as open. `prepare` runs
+/// first, and if it fails the probe is inconclusive, never closed. The
+/// control runs the same on the host, where the change must fail without
+/// that refusal: then the refusal inside is the policy's, not a file flag's
+/// or another rule's.
+fn folder_probe(
+    name: impl Into<String>,
+    prepare: Option<String>,
+    change: String,
+    refusal: &Refusal,
+) -> Probe {
     let prepare = prepare.map_or(String::new(), |p| {
         format!("{p} 2>/dev/null || {{ echo 'could not prepare the probe'; exit 2; }}; ")
     });
     let refused = format!(
-        "out=$({change} 2>&1); case \"$out\" in *'{NOT_PERMITTED}'*) echo \"$out\"; exit 1;; esac"
+        "out=$({change} 2>&1); case \"$out\" in {}) echo \"$out\"; exit 1;; esac",
+        refusal.case_pattern()
     );
     probe(
         "writable folders",
         name,
         format!("{prepare}{refused}; echo \"the policy let it through: $out\""),
-        Expect::FailsWith(NOT_PERMITTED),
+        Expect::FailsWith(refusal.clone()),
         format!("{prepare}{refused}"),
     )
 }
 
 /// Probes that the home and each workspace stay where they are: the
 /// sandbox may neither remove nor rename them (design §5).
-fn folder_probes(i: &ProbeInputs) -> Vec<Probe> {
+fn folder_probes(i: &ProbeInputs, refusal: &Refusal) -> Vec<Probe> {
     // The home holds `tmp/`, made again first so that it is never empty and
     // the removal never happens.
     let mut list = vec![folder_probe(
         "remove the sandbox home",
         Some(format!("/bin/mkdir -p {}", sh_quote(&i.home.join("tmp")))),
         format!("/bin/rmdir {}", sh_quote(&i.home)),
+        refusal,
     )];
     // A workspace not made yet has nothing to rename: see
     // `missing_workspaces`.
@@ -566,6 +539,7 @@ fn folder_probes(i: &ProbeInputs) -> Vec<Probe> {
                 sh_quote(folder),
                 sh_quote(&folder.join("enclos-probe-moved"))
             ),
+            refusal,
         ));
     }
     list
@@ -593,33 +567,28 @@ pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
 /// Renames `folder` into itself, with rename(2) through perl: the filesystem
 /// refuses that whatever the policy, so the folder never moves, and the
 /// same call on the host is the control.
-fn rename_probe(folder: &Path, tag: u32) -> Probe {
+fn rename_probe(folder: &Path, tag: u32, own: &dyn OwnProbes) -> Probe {
     into_itself(
         "renames",
         "rename",
         "rename($ARGV[0], $ARGV[1])",
         folder,
         tag,
-    )
-}
-
-/// Clones `folder` into itself, with clonefileat(2) (syscall 462, with
-/// `AT_FDCWD`) through perl, which has no call of its own for it: refused by
-/// the filesystem whatever the policy, so nothing is copied.
-fn clone_probe(folder: &Path, tag: u32) -> Probe {
-    into_itself(
-        "clones",
-        "clone",
-        "syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0",
-        folder,
-        tag,
+        own,
     )
 }
 
 /// A probe whose perl `call` acts on `folder` and a path inside it
 /// (`$ARGV[0]`, `$ARGV[1]`): see [`Expect::IntoItself`]. Both the probe and
 /// its control print why they failed, and say what a success may have left.
-fn into_itself(route: &'static str, verb: &str, call: &str, folder: &Path, tag: u32) -> Probe {
+pub(crate) fn into_itself(
+    route: &'static str,
+    verb: &str,
+    call: &str,
+    folder: &Path,
+    tag: u32,
+    own: &dyn OwnProbes,
+) -> Probe {
     let script = |on_success: &str, on_failure: &str| {
         format!(
             "/usr/bin/perl -e 'if ({call}) {{ print \"it succeeded, so $ARGV[1] may now exist\\n\"; {on_success} }} {on_failure}' {} {}",
@@ -631,7 +600,10 @@ fn into_itself(route: &'static str, verb: &str, call: &str, folder: &Path, tag: 
         route,
         format!("{verb} {}", folder.display()),
         script("exit 0", "die \"$!\\n\""),
-        Expect::IntoItself,
+        Expect::IntoItself {
+            refusal: own.refusal(),
+            backend: own.name(),
+        },
         // The filesystem's refusal is the control working.
         script("exit 1", "exit 0 if $!{EINVAL}; die \"$!\\n\""),
     )
@@ -651,32 +623,16 @@ fn proxy_probe(name: &str, url: &str) -> Probe {
 }
 
 /// curl through the proxy, printing only the proxy's answer to CONNECT.
-fn curl_through_proxy(url: &str) -> String {
+pub(crate) fn curl_through_proxy(url: &str) -> String {
     format!("/usr/bin/curl -s -o /dev/null -w '%{{http_connect}}' --max-time 15 --noproxy '' {url}")
 }
 
-/// The proxy port on `[::1]`. On macOS 26.5.2 the Seatbelt rule was shown
-/// to open the port there too, so the proxy listens there; whatever the
-/// sandbox reaches at that address must be the proxy.
-fn ipv6_loopback_probe(port: u16) -> Probe {
-    let url = format!("--proxy 'http://[::1]:{port}' https://probe.enclos.invalid:8443/");
-    let script = format!("{}; echo \" $?\"", curl_through_proxy(&url));
-    Probe {
-        route: "network",
-        name: "the proxy port on IPv6 loopback reaches only the proxy".into(),
-        script: script.clone(),
-        proof: Proof::OnlyTheProxy {
-            control: HostScript::new(script),
-        },
-        host: None,
-        closed_by: None,
-    }
-}
-
-/// The probes that are harmless even if a rule does not hold: run wherever
-/// `policy test` runs, the user's Mac included.
-pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
+/// The probes that are harmless even if a rule does not hold, every
+/// backend's and `own`'s: run wherever `policy test` runs, the user's own
+/// machine included.
+pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     let mut list = Vec::new();
+    let refusal = own.refusal();
     for path in i.read_deny.iter().filter(|p| probeable(p)) {
         list.push(read_probe("sensitive files", path));
     }
@@ -690,8 +646,8 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         list.push(denied_under_grant_probe(path, i.tag));
     }
     for folder in i.unmovable.iter().filter(|f| f.is_dir()) {
-        list.push(rename_probe(folder, i.tag));
-        list.push(clone_probe(folder, i.tag));
+        list.push(rename_probe(folder, i.tag, own));
+        list.extend(own.of_folder(folder, i));
     }
     for path in [
         i.data.join("state.db"),
@@ -745,7 +701,7 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "write outside the home",
         i.user_home.join(format!("enclos-probe-{}", i.tag)),
     ));
-    list.extend(folder_probes(i));
+    list.extend(folder_probes(i, &refusal));
 
     // Refused in either network mode (ADR 0025): a port public mode does not
     // open, and addresses no mode reaches, asked for by name through the proxy.
@@ -770,20 +726,13 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
         "a direct connection, around the proxy",
         "/usr/bin/nc -z -w 3 1.1.1.1 443",
     ));
-    list.push(ipv6_loopback_probe(i.proxy_port));
-    list.extend(listen_probes(i.listen, i.proxy_port));
+    list.extend(own.network(i));
     list.push(same_outside(
         "dns",
         "DNS on port 53",
         "/usr/bin/nc -z -w 3 1.1.1.1 53",
     ));
-    list.push(probe(
-        "dns",
-        "a name lookup through mDNSResponder",
-        "/usr/bin/dscacheutil -q host -a name example.com",
-        Expect::OutputLacks("address"),
-        "/usr/bin/dscacheutil -q host -a name example.com | /usr/bin/grep -q address",
-    ));
+    list.extend(own.dns(i));
     for socket in &i.host_sockets {
         list.push(same_outside(
             "host sockets",
@@ -822,24 +771,12 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
                 "terminals",
                 name,
                 open.clone(),
-                Expect::FailsWith(REFUSED),
+                Expect::FailsWith(refusal.clone()),
                 open,
             ));
         }
     }
-    let keychain = i.user_home.join("Library/Keychains/login.keychain-db");
-    if keychain.exists() {
-        // Its settings (lock timeout), not its items.
-        let info = format!(
-            "/usr/bin/security show-keychain-info {} >/dev/null 2>&1",
-            sh_quote(&keychain)
-        );
-        list.push(same_outside(
-            "keychain",
-            "read the login keychain's settings",
-            &info,
-        ));
-    }
+    list.extend(own.before_limits(i));
     // Each limit a backend sets, as a process sees it, hard: closed when it
     // is no higher than the policy's (a hard limit no process without root
     // can raise). The control, the same check on the host, passes when the
@@ -852,54 +789,13 @@ pub fn probes(i: &ProbeInputs) -> Vec<Probe> {
             &limit_script("-Hn", limit),
         ));
     }
-    if let Ok(item) = &i.keychain_item {
-        // Through `security` and the security daemon, as a program in the
-        // sandbox would read a secret: closed when the value does not come
-        // back. The control reads it on the host.
-        let file = item
-            .file
-            .as_ref()
-            .map(|f| format!(" {}", sh_quote(f)))
-            .unwrap_or_default();
-        let read = format!(
-            "/usr/bin/security find-generic-password -s {} -a {} -w{file} 2>/dev/null",
-            sh_quote(Path::new(&item.service)),
-            sh_quote(Path::new(&item.account)),
-        );
-        list.push(probe(
-            "keychain",
-            "read a keychain item",
-            read.clone(),
-            Expect::OutputLacks(KEYCHAIN_PROBE_HEX),
-            format!("{read} | /usr/bin/grep -q {KEYCHAIN_PROBE_HEX}"),
-        ));
-    }
-    list.push(same_outside(
-        "pasteboard",
-        "read the pasteboard",
-        "/usr/bin/pbpaste >/dev/null",
-    ));
-    // An account without a crontab makes the crontab probe inconclusive.
-    list.push(setuid_probe(
-        "crontab",
-        "read the crontab",
-        "/usr/bin/crontab",
-        "-l >/dev/null",
-        "/usr/bin/crontab: Operation not permitted",
-    ));
-    list.push(setuid_probe(
-        "at",
-        "list the `at` queue",
-        "/usr/bin/atq",
-        ">/dev/null",
-        "/usr/bin/atq: Operation not permitted",
-    ));
+    list.extend(own.last(i));
     list
 }
 
 /// What [`probes`] leaves out because it is not on this host, so that the
 /// report says so instead of leaving those routes out silently.
-pub fn not_here(i: &ProbeInputs) -> Vec<String> {
+pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
     let mut absent = Vec::new();
     let missing = i.read_deny.iter().filter(|p| !p.exists()).count();
     let others = i
@@ -926,26 +822,15 @@ pub fn not_here(i: &ProbeInputs) -> Vec<String> {
     let not_folders = i.unmovable.iter().filter(|f| !f.is_dir()).count();
     if not_folders > 0 {
         absent.push(format!(
-            "renames and clones of {not_folders} of the {} folders that cannot move (they are not folders here)",
+            "{} of {not_folders} of the {} folders that cannot move (they are not folders here)",
+            own.notes().folder_moves,
             i.unmovable.len()
         ));
     }
     if i.host_sockets.is_empty() {
         absent.push("host sockets (no SSH agent or Docker socket here)".to_owned());
     }
-    if !i
-        .user_home
-        .join("Library/Keychains/login.keychain-db")
-        .exists()
-    {
-        absent.push("keychain (no login keychain here)".to_owned());
-    }
-    if !launch_agents(i).is_dir() {
-        absent.push("launch agents (no ~/Library/LaunchAgents here)".to_owned());
-    }
-    if let Err(why) = &i.keychain_item {
-        absent.push(format!("keychain items ({why})"));
-    }
+    absent.extend(own.not_here(i));
     absent
 }
 
@@ -955,78 +840,6 @@ pub(crate) fn limit_script(flag: &str, limit: u64) -> String {
     format!(
         "v=$(ulimit {flag}); case \"$v\" in unlimited) exit 0 ;; ''|*[!0-9]*) echo \"unreadable limit: $v\"; exit 0 ;; esac; test \"$v\" -gt {limit}"
     )
-}
-
-/// The probes that could act on the host if a rule did not hold: CI and VMs
-/// only (`--host-services`). Their controls only check that the service is
-/// there; they never use it.
-pub fn host_service_probes(i: &ProbeInputs) -> Vec<Probe> {
-    // A session with Finder, which LaunchServices and Apple Events need.
-    let finder = "/usr/bin/pgrep -x Finder >/dev/null";
-    // What closes LaunchServices and Apple Events, and why, on the baseline
-    // the probes run under: on `(deny default)` only the baseline's refusal,
-    // the rule's there meaning the baseline let the tool through.
-    let (ls_refused, ae_refused, closed_by) = match i.baseline {
-        Baseline::DenyDefault => (
-            LS_LOOKUP_REFUSED,
-            AE_LOOKUP_REFUSED,
-            Some(ClosedBy::Baseline),
-        ),
-        Baseline::AllowDefault => (LS_REFUSED, AE_REFUSED, None),
-    };
-    // `open <folder>` reports the rule's refusal (-54, design §5). Not `open
-    // -R`: inside the sandbox it exits 0 although Finder reveals nothing,
-    // so its exit code says nothing (ADR 0016).
-    let mut launch_services = probe(
-        "launchservices",
-        "open a folder through LaunchServices",
-        "/usr/bin/open -g /System",
-        Expect::FailsWith(ls_refused),
-        finder,
-    );
-    launch_services.closed_by = closed_by;
-    let mut apple_events = probe(
-        "apple events",
-        "send an Apple Event to Finder",
-        "/usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application \"Finder\" to count windows' -e 'end timeout'",
-        Expect::AppleEventBlocked(ae_refused),
-        finder,
-    );
-    apple_events.closed_by = closed_by;
-    let mut list = vec![launch_services, apple_events];
-    let label = format!("org.enclos.probe.{}", i.tag);
-    let mut job = probe(
-        "launchd",
-        "submit a launchd job",
-        format!("/bin/launchctl submit -l {label} -- /usr/bin/true"),
-        Expect::Fails,
-        "/bin/launchctl print gui/$(/usr/bin/id -u) >/dev/null 2>&1",
-    );
-    job.host = Some(HostCheck::LaunchdJob(label));
-    list.push(job);
-    let domain = format!("org.enclos.probe.{}", i.tag);
-    let mut prefs = probe(
-        "preferences",
-        "write preferences through cfprefsd",
-        format!("/usr/bin/defaults write {domain} probe -string written"),
-        Expect::Fails,
-        "/usr/bin/defaults domains >/dev/null 2>&1",
-    );
-    prefs.host = Some(HostCheck::PreferencesDomain(domain));
-    list.push(prefs);
-    // launchd loads `*.plist` property lists from here at login: the probe's
-    // file is neither, and it is removed at once if the rule did not hold.
-    // Whether macOS's background task management reacts to a new file here
-    // is not shown, so this probe writes on the host only where asked.
-    let agents = launch_agents(i);
-    if agents.is_dir() {
-        list.push(write_probe(
-            "launch agents",
-            "write in ~/Library/LaunchAgents",
-            agents.join(format!("enclos-probe-{}", i.tag)),
-        ));
-    }
-    list
 }
 
 /// What the sandbox printed first for a script it ran.
@@ -1097,7 +910,7 @@ pub fn outcome(
             (Proof::Control { .. }, Some((true, _))) => Outcome::Closed,
             (Proof::Control { expect, .. }, Some((false, output))) => {
                 let why = match expect {
-                    Expect::IntoItself => {
+                    Expect::IntoItself { .. } => {
                         "outside the sandbox, the filesystem did not refuse it with Invalid argument"
                     }
                     _ => "it fails outside the sandbox too",
@@ -1145,9 +958,10 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             Outcome::Open(format!("it succeeded: {}", last_line(output)))
         }
         Expect::Fails => Outcome::Closed,
-        Expect::FailsWith(refusal) if output.contains(refusal) => Outcome::Closed,
+        Expect::FailsWith(refusal) if refusal.is_in(output) => Outcome::Closed,
         Expect::FailsWith(refusal) => Outcome::Inconclusive(format!(
-            "it failed, but not with the expected refusal ({refusal}): {}",
+            "it failed, but not with the expected refusal ({}): {}",
+            refusal.shown(),
             last_line(output)
         )),
         Expect::OutputLacks(text) if output.contains(text) => {
@@ -1155,38 +969,26 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
         }
         Expect::OutputLacks(_) => Outcome::Closed,
         // Its script says what the call may have left.
-        Expect::IntoItself if succeeded => Outcome::Open(match last_line(output) {
+        Expect::IntoItself { .. } if succeeded => Outcome::Open(match last_line(output) {
             line if line.is_empty() => "it succeeded".to_owned(),
             line => line,
         }),
-        Expect::IntoItself if output.contains("Operation not permitted") => Outcome::Closed,
-        Expect::IntoItself if output.contains("Invalid argument") => Outcome::Open(
-            "the filesystem refused it (Invalid argument), so Seatbelt let the call through".into(),
-        ),
-        Expect::IntoItself => Outcome::Inconclusive(format!(
-            "it failed, but not with the policy's refusal (Operation not permitted): {}",
-            last_line(output)
-        )),
-        Expect::AppleEventBlocked(_) if succeeded => {
-            Outcome::Open(format!("Finder answered: {}", last_line(output)))
+        Expect::IntoItself { refusal, .. } if refusal.is_in(output) => Outcome::Closed,
+        Expect::IntoItself { backend, .. } if output.contains("Invalid argument") => {
+            Outcome::Open(format!(
+                "the filesystem refused it (Invalid argument), so {backend} let the call through"
+            ))
         }
-        // What shows the event left is matched loosely, what shows it did not
-        // strictly.
-        Expect::AppleEventBlocked(_) if output.contains("-1743") => Outcome::Open(
-            "the event reached macOS's privacy check (TCC refused it, -1743), so Seatbelt did not block it".into(),
-        ),
-        Expect::AppleEventBlocked(_) if output.contains("-1712") => Outcome::Open(
-            "the event reached Finder, which did not answer in time (-1712), so Seatbelt did not block it".into(),
-        ),
-        Expect::AppleEventBlocked(refusal) if output.contains(refusal) => Outcome::Closed,
-        Expect::AppleEventBlocked(refusal) => Outcome::Inconclusive(format!(
-            "the event failed, but not with the refusal expected on this baseline, {refusal}: {}",
+        Expect::IntoItself { refusal, .. } => Outcome::Inconclusive(format!(
+            "it failed, but not with the policy's refusal ({}): {}",
+            refusal.shown(),
             last_line(output)
         )),
+        Expect::Own(reading) => (reading.read)(succeeded, output),
     }
 }
 
-fn last_line(output: &str) -> String {
+pub(crate) fn last_line(output: &str) -> String {
     output
         .trim()
         .lines()
@@ -1200,6 +1002,7 @@ fn last_line(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::seatbelt::probes::SeatbeltProbes;
     use std::process::Command;
 
     fn inputs(dir: &Path) -> ProbeInputs {
@@ -1218,20 +1021,27 @@ mod tests {
             host_sockets: vec![dir.join("agent.sock")],
             proxy_port: 41001,
             listen: false,
-            baseline: crate::backend::seatbelt::Baseline::DenyDefault,
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
-            keychain_item: Err("no test item".into()),
             limits: Default::default(),
         }
+    }
+
+    /// The list of a real backend, whose refusal the texts below use.
+    fn seatbelt() -> SeatbeltProbes {
+        SeatbeltProbes::on(crate::backend::Baseline::DenyDefault)
+    }
+
+    fn probes(i: &ProbeInputs) -> Vec<Probe> {
+        super::probes(i, &seatbelt())
     }
 
     fn all(dir: &Path) -> Vec<Probe> {
         let i = inputs(dir);
         probes(&i)
             .into_iter()
-            .chain(host_service_probes(&i))
+            .chain(seatbelt().host_services(&i))
             .collect()
     }
 
@@ -1252,89 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn host_service_probes_are_apart_and_the_harmless_ones_never_use_a_host_service() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("Library/LaunchAgents")).unwrap();
-        let routes: Vec<&str> = probes(&inputs(dir.path()))
-            .iter()
-            .map(|p| p.route)
-            .collect();
-        for route in HOST_SERVICE_ROUTES {
-            assert!(!routes.contains(route), "{route}");
-        }
-        for route in [
-            "network",
-            "signals",
-            "terminals",
-            "writes",
-            "other sandboxes",
-            "pasteboard",
-            "crontab",
-            "at",
-        ] {
-            assert!(routes.contains(&route), "{route}");
-        }
-        let host: Vec<&str> = host_service_probes(&inputs(dir.path()))
-            .iter()
-            .map(|p| p.route)
-            .collect();
-        assert_eq!(host, HOST_SERVICE_ROUTES);
-    }
-
-    #[test]
-    fn the_harmless_probes_never_need_a_host_service_check() {
-        let dir = tempfile::tempdir().unwrap();
-        for p in probes(&inputs(dir.path())) {
-            assert!(
-                !matches!(
-                    p.host,
-                    Some(HostCheck::LaunchdJob(_) | HostCheck::PreferencesDomain(_))
-                ),
-                "{} acts on a host service",
-                p.name
-            );
-        }
-    }
-
-    #[test]
-    fn what_is_not_on_this_host_is_said() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut i = inputs(dir.path());
-        i.host_sockets.clear();
-        let absent = not_here(&i).join("; ");
-        assert!(
-            absent.contains("1 of the 2 denied sensitive paths"),
-            "{absent}"
-        );
-        assert!(
-            absent.contains("renames and clones of 1 of the 2 folders that cannot move"),
-            "{absent}"
-        );
-        assert!(absent.contains("host sockets"), "{absent}");
-        assert!(absent.contains("keychain"), "{absent}");
-        i.read_deny = vec![dir.path().join("gone")];
-        assert!(
-            not_here(&i)
-                .join("; ")
-                .contains("none of the 1 denied paths")
-        );
-    }
-
-    #[test]
-    fn a_host_service_control_never_repeats_what_the_probe_does() {
-        let dir = tempfile::tempdir().unwrap();
-        for p in host_service_probes(&inputs(dir.path())) {
-            let Proof::Control { control, .. } = &p.proof else {
-                panic!("{} has no control", p.name);
-            };
-            assert_ne!(control.as_str(), p.script, "{}", p.name);
-            for acting in ["open ", "osascript", "submit", "defaults write"] {
-                assert!(!control.as_str().contains(acting), "{}", p.name);
-            }
-        }
-    }
-
-    #[test]
     fn what_the_host_checks_is_what_the_script_touches() {
         let dir = tempfile::tempdir().unwrap();
         for p in all(dir.path()) {
@@ -1342,8 +1069,9 @@ mod tests {
                 Some(HostCheck::File(path)) => {
                     assert!(p.script.contains(&sh_quote(path)), "{}", p.name)
                 }
-                Some(HostCheck::LaunchdJob(label)) => assert!(p.script.contains(label.as_str())),
-                Some(HostCheck::PreferencesDomain(d)) => assert!(p.script.contains(d.as_str())),
+                Some(HostCheck::Tool(check)) => {
+                    assert!(check.look.iter().any(|a| p.script.contains(a.as_str())))
+                }
                 Some(HostCheck::Target) => assert!(p.script.contains("4242")),
                 None => {}
             }
@@ -1470,7 +1198,7 @@ mod tests {
         i.writes.push(dir.path().join("work"));
         i.read_deny = vec![fifo.clone()];
         assert!(named(&probes(&i), "pipe").is_none());
-        let absent = not_here(&i).join("; ");
+        let absent = super::not_here(&i, &seatbelt()).join("; ");
         assert!(
             absent.contains("neither a file nor a folder") && absent.contains("work/pipe"),
             "{absent}"
@@ -1516,94 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_agents_probe_writes_a_file_launchd_never_loads_and_only_where_asked() {
-        let dir = tempfile::tempdir().unwrap();
-        let i = inputs(dir.path());
-        assert!(
-            !host_service_probes(&i)
-                .iter()
-                .any(|p| p.route == "launch agents")
-        );
-        assert!(not_here(&i).join("; ").contains("launch agents"));
-
-        let agents = dir.path().join("Library/LaunchAgents");
-        std::fs::create_dir_all(&agents).unwrap();
-        // It writes on the host if the rule does not hold: a host-service probe.
-        assert!(!probes(&i).iter().any(|p| p.route == "launch agents"));
-        let list = host_service_probes(&i);
-        let write = find(&list, "launch agents");
-        let Some(HostCheck::File(file)) = &write.host else {
-            panic!("the launch agents probe checks its file from the host");
-        };
-        assert_eq!(file.parent(), Some(agents.as_path()));
-        // launchd loads `*.plist` property lists: this is neither.
-        assert_ne!(file.extension().and_then(|e| e.to_str()), Some("plist"));
-        assert_eq!(write.script, format!("echo x > {}", sh_quote(file)));
-        assert!(!not_here(&i).join("; ").contains("launch agents"));
-    }
-
-    #[test]
-    fn setuid_probes_say_seatbelt_itself_closes_them() {
-        let dir = tempfile::tempdir().unwrap();
-        for p in all(dir.path()) {
-            let setuid = matches!(p.route, "crontab" | "at");
-            // On `(deny default)`, as these inputs say, the host services
-            // the baseline refuses something of (likely a lookup; not
-            // traced) are the baseline's.
-            let by = match p.route {
-                "crontab" | "at" => Some(ClosedBy::Seatbelt),
-                "launchservices" | "apple events" => Some(ClosedBy::Baseline),
-                _ => None,
-            };
-            assert_eq!(p.closed_by, by, "{}", p.name);
-            if setuid {
-                let result = ProbeResult::of(p.clone(), Outcome::Closed);
-                assert_eq!(result.closed_by, Some(ClosedBy::Seatbelt));
-                // Only a closed probe carries the note.
-                let other = ProbeResult::of(p.clone(), Outcome::Inconclusive("x".into()));
-                assert_eq!(other.closed_by, None);
-                // Closed only on the shell's refusal to run the program, as
-                // `/bin/sh` prints it; a program that ran and failed is not.
-                let program = p.script.split(' ').next().unwrap();
-                let refused = format!("/bin/sh: {program}: Operation not permitted");
-                assert_eq!(proven(&p, ran(false, &refused)), Outcome::Closed);
-                for after_it_ran in [
-                    "crontab: no crontab for alice",
-                    "crontab: /usr/lib/cron/tabs/alice: Operation not permitted",
-                    "atq: /usr/lib/cron/jobs: Operation not permitted",
-                ] {
-                    assert!(
-                        matches!(
-                            proven(&p, ran(false, after_it_ran)),
-                            Outcome::Inconclusive(_)
-                        ),
-                        "{}: {after_it_ran}",
-                        p.name
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_routes_no_probe_tries_are_named() {
-        for route in [
-            "bootstrapping",
-            "installing a crontab",
-            "submitting an `at` job",
-            "login item",
-            "synthetic input",
-            "writing the pasteboard",
-            "TIOCSTI",
-        ] {
-            assert!(
-                NOT_PROBED.iter().any(|r| r.contains(route)),
-                "{route} is missing from {NOT_PROBED:?}"
-            );
-        }
-    }
-
-    #[test]
     fn each_limit_set_is_probed_as_a_hard_limit() {
         let dir = tempfile::tempdir().unwrap();
         let mut i = inputs(dir.path());
@@ -1626,41 +1266,6 @@ mod tests {
                 limit_script("-Hn", 256).as_str()
             )]
         );
-    }
-
-    #[test]
-    fn a_keychain_item_is_probed_when_one_was_stored_and_said_missing_otherwise() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut i = inputs(dir.path());
-        assert!(!probes(&i).iter().any(|p| p.name == "read a keychain item"));
-        assert!(not_here(&i).iter().any(|a| a.starts_with("keychain items")));
-        i.keychain_item = Ok(KeychainItem {
-            service: "enclos.abc.probe".into(),
-            account: "home/probe".into(),
-            file: None,
-        });
-        let list = probes(&i);
-        let probe = list
-            .iter()
-            .find(|p| p.name == "read a keychain item")
-            .unwrap();
-        assert!(
-            probe
-                .script
-                .contains("find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w"),
-            "{}",
-            probe.script
-        );
-        assert!(
-            matches!(&probe.proof, Proof::Control { expect: Expect::OutputLacks(hex), .. } if *hex == KEYCHAIN_PROBE_HEX)
-        );
-        assert!(!not_here(&i).iter().any(|a| a.starts_with("keychain items")));
-        // The value enclos stores, as `security` prints it back.
-        let hex: String = KEYCHAIN_PROBE_VALUE
-            .bytes()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(hex, KEYCHAIN_PROBE_HEX);
     }
 
     #[test]
@@ -1743,67 +1348,6 @@ mod tests {
             let removal = on_host(folders[0]);
             flag("nouchg");
             assert!(!removal);
-        }
-    }
-
-    #[test]
-    fn the_proxy_port_on_ipv6_loopback_must_reach_the_proxy_or_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let list = probes(&inputs(dir.path()));
-        let p = list
-            .iter()
-            .find(|p| p.name.contains("IPv6 loopback"))
-            .unwrap();
-        assert_eq!(p.route, "network");
-        let Proof::OnlyTheProxy { control } = &p.proof else {
-            panic!("{:?}", p.proof);
-        };
-        // The control is the same request, from the host.
-        assert_eq!(control.as_str(), p.script);
-        assert!(
-            p.script.contains("--proxy 'http://[::1]:41001'")
-                && p.script.ends_with("; echo \" $?\""),
-            "{}",
-            p.script
-        );
-        let held = Some((true, "403 0\n"));
-        // The proxy refused it, as it refuses that port. The script always
-        // ends with `echo`, so it always succeeds.
-        for answer in ["403 56\n", "403"] {
-            assert_eq!(
-                outcome(p, ran(true, answer), Ok(None), held),
-                Outcome::Closed
-            );
-        }
-        // No connection: the rule refused it, and the proxy holds the port.
-        assert_eq!(
-            outcome(p, ran(true, "000 7\n"), Ok(None), held),
-            Outcome::Closed
-        );
-        // Without the proxy on `[::1]` from the host, no connection proves
-        // nothing: the port is free for another program to take.
-        for host in ["000 7\n", ""] {
-            assert!(
-                matches!(
-                    outcome(p, ran(true, "000 7\n"), Ok(None), Some((true, host))),
-                    Outcome::Inconclusive(why) if why.contains("another program could listen there")
-                ),
-                "{host}"
-            );
-        }
-        assert!(matches!(
-            outcome(p, ran(true, "000 7\n"), Ok(None), None),
-            Outcome::NotRun(_)
-        ));
-        // Anything else answered, or accepted and said nothing.
-        for other in ["200 0", "502 56", "000 28", "000 52", ""] {
-            assert!(
-                matches!(
-                    outcome(p, ran(true, other), Ok(None), held),
-                    Outcome::Open(_)
-                ),
-                "{other}"
-            );
         }
     }
 
@@ -1940,179 +1484,6 @@ mod tests {
     }
 
     #[test]
-    fn host_services_count_only_the_refusal_seatbelt_gives() {
-        let dir = tempfile::tempdir().unwrap();
-        let list = all(dir.path());
-        let open = find(&list, "launchservices");
-        // On (deny default) the rule's own refusal would mean the lookup was
-        // allowed: not shown closed.
-        let refused = "LSOpenURLsWithRole() failed with error -54 for the file /System.";
-        assert!(matches!(
-            proven(open, ran(false, refused)),
-            Outcome::Inconclusive(_)
-        ));
-        let other = "LSOpenURLsWithRole() failed with error -10810 for the file /System.";
-        assert!(matches!(
-            proven(open, ran(false, other)),
-            Outcome::Inconclusive(_)
-        ));
-        // Under (deny default) the lookup itself is refused (CI, macOS 15
-        // and 26).
-        let unreachable = "No application knows how to open URL file:///System/ (Error Domain=NSOSStatusErrorDomain Code=-10661 \"kLSApplicationNotFoundErr: E.g. no application claims the file\")";
-        assert_eq!(proven(open, ran(false, unreachable)), Outcome::Closed);
-        assert!(matches!(proven(open, ran(true, "")), Outcome::Open(_)));
-
-        let ae = find(&list, "apple events");
-        assert!(matches!(proven(ae, ran(true, "3")), Outcome::Open(_)));
-        let tcc = "execution error: Not authorized to send Apple events to Finder. (-1743)";
-        assert!(matches!(proven(ae, ran(false, tcc)), Outcome::Open(_)));
-        let timeout = "execution error: Finder got an error: AppleEvent timed out. (-1712)";
-        assert!(matches!(proven(ae, ran(false, timeout)), Outcome::Open(_)));
-        let blocked = "execution error: Finder got an error: Application isn't running. (-600)";
-        assert!(matches!(
-            proven(ae, ran(false, blocked)),
-            Outcome::Inconclusive(_)
-        ));
-        let unreachable = "55:68: execution error: Can’t get application \"Finder\". (-1728)";
-        assert_eq!(proven(ae, ran(false, unreachable)), Outcome::Closed);
-        let broken = "execution error: An error of type -10004 has occurred. (-10004)";
-        assert!(matches!(
-            proven(ae, ran(false, broken)),
-            Outcome::Inconclusive(_)
-        ));
-        // Finder's own -1728 means the event reached it.
-        let answered = "execution error: Finder got an error: Can’t get window 1. (-1728)";
-        assert!(!matches!(proven(ae, ran(false, answered)), Outcome::Closed));
-        // A failed control, or a success, outweighs the codes.
-        for (probe, text) in [(open, unreachable_ls()), (ae, unreachable)] {
-            assert!(matches!(
-                outcome(probe, ran(false, text), Ok(None), Some((false, ""))),
-                Outcome::Inconclusive(_)
-            ));
-            assert!(matches!(proven(probe, ran(true, text)), Outcome::Open(_)));
-            // Under deny default, a route closed so is the baseline's.
-            assert_eq!(probe.closed_by, Some(ClosedBy::Baseline));
-        }
-    }
-
-    fn unreachable_ls() -> &'static str {
-        "No application knows how to open URL file:///System/ (Error Domain=NSOSStatusErrorDomain Code=-10661 \"kLSApplicationNotFoundErr: E.g. no application claims the file\")"
-    }
-
-    /// On `(allow default)` only the rules' own refusals close these routes:
-    /// what a refused lookup says is inconclusive there, so the comparison
-    /// shows the rules.
-    #[test]
-    fn on_allow_default_only_the_rules_refusals_close_the_host_services() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut i = inputs(dir.path());
-        i.baseline = Baseline::AllowDefault;
-        let list = host_service_probes(&i);
-        let open = find(&list, "launchservices");
-        let ae = find(&list, "apple events");
-        assert!(matches!(
-            proven(open, ran(false, unreachable_ls())),
-            Outcome::Inconclusive(_)
-        ));
-        let lookup = "55:68: execution error: Can’t get application \"Finder\". (-1728)";
-        assert!(matches!(
-            proven(ae, ran(false, lookup)),
-            Outcome::Inconclusive(_)
-        ));
-        let refused = "LSOpenURLsWithRole() failed with error -54 for the file /System.";
-        assert_eq!(proven(open, ran(false, refused)), Outcome::Closed);
-        let blocked = "execution error: Finder got an error: Application isn't running. (-600)";
-        assert_eq!(proven(ae, ran(false, blocked)), Outcome::Closed);
-        assert!(list.iter().all(|p| p.closed_by.is_none()));
-    }
-
-    #[test]
-    fn a_rename_or_clone_is_closed_only_by_seatbelt_refusing_it_before_the_filesystem() {
-        let dir = tempfile::tempdir().unwrap();
-        let list = all(dir.path());
-        for route in ["renames", "clones"] {
-            let found: Vec<&Probe> = list.iter().filter(|p| p.route == route).collect();
-            assert_eq!(found.len(), 1, "only folders that exist: {found:?}");
-            let p = found[0];
-            assert!(
-                p.script.contains(&sh_quote(&dir.path().join("it's here"))),
-                "{}",
-                p.script
-            );
-            let refused = "Operation not permitted";
-            assert_eq!(proven(p, ran(false, refused)), Outcome::Closed);
-            assert!(matches!(
-                proven(p, ran(false, "Invalid argument")),
-                Outcome::Open(why) if why.contains("Seatbelt let the call through")
-            ));
-            assert!(matches!(proven(p, ran(true, "")), Outcome::Open(_)));
-            let left = "it succeeded, so /x/enclos-probe-7 may now exist";
-            assert_eq!(proven(p, ran(true, left)), Outcome::Open(left.into()));
-            assert!(matches!(
-                proven(p, ran(false, "No such file or directory")),
-                Outcome::Inconclusive(_)
-            ));
-            // A control that did not get the filesystem's refusal says why,
-            // and never lets the probe count as closed.
-            for host in ["Operation not supported", left] {
-                assert_eq!(
-                    outcome(p, ran(false, refused), Ok(None), Some((false, host))),
-                    Outcome::Inconclusive(format!(
-                        "outside the sandbox, the filesystem did not refuse it with Invalid argument: {host}"
-                    ))
-                );
-            }
-        }
-    }
-
-    /// The controls themselves, run on the host on temporary folders: the
-    /// filesystem refuses a folder into itself, so they work and nothing is
-    /// made; on a folder no longer there, they fail and say why.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_rename_and_clone_controls_work_on_a_folder_and_say_why_they_fail() {
-        let dir = tempfile::tempdir().unwrap();
-        let (here, gone) = (dir.path().join("here"), dir.path().join("gone"));
-        std::fs::create_dir(&here).unwrap();
-        std::fs::create_dir(&gone).unwrap();
-        let controls = |folder: &Path| -> Vec<HostScript> {
-            let mut i = inputs(dir.path());
-            i.unmovable = vec![folder.to_owned()];
-            probes(&i)
-                .into_iter()
-                .filter(|p| ["renames", "clones"].contains(&p.route))
-                .map(|p| match p.proof {
-                    Proof::Control { control, .. } => control,
-                    Proof::ProxyRefuses | Proof::OnlyTheProxy { .. } => {
-                        panic!("{} has no control", p.name)
-                    }
-                })
-                .collect()
-        };
-        let run = |control: &HostScript| {
-            let out = std::process::Command::new("/bin/sh")
-                .args(["-c", control.as_str()])
-                .output()
-                .unwrap();
-            let text = String::from_utf8_lossy(&out.stdout).into_owned()
-                + &String::from_utf8_lossy(&out.stderr);
-            (out.status.success(), text)
-        };
-        let (worked, failing) = (controls(&here), controls(&gone));
-        assert_eq!((worked.len(), failing.len()), (2, 2));
-        for control in &worked {
-            let (ok, text) = run(control);
-            assert!(ok, "{text}");
-        }
-        assert!(!here.join("enclos-probe-7").exists());
-        std::fs::remove_dir(&gone).unwrap();
-        for control in &failing {
-            let (ok, text) = run(control);
-            assert!(!ok && text.contains("No such file or directory"), "{text}");
-        }
-    }
-
-    #[test]
     fn results_are_read_by_what_each_probe_expects() {
         let dir = tempfile::tempdir().unwrap();
         let list = all(dir.path());
@@ -2141,5 +1512,102 @@ mod tests {
             Outcome::Open(_)
         ));
         assert_eq!(proven(dns, ran(true, "")), Outcome::Closed);
+    }
+
+    /// A backend with no probes of its own, refusing as one that leaves
+    /// things out of the sandbox does.
+    struct Plain;
+
+    impl OwnProbes for Plain {
+        fn name(&self) -> &'static str {
+            "Plain"
+        }
+
+        fn refusal(&self) -> Refusal {
+            Refusal::any_of(&["No such file or directory", "Read-only file system"])
+        }
+
+        fn notes(&self) -> ReportNotes {
+            ReportNotes {
+                host: "this host",
+                folder_moves: "renames",
+                only_apart: "",
+                host_service_routes: &[],
+                not_probed: &[],
+            }
+        }
+    }
+
+    /// The shared set names no route, command or word of another backend's,
+    /// and needs none of its own to be complete.
+    #[test]
+    fn a_backend_with_no_probes_of_its_own_gets_the_shared_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let i = inputs(dir.path());
+        let list = super::probes(&i, &Plain);
+        let routes: Vec<&str> = list.iter().map(|p| p.route).collect();
+        for route in [
+            "renames",
+            "other sandboxes",
+            "enclos files",
+            "writes",
+            "writable folders",
+            "network",
+            "dns",
+            "host sockets",
+            "signals",
+            "terminals",
+        ] {
+            assert!(routes.contains(&route), "{route}");
+        }
+        for route in ["clones", "keychain", "pasteboard", "crontab", "at"] {
+            assert!(!routes.contains(&route), "{route}");
+        }
+        for p in &list {
+            assert!(!p.script.contains("Operation not permitted"), "{}", p.name);
+            assert_eq!(p.closed_by, None, "{}", p.name);
+        }
+        assert!(Plain.host_services(&i).is_empty());
+        assert!(
+            super::not_here(&i, &Plain)
+                .join("; ")
+                .contains("renames of 1 of the 2 folders")
+        );
+    }
+
+    /// Each text of a backend's refusal closes a probe, and another
+    /// backend's does not.
+    #[test]
+    fn a_probe_is_closed_by_any_refusal_of_its_backend_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = super::probes(&inputs(dir.path()), &Plain);
+        for route in ["terminals", "writable folders", "renames"] {
+            let p = find(&list, route);
+            for refusal in [
+                "/bin/sh: x: No such file or directory",
+                "Read-only file system",
+            ] {
+                assert_eq!(proven(p, ran(false, refusal)), Outcome::Closed, "{route}");
+            }
+            assert!(
+                matches!(
+                    proven(p, ran(false, "Operation not permitted")),
+                    Outcome::Inconclusive(why) if why.contains("No such file or directory or Read-only file system")
+                ),
+                "{route}"
+            );
+        }
+        // What the filesystem says of a folder into itself is the backend's
+        // letting it through, whichever backend it is.
+        assert!(matches!(
+            proven(find(&list, "renames"), ran(false, "Invalid argument")),
+            Outcome::Open(why) if why.contains("Plain let the call through")
+        ));
+        // Each refusal in the script, so that either stops the folder probe.
+        assert!(
+            find(&list, "writable folders").script.contains(
+                "case \"$out\" in *'No such file or directory'*|*'Read-only file system'*)"
+            )
+        );
     }
 }
