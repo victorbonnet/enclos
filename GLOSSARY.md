@@ -99,6 +99,9 @@ _Avoid_: daemon, job, unit (the service manager's words), agent service
 On Linux, the part of enclos inside a session that listens on the session's own 127.0.0.1 and passes each connection to a Unix socket outside it: the sandbox's proxy, or its runtime's listening service.
 _Avoid_: forwarder, port forward, tunnel (the proxy's word for a connection it carries)
 
+**Holder**:
+On Linux, the process that keeps a sandbox's network namespace in being while its proxy service runs, so that every session of the sandbox can join it.
+
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
 _Avoid_: child, worker
