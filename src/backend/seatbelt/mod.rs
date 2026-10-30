@@ -18,7 +18,6 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 
 pub use compile::{BASELINE_VAR, Baseline, tag};
-pub use wrap::environment;
 
 /// Seatbelt, compiling on one baseline for the whole process.
 pub struct Seatbelt {

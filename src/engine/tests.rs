@@ -5,6 +5,15 @@ use crate::backend::fake::FakeBackend;
 use crate::error::{Error, HomeFound};
 use crate::model::audit::AuditResult;
 
+/// The shell `connect` runs when given no command, as a plan shows it.
+fn default_shell() -> String {
+    crate::backend::environment::shell_command()
+        .iter()
+        .map(|word| word.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn alice() -> Actor {
     Actor {
         user: "alice".into(),

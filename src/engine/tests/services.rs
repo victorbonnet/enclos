@@ -146,8 +146,8 @@ fn connect_waits_for_installed_services_and_starts_nothing() {
     assert_eq!(
         dry_run(&engine, &name),
         [
-            "wait for the gateway of sandbox home to listen",
-            "run `/bin/zsh -l` in sandbox home under policy v1"
+            "wait for the gateway of sandbox home to listen".to_owned(),
+            format!("run `{}` in sandbox home under policy v1", default_shell())
         ]
     );
     let (waited, said) = wait_for_gateway(&engine, &name);

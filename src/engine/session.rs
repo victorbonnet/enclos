@@ -16,6 +16,7 @@ use super::Engine;
 use super::listener::ConnectStep;
 use super::service::STOP_GRACE;
 use super::start::{CommandKind, Group, Started, Starting};
+use crate::backend::environment;
 use crate::error::{Error, Result};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
@@ -79,7 +80,7 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 pub(super) const END_WAIT: Duration = Duration::from_secs(120);
 
 impl Engine {
-    /// Runs `command` (a login shell by default) in the sandbox, in this
+    /// Runs `command` (a shell by default) in the sandbox, in this
     /// terminal, and returns when it exits.
     pub fn connect(
         &self,
@@ -89,7 +90,7 @@ impl Engine {
         confirm: Confirm,
     ) -> Result<Planned<SessionEnd>> {
         let command = if command.is_empty() {
-            vec![OsString::from("/bin/zsh"), OsString::from("-l")]
+            environment::shell_command()
         } else {
             command
         };

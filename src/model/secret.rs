@@ -183,8 +183,8 @@ impl fmt::Debug for SecretValue {
 }
 
 /// Environment variables a session may not be given as a secret: the ones
-/// enclos sets itself or passes on from the host (a test of the Seatbelt
-/// backend holds this list to its environment), or that would change how
+/// enclos sets itself or passes on from the host (a test of the session
+/// environment holds this list to it), or that would change how
 /// the sandbox runs.
 pub fn reserved_variable(name: &str) -> bool {
     const RESERVED: &[&str] = &[
