@@ -1,7 +1,9 @@
 #!/bin/bash
 # The prototype sandbox's files, programs and system calls (design §14,
-# M3-02): broad reads with the deny list not mounted, writes to the home and
-# the workspace only, the home and workspace unmovable, programs run from the
+# M3-02): broad reads with the deny list not mounted, denied paths inside the
+# workspace masked (planted, or missing and so a folder) with the rest of it
+# as granted, writes to the home and the workspace only, the home and
+# workspace unmovable, programs run from the
 # workspace, the seccomp list, other processes (whether /proc/<pid> exists is
 # the control: the host's own read of a process's environ never worked), the
 # host's loopback and DNS. Each probe runs on the host as
@@ -26,11 +28,15 @@ planted=()
 for d in "${DENY[@]}"; do
     [ "$d" = "$H/.enclos" ] && continue
     [ "$d" = "$WORK/denied-file" ] && continue
+    [ "$d" = "$WORK/denied-missing" ] && continue
     mkdir -p "$d"
     echo planted >"$d/enclos-proto-planted"
     planted+=("$d/enclos-proto-planted")
 done
 echo planted >"$WORK/denied-file"
+rm -rf "$WORK/denied-missing"  # the first run leaves the mask's mount point there
+echo kept >"$WORK/kept-file"
+mkdir -p "$WORK/kept-folder"
 other="$H/.enclos/sandboxes/other/home"
 mkdir -p "$other"
 echo planted >"$other/enclos-proto-planted"
@@ -54,6 +60,13 @@ probes+=(
     "write $WORK/denied-folder/enclos-proto-w"
     "open-write $WORK/denied-file"
     "rename $WORK/denied-folder"
+    "exists $WORK/denied-missing"
+    "read $WORK/denied-missing"
+    "write $WORK/denied-missing/enclos-proto-w"
+    "rename $WORK/denied-missing"
+    "read $WORK/kept-file"
+    "write $WORK/kept-folder/enclos-proto-w"
+    "rename $WORK/kept-folder"
     "exists $H/.ssh"
     "read $other/enclos-proto-planted"
     "exists $H/.enclos/sandboxes/other"
@@ -140,6 +153,8 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo "\`ok\` means the operation succeeded; an error name means it was refused with that error."
     echo
     echo "Where the host column already refuses, the row shows nothing about the sandbox: read \`bpf\`, \`perf_event_open\` and \`userfaultfd\` against the host's sysctls in 00-setup.md, and what seccomp adds against the bubblewrap-only column, since the filter's errno (EPERM) is also the kernel's."
+    echo
+    echo "\`read $WORK/denied-file\` reads 0 bytes where the mask holds, and 8 on the host. The host column's \`denied-missing\` rows come after the sandbox modes, so they show the empty folder a mask leaves there."
     echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
