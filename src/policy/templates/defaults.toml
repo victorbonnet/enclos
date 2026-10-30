@@ -1,4 +1,6 @@
 # Built-in defaults, applied under every template (design §5, ADR 0015).
+# One list for every system, so that a policy resolves to the same thing on
+# each: a path that does not exist on a host hides nothing there.
 # Reads are broad except these sensitive paths; writes go only to the
 # sandbox home. enclos's own files are protected by the compiler on top of
 # this, whatever any layer says (ADR 0010).
@@ -32,7 +34,10 @@ read_deny = [
     "~/.vault-token",
     "~/.terraform.d/credentials.tfrc.json",
     "~/Library/Application Support/com.vercel.cli",
+    "~/.local/share/com.vercel.cli",
     "~/Library/Keychains",
+    "~/.local/share/keyrings",
+    "~/.local/share/kwalletd",
     # Hugging Face's login at its default location, not its download cache
     "~/.cache/huggingface/token",
     "~/.cache/huggingface/stored_tokens",
@@ -66,6 +71,23 @@ read_deny = [
     "~/Library/Application Support/Orion",
     "~/Library/Safari",
     "~/Library/Containers/com.apple.Safari",
+    "~/.config/google-chrome",
+    "~/.config/google-chrome-beta",
+    "~/.config/google-chrome-unstable",
+    "~/.config/google-chrome-canary",
+    "~/.config/chromium",
+    "~/.config/BraveSoftware",
+    "~/.config/microsoft-edge",
+    "~/.config/microsoft-edge-beta",
+    "~/.config/microsoft-edge-dev",
+    "~/.config/vivaldi",
+    "~/.config/opera",
+    "~/.mozilla",
+    "~/.config/mozilla",
+    # Ubuntu installs its browsers and mail as snaps, each with its own data
+    "~/snap/firefox",
+    "~/snap/chromium",
+    "~/snap/thunderbird",
     # Cookies and site data apps keep through macOS's own web stack
     "~/Library/Cookies",
     "~/Library/HTTPStorages",
@@ -81,28 +103,49 @@ read_deny = [
     "~/Library/Calendars",
     "~/Library/Group Containers/group.com.apple.calendar",
     "~/Pictures/Photos Library.photoslibrary",
+    "~/.thunderbird",
+    "~/.config/evolution",
+    "~/.local/share/evolution",
     # Password managers
     "~/Library/Application Support/1Password",
     "~/Library/Group Containers/2BUA8C4S2C.com.1password",
     "~/Library/Application Support/Bitwarden",
     "~/Library/Application Support/Bitwarden CLI",
     "~/Library/Application Support/Proton Pass",
+    "~/.config/1Password",
+    "~/.config/Bitwarden",
+    "~/.config/Bitwarden CLI",
+    "~/.config/Proton Pass",
     # KeePassXC's settings: its databases stay wherever the user keeps them
     "~/Library/Application Support/KeePassXC",
+    "~/.config/keepassxc",
     "~/.password-store",
     "~/.config/op",
     # Launch agents: Hermes finds the real home through the user database, not
     # $HOME, and read the host's own gateway job here (prototype, issue #5).
     "~/Library/LaunchAgents",
+    # Linux's counterparts: what the user's manager and desktop start
+    "~/.config/systemd/user",
+    "~/.local/share/systemd/user",
+    "~/.config/autostart",
+    # Rootless containers. Docker's and Podman's sockets live in each user's
+    # runtime folder, which is why the entry is `/run/user`: the list has no
+    # way to name one user's. Their logins and storage live in the home.
+    "/run/user",
+    "~/.config/containers",
+    "~/.local/share/containers",
+    "~/.local/share/docker",
     # The host's own assistant tools' configuration and logins
     "~/.claude",
     "~/.claude.json",
     "~/Library/Application Support/Claude",
+    "~/.config/Claude",
     "~/.codex",
     "~/.hermes",
     "~/.gemini",
     "~/.cursor",
     "~/Library/Application Support/Cursor",
+    "~/.config/Cursor",
     "~/.config/opencode",
     "~/.local/share/opencode",
 ]
