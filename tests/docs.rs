@@ -138,3 +138,11 @@ fn the_lingering_row_holds_the_evidence_and_its_recommendation() {
     }
     assert!(design.contains("| Where bubblewrap comes from (milestone 3) |"));
 }
+
+#[test]
+fn the_host_adrs_stay_proposed() {
+    let proposed = proposed_adrs();
+    for adr in [ADR_0037, ADR_0038] {
+        assert!(proposed.iter().any(|name| name == adr), "{adr}");
+    }
+}
