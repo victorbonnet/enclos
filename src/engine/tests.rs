@@ -227,9 +227,7 @@ mod doctor;
 mod exec;
 mod history;
 /// The runtime's own service, whose port the sandbox's sessions reach (ADR
-/// 0028). macOS only: the lookup reads `lsof` and `sysctl` at their macOS
-/// paths, and the stand-in gateways are `perl`.
-#[cfg(target_os = "macos")]
+/// 0028). The stand-in gateways are `perl`.
 mod listener;
 mod pending;
 mod policy;

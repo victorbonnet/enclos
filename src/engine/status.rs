@@ -304,8 +304,8 @@ fn dashboard(
 /// reach: nothing narrows a sandbox's listener to loopback (ADR 0028). Each
 /// pid and address once, a listener on every address (`0.0.0.0` or `[::]`)
 /// shown as `*:<port>`. A pid is named only while it is still the member
-/// `look` listed, checked after `lsof` looked, so a pid reused meanwhile is
-/// not.
+/// `look` listed, checked after the look at its sockets, so a pid reused
+/// meanwhile is not.
 fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
     let mut members: BTreeMap<u32, (ProcessRef, String)> = BTreeMap::new();
     for session in running.iter().filter(|s| s.kind != SessionKind::Proxy) {
@@ -339,7 +339,7 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
     let mut found = Vec::new();
     for (pid, address) in shown {
         let Some((at, command)) = members.get(&pid) else {
-            return Fact::CannotTell(format!("lsof answered for pid {pid}, which was not asked"));
+            return Fact::CannotTell(format!("a look answered for pid {pid}, which was not asked"));
         };
         match is_same(at) {
             Ok(true) => found.push(NetworkListener {
@@ -355,12 +355,11 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
     Fact::Known(found)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// A running session of `kind` whose root is `root`.
-    #[cfg(target_os = "macos")]
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
         SessionRecord {
             id: crate::model::session::SessionId(1),
@@ -381,11 +380,8 @@ mod tests {
     /// Listens on every address and on loopback, and says both ports. Perl,
     /// which macOS signs, so the firewall asks nothing of whoever runs the
     /// tests.
-    #[cfg(target_os = "macos")]
     const LISTENS: &str = "use Socket; for my $a (INADDR_ANY, INADDR_LOOPBACK) { socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, $a)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); } $| = 1; STDOUT->flush; sleep 30";
 
-    // `lsof` at /usr/sbin is macOS's, where sandboxes listen (ADR 0028).
-    #[cfg(target_os = "macos")]
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
@@ -407,7 +403,7 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let Fact::Known(found) = found else {
-            panic!("lsof could not look: {found:?}");
+            panic!("could not look: {found:?}");
         };
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].pid, child.id());
