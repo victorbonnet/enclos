@@ -1,12 +1,12 @@
 //! One look at what runs of a sandbox's sessions (ADR 0019, ADR 0030).
 //!
 //! A session's members are found from a listing of the host's processes,
-//! then from the processes `lsof` shows holding its marker, always in that
-//! order: each holder is known by the start time the listing gave its pid,
-//! so one that exits and whose pid is reused fails the same-process check
-//! before a signal. With `lsof` first, the listing would give it the start
-//! time of the process that reused the pid, and that process would be
-//! signalled. A [`Look`] that holds markers can only be made that way, and
+//! then from the processes `lsof` or `/proc` shows holding its marker, always
+//! in that order: each holder is known by the start time the listing gave its
+//! pid, so one that exits and whose pid is reused fails the same-process check
+//! before a signal. With the look at the markers first, the listing would give
+//! it the start time of the process that reused the pid, and that process
+//! would be signalled. A [`Look`] that holds markers can only be made that way, and
 //! it answers for every session of the sandbox from the same listing.
 //!
 //! A look that fails says nothing about any session, so it is an error
@@ -289,7 +289,7 @@ mod tests {
         }
     }
 
-    /// The listing comes first, whatever `lsof` answers: that order is what
+    /// The listing comes first, whatever the markers' look answers: that order is what
     /// keeps a pid reused from being signalled (ADR 0030).
     #[test]
     fn a_look_lists_the_processes_before_it_looks_at_the_markers() {
