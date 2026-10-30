@@ -124,7 +124,7 @@ impl Backend for FakeBackend {
         for (name, value) in &launch.env {
             command.env(name, value.expose());
         }
-        for (name, value) in super::seatbelt::environment(ctx) {
+        for (name, value) in super::environment::variables(ctx) {
             command.env(name, value);
         }
         command.env(IN_TERMINAL, launch.in_terminal.to_string());
