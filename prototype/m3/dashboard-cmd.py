@@ -8,11 +8,14 @@ refuses, naming the first. Loopback and serving only this user are hard-coded,
 with no setting. On a remote host, run this over ssh with -L.
 
     python3 -I dashboard-cmd.py run --sandbox S --run DIR --port RESERVED --audit F --log F
+        [--no-proxy-loopback]
     python3 -I dashboard-cmd.py status --sandbox S
 
 --run is the host-only run/<sandbox>/, which here is the holder's folder: the
 holder's socket, its pid, host-relay.sock and service.port. `status` is what
-`enclos status` says on Linux: the command, and no URL.
+`enclos status` says on Linux: the command, and no URL. --no-proxy-loopback is
+half of a control pair (dashboard-chat-check.sh): this session alone gets
+NO_PROXY for its own loopback, so the terminal may reach its backend directly.
 """
 
 import argparse
@@ -31,6 +34,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 COMMAND = 'export PATH="$HOME/.local/bin:$PATH"; exec hermes dashboard --no-open'
+LOOPBACK = "127.0.0.1,localhost,::1"
 REFUSED = 3
 START_SECONDS = 600
 
@@ -44,6 +48,13 @@ def load(name):
 
 def url(port):
     return f"http://127.0.0.1:{port}/"
+
+
+def command(no_proxy_loopback):
+    """The session's command, with or without its loopback left out of the proxy."""
+    if not no_proxy_loopback:
+        return COMMAND
+    return f"export NO_PROXY={LOOPBACK} no_proxy={LOOPBACK}; {COMMAND}"
 
 
 def status_text(sandbox):
@@ -130,7 +141,7 @@ def run(o):
         holder_pid = f.read().strip()
     env = {**os.environ, "SBX_JOIN": "nsenter", "SBX_HOLDER": os.path.join(o.run, "holder.sock")}
     log = open(o.log, "ab")
-    session = subprocess.Popen([f"{HERE}/sbx-ns.sh", "--", "/bin/bash", "-c", COMMAND], env=env,
+    session = subprocess.Popen([f"{HERE}/sbx-ns.sh", "--", "/bin/bash", "-c", command(o.no_proxy_loopback)], env=env,
                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                start_new_session=True)
     srv, reason, code = None, "stopped", 0
@@ -192,6 +203,7 @@ def main():
     r.add_argument("--port", type=int, required=True)
     r.add_argument("--audit", required=True)
     r.add_argument("--log", required=True)
+    r.add_argument("--no-proxy-loopback", action="store_true")
     s = sub.add_parser("status")
     s.add_argument("--sandbox", required=True)
     o = p.parse_args()

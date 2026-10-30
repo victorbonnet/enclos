@@ -48,6 +48,15 @@ class Status(unittest.TestCase):
         self.assertIn("ssh", text)
 
 
+class ControlPair(unittest.TestCase):
+    def test_only_the_fixed_half_sets_no_proxy_and_both_run_the_dashboard(self):
+        self.assertNotIn("NO_PROXY", cmd.command(False))
+        fixed = cmd.command(True)
+        for part in ("NO_PROXY=127.0.0.1,localhost,::1", "no_proxy=127.0.0.1,localhost,::1"):
+            self.assertIn(part, fixed)
+        self.assertTrue(fixed.endswith(cmd.COMMAND))
+
+
 class Audit(unittest.TestCase):
     def test_each_event_is_one_json_line(self):
         with tempfile.TemporaryDirectory() as d:
