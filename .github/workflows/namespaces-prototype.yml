@@ -5,7 +5,7 @@ name: namespaces-prototype
 # share one network and PID namespace that enclos made first, what that
 # changes, what refuses each way of joining, and whether Hermes's clients
 # find a gateway in another session, what restarts do to open sessions, and
-# the host's path to a sandbox's service.
+# the host's path to a sandbox's service, with enclos dashboard's stand-in.
 # Every check acts on the host, so they run only on these throwaway runners.
 # Each writes its result to m3-results/, uploaded as the job's artifact and
 # shown in its summary. It reports; it does not gate merges.
@@ -52,6 +52,9 @@ jobs:
       - name: The host's path to a sandbox's service
         if: always()
         run: bash prototype/m3/dashboard-check.sh
+      - name: enclos dashboard, a second user, ssh -L and Ctrl-C
+        if: always()
+        run: bash prototype/m3/dashboard-cmd-check.sh
       - name: Summary
         if: always()
         run: |
