@@ -18,14 +18,19 @@ use crate::model::session::ProcessRef;
 
 /// `ps` could not answer.
 #[derive(Debug, thiserror::Error)]
-#[error("cannot look at processes with /bin/ps: {0}")]
-pub struct PsError(String);
+pub enum PsError {
+    #[error("cannot look at processes with /bin/ps: {0}")]
+    Ps(String),
+    /// A session's cgroup could not be found or read (`lifecycle::cgroup`).
+    #[error("cannot look at a session's cgroup: {0}")]
+    Cgroup(String),
+}
 
 #[cfg(test)]
 impl PsError {
     /// A `ps` failure with this reason, for tests of what follows one.
     pub(crate) fn new(why: &str) -> PsError {
-        PsError(why.to_owned())
+        PsError::Ps(why.to_owned())
     }
 }
 
@@ -39,7 +44,7 @@ fn ps(args: &[&str]) -> Result<Output, PsError> {
             .args(args),
         super::bounded::LIMIT,
     )
-    .map_err(|e| PsError(format!("/bin/ps: {e}")))
+    .map_err(|e| PsError::Ps(format!("/bin/ps: {e}")))
 }
 
 /// The five words of `lstart`, one space apart. `ps` pads a day before the
@@ -68,7 +73,7 @@ fn listed(out: &Output) -> Result<Option<String>, PsError> {
     match (out.status.code(), text.is_empty(), why.is_empty()) {
         (Some(0), false, _) => Ok(Some(text)),
         (Some(1), true, true) => Ok(None),
-        _ => Err(PsError(format!(
+        _ => Err(PsError::Ps(format!(
             "{}{}{}",
             out.status,
             match why.as_str() {
@@ -90,7 +95,7 @@ fn stat_and_start(pid: u32) -> Result<Option<(String, String)>, PsError> {
     };
     parse_start(&text)
         .map(Some)
-        .ok_or_else(|| PsError(format!("unexpected output `{text}`")))
+        .ok_or_else(|| PsError::Ps(format!("unexpected output `{text}`")))
 }
 
 /// The start time of `pid`, or `None` when no such process runs. A process
@@ -114,7 +119,7 @@ pub fn reference(pid: u32) -> Result<Option<ProcessRef>, PsError> {
 pub fn reference_of_child(child: &Child) -> Result<ProcessRef, PsError> {
     let pid = child.id();
     let (_, started) = stat_and_start(pid)?
-        .ok_or_else(|| PsError(format!("pid {pid}, just started, is not listed")))?;
+        .ok_or_else(|| PsError::Ps(format!("pid {pid}, just started, is not listed")))?;
     Ok(ProcessRef { pid, started })
 }
 
@@ -130,7 +135,7 @@ pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
     };
     pgid.parse()
         .map(Some)
-        .map_err(|_| PsError(format!("unexpected group `{pgid}`")))
+        .map_err(|_| PsError::Ps(format!("unexpected group `{pgid}`")))
 }
 
 /// A process as one listing shows it. `command` is what `ps` calls `comm`, to
@@ -172,8 +177,9 @@ fn parse_processes(text: &str) -> Result<Vec<(Proc, bool)>, PsError> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            parse_listing(line)
-                .ok_or_else(|| PsError(format!("unexpected line `{}` in the listing", line.trim())))
+            parse_listing(line).ok_or_else(|| {
+                PsError::Ps(format!("unexpected line `{}` in the listing", line.trim()))
+            })
         })
         .collect()
 }
@@ -183,14 +189,14 @@ pub fn processes() -> Result<Vec<Proc>, PsError> {
     let out = ps(&["-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=,comm="])?;
     if !out.status.success() {
         let why = String::from_utf8_lossy(&out.stderr);
-        return Err(PsError(format!("{} {}", out.status, why.trim())));
+        return Err(PsError::Ps(format!("{} {}", out.status, why.trim())));
     }
     let listed = parse_processes(&String::from_utf8_lossy(&out.stdout))?;
     // A listing that misses the process asking cannot be read, or is not
     // the whole listing.
     let me = std::process::id();
     if !listed.iter().any(|(p, _)| p.pid == me) {
-        return Err(PsError(format!(
+        return Err(PsError::Ps(format!(
             "the listing does not show pid {me}, the caller"
         )));
     }
