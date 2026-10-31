@@ -221,9 +221,26 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
-    /// The proxies' control sockets.
+    /// What runs keeps here, one folder per sandbox.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
+    }
+
+    /// The sandbox's folder of what runs. Only the host reads it.
+    pub fn sandbox_run_dir(&self, name: &str) -> PathBuf {
+        self.run_dir().join(name)
+    }
+
+    /// The socket a session with a network of its own reaches the sandbox's
+    /// proxy on, in the one folder of [`Layout::sandbox_run_dir`] that is for
+    /// the sandbox's sessions (design §15, Linux runtime boundary).
+    pub fn proxy_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("visible/proxy.sock")
+    }
+
+    /// Creates the folder of the sandbox's proxy socket.
+    pub fn create_proxy_socket_dir(&self, name: &str) -> Result<(), LayoutError> {
+        create_dir(&self.sandbox_run_dir(name).join("visible"))
     }
 
     /// Files no sandbox may read (ADR 0010). Each covers every file whose
@@ -399,6 +416,20 @@ fn create_dir(dir: &Path) -> Result<(), LayoutError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proxy_sockets_folders_are_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path().join("enclos"));
+        layout.create_proxy_socket_dir("home").unwrap();
+        let socket = layout.proxy_socket("home");
+        let visible = socket.parent().unwrap();
+        for folder in [layout.sandbox_run_dir("home").as_path(), visible] {
+            let mode = std::fs::metadata(folder).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", folder.display());
+        }
+    }
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {

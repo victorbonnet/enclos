@@ -231,6 +231,7 @@ mod history;
 mod listener;
 mod pending;
 mod policy;
+mod proxy_socket;
 mod runtime;
 mod sandbox;
 mod secrets;
