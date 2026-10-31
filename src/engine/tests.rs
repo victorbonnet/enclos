@@ -7208,10 +7208,19 @@ mod listener {
         name: &SandboxName,
         ports: usize,
     ) -> (std::process::Child, u16) {
-        let (child, held) = perl(&listening(ports, "127.0.0.1"), ports);
-        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
-        record_gateway(engine, name, root);
-        (child, held[0])
+        // The kernel's ephemeral ports hold the proxy's range, which the
+        // engine refuses in a gateway, so one that lands there is dropped.
+        let proxy_ports = crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST;
+        loop {
+            let (child, held) = perl(&listening(ports, "127.0.0.1"), ports);
+            if held.iter().any(|port| proxy_ports.contains(port)) {
+                end(child);
+                continue;
+            }
+            let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+            record_gateway(engine, name, root);
+            return (child, held[0]);
+        }
     }
 
     pub(super) fn end(mut child: std::process::Child) {
