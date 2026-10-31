@@ -11,8 +11,8 @@ use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 pub fn insert(conn: &Connection, s: &SessionRecord) -> rusqlite::Result<SessionId> {
     conn.execute(
         "INSERT INTO sessions (sandbox, kind, version, snapshot, compiled, root_pid,
-             root_start, pgid, tracked, started_at, ended_at, service)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)",
+             root_start, pgid, tracked, started_at, ended_at, service, cgroup)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)",
         params![
             s.sandbox.as_str(),
             s.kind.as_str(),
@@ -25,6 +25,7 @@ pub fn insert(conn: &Connection, s: &SessionRecord) -> rusqlite::Result<SessionI
             encode(&s.tracked),
             s.started_at.to_string(),
             s.service,
+            s.cgroup,
         ],
     )?;
     Ok(SessionId(conn.last_insert_rowid()))
@@ -92,6 +93,7 @@ fn session(row: &Row<'_>) -> Result<SessionRecord, ReadError> {
             started: row.get(7)?,
         },
         pgid: row.get(8)?,
+        cgroup: row.get(13)?,
         tracked: decode(&tracked)?,
         started_at: time(&started_at)?,
         ended_at: ended_at.as_deref().map(time).transpose()?,
@@ -105,7 +107,7 @@ pub fn list(
 ) -> Result<Vec<SessionRecord>, ReadError> {
     let mut stmt = conn.prepare(
         "SELECT id, sandbox, kind, version, snapshot, compiled, root_pid, root_start,
-                pgid, tracked, started_at, ended_at, service
+                pgid, tracked, started_at, ended_at, service, cgroup
          FROM sessions WHERE sandbox = ?1 AND (?2 = 0 OR ended_at IS NULL) ORDER BY id",
     )?;
     let mut rows = stmt.query(params![sandbox.as_str(), running_only])?;

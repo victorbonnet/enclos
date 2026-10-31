@@ -323,6 +323,7 @@ fn put_session(
             .unwrap()
             .unwrap(),
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: start,
         ended_at: end,
@@ -370,6 +371,7 @@ fn the_last_use_counts_connect_and_service_sessions_and_the_network_not_the_prox
             .unwrap()
             .unwrap(),
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: start,
         ended_at: end,
