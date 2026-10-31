@@ -6,6 +6,7 @@
 pub mod fake;
 #[cfg(target_os = "macos")]
 pub mod launchd;
+pub mod systemd;
 
 use std::ffi::OsString;
 use std::fmt;
