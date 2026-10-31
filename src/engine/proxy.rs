@@ -248,6 +248,7 @@ impl Engine {
             compiled: None,
             root: reference_of_child(child)?,
             pgid: Some(child.id()),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,

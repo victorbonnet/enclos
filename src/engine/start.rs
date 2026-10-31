@@ -243,6 +243,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 root,
                 pgid: group.pgid(child.id(), std::process::id()),
+                cgroup: None,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,

@@ -102,6 +102,8 @@ pub const MIGRATIONS: &[&str] = &[
     // 10: the secret store holding each secret's value (design §12); every
     // secret before this was in the Keychain
     "ALTER TABLE secrets ADD COLUMN store TEXT NOT NULL DEFAULT 'keychain';",
+    // 11: the cgroup of each session's scope, on Linux (design §8)
+    "ALTER TABLE sessions ADD COLUMN cgroup TEXT;",
 ];
 
 /// The schema version this enclos reads and writes.
