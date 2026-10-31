@@ -1,4 +1,10 @@
-//! Finding a session's members on macOS (design §8, ADR 0019).
+//! Finding a session's members (design §8, ADR 0019).
+//!
+//! On Linux a session is in a cgroup, and its members are the processes in
+//! it: the engine and `stop` add them to `tracked`, read from
+//! `lifecycle::cgroup`, and nothing is counted by its group alone, since the
+//! cgroup says what is the session's. The rest of this holds for a session
+//! with no cgroup, as on macOS.
 //!
 //! A session's members are its root process and what it recorded, every
 //! child of a member, and every process in a group a member leads: an
@@ -81,7 +87,7 @@ pub fn find(procs: &[Proc], session: &SessionRecord, tracked: &[ProcessRef]) -> 
     // session's.) In the group of the `enclos` holding the terminal, which
     // is not a member, only what lost its parent counts: a pager piped
     // from `enclos` is the caller's.
-    let mut counted: BTreeSet<u32> = match session.pgid {
+    let mut counted: BTreeSet<u32> = match session.pgid.filter(|_| session.cgroup.is_none()) {
         None => BTreeSet::new(),
         Some(pgid) => {
             let made_for_it = pgid == session.root.pid;
@@ -174,6 +180,7 @@ mod tests {
             compiled: None,
             root: at(root),
             pgid,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -312,6 +319,17 @@ mod tests {
         // apart from what the session left, so the session stays open rather
         // than ending while a member may run.
         assert!(!is_gone(&[proc(24, 1, 20)], &s));
+    }
+
+    #[test]
+    fn a_session_in_a_cgroup_counts_nothing_by_its_group() {
+        // What the program left in its group, outside its cgroup, is not
+        // the session's; what the engine found in the cgroup is, for sure.
+        let procs = vec![proc(31, 1, 30), proc(40, 1, 40)];
+        let mut s = session(30, Some(30));
+        s.cgroup = Some("/s.scope".into());
+        assert!(is_gone(&procs, &s));
+        assert_eq!(pids(&find(&procs, &s, &[at(40)])), [(40, true)]);
     }
 
     #[test]

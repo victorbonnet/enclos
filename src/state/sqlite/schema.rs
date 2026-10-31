@@ -99,6 +99,8 @@ pub const MIGRATIONS: &[&str] = &[
     // (design §6, server name check)
     "ALTER TABLE net_events ADD COLUMN name_seen TEXT;
     ALTER TABLE net_events ADD COLUMN server_name TEXT;",
+    // 10: the cgroup of each session's scope, on Linux (design §8)
+    "ALTER TABLE sessions ADD COLUMN cgroup TEXT;",
 ];
 
 /// The schema version this enclos reads and writes.
