@@ -32,8 +32,10 @@ other="$H/.enclos/sandboxes/other/home"
 mkdir -p "$other"
 echo planted >"$other/enclos-proto-planted"
 echo readable >"$H/enclos-proto-readable.txt"
-cp /usr/bin/true "$SBX_HOME/true-copy"
-cp /usr/bin/true "$WORK/true-copy"
+# Still named `true`: where it is a multi-call binary, as on Ubuntu 26.04, a
+# copy under another name fails, and that would read as a refusal.
+cp /usr/bin/true "$SBX_HOME/true"
+cp /usr/bin/true "$WORK/true"
 printf '#!/bin/sh\necho ran\n' >"$WORK/hello.sh"
 chmod +x "$WORK/hello.sh"
 
@@ -64,8 +66,8 @@ probes+=(
     "leave /tmp/enclos-proto-left"
     "rename $SBX_HOME"
     "rename $WORK"
-    "exec $SBX_HOME/true-copy"
-    "exec $WORK/true-copy"
+    "exec $SBX_HOME/true"
+    "exec $WORK/true"
     "exec $WORK/hello.sh"
     "unshare user"
     "unshare mount"
