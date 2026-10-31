@@ -337,9 +337,12 @@ impl Engine {
             // A session that cannot be told gone counts as running: its
             // file is still compared, and its count said to be unsure.
             let look = match procs.get_or_init(processes) {
-                Ok(procs) => {
-                    Look::in_listing(procs, &self.markers(name)).map_err(|e| e.to_string())
-                }
+                Ok(procs) => Look::in_listing(procs, &self.markers(name))
+                    .map_err(|e| e.to_string())
+                    .and_then(|look| {
+                        look.in_cgroups(&self.cgroups, open.iter().copied())
+                            .map_err(|e| e.to_string())
+                    }),
                 Err(e) => Err(e.to_string()),
             };
             if let Err(e) = &look {
