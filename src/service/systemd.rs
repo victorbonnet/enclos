@@ -471,4 +471,153 @@ WantedBy=default.target
             ]
         );
     }
+
+    /// Whether to run the tests below, which install real units in the
+    /// user's manager, so only on a throwaway runner: CI's `systemd-units`
+    /// job sets `ENCLOS_SYSTEMD_UNIT_TESTS`, and they refuse anywhere else.
+    fn on_a_runner() -> bool {
+        if std::env::var("ENCLOS_SYSTEMD_UNIT_TESTS").as_deref() != Ok("1") {
+            eprintln!("systemd unit tests not run: CI's systemd-units job runs them");
+            return false;
+        }
+        let var = |name: &str| std::env::var(name).unwrap_or_default();
+        assert!(
+            var("GITHUB_ACTIONS") == "true" && var("RUNNER_ENVIRONMENT") == "github-hosted",
+            "these tests install real units: they run only on a GitHub-hosted runner"
+        );
+        true
+    }
+
+    /// A service running `script` on the runner's manager.
+    struct Started {
+        systemd: Systemd,
+        label: ServiceLabel,
+        log: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Started {
+        fn new(case: &str, script: &str, stop_timeout: Duration) -> Started {
+            let home = std::env::var_os("HOME").unwrap();
+            let systemd = Systemd::for_user(Path::new(&home));
+            systemd.available().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("service.log");
+            let label = label(&format!("enclos.ci{}.{case}.test", std::process::id()));
+            systemd
+                .start(&ServiceUnit {
+                    label: label.clone(),
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    log: log.clone(),
+                    env: Vec::new(),
+                    stop_timeout,
+                })
+                .unwrap();
+            Started {
+                systemd,
+                label,
+                log,
+                _dir: dir,
+            }
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Waits past a few restart delays for `count` lines in the log.
+        fn wait_for_lines(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while self.lines().len() < count {
+                assert!(
+                    Instant::now() < deadline,
+                    "{}: {:?}",
+                    self.label,
+                    self.lines()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn stop_leaves_nothing_installed(&self) {
+            self.systemd.stop(&self.label).unwrap();
+            let dir = &self.systemd.units_dir;
+            let name = unit_name(&self.label);
+            assert!(
+                self.systemd
+                    .installed(self.label.as_str())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!dir.join(&name).exists());
+            let wanted = dir.join("default.target.wants").join(&name);
+            assert!(wanted.symlink_metadata().is_err(), "{}", wanted.display());
+            assert_eq!(
+                self.systemd.status(&self.label).unwrap(),
+                ServiceStatus::NotLoaded
+            );
+        }
+    }
+
+    const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn on_a_runner_a_service_that_exits_75_is_started_again() {
+        if !on_a_runner() {
+            return;
+        }
+        let service = Started::new("exits75", "echo ran; exit 75", STOP_TIMEOUT);
+        service.wait_for_lines(2);
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_a_service_that_exits_0_is_not_started_again() {
+        if !on_a_runner() {
+            return;
+        }
+        let service = Started::new("exits0", "echo ran; exit 0", STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        // Past the restart delay of `RestartSec`.
+        std::thread::sleep(Duration::from_secs(15));
+        assert_eq!(service.lines().len(), 1);
+        assert_eq!(
+            service.systemd.status(&service.label).unwrap(),
+            ServiceStatus::Loaded
+        );
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_a_service_ended_by_a_term_it_did_not_ask_for_is_started_again() {
+        if !on_a_runner() {
+            return;
+        }
+        let service = Started::new("signalled", "echo ran; kill -TERM $$", STOP_TIMEOUT);
+        service.wait_for_lines(2);
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_stop_sends_term_then_kills_after_the_timeout() {
+        if !on_a_runner() {
+            return;
+        }
+        let script = "trap 'echo term' TERM; echo ready; while :; do sleep 1; done";
+        let service = Started::new("ignores", script, STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        let ServiceStatus::Running { pid } = service.systemd.status(&service.label).unwrap() else {
+            panic!("{} is not running", service.label);
+        };
+        let began = Instant::now();
+        service.stop_leaves_nothing_installed();
+        assert!(began.elapsed() >= STOP_TIMEOUT, "{:?}", began.elapsed());
+        assert_eq!(service.lines(), ["ready", "term"]);
+        assert!(!Path::new("/proc").join(pid.to_string()).exists());
+    }
 }

@@ -56,6 +56,31 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test --release --locked --test cli init_takes_allow_default_only_in_a_debug_build
 
+  systemd-units:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The tests that install real units run only on these throwaway
+      # runners, never on a developer's host (src/service/systemd.rs).
+      ENCLOS_SYSTEMD_UNIT_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the toolchain and components pinned in rust-toolchain.toml
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # A runner has no login session, so no user manager without this. It
+      # says nothing of what enclos does about lingering (design §15).
+      - name: A user manager for the runner
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime_dir="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
+          timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
+      - run: cargo test --locked --all-features --lib service::systemd::tests::on_a_runner
+
   secrets:
     runs-on: ubuntu-latest
     steps:
@@ -77,7 +102,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, secrets, deny]
+    needs: [lint, test, systemd-units, secrets, deny]
     runs-on: ubuntu-latest
     steps:
       - name: Check needed jobs
