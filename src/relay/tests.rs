@@ -61,14 +61,20 @@ impl Relay {
             loop {
                 let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
                 let _ = client.write_all(b"x");
-                client.set_read_timeout(Some(PATIENCE)).unwrap();
+                // macOS refuses the option (EINVAL) on a connection already
+                // closed both ways, as this one is if it was over the limit;
+                // the read below then cannot wait.
+                let _ = client.set_read_timeout(Some(PATIENCE));
                 if client.read(&mut [0; 1]).unwrap_or(0) == 1 {
                     done.send(()).unwrap();
                     return;
                 }
             }
         });
-        (&self.accepted()).write_all(b"y").unwrap();
+        // Held open until the client has read: closing it with the client's
+        // byte unread could reset the connection and lose the answer.
+        let upstream = self.accepted();
+        (&upstream).write_all(b"y").unwrap();
         wait.recv_timeout(PATIENCE).unwrap();
     }
 
