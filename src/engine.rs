@@ -159,7 +159,7 @@ impl Engine {
         let audit = JsonlAuditLog::new(layout.audit_log());
         let services = crate::service::host(layout.user_home());
         let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
-            Ok(install) => crate::secrets::host(format!("enclos.{install}")),
+            Ok(install) => crate::secrets::host(format!("enclos.{install}"), layout.secrets_file()),
             Err(e) => Box::new(crate::secrets::Unavailable {
                 why: format!("enclos cannot tell this install apart from others: {e}"),
             }),

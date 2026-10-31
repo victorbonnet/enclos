@@ -2,7 +2,13 @@
 //! interface. enclos's own records say which secrets a sandbox has; only the
 //! store holds their values, and nothing writes a value anywhere else.
 
+pub mod file;
 pub mod keychain;
+pub mod libsecret;
+mod tool;
+
+use std::cell::OnceCell;
+use std::path::PathBuf;
 
 use crate::model::secret::{SecretRef, SecretValue};
 
@@ -38,15 +44,73 @@ pub struct SecretError {
     pub untouched: bool,
 }
 
-/// The store of this host: the user's Keychain on macOS, or the keychain
+/// The store of this host: on macOS the user's Keychain, or the keychain
 /// file `ENCLOS_KEYCHAIN` names (for tests and CI), its items under
-/// `service`, which names the enclos install.
-pub fn host(service: String) -> Box<dyn SecretStore> {
+/// `service`, which names the enclos install; on Linux libsecret when a
+/// Secret Service answers, else `file`.
+pub fn host(service: String, file: PathBuf) -> Box<dyn SecretStore> {
     match cfg!(target_os = "macos") {
         true => Box::new(keychain::Keychain::from_env(service)),
-        false => Box::new(Unavailable {
-            why: "secrets need the macOS Keychain on this build; libsecret and a 0600 file come with Linux (milestone 3)".to_owned(),
-        }),
+        false => Box::new(Picked::new(
+            Box::new(libsecret::Libsecret::from_env(service)),
+            Box::new(file::FileStore::new(file)),
+        )),
+    }
+}
+
+/// A store that can say whether it can be reached at all.
+pub trait Prober: SecretStore {
+    fn answers(&self) -> bool;
+}
+
+/// The first store if it answers, else the second. It looks once, as a
+/// secret is first needed: a command that needs none reaches no bus.
+pub struct Picked {
+    preferred: Box<dyn Prober>,
+    otherwise: Box<dyn SecretStore>,
+    answered: OnceCell<bool>,
+}
+
+impl Picked {
+    pub fn new(preferred: Box<dyn Prober>, otherwise: Box<dyn SecretStore>) -> Picked {
+        Picked {
+            preferred,
+            otherwise,
+            answered: OnceCell::new(),
+        }
+    }
+
+    fn store(&self) -> &dyn SecretStore {
+        match self.answered.get_or_init(|| self.preferred.answers()) {
+            true => &*self.preferred,
+            false => &*self.otherwise,
+        }
+    }
+}
+
+impl SecretStore for Picked {
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
+        self.store().set(secret, value)
+    }
+
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
+        self.store().get(secret)
+    }
+
+    fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
+        self.store().remove(secret)
+    }
+
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        self.store().whereabouts(secret)
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        self.store().env()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        self.store().readable()
     }
 }
 
@@ -151,5 +215,106 @@ impl<T: SecretStore> SecretStore for std::rc::Rc<T> {
 
     fn readable(&self) -> Result<(), SecretError> {
         (**self).readable()
+    }
+}
+
+/// The store in memory as a Secret Service that answers or does not,
+/// counting the looks, in place of the real look at a session bus.
+#[cfg(test)]
+pub struct Stubbed {
+    pub answers: bool,
+    pub looks: std::rc::Rc<std::cell::Cell<usize>>,
+    pub store: std::rc::Rc<InMemory>,
+}
+
+#[cfg(test)]
+impl SecretStore for Stubbed {
+    fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
+        self.store.set(secret, value)
+    }
+
+    fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
+        self.store.get(secret)
+    }
+
+    fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
+        self.store.remove(secret)
+    }
+
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        self.store.whereabouts(secret)
+    }
+}
+
+#[cfg(test)]
+impl Prober for Stubbed {
+    fn answers(&self) -> bool {
+        self.looks.set(self.looks.get() + 1);
+        self.answers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn secret() -> SecretRef {
+        "home/telegram".parse().unwrap()
+    }
+
+    fn value() -> SecretValue {
+        SecretValue::new("tok".to_owned()).unwrap()
+    }
+
+    struct Case {
+        picked: Picked,
+        service: Rc<InMemory>,
+        file: Rc<InMemory>,
+        looks: Rc<Cell<usize>>,
+    }
+
+    fn case(answers: bool) -> Case {
+        let (service, file, looks) = (Rc::default(), Rc::default(), Rc::default());
+        let picked = Picked::new(
+            Box::new(Stubbed {
+                answers,
+                looks: Rc::clone(&looks),
+                store: Rc::clone(&service),
+            }),
+            Box::new(Rc::clone(&file)),
+        );
+        Case {
+            picked,
+            service,
+            file,
+            looks,
+        }
+    }
+
+    #[test]
+    fn a_service_that_answers_is_picked() {
+        let case = case(true);
+        case.picked.set(&secret(), &value()).unwrap();
+        assert!(case.service.0.borrow().contains_key(&secret()));
+        assert!(case.file.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn no_service_answering_is_the_cue_to_use_the_file() {
+        let case = case(false);
+        case.picked.set(&secret(), &value()).unwrap();
+        assert!(case.file.0.borrow().contains_key(&secret()));
+        assert!(case.service.0.borrow().is_empty());
+    }
+
+    #[test]
+    fn nothing_looks_until_a_secret_is_needed_and_then_once() {
+        let case = case(true);
+        assert_eq!(case.looks.get(), 0);
+        case.picked.get(&secret()).unwrap();
+        case.picked.remove(&secret()).unwrap();
+        assert_eq!(case.looks.get(), 1);
     }
 }

@@ -53,7 +53,7 @@ enum Command {
     Connect(cli::connect::ConnectArgs),
     /// Run one command inside a sandbox, for a script or another program; exits with its code.
     Exec(cli::connect::ExecArgs),
-    /// Set, list or remove a sandbox's secrets, kept in the Keychain.
+    /// Set, list or remove a sandbox's secrets, kept in the secret store.
     Secret(cli::secret::SecretArgs),
     /// Check enclos's records against the host, or repair what it can.
     State(cli::state::StateArgs),

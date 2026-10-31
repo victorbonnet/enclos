@@ -265,7 +265,7 @@ pub enum Error {
     },
     /// A secret the policy grants, which the secret store does not hold.
     #[error(
-        "the policy gives secret {secret} as ${variable}, but the Keychain has no value for it; set it with `enclos secret set {secret}`"
+        "the policy gives secret {secret} as ${variable}, but the secret store has no value for it; set it with `enclos secret set {secret}`"
     )]
     SecretMissing {
         secret: crate::model::secret::SecretRef,

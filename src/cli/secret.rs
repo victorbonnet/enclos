@@ -25,7 +25,7 @@ pub struct SecretArgs {
 
 #[derive(Subcommand)]
 enum SecretVerb {
-    /// Store a secret of a sandbox in the Keychain, reading its value from
+    /// Store a secret of a sandbox in the secret store, reading its value from
     /// the input: one line typed without echo at a terminal, or all of what
     /// is piped in, its final line ending left out.
     Set {
@@ -35,7 +35,7 @@ enum SecretVerb {
     /// List a sandbox's secrets and what its policy gives each as; never
     /// their values.
     List { sandbox: SandboxName },
-    /// Remove a secret of a sandbox from the Keychain.
+    /// Remove a secret of a sandbox from the secret store.
     Rm { secret: SecretRef },
 }
 
@@ -85,7 +85,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                     output::emit(&json!({"secret": secret.to_string(), "removed": true}))
                 }
                 (Planned::Done(()), false) => {
-                    println!("Removed secret {secret} from the Keychain.")
+                    println!("Removed secret {secret} from the secret store.")
                 }
             }
         }
@@ -93,7 +93,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
     Ok(exit::OK)
 }
 
-/// The most read from a pipe: far more than the Keychain takes.
+/// The most read from a pipe: far more than a store takes.
 const MAX_INPUT: usize = 1 << 20;
 
 /// The most typed at a terminal: a longer value is piped in.
@@ -473,8 +473,8 @@ impl Drop for Quiet<'_> {
 
 fn print_set(secret: &SecretRef, set: &SecretSet) {
     match set.new {
-        true => println!("Stored secret {secret} in the Keychain."),
-        false => println!("Replaced the value of secret {secret} in the Keychain."),
+        true => println!("Stored secret {secret} in the secret store."),
+        false => println!("Replaced the value of secret {secret} in the secret store."),
     }
     let sandbox = &secret.sandbox;
     let shown = |grants: &[&Grant]| {
@@ -543,7 +543,7 @@ fn print_list(sandbox: &SandboxName, secrets: &[SecretView]) {
         );
         return;
     }
-    println!("Secrets of sandbox {sandbox} (values are in the Keychain, never shown):");
+    println!("Secrets of sandbox {sandbox} (values are in the secret store, never shown):");
     for s in secrets {
         let shown = |grants: &[Grant]| match grants {
             [] => "not granted".to_owned(),
