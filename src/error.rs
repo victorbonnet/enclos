@@ -168,6 +168,15 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
+    /// The relay cannot hold its port in the session's network.
+    #[error("the relay cannot listen on 127.0.0.1:{port}: {source}")]
+    RelayListen { port: u16, source: std::io::Error },
+    /// The path the relay forwards to can never be a Unix socket's.
+    #[error("the relay cannot use {path} as a Unix socket: {source}")]
+    RelaySocket {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "sandbox `{sandbox}` has no pending policy: changes that need no restart are in force already. `enclos policy show {sandbox}` shows its policy"
     )]
@@ -357,6 +366,8 @@ impl Error {
             | Error::ProxyListen { .. }
             | Error::ProxySocket { .. }
             | Error::ProxyStopped { .. }
+            | Error::RelayListen { .. }
+            | Error::RelaySocket { .. }
             | Error::Compile(_)
             | Error::HomeNotAFolder { .. }
             | Error::ActivePolicyInvalid { .. }

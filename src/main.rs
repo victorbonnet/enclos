@@ -79,6 +79,9 @@ enum Command {
     /// Run a sandbox's egress proxy; started by enclos itself.
     #[command(hide = true)]
     Proxy(cli::proxy::ProxyArgs),
+    /// Pass connections on a port of 127.0.0.1 to a Unix socket; started by enclos itself inside a session.
+    #[command(hide = true)]
+    Relay(cli::relay::RelayArgs),
 }
 
 #[derive(Args)]
@@ -256,9 +259,13 @@ fn say(line: &str) {
 }
 
 fn run(cli: Cli) -> Result<u8> {
+    let command = match cli.command {
+        Command::Relay(args) => return cli::relay::run(args),
+        command => command,
+    };
     let engine = Engine::open(Layout::from_env()?);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
-    match cli.command {
+    match command {
         Command::Init => {
             let planned = engine.init(&current_actor(), confirm)?;
             match cli::output::json() {
@@ -313,6 +320,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
+        Command::Relay(_) => unreachable!("run above, with no engine"),
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Status(args) => cli::status::run(&engine, args),
@@ -324,7 +332,7 @@ fn run(cli: Cli) -> Result<u8> {
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
 /// `exec`, `runtime`, and the `agent` verbs but `list`), keep running
-/// (`proxy`, `launch`), or handle a closed output themselves (`logs`). No
+/// (`proxy`, `relay`, `launch`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
 fn ends_on_closed_output(command: &Command) -> bool {
     match command {
@@ -342,6 +350,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Exec(_)
         | Command::Runtime(_)
         | Command::Proxy(_)
+        | Command::Relay(_)
         | Command::Launch(_)
         | Command::Logs(_) => false,
     }

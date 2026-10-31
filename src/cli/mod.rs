@@ -9,6 +9,7 @@ pub mod net;
 pub mod output;
 pub mod policy;
 pub mod proxy;
+pub mod relay;
 pub mod runtime;
 pub mod sandbox;
 pub mod secret;
