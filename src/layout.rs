@@ -221,6 +221,11 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
+    /// The file store's one file (design §12): for the host alone.
+    pub fn secrets_file(&self) -> PathBuf {
+        self.data.join("secrets.json")
+    }
+
     /// What runs keeps here, one folder per sandbox.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
@@ -247,12 +252,17 @@ impl Layout {
     /// name starts with it too, such as `state.db-journal` or
     /// `audit.jsonl.torn-12`.
     pub fn hidden_files(&self) -> Vec<PathBuf> {
-        vec![
+        let mut files = vec![
             self.state_db(),
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
-        ]
+        ];
+        // Only Linux has the file store; macOS's rules stay as they are.
+        if cfg!(target_os = "linux") {
+            files.push(self.secrets_file());
+        }
+        files
     }
 
     /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
@@ -416,6 +426,16 @@ fn create_dir(dir: &Path) -> Result<(), LayoutError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandbox never reads the file store, its leftovers included: a hidden
+    /// file covers every name that starts with it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_file_store_is_hidden_from_sandboxes() {
+        let layout = Layout::at("/data/enclos");
+        assert!(layout.hidden_files().contains(&layout.secrets_file()));
+        assert!(layout.secrets_file().starts_with(layout.data()));
+    }
 
     #[test]
     fn a_proxy_sockets_folders_are_the_users_alone() {
