@@ -83,6 +83,10 @@ _Avoid_: stale session, zombie session
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key
 
+**Secret store**:
+Where enclos keeps secrets' values on the host, outside every sandbox: the macOS Keychain, the Secret Service through libsecret, or the file store, a `0600` file for a host where no Secret Service answers.
+_Avoid_: vault, keystore
+
 **Channel**:
 A messaging service, such as Telegram, through which a sandbox answers people.
 _Avoid_: platform, integration
