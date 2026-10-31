@@ -21,6 +21,7 @@ use super::service::{PROXY_WAIT, STOP_GRACE};
 use crate::backend::{Launch, environment};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::cgroup::Scope;
 use crate::lifecycle::marker::{self, Marker};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
@@ -266,7 +267,8 @@ impl Engine {
         let tmp = ctx.home.join("tmp");
         std::fs::create_dir_all(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
         let backend = self.backend_of(name)?;
-        let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
+        let wrapped = backend.wrap(&compiled, &ctx, &launch);
+        let (mut wrapped, scope) = self.in_scope(name, wrapped)?;
         if own_group {
             wrapped.process_group(0);
         }
@@ -283,6 +285,7 @@ impl Engine {
             let keep_waiting = KeepWaiting::new()?;
             let root = reference_of_child(&child)?;
             self.name_marker(name, marked, &root)?;
+            let cgroup = cgroup_of(scope.as_ref(), &child)?;
             let me = std::process::id();
             let mut session = SessionRecord {
                 id: SessionId(0),
@@ -300,6 +303,7 @@ impl Engine {
                     (false, true) => Some(me),
                     (false, false) => None,
                 },
+                cgroup,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,
@@ -706,9 +710,33 @@ impl Engine {
         }
     }
 
-    /// The processes holding each marker of sandbox `name`, by marker.
+    /// `wrapped` as the program of a new scope in sandbox `name`'s slice,
+    /// and that scope, when this engine runs programs in scopes (design §8).
+    pub(super) fn in_scope(
+        &self,
+        name: &SandboxName,
+        wrapped: Command,
+    ) -> Result<(Command, Option<Scope>)> {
+        if !self.scopes {
+            return Ok((wrapped, None));
+        }
+        let scope = Scope::new(&self.layout.install_id()?, name.as_str());
+        Ok((scope.wrap(&wrapped), Some(scope)))
+    }
+
+    /// The processes that are each session of sandbox `name`'s for sure,
+    /// beside what it tracked, by its marker's name: those holding its
+    /// marker (ADR 0030) and those in its cgroup (design §8).
     pub(super) fn held(&self, name: &SandboxName) -> Result<Held> {
-        Ok(marker::holders(&self.markers(name))?)
+        let mut held = marker::holders(&self.markers(name))?;
+        for session in self.state.sessions(name, true)? {
+            if let Some(cgroup) = &session.cgroup {
+                held.entry(marker::name_of(&session.root))
+                    .or_default()
+                    .extend(self.cgroups.pids(cgroup)?);
+            }
+        }
+        Ok(held)
     }
 
     /// `session`, with the processes holding its marker added to those it
@@ -983,6 +1011,7 @@ impl Engine {
             compiled: None,
             root: reference_of_child(child)?,
             pgid: Some(child.id()),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -1113,7 +1142,17 @@ pub(super) fn merged(
     })
 }
 
-/// The processes holding each marker of a sandbox, by marker file name.
+/// Where `child`, the program of `scope`, is held. An error ends the
+/// program, as any failure to record its session does.
+pub(super) fn cgroup_of(scope: Option<&Scope>, child: &Child) -> Result<Option<String>> {
+    match scope {
+        Some(scope) => Ok(scope.cgroup_of(child.id())?),
+        None => Ok(None),
+    }
+}
+
+/// The processes that are each session's for sure (see `Engine::held`), by
+/// marker file name.
 pub(super) type Held = std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>;
 
 /// `tracked`, with the processes in `procs` that hold `session`'s marker

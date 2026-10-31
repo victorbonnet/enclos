@@ -109,6 +109,22 @@ fn rejects_a_newer_schema() {
 }
 
 #[test]
+fn a_new_database_has_each_sessions_cgroup() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    let declared: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('sessions') WHERE name = 'cgroup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(declared, "TEXT");
+}
+
+#[test]
 fn rejects_a_schema_its_migrations_do_not_make() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();
@@ -516,6 +532,7 @@ fn sessions_keep_their_members_until_they_end() {
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
         root: at(10),
         pgid: None,
+        cgroup: Some("/enclos.1f2e3d4c.home.slice/s.scope".into()),
         tracked: vec![at(11)],
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -562,6 +579,7 @@ fn only_a_service_session_names_a_service() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -602,6 +620,7 @@ fn a_session_and_its_sandboxs_state_are_written_together_or_not_at_all() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,

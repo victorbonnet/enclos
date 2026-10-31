@@ -917,6 +917,7 @@ mod sandbox {
             compiled: None,
             root,
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -1559,6 +1560,7 @@ mod sandbox {
             compiled: None,
             root: reference(program.id()).unwrap().unwrap(),
             pgid: Some(program.id()),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -1640,6 +1642,8 @@ mod sandbox {
 }
 
 mod runtime {
+    mod cgroups;
+
     use super::policy::with_sandbox_on;
     use super::*;
     use crate::model::agent::{AgentName, AgentRecord};
@@ -3213,6 +3217,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             compiled: None,
             pgid: Some(child.id()),
             root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -3287,6 +3292,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             compiled: None,
             pgid: Some(child.id()),
             root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -3349,6 +3355,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                 compiled: None,
                 pgid: Some(setup.id()),
                 root: crate::lifecycle::process::reference_of_child(&setup).unwrap(),
+                cgroup: None,
                 tracked: Vec::new(),
                 started_at: crate::model::now(),
                 ended_at: None,
@@ -3553,6 +3560,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             compiled: None,
             pgid: Some(child.id()),
             root,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -3663,6 +3671,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
             compiled: None,
             pgid: None,
             root: root(pid),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -4751,6 +4760,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                         compiled: None,
                         pgid,
                         root,
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -5082,6 +5092,7 @@ chmod 700 \"$HOME/.local/bin/hermes\"
                         compiled: None,
                         pgid: None,
                         root,
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -5368,6 +5379,7 @@ mod services {
                         compiled: None,
                         pgid: None,
                         root: root.clone(),
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -5547,6 +5559,7 @@ mod services {
                         compiled: None,
                         root,
                         pgid: None,
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -6310,6 +6323,7 @@ mod services {
                         compiled: None,
                         pgid: None,
                         root: crate::lifecycle::process::reference(me)?.unwrap(),
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -6354,6 +6368,7 @@ mod services {
                         compiled: None,
                         pgid: None,
                         root: root.clone(),
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
@@ -6752,6 +6767,7 @@ mod status {
                 .unwrap()
                 .unwrap(),
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: start,
             ended_at: end,
@@ -6799,6 +6815,7 @@ mod status {
                 .unwrap()
                 .unwrap(),
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: start,
             ended_at: end,
@@ -7163,6 +7180,7 @@ mod listener {
                         compiled: None,
                         root,
                         pgid: None,
+                        cgroup: None,
                         tracked: Vec::new(),
                         started_at: crate::model::now(),
                         ended_at: None,
