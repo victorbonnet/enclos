@@ -17,6 +17,7 @@ pub mod notes;
 pub mod policy;
 pub mod probes;
 pub mod proxy;
+pub mod relay;
 pub mod runtime;
 pub mod secrets;
 pub mod service;
