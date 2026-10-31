@@ -174,7 +174,7 @@ These need an account, so they cannot run in CI. In a disposable VM (Ubuntu 24.0
 **Still a draft: measured in part.** This is what `compile.py` and `inside.py` produce; `compile.py` is the reference if the two disagree. What the run on PR #113 showed, on both Ubuntu runners, is in the results above. In short:
 
 - **The arguments:** bubblewrap 0.9.0 accepted them as they are, with the AppArmor profile, and every option is in 0.8.0, 0.9.0 and 0.12.0.
-- **Landlock:** the rules applied on ABI 8, and the execute rule refused programs in the workspace. Its write rules were not shown refusing anything on their own, since the mounts refuse first.
+- **Landlock:** the rules applied on ABI 8, and the execute rule refused programs in the workspace. Its write rules were not shown refusing anything on their own, since the mounts refuse first. M3-14's CI job later showed that outside this prototype, for making a file, on both architectures (design §14); the other write rights are still to show.
 - **seccomp:** the filter refused the calls probed: `keyctl`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, a user namespace and TIOCSTI. The rest of the list was not probed one by one.
 - **Chromium:** with its own sandbox off, it loaded a page over the DevTools protocol in full mode on both runners (results above). With Landlock, its renderer OOM-score writes are refused; the page loads regardless.
 

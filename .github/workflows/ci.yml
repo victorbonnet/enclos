@@ -123,6 +123,8 @@ jobs:
       # Installs the toolchain and components pinned in rust-toolchain.toml
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Asks the kernel's Landlock ABI, -1 without Landlock; restricts nothing.
+      - run: uname -r && python3 -c "import ctypes; print('Landlock ABI', ctypes.CDLL(None).syscall(444, None, 0, 1))"
       - run: cargo test --locked --all-features --test inside on_a_runner
 
   libsecret:
