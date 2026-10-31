@@ -1,6 +1,8 @@
 //! Runs the `enclos` binary against a temporary `ENCLOS_HOME` and `HOME`, so
 //! tests never touch the real home folder, its `~/Library/LaunchAgents`
 //! included. No test runs `sandbox start`: it would install real services.
+//! `without_host_service_manager` keeps it so on Linux, where `systemctl
+//! --user` finds the user's manager from the environment, not from `HOME`.
 
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +11,14 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use tempfile::TempDir;
+
+/// Leaves `systemctl --user` no way to reach the manager of whoever runs the
+/// tests, and the unit files of `HOME`'s own folder.
+fn without_host_service_manager(cmd: &mut Command) {
+    cmd.env_remove("XDG_RUNTIME_DIR")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("XDG_CONFIG_HOME");
+}
 
 struct Home {
     _dir: TempDir,
@@ -33,6 +43,7 @@ impl Home {
             // The baseline enclos ships, whatever the shell running the
             // tests exported; a test that compares sets it itself.
             .env_remove("ENCLOS_SEATBELT_BASELINE");
+        without_host_service_manager(&mut cmd);
         cmd
     }
 
@@ -47,6 +58,7 @@ impl Home {
             .env("ENCLOS_HOME", &self.root)
             .env("HOME", self._dir.path())
             .env_remove("ENCLOS_SEATBELT_BASELINE");
+        without_host_service_manager(&mut cmd);
         cmd
     }
 
