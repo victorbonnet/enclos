@@ -84,7 +84,7 @@ pub struct ServiceError {
     pub what: String,
 }
 
-/// The host's service manager: launchd on macOS, systemd later. What the
+/// The host's service manager: launchd or systemd. What the
 /// engine relies on, for every implementation:
 ///
 /// - `start` installs a unit so it runs now and again at each login, and
@@ -112,19 +112,26 @@ pub trait ServiceManager {
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError>;
 }
 
-/// This host's service manager: launchd on macOS. Other systems have none
-/// yet, and refuse to start services.
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
 #[cfg(target_os = "macos")]
 pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
     Box::new(launchd::Launchd::for_user(user_home))
 }
 
-/// This host's service manager: launchd on macOS. Other systems have none
-/// yet, and refuse to start services.
-#[cfg(not(target_os = "macos"))]
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
+#[cfg(target_os = "linux")]
+pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
+    Box::new(systemd::Systemd::for_user(user_home))
+}
+
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn host(_user_home: &Path) -> Box<dyn ServiceManager> {
     Box::new(Unsupported {
-        why: "enclos runs background services only on macOS for now",
+        why: "enclos runs background services only on macOS and Linux",
     })
 }
 
@@ -165,12 +172,12 @@ impl ServiceManager for Unsupported {
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn this_system_has_no_service_manager_yet() {
+    fn this_system_has_no_service_manager() {
         let host = host(Path::new("/home/alice"));
         let err = host.available().unwrap_err();
-        assert!(err.what.contains("only on macOS"), "{err}");
+        assert!(err.what.contains("only on macOS and Linux"), "{err}");
         assert!(host.installed(LABEL_PREFIX).unwrap().is_empty());
     }
 
