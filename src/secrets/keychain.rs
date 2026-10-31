@@ -23,20 +23,17 @@
 //! is written, since writing would ask where to create one, and every call
 //! is ended after [`ANSWER_WAIT`].
 
-use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
 
+use super::tool::{run, run_for, scrub, stderr};
 use super::{SecretError, SecretStore};
 use crate::model::secret::{SecretRef, SecretValue};
 
 const SECURITY: &str = "/usr/bin/security";
 /// What `security` exits with when no such item exists.
 const NOT_FOUND: i32 = 44;
-/// How long a call to `security` may take: long past any answer, short of
-/// a wait on a dialog nobody sees.
-const ANSWER_WAIT: Duration = Duration::from_secs(30);
 /// How long the look at whether the keychain is locked may take: in a login
 /// session it has answered at once (exit 152) and also shown macOS's unlock
 /// dialog instead (both on macOS 26.5.2), and where no session can show one,
@@ -350,127 +347,6 @@ fn default_keychain(out: &Output) -> Result<PathBuf, String> {
     }
 }
 
-/// Runs `command` with `input` on its standard input, ending it after
-/// [`ANSWER_WAIT`]: past that, it waits on something nobody will answer.
-fn run(command: &mut Command, input: Option<&[u8]>) -> Result<Output, String> {
-    run_for(command, input, ANSWER_WAIT)
-}
-
-fn run_for(command: &mut Command, input: Option<&[u8]>, wait: Duration) -> Result<Output, String> {
-    let mut child = command
-        .stdin(match input {
-            Some(_) => Stdio::piped(),
-            None => Stdio::null(),
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run {SECURITY}: {e}"))?;
-    // Read as it writes, so a long answer never fills a pipe and stalls it.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                pipe.read_to_end(&mut bytes)?;
-            }
-            Ok::<_, io::Error>(bytes)
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let status = wait_for(&mut child, input, wait);
-    if status.is_err() {
-        // The child this call started, and nothing else.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    let joined = |drain: std::thread::JoinHandle<io::Result<Vec<u8>>>| match drain.join() {
-        Ok(read) => read.map_err(|e| format!("cannot read what {SECURITY} answered: {e}")),
-        Err(_) => Err(format!("lost what {SECURITY} answered")),
-    };
-    let (stdout, stderr) = (joined(stdout), joined(stderr));
-    // Why it failed, as `security` said it, when it said anything.
-    let status = status.map_err(|e| match &stderr {
-        Ok(said) if !said.is_empty() => {
-            format!("{e} ({})", scrub(String::from_utf8_lossy(said).trim(), ""))
-        }
-        _ => e,
-    })?;
-    Ok(Output {
-        status,
-        stdout: stdout?,
-        stderr: stderr?,
-    })
-}
-
-/// Gives `child` its input, which fits in a pipe's buffer (a line of at
-/// most [`MAX_LINE`] bytes), and waits for it to end, for at most `wait`.
-fn wait_for(child: &mut Child, input: Option<&[u8]>, wait: Duration) -> Result<ExitStatus, String> {
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().expect("piped");
-        stdin
-            .write_all(input)
-            .map_err(|e| format!("cannot give {SECURITY} its input: {e}"))?;
-    }
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                return Err(format!(
-                    "{SECURITY} did not answer within {} seconds, as if it waited on a dialog; it was ended",
-                    wait.as_secs()
-                ));
-            }
-            Err(e) => return Err(format!("lost {SECURITY}: {e}")),
-        }
-    }
-}
-
-fn stderr(bytes: &[u8], status: ExitStatus) -> String {
-    match String::from_utf8_lossy(bytes).trim() {
-        "" if status.success() => String::new(),
-        "" => status.to_string(),
-        why => why.to_owned(),
-    }
-}
-
-/// `text` with every run of hex digits that could be part of a value left
-/// out: one of 16 or more digits, and one of 4 or more found in `value`,
-/// the hex-encoded value.
-fn scrub(text: &str, value: &str) -> String {
-    let mut out = String::new();
-    let mut run = String::new();
-    for c in text.chars().chain(std::iter::once(' ')) {
-        if c.is_ascii_hexdigit() {
-            run.push(c);
-            continue;
-        }
-        let lower = run.to_ascii_lowercase();
-        let of_value =
-            !run.is_empty() && (lower == value || (run.len() >= 4 && value.contains(&lower)));
-        match run.len() >= 16 || of_value {
-            true => out.push('…'),
-            false => out.push_str(&run),
-        }
-        run.clear();
-        out.push(c);
-    }
-    out.pop();
-    out
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -487,7 +363,10 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tool::ANSWER_WAIT;
     use super::*;
+    use std::process::ExitStatus;
+    use std::time::Instant;
 
     fn v(text: &str) -> SecretValue {
         SecretValue::new(text.to_owned()).unwrap()
