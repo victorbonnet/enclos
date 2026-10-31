@@ -368,15 +368,42 @@ mod tests {
         }
     }
 
+    /// The variable that has [`sleeps_when_asked`] sleep.
+    #[cfg(target_os = "linux")]
+    const SLEEP: &str = "ENCLOS_TEST_SLEEP";
+
+    /// What the long-named program below runs: sleeps when asked to, passes
+    /// at once otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sleeps_when_asked() {
+        if std::env::var_os(SLEEP).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
     /// procps cuts a program's name at 15 characters, so a command is for
-    /// showing only.
+    /// showing only. The program is this test program through a link, whose
+    /// name the kernel takes: `/bin/sleep` may be a multi-call binary, which
+    /// exits at once under a name it does not know, and a copy being written
+    /// can be busy when run, if another test forks meanwhile.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_long_program_name_is_listed_cut_at_15_characters() {
         let dir = tempfile::tempdir().unwrap();
         let long = dir.path().join("a-program-with-a-long-name");
-        std::fs::copy("/bin/sleep", &long).unwrap();
-        let mut child = Command::new(&long).arg("30").spawn().unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &long).unwrap();
+        let mut child = Command::new(&long)
+            .args([
+                "--exact",
+                "lifecycle::process::tests::sleeps_when_asked",
+                "--test-threads=1",
+            ])
+            .env(SLEEP, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let listed = processes().unwrap();
         let _ = child.kill();
         let _ = child.wait();
