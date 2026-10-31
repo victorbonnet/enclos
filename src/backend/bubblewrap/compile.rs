@@ -40,7 +40,7 @@ const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 /// Refused with `EPERM`: design §14's list, then the kernel module, reboot
 /// and swap calls, and io_uring, whose operations seccomp does not see.
 /// The same on every architecture: the program that applies the filter
-/// skips a name its own lacks (M3-14).
+/// skips a name its own lacks (`inside/filter.rs`).
 const SECCOMP_DENY: &[&str] = &[
     "keyctl",
     "add_key",

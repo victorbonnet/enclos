@@ -36,7 +36,8 @@ pub fn run(args: InsideArgs) -> Result<u8> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_: InsideArgs) -> Result<u8> {
+pub fn run(args: InsideArgs) -> Result<u8> {
+    drop((args.compiled, args.relay, args.command));
     Err(Error::Inside {
         why: "`enclos inside` is the bubblewrap backend's, on Linux".to_owned(),
     })
