@@ -370,10 +370,10 @@ enum LookupFailed {
 
 /// A place among the connections, or the lookups, the proxy runs at once;
 /// it frees when dropped, as the connection or lookup ends.
-struct Slot(Arc<AtomicUsize>);
+pub(crate) struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
-    fn take(open: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
+    pub(crate) fn take(open: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
         open.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             (n < max).then_some(n + 1)
         })
