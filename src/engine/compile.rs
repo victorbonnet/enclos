@@ -73,6 +73,14 @@ impl Engine {
         Ok(file)
     }
 
+    /// What the active policy compiles to now, without writing it.
+    pub fn compiled_text(&self, name: &SandboxName) -> Result<String> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(self.compiled_file(name, record.proxy_port)?.1)
+    }
+
     /// The file the active policy compiles to, and its text, without
     /// writing it.
     pub(crate) fn compiled_file(

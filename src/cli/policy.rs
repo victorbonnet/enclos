@@ -37,6 +37,9 @@ enum PolicyVerb {
         /// Show the pending policy in full instead.
         #[arg(long)]
         pending: bool,
+        /// Show what the active policy compiles to for the sandbox's backend.
+        #[arg(long, conflicts_with = "pending")]
+        compiled: bool,
     },
     /// Let the sandbox reach a destination: host, host:port or *.domain. Applies at once, or
     /// waits with a pending change it cannot be separated from.
@@ -109,7 +112,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 },
             );
         }
-        PolicyVerb::Show { sandbox, pending } => {
+        PolicyVerb::Show {
+            sandbox, compiled, ..
+        } if compiled => {
+            let text = engine.compiled_text(&sandbox)?;
+            match output::json() {
+                true => output::emit(&json!({"sandbox": sandbox.to_string(), "compiled": text})),
+                false => print!("{text}"),
+            }
+        }
+        PolicyVerb::Show {
+            sandbox, pending, ..
+        } => {
             let view = engine.policy(&sandbox)?;
             match output::json() {
                 true => output::emit(&show_json(&view, pending)?),

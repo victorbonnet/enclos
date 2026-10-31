@@ -500,6 +500,15 @@ mod compile {
     }
 
     #[test]
+    fn the_compiled_text_is_shown_without_being_written() {
+        let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+        let text = engine.compiled_text(&name).unwrap();
+        assert!(text.contains("write {home}"), "{text}");
+        let compiled = engine.layout.sandbox_dir("home").join("compiled");
+        assert!(!compiled.exists());
+    }
+
+    #[test]
     fn a_cut_off_compiled_policy_is_never_reused() {
         let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let file = engine.compile_policy(&name, 41001).unwrap();

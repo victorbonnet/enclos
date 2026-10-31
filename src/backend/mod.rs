@@ -4,6 +4,7 @@
 //! full shape in design §9 (prepare, members, denials, ...) as the commands
 //! that use it arrive.
 
+pub mod bubblewrap;
 pub mod environment;
 #[cfg(test)]
 pub mod fake;
@@ -76,6 +77,12 @@ pub struct SandboxContext {
     pub hidden_dirs: Vec<PathBuf>,
     /// The sandbox's proxy port, on 127.0.0.1 and [::1]: its only way out.
     pub proxy_port: u16,
+    /// The folder of its secrets files, there while its services run (ADR
+    /// 0034, ADR 0036).
+    pub secrets: PathBuf,
+    /// The socket its proxy listens on for a session with a network of its
+    /// own.
+    pub proxy_socket: PathBuf,
 }
 
 impl SandboxContext {
@@ -91,6 +98,8 @@ impl SandboxContext {
             hidden_files: layout.hidden_files(),
             hidden_dirs: layout.hidden_dirs(),
             proxy_port,
+            secrets: layout.sandbox_secrets_dir(name.as_str()),
+            proxy_socket: layout.proxy_socket(name.as_str()),
         }
     }
 }
