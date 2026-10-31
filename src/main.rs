@@ -82,6 +82,9 @@ enum Command {
     /// Pass connections on a port of 127.0.0.1 to a Unix socket; started by enclos itself inside a session.
     #[command(hide = true)]
     Relay(cli::relay::RelayArgs),
+    /// Apply a session's Landlock rules and seccomp filter to this process, start its relay and run its command; run first by bubblewrap.
+    #[command(hide = true)]
+    Inside(cli::inside::InsideArgs),
 }
 
 #[derive(Args)]
@@ -261,6 +264,7 @@ fn say(line: &str) {
 fn run(cli: Cli) -> Result<u8> {
     let command = match cli.command {
         Command::Relay(args) => return cli::relay::run(args),
+        Command::Inside(args) => return cli::inside::run(args),
         command => command,
     };
     let engine = Engine::open(Layout::from_env()?);
@@ -320,7 +324,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
-        Command::Relay(_) => unreachable!("run above, with no engine"),
+        Command::Relay(_) | Command::Inside(_) => unreachable!("run above, with no engine"),
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Status(args) => cli::status::run(&engine, args),
@@ -331,7 +335,7 @@ fn run(cli: Cli) -> Result<u8> {
 /// as it ends any Unix tool, by SIGPIPE, not by a panic on the next print.
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
-/// `exec`, `runtime`, and the `agent` verbs but `list`), keep running
+/// `exec`, `inside`, `runtime`, and the `agent` verbs but `list`), keep running
 /// (`proxy`, `relay`, `launch`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
 fn ends_on_closed_output(command: &Command) -> bool {
@@ -351,6 +355,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Runtime(_)
         | Command::Proxy(_)
         | Command::Relay(_)
+        | Command::Inside(_)
         | Command::Launch(_)
         | Command::Logs(_) => false,
     }
