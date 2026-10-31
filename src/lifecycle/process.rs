@@ -21,7 +21,7 @@ use crate::model::session::ProcessRef;
 #[error("cannot look at processes with /bin/ps: {0}")]
 pub struct PsError(String);
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl PsError {
     /// A `ps` failure with this reason, for tests of what follows one.
     pub(crate) fn new(why: &str) -> PsError {
@@ -133,7 +133,9 @@ pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
         .map_err(|_| PsError(format!("unexpected group `{pgid}`")))
 }
 
-/// A process as one listing shows it.
+/// A process as one listing shows it. `command` is what `ps` calls `comm`, to
+/// show to the user and never to compare: a path on macOS, and on Linux the
+/// program's file name cut at 15 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proc {
     pub pid: u32,
@@ -260,7 +262,8 @@ pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled,
 }
 
 /// Targets `kill` reads as more than one process of a session: 0 is the
-/// caller's own group and -1 every process the user owns; 1 is launchd.
+/// caller's own group and -1 every process the user owns; 1 is launchd or
+/// init.
 fn never_signalled(target: i64) -> bool {
     target.abs() <= 1
 }
@@ -363,6 +366,49 @@ mod tests {
             let err = listed(&out).unwrap_err();
             assert!(err.to_string().contains(says), "{err}");
         }
+    }
+
+    /// The variable that has [`sleeps_when_asked`] sleep.
+    #[cfg(target_os = "linux")]
+    const SLEEP: &str = "ENCLOS_TEST_SLEEP";
+
+    /// What the long-named program below runs: sleeps when asked to, passes
+    /// at once otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sleeps_when_asked() {
+        if std::env::var_os(SLEEP).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    /// procps cuts a program's name at 15 characters, so a command is for
+    /// showing only. The program is this test program through a link, whose
+    /// name the kernel takes: `/bin/sleep` may be a multi-call binary, which
+    /// exits at once under a name it does not know, and a copy being written
+    /// can be busy when run, if another test forks meanwhile.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_program_name_is_listed_cut_at_15_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("a-program-with-a-long-name");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &long).unwrap();
+        let mut child = Command::new(&long)
+            .args([
+                "--exact",
+                "lifecycle::process::tests::sleeps_when_asked",
+                "--test-threads=1",
+            ])
+            .env(SLEEP, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let listed = processes().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = listed.iter().find(|p| p.pid == child.id()).unwrap();
+        assert_eq!(found.command, "a-program-with-");
     }
 
     #[test]

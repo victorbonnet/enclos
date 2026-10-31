@@ -8,7 +8,8 @@
 //! no sandboxed process can open it or change its mode, and enclos keeps no
 //! copy open: the processes holding it are the program and what it started,
 //! unless one closed it or passed it on, or a process outside the sandbox
-//! changed its mode and opened it. `lsof` names them.
+//! changed its mode and opened it. `lsof` names them on macOS, and
+//! `/proc/<pid>/fd` on Linux (see `descriptors`).
 //!
 //! A marker is made in the sandbox's `members/` folder before the program
 //! starts, and named after the session's root process (its pid and start
@@ -19,11 +20,12 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use std::process::Stdio;
 use std::process::{Child, Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::descriptors;
 use crate::model::session::ProcessRef;
 
 /// Which processes hold the markers could not be told.
@@ -35,6 +37,9 @@ pub enum MarkerError {
     /// `lsof` could not run or answer: for every sandbox alike.
     #[error("cannot look at the sandbox's markers with /usr/sbin/lsof: {0}")]
     Lsof(String),
+    /// `/proc` could not be read: for every sandbox alike.
+    #[error("cannot look at the sandbox's markers in /proc: {0}")]
+    Proc(String),
 }
 
 /// A marker made for a program about to start, not yet held by it.
@@ -128,15 +133,18 @@ pub fn remove(dir: &Path, root: &ProcessRef) -> io::Result<()> {
 }
 
 /// The processes holding each named marker in `dir`, by file name, of those
-/// `lsof` can see (the user's; root's are not listed).
+/// `lsof` or `/proc` can show (the user's; root's are not listed).
 pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
     // No folder yet is no marker; a folder that cannot be read is not: read
     // here, since `lsof -w` hides its own failure to open the folder and
     // answers as for one with nothing held.
-    match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
-        Ok(_) => {}
+        Ok(entries) => entries,
+    };
+    if !cfg!(target_os = "macos") {
+        return holders_in_proc(Path::new(descriptors::PROC), dir, entries);
     }
     // `-w`: a warning about another file system (an unreachable network
     // mount) is not a failure to look at this folder.
@@ -149,6 +157,44 @@ pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerErro
     )
     .map_err(|e| MarkerError::Lsof(e.to_string()))?;
     parse(&out)
+}
+
+/// The processes under `proc` holding each named marker in `dir`, whose
+/// `entries` are what the folder shows now: as with `lsof +d`, a file already
+/// removed from it is not listed, and a process working in it holds nothing.
+fn holders_in_proc(
+    proc: &Path,
+    dir: &Path,
+    entries: std::fs::ReadDir,
+) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
+    let folder_error = |e: io::Error| MarkerError::Folder(format!("{}: {e}", dir.display()));
+    let mut markers = BTreeSet::new();
+    for entry in entries {
+        if let Some(name) = entry.map_err(folder_error)?.file_name().to_str()
+            && name.starts_with("root-")
+        {
+            markers.insert(name.to_owned());
+        }
+    }
+    let mut held: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    if markers.is_empty() {
+        return Ok(held);
+    }
+    // `/proc` writes real paths, and `dir` may not be one.
+    let real = dir.canonicalize().map_err(folder_error)?;
+    let processes =
+        descriptors::every_process(proc).map_err(|e| MarkerError::Proc(e.to_string()))?;
+    for (pid, open) in processes {
+        for target in open {
+            if target.parent() == Some(real.as_path())
+                && let Some(name) = target.file_name().and_then(|n| n.to_str())
+                && markers.contains(name)
+            {
+                held.entry(name.to_owned()).or_default().insert(pid);
+            }
+        }
+    }
+    Ok(held)
 }
 
 /// What `lsof -Fpn +d` answered: a `p<pid>` line for each process, then an
@@ -184,7 +230,7 @@ fn parse(out: &Output) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
     Ok(held)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
@@ -209,6 +255,47 @@ mod tests {
         assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
         assert_eq!(held["root-9-b"], BTreeSet::from([200]));
         assert_eq!(held.len(), 2, "{held:?}");
+    }
+
+    /// The folder's markers held under a `/proc` of the test's own: each
+    /// process's descriptors, whatever they name, sorted out by marker.
+    #[test]
+    fn proc_gives_each_sessions_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().canonicalize().unwrap().join("members");
+        std::fs::create_dir(&members).unwrap();
+        for file in ["root-7-a", "root-9-b", "root-8-unheld", "starting-1-2"] {
+            std::fs::write(members.join(file), "").unwrap();
+        }
+        let path = |file: &str| members.join(file).to_str().unwrap().to_owned();
+        let proc = dir.path().join("proc");
+        descriptors::fake_process(&proc, std::process::id(), &[]);
+        descriptors::fake_process(&proc, 100, &[&path("root-7-a"), "socket:[5]"]);
+        descriptors::fake_process(&proc, 200, &[&path("root-7-a"), &path("root-9-b")]);
+        descriptors::fake_process(
+            &proc,
+            300,
+            &[
+                &path("starting-1-2"),
+                &path("root-3-removed (deleted)"),
+                &path("root-3-removed"),
+                members.to_str().unwrap(),
+                "/elsewhere/root-7-a",
+            ],
+        );
+        let held = holders_in_proc(&proc, &members, std::fs::read_dir(&members).unwrap()).unwrap();
+        assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
+        assert_eq!(held["root-9-b"], BTreeSet::from([200]));
+        assert_eq!(held.len(), 2, "{held:?}");
+    }
+
+    #[test]
+    fn a_proc_that_cannot_be_read_is_an_error() {
+        let members = tempfile::tempdir().unwrap();
+        std::fs::write(members.path().join("root-7-a"), "").unwrap();
+        let entries = std::fs::read_dir(members.path()).unwrap();
+        let err = holders_in_proc(Path::new("/nonexistent"), members.path(), entries).unwrap_err();
+        assert!(matches!(err, MarkerError::Proc(_)), "{err}");
     }
 
     #[test]
