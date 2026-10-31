@@ -7,8 +7,9 @@
 //!
 //! A value goes to `secret-tool` on its input, never as an argument, which
 //! other processes could list, and comes back as it went: the tool ends a
-//! value with a line break only at a terminal. `secret-tool` fails with
-//! words on standard error and finds nothing with none, both exit 1.
+//! value with a line break only at a terminal. `lookup` and `clear` exit 1
+//! both when they fail, with words on standard error, and when they find or
+//! remove nothing, with none (libsecret 0.21.4's source).
 //!
 //! Nothing here may ask anything: a service has nobody to answer. Reading a
 //! locked collection would ask to unlock it, so [`Libsecret::readable`]
@@ -34,6 +35,9 @@ const LOOK_WAIT: Duration = Duration::from_secs(5);
 /// An attribute no item has, so looking for it finds nothing, and so unlocks
 /// nothing, whatever the service holds.
 const NO_ITEM: [&str; 2] = ["enclos-probe", "answers"];
+/// The longest value `secret-tool` reads whole from its input (libsecret
+/// 0.21.4, `read_password_stdin`).
+const MAX_VALUE: usize = 8191;
 
 pub struct Libsecret {
     /// The attribute `service` of every item: `enclos.<install>`.
@@ -135,6 +139,19 @@ fn parse_locked(printed: &str) -> Option<bool> {
 
 impl SecretStore for Libsecret {
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
+        if value.expose().len() > MAX_VALUE {
+            return Err(SecretError {
+                untouched: true,
+                ..self.fail(
+                    "store",
+                    secret,
+                    format!(
+                        "its value is {} bytes; `secret-tool` takes at most {MAX_VALUE}",
+                        value.expose().len()
+                    ),
+                )
+            });
+        }
         let mut command = self.on_bus(&self.secret_tool).map_err(|e| SecretError {
             untouched: true,
             ..self.fail("store", secret, e)
@@ -173,8 +190,6 @@ impl SecretStore for Libsecret {
     }
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
-        // `secret-tool clear` exits 0 whether or not it found one.
-        let had = self.get(secret)?.is_some();
         let out = run(
             self.on_bus(&self.secret_tool)
                 .map_err(|e| self.fail("remove", secret, e))?
@@ -183,9 +198,26 @@ impl SecretStore for Libsecret {
             None,
         )
         .map_err(|e| self.fail("remove", secret, e))?;
-        match out.status.success() {
-            true => Ok(had),
-            false => Err(self.fail("remove", secret, stderr(&out.stderr, out.status))),
+        if out.status.success() {
+            return Ok(true);
+        }
+        if !out.stderr.is_empty() {
+            return Err(self.fail("remove", secret, stderr(&out.stderr, out.status)));
+        }
+        // It removed nothing, and it removes only unlocked items: only an
+        // unlocked collection shows there was nothing to remove.
+        match self.locked() {
+            Ok(false) => Ok(false),
+            Ok(true) => Err(self.fail(
+                "remove",
+                secret,
+                "its default collection is locked, so it may still be there",
+            )),
+            Err(e) => Err(self.fail(
+                "remove",
+                secret,
+                format!("it may still be there: cannot tell whether it is locked ({e})"),
+            )),
         }
     }
 
@@ -245,6 +277,8 @@ mod tests {
         "home/telegram".parse().unwrap()
     }
 
+    const UNLOCKED: &str = "echo '   variant       boolean false'";
+
     /// A stand-in for `secret-tool` and `dbus-send`, in a folder of the
     /// test's own: nothing here reaches any bus, the address being made up.
     struct Stub {
@@ -280,9 +314,9 @@ echo "$DBUS_SESSION_BUS_ADDRESS" >"$here/bus"
 case "$1" in
 store) cat >"$here/value" ;;
 lookup) [ -f "$here/value" ] || exit 1; cat "$here/value" ;;
-clear) rm -f "$here/value" ;;
+clear) [ -f "$here/value" ] || exit 1; rm "$here/value" ;;
 esac"#,
-                "exit 1",
+                UNLOCKED,
             )
         }
 
@@ -351,6 +385,49 @@ esac"#,
         let stub = Stub::new("echo 'secret-tool: the service broke' >&2; exit 1", "");
         let err = stub.store.get(&secret()).unwrap_err();
         assert!(err.what.contains("the service broke"), "{err}");
+    }
+
+    /// As libsecret 0.21.4's `secret-tool`: `clear` exits 1 with no words
+    /// when it removed nothing, on an empty keyring as on CI's first run.
+    #[test]
+    fn clearing_nothing_is_no_removal_and_no_failure() {
+        let stub = Stub::new("exit 1", UNLOCKED);
+        assert!(!stub.store.remove(&secret()).unwrap());
+    }
+
+    #[test]
+    fn a_failed_removal_is_not_taken_for_nothing_to_remove() {
+        let stub = Stub::new("echo 'secret-tool: the service broke' >&2; exit 1", "");
+        let err = stub.store.remove(&secret()).unwrap_err();
+        assert!(err.what.contains("the service broke"), "{err}");
+    }
+
+    /// `clear` removes unlocked items only, so finding none in a locked
+    /// collection says nothing: the value may still be there.
+    #[test]
+    fn a_locked_collection_is_not_taken_for_nothing_to_remove() {
+        let stub = Stub::new("exit 1", "echo '   variant       boolean true'");
+        let err = stub.store.remove(&secret()).unwrap_err();
+        assert!(err.what.contains("locked"), "{err}");
+    }
+
+    /// `secret-tool` reads 8192 bytes at most and only warns: a longer value
+    /// would replace the one stored with its first part.
+    #[test]
+    fn a_value_too_long_for_secret_tool_is_refused_before_anything_runs() {
+        let stub = Stub::keeping();
+        stub.store
+            .set(&secret(), &v(&"k".repeat(MAX_VALUE)))
+            .unwrap();
+        stub.store.remove(&secret()).unwrap();
+        std::fs::remove_file(stub.dir.path().join("calls")).unwrap();
+        let err = stub
+            .store
+            .set(&secret(), &v(&"k".repeat(MAX_VALUE + 1)))
+            .unwrap_err();
+        assert!(err.untouched, "{err}");
+        assert!(err.what.contains("at most 8191"), "{err}");
+        assert!(!stub.exists("calls"));
     }
 
     #[test]
