@@ -261,7 +261,8 @@
   },
   "relay": {
     "port": 41001,
-    "socket": "/nonexistent-enclos-test/alice/.enclos/run/home/visible/proxy.sock"
+    "socket": "/nonexistent-enclos-test/alice/.enclos/run/home/visible/proxy.sock",
+    "log": "/tmp/enclos-relay.log"
   },
   "unenforced": [
     {

@@ -40,7 +40,7 @@ const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 /// Refused with `EPERM`: design §14's list, then the kernel module, reboot
 /// and swap calls, and io_uring, whose operations seccomp does not see.
 /// The same on every architecture: the program that applies the filter
-/// skips a name its own lacks (M3-14).
+/// skips a name its own lacks (`inside/filter.rs`).
 const SECCOMP_DENY: &[&str] = &[
     "keyctl",
     "add_key",
@@ -98,6 +98,10 @@ const CLONE_NEW: &[(&str, u64)] = &[
 /// the C library fall back to `clone`.
 const SECCOMP_ENOSYS: &[&str] = &["clone3"];
 
+/// Where the relay's notices go: the sandbox's own `/tmp`, which ends with
+/// the session, so they stay out of its terminal.
+const RELAY_LOG: &str = "/tmp/enclos-relay.log";
+
 /// What the file in `compiled/` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledSandbox {
@@ -149,6 +153,7 @@ pub struct SeccompFilter {
 pub struct Relay {
     pub port: u16,
     pub socket: String,
+    pub log: String,
 }
 
 pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
@@ -290,6 +295,7 @@ fn compiled_sandbox(
         relay: Relay {
             port: ctx.proxy_port,
             socket: text(&ctx.proxy_socket)?,
+            log: RELAY_LOG.to_owned(),
         },
         unenforced: proposed::unenforced(policy),
     })

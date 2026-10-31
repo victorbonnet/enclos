@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod connect;
 pub mod doctor;
+pub mod inside;
 pub mod launch;
 pub mod net;
 pub mod output;

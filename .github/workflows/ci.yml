@@ -107,6 +107,26 @@ jobs:
           timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
       - run: cargo test --locked --all-features --lib engine::tests::runtime::cgroups::on_a_runner
 
+  confinement:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The tests that apply Landlock and seccomp and try what they refuse
+      # run only on these throwaway runners, never on a developer's host
+      # (tests/inside.rs).
+      ENCLOS_CONFINEMENT_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the toolchain and components pinned in rust-toolchain.toml
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Asks the kernel's Landlock ABI, -1 without Landlock; restricts nothing.
+      - run: uname -r && python3 -c "import ctypes; print('Landlock ABI', ctypes.CDLL(None).syscall(444, None, 0, 1))"
+      - run: cargo test --locked --all-features --test inside on_a_runner
+
   libsecret:
     strategy:
       fail-fast: false
@@ -160,7 +180,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, libsecret, secrets, deny]
+    needs: [lint, test, systemd-units, cgroups, confinement, libsecret, secrets, deny]
     runs-on: ubuntu-latest
     steps:
       - name: Check needed jobs

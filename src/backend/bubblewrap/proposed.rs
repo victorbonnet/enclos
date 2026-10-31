@@ -23,6 +23,43 @@ pub(super) const NAMESPACES: &[&str] = &[
 /// comes with 5, the scopes with 6.
 pub const LANDLOCK_ABI_NEEDED: u32 = 6;
 
+/// What a session got of Landlock on its kernel (ADR 0037).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landlock {
+    /// Every compiled rule.
+    Full,
+    /// The rights and scopes this ABI has, as a layer over the mounts; those
+    /// it lacks are not held.
+    Older { abi: u32 },
+    /// None: the session runs without it, on the mounts alone.
+    Missing,
+}
+
+impl Landlock {
+    /// What a kernel with this ABI gives, if it has Landlock.
+    pub fn on(abi: Option<u32>) -> Self {
+        match abi {
+            None => Self::Missing,
+            Some(abi) if abi < LANDLOCK_ABI_NEEDED => Self::Older { abi },
+            Some(_) => Self::Full,
+        }
+    }
+
+    /// The line a session prints when it holds less than was compiled.
+    pub fn notice(self) -> Option<String> {
+        match self {
+            Self::Full => None,
+            Self::Older { abi } => Some(format!(
+                "enclos: this kernel's Landlock has ABI {abi}, and the rules need {LANDLOCK_ABI_NEEDED}: applied what it has, and the mounts hold the rest"
+            )),
+            Self::Missing => Some(
+                "enclos: this kernel has no Landlock: writes are held by the mounts alone, and any program that is mounted can run"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 /// What the backend's capabilities depend on, found on the host (ADR 0037).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Host {
@@ -108,6 +145,17 @@ mod tests {
             Enforcement::Partial { note } => note,
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_session_is_told_when_it_holds_less_than_was_compiled() {
+        assert_eq!(Landlock::on(Some(LANDLOCK_ABI_NEEDED)), Landlock::Full);
+        assert_eq!(Landlock::Full.notice(), None);
+        let older = Landlock::on(Some(4));
+        assert_eq!(older, Landlock::Older { abi: 4 });
+        assert!(older.notice().unwrap().contains("ABI 4"));
+        let missing = Landlock::on(None).notice().unwrap();
+        assert!(missing.contains("mounts alone"), "{missing}");
     }
 
     #[test]
