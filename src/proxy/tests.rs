@@ -754,6 +754,69 @@ fn both_loopbacks_share_one_connection_limit() {
 }
 
 #[test]
+fn a_unix_socket_and_the_loopback_share_one_limit_and_one_log() {
+    let folder = tempfile::tempdir().unwrap();
+    let socket = Address::Unix(folder.path().join("proxy.sock"));
+    let Address::Unix(path) = &socket else {
+        unreachable!()
+    };
+    let unix = listen_unix(path).unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let loopback = Address::Tcp(tcp.local_addr().unwrap());
+    let (proxy, log, _) = built(&[], Box::new(NoResolver), classify, |p| {
+        p.max_connections = 1
+    });
+    let proxy = Arc::new(proxy);
+    let serving = Arc::clone(&proxy);
+    std::thread::spawn(move || serving.serve_all(vec![unix.into(), tcp.into()]));
+
+    let request = "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n";
+    // Holds the one place, on the socket: it sends nothing yet.
+    let first = socket.connect();
+    let deadline = Instant::now() + PATIENCE;
+    while proxy.open.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "never accepted");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let (_conn, reply) = send(loopback.clone(), request);
+    assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
+    drop(first);
+    assert!(send_once_free(&loopback, request).starts_with("HTTP/1.1 403"));
+    assert!(send_once_free(&socket, request).starts_with("HTTP/1.1 403"));
+    assert_eq!(log.wait_for(2).len(), 2);
+}
+
+#[test]
+fn a_socket_left_by_a_dead_proxy_is_taken_over() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("proxy.sock");
+    drop(listen_unix(&path).unwrap());
+    assert!(path.exists(), "dropping a listener leaves its socket");
+    let _taken = listen_unix(&path).unwrap();
+    UnixStream::connect(&path).unwrap();
+}
+
+#[test]
+fn a_socket_a_proxy_answers_on_is_left_to_it() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("proxy.sock");
+    let _serving = listen_unix(&path).unwrap();
+    let e = listen_unix(&path).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+    UnixStream::connect(&path).unwrap();
+}
+
+#[test]
+fn a_file_in_a_sockets_place_is_kept() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("proxy.sock");
+    std::fs::write(&path, "kept").unwrap();
+    let e = listen_unix(&path).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");
+}
+
+#[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
     // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
     let squatter = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();

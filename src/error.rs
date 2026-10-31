@@ -143,6 +143,14 @@ pub enum Error {
         addr: String,
         source: std::io::Error,
     },
+    /// The proxy cannot open the Unix socket a session with a network of
+    /// its own reaches it on, so it does not start.
+    #[error("the proxy of sandbox `{sandbox}` cannot listen on {path}: {source}")]
+    ProxySocket {
+        sandbox: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Another program holds the sandbox's proxy port on `loopback`, and
     /// would receive its traffic. Ports are the host's, so it may be the
     /// proxy of another user's or another enclos install's sandbox, say.
@@ -347,6 +355,7 @@ impl Error {
             | Error::ProxyPortTaken { .. }
             | Error::ProxyRuns { .. }
             | Error::ProxyListen { .. }
+            | Error::ProxySocket { .. }
             | Error::ProxyStopped { .. }
             | Error::Compile(_)
             | Error::HomeNotAFolder { .. }
