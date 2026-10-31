@@ -6,10 +6,10 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -46,6 +46,31 @@ os.waitpid(pid, 0)
 print(said.decode().split()[-1])
 "#;
 
+/// Prints each child's seccomp mode and no_new_privs, as the kernel shows
+/// them: the relay is the only child of the command.
+const RELAY_STATUS: &str = r#"
+import os
+me = str(os.getpid())
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        status = open(f"/proc/{pid}/status").read()
+    except OSError:
+        continue
+    fields = dict(line.split(":\t", 1) for line in status.splitlines() if ":\t" in line)
+    if fields.get("PPid") == me:
+        print(fields["Seccomp"], fields["NoNewPrivs"])
+"#;
+
+/// Ports for relays, one each. They lie below the kernel's ephemeral ports,
+/// so no bind of port 0 gets one, and outside the proxies' range. A port a
+/// bind of 0 found and let go could be another test's by the time a relay
+/// binds it.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(20000);
+
+fn next_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Whether to run these tests: they refuse anywhere but a GitHub-hosted
 /// runner, in CI's `confinement` job, which sets `ENCLOS_CONFINEMENT_TESTS`.
 fn on_a_runner() -> bool {
@@ -65,6 +90,10 @@ fn on_a_runner() -> bool {
 /// `allowed/` the only place to write, and a relay of its own. The program
 /// under test stays out of the execute rules, in `target/`, as an enclos in
 /// the user's home is.
+///
+/// One session each, as [`Confined::run`] takes it by value: a relay ends by
+/// a signal the kernel delivers once its session's command has gone, so a
+/// second session on its port could find it held.
 struct Confined {
     dir: TempDir,
     compiled: PathBuf,
@@ -80,7 +109,7 @@ impl Confined {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend/bubblewrap/minimal.snapshot");
         let mut compiled: Value =
             serde_json::from_str(&std::fs::read_to_string(snapshot).unwrap()).unwrap();
-        let port = free_port();
+        let port = next_port();
         compiled["landlock"]["write"] = serde_json::json!([allowed]);
         compiled["relay"] = serde_json::json!({
             "port": port,
@@ -100,24 +129,18 @@ impl Confined {
         self.dir.path().join(name)
     }
 
-    fn run(&self, command: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_enclos"))
+    /// What the session's command left, and its folder.
+    fn run(self, command: &[&str]) -> (Output, TempDir) {
+        let output = Command::new(env!("CARGO_BIN_EXE_enclos"))
             .arg("inside")
             .arg("--compiled")
             .arg(&self.compiled)
             .arg("--")
             .args(command)
             .output()
-            .unwrap()
+            .unwrap();
+        (output, self.dir)
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -132,6 +155,20 @@ fn said(output: &Output) -> String {
 
 fn python(script: &str) -> Output {
     Command::new(PYTHON).args(["-c", script]).output().unwrap()
+}
+
+/// The kernel's own range is read, so a host that widened it fails here
+/// rather than as a port taken under a session.
+#[test]
+fn a_relay_port_is_one_no_bind_of_port_0_gets_and_no_proxy_uses() {
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let first: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    let (one, other) = (next_port(), next_port());
+    assert_ne!(one, other);
+    for port in [one, other] {
+        assert!(port < first, "{port} is an ephemeral port, from {first}");
+        assert!(port < 41000, "{port} may be a proxy's");
+    }
 }
 
 /// Stops at the file, before anything is started or applied, so this one
@@ -155,35 +192,45 @@ fn a_compiled_file_that_is_not_there_stops_a_session_before_its_command() {
     assert!(!marker.exists());
 }
 
-/// The same write with no rules works: the rules, not the folder, refuse it.
+const WRITE: &str = "echo written > \"$1\"";
+
+fn write_in(confined: Confined, path: &Path) -> (Output, TempDir) {
+    let path = path.to_str().unwrap().to_owned();
+    confined.run(&["/bin/sh", "-c", WRITE, "sh", &path])
+}
+
+/// With nothing on stderr, so every rule held: no line says Landlock is
+/// older or missing.
 #[test]
-fn on_a_runner_a_write_outside_the_rules_is_refused_and_an_allowed_one_works() {
+fn on_a_runner_an_allowed_write_works() {
     if !on_a_runner() {
         return;
     }
     let confined = Confined::new();
-    let script = "echo written > \"$1\"";
-    let write = |path: &Path| {
-        let path = path.to_str().unwrap().to_owned();
-        confined.run(&["/bin/sh", "-c", script, "sh", &path])
-    };
-
     let allowed = confined.path("allowed/file");
-    let written = write(&allowed);
+    let (written, _dir) = write_in(confined, &allowed);
     assert!(written.status.success(), "{written:?}");
     assert!(written.stderr.is_empty(), "{written:?}");
     assert_eq!(std::fs::read_to_string(&allowed).unwrap(), "written\n");
+}
 
+/// The same write with no rules works: the rules, not the folder, refuse it.
+#[test]
+fn on_a_runner_a_write_outside_the_rules_is_refused() {
+    if !on_a_runner() {
+        return;
+    }
+    let confined = Confined::new();
     let outside = confined.path("outside");
     let host = Command::new("/bin/sh")
-        .args(["-c", script, "sh"])
+        .args(["-c", WRITE, "sh"])
         .arg(&outside)
         .status()
         .unwrap();
     assert!(host.success(), "the control could not write");
     std::fs::remove_file(&outside).unwrap();
 
-    let refused = write(&outside);
+    let (refused, _dir) = write_in(confined, &outside);
     assert!(!refused.status.success(), "{refused:?}");
     assert!(
         text(&refused.stderr).contains("Permission denied"),
@@ -199,12 +246,20 @@ fn on_a_runner_a_program_outside_the_execute_rules_is_refused() {
     }
     let confined = Confined::new();
     let copy = confined.path("allowed/true");
-    std::fs::copy("/usr/bin/true", &copy).unwrap();
+    // Copied by a program of its own: a descriptor this process held open
+    // for writing could reach a child a parallel test is starting, and the
+    // copy then could not run (ETXTBSY).
+    let copied = Command::new("/bin/cp")
+        .arg("/usr/bin/true")
+        .arg(&copy)
+        .status()
+        .unwrap();
+    assert!(copied.success(), "the copy failed");
     let copy = copy.to_str().unwrap();
     let ran = Command::new(copy).status().unwrap();
     assert!(ran.success(), "the control could not run");
 
-    let refused = confined.run(&[copy]);
+    let (refused, _dir) = confined.run(&[copy]);
     assert_eq!(refused.status.code(), Some(125), "{refused:?}");
     assert!(
         text(&refused.stderr).contains("Permission denied"),
@@ -222,7 +277,7 @@ fn on_a_runner_tiocsti_is_refused() {
         host, "EPERM",
         "the control is refused as the filter refuses"
     );
-    let inside = Confined::new().run(&[PYTHON, "-c", TIOCSTI]);
+    let (inside, _dir) = Confined::new().run(&[PYTHON, "-c", TIOCSTI]);
     assert_eq!(said(&inside), "EPERM");
 }
 
@@ -232,7 +287,7 @@ fn on_a_runner_a_user_namespace_is_refused() {
         return;
     }
     assert_eq!(said(&python(UNSHARE)), "ok", "the control");
-    let inside = Confined::new().run(&[PYTHON, "-c", UNSHARE]);
+    let (inside, _dir) = Confined::new().run(&[PYTHON, "-c", UNSHARE]);
     assert_eq!(said(&inside), "EPERM");
 }
 
@@ -261,9 +316,20 @@ fn on_a_runner_the_command_reaches_the_proxy_through_the_confined_relay() {
         "import socket\nc = socket.create_connection(('127.0.0.1', {}))\nc.sendall(b'ping')\nprint(c.recv(4).decode())",
         confined.port
     );
-    let output = confined.run(&[PYTHON, "-c", &script]);
+    let (output, _dir) = confined.run(&[PYTHON, "-c", &script]);
     assert_eq!(said(&output), "pong");
     proxy.join().unwrap();
+}
+
+/// It starts before the session applies anything, so a filter on it is the
+/// one it applied to itself.
+#[test]
+fn on_a_runner_the_relay_applied_the_filter_to_itself() {
+    if !on_a_runner() {
+        return;
+    }
+    let (output, _dir) = Confined::new().run(&[PYTHON, "-c", RELAY_STATUS]);
+    assert_eq!(said(&output), "2 1", "{output:?}");
 }
 
 /// A relay's notice goes to its log, not to the session's terminal.
@@ -277,9 +343,10 @@ fn on_a_runner_the_relays_notices_stay_out_of_the_sessions_stderr() {
         "import socket\nc = socket.create_connection(('127.0.0.1', {}))\nprint(c.recv(1))",
         confined.port
     );
-    let output = confined.run(&[PYTHON, "-c", &script]);
+    let log = confined.path("allowed/relay.log");
+    let (output, _dir) = confined.run(&[PYTHON, "-c", &script]);
     assert_eq!(said(&output), "b''");
     assert!(output.stderr.is_empty(), "{output:?}");
-    let log = std::fs::read_to_string(confined.path("allowed/relay.log")).unwrap();
+    let log = std::fs::read_to_string(log).unwrap();
     assert!(log.contains("cannot reach"), "{log}");
 }
