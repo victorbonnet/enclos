@@ -1642,6 +1642,8 @@ mod sandbox {
 }
 
 mod runtime {
+    mod cgroups;
+
     use super::policy::with_sandbox_on;
     use super::*;
     use crate::model::agent::{AgentName, AgentRecord};

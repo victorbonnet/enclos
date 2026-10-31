@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use super::Engine;
-use super::session::{END_WAIT, SessionEnd, abandon};
+use super::session::{END_WAIT, SessionEnd, abandon, cgroup_of};
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
@@ -550,7 +550,8 @@ impl Engine {
             limits: self.launch_limits(&record, &snapshot.policy)?,
         };
         let ctx = self.sandbox_context(name, record.proxy_port);
-        let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
+        let wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
+        let (mut wrapped, scope) = self.in_scope(name, wrapped)?;
         let marker = self.new_marker(name)?;
         let (child, marked) =
             marker
@@ -561,6 +562,7 @@ impl Engine {
         let recorded = (|| -> Result<SessionRecord> {
             let root = reference_of_child(&child)?;
             self.name_marker(name, marked, &root)?;
+            let cgroup = cgroup_of(scope.as_ref(), &child)?;
             let mut session = SessionRecord {
                 id: SessionId(0),
                 sandbox: name.clone(),
@@ -572,7 +574,7 @@ impl Engine {
                 // In a group made for it, which it leads.
                 pgid: Some(child.id()),
                 root,
-                cgroup: None,
+                cgroup,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,
