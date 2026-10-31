@@ -88,6 +88,10 @@ pub struct SessionRecord {
     /// terminal's job, which the `enclos` holding the terminal leads; none
     /// when neither (design §8).
     pub pgid: Option<u32>,
+    /// The cgroup of the scope the program runs in, as the host gave it:
+    /// the session's members are the processes in it. None on macOS, for
+    /// the proxy, and for a program that ended with its scope (design §8).
+    pub cgroup: Option<String>,
     /// Members recorded while the session ran, so that one whose parent
     /// exited is still found.
     pub tracked: Vec<ProcessRef>,

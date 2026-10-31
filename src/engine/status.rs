@@ -373,6 +373,7 @@ mod tests {
             compiled: None,
             root,
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
