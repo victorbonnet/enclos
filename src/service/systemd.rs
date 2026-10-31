@@ -3,8 +3,141 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
-use super::{ServiceError, ServiceLabel, ServiceUnit};
+use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
+
+pub struct Systemd {
+    /// The folder unit files go in.
+    units_dir: PathBuf,
+}
+
+const SYSTEMCTL: &str = "/usr/bin/systemctl";
+/// How long `start` waits for a run of the same label to end before it
+/// starts its own. `start` runs under enclos's state lock, which a runtime
+/// service being ended needs to record its end, so it does not wait long:
+/// the engine removes a sandbox's services before it starts them, outside
+/// the lock, so a unit still running here was started by another command
+/// meanwhile.
+const REPLACE_WAIT: Duration = Duration::from_secs(10);
+/// How often the manager is asked whether the run has ended meanwhile.
+const REPLACE_POLL: Duration = Duration::from_millis(100);
+
+impl Systemd {
+    pub fn for_user(user_home: &Path) -> Systemd {
+        let config_home = std::env::var_os("XDG_CONFIG_HOME");
+        Systemd {
+            units_dir: units_dir(user_home, config_home.as_deref()),
+        }
+    }
+
+    fn unit_path(&self, label: &ServiceLabel) -> PathBuf {
+        self.units_dir.join(unit_name(label))
+    }
+
+    /// `systemctl --user <args>`; an error when it refuses, saying `what`
+    /// it was asked.
+    fn must(&self, what: &str, args: &[&str]) -> Result<(), ServiceError> {
+        let out = systemctl(args)?;
+        if !out.status.success() {
+            return Err(ServiceError {
+                what: format!(
+                    "systemd did not {what}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// What the manager says of the unit now.
+    fn show(&self, label: &ServiceLabel) -> Result<Shown, ServiceError> {
+        let name = unit_name(label);
+        let out = systemctl(&["show", &name, "--property=LoadState,ActiveState,MainPID"])?;
+        if !out.status.success() {
+            return Err(ServiceError {
+                what: format!(
+                    "systemctl cannot say whether {label} runs (exit {}): {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        Ok(parse_show(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// Ends a run of the unit, if there is one, without waiting past
+    /// `REPLACE_WAIT`.
+    fn end_previous_run(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+        let name = unit_name(label);
+        self.must(&format!("stop {label}"), &["stop", "--no-block", &name])?;
+        let deadline = Instant::now() + REPLACE_WAIT;
+        while !self.show(label)?.ended() {
+            if Instant::now() >= deadline {
+                return Err(ServiceError {
+                    what: format!(
+                        "systemd did not stop {label}: it was still running after {} s; another enclos command may be starting or stopping this sandbox's services",
+                        REPLACE_WAIT.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(REPLACE_POLL);
+        }
+        Ok(())
+    }
+}
+
+fn unit_name(label: &ServiceLabel) -> String {
+    format!("{label}.service")
+}
+
+fn systemctl(args: &[&str]) -> Result<Output, ServiceError> {
+    Command::new(SYSTEMCTL)
+        .arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| ServiceError {
+            what: format!("cannot run systemctl: {e}"),
+        })
+}
+
+/// The properties `systemctl --user show` printed for a unit.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Shown {
+    load_state: String,
+    active_state: String,
+    main_pid: u32,
+}
+
+impl Shown {
+    /// Nothing of the unit runs and no restart is pending.
+    fn ended(&self) -> bool {
+        matches!(self.active_state.as_str(), "inactive" | "failed")
+    }
+
+    fn status(&self) -> ServiceStatus {
+        match (self.main_pid, self.load_state.as_str()) {
+            (0, "not-found") => ServiceStatus::NotLoaded,
+            (0, _) => ServiceStatus::Loaded,
+            (pid, _) => ServiceStatus::Running { pid },
+        }
+    }
+}
+
+fn parse_show(text: &str) -> Shown {
+    let mut shown = Shown::default();
+    for (key, value) in text.lines().filter_map(|l| l.split_once('=')) {
+        match key {
+            "LoadState" => shown.load_state = value.to_owned(),
+            "ActiveState" => shown.active_state = value.to_owned(),
+            "MainPID" => shown.main_pid = value.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    shown
+}
 
 /// The folder unit files go in, as the user's manager looks for it:
 /// `$XDG_CONFIG_HOME/systemd/user` when that is an absolute path, else
@@ -88,6 +221,92 @@ WantedBy=default.target
         // 0 would mean no timeout at all.
         timeout = unit.stop_timeout.as_secs().max(1),
     ))
+}
+
+impl ServiceManager for Systemd {
+    fn available(&self) -> Result<(), ServiceError> {
+        self.must(
+            "answer as your user's manager, which runs enclos's services",
+            &["show", "--property=Version"],
+        )
+    }
+
+    fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
+        let failed = |what: String| ServiceError { what };
+        let text = unit_file(unit)?;
+        std::fs::create_dir_all(&self.units_dir)
+            .map_err(|e| failed(format!("cannot create {}: {e}", self.units_dir.display())))?;
+        let path = self.unit_path(&unit.label);
+        std::fs::write(&path, text)
+            .map_err(|e| failed(format!("cannot write {}: {e}", path.display())))?;
+        self.must("read its unit files again", &["daemon-reload"])?;
+        // Replace a previous run of the same unit.
+        self.end_previous_run(&unit.label)?;
+        self.must(
+            &format!("start {}", unit.label),
+            &["enable", "--now", &unit_name(&unit.label)],
+        )
+    }
+
+    fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+        let name = unit_name(label);
+        if self.status(label)? != ServiceStatus::NotLoaded {
+            // Waits while the manager sends TERM, then KILL after the
+            // unit's stop timeout.
+            self.must(&format!("stop {label}"), &["stop", &name])?;
+            // A unit that ended in failure stays listed until told; there
+            // is nothing to reset otherwise, which systemctl calls an error.
+            systemctl(&["reset-failed", &name])?;
+        }
+        let path = self.unit_path(label);
+        if path.exists() {
+            self.must(
+                &format!("disable {label}"),
+                &["disable", "--no-reload", &name],
+            )?;
+            std::fs::remove_file(&path).map_err(|e| ServiceError {
+                what: format!("cannot remove {}: {e}", path.display()),
+            })?;
+            self.must("read its unit files again", &["daemon-reload"])?;
+        }
+        Ok(())
+    }
+
+    /// A unit systemd has not heard of is not loaded; a manager that cannot
+    /// be asked is not knowing, which `stop` must not read as nothing to
+    /// stop.
+    fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus, ServiceError> {
+        Ok(self.show(label)?.status())
+    }
+
+    /// From the unit files: `start` writes one before starting it, and
+    /// `stop` removes it only once the unit has stopped.
+    fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
+        let entries = match std::fs::read_dir(&self.units_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(ServiceError {
+                    what: format!("cannot read {}: {e}", self.units_dir.display()),
+                });
+            }
+        };
+        let mut labels = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| ServiceError {
+                what: format!("cannot read {}: {e}", self.units_dir.display()),
+            })?;
+            let file = entry.file_name();
+            let label = file
+                .to_str()
+                .and_then(|f| f.strip_suffix(".service"))
+                .filter(|l| l.starts_with(prefix))
+                .and_then(ServiceLabel::parse);
+            labels.extend(label);
+        }
+        labels.sort();
+        Ok(labels)
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +415,60 @@ WantedBy=default.target
             units_dir(home, Some(OsStr::new("relative"))),
             Path::new("/home/alice/.config/systemd/user"),
             "the XDG rules ignore a relative path"
+        );
+    }
+
+    #[test]
+    fn a_unit_runs_when_the_manager_shows_its_main_process() {
+        let shown = |load: &str, active: &str, pid: u32| {
+            parse_show(&format!(
+                "MainPID={pid}\nLoadState={load}\nActiveState={active}\n"
+            ))
+        };
+        let running = shown("loaded", "active", 4242);
+        assert_eq!(running.status(), ServiceStatus::Running { pid: 4242 });
+        assert!(!running.ended());
+        let waiting = shown("loaded", "activating", 0);
+        assert_eq!(waiting.status(), ServiceStatus::Loaded);
+        assert!(!waiting.ended(), "a restart is pending");
+        let exited = shown("loaded", "inactive", 0);
+        assert_eq!(exited.status(), ServiceStatus::Loaded);
+        assert!(exited.ended());
+        assert!(shown("loaded", "failed", 0).ended());
+        assert_eq!(
+            shown("not-found", "inactive", 0).status(),
+            ServiceStatus::NotLoaded
+        );
+        assert_eq!(
+            shown("not-found", "active", 7).status(),
+            ServiceStatus::Running { pid: 7 },
+            "its file was removed by hand, and it still runs"
+        );
+    }
+
+    #[test]
+    fn installed_labels_are_the_unit_files_with_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemd = Systemd {
+            units_dir: dir.path().join("systemd/user"),
+        };
+        assert!(systemd.installed("enclos.").unwrap().is_empty());
+        std::fs::create_dir_all(systemd.units_dir.join("default.target.wants")).unwrap();
+        for file in [
+            "enclos.12345678.home.proxy.service",
+            "enclos.12345678.home.gateway.service",
+            "enclos.12345678.homework.proxy.service",
+            "other.service",
+            "enclos.12345678.home.notes",
+        ] {
+            std::fs::write(systemd.units_dir.join(file), "").unwrap();
+        }
+        assert_eq!(
+            systemd.installed("enclos.12345678.home.").unwrap(),
+            [
+                label("enclos.12345678.home.gateway"),
+                label("enclos.12345678.home.proxy")
+            ]
         );
     }
 }
