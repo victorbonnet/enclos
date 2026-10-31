@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{connections_for, serve_up_to};
+use super::{connections_for, forward, serve_up_to};
 
 /// Far beyond the sockets' buffers.
 const LARGE: usize = 64 * 1024 * 1024;
@@ -196,6 +196,20 @@ fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
     // The client is still open: only the relay can have freed the place.
     relay.served_again();
     drop(client);
+}
+
+/// macOS answers ENOTCONN to telling a peer that has closed, and Linux does
+/// not: the other direction may still be carrying that peer's last bytes.
+#[test]
+fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction() {
+    let mut sent = Vec::new();
+    forward(
+        &b"last"[..],
+        &mut sent,
+        || Err(std::io::ErrorKind::NotConnected.into()),
+        || panic!("the other direction was ended"),
+    );
+    assert_eq!(sent, b"last");
 }
 
 #[test]
