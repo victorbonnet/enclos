@@ -2,7 +2,9 @@
 //! interface. enclos's own records say which secrets a sandbox has; only the
 //! store holds their values, and nothing writes a value anywhere else.
 
+pub mod file;
 pub mod keychain;
+mod tool;
 
 use crate::model::secret::{SecretRef, SecretValue};
 
