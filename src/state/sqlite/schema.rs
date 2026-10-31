@@ -63,7 +63,8 @@ pub const MIGRATIONS: &[&str] = &[
         tracked     TEXT NOT NULL DEFAULT '[]',
         started_at  TEXT NOT NULL,
         ended_at    TEXT,
-        service     TEXT CHECK ((kind = 'service') = (service IS NOT NULL))
+        service     TEXT CHECK ((kind = 'service') = (service IS NOT NULL)),
+        cgroup      TEXT
     ) STRICT;
     CREATE INDEX sessions_running ON sessions (sandbox, ended_at);",
     // 5: the runtime installed in each sandbox, and its agents
@@ -99,8 +100,6 @@ pub const MIGRATIONS: &[&str] = &[
     // (design §6, server name check)
     "ALTER TABLE net_events ADD COLUMN name_seen TEXT;
     ALTER TABLE net_events ADD COLUMN server_name TEXT;",
-    // 10: the cgroup of each session's scope, on Linux (design §8)
-    "ALTER TABLE sessions ADD COLUMN cgroup TEXT;",
 ];
 
 /// The schema version this enclos reads and writes.
