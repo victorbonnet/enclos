@@ -1604,3 +1604,149 @@ on_both_listeners!(
     a_hello_that_never_ends_is_closed_at_the_cap,
     a_hello_left_half_sent_goes_idle_frees_its_place_and_sends_nothing,
 );
+
+/// Clients in a sandbox reach the proxy through the relay, with no DNS of
+/// their own. A destination `allowed` lets through, on a server of this
+/// test's, and another, as curl and Python's `urllib` send them.
+mod through_the_relay {
+    use super::*;
+    use std::process::{Command, Output};
+
+    const NOT_ALLOWED: &str = "denied.test";
+
+    /// A proxy on its Unix socket with a relay in front, its port, and the
+    /// server behind it.
+    fn started() -> (Running, u16, u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        ON_UNIX.set(true);
+        let (server, asked) =
+            upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+        let proxy = start(
+            &[
+                format!("allowed.test:{server}"),
+                format!("tunnel.test:{server}"),
+            ],
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            loopback_is_global,
+        );
+        let Address::Unix(socket) = proxy.addr.clone() else {
+            unreachable!("started on a Unix socket");
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || crate::relay::serve(listener, &socket));
+        (proxy, port, server, asked)
+    }
+
+    /// `client`, with no proxy from the environment running these tests.
+    fn run(mut client: Command) -> Output {
+        for name in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            client.env_remove(name);
+        }
+        client.output().unwrap()
+    }
+
+    /// curl's status line for `url`, through the proxy at `port`, followed
+    /// by its body.
+    fn curl(port: u16, url: &str, tunnel: bool) -> String {
+        let mut client = Command::new("curl");
+        client
+            .args(["--silent", "--max-time", "30", "--noproxy", ""])
+            .args(["--proxy", &format!("http://127.0.0.1:{port}")])
+            .args(["--write-out", "\n%{http_code}"])
+            .arg(url);
+        if tunnel {
+            client.arg("--proxytunnel");
+        }
+        let out = run(client);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// What Python's `urllib` got for `url`: its status, then its body.
+    fn python(port: u16, url: &str) -> String {
+        const SCRIPT: &str = r#"
+import sys, urllib.error, urllib.request
+proxy = urllib.request.ProxyHandler({"http": sys.argv[1]})
+try:
+    answer = urllib.request.build_opener(proxy).open(sys.argv[2], timeout=30)
+except urllib.error.HTTPError as refused:
+    answer = refused
+print(answer.status, answer.read().decode())
+"#;
+        let mut client = Command::new("python3");
+        client
+            .args(["-I", "-c", SCRIPT])
+            .arg(format!("http://127.0.0.1:{port}"))
+            .arg(url);
+        let out = run(client);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn curl_reaches_what_the_policy_allows() {
+        let (_proxy, port, server, asked) = started();
+        let got = curl(port, &format!("http://allowed.test:{server}/path"), false);
+        assert_eq!(got, "hi\n200");
+        let asked = asked.recv_timeout(PATIENCE).unwrap();
+        assert!(asked.starts_with(b"GET /path HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn curl_opens_a_tunnel_to_what_the_policy_allows() {
+        let (proxy, port, server, asked) = started();
+        let got = curl(port, &format!("http://tunnel.test:{server}/path"), true);
+        assert_eq!(got, "hi\n200");
+        asked.recv_timeout(PATIENCE).unwrap();
+        let log = proxy.log.0.lock().unwrap();
+        assert_eq!(
+            (log[0].method.as_str(), log[0].verdict),
+            ("CONNECT", Verdict::Allowed)
+        );
+    }
+
+    #[test]
+    fn curl_gets_the_refusal_of_a_destination_the_policy_denies() {
+        let (proxy, port, server, _asked) = started();
+        let got = curl(port, &format!("http://{NOT_ALLOWED}:{server}/"), false);
+        assert!(got.ends_with("\n403"), "{got}");
+        let log = proxy.log.0.lock().unwrap();
+        assert_eq!(
+            (log[0].host.as_str(), log[0].reason),
+            (NOT_ALLOWED, Some(Reason::NotAllowed))
+        );
+    }
+
+    #[test]
+    fn python_reaches_what_the_policy_allows() {
+        let (_proxy, port, server, asked) = started();
+        let got = python(port, &format!("http://allowed.test:{server}/path"));
+        assert_eq!(got, "200 hi\n");
+        let asked = asked.recv_timeout(PATIENCE).unwrap();
+        assert!(asked.starts_with(b"GET /path HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn python_gets_the_refusal_of_a_destination_the_policy_denies() {
+        let (proxy, port, server, _asked) = started();
+        let got = python(port, &format!("http://{NOT_ALLOWED}:{server}/"));
+        assert!(got.starts_with("403 "), "{got}");
+        let log = proxy.log.0.lock().unwrap();
+        assert_eq!(
+            (log[0].host.as_str(), log[0].reason),
+            (NOT_ALLOWED, Some(Reason::NotAllowed))
+        );
+    }
+}

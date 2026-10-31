@@ -27,6 +27,7 @@ use crate::model::sandbox::SandboxName;
 use crate::net::addr::{AddrClass, classify};
 use crate::state::{NetLogStore, StateStore};
 
+pub(crate) use server::Slot;
 pub use stream::Listener;
 
 /// The descriptors a proxy keeps for itself: the standard streams, its
