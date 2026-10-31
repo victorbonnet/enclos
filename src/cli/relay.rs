@@ -3,13 +3,11 @@
 //! the session, not typed by people. It runs where the enclos folder is out
 //! of sight, so it opens none of it.
 
-use std::net::{Ipv4Addr, TcpListener};
-use std::os::unix::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Args;
 
-use enclos::error::{Error, Result};
+use enclos::error::Result;
 
 #[derive(Args)]
 pub struct RelayArgs {
@@ -22,12 +20,5 @@ pub struct RelayArgs {
 }
 
 pub fn run(RelayArgs { port, socket }: RelayArgs) -> Result<u8> {
-    // Said now: on the first connection it would reach no one.
-    SocketAddr::from_pathname(&socket).map_err(|source| Error::RelaySocket {
-        path: socket.clone(),
-        source,
-    })?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-        .map_err(|source| Error::RelayListen { port, source })?;
-    enclos::relay::serve(listener, &socket)
+    enclos::relay::serve(enclos::relay::listen(port, &socket)?, &socket)
 }
