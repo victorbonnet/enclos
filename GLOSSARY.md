@@ -110,6 +110,12 @@ On Linux, the process that keeps a sandbox's network namespace in being while it
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
 _Avoid_: child, worker
 
+**Scope**:
+On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
+
+**Slice**:
+On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
+
 **Workspace**:
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume
