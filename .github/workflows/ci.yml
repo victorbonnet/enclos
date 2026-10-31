@@ -81,6 +81,35 @@ jobs:
           timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
       - run: cargo test --locked --all-features --lib service::systemd::tests::on_a_runner
 
+  libsecret:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The tests that write to a Secret Service run only here, on a private
+      # bus with a throwaway keyring, never on a developer's host
+      # (src/secrets/libsecret.rs).
+      ENCLOS_LIBSECRET_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y dbus gnome-keyring libsecret-tools
+      # Installs the toolchain and components pinned in rust-toolchain.toml
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked --all-features --lib --no-run
+      # Each test on a bus and a keyring of its own: one locks its keyring,
+      # which nothing here can unlock without asking.
+      - name: On a private bus, with a throwaway keyring
+        run: |
+          for test in a_secret_is_stored_read_replaced_and_removed a_locked_collection_is_told_without_asking; do
+            XDG_DATA_HOME="$(mktemp -d)" dbus-run-session -- sh -ec '
+              printf throwaway | gnome-keyring-daemon --unlock --components=secrets
+              cargo test --locked --all-features --lib "secrets::libsecret::tests::on_a_runner_$1"
+            ' sh "$test"
+          done
+
   secrets:
     runs-on: ubuntu-latest
     steps:
@@ -102,7 +131,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, secrets, deny]
+    needs: [lint, test, systemd-units, libsecret, secrets, deny]
     runs-on: ubuntu-latest
     steps:
       - name: Check needed jobs

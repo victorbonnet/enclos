@@ -528,3 +528,50 @@ fn a_store_refused_before_it_wrote_leaves_what_was_there() {
     assert!(!err.to_string().contains("cleaning up"), "{err}");
     assert_eq!(store.get(&telegram).unwrap(), Some(value(VALUE)));
 }
+
+/// What the `secret` commands call, on the store a host with no Secret
+/// Service picks: a real file, in the test's own folder.
+#[test]
+fn with_no_secret_service_the_secret_commands_keep_values_in_the_file() {
+    use crate::secrets::file::FileStore;
+    use crate::secrets::{Picked, Stubbed};
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, engine, _, name) = with_store();
+    let file = dir.path().join("secrets.json");
+    let answering = Rc::new(InMemory::default());
+    let engine = engine.with_secrets(Box::new(Picked::new(
+        Box::new(Stubbed {
+            answers: false,
+            looks: Rc::default(),
+            store: Rc::clone(&answering),
+        }),
+        Box::new(FileStore::new(file.clone())),
+    )));
+    let token = secret("home/telegram");
+    assert!(set(&engine, &token, VALUE).new);
+    assert!(!set(&engine, &token, "other").new);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("home/telegram") && text.contains("other"));
+    assert!(!text.contains(VALUE), "the old value stayed");
+    assert!(answering.0.borrow().is_empty());
+    let listed = engine.secret_list(&name).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].record.secret, token);
+
+    // Widened, it is refused, naming the file.
+    let wide = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(&file, wide).unwrap();
+    let err = engine
+        .secret_set(&alice(), &token, Some(&value("x")), Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(&file.display().to_string()),
+        "{err}"
+    );
+    let narrow = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(&file, narrow).unwrap();
+
+    done(engine.secret_rm(&alice(), &token, Confirm::Yes).unwrap());
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("other"));
+    assert!(engine.secret_list(&name).unwrap().is_empty());
+}
