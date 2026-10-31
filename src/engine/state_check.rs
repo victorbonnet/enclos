@@ -470,7 +470,8 @@ impl Engine {
         let look = match markers_found {
             true => Look::in_listing(&host.procs, &markers_dir)?,
             false => Look::markers_unseen(&host.procs),
-        };
+        }
+        .in_cgroups(&self.cgroups, &open)?;
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();
         for session in &open {

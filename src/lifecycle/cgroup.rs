@@ -211,8 +211,9 @@ impl Scope {
         })
     }
 
-    /// What systemd says of the scope's cgroup.
-    fn control_group(&self) -> Result<Option<String>, PsError> {
+    /// What systemd says of the scope's cgroup: none once nothing is left
+    /// in it. It takes no pid, so it holds for a program already reaped.
+    pub fn control_group(&self) -> Result<Option<String>, PsError> {
         let out = Command::new(SYSTEMCTL)
             .args(["--user", "show", "--property=ControlGroup", &self.unit])
             .stdin(Stdio::null())
@@ -286,6 +287,26 @@ impl Hierarchy {
     /// remains.
     pub fn kill(&self, cgroup: &str) {
         let _ = std::fs::write(self.folder(cgroup).join("cgroup.kill"), "1");
+    }
+
+    /// Kills everything in `cgroup`, and waits up to `wait` for it to be
+    /// empty. What stays, as on a kernel with no `cgroup.kill`, is an error.
+    pub fn end(&self, cgroup: &str, wait: Duration) -> Result<(), PsError> {
+        self.kill(cgroup);
+        let started = Instant::now();
+        loop {
+            let left = self.pids(cgroup)?;
+            if left.is_empty() {
+                return Ok(());
+            }
+            if started.elapsed() >= wait {
+                return Err(PsError::Cgroup(format!(
+                    "{cgroup} still holds {} process(es) after a kill",
+                    left.len()
+                )));
+            }
+            std::thread::sleep(SCOPE_POLL);
+        }
     }
 }
 
@@ -519,5 +540,21 @@ mod tests {
         cgroups.kill("/s.scope");
         let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
         assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn ending_a_cgroup_kills_it_and_waits_until_it_is_empty() {
+        let (dir, cgroups) = hierarchy(&[("s.scope", "")]);
+        cgroups.end("/s.scope", Duration::ZERO).unwrap();
+        let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
+        assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn a_cgroup_that_stays_after_the_kill_or_cannot_be_read_is_not_ended() {
+        let (_dir, cgroups) = hierarchy(&[("s.scope", "1\n"), ("bad.scope", "x\n")]);
+        let left = cgroups.end("/s.scope", Duration::ZERO).unwrap_err();
+        assert!(left.to_string().contains("/s.scope"), "{left}");
+        assert!(cgroups.end("/bad.scope", Duration::ZERO).is_err());
     }
 }

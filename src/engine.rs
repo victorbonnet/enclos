@@ -98,6 +98,12 @@ pub struct Engine {
     /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
     /// leaves them running.
     stop_members: StopMembers,
+    /// Whether a session's program runs in a scope of its own, with a cgroup
+    /// (design §8): on Linux, and in an engine built without it not, so
+    /// tests never reach the host's systemd.
+    scopes: bool,
+    /// Where a session's cgroup is read.
+    cgroups: crate::lifecycle::cgroup::Hierarchy,
 }
 
 /// Stops a session's members within a grace period, as
@@ -184,6 +190,7 @@ impl Engine {
         )
         .with_services(services)
         .with_secrets(secrets)
+        .with_scopes(cfg!(target_os = "linux"))
     }
 
     pub fn new(
@@ -203,10 +210,18 @@ impl Engine {
             }),
             stop_members: crate::lifecycle::stop::stop,
             downloader: Box::new(Curl),
+            scopes: false,
+            cgroups: crate::lifecycle::cgroup::Hierarchy::host(),
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),
         }
+    }
+
+    /// The same engine, running each session's program in a scope or not.
+    pub fn with_scopes(mut self, scopes: bool) -> Engine {
+        self.scopes = scopes;
+        self
     }
 
     /// The same engine with another secret store.
