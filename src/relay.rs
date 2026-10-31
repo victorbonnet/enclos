@@ -126,15 +126,21 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
 }
 
 /// Copies one direction to its end of input, then tells the other side with
-/// `done`; `failed` runs when either goes wrong.
+/// `done`; `failed` runs when the copy goes wrong. A `done` that fails ends
+/// nothing: macOS answers ENOTCONN when that side has closed already, while
+/// the other direction may still carry the last of what it sent, and each
+/// direction sees for itself a peer that is really gone.
 fn forward(
     mut from: impl Read,
     mut to: impl Write,
     done: impl FnOnce() -> io::Result<()>,
     failed: impl FnOnce(),
 ) {
-    if io::copy(&mut from, &mut to).and_then(|_| done()).is_err() {
-        failed();
+    match io::copy(&mut from, &mut to) {
+        Ok(_) => {
+            let _ = done();
+        }
+        Err(_) => failed(),
     }
 }
 
