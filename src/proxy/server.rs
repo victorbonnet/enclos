@@ -6,7 +6,7 @@
 //! (ADR 0027 proposes refusing it instead).
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -16,6 +16,7 @@ use super::Proxy;
 use super::decide::{Destination, allowed, validated};
 use super::hello::{self, FirstBytes};
 use super::request::{Request, origin_head, parse, read_head};
+use super::stream::{Listener, Stream};
 use crate::model::net::{NameSeen, NetEvent, Reason, Verdict, destination};
 use crate::model::now;
 
@@ -72,15 +73,15 @@ impl Proxy {
     /// the process ends. Returns only if one of them stopped accepting, or
     /// an accept thread could not start: an error, so the service manager
     /// starts the proxy again.
-    pub fn serve_all(self: &Arc<Self>, listeners: Vec<TcpListener>) -> io::Error {
+    pub fn serve_all(self: &Arc<Self>, listeners: Vec<Listener>) -> io::Error {
         let proxy = Arc::clone(self);
         until_one_ends(listeners, move |listener| proxy.accept(listener))
     }
 
     /// Accepts connections on `listener`, each on its own thread.
-    fn accept(self: &Arc<Self>, listener: TcpListener) {
-        for client in listener.incoming() {
-            let Ok(mut client) = client else {
+    fn accept(self: &Arc<Self>, listener: Listener) {
+        loop {
+            let Ok(mut client) = listener.accept() else {
                 thread::sleep(ACCEPT_BACKOFF);
                 continue;
             };
@@ -99,7 +100,7 @@ impl Proxy {
         }
     }
 
-    fn handle(&self, mut client: TcpStream) {
+    fn handle(&self, mut client: Stream) {
         let started = Instant::now();
         let mut event = NetEvent {
             at: now(),
@@ -183,9 +184,9 @@ impl Proxy {
     /// the head.
     fn open(
         &self,
-        client: &TcpStream,
+        client: &Stream,
         event: &mut NetEvent,
-    ) -> Result<(TcpStream, Request, Vec<u8>), Reason> {
+    ) -> Result<(Stream, Request, Vec<u8>), Reason> {
         let mut slow = Until {
             stream: client,
             deadline: Instant::now() + HEAD_TIMEOUT,
@@ -310,7 +311,7 @@ impl Proxy {
         port: u16,
         deadline: Instant,
         event: &mut NetEvent,
-    ) -> Result<TcpStream, Reason> {
+    ) -> Result<Stream, Reason> {
         let order = interleaved(addrs);
         for (i, ip) in order.iter().enumerate() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -322,7 +323,7 @@ impl Proxy {
             let addr = SocketAddr::new(*ip, port);
             if let Ok(stream) = TcpStream::connect_timeout(&addr, budget) {
                 event.address = Some(ip.to_string());
-                return Ok(stream);
+                return Ok(stream.into());
             }
         }
         Err(Reason::ConnectFailed)
@@ -389,7 +390,7 @@ impl Drop for Slot {
 
 /// Reads from a client until a deadline, however slowly it sends.
 pub(super) struct Until<'a> {
-    pub(super) stream: &'a TcpStream,
+    pub(super) stream: &'a Stream,
     pub(super) deadline: Instant,
 }
 
@@ -428,8 +429,8 @@ pub(super) fn interleaved(addrs: &[IpAddr]) -> Vec<IpAddr> {
 /// `event` the bytes moved, the reason `idle` when the proxy closed it for
 /// that, and what the check made of it.
 fn forward(
-    client: &TcpStream,
-    upstream: &TcpStream,
+    client: &Stream,
+    upstream: &Stream,
     request: Request,
     early: &[u8],
     limit: Duration,
@@ -688,8 +689,8 @@ impl Activity {
 /// anything is as any client done. The server's bytes come down from the
 /// start, so a protocol in which the server speaks first works.
 fn relay(
-    client: &TcpStream,
-    upstream: &TcpStream,
+    client: &Stream,
+    upstream: &Stream,
     limit: Duration,
     unanswered: Option<&str>,
     room: Option<u64>,
@@ -792,8 +793,8 @@ enum Held {
 /// unless the check refuses them; stopped, as idle, at `deadline` (the
 /// proxy's is [`HELLO_WAIT`]) whatever moved.
 fn check_name(
-    mut client: &TcpStream,
-    upstream: &TcpStream,
+    mut client: &Stream,
+    upstream: &Stream,
     check: NameCheck,
     activity: &Activity,
     limit: Duration,
@@ -894,8 +895,8 @@ fn check_name(
 /// activity. Read, so that closing `from` later does not reset it and lose
 /// the answer on its way.
 fn copy(
-    mut from: &TcpStream,
-    to: &TcpStream,
+    mut from: &Stream,
+    to: &Stream,
     activity: &Activity,
     limit: Duration,
     mut room: Option<u64>,
@@ -956,7 +957,7 @@ fn copy(
 /// cut short still counts what got through. Each write is activity, so the
 /// other copy does not count the time a slow write took as quiet.
 fn write_counted(
-    mut to: &TcpStream,
+    mut to: &Stream,
     mut buf: &[u8],
     activity: &Activity,
     moved: &mut u64,
@@ -984,7 +985,7 @@ fn timed_out(e: &io::Error) -> bool {
     )
 }
 
-fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Result<()> {
+fn refuse(client: &mut Stream, event: &NetEvent, reason: Reason) -> io::Result<()> {
     let dest = destination(&event.host, event.port);
     let (status, body) = match (event.verdict, reason) {
         (Verdict::Allowed, _) => (
@@ -1024,7 +1025,7 @@ fn response(status: &str, body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::loggable_host;
+    use super::{Stream, loggable_host};
 
     /// What a hello naming no server, or under ECH another, comes to: for
     /// a host name, closed; for an address, which a client names no server
@@ -1091,7 +1092,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
-            (near, far)
+            (Stream::from(near), Stream::from(far))
         };
         let (mut client, proxied) = pair();
         let (upstream, _server) = pair();
@@ -1143,7 +1144,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
-            (near, far)
+            (Stream::from(near), Stream::from(far))
         };
         let (upstream, mut server) = pair();
         let (client, mut reader) = pair();

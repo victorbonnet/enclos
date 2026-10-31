@@ -574,6 +574,15 @@ impl Engine {
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
                 let left = self.forget_secrets(&secrets);
+                // Nothing in it outlives the sandbox's proxy, whatever
+                // `keep_data` keeps; left behind, the next proxy of the name
+                // takes its socket over.
+                let run = self.layout.sandbox_run_dir(name.as_str());
+                if let Err(e) = std::fs::remove_dir_all(&run)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::notes::say(&format!("cannot remove {}: {e}", run.display()));
+                }
                 if !keep_data
                     && dir.exists()
                     && let Err(source) = std::fs::remove_dir_all(&dir)

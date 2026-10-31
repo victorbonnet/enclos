@@ -7348,6 +7348,7 @@ mod doctor;
 mod exec;
 mod history;
 mod pending;
+mod proxy_socket;
 mod secrets;
 // `state check` lists program files with `lsof`, which only macOS has here.
 #[cfg(target_os = "macos")]
