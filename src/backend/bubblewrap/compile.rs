@@ -34,6 +34,10 @@ const EXEC_SYSTEM: &[&str] = &[
 /// The ones of [`OWN_TMPFS`] the sandbox writes temporary files in.
 const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
+/// Where the relay's notices go: the sandbox's own `/tmp`, which ends with
+/// the session, so they stay out of its terminal.
+const RELAY_LOG: &str = "/tmp/enclos-relay.log";
+
 /// What the file in `compiled/` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledSandbox {
@@ -116,6 +120,7 @@ pub struct LandlockRules {
 pub struct Relay {
     pub port: u16,
     pub socket: String,
+    pub log: String,
 }
 
 pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
@@ -183,6 +188,7 @@ fn compiled_sandbox(
         relay: Relay {
             port: ctx.proxy_port,
             socket: text(&ctx.proxy_socket)?,
+            log: RELAY_LOG.to_owned(),
         },
         unenforced: proposed::unenforced(policy),
     })
