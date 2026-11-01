@@ -43,6 +43,8 @@ pub struct InstallEnd {
     pub recorded: Option<RuntimeKind>,
     /// The sandbox's active policy version afterwards.
     pub policy: u32,
+    /// What a person runs in the sandbox to log the runtime in and set it up.
+    pub login: String,
 }
 
 /// What `agent add` did.
@@ -51,6 +53,10 @@ pub struct AgentAdded {
     pub agent: AgentRecord,
     pub kind: RuntimeKind,
     pub how: Added,
+    /// What a person runs in the sandbox to talk to the agent.
+    pub talk: String,
+    /// What a person runs in the sandbox to log the runtime in and set it up.
+    pub login: String,
 }
 
 /// How the record came to be: created, adopted (ADR 0023) or imported
@@ -369,6 +375,7 @@ impl Engine {
                 installed: false,
                 recorded,
                 policy,
+                login: adapter(kind).login(),
             }));
         }
         self.write(
@@ -399,6 +406,7 @@ impl Engine {
             installed: true,
             recorded: Some(kind),
             policy: version.version,
+            login: adapter(kind).login(),
         }))
     }
 
@@ -703,6 +711,8 @@ impl Engine {
             agent: record,
             kind,
             how,
+            talk: runtime.talk(&agent),
+            login: runtime.login(),
         }))
     }
 

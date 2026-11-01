@@ -89,7 +89,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 Planned::Done(added) => added,
             };
             let name = &added.agent.name;
-            let runtime = enclos::runtime::adapter(added.kind);
             let kind = added.kind.display_name();
             if output::json() {
                 let (how, session, archive, copy_left) = match &added.how {
@@ -116,7 +115,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                     "session": session,
                     "archive": archive,
                     "copy_left": copy_left,
-                    "talk": format!("enclos connect {sandbox} -- {}", runtime.talk(name)),
+                    "talk": format!("enclos connect {sandbox} -- {}", added.talk),
                     "home": output::path(&engine.sandbox_home(&sandbox)),
                 }));
                 return Ok(exit::OK);
@@ -125,7 +124,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 Added::Adopted => {
                     println!(
                         "Tracked agent {sandbox}/{name}, which {kind} already had. Talk to it with `enclos connect {sandbox} -- {}`.",
-                        runtime.talk(name)
+                        added.talk
                     );
                     return Ok(exit::OK);
                 }
@@ -151,7 +150,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             }
             let imported = matches!(added.how, Added::Imported { .. });
             let shell = format!("enclos connect {sandbox}");
-            let talk = format!("{shell} -- {}", runtime.talk(name));
+            let talk = format!("{shell} -- {}", added.talk);
             let w = talk.len() + 3;
             if imported {
                 println!("Commands to run inside the sandbox:");
@@ -167,7 +166,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 "There, ~ is the sandbox's home: {}",
                 engine.sandbox_home(&sandbox).display()
             );
-            let login = format!("`enclos connect {sandbox} -- {}`", runtime.login());
+            let login = format!("`enclos connect {sandbox} -- {}`", added.login);
             if imported {
                 // That an imported agent uses the sandbox's login is still
                 // to verify (design §14).
