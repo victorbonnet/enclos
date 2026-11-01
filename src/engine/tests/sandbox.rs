@@ -701,9 +701,9 @@ fn dry_runs_of_stop_and_connect_change_nothing() {
         panic!("a dry run connected");
     };
     assert!(
-        plan.changes.last().is_some_and(
-            |c| c.starts_with(&format!("run `{}` in sandbox home", default_shell()))
-        ),
+        plan.changes
+            .last()
+            .is_some_and(|c| c.starts_with(&format!("run `{}` in sandbox home", default_shell()))),
         "{plan:?}"
     );
     assert_eq!(
