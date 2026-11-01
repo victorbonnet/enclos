@@ -33,6 +33,14 @@ class WorkflowTest(unittest.TestCase):
         for path in glob.glob(os.path.join(M3, "test_*.py")):
             self.assertIn(f"python3 -I prototype/m3/{os.path.basename(path)}", text)
 
+    def test_the_landlock_regression_runs_first_and_has_its_variable(self):
+        text = read(WORKFLOW)
+        step = text.index("- name: Landlock proc O_TRUNC regression")
+        self.assertLess(step, text.index("- name: Set up the runner"))
+        self.assertLess(text.index("test_oom.py GrantsTest"), step)
+        self.assertIn('ENCLOS_PROTO_LANDLOCK: "1"\n        run: python3 -I prototype/m3/test_oom.py ProcTruncateTest',
+                      text[step:])
+
 
 if __name__ == "__main__":
     unittest.main()
