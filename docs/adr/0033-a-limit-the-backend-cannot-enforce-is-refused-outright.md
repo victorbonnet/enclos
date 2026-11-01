@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A limit the backend cannot enforce as written is refused outright
