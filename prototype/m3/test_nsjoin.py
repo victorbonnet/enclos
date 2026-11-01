@@ -85,7 +85,9 @@ class Command(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "compiled.json")
             with open(path, "w") as f:
-                json.dump({"bwrap": COMPILED}, f)
+                json.dump({"bwrap": COMPILED,
+                           "home_mask": {"home": d, "denied": [], "grants": [],
+                                         "empty_file": os.path.join(d, "empty")}}, f)
             out = subprocess.run(
                 [sys.executable, "-I", nsjoin.__file__, "--compiled", path, "--join", "userns", "--",
                  "python3", "-I", "inside.py", "--seccomp", "on", "--", "sh", "-c", "a -- b"],
