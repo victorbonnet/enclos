@@ -2,7 +2,7 @@
 
 A walk through every enclos command and what it should do, to run by hand on a Mac before a release. Each step gives the commands, then what to expect; tick the box when it matches. Anything else is a finding: note the step, the command and its output.
 
-It takes about an hour, a quarter of it Hermes's installs. It uses a throwaway enclos home, so your own `~/.enclos` and its sandboxes stay as they are, and it removes everything it made at the end. The steps that need no login, no bot and no logout were run on macOS 26.5.2 with the release build of commit 06ad972; what they print is quoted where it helps.
+It takes about an hour, a quarter of it Hermes's installs. It uses a throwaway enclos home, so your own `~/.enclos` and its sandboxes stay as they are, and it removes everything it made at the end. The steps that need no login, no bot and no logout were first run on macOS 26.5.2 with the release build of commit 06ad972; what they print is quoted where it helps. The whole guide ran on macOS 27.2 for milestone 2 (design §13).
 
 ## 0. Before you start
 
@@ -129,9 +129,9 @@ enclos exec lab; echo "exit $?"
 enclos --dry-run exec lab -- /bin/ls
 ```
 
-- [ ] The shell starts in the sandbox's home (`$ENCLOS_HOME/sandboxes/lab/home`). The first `connect` also starts the sandbox's services, and says so.
+- [ ] The shell starts in the sandbox's home (`$ENCLOS_HOME/sandboxes/lab/home`). A `connect` also starts the sandbox's services if they are not running, and says so; `hermes setup` in §3 usually did.
 - [ ] `main` answers.
-- [ ] `exec` prints `out` and exits 7; `piped` comes back; an unknown sandbox and a missing command exit 125 with enclos's message on stderr; the dry run says `Would run /bin/ls in sandbox lab under policy v…`.
+- [ ] `exec` prints `out` and exits 7; `piped` comes back; an unknown sandbox and a missing command exit 125 with enclos's message on stderr; the dry run says ``Would run `/bin/ls` in sandbox lab under policy v…``.
 - [ ] Run `enclos exec lab -- /bin/sleep 60` in a second terminal: `enclos sandbox show lab` lists an `exec` session with its process; Ctrl-C ends it, and `show` no longer lists it.
 
 ## 6. Policy
@@ -152,7 +152,7 @@ A change that waits, then applies. Keep `enclos exec lab -- /bin/sleep 120` runn
 ```bash
 mkdir -p ~/enclos-e2e-work
 enclos policy edit lab          # set: write_add = ["/Users/<you>/enclos-e2e-work"]; save, quit
-enclos policy show lab | head -8
+enclos --text policy show lab | head -8
 enclos policy diff lab
 enclos policy apply lab; echo "exit $?"   # ends the sleep: needs confirmation
 enclos --yes policy apply lab
@@ -168,8 +168,8 @@ Discard, rollback, refresh:
 enclos exec lab -- /bin/sleep 120 &       # a session again
 enclos policy edit lab                    # set write_add back to []
 enclos policy discard lab
-enclos policy show lab | head -8
-kill %1; enclos sandbox stop lab          # nothing runs: a change is in force at once
+enclos --text policy show lab | head -8
+kill %%; enclos sandbox stop lab          # nothing runs: a change is in force at once
 enclos policy rollback lab --to 2
 enclos policy history lab
 enclos policy refresh lab
@@ -273,10 +273,10 @@ enclos secret list lab
 
 ## 9. Telegram bots and agent settings
 
-Two bots in `lab`, one for the built-in agent and one for `main`, each granted to its agent alone (ADR 0036). First give each agent a prefix, so a reply says which agent wrote it:
+Two bots in `lab`, one for the built-in agent and one for `main`, each granted to its agent alone (ADR 0036). First give each agent a prefix, so a reply says which agent wrote it. The built-in agent's is `[alpha]`: a model given `[default]` may quote the instruction and still not follow it.
 
 ```bash
-enclos connect lab -- /bin/sh -c 'echo "Start every reply with [default]." >> ~/.hermes/SOUL.md'
+enclos connect lab -- /bin/sh -c 'echo "Start every reply with [alpha]." >> ~/.hermes/SOUL.md'
 enclos connect lab -- /bin/sh -c 'echo "Start every reply with [main]." >> ~/.hermes/profiles/main/SOUL.md'
 enclos secret set lab/telegram          # the first token
 enclos secret set lab/main-telegram     # the second token
@@ -286,18 +286,18 @@ enclos policy edit lab                  # add at the end:
                                         #   [secrets.agents.main]
                                         #   env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 enclos --yes policy apply lab
-enclos policy show lab | grep -A3 '^Secrets'
+enclos --text policy show lab | grep -A3 '^Secrets'
 enclos secret list lab
 enclos runtime configure lab --channel telegram --allow-user <your id>
 enclos runtime configure lab/main --channel telegram --allow-user <your id>
 enclos logs lab | grep -i telegram
 ```
 
-- [ ] In the editor, put the first token under `[secrets]` first and save: it is refused, saying a bot's token goes under `[secrets.agents.default]`, and the editor opens again for you to move it.
+- [ ] In the editor, first grant `lab/telegram` under `[secrets]`, beside `DEMO`, and save: it is refused, saying a bot's token goes under `[secrets.agents.default]`, and the editor opens again. Keep `DEMO` under `[secrets]`, and move only the token.
 - [ ] `policy show` lists `$DEMO = secret:lab/demo  (every session and agent)`, then `$TELEGRAM_BOT_TOKEN` twice, `(agent default)` and `(agent main)`; `secret list` gives `telegram` as `$TELEGRAM_BOT_TOKEN for agent default` and `main-telegram` as `… for agent main`.
 - [ ] Each `configure` says `Agent lab/<agent> reads the secrets the policy grants it under [secrets.agents.<agent>]`, then that its Telegram bot is set up, its token read from `$TELEGRAM_BOT_TOKEN`, answering 1 user. Without `policy apply` first, it refuses until the grant is in force. (Run on a stopped sandbox, Hermes also prints `helper failed … no secrets applied` for each command: the agent's secrets file exists only while the services run. Harmless.)
 - [ ] The gateway's log has two Telegram connections and no `same credential` refusal.
-- [ ] Message each bot from your account: each answers, the first with `[default]`, the second with `[main]`. From an account not in `--allow-user`, neither does.
+- [ ] Message each bot from your account: each answers, the first with `[alpha]`, the second with `[main]`. From an account not in `--allow-user`, neither does.
 - [ ] While the gateway runs, `$ENCLOS_HOME/sandboxes/lab/secrets/` holds `.env`, `default.env` and `main.env`, each `-rw-------` in a `drwx------` folder, and only `main.env` holds the second token; after `enclos sandbox stop lab` the files are gone. (`sandbox start lab` again after checking.)
 - [ ] Once the bots have answered, no file of this home holds a token but the secrets files: `grep -ral "<the part of a token after its colon>" "$ENCLOS_HOME" | grep -v /secrets/` finds nothing, for each token, the services' logs included.
 - [ ] From another sandbox: `enclos exec scout -- /bin/cat "$ENCLOS_HOME/sandboxes/lab/secrets/main.env"` and `enclos exec scout -- /bin/ls "$ENCLOS_HOME/sandboxes/lab/home"` both say `Operation not permitted`.
@@ -345,7 +345,7 @@ enclos sandbox start lab scout
 ```
 
 - [ ] `show` lists the proxy and gateway sessions with their processes, and both services `running (pid …)`.
-- [ ] Changing `~/.hermes/config.yaml` inside the sandbox: the log says `~/.hermes/config.yaml changed: asked the gateway service to restart`.
+- [ ] Changing `~/.hermes/config.yaml` inside the sandbox: a few seconds later, the log says `~/.hermes/config.yaml changed: asked the gateway service to restart`.
 - [ ] `restart`, then `stop` and `start` with two names, each say what they did per sandbox.
 - [ ] Save your work in other apps (a logout quits them), then log out of the Mac and back in: `lab` and `scout` run again and both bots answer. After `enclos sandbox stop lab`, a logout and login leave it stopped.
 
@@ -370,6 +370,7 @@ With `lab` started, unload its gateway's launchd job by hand (the label from `sa
 
 ```bash
 launchctl bootout "gui/$(id -u)/enclos.<8 hex>.lab.gateway"
+sleep 10                                   # it returns at once; launchd ends the job over a few seconds
 enclos state check lab; echo "exit $?"
 enclos sandbox stop lab && enclos sandbox start lab
 enclos state check lab
