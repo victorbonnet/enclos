@@ -15,10 +15,12 @@ exists and delivers nothing.
 
 import ctypes
 import errno
+import fcntl
 import os
 import platform
 import select
 import socket
+import struct
 import subprocess
 import sys
 
@@ -279,6 +281,158 @@ def p_dns(name):
         return "EAI", str(e)
 
 
+# M3-03: what a session sees of its sandbox's other sessions.
+
+def p_netns():
+    return "ok", " ".join(os.readlink(f"/proc/self/ns/{n}") for n in ("user", "pid", "net"))
+
+
+# The marker is passed to these probes reversed, so that neither their own
+# command line nor bubblewrap's, which holds the probes', matches it.
+LAUNCHERS = ("bwrap", "nsenter", "inside.py", "ns-fds.py", "sbx-ns.sh", "probe.py", "timeout")
+
+
+def find_marker(reversed_marker):
+    """The pids, as this side numbers them, of the processes whose command
+    line holds the marker, launchers left out."""
+    marker = reversed_marker[::-1].encode()
+    found = []
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not any(marker in a for a in argv):
+            continue
+        if any(os.path.basename(a.decode(errors="replace")) in LAUNCHERS for a in argv[:3]):
+            continue
+        found.append(int(p))
+    return found
+
+
+def p_find(marker):
+    found = find_marker(marker)
+    total = sum(1 for p in os.listdir("/proc") if p.isdigit())
+    if found:
+        return "ok", f"pids {' '.join(map(str, found))} of {total} listed"
+    return "absent", f"{total} processes listed, marker in none"
+
+
+def peer(marker, act):
+    found = find_marker(marker)
+    if not found:
+        return "absent", "no process with the marker in sight"
+    result, detail = act(found[-1])
+    return result, f"pid {found[-1]}" + (f"; {detail}" if detail else "")
+
+
+def p_peer_kill(marker):
+    return peer(marker, p_kill)
+
+
+def p_peer_ptrace(marker):
+    return peer(marker, p_ptrace)
+
+
+def p_peer_environ(marker):
+    def read(pid):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                held = marker[::-1].encode() in f.read()
+            return ("ok", "marker read") if held else ("ok", "read, no marker")
+        except OSError as e:
+            return err(e.errno), ""
+    return peer(marker, read)
+
+
+def p_listen_tcp(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((host, int(port)))
+        s.listen(1)
+        return "ok", f"bound {host}:{s.getsockname()[1]}"
+    except OSError as e:
+        return err(e.errno), ""
+    finally:
+        s.close()
+
+
+def p_http(url):
+    """A request through the proxy variables, as clients make them."""
+    import urllib.request
+    try:
+        return "ok", f"status {urllib.request.urlopen(url, timeout=20).status}"
+    except urllib.error.HTTPError as e:
+        return "ok", f"status {e.code}"
+    except OSError as e:
+        return err(e.errno) if getattr(e, "errno", None) else "error", str(e)[:80]
+
+
+def p_fds():
+    """Namespace descriptors this process holds open."""
+    held = []
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target.split(":")[0] in ("user", "pid", "net", "mnt"):
+            held.append(f"{fd}={target}")
+    return ("held", " ".join(held)) if held else ("none", "")
+
+
+def p_setns_net():
+    """Joining the network namespace this process is already in: the call
+    still needs CAP_SYS_ADMIN in the user namespace that owns it."""
+    fd = os.open("/proc/self/ns/net", os.O_RDONLY)
+    try:
+        os.setns(fd, os.CLONE_NEWNET)
+        return "ok", "joined"
+    except OSError as e:
+        return err(e.errno), ""
+    finally:
+        os.close(fd)
+
+
+def p_net_admin():
+    """Setting loopback's flags to what they are: needs CAP_NET_ADMIN in the
+    user namespace that owns the network namespace, and changes nothing."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        req = fcntl.ioctl(s, 0x8913, struct.pack("16sh14x", b"lo", 0))  # SIOCGIFFLAGS
+        fcntl.ioctl(s, 0x8914, req)  # SIOCSIFFLAGS
+        return "ok", "set"
+    except OSError as e:
+        return err(e.errno), ""
+    finally:
+        s.close()
+
+
+def p_status():
+    """What the kernel holds of this process's confinement."""
+    want = ("NoNewPrivs", "Seccomp", "CapEff", "CapBnd")
+    with open("/proc/self/status") as f:
+        found = dict(line.split(":\t", 1) for line in f if ":\t" in line)
+    return "ok", " ".join(f"{k}={found[k].strip()}" for k in want if k in found)
+
+
+def p_max_userns():
+    with open("/proc/sys/user/max_user_namespaces") as f:
+        return "ok", f.read().strip()
+
+
+def p_nsopen(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.close(fd)
+        return "ok", os.readlink(path)
+    except OSError as e:
+        return err(e.errno), ""
+
+
 PROBES = {
     "read": p_read, "exists": p_exists, "write": p_write, "open-write": p_open_write, "leave": p_leave,
     "exec": p_exec, "exec-loader": p_exec_loader, "exec-memfd": p_exec_memfd, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
@@ -286,6 +440,10 @@ PROBES = {
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,
     "ptrace": p_ptrace, "connect-unix": p_connect_unix,
     "connect-tcp": p_connect_tcp, "connect-vsock": p_connect_vsock, "dns": p_dns,
+    "netns": p_netns, "find": p_find, "peer-kill": p_peer_kill, "peer-ptrace": p_peer_ptrace,
+    "peer-environ": p_peer_environ, "listen-tcp": p_listen_tcp, "http": p_http, "fds": p_fds,
+    "nsopen": p_nsopen, "setns-net": p_setns_net, "net-admin": p_net_admin, "status": p_status,
+    "max-userns": p_max_userns,
 }
 
 
