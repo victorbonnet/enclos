@@ -11,6 +11,7 @@ pub mod decide;
 mod hello;
 pub mod request;
 mod server;
+mod tunnel;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
