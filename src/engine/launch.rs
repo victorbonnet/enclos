@@ -151,7 +151,7 @@ impl Engine {
                 None => format!("session {session}"),
             }
         };
-        let (started, _) =
+        let (Started { session, mut child, .. }, _) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
                 // Sessions stopped and ended before a failure are named in
                 // the failed entry too.
@@ -177,10 +177,7 @@ impl Engine {
                     // recorded its end, at logout or by the service manager's
                     // timeout: its process is gone, so it ends here.
                     self.end_dead_sessions(lock, name, SessionKind::Service)?;
-                    let starting = Starting::Service {
-                        runtime: kind,
-                        name: service,
-                    };
+                    let starting = Starting::Service { service };
                     self.start_session(lock, name, &command, starting, || Ok(()))
                 })();
                 let started = match (started, replaced_earlier(service, &replaced)) {
@@ -193,9 +190,6 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
-        let Started {
-            session, mut child, ..
-        } = started;
         // Asked to restart once its settings change (ADR 0031).
         let mut restarting = false;
         let mut look = |notes: &mut Vec<String>| {

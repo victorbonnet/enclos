@@ -15,7 +15,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use super::Engine;
 use super::listener::ConnectStep;
 use super::service::STOP_GRACE;
-use super::start::{Group, Started, Starting};
+use super::start::{CommandKind, Group, Started, Starting};
 use crate::error::{Error, Result};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
@@ -25,7 +25,7 @@ use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxState};
-use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::model::session::{Member, ProcessRef, SessionId, SessionRecord};
 use crate::runtime::SandboxCommand;
 use crate::state::{StateError, StateLock};
 
@@ -126,7 +126,7 @@ impl Engine {
             name,
             SandboxCommand::new(command),
             "exec",
-            SessionKind::Exec,
+            CommandKind::Exec,
         )
         .map(Planned::Done)
     }
@@ -140,7 +140,7 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
-        self.run_in_sandbox_as(by, name, command, audit_name, SessionKind::Interactive)
+        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Interactive)
     }
 
     /// Runs `command` in the sandbox as a recorded session of `kind`, with
@@ -152,39 +152,22 @@ impl Engine {
         name: &SandboxName,
         command: SandboxCommand,
         audit_name: &str,
-        kind: SessionKind,
+        kind: CommandKind,
     ) -> Result<SessionEnd> {
         let command = command.into_words();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
-        // Which process group the program starts in (design §8). Without a
-        // terminal (a script, CI, a supervisor, whether or not this process
-        // leads its group), a group made for the program, to which this
-        // process passes every signal it catches. In a terminal, when this
-        // command leads its group, as a terminal's job does, that group: the
-        // program keeps the terminal, and this process, which leads the
-        // group, is not a member. Otherwise (a terminal, but not a job of
-        // its own, as in a shell's pipeline) the caller's group, which is
-        // not the session's: the session then has no group, only the
-        // processes the program starts. A terminal on any of the standard
-        // streams counts: with input piped in, the output still goes to the
-        // terminal, whose Ctrl-C must reach the program.
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
         let in_terminal = std::io::stdin().is_terminal()
             || std::io::stdout().is_terminal()
             || std::io::stderr().is_terminal();
-        let group = match (in_terminal, leads_group) {
-            (false, _) => Group::Own,
-            (true, true) => Group::ThisProcess,
-            (true, false) => Group::Caller,
-        };
-        let own_group = group == Group::Own;
+        let group = Group::of(in_terminal, leads_group);
         self.wait_service_proxy(name)?;
         let Started {
             session,
             mut child,
             unreachable,
-            ready: keep_waiting,
+            prepared: keep_waiting,
         } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
             let starting = Starting::Command { kind, group };
             let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
@@ -198,10 +181,10 @@ impl Engine {
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
             for signal in keep_waiting.received() {
-                let sent = match (own_group, signal) {
-                    (true, _) => signal_group(&session.root, pgid, signal),
-                    (false, Signal::Term) => signal_process(&session.root, signal),
-                    (false, _) => continue,
+                let sent = match (group, signal) {
+                    (Group::Own, _) => signal_group(&session.root, pgid, signal),
+                    (_, Signal::Term) => signal_process(&session.root, signal),
+                    _ => continue,
                 };
                 let why = match sent {
                     Ok(Signalled::Sent | Signalled::Gone) => continue,

@@ -82,8 +82,8 @@ impl Marker {
 }
 
 /// The marker of a program that started, before its session is recorded.
-/// Dropped unnamed, as when the program did not start or its session could
-/// not be recorded, it is removed.
+/// Dropped unnamed, as when the program did not start or failed before it
+/// was named, it is removed. Once named, it stays until the session's end.
 pub struct Started {
     path: Option<PathBuf>,
 }

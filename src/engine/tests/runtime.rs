@@ -3137,11 +3137,10 @@ fn a_launch_stops_a_live_session_of_its_service_before_starting_another() {
     other.wait().unwrap();
 }
 
-/// A sandbox may remove the folder `TMPDIR` names: a service gets it back as
-/// it starts, as every other session does.
+/// Runs the gateway once, after `change` did what it does to the sandbox's
+/// `tmp`, and says whether that is then a folder.
 #[cfg(target_os = "macos")]
-#[test]
-fn a_service_gets_back_the_tmp_folder_its_sandbox_removed() {
+fn tmp_is_a_folder_after_a_launch(change: impl FnOnce(&Path)) -> bool {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -3153,44 +3152,158 @@ fn a_service_gets_back_the_tmp_folder_its_sandbox_removed() {
         .layout
         .sandbox_home(lab.name.as_str())
         .join("tmp");
-    std::fs::remove_dir_all(&tmp).unwrap();
+    change(&tmp);
     let ended = Arc::new(AtomicBool::new(false));
     let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
     lab.engine
         .launch_until(&alice(), &lab.name, "gateway", &ended)
         .unwrap();
     teller.join().unwrap();
-    assert!(tmp.is_dir());
+    tmp.symlink_metadata().is_ok_and(|found| found.is_dir())
 }
 
-/// A start that fails once the program runs, for either kind of session,
-/// ends the program, leaves no session open and no marker behind.
+/// A sandbox may remove the folder `TMPDIR` names: a service gets it back as
+/// it starts, as every other session does.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
-    use crate::engine::start::{Group, Starting};
+fn a_service_gets_back_the_tmp_folder_its_sandbox_removed() {
+    assert!(tmp_is_a_folder_after_a_launch(|tmp| {
+        std::fs::remove_dir_all(tmp).unwrap();
+    }));
+}
+
+/// What a sandbox leaves in its place cannot keep a service from starting,
+/// or the service manager would start it again and again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_a_sandbox_left_in_place_of_tmp_keeps_no_service_from_starting() {
+    assert!(tmp_is_a_folder_after_a_launch(|tmp| {
+        std::fs::remove_dir_all(tmp).unwrap();
+        std::fs::write(tmp, "a file").unwrap();
+    }));
+}
+
+/// A session starts in the group it records, for every kind of start: the
+/// process tree alone would not show a mistake here, as `stop` would still
+/// find the program.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_starts_in_the_group_it_records_as_what_it_was_started_for() {
+    use crate::engine::start::{CommandKind, Group, Starting};
+    use crate::lifecycle::process::group_of;
     use crate::model::session::SessionKind;
-    use std::cell::Cell;
-    use std::time::{Duration, Instant};
 
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
-    let pid_file = lab.home.join("program-pid");
-    let command: Vec<std::ffi::OsString> = vec![
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let me = std::process::id();
+    let mine = group_of(me).unwrap();
+    let command = |group| Starting::Command {
+        kind: CommandKind::Interactive,
+        group,
+    };
+    let sleep = ["/bin/sleep".into(), "30".into()];
+    for (starting, kind, service, ours, recorded_ours) in [
+        (
+            command(Group::Own),
+            SessionKind::Interactive,
+            None,
+            false,
+            false,
+        ),
+        (
+            command(Group::ThisProcess),
+            SessionKind::Interactive,
+            None,
+            true,
+            true,
+        ),
+        (
+            command(Group::Caller),
+            SessionKind::Interactive,
+            None,
+            true,
+            false,
+        ),
+        (
+            Starting::Service { service: "gateway" },
+            SessionKind::Service,
+            Some("gateway".to_owned()),
+            false,
+            false,
+        ),
+    ] {
+        let lock = lab.engine.state.lock().unwrap();
+        let started = lab
+            .engine
+            .start_session(&lock, &lab.name, &sleep, starting, || Ok(()));
+        drop(lock);
+        let Ok(mut started) = started else {
+            panic!("{starting:?} did not start");
+        };
+        let child = started.child.id();
+        let group = group_of(child).unwrap();
+        started.child.kill().unwrap();
+        started.child.wait().unwrap();
+        assert_eq!(group, if ours { mine } else { Some(child) }, "{starting:?}");
+        let pgid = started.session.pgid;
+        match (recorded_ours, ours) {
+            (true, _) => assert_eq!(pgid, Some(me), "{starting:?}"),
+            (false, true) => assert_eq!(pgid, None, "{starting:?}"),
+            (false, false) => assert_eq!(pgid, Some(child), "{starting:?}"),
+        }
+        assert_eq!(started.session.kind, kind, "{starting:?}");
+        assert_eq!(started.session.service, service, "{starting:?}");
+    }
+}
+
+/// `sh` writes its pid, then becomes a long sleep: what a start that fails
+/// must end.
+#[cfg(target_os = "macos")]
+fn writes_its_pid_and_sleeps(pid_file: &Path) -> Vec<std::ffi::OsString> {
+    vec![
         "/bin/sh".into(),
         "-c".into(),
         "echo $$ > \"$0.new\"; mv \"$0.new\" \"$0\"; exec /bin/sleep 30".into(),
-        pid_file.clone().into(),
-    ];
+        pid_file.into(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_pid(pid_file: &Path) -> u32 {
+    use std::time::{Duration, Instant};
+    let begun = Instant::now();
+    while !pid_file.exists() {
+        assert!(
+            begun.elapsed() < Duration::from_secs(10),
+            "it did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pids_in(pid_file)[0]
+}
+
+/// A start that fails once the program runs and before its marker is named,
+/// for either kind of session, ends the program, and leaves no session open
+/// and no marker behind.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
+    use crate::engine::start::{CommandKind, Group, Starting};
+    use crate::model::session::SessionKind;
+    use std::cell::Cell;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let pid_file = lab.home.join("program-pid");
+    let command = writes_its_pid_and_sleeps(&pid_file);
     for starting in [
         Starting::Command {
-            kind: SessionKind::Interactive,
+            kind: CommandKind::Interactive,
             group: Group::Own,
         },
-        Starting::Service {
-            runtime: RuntimeKind::Hermes,
-            name: "gateway",
-        },
+        Starting::Service { service: "gateway" },
     ] {
         let _ = std::fs::remove_file(&pid_file);
         let pid = Cell::new(0);
@@ -3198,15 +3311,7 @@ fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
         let started = lab
             .engine
             .start_session(&lock, &lab.name, &command, starting, || {
-                let begun = Instant::now();
-                while !pid_file.exists() {
-                    assert!(
-                        begun.elapsed() < Duration::from_secs(10),
-                        "it did not start"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                pid.set(pids_in(&pid_file)[0]);
+                pid.set(wait_for_pid(&pid_file));
                 Err::<(), _>(Error::Session {
                     what: "refused before it was recorded".into(),
                 })
@@ -3225,11 +3330,123 @@ fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
             open.iter().all(|s| s.kind == SessionKind::Proxy),
             "{open:?}"
         );
-        let markers = lab.engine.markers(&lab.name);
-        let left: Vec<_> = std::fs::read_dir(&markers)
+        let left: Vec<_> = std::fs::read_dir(lab.engine.markers(&lab.name))
             .map_or_else(|_| Vec::new(), |files| files.flatten().collect());
         assert!(left.is_empty(), "{left:?}");
     }
+}
+
+/// The state's write is the failure a start can really meet: by then the
+/// marker is named, and the program is ended all the same.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_session_that_cannot_be_written_ends_its_program() {
+    use crate::engine::start::Starting;
+    use crate::model::session::SessionKind;
+    use std::cell::Cell;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let pid_file = lab.home.join("program-pid");
+    let command = writes_its_pid_and_sleeps(&pid_file);
+    let conn = rusqlite::Connection::open(lab.engine.layout.state_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER no_session BEFORE INSERT ON sessions
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .unwrap();
+    let pid = Cell::new(0);
+    let lock = lab.engine.state.lock().unwrap();
+    let started = lab.engine.start_session(
+        &lock,
+        &lab.name,
+        &command,
+        Starting::Service { service: "gateway" },
+        || {
+            pid.set(wait_for_pid(&pid_file));
+            Ok(())
+        },
+    );
+    drop(lock);
+    conn.execute_batch("DROP TRIGGER no_session").unwrap();
+    let Err(error) = started else {
+        panic!("a session that was not written started");
+    };
+    assert!(error.to_string().contains("injected failure"), "{error}");
+    assert_eq!(
+        crate::lifecycle::process::reference(pid.get()).unwrap(),
+        None
+    );
+    let open = lab.engine.state.sessions(&lab.name, true).unwrap();
+    assert!(
+        open.iter().all(|s| s.kind == SessionKind::Proxy),
+        "{open:?}"
+    );
+}
+
+/// A program that cannot start is named, for either kind of session, and
+/// leaves no marker.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_program_that_cannot_start_is_named_and_leaves_no_marker() {
+    use crate::engine::start::{CommandKind, Group, Starting};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let command = ["/nonexistent/program".into()];
+    for (starting, says) in [
+        (
+            Starting::Command {
+                kind: CommandKind::Interactive,
+                group: Group::Own,
+            },
+            format!("could not start /nonexistent/program in {}:", lab.name),
+        ),
+        (
+            Starting::Service { service: "gateway" },
+            format!(
+                "could not start the {} gateway service:",
+                RuntimeKind::Hermes
+            ),
+        ),
+    ] {
+        let lock = lab.engine.state.lock().unwrap();
+        let started = lab
+            .engine
+            .start_session(&lock, &lab.name, &command, starting, || Ok(()));
+        drop(lock);
+        let Err(error) = started else {
+            panic!("a program that does not exist started");
+        };
+        assert!(error.to_string().starts_with(&says), "{error}");
+        let left: Vec<_> = std::fs::read_dir(lab.engine.markers(&lab.name))
+            .map_or_else(|_| Vec::new(), |files| files.flatten().collect());
+        assert!(left.is_empty(), "{left:?}");
+    }
+}
+
+/// A `launch` ends what another service's killed `launch` left recorded,
+/// which `stop_sessions`, asked only about its own service, would not reach.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_launch_ends_a_dead_session_of_another_service() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let dead = record_service_session(&lab, "mail", super::sandbox::gone_process(), None);
+    let ended = Arc::new(AtomicBool::new(false));
+    let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
+    lab.engine
+        .launch_until(&alice(), &lab.name, "gateway", &ended)
+        .unwrap();
+    teller.join().unwrap();
+    let open = open_service_sessions(&lab);
+    assert!(open.iter().all(|s| s.id != dead), "{open:?}");
 }
 
 #[cfg(target_os = "macos")]
