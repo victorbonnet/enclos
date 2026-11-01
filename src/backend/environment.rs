@@ -255,9 +255,18 @@ mod tests {
             let env = on(system, &all_present);
             assert_eq!(env["HOME"], HOME);
             assert_eq!(env["TMPDIR"], format!("{HOME}/tmp/"));
-            assert_eq!(env["https_proxy"], "http://127.0.0.1:41001");
-            assert_eq!(env["HTTP_PROXY"], "http://127.0.0.1:41001");
+            for name in [
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "ALL_PROXY",
+                "https_proxy",
+                "http_proxy",
+                "all_proxy",
+            ] {
+                assert_eq!(env[name], "http://127.0.0.1:41001", "{name}");
+            }
             assert_eq!(env["NO_PROXY"], "");
+            assert_eq!(env["no_proxy"], "");
             assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
             assert_eq!(env["ENCLOS_SANDBOX"], "home");
         }
