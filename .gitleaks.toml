@@ -23,9 +23,10 @@ keywords = ["/users/", "/home/"]
 [[rules.allowlists]]
 description = "Placeholder names in tests and docs, and folders that belong to no person"
 regexes = [
-  # Placeholders. `x` is in an older version of docs/design.md, allowed so
-  # a scan of the whole history passes.
-  '''^(?:alice|alicex|x)$''',
+  # Placeholders. `x` is in an older version of docs/design.md, and `you` in
+  # an older version of site/index.html, allowed so a scan of the whole
+  # history passes.
+  '''^(?:alice|alicex|x|you)$''',
   # A test program in a sandbox's home folder (`sandboxes/home/home/sleeper`),
   # named in a test's expected text.
   '''^sleeper$''',

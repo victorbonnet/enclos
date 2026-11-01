@@ -84,10 +84,10 @@ allow_add = ["api.telegram.org"]</code></pre>
 (deny file-write*)
 (allow file-write*
   (subpath ".../sandboxes/lab/home")
-  (subpath "/Users/you/Documents/notes"))
+  (subpath "/Users/alice/Documents/notes"))
 (deny file-read* file-write*
-  (subpath "/Users/you/.ssh")
-  (subpath "/Users/you/work"))
+  (subpath "/Users/alice/.ssh")
+  (subpath "/Users/alice/work"))
 (allow network-outbound
   (remote tcp "localhost:41001"))</code></pre>
             <figcaption>What Seatbelt enforces, shortened.</figcaption>
