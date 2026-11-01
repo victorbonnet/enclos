@@ -470,9 +470,9 @@ src/
   model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs
   policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
-  lifecycle/       sessions.rs  stop.rs
+  lifecycle/       process.rs  members.rs (which processes are a session's)  marker.rs  look.rs (one look at a sandbox: the listing, then the markers)  stop.rs  listeners.rs  programs.rs
   probes/          mod.rs (escape probes for `policy test`, run by engine/probe.rs)
-  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, denials.rs}
+  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, denials.rs}
   proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs

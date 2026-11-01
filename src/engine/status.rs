@@ -20,12 +20,11 @@ use std::path::{Path, PathBuf};
 
 use super::Engine;
 use super::listener::{NoPort, outside_proxy_range, service_listener};
-use super::markers::marked_in;
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
-use crate::lifecycle::members::{find, is_gone};
-use crate::lifecycle::process::{Proc, is_same, processes};
+use crate::lifecycle::members::find;
+use crate::lifecycle::process::{Proc, is_same};
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
@@ -95,25 +94,12 @@ impl Engine {
         let active = self.state.active_policy(&name)?.map(|(v, _)| v.version);
         let compiled = self.active_compiled(&record);
         let open = self.state.sessions(&name, true)?;
-        // Looked at only when a session is open: most sandboxes have none.
-        let procs = match open.is_empty() {
-            true => Vec::new(),
-            false => processes()?,
-        };
+        let look = self.look_open(&name, &open)?;
         // With what holds each session's marker, its members too (ADR 0030).
-        let open: Vec<SessionRecord> = match open.is_empty() {
-            true => open,
-            false => {
-                let held = self.held(&name)?;
-                open.into_iter()
-                    .map(|mut s| {
-                        s.tracked = marked_in(&s, &s.tracked, &procs, &held);
-                        s
-                    })
-                    .collect()
-            }
-        };
-        let (gone, running): (Vec<_>, Vec<_>) = open.into_iter().partition(|s| is_gone(&procs, s));
+        let (gone, running): (Vec<_>, Vec<_>) = open
+            .iter()
+            .map(|s| look.marked(s))
+            .partition(|s| look.is_gone(s));
         let sessions = self.state.sessions(&name, false)?;
         let last_connect = sessions
             .iter()
@@ -152,7 +138,7 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
-        let network_listeners = network_listeners(&procs, &running);
+        let network_listeners = network_listeners(look.listing(), &running);
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
@@ -412,7 +398,7 @@ mod tests {
         let mut port = || lines.next().unwrap().unwrap();
         let (wide, narrow) = (port(), port());
         let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
-        let procs = processes().unwrap();
+        let procs = crate::lifecycle::process::processes().unwrap();
         let running = [session_of(SessionKind::Interactive, root.clone())];
         let found = network_listeners(&procs, &running);
         // The proxy runs on the host, not in the sandbox: never counted.

@@ -127,9 +127,18 @@ pub fn remove(dir: &Path, root: &ProcessRef) -> io::Result<()> {
     }
 }
 
+/// The processes holding each marker of a sandbox, by marker file name.
+pub type Held = BTreeMap<String, BTreeSet<u32>>;
+
+/// Whether a process in `held` holds the marker of the session whose root
+/// is `root`.
+pub fn is_held(held: &Held, root: &ProcessRef) -> bool {
+    held.get(&name_of(root)).is_some_and(|p| !p.is_empty())
+}
+
 /// The processes holding each named marker in `dir`, by file name, of those
 /// `lsof` can see (the user's; root's are not listed).
-pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
+pub fn holders(dir: &Path) -> Result<Held, MarkerError> {
     // No folder yet is no marker; a folder that cannot be read is not: read
     // here, since `lsof -w` hides its own failure to open the folder and
     // answers as for one with nothing held.
@@ -155,7 +164,7 @@ pub fn holders(dir: &Path) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerErro
 /// `n<path>` line for each file of the folder it holds, the folder itself
 /// for a process working in it. With nothing held it prints nothing and
 /// exits 1, as for listeners (`listeners.rs`).
-fn parse(out: &Output) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
+fn parse(out: &Output) -> Result<Held, MarkerError> {
     let text = String::from_utf8_lossy(&out.stdout);
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
@@ -163,7 +172,7 @@ fn parse(out: &Output) -> Result<BTreeMap<String, BTreeSet<u32>>, MarkerError> {
         (Some(0), false, _) | (Some(1), false, true) => {}
         _ => return Err(MarkerError::Lsof(format!("{}: {why}", out.status))),
     }
-    let mut held: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    let mut held = Held::new();
     let mut pid = None;
     for line in text.lines() {
         if let Some(p) = line.strip_prefix('p') {

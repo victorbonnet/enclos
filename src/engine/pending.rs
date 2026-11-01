@@ -15,7 +15,6 @@ use super::policy::{ChangeOutcome, PendingEnd, PolicyApplied, differences, with_
 use super::sandbox::StopReport;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::members::members;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetPolicy, PendingPolicy, PolicySnapshot, PolicyVersion};
@@ -105,16 +104,11 @@ impl Engine {
     /// session's start does not reach until they restart. The proxy has no
     /// compiled policy, and applies its rules live.
     pub(super) fn sessions_under_rules(&self, name: &SandboxName) -> Result<Vec<SessionRecord>> {
-        let mut running = Vec::new();
-        for session in self.state.sessions(name, true)? {
-            if session.compiled.is_none() {
-                continue;
-            }
-            if !members(&self.marked(&session)?)?.is_empty() {
-                running.push(session);
-            }
-        }
-        Ok(running)
+        let mut open = self.state.sessions(name, true)?;
+        open.retain(|s| s.compiled.is_some());
+        let look = self.look_open(name, &open)?;
+        open.retain(|s| !look.is_gone(s));
+        Ok(open)
     }
 
     /// Where `policy edit` keeps an edit of the sandbox's `policy.toml`.

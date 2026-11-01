@@ -2,13 +2,10 @@
 //! (design §8, §10).
 
 use super::Engine;
-use super::markers::{Held, marked_in};
 use super::secrets::SecretLeft;
 use super::service::IfUnrecorded;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::members::{is_gone, members};
-use crate::lifecycle::process::processes;
 use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -300,20 +297,24 @@ impl Engine {
         let pending = self.state.pending_policy(&record.name)?.map(|(p, _)| p);
         let compiled = self.active_compiled(&record);
         let active = compiled.as_ref().ok().map(PathBuf::as_path);
-        let sessions = self
-            .state
-            .sessions(&record.name, true)?
+        let open = self.state.sessions(&record.name, true)?;
+        let look = self.look_open(&record.name, &open)?;
+        let sessions = open
             .into_iter()
             .map(|session| {
-                let members = members(&self.marked(&session)?)?;
+                let members = look
+                    .members(&session)
+                    .into_iter()
+                    .map(|found| found.member)
+                    .collect();
                 let needs_restart = needs_restart(&session, active);
-                Ok(SessionView {
+                SessionView {
                     session,
                     members,
                     needs_restart,
-                })
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
         Ok(SandboxView {
             record,
             template,
@@ -380,31 +381,16 @@ impl Engine {
         };
         // Which sessions still run, looked at before the services are
         // removed: a session a service ran (the proxy service's always)
-        // ends with its service, and is stopped, not found gone. A listing
+        // ends with its service, and is stopped, not found gone. A look
         // that fails tells none apart, so none is said to be gone; the stop
         // below looks again, and fails on its own if it still cannot.
         let open = self.state.sessions(name, true)?;
-        // What holds a marker is a member too (ADR 0030), looked at after
-        // the listing (see `Engine::marked`); a failed look at either is as
-        // a failed listing.
-        let looked = (|| -> Result<Vec<SessionId>> {
-            let procs = processes()?;
-            let held = match open.is_empty() {
-                true => Held::new(),
-                false => self.held(name)?,
-            };
-            Ok(open
+        let ran: Vec<SessionId> = match self.look_open(name, &open) {
+            Ok(look) => open
                 .iter()
-                .filter(|s| {
-                    let mut marked = (*s).clone();
-                    marked.tracked = marked_in(s, &s.tracked, &procs, &held);
-                    !is_gone(&procs, &marked)
-                })
+                .filter(|s| !look.is_gone(s))
                 .map(|s| s.id)
-                .collect())
-        })();
-        let ran: Vec<SessionId> = match looked {
-            Ok(ran) => ran,
+                .collect(),
             Err(_) => open.iter().map(|s| s.id).collect(),
         };
         // The services first, so the service manager does not restart what
@@ -622,16 +608,8 @@ impl Engine {
             });
         }
         let open = self.state.sessions(name, true)?;
-        if open.is_empty() {
-            return Ok(Vec::new());
-        }
-        let procs = processes()?;
-        let held = self.held(name)?;
-        if open.iter().all(|s| {
-            let mut marked = s.clone();
-            marked.tracked = marked_in(s, &s.tracked, &procs, &held);
-            is_gone(&procs, &marked)
-        }) {
+        let look = self.look_open(name, &open)?;
+        if open.iter().all(|s| look.is_gone(s)) {
             return Ok(open.iter().map(|s| s.id).collect());
         }
         let name = name.to_string();

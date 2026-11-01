@@ -15,7 +15,7 @@
 //! counted but never signalled.
 //!
 //! A process holding the session's marker (ADR 0030) is a sure member too:
-//! the engine adds it to `tracked`, so a double fork is found and stopped.
+//! `look` adds it to `tracked`, so a double fork is found and stopped.
 //!
 //! Known gap: a process that closes its marker's descriptor and leaves its
 //! group and parent is seen only by the rules above. It keeps its Seatbelt
@@ -23,7 +23,7 @@
 
 use std::collections::BTreeSet;
 
-use super::process::{Proc, PsError, processes};
+use super::process::Proc;
 use crate::model::session::{Member, ProcessRef, SessionRecord};
 
 /// A member found in one listing of the processes.
@@ -45,14 +45,6 @@ impl Found {
             started: self.member.started.clone(),
         })
     }
-}
-
-/// The session's members running now.
-pub fn members(session: &SessionRecord) -> Result<Vec<Member>, PsError> {
-    Ok(find(&processes()?, session, &session.tracked)
-        .into_iter()
-        .map(|f| f.member)
-        .collect())
 }
 
 /// Whether nothing of `session` runs in `procs`: its root and every member

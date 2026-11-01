@@ -14,7 +14,6 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
 use super::Engine;
 use super::listener::ConnectStep;
-use super::markers::marked_in;
 use super::proxy::abandon;
 use super::service::STOP_GRACE;
 use crate::backend::Launch;
@@ -554,13 +553,15 @@ impl Engine {
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it,
         // what holds its marker included (ADR 0030).
+        // Without the marker, what is left cannot be told, so the session
+        // stays open.
         let left = (|| -> Result<Vec<Found>> {
-            let procs = processes()?;
-            // After the listing (see `Engine::marked`). Without the marker,
-            // what is left cannot be told, so the session stays open.
-            let held = self.held(&session.sandbox)?;
-            known = marked_in(session, &known, &procs, &held);
-            Ok(find(&procs, session, &known))
+            let look = self.look_now(&session.sandbox)?;
+            let mut marked = session.clone();
+            marked.tracked = known.clone();
+            let marked = look.marked(&marked);
+            known.clone_from(&marked.tracked);
+            Ok(look.members(&marked))
         })();
         Ok(Waited {
             status,
@@ -590,8 +591,8 @@ impl Engine {
         let mut known = session.clone();
         known.tracked = waited.known.clone();
         waited.left = self
-            .marked_listed(&known)
-            .map(|(procs, marked)| find(&procs, session, &marked.tracked));
+            .look_now(&session.sandbox)
+            .map(|look| look.members(&known));
     }
 
     /// Ends the session, or, while it left members running or enclos could
