@@ -318,10 +318,10 @@ impl Engine {
             // runs: the session stays open, for a stop to end it.
             // One that cannot be looked at stays open too, rather than
             // keep the new service from starting.
-            let Ok((procs, marked)) = self.marked_listed(&session) else {
+            let Ok(look) = self.look_now(name) else {
                 continue;
             };
-            if !crate::lifecycle::members::is_gone(&procs, &marked) {
+            if !look.is_gone(&session) {
                 continue;
             }
             self.state.end_session(lock, session.id)?;

@@ -191,7 +191,6 @@ fn wait_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lifecycle::members::members;
     use crate::lifecycle::process::{group_of, is_same, reference};
     use crate::model::now;
     use crate::model::session::{SessionId, SessionKind};
@@ -214,6 +213,14 @@ mod tests {
             started_at: now(),
             ended_at: None,
         }
+    }
+
+    /// The session's members running now.
+    fn members(session: &SessionRecord) -> Result<Vec<Member>, PsError> {
+        Ok(find(&processes()?, session, &session.tracked)
+            .into_iter()
+            .map(|f| f.member)
+            .collect())
     }
 
     /// A shell running `script` in a group of its own, which exits once its

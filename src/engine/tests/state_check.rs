@@ -12,6 +12,7 @@ use crate::engine::service::Unit;
 use crate::engine::{Finding, Remedy, Subject};
 use crate::lifecycle::programs::tests::Sleeper;
 use crate::model::sandbox::{SandboxName, SandboxState};
+use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 
 /// The repairs found, or made: a check's and a repair's findings alike.
 fn repairs(found: &[Finding]) -> Vec<String> {
@@ -779,6 +780,135 @@ fn a_repair_records_no_end_for_a_session_whose_marker_is_held_again() {
     );
     drop(lock);
     assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// A markers folder that cannot be looked at: a link to itself.
+fn markers_that_cannot_be_looked_at(engine: &Engine, name: &SandboxName) {
+    let markers = engine.markers(name);
+    let _ = std::fs::remove_dir_all(&markers);
+    std::os::unix::fs::symlink(&markers, &markers).unwrap();
+}
+
+/// A session of which `sessions_under_rules` would ask: one with a compiled
+/// policy.
+fn compiled_session(engine: &Engine, name: &SandboxName, root: ProcessRef) -> SessionRecord {
+    let mut session = session_of(engine, name, root);
+    session.compiled = Some("compiled.sb".into());
+    session
+}
+
+/// A look that fails says nothing about a session: whatever each command
+/// does with it, none takes it for a session that is gone.
+#[test]
+fn a_look_that_fails_ends_no_session_and_removes_no_sandbox() {
+    let (_dir, engine, name) = with_sandbox();
+    put(&engine, &compiled_session(&engine, &name, gone_process()));
+    markers_that_cannot_be_looked_at(&engine, &name);
+    assert!(matches!(engine.show_sandbox(&name), Err(Error::Markers(_))));
+    assert!(matches!(
+        engine.remove_sandbox(&alice(), &name, false, Confirm::Yes),
+        Err(Error::Markers(_))
+    ));
+    assert!(engine.layout.sandbox_home(name.as_str()).is_dir());
+    assert!(engine.sessions_under_rules(&name).is_err());
+    assert_eq!(engine.status(None).unwrap().unlisted.len(), 1);
+    {
+        let lock = engine.state.lock().unwrap();
+        engine
+            .end_dead_sessions(&lock, &name, SessionKind::Interactive)
+            .unwrap();
+    }
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+    assert!(engine.stop_sandbox(&alice(), &name, Confirm::Yes).is_err());
+    assert!(matches!(
+        state_of(&engine, &name),
+        SandboxState::Failed { .. }
+    ));
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// With nothing to ask about, a look that could not be made is not missed:
+/// a sandbox with no open session, or only a proxy's, has no compiled
+/// policy a change waits for.
+#[test]
+fn nothing_open_needs_no_look() {
+    let (_dir, engine, name) = with_sandbox();
+    markers_that_cannot_be_looked_at(&engine, &name);
+    assert!(engine.show_sandbox(&name).is_ok());
+    assert!(engine.status(None).unwrap().unlisted.is_empty());
+    assert!(engine.sessions_under_rules(&name).unwrap().is_empty());
+    put(&engine, &session_of(&engine, &name, gone_process()));
+    assert!(engine.sessions_under_rules(&name).unwrap().is_empty());
+}
+
+/// A session whose program exited stays open with the members last seen
+/// when what it left cannot be told.
+#[test]
+fn a_session_whose_look_failed_stays_open_with_what_it_last_saw() {
+    use std::os::unix::process::ExitStatusExt;
+    let (_dir, engine, name) = with_sandbox();
+    let mut session = session_of(&engine, &name, gone_process());
+    session.id = put(&engine, &session);
+    let seen = ProcessRef {
+        pid: 1,
+        started: "seen".into(),
+    };
+    let waited = crate::engine::session::Waited {
+        status: std::process::ExitStatus::from_raw(0),
+        left: Err(crate::lifecycle::marker::MarkerError::Unlisted(1).into()),
+        known: vec![seen.clone()],
+        notes: Vec::new(),
+    };
+    let lock = engine.state.lock().unwrap();
+    engine.end_or_track(&lock, &session, &waited).unwrap();
+    drop(lock);
+    let open = engine.state.sessions(&name, true).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].tracked, [seen]);
+}
+
+/// A process holding a session's marker keeps it open wherever that
+/// matters, with its root and everything it recorded gone. The holder is
+/// this test's own process, so nothing here stops a session.
+#[test]
+fn a_session_kept_only_by_its_marker_is_not_gone_to_any_command() {
+    let (_dir, engine, name) = with_sandbox();
+    let session = compiled_session(&engine, &name, gone_process());
+    put(&engine, &session);
+    let marker = engine
+        .markers(&name)
+        .join(crate::lifecycle::marker::name_of(&session.root));
+    std::fs::write(&marker, "").unwrap();
+    let _held = std::fs::File::open(&marker).unwrap();
+    assert!(matches!(
+        engine.remove_sandbox(&alice(), &name, false, Confirm::Yes),
+        Err(Error::SandboxRunning { .. })
+    ));
+    assert_eq!(engine.sessions_under_rules(&name).unwrap().len(), 1);
+    {
+        let lock = engine.state.lock().unwrap();
+        engine
+            .end_dead_sessions(&lock, &name, SessionKind::Interactive)
+            .unwrap();
+    }
+    assert_eq!(engine.state.sessions(&name, true).unwrap().len(), 1);
+}
+
+/// Markers that cannot be looked for take a session that runs for none the
+/// listing shows: `state check` has its processes still.
+#[test]
+fn a_running_session_is_not_gone_though_its_markers_folder_is() {
+    let (_dir, engine, name) = with_sandbox();
+    let sleeping = Sleeping::new();
+    let id = put(&engine, &session_of(&engine, &name, sleeping.process()));
+    let members = engine.markers(&name);
+    let _ = std::fs::remove_dir_all(&members);
+    set_state(&engine, &name, SandboxState::Running);
+    let found = engine.state_check(None).unwrap();
+    assert!(
+        about(&found, &format!("session {id} is gone")).is_empty(),
+        "{found:?}"
+    );
 }
 
 /// A `members` folder that cannot be read is no answer that no marker is

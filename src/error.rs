@@ -280,6 +280,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<crate::lifecycle::look::LookError> for Error {
+    fn from(e: crate::lifecycle::look::LookError) -> Error {
+        use crate::lifecycle::look::LookError;
+        match e {
+            LookError::Processes(e) => e.into(),
+            LookError::Markers(e) => e.into(),
+        }
+    }
+}
+
 /// Exit codes (design §10).
 pub mod exit {
     pub const OK: u8 = 0;

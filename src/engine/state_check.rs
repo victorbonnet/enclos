@@ -10,12 +10,11 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use super::Engine;
-use super::markers::marked_in;
 use super::printable_line;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::marker::MarkerError;
-use crate::lifecycle::members::{find, is_gone};
+use crate::lifecycle::look::Look;
+use crate::lifecycle::marker::{MarkerError, holders, is_held};
 use crate::lifecycle::process::{Proc, processes};
 use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::{Actor, Outcome};
@@ -281,14 +280,11 @@ impl Engine {
         // pid the check knew (ADR 0030). No signal follows from this look,
         // so a pid reused meanwhile does no harm; a holder found leaves
         // every record as it was.
-        let held = self.held(name)?;
+        let held = holders(&self.markers(name))?;
         let still: Vec<String> = sessions
             .iter()
             .filter(|s| ended.contains(&s.id))
-            .filter(|s| {
-                held.get(&crate::lifecycle::marker::name_of(&s.root))
-                    .is_some_and(|pids| !pids.is_empty())
-            })
+            .filter(|s| is_held(&held, &s.root))
             .map(|s| s.id.to_string())
             .collect();
         if !still.is_empty() {
@@ -471,25 +467,17 @@ impl Engine {
                     .into());
                 }
             };
-        let held = match markers_found {
-            true => self.held(name)?,
-            false => Default::default(),
+        let look = match markers_found {
+            true => Look::in_listing(&host.procs, &markers_dir)?,
+            false => Look::markers_unseen(&host.procs),
         };
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();
         for session in &open {
-            let tracked = marked_in(session, &session.tracked, &host.procs, &held);
-            let mut marked = session.clone();
-            marked.tracked = tracked.clone();
-            if is_gone(&host.procs, &marked) {
+            if look.is_gone(session) {
                 gone.push(session.id);
-            } else {
-                members.extend(
-                    find(&host.procs, session, &tracked)
-                        .iter()
-                        .map(|f| f.member.pid),
-                );
             }
+            members.extend(look.members(session).iter().map(|f| f.member.pid));
         }
         if !gone.is_empty() {
             let ids: Vec<String> = gone.iter().map(ToString::to_string).collect();

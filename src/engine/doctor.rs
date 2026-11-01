@@ -15,13 +15,12 @@ use std::path::PathBuf;
 
 use super::Engine;
 use super::compile::compiled_stem;
-use super::markers::marked_in;
 use super::settings_secrets::SettingsFinding;
 use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
 use crate::layout::LayoutError;
-use crate::lifecycle::members::is_gone;
+use crate::lifecycle::look::Look;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
 use crate::model::session::SessionRecord;
@@ -337,26 +336,20 @@ impl Engine {
         if !open.is_empty() {
             // A session that cannot be told gone counts as running: its
             // file is still compared, and its count said to be unsure.
-            let listed = procs.get_or_init(processes).as_deref();
-            let held = match listed {
-                Ok(_) => self.held(name).map_err(|e| e.to_string()),
+            let look = match procs.get_or_init(processes) {
+                Ok(procs) => {
+                    Look::in_listing(procs, &self.markers(name)).map_err(|e| e.to_string())
+                }
                 Err(e) => Err(e.to_string()),
             };
-            if let Err(e) = &held {
+            if let Err(e) = &look {
                 check
                     .unreadable
                     .push(format!("cannot tell which of its sessions run: {e}"));
                 unsure = true;
             }
             for session in open {
-                let gone = match (listed, &held) {
-                    (Ok(procs), Ok(held)) => {
-                        let mut marked = session.clone();
-                        marked.tracked = marked_in(session, &session.tracked, procs, held);
-                        is_gone(procs, &marked)
-                    }
-                    _ => false,
-                };
+                let gone = look.as_ref().is_ok_and(|l| l.is_gone(session));
                 if !gone && let Some(compiled) = &session.compiled {
                     running.push((session.version, compiled));
                 }
