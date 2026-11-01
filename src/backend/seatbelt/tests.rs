@@ -60,6 +60,8 @@ struct World {
     other: TcpListener,
 }
 
+static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
+
 fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
@@ -306,6 +308,9 @@ fn the_network_reaches_only_the_proxy_port() {
 /// as `policy test` judges them, and open without the deny rules.
 #[test]
 fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
+    // It frees and binds ports of the proxy range, which a test starting a
+    // proxy may take meanwhile: `Address already in use` proves nothing.
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut w = world();
     let bind = |addr: &str, port: u16| {
         let (family, sockaddr) = match addr.contains(':') {
