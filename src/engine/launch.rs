@@ -1,8 +1,6 @@
 //! `enclos launch`, what the service manager runs for a runtime's service,
 //! and the proxy recording itself (design §8, ADR 0021).
 
-use std::os::unix::process::CommandExt;
-use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -10,15 +8,14 @@ use std::time::{Duration, Instant};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use super::Engine;
-use super::proxy::abandon;
 use super::service::PROXY_WAIT;
 use super::session::SessionEnd;
-use crate::backend::Launch;
+use super::start::{Started, Starting};
 use crate::error::{Error, Result};
-use crate::lifecycle::process::{group_of, is_same, reference, reference_of_child};
+use crate::lifecycle::process::{group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
-use crate::model::sandbox::{SandboxName, SandboxState};
+use crate::model::sandbox::SandboxName;
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::runtime::adapter;
 
@@ -120,9 +117,11 @@ impl Engine {
             })?
             .command
             .into_words();
-        let (program, args) = command.split_first().ok_or_else(|| Error::Session {
-            what: format!("{kind} declares the {service} service with no command"),
-        })?;
+        if command.is_empty() {
+            return Err(Error::Session {
+                what: format!("{kind} declares the {service} service with no command"),
+            });
+        }
         let record = self.record(name)?;
         // The sandbox's own proxy, not whatever listens on its port: a proxy
         // records itself only once it holds the port, so a recorded proxy
@@ -145,19 +144,19 @@ impl Engine {
             std::thread::sleep(Duration::from_millis(200));
         }
         let mut watch = self.settings_watch(name, kind, service);
-        let summary = |(session, _, replaced): &(SessionRecord, _, Vec<SessionId>)| {
-            let earlier = replaced_earlier(service, replaced);
-            match earlier {
-                Some(earlier) => format!("session {}, after {earlier}", session.id),
-                None => format!("session {}", session.id),
+        let summary = |(started, replaced): &(Started<()>, Vec<SessionId>)| {
+            let session = started.session.id;
+            match replaced_earlier(service, replaced) {
+                Some(earlier) => format!("session {session}, after {earlier}"),
+                None => format!("session {session}"),
             }
         };
-        let (session, mut child, _) =
+        let (started, _) =
             self.write(by, "launch", Some(name.to_string()), summary, |lock| {
                 // Sessions stopped and ended before a failure are named in
                 // the failed entry too.
                 let mut replaced = Vec::new();
-                let started = (|| -> Result<(SessionRecord, Child)> {
+                let started = (|| -> Result<Started<()>> {
                     // A `launch` killed before it recorded its end leaves its
                     // session open, and maybe its runtime running (design §4).
                     self.stop_sessions(
@@ -174,10 +173,18 @@ impl Engine {
                             what: format!("told to end before the {service} service of {name} started"),
                         });
                     }
-                    self.start_service(lock, name, program, args, kind, service)
+                    // A service session whose `launch` was killed before it
+                    // recorded its end, at logout or by the service manager's
+                    // timeout: its process is gone, so it ends here.
+                    self.end_dead_sessions(lock, name, SessionKind::Service)?;
+                    let starting = Starting::Service {
+                        runtime: kind,
+                        name: service,
+                    };
+                    self.start_session(lock, name, &command, starting, || Ok(()))
                 })();
                 let started = match (started, replaced_earlier(service, &replaced)) {
-                    (Ok((session, child)), _) => Ok((session, child, replaced)),
+                    (Ok(started), _) => Ok((started, replaced)),
                     (Err(error), None) => Err(error),
                     (Err(error), Some(done)) => Err(Error::FailedAfter {
                         error: Box::new(error),
@@ -186,6 +193,9 @@ impl Engine {
                 };
                 self.failed_on_error(lock, name, "launch", started)
             })?;
+        let Started {
+            session, mut child, ..
+        } = started;
         // Asked to restart once its settings change (ADR 0031).
         let mut restarting = false;
         let mut look = |notes: &mut Vec<String>| {
@@ -231,76 +241,6 @@ impl Engine {
         let mut end = self.finish_session(by, "service end", &session, waited)?;
         end.restarting = restarting;
         Ok(end)
-    }
-
-    /// Starts the service's `program` in the sandbox and records it as a
-    /// session, with the sandbox as `Running` (design §8 steps 2-4), under
-    /// the state lock.
-    fn start_service(
-        &self,
-        lock: &crate::state::StateLock,
-        name: &SandboxName,
-        program: &std::ffi::OsString,
-        args: &[std::ffi::OsString],
-        kind: crate::model::runtime::RuntimeKind,
-        service: &str,
-    ) -> Result<(SessionRecord, std::process::Child)> {
-        // A service session whose `launch` was killed before it recorded its
-        // end, at logout or by the service manager's timeout: its process is
-        // gone, so it ends here.
-        self.end_dead_sessions(lock, name, SessionKind::Service)?;
-        let mut record = self.record(name)?;
-        let compiled = self.compile_policy(name, record.proxy_port)?;
-        let (version, snapshot) = self.active_policy(name)?;
-        let launch = Launch {
-            program: program.clone(),
-            args: args.to_vec(),
-            // Read on the host, as the service starts, never written to the
-            // service manager's file (ADR 0022).
-            env: self.service_secrets(name, kind, service, &snapshot.policy)?,
-            // Even when `enclos launch` is run by hand in a terminal: a
-            // service outlives it.
-            in_terminal: false,
-            service_port: None,
-            limits: self.launch_limits(&record, &snapshot.policy)?,
-        };
-        let ctx = self.sandbox_context(name, record.proxy_port);
-        let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
-        let marker = self.new_marker(name)?;
-        let (child, marked) =
-            marker
-                .spawn(wrapped.process_group(0))
-                .map_err(|e| Error::Session {
-                    what: format!("could not start the {kind} {service} service: {e}"),
-                })?;
-        let recorded = (|| -> Result<SessionRecord> {
-            let root = reference_of_child(&child)?;
-            self.name_marker(name, marked, &root)?;
-            let mut session = SessionRecord {
-                id: SessionId(0),
-                sandbox: name.clone(),
-                kind: SessionKind::Service,
-                service: Some(service.to_owned()),
-                version: version.version,
-                snapshot: snapshot.id,
-                compiled: Some(compiled.display().to_string()),
-                // In a group made for it, which it leads.
-                pgid: Some(child.id()),
-                root,
-                tracked: Vec::new(),
-                started_at: now(),
-                ended_at: None,
-            };
-            // Running again, also after a `launch` that failed and that the
-            // service manager starts again.
-            record.state = SandboxState::Running;
-            session.id = self.state.start_session(lock, &session, &record)?;
-            Ok(session)
-        })();
-        match recorded {
-            Ok(session) => Ok((session, child)),
-            Err(e) => Err(abandon(child, e, "the service")),
-        }
     }
 
     /// Ends the sandbox's sessions of `kind` whose root process is gone.
