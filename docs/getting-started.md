@@ -176,6 +176,8 @@ enclos runtime configure lab/main --set 'platforms.discord.token=${DISCORD_BOT_T
 
 enclos refuses a variable the policy does not grant the agent, and a value that looks like a secret written as itself. Agents of a sandbox share its files, so a secret granted to one agent is kept apart from the others, not hidden from them.
 
+`enclos doctor` names any secret it finds in plain text in Hermes's settings in the sandbox home, such as one pasted into `hermes setup`, and any `${VAR}` there the policy does not grant that agent, by file and line, never by value, with what to do about it.
+
 ## What does not work yet
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.

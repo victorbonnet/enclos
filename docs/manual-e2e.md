@@ -317,6 +317,21 @@ enclos --dry-run runtime configure lab/main --set 'e2e.demo=${DEMO}'
 - [ ] A variable the policy grants neither `main` nor the whole sandbox is refused; so is `e2e.token` with no `${…}`, which `looks like a secret`; so is an agent enclos does not track, with the `agent add` command to track it. Each exits 1 and changes nothing.
 - [ ] The dry run lists the `hermes -p main config set …` commands it would run, and runs none.
 
+`doctor` looks for secrets in those settings, wherever they came from. A made-up token stands in for one pasted into `hermes setup`:
+
+```bash
+enclos doctor; echo "exit $?"
+enclos exec lab -- /bin/sh -c 'echo E2E_API_KEY=made-up >> .hermes/profiles/main/.env; echo "e2e_ref: \${MAIN_ONLY}" >> .hermes/config.yaml'
+enclos doctor; echo "exit $?"
+enclos exec lab -- /usr/bin/sed -i '' '/^E2E_API_KEY=/d' .hermes/profiles/main/.env
+enclos exec lab -- /usr/bin/sed -i '' '/^e2e_ref:/d' .hermes/config.yaml
+enclos doctor; echo "exit $?"
+```
+
+- [ ] The first `doctor` reports nothing under `lab`'s settings: the bots' `${TELEGRAM_BOT_TOKEN}` and `${DEMO}` count as granted, each in its own agent's files.
+- [ ] The second names `~/.hermes/profiles/main/.env` and the line holding `E2E_API_KEY` in plain text, and `~/.hermes/config.yaml` and the line referring to `${MAIN_ONLY}`, each with what to do, naming agents `main` and `default`; `made-up` appears nowhere. It still exits 0.
+- [ ] The third reports nothing again.
+
 ## 10. Services
 
 ```bash

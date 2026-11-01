@@ -1,12 +1,15 @@
-//! `enclos doctor`: what keeps enclos from working on this host, and which
-//! compiled policies enclos now writes differently (design §10).
+//! `enclos doctor`: what keeps enclos from working on this host, which
+//! compiled policies enclos now writes differently, and secrets in a
+//! runtime's settings (design §10).
 
 use enclos::backend::Enforcement;
 use enclos::engine::{
-    BackendCheck, BackendState, Doctor, Drift, DriftKind, Engine, LineChange, Lines, MAX_LINES,
-    NextSession, RanFile, SandboxCheck, Sandboxes,
+    BackendCheck, BackendState, Doctor, Drift, DriftKind, Engine, Held, LineChange, Lines,
+    MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
+use enclos::model::agent::AgentName;
+use enclos::runtime::RuntimeAgentName;
 
 pub fn run(engine: &Engine) -> Result<u8> {
     use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
@@ -118,6 +121,53 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                 found
             })
             .collect();
+        let settings: Vec<_> = s
+            .settings
+            .iter()
+            .map(|f| match f {
+                SettingsFinding::Plain {
+                    agent,
+                    file,
+                    line,
+                    held: Held::Variable { name, granted },
+                } => json!({
+                    "kind": "plain",
+                    "agent": agent.as_str(),
+                    "file": file.to_string(),
+                    "line": line,
+                    "variable": name,
+                    "granted": granted,
+                }),
+                SettingsFinding::Plain {
+                    agent,
+                    file,
+                    line,
+                    held: Held::Key(key),
+                } => json!({
+                    "kind": "plain",
+                    "agent": agent.as_str(),
+                    "file": file.to_string(),
+                    "line": line,
+                    "key": key,
+                }),
+                SettingsFinding::NotGranted {
+                    agent,
+                    file,
+                    line,
+                    variable,
+                } => json!({
+                    "kind": "not_granted",
+                    "agent": agent.as_str(),
+                    "file": file.to_string(),
+                    "line": line,
+                    "variable": variable,
+                }),
+                SettingsFinding::NotSetUp { agent } => json!({
+                    "kind": "not_set_up",
+                    "agent": agent.as_str(),
+                }),
+            })
+            .collect();
         json!({
             "name": s.name.to_string(),
             "backend": s.backend.to_string(),
@@ -125,6 +175,7 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             "next_session": next,
             "last_version": s.last_version,
             "drift": drift,
+            "settings": settings,
             "unreadable": s.unreadable,
         })
     };
@@ -254,6 +305,9 @@ fn sandbox(s: &SandboxCheck) -> String {
     for drift in &s.drift {
         out += &drift_lines(name.as_str(), drift);
     }
+    for finding in &s.settings {
+        out += &settings_line(name.as_str(), finding);
+    }
     for what in &s.unreadable {
         out += &format!("    enclos could not look: {what}\n");
     }
@@ -344,6 +398,85 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
     out
 }
 
+/// What was found in the runtime's settings, and what to do about it. Only
+/// names: doctor never prints a value.
+fn settings_line(name: &str, finding: &SettingsFinding) -> String {
+    let store = format!("store it with `enclos secret set {name}/<secret>`");
+    // A policy and a command name an agent under enclos's own rule; the
+    // runtime may have one it does not take, such as `my_bot`, which gets
+    // what the whole sandbox gets.
+    let named = |agent: &RuntimeAgentName| agent.as_str().parse::<AgentName>().is_ok();
+    let grant = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!("grant it under [secrets.agents.{agent}] with `enclos policy edit {name}`"),
+        false => format!(
+            "grant it under [secrets] with `enclos policy edit {name}`, as enclos cannot name agent {agent}"
+        ),
+    };
+    let set_up = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!(", then run `enclos runtime configure {name}/{agent}`"),
+        false => String::new(),
+    };
+    let reference = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!(
+            "`enclos runtime configure {name}/{agent} --set '<its whole dotted key>=${{VARIABLE}}'`"
+        ),
+        false => format!(
+            "the runtime's own command through `enclos connect {name}`, as its whole dotted key set to `${{VARIABLE}}`"
+        ),
+    };
+    match finding {
+        SettingsFinding::Plain {
+            file,
+            line,
+            held:
+                Held::Variable {
+                    name: variable,
+                    granted: true,
+                },
+            ..
+        } => format!(
+            "    {file}, line {line}, holds {variable} in plain text, which the policy already grants as a secret: remove the line\n"
+        ),
+        SettingsFinding::Plain {
+            agent,
+            file,
+            line,
+            held:
+                Held::Variable {
+                    name: variable,
+                    granted: false,
+                },
+        } => format!(
+            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, remove the line{}\n",
+            grant(agent),
+            set_up(agent)
+        ),
+        SettingsFinding::Plain {
+            agent,
+            file,
+            line,
+            held: Held::Key(key),
+        } => format!(
+            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then give it with {}\n",
+            grant(agent),
+            reference(agent)
+        ),
+        SettingsFinding::NotGranted {
+            agent,
+            file,
+            line,
+            variable,
+        } => format!(
+            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, {} as {variable}{}\n",
+            grant(agent),
+            set_up(agent)
+        ),
+        SettingsFinding::NotSetUp { agent } => format!(
+            "    agent {agent} does not read the secrets the policy grants it under [secrets.agents.{agent}]: run `enclos runtime configure {name}/{agent}`\n"
+        ),
+    }
+}
+
 fn enforced(e: &Enforcement) -> String {
     match e {
         Enforcement::Enforced => "enforced".to_owned(),
@@ -388,6 +521,7 @@ mod tests {
             },
             last_version: Some(2),
             drift: Vec::new(),
+            settings: Vec::new(),
             unreadable: Vec::new(),
         }
     }
@@ -603,6 +737,102 @@ mod tests {
             "{shown}"
         );
         assert_eq!(shown.matches("until restarted").count(), 0, "{shown}");
+    }
+
+    /// Each secret found in the runtime's settings is a line naming the file,
+    /// the line and what to do, in text and in JSON.
+    #[test]
+    fn secrets_in_the_runtimes_settings_are_said_by_name() {
+        use enclos::runtime::HomePath;
+        let env = HomePath::new(".hermes/.env").unwrap();
+        let config = HomePath::new(".hermes/config.yaml").unwrap();
+        let doctor = doctor(SandboxCheck {
+            settings: vec![
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
+                    file: env.clone(),
+                    line: 3,
+                    held: Held::Variable {
+                        name: "OPENROUTER_API_KEY".into(),
+                        granted: false,
+                    },
+                },
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
+                    file: env,
+                    line: 4,
+                    held: Held::Variable {
+                        name: "TELEGRAM_BOT_TOKEN".into(),
+                        granted: true,
+                    },
+                },
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
+                    file: config.clone(),
+                    line: 7,
+                    held: Held::Key("token".into()),
+                },
+                // A name Hermes takes and enclos does not.
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("my_bot").unwrap(),
+                    file: HomePath::new(".hermes/profiles/my_bot/.env").unwrap(),
+                    line: 1,
+                    held: Held::Variable {
+                        name: "API_KEY".into(),
+                        granted: false,
+                    },
+                },
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("my_bot").unwrap(),
+                    file: HomePath::new(".hermes/profiles/my_bot/config.yaml").unwrap(),
+                    line: 2,
+                    held: Held::Key("token".into()),
+                },
+                SettingsFinding::NotGranted {
+                    agent: RuntimeAgentName::new("default").unwrap(),
+                    file: config,
+                    line: 9,
+                    variable: "SLACK_BOT_TOKEN".into(),
+                },
+                SettingsFinding::NotSetUp {
+                    agent: RuntimeAgentName::new("main").unwrap(),
+                },
+            ],
+            ..compiles()
+        });
+        let shown = shown(&doctor);
+        for expected in [
+            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it under [secrets.agents.default] with `enclos policy edit home` as OPENROUTER_API_KEY, remove the line, then run `enclos runtime configure home/default`\n",
+            "    ~/.hermes/.env, line 4, holds TELEGRAM_BOT_TOKEN in plain text, which the policy already grants as a secret: remove the line\n",
+            "    ~/.hermes/config.yaml, line 7, holds `token` in plain text",
+            "then give it with `enclos runtime configure home/default --set '<its whole dotted key>=${VARIABLE}'`\n",
+            "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant agent default",
+            "then run `enclos runtime configure home/default`\n",
+            "as API_KEY, remove the line\n",
+            "grant it under [secrets] with `enclos policy edit home`, as enclos cannot name agent my_bot",
+            "then give it with the runtime's own command through `enclos connect home`",
+            "    agent main does not read the secrets the policy grants it under [secrets.agents.main]: run `enclos runtime configure home/main`\n",
+        ] {
+            assert!(shown.contains(expected), "{expected}\n{shown}");
+        }
+        // A secret found is reported, not a problem.
+        assert!(!doctor.has_problems());
+        let json = json(&doctor);
+        let settings = &json["records"]["sandboxes"][0]["settings"];
+        assert_eq!(settings[0]["kind"], "plain", "{json}");
+        assert_eq!(settings[0]["file"], "~/.hermes/.env", "{json}");
+        assert_eq!(settings[0]["variable"], "OPENROUTER_API_KEY", "{json}");
+        assert_eq!(settings[1]["granted"], true, "{json}");
+        assert_eq!(settings[2]["key"], "token", "{json}");
+        assert_eq!(settings[0]["line"], 3, "{json}");
+        assert_eq!(settings[2]["line"], 7, "{json}");
+        assert_eq!(settings[3]["agent"], "my_bot", "{json}");
+        assert_eq!(settings[5]["line"], 9, "{json}");
+        assert_eq!(settings[5]["kind"], "not_granted", "{json}");
+        assert_eq!(settings[5]["agent"], "default", "{json}");
+        assert_eq!(settings[6]["kind"], "not_set_up", "{json}");
+        assert_eq!(settings[6]["agent"], "main", "{json}");
+        assert_eq!(json["problems"], false, "{json}");
     }
 
     /// A sandbox whose backend does not run here is never said to compile

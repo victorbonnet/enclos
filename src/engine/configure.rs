@@ -5,6 +5,7 @@
 //! grants, and sets up a channel's bot from the same settings.
 
 use super::Engine;
+use super::settings_secrets::{dotenv_line, names_a_secret};
 use crate::error::{Error, Result};
 use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
@@ -395,17 +396,6 @@ fn referenced(value: &str) -> Vec<&str> {
     found
 }
 
-/// Whether a setting's name says it holds a secret: its last part, after
-/// the last `.`, names a token, a secret, a password or a key.
-fn names_a_secret(key: &str) -> bool {
-    let last = key.rsplit('.').next().unwrap_or(key).to_ascii_uppercase();
-    ["TOKEN", "SECRET", "PASSWORD", "PASSWD"]
-        .iter()
-        .any(|w| last.contains(w))
-        || last == "KEY"
-        || last.ends_with("_KEY")
-}
-
 /// What a dry run says of a channel whose host the policy does not reach.
 fn unreachable(name: &SandboxName, channel: Channel) -> String {
     format!(
@@ -417,16 +407,9 @@ fn unreachable(name: &SandboxName, channel: Channel) -> String {
 /// Whether the `.env` text `text` sets `variable` to something: a line
 /// `variable=...` or `export variable=...`, with a value that is not empty.
 fn holds_variable(text: &str, variable: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        line.strip_prefix(variable)
-            .and_then(|rest| rest.trim_start().strip_prefix('='))
-            .is_some_and(|value| {
-                let value = value.trim();
-                !value.is_empty() && value != "\"\"" && value != "''"
-            })
-    })
+    text.lines()
+        .filter_map(dotenv_line)
+        .any(|(name, value)| name == variable && !matches!(value, "" | "\"\"" | "''"))
 }
 
 #[cfg(test)]
@@ -471,6 +454,7 @@ mod tests {
         for plain in [
             "DISCORD_ALLOWED_USERS",
             "model.default",
+            "model.max_tokens",
             "keyboard",
             "monkey",
         ] {

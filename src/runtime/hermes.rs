@@ -355,15 +355,42 @@ impl RuntimeAdapter for Hermes {
         }]
     }
 
-    fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> {
-        // Agents added later are served without a restart.
-        std::iter::once(DEFAULT_PROFILE.runtime_name())
-            .chain(agents.iter().cloned())
-            .flat_map(|agent| {
-                let folder = agent_folder(&agent);
-                ["config.yaml", ".env"].map(|name| folder.child(name).expect("a plain file name"))
-            })
-            .collect()
+    fn agent_settings_files(&self, agent: &RuntimeAgentName) -> Vec<HomePath> {
+        let folder = agent_folder(agent);
+        ["config.yaml", ".env"]
+            .map(|name| folder.child(name).expect("a plain file name"))
+            .to_vec()
+    }
+
+    fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool {
+        // `secrets.command` as `agent_secrets_source` sets it, read line by
+        // line: a clone or an import keeps the command and turns it off
+        // (`after_create_agent`), and a line outside it says nothing. YAML
+        // may fold the command over two lines, both inside the block.
+        let secrets_file = secrets_file.to_string_lossy();
+        let (mut reads, mut on) = (false, false);
+        let (mut in_secrets, mut block) = (false, None);
+        for line in text.lines() {
+            let content = line.trim_start();
+            if content.is_empty() || content.starts_with('#') {
+                continue;
+            }
+            let content = content.split(" #").next().unwrap_or(content).trim_end();
+            let indent = line.len() - line.trim_start().len();
+            if indent == 0 {
+                in_secrets = content == "secrets:";
+                block = None;
+                continue;
+            }
+            match block {
+                Some(at) if indent > at => {
+                    reads |= content.contains(&*secrets_file);
+                    on |= content == "enabled: true";
+                }
+                _ => block = (in_secrets && content == "command:").then_some(indent),
+            }
+        }
+        reads && on
     }
 
     fn secrets_folder_var(&self) -> Option<&'static str> {
@@ -501,6 +528,33 @@ mod tests {
             crate::net::host::AllowEntry::parse(entry).unwrap();
             assert!(!entry.starts_with('*'), "no wildcard: {entry}");
         }
+    }
+
+    #[test]
+    fn an_agent_reads_its_secrets_only_from_a_command_that_is_on() {
+        let file = Path::new("/e/sandboxes/lab/secrets/main.env");
+        let reads = |text: &str| Hermes.reads_agent_secrets(text, file);
+        let on = "model: x\nsecrets:\n  command:\n    enabled: true\n    command: cat '/e/sandboxes/lab/secrets/main.env'\n    override_existing: true\nplatforms:\n  telegram:\n    enabled: false\n";
+        assert!(reads(on));
+        // YAML folds a long command.
+        assert!(reads(
+            "secrets:\n  command:\n    command: cat\n      '/e/sandboxes/lab/secrets/main.env'\n    enabled: true # on\n"
+        ));
+        // Turned off, as a clone or an import leaves it.
+        assert!(!reads(&on.replace("enabled: true", "enabled: false")));
+        // Another agent's file.
+        assert!(!reads(&on.replace("main.env", "scout.env")));
+        // In a comment, or in another block.
+        assert!(!reads(
+            "secrets:\n  command:\n    enabled: true\n    # command: cat '/e/sandboxes/lab/secrets/main.env'\n"
+        ));
+        assert!(!reads(
+            "other:\n  command:\n    enabled: true\n    command: cat '/e/sandboxes/lab/secrets/main.env'\n"
+        ));
+        assert!(!reads(
+            "secrets:\n  other:\n    enabled: true\n    command: cat '/e/sandboxes/lab/secrets/main.env'\n"
+        ));
+        assert!(!reads(""));
     }
 
     #[test]
