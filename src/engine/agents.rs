@@ -2,6 +2,8 @@
 //! the runtime has (ADR 0023, ADR 0024); importing one from the host is in
 //! `import.rs`.
 
+use std::path::PathBuf;
+
 use super::Engine;
 use super::import::{Archive, LeftCopy};
 use super::session::SessionEnd;
@@ -426,6 +428,27 @@ impl Engine {
                 ),
             }
         })
+    }
+
+    /// A command named `agent` on the sandbox's PATH, if there is one: the
+    /// runtime's alias for the agent would collide with it.
+    pub(super) fn command_named(
+        &self,
+        name: &SandboxName,
+        agent: &AgentName,
+    ) -> Result<Option<PathBuf>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let ctx = self.sandbox_context(name, record.proxy_port);
+        let path = crate::backend::seatbelt::environment(&ctx)
+            .into_iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        Ok(std::env::split_paths(&path)
+            .map(|dir| dir.join(agent.as_str()))
+            .find(|file| file.exists()))
     }
 
     pub(super) fn refuse_known_agent(&self, name: &SandboxName, agent: &AgentName) -> Result<()> {

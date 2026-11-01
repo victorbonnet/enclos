@@ -9,7 +9,6 @@ use super::Engine;
 use super::policy::{adapter_layer, differences, listen_change};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
-use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::PolicyVersion;
@@ -276,27 +275,6 @@ impl Engine {
             },
         )?;
         Ok((version.version, recorded))
-    }
-
-    /// A command named `agent` on the sandbox's PATH, if there is one: the
-    /// runtime's alias for the agent would collide with it.
-    pub(super) fn command_named(
-        &self,
-        name: &SandboxName,
-        agent: &AgentName,
-    ) -> Result<Option<PathBuf>> {
-        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-            name: name.to_string(),
-        })?;
-        let ctx = self.sandbox_context(name, record.proxy_port);
-        let path = crate::backend::seatbelt::environment(&ctx)
-            .into_iter()
-            .find(|(k, _)| k == "PATH")
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-        Ok(std::env::split_paths(&path)
-            .map(|dir| dir.join(agent.as_str()))
-            .find(|file| file.exists()))
     }
 
     /// The sandbox's home folder, which is `~` for everything that runs in it.
