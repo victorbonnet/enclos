@@ -1,5 +1,5 @@
-//! A tunnel once it is open: the server name check, the bytes each way,
-//! and how long it may stay quiet (design §6).
+//! A connection once it is open: the bytes each way, how long it may stay
+//! quiet, and a tunnel's server name check (design §6).
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};

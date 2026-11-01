@@ -1,5 +1,5 @@
 //! Serving connections: one thread per client connection, two while a
-//! tunnel relays bytes, and one for each name lookup. Every connection the
+//! connection relays bytes, and one for each name lookup. Every connection the
 //! proxy decides on gets one network log record, written at the decision.
 //! If that write fails, the proxy says so on its standard error and goes on
 //! as if it had succeeded: an allowed connection is served without a record

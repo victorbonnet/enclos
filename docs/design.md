@@ -462,7 +462,7 @@ pub trait Downloader {
 ```text
 src/
   main.rs          CLI: parse args into models, call Engine, print the result
-  cli/             one file per command group (policy.rs, ...): its arguments and output
+  cli/             one file per command group (policy.rs, ...), a large one with a folder of its own (policy/): its arguments and output
   lib.rs           the core library every client uses
   engine.rs        the API above; the only place components meet; engine/ holds its parts (policy.rs, ...)
   error.rs         the engine's typed errors and their exit codes
@@ -473,7 +473,7 @@ src/
   lifecycle/       sessions.rs  stop.rs
   probes/          mod.rs (escape probes for `policy test`, run by engine/probe.rs)
   backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, members.rs, denials.rs}
-  proxy/           decide.rs (pure checks)  request.rs  server.rs  control.rs (later)
+  proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
   state/           mod.rs (trait)  sqlite/
