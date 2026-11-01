@@ -49,6 +49,32 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | Compile | `connect` and `exec`, `enclos launch` for a service, `policy test`; `sandbox show` in memory only | `src/engine/compile.rs`, `src/backend/seatbelt/compile.rs` | `compiled/<hash>.sb` |
 | Apply | the same, right after compiling | `src/backend/seatbelt/wrap.rs` | `sandbox-exec` running the program |
 
+## The templates
+
+A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. The templates differ only in what the sandbox reaches on the network:
+
+| Can it… | `minimal` | `mcp-only` | `assistant` |
+| --- | --- | --- | --- |
+| Write to its own home | yes | yes | yes |
+| Write to other folders | only those added | only those added | only those added |
+| Read your files, except sensitive paths | yes | yes | yes |
+| Read sensitive paths, such as SSH keys | no | no | no |
+| Run programs, and install them in its home | yes | yes | yes |
+| Reach what its runtime needs, once installed | yes | yes | yes |
+| **Reach the public web** | **only what is listed** | **only what is listed** | **yes, ports 80 and 443** |
+| Reach other ports | only if listed | only if listed | only if listed |
+| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` | only if listed and in `private` |
+| Reach your computer's own services or cloud metadata | no | no | no |
+| Open apps, send Apple Events or signal other processes | no | no | no |
+
+- **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name.
+- **`mcp-only`** has the same rules as `minimal` for now, and differs once program rules come. Use it for assistants working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
+- **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
+
+Under every template, each connection goes through the sandbox's proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
+
+A `coding` template is planned (design §7) and does not exist yet.
+
 ## Every setting
 
 A `policy.toml` holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox's file with `enclos policy edit <sandbox>`; `enclos policy show <sandbox>` prints what it resolves to.
@@ -80,7 +106,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 
 | Setting | Accepts | Notes |
 | --- | --- | --- |
-| `extends` | `minimal`, `mcp-only`, `assistant` | Required. The template this policy builds on. |
+| `extends` | `minimal`, `mcp-only`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
 
 **`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. A change waits for sessions to restart.
 
@@ -101,7 +127,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
 | `private_add` | a list of hosts | none | Adds to that list. |
 | `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
-| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: Hermes's chat reaches its gateway this way, and `false` here wins over the adapter. |
+| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. |
 
 **`[resources]`.** A limit is fixed when a process starts, so a change waits for sessions to restart. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
 

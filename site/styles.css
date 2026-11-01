@@ -108,9 +108,9 @@ h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.0
 .doc ul, .doc ol { padding-left: 22px; }
 .doc li { padding-block: 3px; }
 .doc strong { color: var(--text); font-weight: 600; }
-.doc p a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.doc p a, .doc td a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
 .doc :not(pre) > code { color: var(--accent); overflow-wrap: anywhere; }
-.doc td:first-child code { overflow-wrap: normal; }
+.doc td:first-child code, .doc th code { overflow-wrap: normal; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 15px; }
 th, td { padding: 10px 12px 10px 0; text-align: left; vertical-align: top; border-top: 1px solid var(--line); color: var(--text-muted); }

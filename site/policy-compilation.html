@@ -69,6 +69,31 @@
       <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. On Seatbelt today, an <code>[exec]</code> section is refused, and so are limits on CPU time, memory, file size and CPU share.</p>
       <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
 
+      <h2 id="templates">The templates</h2>
+      <p>A sandbox starts from a template, named when it is created and kept in <code>extends</code>. Change <code>extends</code> with <code>enclos policy edit lab</code> to move it to another. The templates differ only in what the sandbox reaches on the network:</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Can it…</th><th><code>minimal</code></th><th><code>mcp-only</code></th><th><code>assistant</code></th></tr></thead>
+        <tbody>
+          <tr><td>Write to its own home</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Write to other folders</td><td>If added</td><td>If added</td><td>If added</td></tr>
+          <tr><td>Read your files, except sensitive paths</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Read sensitive paths, such as SSH keys</td><td>No</td><td>No</td><td>No</td></tr>
+          <tr><td>Run programs, and install them in its home</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Reach what its runtime needs, once installed</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td><strong>Reach the public web</strong></td><td><strong>If listed</strong></td><td><strong>If listed</strong></td><td><strong>Yes, ports 80 and 443</strong></td></tr>
+          <tr><td>Reach other ports</td><td>If listed</td><td>If listed</td><td>If listed</td></tr>
+          <tr><td>Reach a host on your local network</td><td>If you opt in</td><td>If you opt in</td><td>If you opt in</td></tr>
+          <tr><td>Reach your computer’s own services or cloud metadata</td><td>No</td><td>No</td><td>No</td></tr>
+          <tr><td>Open apps, send Apple Events or signal other processes</td><td>No</td><td>No</td><td>No</td></tr>
+        </tbody>
+      </table></div>
+      <ul>
+        <li><strong><code>minimal</code></strong> reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes, that is its install sources and the ChatGPT subscription’s hosts; another model provider’s hosts need <code>enclos policy allow</code>. Use it when an agent should reach only what you name.</li>
+        <li><strong><code>mcp-only</code></strong> has the same rules as <code>minimal</code> for now. Use it for assistants working on outside data through remote MCP servers: allow each server’s host, then tell the runtime of it with its own commands.</li>
+        <li><strong><code>assistant</code></strong> adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.</li>
+      </ul>
+      <p>Under every template, each connection goes through the sandbox’s proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
+
       <h2 id="settings">Every setting</h2>
       <p>A <code>policy.toml</code> holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox’s file with <code>enclos policy edit lab</code>.</p>
       <div class="terminal"><pre><code>extends = "assistant"
@@ -96,7 +121,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td><code>extends</code></td><td><code>minimal</code>, <code>mcp-only</code>, <code>assistant</code></td><td>Required. The template this policy builds on.</td></tr>
+          <tr><td><code>extends</code></td><td><code>minimal</code>, <code>mcp-only</code>, <code>assistant</code></td><td>Required. The template this policy builds on: see <a href="#templates">the templates</a>.</td></tr>
         </tbody>
       </table></div>
 
@@ -123,7 +148,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
           <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
           <tr><td><code>private_add</code></td><td>hosts</td><td>Adds to that list.</td></tr>
           <tr><td><code>log</code></td><td><code>metadata</code></td><td>The only value: host, port, address, verdict, bytes and duration, never contents.</td></tr>
-          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on: its chat reaches its gateway this way, so leave it unset.</td></tr>
+          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on. Leave it unset: its gateway exits if it cannot listen.</td></tr>
         </tbody>
       </table></div>
 

@@ -47,7 +47,7 @@
 <span class="comment"># Hermes's own setup: your provider, its login, a model</span>
 <span class="command">enclos connect lab -- hermes -p default setup</span></code></pre></div>
       <p>The install runs inside the sandbox, through its proxy, so it can write only to the sandbox’s home. The sandbox cannot open a browser: when the login shows a URL, open it in your browser yourself. Every agent in the sandbox shares this login.</p>
-      <p>The <code>assistant</code> template reaches the public web on ports 80 and 443, and logs every connection. To start with only the hosts Hermes needs, use <code>--template minimal</code>.</p>
+      <p>The <code>assistant</code> template reaches the public web on ports 80 and 443, and logs every connection. To start with only the hosts Hermes needs, use <code>--template minimal</code>. See <a href="./policy-compilation.html#templates">what each template can do</a>.</p>
 
       <h2>Add agents</h2>
       <p>Hermes comes with a built-in agent, <code>default</code>. Add more with one command:</p>
