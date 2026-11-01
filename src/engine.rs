@@ -5,6 +5,7 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
+mod agents;
 mod compile;
 mod configure;
 mod doctor;
@@ -28,6 +29,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
@@ -39,7 +41,7 @@ pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use probe::TestReport;
-pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
+pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
