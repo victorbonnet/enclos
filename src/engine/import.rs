@@ -217,7 +217,6 @@ impl Engine {
                 Added::Imported { copy_left, .. } => with_copy_left(e, copy_left.clone()),
                 _ => e,
             })?;
-        let runtime = adapter(kind);
         Ok(Planned::Done(AgentAdded {
             agent: record,
             kind,

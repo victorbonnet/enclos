@@ -43,7 +43,8 @@ pub struct InstallEnd {
     pub recorded: Option<RuntimeKind>,
     /// The sandbox's active policy version afterwards.
     pub policy: u32,
-    /// What a person runs in the sandbox to log the runtime in and set it up.
+    /// What a person runs in the sandbox to log `kind` in and set it up,
+    /// even after a failed install.
     pub login: String,
 }
 
@@ -375,7 +376,7 @@ impl Engine {
                 installed: false,
                 recorded,
                 policy,
-                login: adapter(kind).login(),
+                login: runtime.login(),
             }));
         }
         self.write(
@@ -406,7 +407,7 @@ impl Engine {
             installed: true,
             recorded: Some(kind),
             policy: version.version,
-            login: adapter(kind).login(),
+            login: runtime.login(),
         }))
     }
 
