@@ -89,7 +89,7 @@ def p_leave(path):
 
 def p_exec(path):
     try:
-        out = subprocess.run([path], capture_output=True, timeout=20, text=True)
+        out = subprocess.run([path], stdin=subprocess.DEVNULL, capture_output=True, timeout=20, text=True)
         return ("ok" if out.returncode == 0 else f"exit {out.returncode}"), out.stdout.strip()
     except OSError as e:
         return err(e.errno), ""
