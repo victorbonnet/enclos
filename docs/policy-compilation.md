@@ -51,24 +51,23 @@ The compiled policy does not hold the network allowlist. It only sends every con
 
 ## The templates
 
-A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. The templates differ only in what the sandbox reaches on the network:
+A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. The two differ only in what the sandbox reaches on the network:
 
-| Can it… | `minimal` | `mcp-only` | `assistant` |
-| --- | --- | --- | --- |
-| Write to its own home | yes | yes | yes |
-| Write to other folders | only those added | only those added | only those added |
-| Read your files, except sensitive paths | yes | yes | yes |
-| Read sensitive paths, such as SSH keys | no | no | no |
-| Run programs, and install them in its home | yes | yes | yes |
-| Reach what its runtime needs, once installed | yes | yes | yes |
-| **Reach the public web** | **only what is listed** | **only what is listed** | **yes, ports 80 and 443** |
-| Reach other ports | only if listed | only if listed | only if listed |
-| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` | only if listed and in `private` |
-| Reach your computer's own services or cloud metadata | no | no | no |
-| Open apps, send Apple Events or signal other processes | no | no | no |
+| Can it… | `minimal` | `assistant` |
+| --- | --- | --- |
+| Write to its own home | yes | yes |
+| Write to other folders | only those added | only those added |
+| Read your files, except sensitive paths | yes | yes |
+| Read sensitive paths, such as SSH keys | no | no |
+| Run programs, and install them in its home | yes | yes |
+| Reach what its runtime needs, once installed | yes | yes |
+| **Reach the public web** | **only what is listed** | **yes, ports 80 and 443** |
+| Reach other ports | only if listed | only if listed |
+| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` |
+| Reach your computer's own services or cloud metadata | no | no |
+| Open apps, send Apple Events or signal other processes | no | no |
 
-- **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name.
-- **`mcp-only`** has the same rules as `minimal` for now, and differs once program rules come. Use it for assistants working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
+- **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
 - **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
 
 Under every template, each connection goes through the sandbox's proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
@@ -106,7 +105,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 
 | Setting | Accepts | Notes |
 | --- | --- | --- |
-| `extends` | `minimal`, `mcp-only`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
+| `extends` | `minimal`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
 
 **`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. A change waits for sessions to restart.
 
@@ -121,7 +120,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
-| `mode` | `public`, `allowlist` | from the template: `assistant` is `public`, the others `allowlist` | `public` reaches any public address on ports 80 and 443, as well as what is listed. `allowlist` reaches only what is listed. |
+| `mode` | `public`, `allowlist` | from the template: `assistant` is `public`, `minimal` is `allowlist` | `public` reaches any public address on ports 80 and 443, as well as what is listed. `allowlist` reaches only what is listed. |
 | `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
 | `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
@@ -157,7 +156,7 @@ A variable granted to the whole sandbox cannot also be granted to an agent. An `
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `mcp-only` and `assistant` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal` and `assistant` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
 | 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is an error (`names no template`) |
 

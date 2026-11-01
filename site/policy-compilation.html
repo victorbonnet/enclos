@@ -30,7 +30,7 @@
       <p>A sandbox’s <code>policy.toml</code> only says what differs. enclos applies four layers in order:</p>
       <ol>
         <li><strong>Built-in defaults:</strong> writes only to the sandbox’s home, and the list of sensitive paths it may not read.</li>
-        <li><strong>The template:</strong> <code>minimal</code>, <code>mcp-only</code> or <code>assistant</code>, which the file names with <code>extends</code>.</li>
+        <li><strong>The template:</strong> <code>minimal</code> or <code>assistant</code>, which the file names with <code>extends</code>.</li>
         <li><strong>The runtime’s needs:</strong> the hosts its install, login and model calls use.</li>
         <li><strong>Your <code>policy.toml</code>:</strong> what you add.</li>
       </ol>
@@ -70,26 +70,25 @@
       <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
 
       <h2 id="templates">The templates</h2>
-      <p>A sandbox starts from a template, named when it is created and kept in <code>extends</code>. Change <code>extends</code> with <code>enclos policy edit lab</code> to move it to another. The templates differ only in what the sandbox reaches on the network:</p>
+      <p>A sandbox starts from a template, named when it is created and kept in <code>extends</code>. Change <code>extends</code> with <code>enclos policy edit lab</code> to move it to another. The two differ only in what the sandbox reaches on the network:</p>
       <div class="table-scroll"><table>
-        <thead><tr><th>Can it…</th><th><code>minimal</code></th><th><code>mcp-only</code></th><th><code>assistant</code></th></tr></thead>
+        <thead><tr><th>Can it…</th><th><code>minimal</code></th><th><code>assistant</code></th></tr></thead>
         <tbody>
-          <tr><td>Write to its own home</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-          <tr><td>Write to other folders</td><td>If added</td><td>If added</td><td>If added</td></tr>
-          <tr><td>Read your files, except sensitive paths</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-          <tr><td>Read sensitive paths, such as SSH keys</td><td>No</td><td>No</td><td>No</td></tr>
-          <tr><td>Run programs, and install them in its home</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-          <tr><td>Reach what its runtime needs, once installed</td><td>Yes</td><td>Yes</td><td>Yes</td></tr>
-          <tr><td><strong>Reach the public web</strong></td><td><strong>If listed</strong></td><td><strong>If listed</strong></td><td><strong>Yes, ports 80 and 443</strong></td></tr>
-          <tr><td>Reach other ports</td><td>If listed</td><td>If listed</td><td>If listed</td></tr>
-          <tr><td>Reach a host on your local network</td><td>If you opt in</td><td>If you opt in</td><td>If you opt in</td></tr>
-          <tr><td>Reach your computer’s own services or cloud metadata</td><td>No</td><td>No</td><td>No</td></tr>
-          <tr><td>Open apps, send Apple Events or signal other processes</td><td>No</td><td>No</td><td>No</td></tr>
+          <tr><td>Write to its own home</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Write to other folders</td><td>If added</td><td>If added</td></tr>
+          <tr><td>Read your files, except sensitive paths</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Read sensitive paths, such as SSH keys</td><td>No</td><td>No</td></tr>
+          <tr><td>Run programs, and install them in its home</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td>Reach what its runtime needs, once installed</td><td>Yes</td><td>Yes</td></tr>
+          <tr><td><strong>Reach the public web</strong></td><td><strong>If listed</strong></td><td><strong>Yes, ports 80 and 443</strong></td></tr>
+          <tr><td>Reach other ports</td><td>If listed</td><td>If listed</td></tr>
+          <tr><td>Reach a host on your local network</td><td>If you opt in</td><td>If you opt in</td></tr>
+          <tr><td>Reach your computer’s own services or cloud metadata</td><td>No</td><td>No</td></tr>
+          <tr><td>Open apps, send Apple Events or signal other processes</td><td>No</td><td>No</td></tr>
         </tbody>
       </table></div>
       <ul>
-        <li><strong><code>minimal</code></strong> reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes, that is its install sources and the ChatGPT subscription’s hosts; another model provider’s hosts need <code>enclos policy allow</code>. Use it when an agent should reach only what you name.</li>
-        <li><strong><code>mcp-only</code></strong> has the same rules as <code>minimal</code> for now. Use it for assistants working on outside data through remote MCP servers: allow each server’s host, then tell the runtime of it with its own commands.</li>
+        <li><strong><code>minimal</code></strong> reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes, that is its install sources and the ChatGPT subscription’s hosts; another model provider’s hosts need <code>enclos policy allow</code>. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server’s host, then tell the runtime of it with its own commands.</li>
         <li><strong><code>assistant</code></strong> adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.</li>
       </ul>
       <p>Under every template, each connection goes through the sandbox’s proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
@@ -121,7 +120,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td><code>extends</code></td><td><code>minimal</code>, <code>mcp-only</code>, <code>assistant</code></td><td>Required. The template this policy builds on: see <a href="#templates">the templates</a>.</td></tr>
+          <tr><td><code>extends</code></td><td><code>minimal</code>, <code>assistant</code></td><td>Required. The template this policy builds on: see <a href="#templates">the templates</a>.</td></tr>
         </tbody>
       </table></div>
 
@@ -142,7 +141,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td><code>mode</code></td><td><code>public</code>, <code>allowlist</code></td><td><code>public</code> reaches any public address on ports 80 and 443, as well as what is listed. <code>allowlist</code> reaches only what is listed. <code>assistant</code> starts <code>public</code>, the other templates <code>allowlist</code>.</td></tr>
+          <tr><td><code>mode</code></td><td><code>public</code>, <code>allowlist</code></td><td><code>public</code> reaches any public address on ports 80 and 443, as well as what is listed. <code>allowlist</code> reaches only what is listed. <code>assistant</code> starts <code>public</code>, <code>minimal</code> <code>allowlist</code>.</td></tr>
           <tr><td><code>allow</code></td><td>destinations</td><td>Replaces the list, the runtime’s own hosts too, so its login and model calls may stop working. Prefer <code>allow_add</code>.</td></tr>
           <tr><td><code>allow_add</code></td><td>destinations</td><td>Adds destinations, as <code>enclos policy allow</code> does.</td></tr>
           <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
