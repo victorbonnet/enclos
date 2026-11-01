@@ -1,10 +1,11 @@
 //! Secrets in a runtime's settings files in the sandbox home, which `enclos
 //! doctor` reports (design §10): a value written there in plain text, which
-//! every agent of the sandbox and any backup of the home reads (ADR 0022),
-//! and a `${VAR}` reference to a variable the active policy does not grant
-//! the agent the file belongs to (ADR 0036). Whatever wrote them: the
-//! runtime's own setup, a person through `enclos connect`, or `runtime
-//! configure`. Only names and line numbers are kept, never a value.
+//! every agent of the sandbox reads (ADR 0003), and a `${VAR}` reference to
+//! a variable the active policy does not grant the agent the file belongs
+//! to (ADR 0036). Whatever wrote them: the runtime's own setup, a person
+//! through `enclos connect`, or `runtime configure`. With them, the agents
+//! granted secrets of their own that do not read them. Only names and line
+//! numbers are kept, never a value.
 
 use std::collections::BTreeSet;
 
@@ -24,21 +25,19 @@ struct SettingsFile {
     granted: BTreeSet<String>,
 }
 
-/// A secret found in a runtime's settings files. `line` counts from 1.
+/// What `doctor` reports of a runtime's settings. `line` counts from 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsFinding {
     /// The line sets `held` to a value in plain text: a variable the active
-    /// policy grants `agent` (`granted`), or a name that says it holds a
-    /// secret.
+    /// policy grants `agent`, or a name that says it holds a secret.
     Plain {
         agent: RuntimeAgentName,
         file: HomePath,
         line: usize,
         held: Held,
-        granted: bool,
     },
     /// The line refers to `${variable}`, which the active policy does not
-    /// grant `agent` and no `.env` among the files sets: nothing enclos
+    /// grant `agent` and `agent`'s own `.env` does not set: nothing enclos
     /// gives the agent sets it.
     NotGranted {
         agent: RuntimeAgentName,
@@ -46,32 +45,35 @@ pub enum SettingsFinding {
         line: usize,
         variable: String,
     },
-    /// The active policy grants `agent` secrets of its own, and no settings
-    /// file of its names the file they are written to: it does not read
-    /// them until `runtime configure` points it there (ADR 0036).
+    /// The active policy grants `agent` secrets of its own, and it does not
+    /// read them: the runtime has no such agent, or its settings do not
+    /// point it at them, which `runtime configure` does (ADR 0036).
     NotSetUp { agent: RuntimeAgentName },
 }
 
 /// What a settings line sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Held {
-    /// A variable of a `.env` file.
-    Variable(String),
+    /// A variable of a `.env` file; `granted`: one the active policy grants
+    /// the agent.
+    Variable { name: String, granted: bool },
     /// A key of a YAML file, as written on its line (`token`, not the
     /// dotted path above it).
     Key(String),
 }
 
 /// Whether a name says it holds a secret, by its last word, words split at
-/// `_`, `-` and `.`, any case: `key` or `apikey`, or one ending in a token,
-/// a secret or a password: `TELEGRAM_BOT_TOKEN`, `api_key`, `botToken`.
+/// `_`, `-` and `.`, any case: `key` or `apikey`, or one holding a secret, a
+/// password or a token, but for a count of tokens: `TELEGRAM_BOT_TOKEN`,
+/// `api_key`, `secretKey`, not `max_tokens`.
 pub(super) fn names_a_secret(name: &str) -> bool {
     name.rsplit(['_', '-', '.']).next().is_some_and(|last| {
         let last = last.to_ascii_lowercase();
         matches!(last.as_str(), "key" | "apikey")
-            || ["token", "secret", "password", "passwd"]
+            || ["secret", "password", "passwd"]
                 .iter()
-                .any(|word| last.ends_with(word))
+                .any(|word| last.contains(word))
+            || (last.contains("token") && !last.ends_with("tokens"))
     })
 }
 
@@ -112,6 +114,7 @@ fn yaml_line(line: &str) -> Option<(&str, &str)> {
         Some(quote @ ('"' | '\'')) => value[1..]
             .find(quote)
             .map_or(value, |end| &value[..end + 2]),
+        Some('#') => "",
         _ => value.split(" #").next().unwrap_or("").trim_end(),
     };
     Some((key, value))
@@ -202,21 +205,23 @@ fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
                 true => dotenv_line(line).map(|(name, value)| {
                     let granted = granted.contains(name);
                     let plain = holds_a_value(value, false) && (granted || names_a_secret(name));
-                    (plain, Held::Variable(name.to_owned()), granted)
+                    let name = name.to_owned();
+                    (plain, Held::Variable { name, granted })
                 }),
                 false => yaml_line(line).map(|(key, value)| {
                     let plain = holds_a_value(value, true) && names_a_secret(key);
-                    (plain, Held::Key(key.to_owned()), false)
+                    (plain, Held::Key(key.to_owned()))
                 }),
             };
-            if let Some((true, held, granted)) = held {
+            if let Some((true, held)) = held {
                 found.push(SettingsFinding::Plain {
                     agent: agent.clone(),
                     file: file.clone(),
                     line: line_no,
                     held,
-                    granted,
                 });
+                // What it holds is a value: nothing of it is shown.
+                continue;
             }
             let referring = match is_dotenv(file) {
                 true => line,
@@ -242,11 +247,12 @@ fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
 }
 
 impl Engine {
-    /// The secrets found in the settings files of the sandbox's runtime,
+    /// What is reported of the settings files of the sandbox's runtime,
     /// for its built-in agent and every agent the runtime has (ADR 0031's
-    /// files), read as other files of the home are (ADR 0023). What could
-    /// not be read is in `unreadable`; a sandbox without a runtime has
-    /// nothing to look at.
+    /// files), read as other files of the home are (ADR 0023), and of each
+    /// agent the policy grants secrets of its own. What could not be read
+    /// is in `unreadable`; a sandbox without a runtime has nothing to look
+    /// at.
     pub(super) fn settings_secrets(
         &self,
         record: &SandboxRecord,
@@ -268,7 +274,9 @@ impl Engine {
             }
         };
         let home = self.sandbox_home(name);
-        let agents = runtime.agents_in(&home).unwrap_or_else(|e| {
+        let listed = runtime.agents_in(&home);
+        let whole_list = listed.is_ok();
+        let agents = listed.unwrap_or_else(|e| {
             unreadable.push(format!(
                 "did not look for secrets in the settings of {}'s other agents: cannot list them: {e}",
                 kind.display_name()
@@ -276,9 +284,10 @@ impl Engine {
             Vec::new()
         });
         let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
+        let looked_at: Vec<_> = builtin.into_iter().chain(agents).collect();
         let mut files = Vec::new();
         let mut not_set_up = Vec::new();
-        for agent in builtin.into_iter().chain(agents) {
+        for agent in &looked_at {
             let own = policy.agent_secrets.get(agent.as_str());
             let granted: BTreeSet<String> = policy
                 .secrets
@@ -289,12 +298,11 @@ impl Engine {
             let secrets_file = self
                 .layout
                 .agent_secrets_file(name.as_str(), agent.as_str());
-            let secrets_file = secrets_file.to_string_lossy();
             let (mut reads, mut whole) = (false, true);
-            for path in runtime.agent_settings_files(&agent) {
+            for path in runtime.agent_settings_files(agent) {
                 match read_text(&home, &path, MAX_SETTINGS) {
                     Ok(Some(text)) => {
-                        reads |= text.contains(&*secrets_file);
+                        reads |= runtime.reads_agent_secrets(&text, &secrets_file);
                         files.push(SettingsFile {
                             agent: agent.clone(),
                             path,
@@ -310,8 +318,20 @@ impl Engine {
                 }
             }
             if whole && !reads && own.is_some_and(|grants| !grants.is_empty()) {
-                not_set_up.push(SettingsFinding::NotSetUp { agent });
+                not_set_up.push(SettingsFinding::NotSetUp {
+                    agent: agent.clone(),
+                });
             }
+        }
+        // Granted to an agent the runtime does not have: it reaches no one.
+        if whole_list {
+            let absent = policy
+                .agent_secrets
+                .iter()
+                .filter(|(_, grants)| !grants.is_empty())
+                .map(|(agent, _)| RuntimeAgentName::from(agent))
+                .filter(|agent| !looked_at.contains(agent));
+            not_set_up.extend(absent.map(|agent| SettingsFinding::NotSetUp { agent }));
         }
         let mut found = findings(&files);
         found.append(&mut not_set_up);
@@ -340,13 +360,19 @@ mod tests {
         }
     }
 
-    fn plain(file: &str, line: usize, held: Held, granted: bool) -> SettingsFinding {
+    fn variable(name: &str, granted: bool) -> Held {
+        Held::Variable {
+            name: name.to_owned(),
+            granted,
+        }
+    }
+
+    fn plain(file: &str, line: usize, held: Held) -> SettingsFinding {
         SettingsFinding::Plain {
             agent: agent("default"),
             file: at(file),
             line,
             held,
-            granted,
         }
     }
 
@@ -371,6 +397,10 @@ mod tests {
             "APIKEY",
             "x.botToken",
             "x.apitoken",
+            "x.api-key",
+            "storage.secretKey",
+            "x.tokenValue",
+            "x.passwordHash",
         ] {
             assert!(names_a_secret(secret), "{secret}");
         }
@@ -429,6 +459,7 @@ mod tests {
         assert_eq!(yaml_line("token : abc"), Some(("token", "abc")));
         assert_eq!(yaml_line("\"token\": abc"), Some(("token", "abc")));
         assert_eq!(yaml_line("token: \"\" # mine"), Some(("token", "\"\"")));
+        assert_eq!(yaml_line("token: # mine"), Some(("token", "")));
         assert_eq!(yaml_line("url: http://x"), Some(("url", "http://x")));
         assert_eq!(yaml_line("http://x"), None);
         assert_eq!(yaml_line("a b: c"), None);
@@ -470,11 +501,11 @@ mod tests {
         assert_eq!(
             found,
             [
-                plain(env, 3, Held::Variable("TELEGRAM_BOT_TOKEN".into()), false),
-                plain(env, 4, Held::Variable("OPENROUTER_API_KEY".into()), false),
+                plain(env, 3, variable("TELEGRAM_BOT_TOKEN", false)),
+                plain(env, 4, variable("OPENROUTER_API_KEY", false)),
                 // Named like no secret, but the policy grants it.
-                plain(env, 5, Held::Variable("MY_LOGIN".into()), true),
-                plain(config, 3, Held::Key("token".into()), false),
+                plain(env, 5, variable("MY_LOGIN", true)),
+                plain(config, 3, Held::Key("token".into())),
             ]
         );
         let shown = format!("{found:?}");
@@ -554,7 +585,20 @@ mod tests {
         let files = vec![file("default", env, "SMTP_PASSWORD=!hunter2\n", &[])];
         assert_eq!(
             findings(&files),
-            [plain(env, 1, Held::Variable("SMTP_PASSWORD".into()), false)]
+            [plain(env, 1, variable("SMTP_PASSWORD", false))]
+        );
+    }
+
+    /// A value in plain text that holds what looks like a reference is
+    /// reported as a value, and nothing of it is taken for a variable's
+    /// name, which `doctor` would print.
+    #[test]
+    fn a_value_in_plain_text_gives_no_reference() {
+        let env = ".hermes/.env";
+        let files = vec![file("default", env, "DB_PASSWORD=ab${Cd3f}gh\n", &[])];
+        assert_eq!(
+            findings(&files),
+            [plain(env, 1, variable("DB_PASSWORD", false))]
         );
     }
 

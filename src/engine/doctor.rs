@@ -89,7 +89,8 @@ pub struct SandboxCheck {
     /// version compiles differently from now.
     pub drift: Vec<Drift>,
     /// Secrets in plain text, or not granted, in its runtime's settings
-    /// files: reported, not a problem.
+    /// files, and agents that do not read the secrets granted them:
+    /// reported, not a problem.
     pub settings: Vec<SettingsFinding>,
     /// What enclos could not look at for it: what is above may then be
     /// incomplete.

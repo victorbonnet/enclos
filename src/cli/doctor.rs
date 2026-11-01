@@ -8,6 +8,7 @@ use enclos::engine::{
     MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
+use enclos::model::agent::AgentName;
 use enclos::runtime::RuntimeAgentName;
 
 pub fn run(engine: &Engine) -> Result<u8> {
@@ -128,14 +129,13 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     agent,
                     file,
                     line,
-                    held: Held::Variable(variable),
-                    granted,
+                    held: Held::Variable { name, granted },
                 } => json!({
                     "kind": "plain",
                     "agent": agent.as_str(),
                     "file": file.to_string(),
                     "line": line,
-                    "variable": variable,
+                    "variable": name,
                     "granted": granted,
                 }),
                 SettingsFinding::Plain {
@@ -143,7 +143,6 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     file,
                     line,
                     held: Held::Key(key),
-                    ..
                 } => json!({
                     "kind": "plain",
                     "agent": agent.as_str(),
@@ -399,19 +398,41 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
     out
 }
 
-/// A secret found in the runtime's settings, and what to do about it. Only
+/// What was found in the runtime's settings, and what to do about it. Only
 /// names: doctor never prints a value.
 fn settings_line(name: &str, finding: &SettingsFinding) -> String {
     let store = format!("store it with `enclos secret set {name}/<secret>`");
-    let grant = |agent: &RuntimeAgentName| {
-        format!("grant it under [secrets.agents.{agent}] with `enclos policy edit {name}`")
+    // A policy and a command name an agent under enclos's own rule; the
+    // runtime may have one it does not take, such as `my_bot`, which gets
+    // what the whole sandbox gets.
+    let named = |agent: &RuntimeAgentName| agent.as_str().parse::<AgentName>().is_ok();
+    let grant = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!("grant it under [secrets.agents.{agent}] with `enclos policy edit {name}`"),
+        false => format!(
+            "grant it under [secrets] with `enclos policy edit {name}`, as enclos cannot name agent {agent}"
+        ),
+    };
+    let set_up = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!(", then run `enclos runtime configure {name}/{agent}`"),
+        false => String::new(),
+    };
+    let reference = |agent: &RuntimeAgentName| match named(agent) {
+        true => format!(
+            "`enclos runtime configure {name}/{agent} --set '<its whole dotted key>=${{VARIABLE}}'`"
+        ),
+        false => format!(
+            "the runtime's own command through `enclos connect {name}`, as its whole dotted key set to `${{VARIABLE}}`"
+        ),
     };
     match finding {
         SettingsFinding::Plain {
             file,
             line,
-            held: Held::Variable(variable),
-            granted: true,
+            held:
+                Held::Variable {
+                    name: variable,
+                    granted: true,
+                },
             ..
         } => format!(
             "    {file}, line {line}, holds {variable} in plain text, which the policy already grants as a secret: remove the line\n"
@@ -420,21 +441,25 @@ fn settings_line(name: &str, finding: &SettingsFinding) -> String {
             agent,
             file,
             line,
-            held: Held::Variable(variable),
-            granted: false,
+            held:
+                Held::Variable {
+                    name: variable,
+                    granted: false,
+                },
         } => format!(
-            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, remove the line, then run `enclos runtime configure {name}/{agent}`\n",
-            grant(agent)
+            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, remove the line{}\n",
+            grant(agent),
+            set_up(agent)
         ),
         SettingsFinding::Plain {
             agent,
             file,
             line,
             held: Held::Key(key),
-            ..
         } => format!(
-            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then give it with `enclos runtime configure {name}/{agent} --set '<its whole dotted key>=${{VARIABLE}}'`\n",
-            grant(agent)
+            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then give it with {}\n",
+            grant(agent),
+            reference(agent)
         ),
         SettingsFinding::NotGranted {
             agent,
@@ -442,8 +467,9 @@ fn settings_line(name: &str, finding: &SettingsFinding) -> String {
             line,
             variable,
         } => format!(
-            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, {} as {variable}, then run `enclos runtime configure {name}/{agent}`\n",
-            grant(agent)
+            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, {} as {variable}{}\n",
+            grant(agent),
+            set_up(agent)
         ),
         SettingsFinding::NotSetUp { agent } => format!(
             "    agent {agent} does not read the secrets the policy grants it under [secrets.agents.{agent}]: run `enclos runtime configure {name}/{agent}`\n"
@@ -726,22 +752,41 @@ mod tests {
                     agent: RuntimeAgentName::new("default").unwrap(),
                     file: env.clone(),
                     line: 3,
-                    held: Held::Variable("OPENROUTER_API_KEY".into()),
-                    granted: false,
+                    held: Held::Variable {
+                        name: "OPENROUTER_API_KEY".into(),
+                        granted: false,
+                    },
                 },
                 SettingsFinding::Plain {
                     agent: RuntimeAgentName::new("default").unwrap(),
                     file: env,
                     line: 4,
-                    held: Held::Variable("TELEGRAM_BOT_TOKEN".into()),
-                    granted: true,
+                    held: Held::Variable {
+                        name: "TELEGRAM_BOT_TOKEN".into(),
+                        granted: true,
+                    },
                 },
                 SettingsFinding::Plain {
                     agent: RuntimeAgentName::new("default").unwrap(),
                     file: config.clone(),
                     line: 7,
                     held: Held::Key("token".into()),
-                    granted: false,
+                },
+                // A name Hermes takes and enclos does not.
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("my_bot").unwrap(),
+                    file: HomePath::new(".hermes/profiles/my_bot/.env").unwrap(),
+                    line: 1,
+                    held: Held::Variable {
+                        name: "API_KEY".into(),
+                        granted: false,
+                    },
+                },
+                SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("my_bot").unwrap(),
+                    file: HomePath::new(".hermes/profiles/my_bot/config.yaml").unwrap(),
+                    line: 2,
+                    held: Held::Key("token".into()),
                 },
                 SettingsFinding::NotGranted {
                     agent: RuntimeAgentName::new("default").unwrap(),
@@ -763,6 +808,9 @@ mod tests {
             "then give it with `enclos runtime configure home/default --set '<its whole dotted key>=${VARIABLE}'`\n",
             "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant agent default",
             "then run `enclos runtime configure home/default`\n",
+            "as API_KEY, remove the line\n",
+            "grant it under [secrets] with `enclos policy edit home`, as enclos cannot name agent my_bot",
+            "then give it with the runtime's own command through `enclos connect home`",
             "    agent main does not read the secrets the policy grants it under [secrets.agents.main]: run `enclos runtime configure home/main`\n",
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
@@ -776,10 +824,11 @@ mod tests {
         assert_eq!(settings[0]["variable"], "OPENROUTER_API_KEY", "{json}");
         assert_eq!(settings[1]["granted"], true, "{json}");
         assert_eq!(settings[2]["key"], "token", "{json}");
-        assert_eq!(settings[3]["kind"], "not_granted", "{json}");
-        assert_eq!(settings[3]["agent"], "default", "{json}");
-        assert_eq!(settings[4]["kind"], "not_set_up", "{json}");
-        assert_eq!(settings[4]["agent"], "main", "{json}");
+        assert_eq!(settings[3]["agent"], "my_bot", "{json}");
+        assert_eq!(settings[5]["kind"], "not_granted", "{json}");
+        assert_eq!(settings[5]["agent"], "default", "{json}");
+        assert_eq!(settings[6]["kind"], "not_set_up", "{json}");
+        assert_eq!(settings[6]["agent"], "main", "{json}");
         assert_eq!(json["problems"], false, "{json}");
     }
 

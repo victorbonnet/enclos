@@ -744,7 +744,7 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     );
     let before = engine.layout.read_policy("home").unwrap();
     let after = format!(
-        "{before}\n[secrets]\nenv = {{ OPENROUTER_API_KEY = \"secret:home/openrouter\" }}\n\n[secrets.agents.main]\nenv = {{ MAIN_BOT = \"secret:home/openrouter\" }}\n"
+        "{before}\n[secrets]\nenv = {{ OPENROUTER_API_KEY = \"secret:home/openrouter\" }}\n\n[secrets.agents.main]\nenv = {{ MAIN_BOT = \"secret:home/openrouter\" }}\n\n[secrets.agents.ghost]\nenv = {{ GHOST_BOT = \"secret:home/openrouter\" }}\n"
     );
     engine
         .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
@@ -787,14 +787,20 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
                 agent: RuntimeAgentName::new("default").unwrap(),
                 file: at(".hermes/.env"),
                 line: 1,
-                held: Held::Variable("OPENROUTER_API_KEY".into()),
-                granted: true,
+                held: Held::Variable {
+                    name: "OPENROUTER_API_KEY".into(),
+                    granted: true,
+                },
             },
             SettingsFinding::NotGranted {
                 agent: RuntimeAgentName::new("main").unwrap(),
                 file: at(".hermes/profiles/main/config.yaml"),
                 line: 3,
                 variable: "SLACK_BOT_TOKEN".into(),
+            },
+            // Granted to an agent the runtime does not have.
+            SettingsFinding::NotSetUp {
+                agent: RuntimeAgentName::new("ghost").unwrap(),
             },
         ]
     );
@@ -806,27 +812,35 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     assert!(!format!("{doctor:?}").contains("sk-plain"));
 
     // Granted secrets, and no setting that reads them: said once every file
-    // of the agent could be read, and no more once one names its secrets
-    // file.
+    // of the agent could be read, and no more once its settings read them.
     let not_set_up = |engine: &crate::engine::Engine| {
         check_of(&engine.doctor(), &name)
             .settings
             .iter()
-            .filter(|f| matches!(f, SettingsFinding::NotSetUp { .. }))
-            .count()
+            .filter_map(|f| match f {
+                SettingsFinding::NotSetUp { agent } => Some(agent.as_str().to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
     };
-    assert_eq!(not_set_up(&engine), 0, "a link hid one of its files");
+    assert_eq!(
+        not_set_up(&engine),
+        ["ghost"],
+        "a link hid one of main's files"
+    );
     std::fs::remove_file(main.join(".env")).unwrap();
-    assert_eq!(not_set_up(&engine), 1);
+    assert_eq!(not_set_up(&engine), ["main", "ghost"]);
     let file = engine.layout.agent_secrets_file("home", "main");
     let config = std::fs::read_to_string(main.join("config.yaml")).unwrap();
-    std::fs::write(
-        main.join("config.yaml"),
+    let block = |enabled: bool| {
         format!(
-            "{config}secrets:\n  command:\n    command: cat '{}'\n",
+            "{config}secrets:\n  command:\n    enabled: {enabled}\n    command: cat '{}'\n",
             file.display()
-        ),
-    )
-    .unwrap();
-    assert_eq!(not_set_up(&engine), 0);
+        )
+    };
+    // Off, as a clone or an import leaves it.
+    std::fs::write(main.join("config.yaml"), block(false)).unwrap();
+    assert_eq!(not_set_up(&engine), ["main", "ghost"]);
+    std::fs::write(main.join("config.yaml"), block(true)).unwrap();
+    assert_eq!(not_set_up(&engine), ["ghost"]);
 }

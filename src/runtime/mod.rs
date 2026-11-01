@@ -222,13 +222,23 @@ pub trait RuntimeAdapter {
     }
     /// Files in the home the services read only as they start, for the
     /// built-in agent and `agents` (ADR 0031).
-    fn settings_files(&self, _agents: &[RuntimeAgentName]) -> Vec<HomePath> {
-        Vec::new()
+    fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> {
+        self.builtin_agent()
+            .map(BuiltinAgent::runtime_name)
+            .into_iter()
+            .chain(agents.iter().cloned())
+            .flat_map(|agent| self.agent_settings_files(&agent))
+            .collect()
     }
-    /// The files among [`RuntimeAdapter::settings_files`] that hold `agent`'s
-    /// settings alone.
+    /// The settings files of `agent` alone.
     fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath> {
         Vec::new()
+    }
+    /// Whether `text`, a settings file of an agent, has it read its secrets
+    /// from `secrets_file`, as [`RuntimeAdapter::agent_secrets_source`] sets
+    /// up (ADR 0036).
+    fn reads_agent_secrets(&self, _text: &str, _secrets_file: &Path) -> bool {
+        false
     }
     /// The names of the agents the runtime has in this sandbox home, as it
     /// would list them, sorted, read on the host without running anything.
