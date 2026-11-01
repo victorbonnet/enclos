@@ -32,6 +32,8 @@ jobs:
         run: python3 -I prototype/m3/test_compile.py
       - name: The relay's tests (loopback sockets, no host access)
         run: python3 -I prototype/m3/test_relay.py
+      - name: The exec probes' tests (a temporary folder, no host access)
+        run: python3 -I prototype/m3/test_probe.py
       - name: The workflow's text
         run: python3 -I prototype/m3/test_workflow.py
       - name: The Landlock grants' tests (no host access)
