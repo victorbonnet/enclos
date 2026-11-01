@@ -255,6 +255,52 @@ mod tests {
         assert_eq!(left(dir.path()), [format!("hermes-install-{sha256}.sh")]);
     }
 
+    /// Downloads run outside the state lock, so two installs at once must
+    /// not write the same part file.
+    #[test]
+    fn a_download_goes_to_a_part_file_of_this_process() {
+        struct Records(std::cell::RefCell<PathBuf>);
+        impl Downloader for Records {
+            fn download(&self, _: &str, to: &Path) -> std::result::Result<(), DownloadFailed> {
+                *self.0.borrow_mut() = to.to_owned();
+                std::fs::write(to, "x").unwrap();
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let records = Records(Default::default());
+        download_installer(&records, dir.path(), &Hermes).unwrap();
+        assert_eq!(
+            *records.0.borrow(),
+            dir.path()
+                .join(format!("hermes-install.{}.part", std::process::id()))
+        );
+    }
+
+    /// A staged path holding a quote stays one word for `sh`.
+    #[test]
+    fn a_staged_path_with_a_quote_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("it's staged");
+        std::fs::write(&staged, "first").unwrap();
+        let file = HomeFile {
+            path: "bin/one",
+            contents: "",
+            executable: true,
+        };
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(home_files_script(&[(staged, &file)]))
+            .env("HOME", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("bin/one")).unwrap(),
+            "first"
+        );
+    }
+
     /// Each way a download fails is said, and leaves no part of it.
     #[test]
     fn a_failed_download_says_why_and_leaves_nothing() {
@@ -340,6 +386,7 @@ mod tests {
             assert!(pair("--proto", "=https"), "{args:?}");
             assert!(pair("--proto-redir", "=https"), "{args:?}");
             assert!(args.contains(&"-fsSL"), "{args:?}");
+            assert!(pair("--max-time", "120"), "{args:?}");
             assert!(
                 pair("--max-filesize", &INSTALLER_MAX_BYTES.to_string()),
                 "{args:?}"
