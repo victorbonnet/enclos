@@ -54,7 +54,7 @@ code { font-family: var(--mono); font-size: 13px; }
 
 /* Hero */
 .hero { display: grid; gap: 32px; padding-block: 40px 56px; }
-h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.05em; }
+h1 { font-size: clamp(30px, 9.2vw, 66px); line-height: 1.05; letter-spacing: -0.05em; }
 .serif-word { font-family: var(--serif); font-weight: 400; font-style: italic; color: var(--accent); letter-spacing: -0.04em; }
 .lead { font-size: 18px; color: var(--text-muted); max-width: 460px; margin-top: 20px; }
 .install { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 12px 16px; margin-top: 28px; background: var(--panel-deep); }
@@ -133,6 +133,7 @@ th { color: var(--text); font-weight: 600; border-top: 0; }
 
 @media (min-width: 960px) {
   .hero { grid-template-columns: 1fr 1fr; align-items: center; gap: 56px; padding-block: 64px 80px; }
+  h1 { font-size: 44px; }
   .start { grid-template-columns: 0.8fr 1.2fr; align-items: center; gap: 56px; padding-block: 88px; }
   .policy { padding-block: 72px 88px; }
   .policy-compile { grid-template-columns: minmax(0, 0.8fr) auto minmax(0, 1.2fr); align-items: center; gap: 16px; }
