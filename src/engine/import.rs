@@ -221,6 +221,8 @@ impl Engine {
             agent: record,
             kind,
             how,
+            talk: runtime.talk(&agent),
+            login: runtime.login(),
         }))
     }
 }
