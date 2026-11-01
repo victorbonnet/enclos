@@ -10,7 +10,7 @@ Throwaway scripts that answer the milestone 3 questions in `docs/design.md` §14
 | `bwrap-check.sh` | Runs bubblewrap as the user as installed, then with an AppArmor profile that lets `/usr/bin/bwrap` alone make user namespaces, then with AppArmor's restriction off, restoring each setting. In each of the three it also tries bubblewrap alone, `bwrap --ro-bind / / true`, then a write in the home that it must refuse. **Acts on the host**: refuses to run outside a GitHub-hosted runner. |
 | `logout-check.sh` | Logs in over ssh to localhost, starts a `systemd --user` unit, logs out, and checks the unit and the user manager past logind's stop delay, without then with lingering. **Acts on the host** (installs sshd, changes lingering): refuses to run outside a GitHub-hosted runner. |
 | `test_survey.sh` | Checks `survey.sh` with a stubbed `busctl`: the seccomp lines are printed, and `unknown` is reported when logind cannot be asked. Runs nothing else, so it is safe on any host. |
-| `.github/workflows/host-survey.yml` | Runs the three on `ubuntu-latest` and `ubuntu-24.04-arm`, on a pull request that touches this folder or by hand, and writes their output to the job summary. It does not gate merges. |
+| `.github/workflows/host-survey.yml` | Runs the three on `ubuntu-24.04`, `ubuntu-26.04` and `ubuntu-24.04-arm`, on a pull request that touches this folder or by hand, and writes their output to the job summary. It does not gate merges. |
 
 ## Results
 
