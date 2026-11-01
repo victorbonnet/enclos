@@ -124,20 +124,26 @@ fn readable_own(only: Option<&[u32]>) -> Result<BTreeSet<u32>, ProgramsError> {
     let out =
         super::bounded::output_within(ps.args(["-o", "pid=,flags=,stat="]), super::bounded::LIMIT)
             .map_err(|e| ProgramsError(format!("/bin/ps: {e}")))?;
-    // Asked for some processes that have all gone, it prints nothing and
-    // exits 1 (macOS 26.5.2).
-    let all_gone = only.is_some()
-        && out.status.code() == Some(1)
-        && out.stdout.trim_ascii().is_empty()
-        && out.stderr.trim_ascii().is_empty();
-    if !out.status.success() && !all_gone {
-        return Err(ProgramsError(format!(
-            "/bin/ps {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+    answered(&out, only.is_some())
+}
+
+/// What `ps -o pid=,flags=,stat=` answered. Asked for `some` processes that
+/// have all gone, it prints nothing and exits 1 (macOS 26.5.2). Any other
+/// failure, or a success that prints nothing, means it could not look:
+/// [`whole`] takes a process `ps` does not show for one gone, so an empty
+/// answer must not pass for that.
+fn answered(out: &Output, some: bool) -> Result<BTreeSet<u32>, ProgramsError> {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+    match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
+        (Some(0), false, _) => parse_readable(&text),
+        (Some(1), true, true) if some => Ok(BTreeSet::new()),
+        (_, true, true) => Err(ProgramsError(format!(
+            "/bin/ps {}, with no output",
+            out.status
+        ))),
+        _ => Err(ProgramsError(format!("/bin/ps {}: {why}", out.status))),
     }
-    parse_readable(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// `ps -o pid=,flags=,stat=` lines, as the pids `lsof` can read. One exiting,
@@ -464,6 +470,27 @@ pub(crate) mod tests {
             parse(&output(1, "p10\nn/x\n", ""), true).unwrap()[&10],
             ["/x"]
         );
+    }
+
+    /// The last `ps` says which processes have gone, so only an answer that
+    /// says so counts: lines, or for some processes a silent exit of 1. An
+    /// empty success is not "all gone", which would let a partial listing
+    /// pass as whole.
+    #[test]
+    fn ps_that_says_nothing_has_not_looked() {
+        let line = "  13     4004 S\n";
+        assert_eq!(answered(&output(0, line, ""), true).unwrap(), [13].into());
+        assert_eq!(answered(&output(0, line, ""), false).unwrap(), [13].into());
+        assert!(answered(&output(1, "", ""), true).unwrap().is_empty());
+
+        let empty = answered(&output(0, "", ""), true).unwrap_err().to_string();
+        assert!(empty.contains("with no output"), "{empty}");
+        assert!(answered(&output(0, " \n", ""), true).is_err());
+        assert!(answered(&output(0, "", ""), false).is_err());
+        assert!(answered(&output(1, "", ""), false).is_err());
+        assert!(answered(&output(1, "", "ps: bad option"), true).is_err());
+        assert!(answered(&output(0, "", "ps: bad option"), true).is_err());
+        assert!(answered(&output(1, line, ""), true).is_err());
     }
 
     /// Asked for processes that have all gone, `lsof` lists none and `ps`
