@@ -426,11 +426,6 @@ fn joined(labels: &[ServiceLabel]) -> String {
         .join(", ")
 }
 
-/// Tests that raise TERM at this process take this first: the flag of every
-/// `EndOn` registered then would be set.
-#[cfg(test)]
-pub(crate) static TERM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;

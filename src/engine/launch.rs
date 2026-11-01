@@ -1,5 +1,5 @@
-//! `enclos launch`: what the service manager runs for a sandbox's service
-//! (design §8, ADR 0021).
+//! `enclos launch`, what the service manager runs for a runtime's service,
+//! and the proxy recording itself (design §8, ADR 0021).
 
 use std::os::unix::process::CommandExt;
 use std::process::Child;
@@ -368,10 +368,14 @@ impl Engine {
     }
 }
 
+/// Tests that raise TERM at this process take this first: the flag of every
+/// `EndOn` registered then would be set.
+#[cfg(test)]
+pub(crate) static TERM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::service::TERM_LOCK;
 
     #[test]
     fn end_on_sets_the_flag_on_term_and_the_process_lives() {

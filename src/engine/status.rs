@@ -6,8 +6,8 @@
 //! manager, and from the sandbox home, which the sandbox writes. The
 //! runtime adapter names paths and lists its agents; every read of the home
 //! goes through descriptors that never follow a link (`runtime::home`, ADR
-//! 0023), sizes
-//! and counts are bounded, and "cannot tell", with why, is an answer.
+//! 0023), sizes and counts are bounded, and "cannot tell", with why, is an
+//! answer.
 
 mod disk;
 mod facts;

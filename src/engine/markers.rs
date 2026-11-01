@@ -1,4 +1,4 @@
-//! The marker each member of a session holds, by which enclos finds it
+//! The marker a session's processes inherit, by which enclos finds them
 //! (ADR 0030).
 
 use std::time::Duration;

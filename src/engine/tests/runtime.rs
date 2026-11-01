@@ -2087,7 +2087,7 @@ fn a_runtime_service_told_to_end_stops_its_runtime_and_records_the_end() {
     use std::time::{Duration, Instant};
 
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let _term = crate::engine::service::TERM_LOCK
+    let _term = crate::engine::launch::TERM_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
