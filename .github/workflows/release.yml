@@ -96,7 +96,7 @@ jobs:
   # Signs and publishes what `build` made, without building anything.
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write # create the release and upload its assets
       id-token: write # sign the provenance attestation
