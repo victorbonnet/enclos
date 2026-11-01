@@ -14,7 +14,7 @@ use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
 
 use super::Engine;
-use super::runtime::{Added, AgentAdded};
+use super::agents::{Added, AgentAdded};
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::model::agent::AgentName;
