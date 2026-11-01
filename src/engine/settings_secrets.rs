@@ -317,7 +317,7 @@ impl Engine {
                     }
                 }
             }
-            if whole && !reads && own.is_some_and(|grants| !grants.is_empty()) {
+            if whole && !reads && own.is_some() {
                 not_set_up.push(SettingsFinding::NotSetUp {
                     agent: agent.clone(),
                 });
@@ -327,9 +327,8 @@ impl Engine {
         if whole_list {
             let absent = policy
                 .agent_secrets
-                .iter()
-                .filter(|(_, grants)| !grants.is_empty())
-                .map(|(agent, _)| RuntimeAgentName::from(agent))
+                .keys()
+                .map(RuntimeAgentName::from)
                 .filter(|agent| !looked_at.contains(agent));
             not_set_up.extend(absent.map(|agent| SettingsFinding::NotSetUp { agent }));
         }
@@ -446,6 +445,10 @@ mod tests {
         // An anchor or a tag before a value does not hide it.
         assert!(holds_a_value("&a abc", true));
         assert!(holds_a_value("!!str abc", true));
+        // Quoted, a marker is the value's own start.
+        assert!(holds_a_value("\"*hunter2\"", true));
+        // Text between references is a value.
+        assert!(holds_a_value("${A}abc${B}", true));
     }
 
     #[test]
@@ -557,6 +560,28 @@ mod tests {
             findings(&files),
             [not_granted("scout", scout, 1, "MAIN_BOT")]
         );
+    }
+
+    /// A reference on a line with no key, such as a list item, counts.
+    #[test]
+    fn a_reference_in_a_list_item_is_found() {
+        let config = ".hermes/config.yaml";
+        let files = vec![file("default", config, "items:\n  - ${MISSING}\n", &[])];
+        assert_eq!(
+            findings(&files),
+            [not_granted("default", config, 2, "MISSING")]
+        );
+    }
+
+    /// A variable a `.env` leaves empty is not set by it.
+    #[test]
+    fn a_dotenv_line_with_no_value_sets_nothing() {
+        let config = ".hermes/config.yaml";
+        let files = vec![
+            file("default", ".hermes/.env", "FOO=\n", &[]),
+            file("default", config, "a: ${FOO}\n", &[]),
+        ];
+        assert_eq!(findings(&files), [not_granted("default", config, 1, "FOO")]);
     }
 
     /// Hermes keeps each profile's `.env` apart: what one agent's sets is

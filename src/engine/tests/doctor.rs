@@ -707,13 +707,138 @@ fn a_file_on_the_allow_default_baseline_is_said_so() {
     assert_eq!(flag(&engine), (false, true));
 }
 
+/// Records Hermes as the sandbox's runtime.
+fn on_hermes(engine: &Engine, name: &SandboxName) {
+    engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                let mut record = engine.state.get(name)?.unwrap();
+                record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+                Ok(engine.state.put(lock, &record)?)
+            },
+        )
+        .unwrap();
+}
+
+/// Whether anything found in the sandbox's settings is an agent not set up.
+fn any_not_set_up(check: &SandboxCheck) -> bool {
+    check
+        .settings
+        .iter()
+        .any(|f| matches!(f, crate::engine::SettingsFinding::NotSetUp { .. }))
+}
+
+/// A policy that cannot be read: the settings are said not to have been
+/// looked at, which is a problem, not a clean report.
+#[test]
+fn settings_a_policy_cannot_judge_are_said_not_to_be_looked_at() {
+    let (_dir, engine, name) = with_sandbox();
+    on_hermes(&engine, &name);
+    let id = engine.policy(&name).unwrap().snapshot.id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    conn.execute(
+        "UPDATE policy_snapshots SET policy = '{' WHERE id = ?1",
+        [&id.0],
+    )
+    .unwrap();
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(check.settings.is_empty(), "{check:?}");
+    assert!(
+        check.unreadable.iter().any(|u| u.starts_with(
+            "did not look for secrets in Hermes's settings: cannot read its active policy"
+        )),
+        "{check:?}"
+    );
+    assert!(doctor.has_problems());
+}
+
+/// Agents that cannot be listed: that is said, a problem, and an agent the
+/// policy grants secrets is not called absent, since nothing says it is.
+#[test]
+fn an_agent_list_that_cannot_be_read_is_said_and_calls_no_agent_absent() {
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::InMemory;
+    let (dir, engine, name) = with_sandbox();
+    let engine = engine.with_secrets(Box::new(InMemory::default()));
+    on_hermes(&engine, &name);
+    let secret: SecretRef = "home/bot".parse().unwrap();
+    let value = SecretValue::new("sk".into()).unwrap();
+    done(
+        engine
+            .secret_set(&alice(), &secret, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = engine.layout.read_policy("home").unwrap();
+    let after =
+        format!("{before}\n[secrets.agents.ghost]\nenv = {{ BOT = \"secret:home/bot\" }}\n");
+    engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap();
+
+    let hermes = engine.layout.sandbox_home("home").join(".hermes");
+    std::fs::create_dir_all(&hermes).unwrap();
+    assert!(any_not_set_up(&check_of(&engine.doctor(), &name)));
+
+    std::os::unix::fs::symlink(dir.path(), hermes.join("profiles")).unwrap();
+    let doctor = engine.doctor();
+    let check = check_of(&doctor, &name);
+    assert!(!any_not_set_up(&check), "{check:?}");
+    assert!(
+        check.unreadable.iter().any(|u| u.starts_with(
+            "did not look for secrets in the settings of Hermes's other agents: cannot list them"
+        )),
+        "{check:?}"
+    );
+    assert!(doctor.has_problems());
+}
+
+/// An agent's section that grants nothing leaves nothing for it to read.
+#[test]
+fn an_empty_grant_asks_no_agent_to_read_it() {
+    let (_dir, engine, name) = with_sandbox();
+    on_hermes(&engine, &name);
+    let before = engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.default]\nenv = {{}}\n\n[secrets.agents.ghost]\nenv = {{}}\n"
+    );
+    engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap();
+    std::fs::create_dir_all(engine.layout.sandbox_home("home").join(".hermes")).unwrap();
+    let check = check_of(&engine.doctor(), &name);
+    assert!(!any_not_set_up(&check), "{check:?}");
+}
+
+/// The home is read on the host: a sandbox whose backend does not run here
+/// still has its settings looked at.
+#[test]
+fn settings_are_looked_at_whatever_the_backend() {
+    let (_dir, engine, name) = with_sandbox();
+    on_hermes(&engine, &name);
+    let lock = engine.state.lock().unwrap();
+    let mut record = engine.state.get(&name).unwrap().unwrap();
+    record.backend = BackendKind::Bubblewrap;
+    engine.state.put(&lock, &record).unwrap();
+    drop(lock);
+    let home = engine.layout.sandbox_home("home");
+    std::fs::create_dir_all(home.join(".hermes")).unwrap();
+    std::fs::write(home.join(".hermes/.env"), "API_KEY=sk-plain\n").unwrap();
+    let check = check_of(&engine.doctor(), &name);
+    assert!(!check.backend_runs());
+    assert_eq!(check.settings.len(), 1, "{check:?}");
+}
+
 /// Secrets in the runtime's settings, for the built-in agent and every
 /// other: a value in plain text and a reference the policy does not grant
 /// are found, a file that is a link is not read, and no value is kept.
 #[test]
 fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     use crate::engine::{Held, SettingsFinding};
-    use crate::model::runtime::RuntimeKind;
     use crate::model::secret::{SecretRef, SecretValue};
     use crate::runtime::{HomePath, RuntimeAgentName};
     use crate::secrets::InMemory;
@@ -722,19 +847,7 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     // No runtime yet: nothing to look at.
     assert!(check_of(&engine.doctor(), &name).settings.is_empty());
 
-    engine
-        .write(
-            &alice(),
-            "test",
-            None,
-            |_| String::new(),
-            |lock| {
-                let mut record = engine.state.get(&name)?.unwrap();
-                record.runtime = Some(RuntimeKind::Hermes);
-                Ok(engine.state.put(lock, &record)?)
-            },
-        )
-        .unwrap();
+    on_hermes(&engine, &name);
     let secret: SecretRef = "home/openrouter".parse().unwrap();
     let value = SecretValue::new("sk-granted".into()).unwrap();
     done(

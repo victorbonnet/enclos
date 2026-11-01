@@ -824,7 +824,10 @@ mod tests {
         assert_eq!(settings[0]["variable"], "OPENROUTER_API_KEY", "{json}");
         assert_eq!(settings[1]["granted"], true, "{json}");
         assert_eq!(settings[2]["key"], "token", "{json}");
+        assert_eq!(settings[0]["line"], 3, "{json}");
+        assert_eq!(settings[2]["line"], 7, "{json}");
         assert_eq!(settings[3]["agent"], "my_bot", "{json}");
+        assert_eq!(settings[5]["line"], 9, "{json}");
         assert_eq!(settings[5]["kind"], "not_granted", "{json}");
         assert_eq!(settings[5]["agent"], "default", "{json}");
         assert_eq!(settings[6]["kind"], "not_set_up", "{json}");
