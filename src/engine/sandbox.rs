@@ -2,9 +2,9 @@
 //! (design §8, §10).
 
 use super::Engine;
+use super::markers::{Held, marked_in};
 use super::secrets::SecretLeft;
 use super::service::IfUnrecorded;
-use super::session::{Held, marked_in};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::members::{is_gone, members};

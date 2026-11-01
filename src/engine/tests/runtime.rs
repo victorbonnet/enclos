@@ -2000,7 +2000,7 @@ fn two_stops_keep_a_survivor_of_the_first_that_still_runs() {
         why,
     };
     let runs = |p: &crate::model::session::ProcessRef| Ok(p.pid == 1 || p.pid == 2);
-    let merged = |first, second| super::session::merged(first, second, runs).unwrap();
+    let merged = |first, second| super::markers::merged(first, second, runs).unwrap();
     // One still running that the second stop could not see is kept.
     let first = Stopped::Survivors(vec![survivor(1, Why::Survived), survivor(3, Why::Survived)]);
     let Stopped::Survivors(left) = merged(first, Stopped::Clean) else {
@@ -2066,17 +2066,17 @@ fn a_marker_holder_is_its_own_sessions_member_only() {
         command: "sleep".into(),
     };
     let (a, b) = (session(1, 10), session(2, 20));
-    let held = super::session::Held::from([(
+    let held = super::markers::Held::from([(
         name_of(&a.root),
         std::collections::BTreeSet::from([11, 12]),
     )]);
     let procs = [proc_(11), proc_(12), proc_(21)];
-    let of_a = super::session::marked_in(&a, &a.tracked, &procs, &held);
+    let of_a = super::markers::marked_in(&a, &a.tracked, &procs, &held);
     assert_eq!(of_a, [root(11), root(12)]);
-    assert!(super::session::marked_in(&b, &b.tracked, &procs, &held).is_empty());
+    assert!(super::markers::marked_in(&b, &b.tracked, &procs, &held).is_empty());
     // A holder no longer listed is not added.
     assert_eq!(
-        super::session::marked_in(&a, &a.tracked, &procs[..1], &held),
+        super::markers::marked_in(&a, &a.tracked, &procs[..1], &held),
         [root(11)]
     );
 }

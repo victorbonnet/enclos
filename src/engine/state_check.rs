@@ -10,8 +10,8 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use super::Engine;
+use super::markers::marked_in;
 use super::printable_line;
-use super::session::marked_in;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::lifecycle::marker::MarkerError;

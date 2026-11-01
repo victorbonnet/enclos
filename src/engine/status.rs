@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use super::Engine;
 use super::listener::{NoPort, outside_proxy_range, service_listener};
+use super::markers::marked_in;
 use super::sandbox::{compile_refused, needs_restart};
-use super::session::marked_in;
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
 use crate::lifecycle::members::{find, is_gone};
