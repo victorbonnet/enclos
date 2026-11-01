@@ -38,8 +38,8 @@ pub struct HostSystem {
     /// name when none is found.
     shells: &'static [&'static str],
     /// What makes the shell ready for a person. A login shell on macOS. Not
-    /// on Linux: `/etc/profile` sets `PATH` there on Debian and Ubuntu, which
-    /// would drop the sandbox's own `bin` folders.
+    /// on Linux: Debian's `/etc/profile` sets `PATH`, which would drop the
+    /// sandbox's own `bin` folders; Ubuntu's does not.
     shell_args: &'static [&'static str],
     /// Its folders of programs, in `PATH` order.
     folders: &'static [&'static str],
@@ -319,8 +319,9 @@ mod tests {
 
     /// The shell a session gets keeps the `PATH` it is given, so that a
     /// program in the home's `bin` folders is found: a login shell on Debian
-    /// or Ubuntu loses it to `/etc/profile`. It only prints it, in an empty
-    /// home.
+    /// loses it to `/etc/profile`. Ubuntu's sets no `PATH`, so there only
+    /// `a_session_with_no_command_runs_the_systems_shell` holds the arguments.
+    /// It only prints it, in an empty home.
     #[test]
     fn the_sessions_shell_keeps_the_sandboxs_path() {
         let home = tempfile::tempdir().unwrap();
