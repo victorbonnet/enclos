@@ -404,8 +404,8 @@ mod tests {
         assert!(!needs(OsStr::new(""), false, None));
     }
 
-    /// Debian's `ncurses-base` files the common terminals in `/lib/terminfo`,
-    /// and anything else in `/usr/share/terminfo`.
+    /// `ncurses-base` files the common terminals in `/lib/terminfo` or in
+    /// `/usr/share/terminfo`, depending on the release.
     #[test]
     fn each_system_names_where_its_ncurses_looks() {
         assert_eq!(MACOS.terminfo, ["/usr/share/terminfo"]);
@@ -431,14 +431,13 @@ mod tests {
     }
 
     /// On the host itself, where every system has the usual terminal.
-    #[cfg(target_os = "macos")]
     #[test]
     fn the_system_describes_xterm_256color() {
         assert!(!needs_fallback_term(
             OsStr::new("xterm-256color"),
             false,
             None,
-            MACOS.terminfo
+            HostSystem::current().terminfo
         ));
     }
 }
