@@ -55,7 +55,7 @@ This document describes what enclos is and how it works. Decisions that are hard
 | Session | A single use of a sandbox from start to end (an interactive `connect`, an `exec`, or a runtime service) with every process it starts. Each session records the policy snapshot it started under. | `enclos connect home -- main` |
 | Audit entry | One record per state-changing command: time, user, host, command, state before and after, result. Append-only, hash-chained. | `enclos policy allow home api.telegram.org` |
 
-Templates are reusable policies: `minimal`, `mcp-only`, `assistant`, `coding`.
+Templates are reusable policies: `minimal`, `assistant`, `coding`.
 
 **The sandbox is the permission boundary, the agent is not** ([ADR 0003](adr/0003-sandbox-is-the-permission-boundary.md)). Agents in one sandbox can read each other's files, because they share one policy. Agents that need different permissions go in different sandboxes.
 
@@ -198,9 +198,10 @@ env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 | Template | Writes | Programs | Network | Use for |
 | --- | --- | --- | --- | --- |
 | `minimal` | own home | the runtime only, once program rules come; for now any, since a policy with `[exec]` is refused until a backend enforces it | what is listed: from `runtime install` on, the runtime adapter's endpoints (for Hermes: its install sources, and `chatgpt.com` and `auth.openai.com` for a ChatGPT subscription), and what `policy allow` adds, such as another provider's hosts | a starting point |
-| `mcp-only` | own home | as `minimal`; the runtime's MCP servers too, once program rules come | for now the same as `minimal`: each remote MCP endpoint's host is added with `policy allow`, and the runtime is told of it with its own commands through `enclos connect`, until `runtime configure --mcp-add` does both | assistants working on outside data |
 | `assistant` | own home | any, including what the agent installs in its home | the public web (any public address on ports 80 and 443), plus the runtime's endpoints and listed APIs | personal agents such as Hermes |
 | `coding` | own home + the selected project folder, written in place | any | model provider, Git hosts, package registries | Claude Code, Codex, a dev agent |
+
+`mcp-only`, in 0.1.0, had the same rules as `minimal`, so it is gone: a sandbox for remote MCP servers starts from `minimal`, adds each endpoint's host with `policy allow`, and tells the runtime of it with its own commands through `enclos connect`, until `runtime configure --mcp-add` does both. A template for it can return when program rules make it differ.
 
 Every template reads the host broadly, minus the sensitive deny list (§5). Validation: no loopback or link-local entries; a wildcard may only cover the subdomains of a named domain (`*.example.com`), never everything (`*`) or a public suffix (`*.com`, `*.co.uk`); private addresses only through `private`, for hosts that are also on the allowlist; no filesystem grant may cover the protected paths. Each runtime adapter contributes the endpoints its runtime needs to work at all (for Hermes: the model provider, its login endpoints and its install sources, shown by the prototype for Hermes 0.22.2: the install needed `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, `releases.astral.sh`, `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `nodejs.org`, `cdn.playwright.dev`, `storage.googleapis.com` and `ffmpeg.martin-riedl.de`; the device-code login and token refreshes need `auth.openai.com`; model calls and the model list need `chatgpt.com`), so the runtime also works in `allowlist` mode. An adapter's layer may also set `listen`, and nothing else besides its endpoints (a `mode`, a `log`, a list it replaces or a filesystem rule is refused): Hermes's sets `listen = true`, for its gateway ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md)). A sandbox's `policy.toml` may set `listen` too: `true` lets a sandbox listen whatever its runtime, and `policy allow` lists it as a change to accept. `runtime install` shows it with the destinations, as what the runtime brings, not as a change to confirm, and a sandbox's `policy.toml` can set `listen = false`, which leaves that runtime's gateway unable to start, and `runtime install` then says so. No template or adapter contributes a weather service or any task-specific API: in `public` mode the agent reaches one on its own, through the logged proxy.
 
@@ -580,7 +581,7 @@ enclos runtime configure home/main --channel telegram --allow-user 123456789   #
 enclos sandbox create dev --backend seatbelt --template coding --workspace ~/dev/app
 enclos runtime install claude-code --sandbox dev
 
-enclos sandbox create community --backend seatbelt --template mcp-only
+enclos sandbox create community --backend seatbelt --template minimal
 enclos runtime install hermes --sandbox community
 enclos agent add community/support
 enclos policy allow community mcp.example.org              # the remote endpoint's host

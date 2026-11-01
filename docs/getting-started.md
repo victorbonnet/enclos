@@ -187,4 +187,6 @@ The [release notes](release-notes/0.1.0.md) list every known gap.
 
 ## If you used an earlier build
 
+A sandbox made from `mcp-only` under 0.1.0 keeps running, but `policy allow`, `runtime install` and `policy refresh` stop with `unknown template`: that template had the same rules as `minimal` and is gone. Run `enclos policy edit <sandbox>` and change `extends` to `minimal`.
+
 A build from before the runtime and agent names stored its state differently, and this one refuses it with a message saying so. Remove the old sandboxes with the old build first (`enclos sandbox stop <name>`, then `enclos sandbox rm <name>`), or move `~/.enclos` aside, then install this build and start again from `enclos init`.
