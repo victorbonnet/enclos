@@ -1,6 +1,6 @@
 # enclos — design
 
-*enclos* (French for an enclosure, said "ahn-KLOH") is an open-source CLI that creates sandboxes, installs agent runtimes in them (Hermes first, then Claude Code, Codex, OpenClaw) and runs agents there, and keeps a proper state and an audit log of every command. It manages only the sandboxes it creates.
+*enclos* (French for an enclosure, said "ahn-KLOH") is an open-source CLI that creates sandboxes, installs agent runtimes in them (Hermes first, then OpenClaw, Claude Code, Codex, DeepSeek Harness and more) and runs agents there, and keeps a proper state and an audit log of every command. It manages only the sandboxes it creates.
 
 Status: milestones 1 and 2 (§13) are done: their acceptance scenarios passed on 2026-10-22 and 2026-11-01, and 0.1.0 is the first release. Anything else described here comes later. Some sections also say where milestone 1 does less than the design. Target platforms: macOS on Apple Silicon first, then Linux (including Raspberry Pi). Windows through WSL2 later.
 
@@ -657,7 +657,7 @@ Each milestone holds only what its goal needs; everything else waits for a later
    Done when the acceptance scenarios of milestones 1 and 2 pass on Linux on x86_64 and on a Raspberry Pi, with systemd in place of launchd, libsecret or the `0600` file in place of the Keychain, and the same `policy.toml` as on the Mac; the steps about macOS alone (a code signature, the Seatbelt baseline) are left out.
 4. **Breadth**, in this order unless needs change:
    1. The host-service forward (one named host port to one sandbox).
-   2. Coding agents: Claude Code and Codex adapters (interactive), the `coding` template writing in place to the selected project folder.
+   2. Runtimes: an OpenClaw adapter, then the coding agents, Claude Code and Codex adapters (interactive) with the `coding` template writing in place to the selected project folder, then DeepSeek Harness.
    3. UI: `enclos ui` with sandboxes, policy editor, active and pending policy, live network log, denials, state and audit.
    4. More backends: OpenShell, then a microVM (libkrun first, macOS and Linux). Host-owned subscription refresh.
 
