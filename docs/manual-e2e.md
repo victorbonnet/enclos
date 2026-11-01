@@ -329,7 +329,7 @@ enclos doctor; echo "exit $?"
 ```
 
 - [ ] The first `doctor` reports nothing under `lab`'s settings: the bots' `${TELEGRAM_BOT_TOKEN}` and `${DEMO}` count as granted, each in its own agent's files.
-- [ ] The second names `~/.hermes/profiles/main/.env` and the line holding `E2E_API_KEY` in plain text, and `~/.hermes/config.yaml` and the line referring to `${MAIN_ONLY}`, each with what to do; `made-up` appears nowhere. It still exits 0.
+- [ ] The second names `~/.hermes/profiles/main/.env` and the line holding `E2E_API_KEY` in plain text, and `~/.hermes/config.yaml` and the line referring to `${MAIN_ONLY}`, each with what to do, naming agents `main` and `default`; `made-up` appears nowhere. It still exits 0.
 - [ ] The third reports nothing again.
 
 ## 10. Services

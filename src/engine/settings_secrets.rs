@@ -46,6 +46,10 @@ pub enum SettingsFinding {
         line: usize,
         variable: String,
     },
+    /// The active policy grants `agent` secrets of its own, and no settings
+    /// file of its names the file they are written to: it does not read
+    /// them until `runtime configure` points it there (ADR 0036).
+    NotSetUp { agent: RuntimeAgentName },
 }
 
 /// What a settings line sets.
@@ -58,14 +62,17 @@ pub enum Held {
     Key(String),
 }
 
-/// The last word of a name that says it holds a secret, words split at
-/// `_`, `-` and `.`, any case: `TELEGRAM_BOT_TOKEN`, `api_key`.
-const SECRET_WORDS: [&str; 6] = ["token", "key", "secret", "password", "passwd", "apikey"];
-
+/// Whether a name says it holds a secret, by its last word, words split at
+/// `_`, `-` and `.`, any case: `key` or `apikey`, or one ending in a token,
+/// a secret or a password: `TELEGRAM_BOT_TOKEN`, `api_key`, `botToken`.
 pub(super) fn names_a_secret(name: &str) -> bool {
-    name.rsplit(['_', '-', '.'])
-        .next()
-        .is_some_and(|last| SECRET_WORDS.contains(&last.to_ascii_lowercase().as_str()))
+    name.rsplit(['_', '-', '.']).next().is_some_and(|last| {
+        let last = last.to_ascii_lowercase();
+        matches!(last.as_str(), "key" | "apikey")
+            || ["token", "secret", "password", "passwd"]
+                .iter()
+                .any(|word| last.ends_with(word))
+    })
 }
 
 /// A `.env` line's variable and value, both trimmed: `NAME=value` or
@@ -86,6 +93,7 @@ fn yaml_line(line: &str) -> Option<(&str, &str)> {
     let line = line.trim_start();
     let line = line.strip_prefix("- ").unwrap_or(line).trim_start();
     let (key, value) = line.split_once(':')?;
+    let key = unquoted(key.trim_end());
     let plain_key = !key.is_empty()
         && key
             .bytes()
@@ -99,9 +107,12 @@ fn yaml_line(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     let value = value.trim();
-    let value = match value.starts_with(['"', '\'']) {
-        true => value,
-        false => value.split(" #").next().unwrap_or("").trim_end(),
+    let value = match value.chars().next() {
+        // Up to its closing quote, so a comment after it is left out.
+        Some(quote @ ('"' | '\'')) => value[1..]
+            .find(quote)
+            .map_or(value, |end| &value[..end + 2]),
+        _ => value.split(" #").next().unwrap_or("").trim_end(),
     };
     Some((key, value))
 }
@@ -116,32 +127,40 @@ fn unquoted(value: &str) -> &str {
     value
 }
 
-/// Whether `value` holds a value of its own: not empty, not YAML's null or
-/// a boolean, not a mapping, list, block or alias whose value is elsewhere,
-/// and not only a `${VAR}` reference.
-fn holds_a_value(value: &str) -> bool {
+/// Whether `value` holds a value of its own: not empty, not null or a
+/// boolean, not only a `${...}` reference, whatever its source, and in YAML
+/// not a mapping, list, block or alias whose value is elsewhere, nor a tag
+/// or an anchor alone.
+fn holds_a_value(value: &str, yaml: bool) -> bool {
     let inner = unquoted(value).trim();
     let reference = inner
         .strip_prefix("${")
         .and_then(|v| v.strip_suffix('}'))
-        .is_some_and(is_variable_name);
+        .is_some_and(|v| !v.contains('}'));
+    let elsewhere = yaml
+        && value == inner
+        && (inner.starts_with(['{', '[', '|', '>', '*'])
+            || (inner.starts_with(['&', '!']) && !inner.contains(' ')));
     !inner.is_empty()
         && !reference
+        && !elsewhere
         && !matches!(inner, "~" | "null" | "true" | "false")
-        && !(value == inner && inner.starts_with(['{', '[', '|', '>', '&', '*', '!']))
 }
 
-/// The variables `${NAME}` refers to on `line`, in order.
+/// The variables `${NAME}` or `${env:NAME}` refers to on `line`, in order:
+/// Hermes's two forms of a reference to a variable.
 fn references(line: &str) -> Vec<&str> {
     let mut found = Vec::new();
     let mut rest = line;
     while let Some(start) = rest.find("${") {
         rest = &rest[start + 2..];
-        if let Some(end) = rest.find('}')
-            && is_variable_name(&rest[..end])
-        {
-            found.push(&rest[..end]);
-            rest = &rest[end + 1..];
+        if let Some(end) = rest.find('}') {
+            let inner = rest[..end].trim();
+            let name = inner.strip_prefix("env:").unwrap_or(inner).trim();
+            if is_variable_name(name) {
+                found.push(name);
+                rest = &rest[end + 1..];
+            }
         }
     }
     found
@@ -156,15 +175,6 @@ fn is_dotenv(file: &HomePath) -> bool {
 /// lines is not looked at.
 fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
     let comment = |line: &str| line.trim_start().starts_with('#');
-    // A variable a `.env` sets is in the runtime's environment, whatever
-    // the policy grants.
-    let set: BTreeSet<&str> = files
-        .iter()
-        .filter(|file| is_dotenv(&file.path))
-        .flat_map(|file| file.text.lines().filter_map(dotenv_line))
-        .filter(|(_, value)| !unquoted(value).trim().is_empty())
-        .map(|(name, _)| name)
-        .collect();
     let mut found = Vec::new();
     for SettingsFile {
         agent,
@@ -173,6 +183,15 @@ fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
         granted,
     } in files
     {
+        // What its agent's `.env` sets the agent has, whatever the policy
+        // grants; Hermes keeps each profile's apart.
+        let set: BTreeSet<&str> = files
+            .iter()
+            .filter(|other| other.agent == *agent && is_dotenv(&other.path))
+            .flat_map(|other| other.text.lines().filter_map(dotenv_line))
+            .filter(|(_, value)| !unquoted(value).trim().is_empty())
+            .map(|(name, _)| name)
+            .collect();
         let mut referred: BTreeSet<&str> = BTreeSet::new();
         for (n, line) in text.lines().enumerate() {
             if comment(line) {
@@ -182,11 +201,11 @@ fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
             let held = match is_dotenv(file) {
                 true => dotenv_line(line).map(|(name, value)| {
                     let granted = granted.contains(name);
-                    let plain = holds_a_value(value) && (granted || names_a_secret(name));
+                    let plain = holds_a_value(value, false) && (granted || names_a_secret(name));
                     (plain, Held::Variable(name.to_owned()), granted)
                 }),
                 false => yaml_line(line).map(|(key, value)| {
-                    let plain = holds_a_value(value) && names_a_secret(key);
+                    let plain = holds_a_value(value, true) && names_a_secret(key);
                     (plain, Held::Key(key.to_owned()), false)
                 }),
             };
@@ -199,7 +218,11 @@ fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
                     granted,
                 });
             }
-            for variable in references(line) {
+            let referring = match is_dotenv(file) {
+                true => line,
+                false => yaml_line(line).map_or(line, |(_, value)| value),
+            };
+            for variable in references(referring) {
                 let given = granted.contains(variable)
                     || reserved_variable(variable)
                     || set.contains(variable);
@@ -247,13 +270,14 @@ impl Engine {
         let home = self.sandbox_home(name);
         let agents = runtime.agents_in(&home).unwrap_or_else(|e| {
             unreadable.push(format!(
-                "looked for secrets in the built-in agent's settings only: cannot list {}'s agents: {e}",
+                "did not look for secrets in the settings of {}'s other agents: cannot list them: {e}",
                 kind.display_name()
             ));
             Vec::new()
         });
         let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
         let mut files = Vec::new();
+        let mut not_set_up = Vec::new();
         for agent in builtin.into_iter().chain(agents) {
             let own = policy.agent_secrets.get(agent.as_str());
             let granted: BTreeSet<String> = policy
@@ -262,20 +286,36 @@ impl Engine {
                 .chain(own.into_iter().flat_map(|g| g.keys()))
                 .cloned()
                 .collect();
+            let secrets_file = self
+                .layout
+                .agent_secrets_file(name.as_str(), agent.as_str());
+            let secrets_file = secrets_file.to_string_lossy();
+            let (mut reads, mut whole) = (false, true);
             for path in runtime.agent_settings_files(&agent) {
                 match read_text(&home, &path, MAX_SETTINGS) {
-                    Ok(Some(text)) => files.push(SettingsFile {
-                        agent: agent.clone(),
-                        path,
-                        text,
-                        granted: granted.clone(),
-                    }),
+                    Ok(Some(text)) => {
+                        reads |= text.contains(&*secrets_file);
+                        files.push(SettingsFile {
+                            agent: agent.clone(),
+                            path,
+                            text,
+                            granted: granted.clone(),
+                        });
+                    }
                     Ok(None) => {}
-                    Err(e) => unreadable.push(format!("did not look for secrets in {path}: {e}")),
+                    Err(e) => {
+                        whole = false;
+                        unreadable.push(format!("did not look for secrets in {path}: {e}"));
+                    }
                 }
             }
+            if whole && !reads && own.is_some_and(|grants| !grants.is_empty()) {
+                not_set_up.push(SettingsFinding::NotSetUp { agent });
+            }
         }
-        findings(&files)
+        let mut found = findings(&files);
+        found.append(&mut not_set_up);
+        found
     }
 }
 
@@ -329,6 +369,8 @@ mod tests {
             "client-secret",
             "db.password",
             "APIKEY",
+            "x.botToken",
+            "x.apitoken",
         ] {
             assert!(names_a_secret(secret), "{secret}");
         }
@@ -348,7 +390,7 @@ mod tests {
     #[test]
     fn a_value_of_its_own_is_told_from_a_reference_and_from_nothing() {
         for value in ["abc", "\"abc\"", "'123:tok'", "x${Y}", "${Y}z", "1234"] {
-            assert!(holds_a_value(value), "{value:?}");
+            assert!(holds_a_value(value, true), "{value:?}");
         }
         for nothing in [
             "",
@@ -360,16 +402,20 @@ mod tests {
             "false",
             "${TOKEN}",
             "\"${TOKEN}\"",
-            "{}",
-            "[a]",
-            "|",
-            ">-",
-            "&anchor",
-            "*alias",
-            "!secret",
+            "${env:TOKEN}",
+            "${bitwarden:item}",
         ] {
-            assert!(!holds_a_value(nothing), "{nothing:?}");
+            assert!(!holds_a_value(nothing, true), "{nothing:?}");
+            assert!(!holds_a_value(nothing, false), "{nothing:?}");
         }
+        // What only YAML writes elsewhere: in a `.env` these are values.
+        for elsewhere in ["{}", "[a]", "|", ">-", "&anchor", "*alias", "!secret"] {
+            assert!(!holds_a_value(elsewhere, true), "{elsewhere:?}");
+            assert!(holds_a_value(elsewhere, false), "{elsewhere:?}");
+        }
+        // An anchor or a tag before a value does not hide it.
+        assert!(holds_a_value("&a abc", true));
+        assert!(holds_a_value("!!str abc", true));
     }
 
     #[test]
@@ -380,6 +426,9 @@ mod tests {
             Some(("api_key", "\"a #b\""))
         );
         assert_eq!(yaml_line("telegram:"), Some(("telegram", "")));
+        assert_eq!(yaml_line("token : abc"), Some(("token", "abc")));
+        assert_eq!(yaml_line("\"token\": abc"), Some(("token", "abc")));
+        assert_eq!(yaml_line("token: \"\" # mine"), Some(("token", "\"\"")));
         assert_eq!(yaml_line("url: http://x"), Some(("url", "http://x")));
         assert_eq!(yaml_line("http://x"), None);
         assert_eq!(yaml_line("a b: c"), None);
@@ -389,7 +438,11 @@ mod tests {
     #[test]
     fn references_are_found_in_order_and_only_to_variables() {
         assert_eq!(references("a ${A} b ${B_2}"), ["A", "B_2"]);
-        assert_eq!(references("${} ${1X} ${A-b} $C ${D"), Vec::<&str>::new());
+        assert_eq!(references("${env:A} ${ B }"), ["A", "B"]);
+        assert_eq!(
+            references("${} ${1X} ${A-b} ${vault:c} $C ${D"),
+            Vec::<&str>::new()
+        );
     }
 
     /// A secret written in plain text is found by the policy's grant or its
@@ -437,15 +490,15 @@ mod tests {
         let config = ".hermes/profiles/main/config.yaml";
         let files = vec![
             file(
-                "default",
-                ".hermes/.env",
+                "main",
+                ".hermes/profiles/main/.env",
                 "FROM_ENV=x\nALIAS=${FROM_ENV}\n",
                 &[],
             ),
             file(
                 "main",
                 config,
-                "# token: ${IN_A_COMMENT}\ntoken: ${MISSING}\nagain: ${MISSING}\nok: ${GRANTED}\nhome: ${HOME}/x\nenv: ${FROM_ENV} ${ALIAS}\nother: ${OTHER}\n",
+                "# token: ${IN_A_COMMENT}\ntoken: ${MISSING}\nagain: ${MISSING}\nok: ${GRANTED}\nhome: ${HOME}/x\nenv: ${FROM_ENV} ${ALIAS}\nother: ${OTHER}\nnoted: 1 # ${IN_A_NOTE}\n",
                 &["GRANTED"],
             ),
         ];
@@ -472,6 +525,36 @@ mod tests {
         assert_eq!(
             findings(&files),
             [not_granted("scout", scout, 1, "MAIN_BOT")]
+        );
+    }
+
+    /// Hermes keeps each profile's `.env` apart: what one agent's sets is
+    /// not set for another.
+    #[test]
+    fn a_dotenv_sets_a_variable_for_its_own_agent_alone() {
+        let scout = ".hermes/profiles/scout/config.yaml";
+        let files = vec![
+            file("main", ".hermes/profiles/main/.env", "FOO=x\n", &[]),
+            file(
+                "main",
+                ".hermes/profiles/main/config.yaml",
+                "a: ${FOO}\n",
+                &[],
+            ),
+            file("scout", scout, "a: ${FOO}\n", &[]),
+        ];
+        assert_eq!(findings(&files), [not_granted("scout", scout, 1, "FOO")]);
+    }
+
+    /// YAML's markers are values in a `.env`: a password that starts with
+    /// one is found.
+    #[test]
+    fn a_dotenv_value_that_looks_like_yaml_is_still_a_value() {
+        let env = ".hermes/.env";
+        let files = vec![file("default", env, "SMTP_PASSWORD=!hunter2\n", &[])];
+        assert_eq!(
+            findings(&files),
+            [plain(env, 1, Held::Variable("SMTP_PASSWORD".into()), false)]
         );
     }
 

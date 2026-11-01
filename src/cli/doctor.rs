@@ -163,6 +163,10 @@ fn json(doctor: &Doctor) -> serde_json::Value {
                     "line": line,
                     "variable": variable,
                 }),
+                SettingsFinding::NotSetUp { agent } => json!({
+                    "kind": "not_set_up",
+                    "agent": agent.as_str(),
+                }),
             })
             .collect();
         json!({
@@ -419,7 +423,7 @@ fn settings_line(name: &str, finding: &SettingsFinding) -> String {
             held: Held::Variable(variable),
             granted: false,
         } => format!(
-            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, then remove the line\n",
+            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, remove the line, then run `enclos runtime configure {name}/{agent}`\n",
             grant(agent)
         ),
         SettingsFinding::Plain {
@@ -429,7 +433,7 @@ fn settings_line(name: &str, finding: &SettingsFinding) -> String {
             held: Held::Key(key),
             ..
         } => format!(
-            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then set `{key}` to `${{VARIABLE}}` with `enclos runtime configure {name}/{agent} --set`\n",
+            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then give it with `enclos runtime configure {name}/{agent} --set '<its whole dotted key>=${{VARIABLE}}'`\n",
             grant(agent)
         ),
         SettingsFinding::NotGranted {
@@ -438,8 +442,11 @@ fn settings_line(name: &str, finding: &SettingsFinding) -> String {
             line,
             variable,
         } => format!(
-            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, then {} as {variable}\n",
+            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, {} as {variable}, then run `enclos runtime configure {name}/{agent}`\n",
             grant(agent)
+        ),
+        SettingsFinding::NotSetUp { agent } => format!(
+            "    agent {agent} does not read the secrets the policy grants it under [secrets.agents.{agent}]: run `enclos runtime configure {name}/{agent}`\n"
         ),
     }
 }
@@ -742,16 +749,21 @@ mod tests {
                     line: 9,
                     variable: "SLACK_BOT_TOKEN".into(),
                 },
+                SettingsFinding::NotSetUp {
+                    agent: RuntimeAgentName::new("main").unwrap(),
+                },
             ],
             ..compiles()
         });
         let shown = shown(&doctor);
         for expected in [
-            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it under [secrets.agents.default] with `enclos policy edit home` as OPENROUTER_API_KEY, then remove the line\n",
+            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it under [secrets.agents.default] with `enclos policy edit home` as OPENROUTER_API_KEY, remove the line, then run `enclos runtime configure home/default`\n",
             "    ~/.hermes/.env, line 4, holds TELEGRAM_BOT_TOKEN in plain text, which the policy already grants as a secret: remove the line\n",
             "    ~/.hermes/config.yaml, line 7, holds `token` in plain text",
-            "then set `token` to `${VARIABLE}` with `enclos runtime configure home/default --set`\n",
-            "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant",
+            "then give it with `enclos runtime configure home/default --set '<its whole dotted key>=${VARIABLE}'`\n",
+            "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant agent default",
+            "then run `enclos runtime configure home/default`\n",
+            "    agent main does not read the secrets the policy grants it under [secrets.agents.main]: run `enclos runtime configure home/main`\n",
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");
         }
@@ -765,6 +777,9 @@ mod tests {
         assert_eq!(settings[1]["granted"], true, "{json}");
         assert_eq!(settings[2]["key"], "token", "{json}");
         assert_eq!(settings[3]["kind"], "not_granted", "{json}");
+        assert_eq!(settings[3]["agent"], "default", "{json}");
+        assert_eq!(settings[4]["kind"], "not_set_up", "{json}");
+        assert_eq!(settings[4]["agent"], "main", "{json}");
         assert_eq!(json["problems"], false, "{json}");
     }
 

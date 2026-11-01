@@ -804,4 +804,29 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
         "{check:?}"
     );
     assert!(!format!("{doctor:?}").contains("sk-plain"));
+
+    // Granted secrets, and no setting that reads them: said once every file
+    // of the agent could be read, and no more once one names its secrets
+    // file.
+    let not_set_up = |engine: &crate::engine::Engine| {
+        check_of(&engine.doctor(), &name)
+            .settings
+            .iter()
+            .filter(|f| matches!(f, SettingsFinding::NotSetUp { .. }))
+            .count()
+    };
+    assert_eq!(not_set_up(&engine), 0, "a link hid one of its files");
+    std::fs::remove_file(main.join(".env")).unwrap();
+    assert_eq!(not_set_up(&engine), 1);
+    let file = engine.layout.agent_secrets_file("home", "main");
+    let config = std::fs::read_to_string(main.join("config.yaml")).unwrap();
+    std::fs::write(
+        main.join("config.yaml"),
+        format!(
+            "{config}secrets:\n  command:\n    command: cat '{}'\n",
+            file.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(not_set_up(&engine), 0);
 }
