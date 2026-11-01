@@ -81,7 +81,8 @@ def landlock_abi():
 
 def landlock_grants(rules, proc_truncate=False):
     """(path, rights) for each rule. `proc_truncate` adds TRUNCATE to the /proc
-    rule, for oom-check.sh to compare; the draft rules leave it out."""
+    rule, for oom-check.sh and test_oom.py to compare; the draft rules leave
+    it out, while TRUNCATE stays handled."""
     grants = []
     for path in rules["read"]:
         grants.append((path, READ))

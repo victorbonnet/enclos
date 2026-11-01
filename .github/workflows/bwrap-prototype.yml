@@ -34,6 +34,12 @@ jobs:
         run: python3 -I prototype/m3/test_relay.py
       - name: The workflow's text
         run: python3 -I prototype/m3/test_workflow.py
+      - name: The Landlock grants' tests (no host access)
+        run: python3 -I prototype/m3/test_oom.py GrantsTest
+      - name: Landlock proc O_TRUNC regression
+        env:
+          ENCLOS_PROTO_LANDLOCK: "1"
+        run: python3 -I prototype/m3/test_oom.py ProcTruncateTest
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
       - name: Files, programs and system calls
