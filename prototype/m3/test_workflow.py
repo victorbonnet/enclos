@@ -11,7 +11,9 @@ import re
 import unittest
 
 M3 = os.path.dirname(os.path.abspath(__file__))
-WORKFLOW = os.path.join(M3, "..", "..", ".github", "workflows", "bwrap-prototype.yml")
+WORKFLOWS = os.path.join(M3, "..", "..", ".github", "workflows")
+WORKFLOW = os.path.join(WORKFLOWS, "bwrap-prototype.yml")
+PROTOTYPE_WORKFLOWS = [WORKFLOW, os.path.join(WORKFLOWS, "namespaces-prototype.yml")]
 
 
 def read(path):
@@ -25,11 +27,13 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(matrix.split(", "), ["ubuntu-24.04", "ubuntu-26.04", "ubuntu-24.04-arm"])
 
     def test_nothing_names_a_runner_that_moves(self):
-        self.assertNotIn("ubuntu-latest", read(WORKFLOW))
+        for w in PROTOTYPE_WORKFLOWS:
+            if os.path.exists(w):
+                self.assertNotIn("ubuntu-latest", read(w))
         self.assertNotIn("ubuntu-latest", read(os.path.join(M3, "README.md")))
 
-    def test_every_python_test_runs_in_the_workflow(self):
-        text = read(WORKFLOW)
+    def test_every_python_test_runs_in_a_prototype_workflow(self):
+        text = "".join(read(w) for w in PROTOTYPE_WORKFLOWS if os.path.exists(w))
         for path in glob.glob(os.path.join(M3, "test_*.py")):
             self.assertIn(f"python3 -I prototype/m3/{os.path.basename(path)}", text)
 
