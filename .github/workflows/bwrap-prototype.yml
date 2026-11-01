@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -32,6 +32,8 @@ jobs:
         run: python3 -I prototype/m3/test_compile.py
       - name: The relay's tests (loopback sockets, no host access)
         run: python3 -I prototype/m3/test_relay.py
+      - name: The workflow's text
+        run: python3 -I prototype/m3/test_workflow.py
       - name: Set up the runner (packages, AppArmor setting for bubblewrap)
         run: bash prototype/m3/setup-runner.sh
       - name: Files, programs and system calls
