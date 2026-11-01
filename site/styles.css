@@ -71,7 +71,13 @@ h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.0
 .command::before { content: "$ "; color: var(--panel-muted); user-select: none; }
 .comment { font-style: italic; }
 
-/* The four wins */
+/* One policy, compiled */
+.policy { padding-block: 48px 64px; border-top: 1px solid var(--line); }
+.policy-intro p { color: var(--text-muted); max-width: 640px; margin-top: 16px; }
+.policy-compile { display: grid; gap: 8px; margin-top: 28px; }
+.compiles-to { justify-self: center; font-size: 22px; line-height: 1; color: var(--accent); transform: rotate(90deg); }
+
+/* The wins */
 .wins { display: grid; gap: 12px; }
 .win { padding: 24px; background: var(--surface); border: 1px solid var(--line); }
 .win > p:not(.today), .win-wide p { color: var(--text-muted); margin-top: 8px; }
@@ -83,7 +89,7 @@ h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.0
 
 /* Get started */
 .start { display: grid; gap: 28px; padding-block: 64px; }
-.start h2, .limits h2 { font-size: clamp(30px, 6vw, 40px); line-height: 1.12; letter-spacing: -0.04em; }
+.start h2, .limits h2, .policy h2 { font-size: clamp(30px, 6vw, 40px); line-height: 1.12; letter-spacing: -0.04em; }
 .start p { color: var(--text-muted); max-width: 400px; margin-block: 16px 8px; }
 
 /* Limits */
@@ -102,13 +108,16 @@ h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.0
   .wrap { width: min(1080px, 100% - 64px); }
   .terminal pre { padding: 20px; font-size: 13px; }
   .terminal figcaption { padding-inline: 20px; }
-  .wins { grid-template-columns: repeat(3, 1fr); }
+  .wins { grid-template-columns: repeat(2, 1fr); }
   .win-wide { grid-column: 1 / -1; grid-template-columns: 1fr 1.2fr; gap: 40px; }
 }
 
 @media (min-width: 960px) {
   .hero { grid-template-columns: 1fr 1fr; align-items: center; gap: 56px; padding-block: 64px 80px; }
   .start { grid-template-columns: 0.8fr 1.2fr; align-items: center; gap: 56px; padding-block: 88px; }
+  .policy { padding-block: 72px 88px; }
+  .policy-compile { grid-template-columns: minmax(0, 0.8fr) auto minmax(0, 1.2fr); align-items: center; gap: 16px; }
+  .compiles-to { transform: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
