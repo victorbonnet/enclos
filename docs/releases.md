@@ -9,9 +9,10 @@ A release is a GitHub Release with two assets, built for Apple silicon Macs runn
 
 ## Publishing one
 
-1. Set the version in `Cargo.toml` (and `Cargo.lock`, with `cargo check`), merge it, and wait for CI to pass on `main`.
+1. Set the version in `Cargo.toml` (and `Cargo.lock`, with `cargo check`), write its notes in `docs/release-notes/<version>.md`, merge them, and wait for CI to pass on `main`.
 2. Run the [manual end-to-end test](manual-e2e.md) with a build of that commit, on a Mac.
 3. Push a tag named `v` and that version, such as `v0.1.0` for `0.1.0`, on that commit.
+4. Once it is published, put its notes on the release: `gh release edit v0.1.0 --notes-file docs/release-notes/0.1.0.md`. The workflow only generates a list of changes.
 
 The tag runs [`release.yml`](../.github/workflows/release.yml) in two jobs. **build**, with read access only, so dependency build scripts never see a token that can publish:
 

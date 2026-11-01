@@ -1,6 +1,6 @@
 # Getting started on a Mac
 
-This guide runs Hermes agents in a sandbox on your Mac, with milestone 1 of enclos. It creates a sandbox called `lab` with two agents, `main` and `scout`. Pick any name you like for the sandbox; avoid `home`, which makes paths such as `sandboxes/home/home` hard to read.
+This guide runs Hermes agents in a sandbox on your Mac. It creates a sandbox called `lab` with two agents, `main` and `scout`. Pick any name you like for the sandbox; avoid `home`, which makes paths such as `sandboxes/home/home` hard to read.
 
 The words used here:
 
@@ -22,7 +22,7 @@ curl -fsSL https://enclos.dev/install.sh | bash
 
 The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
 
-**No release is published yet.** Until the first one, the installer says so and installs nothing. Build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
+To build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
 
 ```bash
 cargo install --locked --path .
@@ -181,6 +181,8 @@ enclos refuses a variable the policy does not grant the agent, and a value that 
 ## What does not work yet
 
 - **Browser tools:** Chromium does not start inside the sandbox yet, so Hermes's browser tools are unavailable.
+
+The [release notes](release-notes/0.1.0.md) list every known gap.
 
 ## If you used an earlier build
 
