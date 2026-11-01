@@ -65,7 +65,6 @@ mode = "allowlist"
 allow_add = ["api.example.com", "api.example.com:8443", "*.example.org", "printer.lan"]
 private_add = ["printer.lan"]
 log = "metadata"
-listen = false
 
 [resources]
 open_files = 1024
@@ -102,7 +101,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
 | `private_add` | a list of hosts | none | Adds to that list. |
 | `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
-| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. |
+| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: Hermes's chat reaches its gateway this way, and `false` here wins over the adapter. |
 
 **`[resources]`.** A limit is fixed when a process starts, so a change waits for sessions to restart. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
 

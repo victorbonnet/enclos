@@ -82,7 +82,6 @@ mode = "allowlist"
 allow_add = ["api.example.com", "*.example.org", "printer.lan"]
 private_add = ["printer.lan"]
 log = "metadata"
-listen = false
 
 [resources]
 open_files = 1024
@@ -124,7 +123,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
           <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
           <tr><td><code>private_add</code></td><td>hosts</td><td>Adds to that list.</td></tr>
           <tr><td><code>log</code></td><td><code>metadata</code></td><td>The only value: host, port, address, verdict, bytes and duration, never contents.</td></tr>
-          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default; Hermes turns it on.</td></tr>
+          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on: its chat reaches its gateway this way, so leave it unset.</td></tr>
         </tbody>
       </table></div>
 
