@@ -1,6 +1,6 @@
 # Architecture
 
-How enclos is put together in milestone 1, on a Mac with the Seatbelt backend. The [design](design.md) says what enclos is meant to be and why; the [ADRs](adr/) record each decision. Words such as sandbox, runtime, agent and policy are defined in the [glossary](../GLOSSARY.md).
+How enclos is put together, on a Mac with the Seatbelt backend. The [design](design.md) says what enclos is meant to be and why; the [ADRs](adr/) record each decision. Words such as sandbox, runtime, agent and policy are defined in the [glossary](../GLOSSARY.md).
 
 ## The big picture
 
