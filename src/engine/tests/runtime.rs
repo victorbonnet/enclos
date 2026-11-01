@@ -1,5 +1,5 @@
-//! A runtime in a sandbox: its install, its agents and its settings
-//! (design §9).
+//! A runtime in a sandbox: its install, agents, settings, channels and
+//! secrets, and its service's launch and stop (design §8, §9).
 
 use super::policy::with_sandbox_on;
 use super::*;

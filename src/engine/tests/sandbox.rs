@@ -1,4 +1,4 @@
-//! A sandbox's life: create, start, stop, show and remove (design §8).
+//! A sandbox's life: create, connect, stop, show and remove (design §8).
 
 use super::policy::with_sandbox_on;
 use super::*;

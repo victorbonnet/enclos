@@ -1,4 +1,4 @@
-//! `enclos status` and what it suggests (design §10).
+//! `enclos status` and what it suggests (design §9).
 
 use std::path::Path;
 
