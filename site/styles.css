@@ -125,6 +125,7 @@ th { color: var(--text); font-weight: 600; border-top: 0; }
 /* Wider screens */
 @media (min-width: 720px) {
   .wrap { width: min(1080px, 100% - 64px); }
+  h1 { font-size: 56px; }
   .terminal pre { padding: 20px; font-size: 13px; }
   .terminal figcaption { padding-inline: 20px; }
   .wins { grid-template-columns: repeat(2, 1fr); }
@@ -133,7 +134,8 @@ th { color: var(--text); font-weight: 600; border-top: 0; }
 
 @media (min-width: 960px) {
   .hero { grid-template-columns: 1fr 1fr; align-items: center; gap: 56px; padding-block: 64px 80px; }
-  h1 { font-size: 44px; }
+  /* Each line of the headline stays whole in its half of the page. */
+  h1 { font-size: min(3.85vw, 44px); white-space: nowrap; }
   .start { grid-template-columns: 0.8fr 1.2fr; align-items: center; gap: 56px; padding-block: 88px; }
   .policy { padding-block: 72px 88px; }
   .policy-compile { grid-template-columns: minmax(0, 0.8fr) auto minmax(0, 1.2fr); align-items: center; gap: 16px; }
