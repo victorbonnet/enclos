@@ -119,7 +119,7 @@ It resolves to `write = ["{home}"]`, the built-in read-deny list, `mode = "publi
 
 ## Stage 3: compiling
 
-`Engine::compile_policy(name, proxy_port)` in `src/engine/compile.rs` runs every time a program starts in the sandbox: `connect` and `exec` (`start_in_sandbox`), a runtime service (`enclos launch`), and `policy test` before its probes. `sandbox show` calls `compiled_file`, the same steps without writing, to tell which sessions run under an older compiled policy.
+`Engine::compile_policy(name, proxy_port)` in `src/engine/compile.rs` runs every time a program starts in the sandbox: `connect`, `exec`, the installers and agent commands, and a runtime service (`enclos launch`), all through `Engine::start_session`, and `policy test` before its probes. `sandbox show` calls `compiled_file`, the same steps without writing, to tell which sessions run under an older compiled policy.
 
 1. **Pick the backend.** The sandbox's recorded backend must be in this build and its probe must say it runs on this host; otherwise the command fails, with no override ([ADR 0009](adr/0009-refuse-what-cannot-be-enforced.md)).
 2. **Load the active snapshot as stored.** The policy is not resolved again: a newer template or enclos version changes no grant until a command stores a new snapshot (design §7, Updates).

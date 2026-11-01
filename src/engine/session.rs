@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,21 +14,18 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 
 use super::Engine;
 use super::listener::ConnectStep;
-use super::proxy::abandon;
 use super::service::STOP_GRACE;
-use crate::backend::Launch;
+use super::start::{CommandKind, Group, Started, Starting};
 use crate::error::{Error, Result};
-use crate::layout::LayoutError;
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
-    Signal, Signalled, group_of, processes, reference_of_child, signal_group, signal_process,
+    Signal, Signalled, group_of, processes, signal_group, signal_process,
 };
 use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
-use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxState};
-use crate::model::session::{Member, ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::model::session::{Member, ProcessRef, SessionId, SessionRecord};
 use crate::runtime::SandboxCommand;
 use crate::state::{StateError, StateLock};
 
@@ -129,7 +126,7 @@ impl Engine {
             name,
             SandboxCommand::new(command),
             "exec",
-            SessionKind::Exec,
+            CommandKind::Exec,
         )
         .map(Planned::Done)
     }
@@ -143,7 +140,7 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
-        self.run_in_sandbox_as(by, name, command, audit_name, SessionKind::Interactive)
+        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Interactive)
     }
 
     /// Runs `command` in the sandbox as a recorded session of `kind`, with
@@ -155,35 +152,27 @@ impl Engine {
         name: &SandboxName,
         command: SandboxCommand,
         audit_name: &str,
-        kind: SessionKind,
+        kind: CommandKind,
     ) -> Result<SessionEnd> {
         let command = command.into_words();
-        let summary = |(session, ..): &(SessionRecord, _, _, _)| format!("session {}", session.id);
-        // Which process group the program starts in (design §8). Without a
-        // terminal (a script, CI, a supervisor, whether or not this process
-        // leads its group), a group made for the program, to which this
-        // process passes every signal it catches. In a terminal, when this
-        // command leads its group, as a terminal's job does, that group: the
-        // program keeps the terminal, and this process, which leads the
-        // group, is not a member. Otherwise (a terminal, but not a job of
-        // its own, as in a shell's pipeline) the caller's group, which is
-        // not the session's: the session then has no group, only the
-        // processes the program starts. A terminal on any of the standard
-        // streams counts: with input piped in, the output still goes to the
-        // terminal, whose Ctrl-C must reach the program.
+        let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
         let in_terminal = std::io::stdin().is_terminal()
             || std::io::stdout().is_terminal()
             || std::io::stderr().is_terminal();
-        let own_group = !in_terminal;
+        let group = Group::of(in_terminal, leads_group);
         self.wait_service_proxy(name)?;
-        let (session, mut child, keep_waiting, unreachable) =
-            self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
-                let started =
-                    self.start_in_sandbox(lock, name, &command, own_group, leads_group, kind);
-                self.failed_on_error(lock, name, audit_name, started)
-            })?;
+        let Started {
+            session,
+            mut child,
+            unreachable,
+            prepared: keep_waiting,
+        } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
+            let starting = Starting::Command { kind, group };
+            let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
+            self.failed_on_error(lock, name, audit_name, started)
+        })?;
 
         // In a group of its own, the program hears of a signal only when
         // this process passes it on, to the group it leads. In a terminal,
@@ -192,10 +181,10 @@ impl Engine {
         let pgid = child.id();
         let mut pass_on = |notes: &mut Vec<String>| {
             for signal in keep_waiting.received() {
-                let sent = match (own_group, signal) {
-                    (true, _) => signal_group(&session.root, pgid, signal),
-                    (false, Signal::Term) => signal_process(&session.root, signal),
-                    (false, _) => continue,
+                let sent = match (group, signal) {
+                    (Group::Own, _) => signal_group(&session.root, pgid, signal),
+                    (_, Signal::Term) => signal_process(&session.root, signal),
+                    _ => continue,
                 };
                 let why = match sent {
                     Ok(Signalled::Sent | Signalled::Gone) => continue,
@@ -218,94 +207,6 @@ impl Engine {
         // which explains a runtime's own "connection failed".
         end.notes.extend(unreachable);
         Ok(end)
-    }
-
-    /// Starts `command` in the sandbox and records it as a session (design
-    /// §8 steps 2-4), under the state lock.
-    fn start_in_sandbox(
-        &self,
-        lock: &StateLock,
-        name: &SandboxName,
-        command: &[OsString],
-        own_group: bool,
-        leads_group: bool,
-        kind: SessionKind,
-    ) -> Result<(SessionRecord, Child, KeepWaiting, Option<String>)> {
-        let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
-            name: name.to_string(),
-        })?;
-        let compiled = self.compile_policy(name, record.proxy_port)?;
-        self.ensure_proxy(lock, &record)?;
-        let (version, snapshot) = self.active_policy(name)?;
-        let (program, args) = command.split_first().ok_or_else(|| Error::Session {
-            what: "no command to run".into(),
-        })?;
-        // The runtime's clients reach its service on the port it holds now
-        // (ADR 0028), or the session says why it cannot.
-        let (service_port, unreachable) = match self.service_port(&record) {
-            Ok(port) => (port, None),
-            Err(why) => (None, Some(why)),
-        };
-        let launch = Launch {
-            program: program.clone(),
-            args: args.to_vec(),
-            // Read on the host, now: the sandbox reaches no secret store.
-            env: self.secret_env(&snapshot.policy)?,
-            in_terminal: true,
-            service_port,
-            limits: self.launch_limits(&record, &snapshot.policy)?,
-        };
-        let ctx = self.sandbox_context(name, record.proxy_port);
-        // TMPDIR inside the sandbox (the policy denies /tmp).
-        let tmp = ctx.home.join("tmp");
-        std::fs::create_dir_all(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
-        let backend = self.backend_of(name)?;
-        let mut wrapped = backend.wrap(&compiled, &ctx, &launch);
-        if own_group {
-            wrapped.process_group(0);
-        }
-        let marker = self.new_marker(name)?;
-        let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
-            what: format!(
-                "could not start {} in {name}: {e}",
-                launch.program.to_string_lossy()
-            ),
-        })?;
-        let recorded = (|| -> Result<(SessionRecord, KeepWaiting)> {
-            // Before the session is recorded, so that a failure here leaves
-            // no session open for a program that is ended.
-            let keep_waiting = KeepWaiting::new()?;
-            let root = reference_of_child(&child)?;
-            self.name_marker(name, marked, &root)?;
-            let me = std::process::id();
-            let mut session = SessionRecord {
-                id: SessionId(0),
-                sandbox: name.clone(),
-                kind,
-                service: None,
-                version: version.version,
-                snapshot: snapshot.id,
-                compiled: Some(compiled.display().to_string()),
-                // Read even if the program already exited: it is still a
-                // session, with an exit status to report.
-                root,
-                pgid: match (own_group, leads_group) {
-                    (true, _) => Some(child.id()),
-                    (false, true) => Some(me),
-                    (false, false) => None,
-                },
-                tracked: Vec::new(),
-                started_at: now(),
-                ended_at: None,
-            };
-            record.state = SandboxState::Running;
-            session.id = self.state.start_session(lock, &session, &record)?;
-            Ok((session, keep_waiting))
-        })();
-        match recorded {
-            Ok((session, keep_waiting)) => Ok((session, child, keep_waiting, unreachable)),
-            Err(e) => Err(abandon(child, e, "the program")),
-        }
     }
 
     /// Saves `Failed { reason: "<what> failed: …" }` on the sandbox when

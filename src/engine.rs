@@ -27,6 +27,7 @@ mod service;
 mod session;
 mod settings_secrets;
 mod staging;
+mod start;
 mod state_check;
 mod status;
 #[cfg(test)]
