@@ -1,5 +1,5 @@
-//! What `enclos status` suggests: removing what nobody uses, and starting
-//! again what stopped (design §9).
+//! What `enclos status` suggests: fixed rules, each naming an existing
+//! command (design §9).
 
 use serde::{Serialize, Serializer};
 

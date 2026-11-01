@@ -1,5 +1,5 @@
-//! What a sandbox costs on disk: a walk of its home that never follows a
-//! link and counts within a budget (ADR 0023).
+//! What a sandbox costs on disk: a walk of the sandbox folder that never
+//! follows a link and counts within a budget (ADR 0023).
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};

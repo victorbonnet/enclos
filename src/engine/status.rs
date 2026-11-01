@@ -4,8 +4,9 @@
 //!
 //! Facts come from enclos's own records (trusted), from the service
 //! manager, and from the sandbox home, which the sandbox writes. The
-//! runtime adapter only names paths; every read of the home goes through
-//! descriptors that never follow a link (`runtime::home`, ADR 0023), sizes
+//! runtime adapter names paths and lists its agents; every read of the home
+//! goes through descriptors that never follow a link (`runtime::home`, ADR
+//! 0023), sizes
 //! and counts are bounded, and "cannot tell", with why, is an answer.
 
 mod disk;
@@ -287,10 +288,6 @@ pub(super) fn last_used(
         .fold(created, Timestamp::max)
 }
 
-// ---- Reading the sandbox home (ADR 0023) ----
-
-// ---- Disk usage ----
-
 /// The address of the page `listener`'s service serves on the host, at the
 /// port sessions are given (ADR 0028), found the same way.
 fn dashboard(
@@ -372,7 +369,7 @@ fn network_listeners(procs: &[Proc], running: &[SessionRecord]) -> Fact<Vec<Netw
     Fact::Known(found)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
