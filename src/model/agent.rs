@@ -7,13 +7,37 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 use super::Timestamp;
 use super::sandbox::is_short_name;
 
 /// An agent name: the sandbox naming rule (`is_short_name`), so it is safe
-/// in paths and commands.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// in paths and commands. Read from text only through that rule, a policy's
+/// `[secrets.agents.<agent>]` included.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct AgentName(String);
+
+impl TryFrom<String> for AgentName {
+    type Error = InvalidAgentName;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<AgentName> for String {
+    fn from(name: AgentName) -> String {
+        name.0
+    }
+}
+
+impl std::borrow::Borrow<str> for AgentName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(

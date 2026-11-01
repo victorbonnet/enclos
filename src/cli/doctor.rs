@@ -8,6 +8,7 @@ use enclos::engine::{
     MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
+use enclos::runtime::RuntimeAgentName;
 
 pub fn run(engine: &Engine) -> Result<u8> {
     use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
@@ -124,34 +125,40 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             .iter()
             .map(|f| match f {
                 SettingsFinding::Plain {
+                    agent,
                     file,
                     line,
                     held: Held::Variable(variable),
                     granted,
                 } => json!({
                     "kind": "plain",
+                    "agent": agent.as_str(),
                     "file": file.to_string(),
                     "line": line,
                     "variable": variable,
                     "granted": granted,
                 }),
                 SettingsFinding::Plain {
+                    agent,
                     file,
                     line,
                     held: Held::Key(key),
                     ..
                 } => json!({
                     "kind": "plain",
+                    "agent": agent.as_str(),
                     "file": file.to_string(),
                     "line": line,
                     "key": key,
                 }),
                 SettingsFinding::NotGranted {
+                    agent,
                     file,
                     line,
                     variable,
                 } => json!({
                     "kind": "not_granted",
+                    "agent": agent.as_str(),
                     "file": file.to_string(),
                     "line": line,
                     "variable": variable,
@@ -392,38 +399,47 @@ fn drift_lines(name: &str, drift: &Drift) -> String {
 /// names: doctor never prints a value.
 fn settings_line(name: &str, finding: &SettingsFinding) -> String {
     let store = format!("store it with `enclos secret set {name}/<secret>`");
-    let grant = format!("grant it with `enclos policy edit {name}`");
+    let grant = |agent: &RuntimeAgentName| {
+        format!("grant it under [secrets.agents.{agent}] with `enclos policy edit {name}`")
+    };
     match finding {
         SettingsFinding::Plain {
             file,
             line,
             held: Held::Variable(variable),
             granted: true,
+            ..
         } => format!(
             "    {file}, line {line}, holds {variable} in plain text, which the policy already grants as a secret: remove the line\n"
         ),
         SettingsFinding::Plain {
+            agent,
             file,
             line,
             held: Held::Variable(variable),
             granted: false,
         } => format!(
-            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {grant} as {variable}, then remove the line\n"
+            "    {file}, line {line}, holds {variable} in plain text, where any process of the sandbox reads it: {store}, {} as {variable}, then remove the line\n",
+            grant(agent)
         ),
         SettingsFinding::Plain {
+            agent,
             file,
             line,
             held: Held::Key(key),
             ..
         } => format!(
-            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {grant} as a variable, then set `{key}` to `${{VARIABLE}}` with the runtime's own command\n"
+            "    {file}, line {line}, holds `{key}` in plain text, where any process of the sandbox reads it: {store}, {} as a variable, then set `{key}` to `${{VARIABLE}}` with `enclos runtime configure {name}/{agent} --set`\n",
+            grant(agent)
         ),
         SettingsFinding::NotGranted {
+            agent,
             file,
             line,
             variable,
         } => format!(
-            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant, so nothing enclos gives the sandbox sets it: {store}, then {grant} as {variable}\n"
+            "    {file}, line {line}, refers to ${{{variable}}}, which the policy does not grant agent {agent}, so nothing enclos gives it sets it: {store}, then {} as {variable}\n",
+            grant(agent)
         ),
     }
 }
@@ -700,24 +716,28 @@ mod tests {
         let doctor = doctor(SandboxCheck {
             settings: vec![
                 SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
                     file: env.clone(),
                     line: 3,
                     held: Held::Variable("OPENROUTER_API_KEY".into()),
                     granted: false,
                 },
                 SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
                     file: env,
                     line: 4,
                     held: Held::Variable("TELEGRAM_BOT_TOKEN".into()),
                     granted: true,
                 },
                 SettingsFinding::Plain {
+                    agent: RuntimeAgentName::new("default").unwrap(),
                     file: config.clone(),
                     line: 7,
                     held: Held::Key("token".into()),
                     granted: false,
                 },
                 SettingsFinding::NotGranted {
+                    agent: RuntimeAgentName::new("default").unwrap(),
                     file: config,
                     line: 9,
                     variable: "SLACK_BOT_TOKEN".into(),
@@ -727,10 +747,10 @@ mod tests {
         });
         let shown = shown(&doctor);
         for expected in [
-            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it with `enclos policy edit home` as OPENROUTER_API_KEY, then remove the line\n",
+            "    ~/.hermes/.env, line 3, holds OPENROUTER_API_KEY in plain text, where any process of the sandbox reads it: store it with `enclos secret set home/<secret>`, grant it under [secrets.agents.default] with `enclos policy edit home` as OPENROUTER_API_KEY, then remove the line\n",
             "    ~/.hermes/.env, line 4, holds TELEGRAM_BOT_TOKEN in plain text, which the policy already grants as a secret: remove the line\n",
             "    ~/.hermes/config.yaml, line 7, holds `token` in plain text",
-            "then set `token` to `${VARIABLE}` with the runtime's own command\n",
+            "then set `token` to `${VARIABLE}` with `enclos runtime configure home/default --set`\n",
             "    ~/.hermes/config.yaml, line 9, refers to ${SLACK_BOT_TOKEN}, which the policy does not grant",
         ] {
             assert!(shown.contains(expected), "{expected}\n{shown}");

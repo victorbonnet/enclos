@@ -715,7 +715,7 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     use crate::engine::{Held, SettingsFinding};
     use crate::model::runtime::RuntimeKind;
     use crate::model::secret::{SecretRef, SecretValue};
-    use crate::runtime::HomePath;
+    use crate::runtime::{HomePath, RuntimeAgentName};
     use crate::secrets::InMemory;
     let (_dir, engine, name) = with_sandbox();
     let engine = engine.with_secrets(Box::new(InMemory::default()));
@@ -744,7 +744,7 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     );
     let before = engine.layout.read_policy("home").unwrap();
     let after = format!(
-        "{before}\n[secrets]\nenv = {{ OPENROUTER_API_KEY = \"secret:home/openrouter\" }}\n"
+        "{before}\n[secrets]\nenv = {{ OPENROUTER_API_KEY = \"secret:home/openrouter\" }}\n\n[secrets.agents.main]\nenv = {{ MAIN_BOT = \"secret:home/openrouter\" }}\n"
     );
     engine
         .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
@@ -760,12 +760,12 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     .unwrap();
     std::fs::write(
         home.join(".hermes/config.yaml"),
-        "model:\n  api_key: ${OPENROUTER_API_KEY}\n",
+        "model:\n  api_key: ${OPENROUTER_API_KEY}\nother: ${MAIN_BOT}\n",
     )
     .unwrap();
     std::fs::write(
         main.join("config.yaml"),
-        "platforms:\n  slack:\n    bot_token: ${SLACK_BOT_TOKEN}\n",
+        "platforms:\n  slack:\n    bot_token: ${SLACK_BOT_TOKEN}\n  telegram:\n    token: ${MAIN_BOT}\n",
     )
     .unwrap();
     std::os::unix::fs::symlink("/etc/hosts", main.join(".env")).unwrap();
@@ -776,13 +776,22 @@ fn secrets_in_the_runtimes_settings_are_found_without_their_values() {
     assert_eq!(
         check.settings,
         [
+            // Granted to agent main alone: in main's own file it is no finding.
+            SettingsFinding::NotGranted {
+                agent: RuntimeAgentName::new("default").unwrap(),
+                file: at(".hermes/config.yaml"),
+                line: 3,
+                variable: "MAIN_BOT".into(),
+            },
             SettingsFinding::Plain {
+                agent: RuntimeAgentName::new("default").unwrap(),
                 file: at(".hermes/.env"),
                 line: 1,
                 held: Held::Variable("OPENROUTER_API_KEY".into()),
                 granted: true,
             },
             SettingsFinding::NotGranted {
+                agent: RuntimeAgentName::new("main").unwrap(),
                 file: at(".hermes/profiles/main/config.yaml"),
                 line: 3,
                 variable: "SLACK_BOT_TOKEN".into(),

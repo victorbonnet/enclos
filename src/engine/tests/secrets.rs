@@ -31,6 +31,11 @@ fn with_store() -> (TempDir, Engine, Rc<InMemory>, SandboxName) {
     (dir, engine, store, name)
 }
 
+/// How grants read, `$VAR` or `$VAR for agent main`.
+fn shown(grants: &[crate::engine::Grant]) -> Vec<String> {
+    grants.iter().map(ToString::to_string).collect()
+}
+
 fn secret(text: &str) -> SecretRef {
     text.parse().unwrap()
 }
@@ -182,7 +187,7 @@ fn a_policy_grants_only_the_sandboxs_own_secrets_once_they_are_set() {
         "secret:home/telegram"
     );
     let listed = engine.secret_list(&name).unwrap();
-    assert_eq!(listed[0].granted_as, ["TOKEN"]);
+    assert_eq!(shown(&listed[0].granted_as), ["$TOKEN"]);
     // Resolved again, the grant is no change: it is stored as written.
     let refreshed = done(
         engine
@@ -196,6 +201,55 @@ fn a_policy_grants_only_the_sandboxs_own_secrets_once_they_are_set() {
         removed.also,
         ["stop giving it $TOKEN (sessions started from now on)"]
     );
+}
+
+/// `policy.toml` granting agent `agent` `grants`, as an edit (ADR 0036).
+fn grant_agent(
+    engine: &Engine,
+    name: &SandboxName,
+    agent: &str,
+    grants: &str,
+) -> Result<crate::engine::PolicyApplied> {
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = format!("{before}\n[secrets.agents.{agent}]\nenv = {{ {grants} }}\n");
+    engine
+        .policy_edit(&alice(), name, &before, &after, Confirm::Ask)
+        .map(done)
+}
+
+/// An agent is granted only a secret its sandbox has, as the sandbox is,
+/// and a rollback to a version granting it one since removed is refused.
+#[test]
+fn an_agent_is_granted_only_a_secret_its_sandbox_has() {
+    let (_dir, engine, _store, name) = with_store();
+    let err = grant_agent(&engine, &name, "main", "T = \"secret:home/telegram\"").unwrap_err();
+    assert!(matches!(err, Error::NoSuchSecret { .. }), "{err}");
+    assert!(
+        err.to_string().contains("enclos secret set home/telegram"),
+        "{err}"
+    );
+    let telegram = secret("home/telegram");
+    set(&engine, &telegram, VALUE);
+    let granted = grant_agent(&engine, &name, "main", "T = \"secret:home/telegram\"").unwrap();
+    let listed = engine.secret_list(&name).unwrap();
+    assert_eq!(shown(&listed[0].granted_as), ["$T for agent main"]);
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = before.split("\n[secrets").next().unwrap().to_owned();
+    done(
+        engine
+            .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+            .unwrap(),
+    );
+    done(engine.secret_rm(&alice(), &telegram, Confirm::Yes).unwrap());
+    let version = engine.policy(&name).unwrap().version.version;
+    let err = engine
+        .policy_rollback(&alice(), &name, granted.version.version, Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("enclos secret set home/telegram"),
+        "{err}"
+    );
+    assert_eq!(engine.policy(&name).unwrap().version.version, version);
 }
 
 #[test]
@@ -234,8 +288,8 @@ fn a_grant_while_a_session_runs_waits_for_the_restart() {
     let listed = engine.secret_list(&name).unwrap();
     assert!(listed[0].granted_as.is_empty());
     assert_eq!(
-        listed[0].pending_as.as_deref(),
-        Some(&["TOKEN".to_owned()][..])
+        listed[0].pending_as.as_deref().map(shown),
+        Some(vec!["$TOKEN".to_owned()])
     );
     // A new value says the pending policy gives it.
     let again = set(&engine, &telegram, "other");
@@ -243,7 +297,7 @@ fn a_grant_while_a_session_runs_waits_for_the_restart() {
         again.granted_as.is_empty() && again.running == 0,
         "{again:?}"
     );
-    assert_eq!(again.pending_as, ["TOKEN"]);
+    assert_eq!(shown(&again.pending_as), ["$TOKEN"]);
     // Granted by the pending policy: it cannot go, and discarding that
     // policy is one way out.
     let err = engine
@@ -269,7 +323,7 @@ fn a_new_value_counts_the_sessions_keeping_the_old_one() {
     put(&engine, &session);
     let again = set(&engine, &telegram, "other");
     assert!(!again.new, "{again:?}");
-    assert_eq!(again.granted_as, ["TOKEN"]);
+    assert_eq!(shown(&again.granted_as), ["$TOKEN"]);
     assert_eq!(again.running, 1);
     let err = engine
         .secret_rm(&alice(), &telegram, Confirm::Yes)

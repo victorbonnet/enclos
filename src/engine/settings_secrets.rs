@@ -1,10 +1,10 @@
 //! Secrets in a runtime's settings files in the sandbox home, which `enclos
-//! doctor` reports (design §10, ADR 0036, proposed): a value written there
-//! in plain text, which every agent of the sandbox and any backup of the
-//! home reads (ADR 0022), and a `${VAR}` reference to a variable the active
-//! policy does not grant. Whatever wrote them: the runtime's own setup, a
-//! person through `enclos connect`, or `runtime configure`. Only names and
-//! line numbers are kept, never a value.
+//! doctor` reports (design §10): a value written there in plain text, which
+//! every agent of the sandbox and any backup of the home reads (ADR 0022),
+//! and a `${VAR}` reference to a variable the active policy does not grant
+//! the agent the file belongs to (ADR 0036). Whatever wrote them: the
+//! runtime's own setup, a person through `enclos connect`, or `runtime
+//! configure`. Only names and line numbers are kept, never a value.
 
 use std::collections::BTreeSet;
 
@@ -13,23 +13,35 @@ use super::restart::MAX_SETTINGS;
 use crate::model::sandbox::SandboxRecord;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::runtime::home::read_text;
-use crate::runtime::{HomePath, adapter};
+use crate::runtime::{HomePath, RuntimeAgentName, adapter};
+
+/// A settings file read from the home, and what the active policy grants
+/// the agent it belongs to: the whole sandbox's secrets and the agent's own.
+struct SettingsFile {
+    agent: RuntimeAgentName,
+    path: HomePath,
+    text: String,
+    granted: BTreeSet<String>,
+}
 
 /// A secret found in a runtime's settings files. `line` counts from 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsFinding {
     /// The line sets `held` to a value in plain text: a variable the active
-    /// policy grants (`granted`), or a name that says it holds a secret.
+    /// policy grants `agent` (`granted`), or a name that says it holds a
+    /// secret.
     Plain {
+        agent: RuntimeAgentName,
         file: HomePath,
         line: usize,
         held: Held,
         granted: bool,
     },
     /// The line refers to `${variable}`, which the active policy does not
-    /// grant and no `.env` among the files sets: nothing enclos gives the
-    /// sandbox sets it.
+    /// grant `agent` and no `.env` among the files sets: nothing enclos
+    /// gives the agent sets it.
     NotGranted {
+        agent: RuntimeAgentName,
         file: HomePath,
         line: usize,
         variable: String,
@@ -50,7 +62,7 @@ pub enum Held {
 /// `_`, `-` and `.`, any case: `TELEGRAM_BOT_TOKEN`, `api_key`.
 const SECRET_WORDS: [&str; 6] = ["token", "key", "secret", "password", "passwd", "apikey"];
 
-fn names_a_secret(name: &str) -> bool {
+pub(super) fn names_a_secret(name: &str) -> bool {
     name.rsplit(['_', '-', '.'])
         .next()
         .is_some_and(|last| SECRET_WORDS.contains(&last.to_ascii_lowercase().as_str()))
@@ -139,23 +151,28 @@ fn is_dotenv(file: &HomePath) -> bool {
     file.as_path().file_name().is_some_and(|n| n == ".env")
 }
 
-/// The secrets found in `files`, each a settings file and its text, given
-/// the variables the active policy grants. A `.env` file is read as
-/// `NAME=value` lines, any other as YAML, line by line: a value spread over
-/// several lines is not looked at.
-pub fn findings(files: &[(HomePath, String)], granted: &BTreeSet<String>) -> Vec<SettingsFinding> {
+/// The secrets found in `files`. A `.env` file is read as `NAME=value`
+/// lines, any other as YAML, line by line: a value spread over several
+/// lines is not looked at.
+fn findings(files: &[SettingsFile]) -> Vec<SettingsFinding> {
     let comment = |line: &str| line.trim_start().starts_with('#');
     // A variable a `.env` sets is in the runtime's environment, whatever
     // the policy grants.
     let set: BTreeSet<&str> = files
         .iter()
-        .filter(|(file, _)| is_dotenv(file))
-        .flat_map(|(_, text)| text.lines().filter_map(dotenv_line))
+        .filter(|file| is_dotenv(&file.path))
+        .flat_map(|file| file.text.lines().filter_map(dotenv_line))
         .filter(|(_, value)| !unquoted(value).trim().is_empty())
         .map(|(name, _)| name)
         .collect();
     let mut found = Vec::new();
-    for (file, text) in files {
+    for SettingsFile {
+        agent,
+        path: file,
+        text,
+        granted,
+    } in files
+    {
         let mut referred: BTreeSet<&str> = BTreeSet::new();
         for (n, line) in text.lines().enumerate() {
             if comment(line) {
@@ -175,6 +192,7 @@ pub fn findings(files: &[(HomePath, String)], granted: &BTreeSet<String>) -> Vec
             };
             if let Some((true, held, granted)) = held {
                 found.push(SettingsFinding::Plain {
+                    agent: agent.clone(),
                     file: file.clone(),
                     line: line_no,
                     held,
@@ -188,6 +206,7 @@ pub fn findings(files: &[(HomePath, String)], granted: &BTreeSet<String>) -> Vec
                 // Each variable once per file, at its first line.
                 if !given && referred.insert(variable) {
                     found.push(SettingsFinding::NotGranted {
+                        agent: agent.clone(),
                         file: file.clone(),
                         line: line_no,
                         variable: variable.to_owned(),
@@ -215,8 +234,8 @@ impl Engine {
         };
         let runtime = adapter(kind);
         let name = &record.name;
-        let granted: BTreeSet<String> = match self.policy(name) {
-            Ok(view) => view.snapshot.policy.secrets.keys().cloned().collect(),
+        let policy = match self.policy(name) {
+            Ok(view) => view.snapshot.policy,
             Err(e) => {
                 unreadable.push(format!(
                     "did not look for secrets in {}'s settings: cannot read its active policy: {e}",
@@ -233,15 +252,30 @@ impl Engine {
             ));
             Vec::new()
         });
+        let builtin = runtime.builtin_agent().map(|b| b.runtime_name());
         let mut files = Vec::new();
-        for file in runtime.settings_files(&agents) {
-            match read_text(&home, &file, MAX_SETTINGS) {
-                Ok(Some(text)) => files.push((file, text)),
-                Ok(None) => {}
-                Err(e) => unreadable.push(format!("did not look for secrets in {file}: {e}")),
+        for agent in builtin.into_iter().chain(agents) {
+            let own = policy.agent_secrets.get(agent.as_str());
+            let granted: BTreeSet<String> = policy
+                .secrets
+                .keys()
+                .chain(own.into_iter().flat_map(|g| g.keys()))
+                .cloned()
+                .collect();
+            for path in runtime.agent_settings_files(&agent) {
+                match read_text(&home, &path, MAX_SETTINGS) {
+                    Ok(Some(text)) => files.push(SettingsFile {
+                        agent: agent.clone(),
+                        path,
+                        text,
+                        granted: granted.clone(),
+                    }),
+                    Ok(None) => {}
+                    Err(e) => unreadable.push(format!("did not look for secrets in {path}: {e}")),
+                }
             }
         }
-        findings(&files, &granted)
+        findings(&files)
     }
 }
 
@@ -253,12 +287,22 @@ mod tests {
         HomePath::new(path).unwrap()
     }
 
-    fn granted(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|n| (*n).to_owned()).collect()
+    fn agent(name: &str) -> RuntimeAgentName {
+        RuntimeAgentName::new(name).unwrap()
+    }
+
+    fn file(owner: &str, path: &str, text: &str, granted: &[&str]) -> SettingsFile {
+        SettingsFile {
+            agent: agent(owner),
+            path: at(path),
+            text: text.to_owned(),
+            granted: granted.iter().map(|n| (*n).to_owned()).collect(),
+        }
     }
 
     fn plain(file: &str, line: usize, held: Held, granted: bool) -> SettingsFinding {
         SettingsFinding::Plain {
+            agent: agent("default"),
             file: at(file),
             line,
             held,
@@ -266,8 +310,9 @@ mod tests {
         }
     }
 
-    fn not_granted(file: &str, line: usize, variable: &str) -> SettingsFinding {
+    fn not_granted(owner: &str, file: &str, line: usize, variable: &str) -> SettingsFinding {
         SettingsFinding::NotGranted {
+            agent: agent(owner),
             file: at(file),
             line,
             variable: variable.to_owned(),
@@ -353,17 +398,22 @@ mod tests {
     fn a_secret_in_plain_text_is_found_and_its_value_never_kept() {
         let env = ".hermes/.env";
         let config = ".hermes/config.yaml";
+        let grants = ["GRANTED", "MY_LOGIN"];
         let files = vec![
-            (
-                at(env),
-                "# TELEGRAM_BOT_TOKEN=commented\nTELEGRAM_ALLOWED_USERS=111\nexport TELEGRAM_BOT_TOKEN=\"999:plain\"\nOPENROUTER_API_KEY=sk-x\nMY_LOGIN=hunter2\nEMPTY_TOKEN=\nREF_TOKEN=${GRANTED}\n".to_owned(),
+            file(
+                "default",
+                env,
+                "# TELEGRAM_BOT_TOKEN=commented\nTELEGRAM_ALLOWED_USERS=111\nexport TELEGRAM_BOT_TOKEN=\"999:plain\"\nOPENROUTER_API_KEY=sk-x\nMY_LOGIN=hunter2\nEMPTY_TOKEN=\nREF_TOKEN=${GRANTED}\n",
+                &grants,
             ),
-            (
-                at(config),
-                "platforms:\n  telegram:\n    token: 999:plain\n    enabled: true\n  slack:\n    bot_token: ${GRANTED}\nmodel:\n  max_tokens: 4096\n".to_owned(),
+            file(
+                "default",
+                config,
+                "platforms:\n  telegram:\n    token: 999:plain\n    enabled: true\n  slack:\n    bot_token: ${GRANTED}\nmodel:\n  max_tokens: 4096\n",
+                &grants,
             ),
         ];
-        let found = findings(&files, &granted(&["GRANTED", "MY_LOGIN"]));
+        let found = findings(&files);
         assert_eq!(
             found,
             [
@@ -386,18 +436,42 @@ mod tests {
     fn a_reference_the_policy_does_not_grant_is_found_once_per_file() {
         let config = ".hermes/profiles/main/config.yaml";
         let files = vec![
-            (at(".hermes/.env"), "FROM_ENV=x\nALIAS=${FROM_ENV}\n".to_owned()),
-            (
-                at(config),
-                "# token: ${IN_A_COMMENT}\ntoken: ${MISSING}\nagain: ${MISSING}\nok: ${GRANTED}\nhome: ${HOME}/x\nenv: ${FROM_ENV} ${ALIAS}\nother: ${OTHER}\n".to_owned(),
+            file(
+                "default",
+                ".hermes/.env",
+                "FROM_ENV=x\nALIAS=${FROM_ENV}\n",
+                &[],
+            ),
+            file(
+                "main",
+                config,
+                "# token: ${IN_A_COMMENT}\ntoken: ${MISSING}\nagain: ${MISSING}\nok: ${GRANTED}\nhome: ${HOME}/x\nenv: ${FROM_ENV} ${ALIAS}\nother: ${OTHER}\n",
+                &["GRANTED"],
             ),
         ];
         assert_eq!(
-            findings(&files, &granted(&["GRANTED"])),
+            findings(&files),
             [
-                not_granted(config, 2, "MISSING"),
-                not_granted(config, 7, "OTHER")
+                not_granted("main", config, 2, "MISSING"),
+                not_granted("main", config, 7, "OTHER")
             ]
+        );
+    }
+
+    /// What the policy grants one agent is granted in that agent's files
+    /// alone: in another's it is not, and held there in plain text it counts
+    /// as a name, not as a grant.
+    #[test]
+    fn a_secret_granted_to_one_agent_is_granted_in_its_files_alone() {
+        let main = ".hermes/profiles/main/config.yaml";
+        let scout = ".hermes/profiles/scout/config.yaml";
+        let files = vec![
+            file("main", main, "token: ${MAIN_BOT}\n", &["MAIN_BOT"]),
+            file("scout", scout, "token: ${MAIN_BOT}\n", &[]),
+        ];
+        assert_eq!(
+            findings(&files),
+            [not_granted("scout", scout, 1, "MAIN_BOT")]
         );
     }
 

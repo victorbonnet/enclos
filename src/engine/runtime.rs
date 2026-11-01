@@ -649,14 +649,19 @@ impl Engine {
                 Adoption::Adopt => vec![format!(
                     "record agent {name}/{agent}, which {shown} already has in the sandbox"
                 )],
-                Adoption::Create(command) => vec![
-                    format!(
-                        "run `{}` in sandbox {name} under policy v{}",
-                        command.shown(),
-                        self.policy(name)?.version.version
-                    ),
-                    format!("record agent {name}/{agent}"),
-                ],
+                Adoption::Create(command) => {
+                    let version = self.policy(name)?.version.version;
+                    std::iter::once(command)
+                        .chain(&runtime.after_create_agent(&agent))
+                        .map(|c| {
+                            format!(
+                                "run `{}` in sandbox {name} under policy v{version}",
+                                c.shown()
+                            )
+                        })
+                        .chain([format!("record agent {name}/{agent}")])
+                        .collect()
+                }
             };
             return Ok(Planned::DryRun(Plan {
                 changes,
@@ -674,6 +679,21 @@ impl Engine {
                             created.exit
                         ),
                     });
+                }
+                for then in runtime.after_create_agent(&agent) {
+                    let shown_then = then.shown();
+                    let ended = self.run_in_sandbox(by, name, then, "agent create")?;
+                    if ended.exit != 0 {
+                        return Err(Error::FailedAfter {
+                            error: Box::new(Error::Session {
+                                what: format!(
+                                    "`{shown_then}` exited with {} in sandbox {name}: its output above says why. Run it with `enclos connect {name} -- {shown_then}`, then `enclos agent add {name}/{agent}`, which tracks the agent as it is",
+                                    ended.exit
+                                ),
+                            }),
+                            done: format!("creating agent {agent} in sandbox {name}"),
+                        });
+                    }
                 }
                 Added::Created(created)
             }

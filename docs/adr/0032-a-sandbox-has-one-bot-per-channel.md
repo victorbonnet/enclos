@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: superseded by 0036
 ---
 
 # A sandbox has one bot per channel, its built-in agent's

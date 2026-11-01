@@ -21,7 +21,7 @@ enclos protects against accidental damage by agents you mostly trust ([threat mo
 | --- | --- |
 | **Sandbox** | A named, isolated environment with its own home folder, policy and proxy. The permission boundary. |
 | **Runtime** | The software installed in a sandbox to run its agents, such as Hermes. One per sandbox. |
-| **Agent** | A named identity of the runtime, with its own configuration, memory, skills, sessions and channels. Agents in a sandbox share its runtime, policy, proxy and secrets. |
+| **Agent** | A named identity of the runtime, with its own configuration, memory, skills, sessions and channels. Agents in a sandbox share its runtime, policy, proxy and secrets; each may also be granted its own, such as its bot's token. |
 | **Policy** | What a sandbox may do with files, network and host services, stored as immutable snapshots. |
 
 More in the [glossary](GLOSSARY.md).
@@ -75,6 +75,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 - [Website](https://enclos.dev/): a visual introduction, everyday examples and common questions ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
+- [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
 - [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.

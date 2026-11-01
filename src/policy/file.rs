@@ -51,10 +51,20 @@ fn as_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::
 }
 
 /// The secrets a layer grants, by environment variable: `env` replaces what
-/// the layers below grant, and `env_add` adds to it.
+/// the layers below grant, and `env_add` adds to it; `agents` grants each
+/// agent named its own, the same way (ADR 0036).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SecretsLayer {
+    pub env: Option<std::collections::BTreeMap<String, SecretGrant>>,
+    pub env_add: std::collections::BTreeMap<String, SecretGrant>,
+    pub agents: std::collections::BTreeMap<crate::model::agent::AgentName, AgentSecretsLayer>,
+}
+
+/// The secrets a layer grants one agent: `[secrets.agents.<agent>]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AgentSecretsLayer {
     pub env: Option<std::collections::BTreeMap<String, SecretGrant>>,
     pub env_add: std::collections::BTreeMap<String, SecretGrant>,
 }
@@ -162,6 +172,18 @@ impl PolicyFile {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
+        for (agent, grants) in &self.secrets.agents {
+            let granted = policy.agent_secrets.entry(agent.clone()).or_default();
+            if let Some(env) = &grants.env {
+                granted.clone_from(env);
+            }
+            granted.extend(grants.env_add.iter().map(|(k, v)| (k.clone(), v.clone())));
+            // An agent granted nothing is not listed, so a snapshot holds
+            // no empty entry.
+            if granted.is_empty() {
+                policy.agent_secrets.remove(agent);
+            }
+        }
         // Every field named, so one added to the layer is not dropped here.
         let ResourcesLayer {
             open_files,
@@ -301,6 +323,40 @@ mod tests {
         // A grant that names no secret is refused as the file is read.
         let err = PolicyFile::parse("d", "[secrets]\nenv = { X = \"home/x\" }").unwrap_err();
         assert!(err.to_string().contains("secret:<sandbox>/<name>"), "{err}");
+    }
+
+    /// An agent's grants layer as the sandbox's do (ADR 0036), apart from
+    /// them, and an agent left with none is not listed.
+    #[test]
+    fn an_agent_is_granted_its_own_secrets_layer_by_layer() {
+        let mut policy = Policy::default();
+        PolicyFile::parse(
+            "a",
+            "[secrets]\nenv = { A = \"secret:home/aa\" }\n[secrets.agents.main]\nenv = { T = \"secret:home/main-bot\" }\n[secrets.agents.scout]\nenv = { T = \"secret:home/scout-bot\" }",
+        )
+        .unwrap()
+        .apply(&mut policy);
+        PolicyFile::parse(
+            "b",
+            "[secrets.agents.main]\nenv_add = { U = \"secret:home/uu\" }\n[secrets.agents.scout]\nenv = {}",
+        )
+        .unwrap()
+        .apply(&mut policy);
+        assert_eq!(policy.secrets.len(), 1);
+        let main = &policy.agent_secrets["main"];
+        assert_eq!(main["T"].to_string(), "secret:home/main-bot");
+        assert_eq!(main["U"].to_string(), "secret:home/uu");
+        assert!(!policy.agent_secrets.contains_key("scout"), "{policy:?}");
+        // An adapter or template grants an agent nothing either.
+        let layer = PolicyFile::parse(
+            "adapter",
+            "[secrets.agents.main]\nenv = { X = \"secret:home/xx\" }",
+        )
+        .unwrap();
+        assert_eq!(layer.beyond_destinations(), ["secrets"]);
+        // A misspelled field under an agent is refused as the file is read.
+        let err = PolicyFile::parse("c", "[secrets.agents.main]\nenvs = {}").unwrap_err();
+        assert!(err.to_string().contains("envs"), "{err}");
     }
 
     #[test]

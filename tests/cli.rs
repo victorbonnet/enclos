@@ -511,15 +511,17 @@ fn a_sandbox_is_created_only_with_its_template_named() {
     assert!(!home.root.join("sandboxes/home").exists());
 }
 
-/// `runtime configure` sets up the sandbox's bot, never an agent's own
-/// (ADR 0032): naming an agent is refused, and nothing is recorded.
+/// `runtime configure <sandbox>/<agent>` sets up that agent's own bot (ADR
+/// 0036), for an agent the sandbox has: another is refused, saying how to
+/// add it, and nothing is recorded.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_bot_of_an_agents_own_is_refused() {
+fn a_bot_is_set_up_only_for_an_agent_the_sandbox_has() {
     let home = Home::new();
     home.init(1);
     home.run(&["sandbox", "create", "home", "--template", "assistant"])
         .ok();
+    let _profile = record_hermes(&home, "home");
     let lines = home.audit_lines().len();
     let out = home.run(&[
         "runtime",
@@ -532,8 +534,9 @@ fn a_bot_of_an_agents_own_is_refused() {
     ]);
     assert_ne!(out.code(), 0, "{}", out.stdout());
     assert!(
-        out.stderr()
-            .contains("does not set up a bot of agent main's own"),
+        out.stderr().contains(
+            "has no agent main that enclos tracks: add it with `enclos agent add home/main` first"
+        ),
         "{}",
         out.stderr()
     );

@@ -6,7 +6,7 @@
 //! enclos adds when it compiles a policy writes a new file at the next
 //! session start, without asking (ADR 0018); this is where that change is
 //! shown. It also looks for secrets in the runtime's settings files in the
-//! sandbox home (ADR 0036, proposed).
+//! sandbox home.
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
