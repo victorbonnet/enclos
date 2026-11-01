@@ -94,8 +94,11 @@ fn on_host(path: &str) -> bool {
 
 /// The command a session runs when it is given none.
 pub fn shell_command() -> Vec<OsString> {
-    let system = HostSystem::current();
-    std::iter::once(system.shell(&on_host))
+    shell_command_on(HostSystem::current(), &on_host)
+}
+
+fn shell_command_on(system: &HostSystem, present: &dyn Fn(&str) -> bool) -> Vec<OsString> {
+    std::iter::once(system.shell(present))
         .chain(system.shell_args.iter().copied())
         .map(OsString::from)
         .collect()
@@ -301,6 +304,16 @@ mod tests {
         assert_eq!(
             env["PATH"],
             format!("{HOME}/.local/bin:{HOME}/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_command_runs_the_systems_shell() {
+        assert_eq!(shell_command_on(&MACOS, &all_present), ["/bin/zsh", "-l"]);
+        assert_eq!(shell_command_on(&LINUX, &all_present), ["/bin/bash"]);
+        assert_eq!(
+            shell_command_on(&LINUX, &|path| path != "/bin/bash"),
+            ["/bin/sh"]
         );
     }
 
