@@ -541,24 +541,32 @@ fn present(check: &HostCheck) -> std::result::Result<bool, String> {
             .try_exists()
             .map_err(|e| format!("cannot look for {}: {e}", path.display())),
         // Absent when the tool says so; any other failure cannot tell.
-        HostCheck::LaunchdJob(label) => {
-            listed("/bin/launchctl", &["list", label], "Could not find service")
-        }
-        HostCheck::PreferencesDomain(domain) => {
-            listed("/usr/bin/defaults", &["read", domain], "does not exist")
-        }
+        HostCheck::LaunchdJob(label) => listed(
+            "/bin/launchctl",
+            &["list", label],
+            &["Could not find service"],
+        ),
+        // `does not exist` to macOS 26, `not found` on macOS 27.
+        HostCheck::PreferencesDomain(domain) => listed(
+            "/usr/bin/defaults",
+            &["read", domain],
+            &["does not exist", "not found"],
+        ),
         HostCheck::Target => Ok(false),
     }
 }
 
-fn listed(program: &str, args: &[&str], absent: &str) -> std::result::Result<bool, String> {
+/// Whether `program` finds what `args` name, or, by one of the `absent`
+/// messages, says it is not there.
+fn listed(program: &str, args: &[&str], absent: &[&str]) -> std::result::Result<bool, String> {
     let out = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("cannot run {program}: {e}"))?;
     let text = output(&out);
-    match (out.status.success(), text.contains(absent)) {
+    let says_absent = absent.iter().any(|message| text.contains(message));
+    match (out.status.success(), says_absent) {
         (true, _) => Ok(true),
         (false, true) => Ok(false),
         (false, false) => Err(format!(
