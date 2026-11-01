@@ -3,18 +3,13 @@
 //! own command, through `enclos connect` (ADR 0024); importing an agent
 //! from the host is in `import.rs`.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 use super::Engine;
 use super::import::{Archive, LeftCopy};
 use super::policy::{adapter_layer, differences, listen_change};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
-use crate::layout::LayoutError;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -24,7 +19,7 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::policy::file::PolicyFile;
 use crate::runtime::{
-    BuiltinAgent, HomeFile, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter,
+    BuiltinAgent, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter,
 };
 
 /// How `runtime install` ended.
@@ -151,9 +146,6 @@ struct InstallPlan {
     also: Vec<String>,
     proxy_runs: bool,
 }
-
-/// An installer larger than this is not an install script: refused.
-const INSTALLER_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// The agents a runtime has in a sandbox, checked against the ones enclos
 /// tracks (ADR 0023).
@@ -506,104 +498,6 @@ impl Engine {
             },
         )?;
         Ok((version.version, recorded))
-    }
-
-    /// Stages what an install needs in the sandbox's `installers/` folder,
-    /// beside its home: the compiled policy denies the sandbox writes there
-    /// (Seatbelt tests), which is what keeps the host's plain writes from
-    /// following a link the sandbox planted. Returns the command that
-    /// installs: it copies the adapter's files into the home from inside the
-    /// sandbox, under its policy, then runs the installer, with the
-    /// installer's SHA-256.
-    fn stage_install(
-        &self,
-        name: &SandboxName,
-        runtime: &dyn RuntimeAdapter,
-    ) -> Result<(SandboxCommand, String)> {
-        let dir = self.layout.sandbox_dir(name.as_str()).join("installers");
-        let io = |path: &Path| {
-            let path = path.to_owned();
-            move |source| Error::Layout(LayoutError::Io { path, source })
-        };
-        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-        let files = runtime.home_files();
-        let mut staged = Vec::new();
-        for (i, file) in files.iter().enumerate() {
-            if !file.path_is_inside_home() {
-                return Err(Error::Session {
-                    what: format!(
-                        "the {} adapter names a file outside the sandbox home: {}",
-                        runtime.kind(),
-                        file.path
-                    ),
-                });
-            }
-            let path = dir.join(format!("home-{i}"));
-            std::fs::write(&path, file.contents).map_err(io(&path))?;
-            staged.push((path, file));
-        }
-        let (installer, sha256) = self.download_installer(&dir, runtime)?;
-        let mut script = home_files_script(&staged);
-        script.push_str("exec /bin/bash \"$0\" \"$@\"\n");
-        let mut words: Vec<OsString> = vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            script.into(),
-            installer.into_os_string(),
-        ];
-        words.extend(runtime.installer().args.iter().map(Into::into));
-        Ok((SandboxCommand::new(words), sha256))
-    }
-
-    /// Downloads the runtime's installer on the host into `dir`, outside the
-    /// sandbox home, with its SHA-256, which the audit entry names. Any
-    /// version is run (ADR 0029), so the file is named after its hash: an
-    /// install running at the same time that got another version moves its
-    /// own to another path, and the bytes this install runs are the ones its
-    /// entry names. It is downloaded under a name of its own and moved into
-    /// place once read.
-    fn download_installer(
-        &self,
-        dir: &Path,
-        runtime: &dyn RuntimeAdapter,
-    ) -> Result<(PathBuf, String)> {
-        let installer = runtime.installer();
-        let part = dir.join(format!(
-            "{}-install.{}.part",
-            runtime.kind(),
-            std::process::id()
-        ));
-        let failed = |what: String| Error::Session { what };
-        let status = Command::new("/usr/bin/curl")
-            .args(download_args(&installer.url, &part, cfg!(test)))
-            .stdin(Stdio::null())
-            .status()
-            .map_err(|e| failed(format!("cannot run curl: {e}")))?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&part);
-            // curl exits 1, unsupported protocol, when `--proto` or
-            // `--proto-redir` refuses the URL or a redirect.
-            return Err(failed(if status.code() == Some(1) {
-                format!(
-                    "could not download {}: it is not served over HTTPS, or redirects off HTTPS, and enclos downloads installers over HTTPS only. Update enclos, or report it if the {} installer moved",
-                    installer.url,
-                    runtime.kind()
-                )
-            } else {
-                format!("could not download {} ({status})", installer.url)
-            }));
-        }
-        let bytes = std::fs::read(&part)
-            .map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
-        let sha256 = hex(&Sha256::digest(&bytes));
-        let path = dir.join(format!("{}-install-{sha256}.sh", runtime.kind()));
-        std::fs::rename(&part, &path).map_err(|e| {
-            failed(format!(
-                "cannot move the installer into place at {}: {e}",
-                path.display()
-            ))
-        })?;
-        Ok((path, sha256))
     }
 
     /// Adds an agent: the runtime creates it inside the sandbox, and enclos
@@ -1030,142 +924,5 @@ fn needs_confirmation(kind: RuntimeKind, name: &SandboxName, also: &[String]) ->
             also.len(),
             also.join("; ")
         ),
-    }
-}
-
-/// `bytes` as lowercase hex: how enclos writes a SHA-256.
-pub(super) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The `sh` lines that copy staged files into the sandbox home. They run
-/// inside the sandbox, so a link the sandbox planted can only lead where
-/// the sandbox may write anyway. Whatever is at the target first goes
-/// (a link, a folder), and the copy must leave a plain file.
-pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
-    let mut script = String::from("set -e\n");
-    for (path, file) in staged {
-        let target = format!("\"$HOME\"/{}", sh_word(file.path));
-        let mode = if file.executable { "700" } else { "600" };
-        script.push_str(&format!(
-            "mkdir -p \"$(dirname {target})\"\n\
-             rm -rf -- {target}\n\
-             cp {} {target} && test -f {target} && ! test -L {target} || {{ echo {} >&2; exit 1; }}\n\
-             chmod {mode} {target}\n",
-            sh_word(&path.display().to_string()),
-            sh_word(&format!(
-                "enclos: cannot put {} in the sandbox home: something the sandbox may not replace is in the way",
-                file.path
-            )),
-        ));
-    }
-    script
-}
-
-/// The arguments of the curl that downloads an installer from `url` to
-/// `out`. `-q` comes first, the only place curl reads it, so no `.curlrc`
-/// adds options; curl's environment variables, such as `https_proxy`, still
-/// apply. The download and every redirect must stay on HTTPS, so curl
-/// refuses any other URL, except a `file://` one when `allow_file` is set:
-/// only this crate's tests set it, to install from a file. The SHA-256 check
-/// after it is what decides whether the file is run.
-fn download_args(url: &str, out: &Path, allow_file: bool) -> Vec<OsString> {
-    let proto = if allow_file && url.starts_with("file://") {
-        "=file"
-    } else {
-        "=https"
-    };
-    vec![
-        "-q".into(),
-        "--proto".into(),
-        proto.into(),
-        "--proto-redir".into(),
-        "=https".into(),
-        "-fsSL".into(),
-        "--max-time".into(),
-        "120".into(),
-        "--max-filesize".into(),
-        INSTALLER_MAX_BYTES.to_string().into(),
-        "-o".into(),
-        out.into(),
-        url.into(),
-    ]
-}
-
-/// `s` as one `sh` word.
-fn sh_word(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_installer_download_reads_no_curlrc_and_stays_on_https() {
-        for url in [
-            "https://example.com/install.sh",
-            "http://example.com/install.sh",
-        ] {
-            let args = download_args(url, Path::new("/tmp/x.part"), false);
-            let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
-            // curl reads `-q` only as its first argument.
-            assert_eq!(args[0], "-q", "{args:?}");
-            let pair = |flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
-            assert!(pair("--proto", "=https"), "{args:?}");
-            assert!(pair("--proto-redir", "=https"), "{args:?}");
-            assert!(args.contains(&"-fsSL"), "{args:?}");
-            assert!(
-                pair("--max-filesize", &INSTALLER_MAX_BYTES.to_string()),
-                "{args:?}"
-            );
-            assert!(pair("-o", "/tmp/x.part"), "{args:?}");
-            assert_eq!(args.last(), Some(&url));
-        }
-    }
-
-    #[test]
-    fn a_release_build_refuses_an_installer_url_to_a_file() {
-        let args = download_args("file:///etc/hosts", Path::new("/tmp/x.part"), false);
-        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
-        assert!(
-            args.windows(2).any(|w| w == ["--proto", "=https"]),
-            "{args:?}"
-        );
-        assert!(!args.contains(&"=file"), "{args:?}");
-        // Only a `file://` URL gets the tests' exception.
-        let args = download_args("http://example.com/x", Path::new("/tmp/x.part"), true);
-        assert!(!args.contains(&OsString::from("=file")), "{args:?}");
-    }
-
-    #[test]
-    fn the_host_curl_reads_no_curlrc_for_an_installer_download() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".curlrc"),
-            "write-out = \"CURLRC-READ\\n\"\n",
-        )
-        .unwrap();
-        let src = dir.path().join("install.sh");
-        std::fs::write(&src, "echo hi\n").unwrap();
-        let out = dir.path().join("install.part");
-        let url = format!("file://{}", src.display());
-        let curl = |args: &[OsString]| {
-            let output = Command::new("/usr/bin/curl")
-                .args(args)
-                .env("CURL_HOME", dir.path())
-                .env("HOME", dir.path())
-                .env_remove("XDG_CONFIG_HOME")
-                .stdin(Stdio::null())
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        };
-        let args = download_args(&url, &out, true);
-        assert!(!curl(&args).contains("CURLRC-READ"));
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), "echo hi\n");
-        // Without `-q` the same curl reads it, so the check above can fail.
-        assert!(curl(&args[1..]).contains("CURLRC-READ"));
     }
 }

@@ -22,6 +22,7 @@ mod secrets;
 mod service;
 mod session;
 mod settings_secrets;
+mod staging;
 mod state_check;
 mod status;
 #[cfg(test)]
@@ -38,14 +39,15 @@ pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use probe::TestReport;
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) use runtime::home_files_script;
 pub use runtime::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept, InstallEnd};
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, Unit};
 pub use session::{Left, SessionEnd};
 pub use settings_secrets::{Held, SettingsFinding};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use staging::home_files_script;
+use staging::{Curl, Downloader};
 pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
@@ -83,6 +85,8 @@ pub struct Engine {
     services: Box<dyn crate::service::ServiceManager>,
     /// Where secrets' values are kept (ADR 0022).
     secrets: Box<dyn crate::secrets::SecretStore>,
+    /// How an installer reaches the host.
+    downloader: Box<dyn Downloader>,
     /// How a session's members are stopped when `enclos launch` is told to
     /// end, and when it or `sandbox start` stops the sessions a new one
     /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
@@ -192,6 +196,7 @@ impl Engine {
                 why: "this engine has no service manager",
             }),
             stop_members: crate::lifecycle::stop::stop,
+            downloader: Box::new(Curl),
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),
@@ -201,6 +206,13 @@ impl Engine {
     /// The same engine with another secret store.
     pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::SecretStore>) -> Engine {
         self.secrets = secrets;
+        self
+    }
+
+    /// The same engine with another way to download an installer.
+    #[cfg(test)]
+    pub(crate) fn with_downloader(mut self, downloader: Box<dyn Downloader>) -> Engine {
+        self.downloader = downloader;
         self
     }
 
