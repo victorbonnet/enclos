@@ -62,6 +62,10 @@ struct World {
 
 static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
 
+/// Where the next world looks for its proxy port.
+static NEXT_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(crate::model::sandbox::PORT_FIRST);
+
 fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
@@ -92,8 +96,10 @@ fn world() -> World {
     // A workspace the user reaches through a link of their own.
     std::os::unix::fs::symlink(user.join("projects"), user.join("linked")).unwrap();
     // The proxy's port: one of enclos's proxy range, which the compiler
-    // requires (ADR 0028).
-    let allowed = (crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST)
+    // requires (ADR 0028). Each world starts past the last, so one a test
+    // frees is not taken by the next world while it binds that port again.
+    let first = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let allowed = (first..=crate::model::sandbox::PORT_LAST)
         .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
         .unwrap();
     let other = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -308,7 +314,7 @@ fn the_network_reaches_only_the_proxy_port() {
 /// as `policy test` judges them, and open without the deny rules.
 #[test]
 fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
-    // It frees and binds ports of the proxy range, which a test starting a
+    // It frees and binds a port of the proxy range, which a test starting a
     // proxy may take meanwhile: `Address already in use` proves nothing.
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut w = world();
