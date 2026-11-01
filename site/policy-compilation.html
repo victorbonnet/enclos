@@ -61,13 +61,97 @@
         <thead><tr><th>You change</th><th>New sessions</th><th>Running sessions</th></tr></thead>
         <tbody>
           <tr><td>Network hosts or mode</td><td>Use it</td><td>Use it at once</td></tr>
-          <tr><td>Files or listening</td><td>Use it, once it is active</td><td>Wait for <code>enclos policy apply</code></td></tr>
+          <tr><td>Files, listening, secrets or limits</td><td>Use it, once it is active</td><td>Wait for <code>enclos policy apply</code></td></tr>
         </tbody>
       </table></div>
 
       <h2>What a backend cannot enforce is refused</h2>
       <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. On Seatbelt today, an <code>[exec]</code> section is refused, and so are limits on CPU time, memory, file size and CPU share.</p>
       <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
+
+      <h2 id="settings">Every setting</h2>
+      <p>A <code>policy.toml</code> holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox’s file with <code>enclos policy edit lab</code>.</p>
+      <div class="terminal"><pre><code>extends = "assistant"
+
+[filesystem]
+write_add = ["~/Documents/notes"]
+read_deny_add = ["~/work"]
+
+[network]
+mode = "allowlist"
+allow_add = ["api.example.com", "*.example.org", "printer.lan"]
+private_add = ["printer.lan"]
+log = "metadata"
+listen = false
+
+[resources]
+open_files = 1024
+
+[secrets]
+env_add = { API_TOKEN = "secret:lab/api" }
+
+[secrets.agents.main]
+env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
+
+      <h3>Top level</h3>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>extends</code></td><td><code>minimal</code>, <code>mcp-only</code>, <code>assistant</code></td><td>Required. The template this policy builds on.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>[filesystem]</h3>
+      <p>A path starts with <code>/</code>, <code>~</code>, <code>{home}</code> or <code>{tmp}</code>. A change waits for sessions to restart.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>write</code></td><td>paths</td><td>Replaces the folders the sandbox may write. Its home stays writable either way.</td></tr>
+          <tr><td><code>write_add</code></td><td>paths</td><td>Adds folders. Each must exist before the sandbox uses it. enclos’s own folders are refused.</td></tr>
+          <tr><td><code>read_deny</code></td><td>paths</td><td>Replaces the sensitive list, and must keep every built-in entry, so use <code>read_deny_add</code>.</td></tr>
+          <tr><td><code>read_deny_add</code></td><td>paths</td><td>Adds paths the sandbox may neither read nor write.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>[network]</h3>
+      <p>A destination is <code>host</code>, <code>host:port</code> or <code>*.domain</code>, for its subdomains; the port is 443 unless written. <code>*</code>, <code>*.com</code>, <code>localhost</code> and loopback addresses are refused. A change applies at once, except <code>listen</code>, which waits for sessions to restart.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>mode</code></td><td><code>public</code>, <code>allowlist</code></td><td><code>public</code> reaches any public address on ports 80 and 443, as well as what is listed. <code>allowlist</code> reaches only what is listed. <code>assistant</code> starts <code>public</code>, the other templates <code>allowlist</code>.</td></tr>
+          <tr><td><code>allow</code></td><td>destinations</td><td>Replaces the list, the runtime’s own hosts too, so its login and model calls may stop working. Prefer <code>allow_add</code>.</td></tr>
+          <tr><td><code>allow_add</code></td><td>destinations</td><td>Adds destinations, as <code>enclos policy allow</code> does.</td></tr>
+          <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
+          <tr><td><code>private_add</code></td><td>hosts</td><td>Adds to that list.</td></tr>
+          <tr><td><code>log</code></td><td><code>metadata</code></td><td>The only value: host, port, address, verdict, bytes and duration, never contents.</td></tr>
+          <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default; Hermes turns it on.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>[resources]</h3>
+      <p>A limit is fixed when a process starts, so a change waits for sessions to restart.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>On Seatbelt</th></tr></thead>
+        <tbody>
+          <tr><td><code>open_files</code></td><td>16 to 1048576</td><td>Enforced, up to macOS’s own ceiling.</td></tr>
+          <tr><td><code>file_size</code></td><td>bytes, or <code>512K</code>, <code>100M</code>, <code>1G</code></td><td>Refused.</td></tr>
+          <tr><td><code>cpu_seconds</code></td><td>seconds</td><td>Refused.</td></tr>
+          <tr><td><code>memory</code></td><td>any value</td><td>Refused.</td></tr>
+          <tr><td><code>cpu</code></td><td>any value</td><td>Refused.</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>[secrets] and [secrets.agents.&lt;agent&gt;]</h3>
+      <p>A grant maps a variable to <code>secret:&lt;sandbox&gt;/&lt;name&gt;</code>, a secret of this sandbox stored first with <code>enclos secret set</code>. Variables enclos sets itself, such as <code>PATH</code>, are refused. A change waits for sessions to restart.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>env</code></td><td>grants</td><td>Replaces what every session and service of the sandbox is granted.</td></tr>
+          <tr><td><code>env_add</code></td><td>grants</td><td>Adds to them.</td></tr>
+          <tr><td><code>agents.<wbr>&lt;agent&gt;.<wbr>env</code></td><td>grants</td><td>Replaces what one agent is granted. A bot’s token goes here, never to the whole sandbox.</td></tr>
+          <tr><td><code>agents.<wbr>&lt;agent&gt;.<wbr>env_add</code></td><td>grants</td><td>Adds to them.</td></tr>
+        </tbody>
+      </table></div>
 
       <h2>See it for yourself</h2>
       <div class="terminal"><pre><code><span class="comment"># the active policy: version, writes, deny list, network</span>

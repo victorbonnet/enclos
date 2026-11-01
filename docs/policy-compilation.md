@@ -49,6 +49,82 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | Compile | `connect` and `exec`, `enclos launch` for a service, `policy test`; `sandbox show` in memory only | `src/engine/compile.rs`, `src/backend/seatbelt/compile.rs` | `compiled/<hash>.sb` |
 | Apply | the same, right after compiling | `src/backend/seatbelt/wrap.rs` | `sandbox-exec` running the program |
 
+## Every setting
+
+A `policy.toml` holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox's file with `enclos policy edit <sandbox>`; `enclos policy show <sandbox>` prints what it resolves to.
+
+```toml
+extends = "assistant"
+
+[filesystem]
+write_add = ["~/Documents/notes"]
+read_deny_add = ["~/work"]
+
+[network]
+mode = "allowlist"
+allow_add = ["api.example.com", "api.example.com:8443", "*.example.org", "printer.lan"]
+private_add = ["printer.lan"]
+log = "metadata"
+listen = false
+
+[resources]
+open_files = 1024
+
+[secrets]
+env_add = { API_TOKEN = "secret:lab/api" }
+
+[secrets.agents.main]
+env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
+```
+
+**At the top level:**
+
+| Setting | Accepts | Notes |
+| --- | --- | --- |
+| `extends` | `minimal`, `mcp-only`, `assistant` | Required. The template this policy builds on. |
+
+**`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. A change waits for sessions to restart.
+
+| Setting | Accepts | Default | Notes |
+| --- | --- | --- | --- |
+| `write` | a list of paths | `["{home}"]` | Replaces the folders the sandbox may write. The home stays writable either way. |
+| `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders. Malformed: a folder inside the home, already writable. |
+| `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
+| `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
+
+**`[network]`.** A change to `mode`, the lists or `log` applies at once; a change to `listen` waits for sessions to restart. A destination is `host`, `host:port` or `*.domain`, for its subdomains; the port is 443 unless written. A wildcard over everything (`*`) or a public suffix (`*.com`), and `localhost`, loopback or link-local addresses, are refused.
+
+| Setting | Accepts | Default | Notes |
+| --- | --- | --- | --- |
+| `mode` | `public`, `allowlist` | from the template: `assistant` is `public`, the others `allowlist` | `public` reaches any public address on ports 80 and 443, as well as what is listed. `allowlist` reaches only what is listed. |
+| `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
+| `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
+| `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
+| `private_add` | a list of hosts | none | Adds to that list. |
+| `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
+| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. |
+
+**`[resources]`.** A limit is fixed when a process starts, so a change waits for sessions to restart. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
+
+| Setting | Accepts | On Seatbelt |
+| --- | --- | --- |
+| `open_files` | 16 to 1048576 | Enforced, up to macOS's own ceiling for a process. |
+| `file_size` | bytes, or `512K`, `100M`, `1G` | Refused. |
+| `cpu_seconds` | a number of seconds | Refused. |
+| `memory` | any value | Refused. |
+| `cpu` | any value | Refused. |
+
+**`[secrets]` and `[secrets.agents.<agent>]`.** Each grant maps a variable to `secret:<sandbox>/<name>`, a secret of this sandbox already stored with `enclos secret set`. A variable uses letters, digits and `_`, and not one enclos sets itself, such as `PATH`. A change waits for sessions to restart.
+
+| Setting | Accepts | Notes |
+| --- | --- | --- |
+| `env` | a table of grants | Replaces what the layers below grant every session and service of the sandbox. |
+| `env_add` | a table of grants | Adds to them. |
+| `agents.<agent>.env` | a table of grants | Replaces what one agent is granted. A bot's token goes here, never to the whole sandbox. |
+| `agents.<agent>.env_add` | a table of grants | Adds to them. |
+
+A variable granted to the whole sandbox cannot also be granted to an agent. An `[exec]` section is refused: no backend enforces it yet.
+
 ## Stage 1: resolving the layers
 
 `policy::resolve(overrides, adapter)` reads four layers, each a TOML file of the same shape (`PolicyFile`), and applies them in order on top of an empty policy:
@@ -115,7 +191,7 @@ It resolves to `write = ["{home}"]`, the built-in read-deny list, `mode = "publi
 - `policy allow` adds the entry to `[network] allow_add` (keeping the file's comments), then resolves the whole file against the current template and adapter. When the result changes more than that entry (edits to `policy.toml` not stored yet, or a newer template or built-in defaults), it lists each change and asks first.
 - `policy edit` opens a copy of `policy.toml` (`policy.toml.edit`, beside it, with the file it started from in `policy.toml.edit.base`) in the user's editor, then resolves the copy. An edit not applied (refused, an editor that failed, a dry run) stays, and the next `policy edit` opens it again, unless `policy.toml` changed since it began: then it is refused, as it would undo that change, and so is an edit whose `policy.toml` changed while the editor was open. `policy discard` drops a kept edit.
 
-`allow` and `edit` record the result through `Engine::propose` (`src/engine/pending.rs`): it becomes the active version at once, unless it changes the rules a session keeps from its start (`Policy::same_at_launch`: the filesystem rules, `listen` and the secrets granted) while a session runs under a compiled policy. Then it is saved as the pending policy, beside the active one; a change of network rules alone (a destination `policy allow` adds, or a `policy edit` that touches only the network while a change waits) still applies at once, resolved from the active snapshot's `policy.toml` with that change, provided the result differs from the active policy by exactly it; it is part of the pending one too. Without `--yes` nothing is asked interactively, so such a change waits; with `--yes`, a change that itself brings the rules sessions keep restarts the sandbox into it (`Engine::restart_into`: `sandbox stop`, then the pending policy made active, then `sandbox start` when services were installed). `policy apply` does the same for a change already waiting, and `policy discard` drops it, writing back the `policy.toml` the active snapshot was resolved from (each snapshot keeps that text) and keeping the replaced file as `policy.toml.discarded`. `runtime install` is refused while a change waits, since it resolves `policy.toml` on its own. `store_policy` writes `policy.toml` first and records the version second; if recording fails, the file goes back to what it was.
+`allow` and `edit` record the result through `Engine::propose` (`src/engine/pending.rs`): it becomes the active version at once, unless it changes the rules a session keeps from its start (`Policy::same_at_launch`: the filesystem rules, `listen`, the secrets granted and the limits) while a session runs under a compiled policy. Then it is saved as the pending policy, beside the active one; a change of network rules alone (a destination `policy allow` adds, or a `policy edit` that touches only the network while a change waits) still applies at once, resolved from the active snapshot's `policy.toml` with that change, provided the result differs from the active policy by exactly it; it is part of the pending one too. Without `--yes` nothing is asked interactively, so such a change waits; with `--yes`, a change that itself brings the rules sessions keep restarts the sandbox into it (`Engine::restart_into`: `sandbox stop`, then the pending policy made active, then `sandbox start` when services were installed). `policy apply` does the same for a change already waiting, and `policy discard` drops it, writing back the `policy.toml` the active snapshot was resolved from (each snapshot keeps that text) and keeping the replaced file as `policy.toml.discarded`. `runtime install` is refused while a change waits, since it resolves `policy.toml` on its own. `store_policy` writes `policy.toml` first and records the version second; if recording fails, the file goes back to what it was.
 
 ## Stage 3: compiling
 

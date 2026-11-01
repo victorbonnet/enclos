@@ -85,7 +85,7 @@
 <span class="comment"># what is in force, and every version so far</span>
 <span class="command">enclos policy show lab</span>
 <span class="command">enclos policy history lab</span></code></pre></div>
-      <p>Set <code>mode = "allowlist"</code> under <code>[network]</code> to keep a sandbox to the hosts you list. A change to the network applies at once. A change to what the sandbox may write waits for you while sessions run; <code>enclos policy apply lab</code> restarts the sandbox into it. <a href="./policy-compilation.html">How a policy compiles</a> explains why.</p>
+      <p>Set <code>mode = "allowlist"</code> under <code>[network]</code> to keep a sandbox to the hosts you list. A change to the network applies at once. A change to what the sandbox may write waits for you while sessions run; <code>enclos policy apply lab</code> restarts the sandbox into it. <a href="./policy-compilation.html">How a policy compiles</a> explains why, and lists <a href="./policy-compilation.html#settings">every setting</a>.</p>
 
       <h2>Run more than one</h2>
       <p>To add a sandbox, repeat the steps with another name. Each one has its own Hermes install, login, policy and proxy, and cannot read the others’ files.</p>

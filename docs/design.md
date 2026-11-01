@@ -187,8 +187,13 @@ listen = false                           # TCP listening, any port but the proxy
 open_files = 1024
 
 [secrets]                                # every session in the sandbox receives these
+env = { API_TOKEN = "secret:home/api" }
+
+[secrets.agents.main]                    # this agent alone; a bot's token goes here
 env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 ```
+
+[Policy compilation](policy-compilation.md#every-setting) lists every setting.
 
 | Template | Writes | Programs | Network | Use for |
 | --- | --- | --- | --- | --- |
