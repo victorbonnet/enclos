@@ -6,8 +6,8 @@
 //! manager, and from the sandbox home, which the sandbox writes. The
 //! runtime adapter names paths and lists its agents; every read of the home
 //! goes through descriptors that never follow a link (`runtime::home`, ADR
-//! 0023), sizes
-//! and counts are bounded, and "cannot tell", with why, is an answer.
+//! 0023), sizes and counts are bounded, and "cannot tell", with why, is an
+//! answer.
 
 mod disk;
 mod facts;
@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use super::Engine;
 use super::listener::{NoPort, outside_proxy_range, service_listener};
+use super::markers::marked_in;
 use super::sandbox::{compile_refused, needs_restart};
-use super::session::marked_in;
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
 use crate::lifecycle::members::{find, is_gone};
