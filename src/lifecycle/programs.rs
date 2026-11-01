@@ -147,8 +147,8 @@ fn answered(out: &Output, some: bool) -> Result<BTreeSet<u32>, ProgramsError> {
 }
 
 /// `ps -o pid=,flags=,stat=` lines, as the pids `lsof` can read. One exiting,
-/// which `ps` marks `E`, is there until it ends yet listed by no `lsof`,
-/// however often it is asked (macOS 26.5.2).
+/// which `ps` marks `E`, was left out by every `lsof` while it tore down (a
+/// killed process, macOS 26.5.2; design §14).
 fn parse_readable(text: &str) -> Result<BTreeSet<u32>, ProgramsError> {
     let mut pids = BTreeSet::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
