@@ -469,16 +469,15 @@ impl Engine {
             };
         let look = match markers_found {
             true => Look::in_listing(&host.procs, &markers_dir)?,
-            false => Look::without_markers(&host.procs),
+            false => Look::markers_unseen(&host.procs),
         };
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();
         for session in &open {
-            let found = look.members(session);
-            if found.is_empty() {
+            if look.is_gone(session) {
                 gone.push(session.id);
             }
-            members.extend(found.iter().map(|f| f.member.pid));
+            members.extend(look.members(session).iter().map(|f| f.member.pid));
         }
         if !gone.is_empty() {
             let ids: Vec<String> = gone.iter().map(ToString::to_string).collect();

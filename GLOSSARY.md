@@ -99,6 +99,9 @@ _Avoid_: daemon, job, unit (the service manager's words), agent service
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
 _Avoid_: child, worker
 
+**Marker**:
+A file enclos gives a program as a session starts, which the program and everything it starts hold open, so that holding it proves a process is that session's member.
+
 **Workspace**:
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume

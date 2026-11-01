@@ -553,15 +553,15 @@ impl Engine {
         // The program's exit is not the session's end: what it left running
         // keeps the session open, so `show`, `stop` and `rm` still see it,
         // what holds its marker included (ADR 0030).
-        // Without the marker, what is left cannot be told, so the session
-        // stays open.
+        // A look that fails cannot tell what is left, so the session stays
+        // open.
         let left = (|| -> Result<Vec<Found>> {
             let look = self.look_now(&session.sandbox)?;
             let mut marked = session.clone();
             marked.tracked = known.clone();
             let marked = look.marked(&marked);
             known.clone_from(&marked.tracked);
-            Ok(look.members(&marked))
+            Ok(look.left(&marked)?)
         })();
         Ok(Waited {
             status,
@@ -588,11 +588,11 @@ impl Engine {
                 format!("could not stop what it left running: {e}"),
             );
         }
-        let mut known = session.clone();
-        known.tracked = waited.known.clone();
+        // With what it was asked to stop: one that survived is still left,
+        // whether or not it holds the marker or has a parent any more.
         waited.left = self
             .look_now(&session.sandbox)
-            .map(|look| look.members(&known));
+            .and_then(|look| Ok(look.left(&members)?));
     }
 
     /// Ends the session, or, while it left members running or enclos could

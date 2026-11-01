@@ -58,16 +58,17 @@ impl Engine {
         }
     }
 
-    /// A look at what runs of sandbox `name`, whose open sessions are
-    /// `open`. Most sandboxes have none, and then nothing is looked at.
+    /// A look at what runs of sandbox `name`, to ask about `open`, its open
+    /// sessions or some of them. With none, as for most sandboxes, nothing
+    /// is looked at, and the look is asked about no other session.
     pub(super) fn look_open(
         &self,
         name: &SandboxName,
         open: &[SessionRecord],
     ) -> Result<Look<'static>> {
         match open.is_empty() {
-            true => Ok(Look::without_markers(&[])),
-            false => Ok(self.look_now(name)?),
+            true => Ok(Look::nothing_open()),
+            false => self.look_now(name),
         }
     }
 

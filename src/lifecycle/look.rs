@@ -1,18 +1,22 @@
 //! One look at what runs of a sandbox's sessions (ADR 0019, ADR 0030).
 //!
-//! A session's members are found from a listing of the host's processes and
-//! from the processes `lsof` shows holding its marker, always in that order:
-//! a holder that exits in between, its pid reused, is then listed with its
-//! own start time and fails the same-process check before a signal, where
-//! the other order would name the process that reused the pid. A [`Look`]
-//! can only be made that way, and it answers for every session of the
-//! sandbox from the same listing.
+//! A session's members are found from a listing of the host's processes,
+//! then from the processes `lsof` shows holding its marker, always in that
+//! order: each holder is known by the start time the listing gave its pid,
+//! so one that exits and whose pid is reused fails the same-process check
+//! before a signal. With `lsof` first, the listing would give it the start
+//! time of the process that reused the pid, and that process would be
+//! signalled. A [`Look`] that holds markers can only be made that way, and
+//! it answers for every session of the sandbox from the same listing.
 //!
 //! A look that fails says nothing about any session, so it is an error
-//! rather than an answer: what it means is the caller's to decide. `sandbox
-//! stop` treats every session as running, `sandbox rm` and `status` refuse,
-//! `doctor` reports it is unsure, and a session whose program exited stays
-//! open.
+//! rather than an answer, and what it means is the caller's to decide:
+//! `sandbox stop` counts every session as having run, and fails if its stop
+//! cannot look either; `sandbox rm` refuses; `status` lists the sandbox as
+//! "cannot tell"; `doctor` reports it is unsure; and a session whose program
+//! exited stays open. A markers folder that is not there is not a failed
+//! look: no marker is held, and `state check` alone, which tells a person
+//! so, treats that as no answer.
 //!
 //! Which listed processes are a session's is `members`'s to say; `stop`
 //! sends the signals.
@@ -21,13 +25,13 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
 
-use super::marker::{Held, MarkerError, holders, name_of};
+use super::marker::{Held, MarkerError, holders, is_held, name_of};
 use super::members::{Found, find, is_gone};
 use super::process::{Proc, PsError, processes};
 use super::stop::{Stopped, Survivor, Why};
 use crate::model::session::{ProcessRef, SessionRecord};
 
-/// Why a look could not be made.
+/// Why a look, or a stop that depends on one, failed.
 #[derive(Debug, thiserror::Error)]
 pub enum LookError {
     #[error(transparent)]
@@ -46,18 +50,36 @@ pub struct Look<'a> {
 impl Look<'static> {
     /// Lists the processes, then looks at the markers in `markers`.
     pub fn now(markers: &Path) -> Result<Look<'static>, LookError> {
-        let procs = processes()?;
-        let held = holders(markers)?;
+        Look::made(processes, || holders(markers))
+    }
+
+    /// `list`, then `hold`, which runs only once `list` gave a listing.
+    fn made(
+        list: impl FnOnce() -> Result<Vec<Proc>, PsError>,
+        hold: impl FnOnce() -> Result<Held, MarkerError>,
+    ) -> Result<Look<'static>, LookError> {
+        let procs = list()?;
+        let held = hold()?;
         Ok(Look {
             procs: Cow::Owned(procs),
             held,
         })
     }
+
+    /// The look of a sandbox with no open session, for which nothing is
+    /// looked at. It calls every session gone, so it is asked only about
+    /// the sessions that were open: none.
+    pub fn nothing_open() -> Look<'static> {
+        Look::markers_unseen(&[])
+    }
 }
 
 impl<'a> Look<'a> {
     /// Looks at the markers in `markers`, after `procs`, for the commands
-    /// that list the processes once for every sandbox.
+    /// that list the processes once for every sandbox. The listing may be
+    /// older than this look, so a process started since is not counted: a
+    /// session this calls gone is looked at again before its end is
+    /// recorded, and no signal follows from this look.
     pub fn in_listing(procs: &'a [Proc], markers: &Path) -> Result<Look<'a>, MarkerError> {
         Ok(Look {
             procs: Cow::Borrowed(procs),
@@ -65,22 +87,18 @@ impl<'a> Look<'a> {
         })
     }
 
-    /// `procs` with no marker held: when there are no markers to look for,
-    /// or, with `&[]`, when no session is open and nothing was looked at.
-    pub fn without_markers(procs: &'a [Proc]) -> Look<'a> {
+    /// `procs`, with no look at the markers: for a sandbox whose markers
+    /// cannot be looked for, so whether one is held is not known. The
+    /// caller says so where it matters.
+    pub fn markers_unseen(procs: &'a [Proc]) -> Look<'a> {
         Look {
             procs: Cow::Borrowed(procs),
             held: Held::new(),
         }
     }
 
-    /// The processes this look listed.
-    pub fn listing(&self) -> &[Proc] {
-        &self.procs
-    }
-
-    /// `session`, with the processes holding its marker added to those it
-    /// tracked, each once.
+    /// `session`, with the listed processes holding its marker added to
+    /// those it tracked, each once.
     pub fn marked(&self, session: &SessionRecord) -> SessionRecord {
         let mut marked = session.clone();
         if let Some(pids) = self.held.get(&name_of(&session.root)) {
@@ -97,26 +115,44 @@ impl<'a> Look<'a> {
         marked
     }
 
-    /// The members of `session` running now, what holds its marker included.
+    /// The members of `session` in this look, the listed holders of its
+    /// marker included.
     pub fn members(&self, session: &SessionRecord) -> Vec<Found> {
         let marked = self.marked(session);
         find(&self.procs, &marked, &marked.tracked)
     }
 
-    /// Whether nothing of `session` runs now, what holds its marker included.
+    /// Whether nothing of `session` runs in this look: it has no member,
+    /// and nothing holds its marker. A holder the listing does not show
+    /// started after it, so it has no start time to be known by, but it
+    /// shows the session is not over.
     pub fn is_gone(&self, session: &SessionRecord) -> bool {
-        is_gone(&self.procs, &self.marked(session))
+        is_gone(&self.procs, &self.marked(session)) && !is_held(&self.held, &session.root)
+    }
+
+    /// The members of `session` in this look, for ending it when there are
+    /// none. Only a holder the listing does not show keeps those from
+    /// being all that is left, and that is an error, so the session stays
+    /// open.
+    pub fn left(&self, session: &SessionRecord) -> Result<Vec<Found>, MarkerError> {
+        let found = self.members(session);
+        match found.is_empty() && is_held(&self.held, &session.root) {
+            true => Err(MarkerError::Unlisted(session.root.pid)),
+            false => Ok(found),
+        }
     }
 }
 
 /// Stops `session`'s members, with what holds its marker, then, whatever
 /// came of it, looks at the marker again: a process that gained it
-/// meanwhile, such as one a member detached during the grace period or a
-/// child its TERM handler forked, is stopped too, and one that survives that
-/// is a survivor, so the session stays open.
+/// meanwhile, such as one a member detached during the grace period or one
+/// its TERM handler forked, is stopped too, and one that survives that is a
+/// survivor, so the session stays open.
 ///
 /// `look` makes a fresh look, `stop` stops the members of a session, and
-/// `runs` says whether a process still runs.
+/// `runs` says whether a process still runs. `look` gives a `Look<'static>`
+/// so that a listing shared between sandboxes, which may be old, never
+/// decides a signal.
 pub fn stop_marked(
     session: &SessionRecord,
     grace: Duration,
@@ -126,7 +162,7 @@ pub fn stop_marked(
 ) -> Result<Stopped, LookError> {
     let marked = look()?.marked(session);
     let first = stop(&marked, grace)?;
-    // Looked at again whatever came of it, survivors included: a child a
+    // Looked at again whatever came of it, survivors included: a process a
     // member's TERM handler forked before it exited is an orphan only the
     // marker proves the session's, so it is reported as not signalled until
     // it is.
@@ -137,11 +173,7 @@ pub fn stop_marked(
     // What the first stop knew stays known: the first look's holders, and
     // the members it signalled that survived, which may since have closed
     // the marker or lost their parent.
-    let earlier: Vec<Survivor> = match &first {
-        Stopped::Survivors(left) => left.clone(),
-        Stopped::Clean | Stopped::Gone => Vec::new(),
-    };
-    let signalled = earlier
+    let signalled = survivors(&first)
         .iter()
         .filter(|s| !matches!(s.why, Why::NotSignalled))
         .map(|s| ProcessRef {
@@ -157,6 +189,14 @@ pub fn stop_marked(
     Ok(merged(first, second, runs)?)
 }
 
+/// What of the session a stop left running.
+fn survivors(stopped: &Stopped) -> &[Survivor] {
+    match stopped {
+        Stopped::Survivors(left) => left,
+        Stopped::Clean | Stopped::Gone => &[],
+    }
+}
+
 /// What two stops of a session came to, the second after the marker gained
 /// holders: the second's survivors, and each survivor of the first that
 /// `runs` still and the second did not report, as one only counted, which
@@ -167,19 +207,14 @@ fn merged(
     second: Stopped,
     runs: impl Fn(&ProcessRef) -> Result<bool, PsError>,
 ) -> Result<Stopped, PsError> {
-    let mut left = match &second {
-        Stopped::Survivors(left) => left.clone(),
-        Stopped::Clean | Stopped::Gone => Vec::new(),
-    };
-    if let Stopped::Survivors(earlier) = &first {
-        for s in earlier {
-            let process = ProcessRef {
-                pid: s.member.pid,
-                started: s.member.started.clone(),
-            };
-            if !left.iter().any(|l| l.member.pid == s.member.pid) && runs(&process)? {
-                left.push(s.clone());
-            }
+    let mut left = survivors(&second).to_vec();
+    for s in survivors(&first) {
+        let process = ProcessRef {
+            pid: s.member.pid,
+            started: s.member.started.clone(),
+        };
+        if !left.iter().any(|l| l.member.pid == s.member.pid) && runs(&process)? {
+            left.push(s.clone());
         }
     }
     Ok(match (left.is_empty(), second, first) {
@@ -235,13 +270,7 @@ mod tests {
     fn look(procs: &[u32], session: &SessionRecord, held: &[u32]) -> Look<'static> {
         Look {
             procs: Cow::Owned(procs.iter().copied().map(proc_).collect()),
-            held: match held {
-                [] => Held::new(),
-                pids => Held::from([(
-                    name_of(&session.root),
-                    pids.iter().copied().collect::<BTreeSet<u32>>(),
-                )]),
-            },
+            held: Held::from([(name_of(&session.root), set(held))]),
         }
     }
 
@@ -260,6 +289,43 @@ mod tests {
         }
     }
 
+    /// The listing comes first, whatever `lsof` answers: that order is what
+    /// keeps a pid reused from being signalled (ADR 0030).
+    #[test]
+    fn a_look_lists_the_processes_before_it_looks_at_the_markers() {
+        let steps = RefCell::new(Vec::new());
+        Look::made(
+            || {
+                steps.borrow_mut().push("list");
+                Ok(Vec::new())
+            },
+            || {
+                steps.borrow_mut().push("hold");
+                Ok(Held::new())
+            },
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["list", "hold"]);
+    }
+
+    #[test]
+    fn a_listing_that_fails_looks_at_no_marker() {
+        let looked = Look::made(
+            || Err(PsError::new("ps failed")),
+            || panic!("the markers were looked at"),
+        );
+        assert!(matches!(looked, Err(LookError::Processes(_))));
+    }
+
+    #[test]
+    fn a_look_at_the_markers_that_fails_is_no_listing_alone() {
+        let looked = Look::made(
+            || Ok(vec![proc_(10)]),
+            || Err(MarkerError::Lsof("no lsof".into())),
+        );
+        assert!(matches!(looked, Err(LookError::Markers(_))));
+    }
+
     /// A process holding one session's marker is that session's member,
     /// never another's (ADR 0030).
     #[test]
@@ -268,7 +334,7 @@ mod tests {
         let seen = look(&[11, 12, 21], &a, &[11, 12]);
         assert_eq!(seen.marked(&a).tracked, [at(11), at(12)]);
         assert!(seen.marked(&b).tracked.is_empty());
-        // A holder no longer listed is not added.
+        // A holder the listing does not show is not added.
         assert_eq!(look(&[11], &a, &[11, 12]).marked(&a).tracked, [at(11)]);
     }
 
@@ -291,17 +357,34 @@ mod tests {
         let seen = look(&[50], &a, &[50]);
         assert!(!seen.is_gone(&a));
         assert_eq!(pids(&seen.members(&a)), [50]);
+        assert_eq!(pids(&seen.left(&a).unwrap()), [50]);
     }
 
-    /// A holder `lsof` named that the listing, made first, does not show
-    /// started after it, or was a pid since reused: nothing proves it is
-    /// the process the session holds, and it is not a member.
+    /// A holder `lsof` names that the listing, made first, does not show
+    /// started after it: this look has no start time to know it by, so it
+    /// is no member to signal, but the session is not over.
     #[test]
-    fn a_holder_the_listing_does_not_show_is_no_member() {
+    fn a_holder_the_listing_does_not_show_keeps_the_session_open() {
         let a = session(1, 10);
         let seen = look(&[], &a, &[50]);
-        assert!(seen.is_gone(&a));
         assert!(seen.members(&a).is_empty());
+        assert!(!seen.is_gone(&a));
+        assert!(matches!(seen.left(&a), Err(MarkerError::Unlisted(10))));
+    }
+
+    #[test]
+    fn a_session_of_which_nothing_runs_has_nothing_left() {
+        let a = session(1, 10);
+        assert!(look(&[50], &a, &[]).left(&a).unwrap().is_empty());
+    }
+
+    /// Only the session's own marker counts.
+    #[test]
+    fn a_holder_of_another_sessions_marker_keeps_this_one_from_nothing() {
+        let (a, b) = (session(1, 10), session(2, 20));
+        let seen = look(&[], &a, &[50]);
+        assert!(seen.is_gone(&b));
+        assert!(seen.left(&b).unwrap().is_empty());
     }
 
     /// What holds a session's marker is sure, so it may be signalled.
@@ -313,13 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn a_look_with_no_markers_counts_only_the_listing() {
+    fn a_look_at_no_markers_counts_only_the_listing() {
         let a = session(1, 10);
         let procs = [proc_(10)];
-        let seen = Look::without_markers(&procs);
-        assert!(!seen.is_gone(&a));
-        assert_eq!(seen.listing(), procs);
-        assert!(Look::without_markers(&[]).is_gone(&a));
+        assert!(!Look::markers_unseen(&procs).is_gone(&a));
+        assert!(Look::markers_unseen(&[]).is_gone(&a));
+    }
+
+    #[test]
+    fn with_nothing_open_nothing_was_looked_at() {
+        let look = Look::nothing_open();
+        assert!(look.procs.is_empty());
+        assert!(look.held.is_empty());
     }
 
     /// A markers' folder that cannot be read is a failed look, not a look
@@ -344,12 +432,12 @@ mod tests {
 
     /// Stops `a` with looks answering from `looks` in turn (the last one
     /// repeats) and stops answering from `stops`, and returns the result
-    /// with what each stop was asked to end.
+    /// with the pids each stop was asked to end. Only pid 1 still runs.
     fn stopped_with(
         a: &SessionRecord,
         looks: &[&[u32]],
         stops: Vec<Stopped>,
-    ) -> (Stopped, Vec<Vec<ProcessRef>>) {
+    ) -> (Stopped, Vec<BTreeSet<u32>>) {
         let looked = RefCell::new(0);
         let asked = RefCell::new(Vec::new());
         let stops = RefCell::new(stops);
@@ -363,7 +451,9 @@ mod tests {
                 Ok(look(held, a, held))
             },
             |s, _| {
-                asked.borrow_mut().push(s.tracked.clone());
+                asked
+                    .borrow_mut()
+                    .push(s.tracked.iter().map(|r| r.pid).collect());
                 Ok(stops.borrow_mut().remove(0))
             },
             |p| Ok(p.pid == 1),
@@ -372,12 +462,16 @@ mod tests {
         (result, asked.into_inner())
     }
 
+    fn set(pids: &[u32]) -> BTreeSet<u32> {
+        pids.iter().copied().collect()
+    }
+
     #[test]
     fn a_stop_that_gains_no_holder_stops_once() {
         let a = session(1, 10);
         let (result, asked) = stopped_with(&a, &[&[50]], vec![Stopped::Clean]);
         assert_eq!(result, Stopped::Clean);
-        assert_eq!(asked, [vec![at(50)]]);
+        assert_eq!(asked, [set(&[50])]);
     }
 
     /// A holder gone since the first look is no new holder.
@@ -397,20 +491,21 @@ mod tests {
         let (result, asked) =
             stopped_with(&a, &[&[50], &[60]], vec![Stopped::Clean, Stopped::Clean]);
         assert_eq!(result, Stopped::Clean);
-        assert_eq!(asked, [vec![at(50)], vec![at(60), at(50)]]);
+        assert_eq!(asked, [set(&[50]), set(&[50, 60])]);
     }
 
-    /// A member signalled that survived stays known to the second stop;
-    /// one only counted stays unsignalled.
+    /// A member signalled that survived, or that could not be, stays known
+    /// to the second stop; one only counted stays unsignalled.
     #[test]
-    fn the_second_stop_knows_only_the_survivors_the_first_signalled() {
+    fn the_second_stop_knows_only_the_survivors_the_first_tried_to_signal() {
         let a = session(1, 10);
         let first = Stopped::Survivors(vec![
             survivor(70, Why::Survived),
             survivor(71, Why::NotSignalled),
+            survivor(72, Why::NotSent("no permission".into())),
         ]);
         let (_, asked) = stopped_with(&a, &[&[], &[60]], vec![first, Stopped::Clean]);
-        assert_eq!(asked[1], [at(60), at(70)]);
+        assert_eq!(asked[1], set(&[60, 70, 72]));
     }
 
     /// With no new holder, the first stop's own report stands.
@@ -423,8 +518,34 @@ mod tests {
         assert_eq!(asked.len(), 1);
     }
 
-    /// A look that fails, before or after signals, is no answer: it is the
-    /// caller's to say the session stays open.
+    /// A survivor of the first stop that still runs is reported though the
+    /// second stop, which never saw it, ended everything it was asked to.
+    #[test]
+    fn two_stops_report_a_survivor_of_the_first_that_still_runs() {
+        let a = session(1, 10);
+        let first = Stopped::Survivors(vec![survivor(1, Why::NotSignalled)]);
+        let (result, _) = stopped_with(&a, &[&[], &[60]], vec![first, Stopped::Clean]);
+        assert_eq!(
+            result,
+            Stopped::Survivors(vec![survivor(1, Why::NotSignalled)])
+        );
+    }
+
+    /// A look that fails is no answer, and it comes before any signal.
+    #[test]
+    fn a_first_look_that_fails_stops_nothing() {
+        let a = session(1, 10);
+        let result = stop_marked(
+            &a,
+            Duration::ZERO,
+            || Err(LookError::Markers(MarkerError::Lsof("no lsof".into()))),
+            |_, _| panic!("stopped without a look"),
+            |_| Ok(false),
+        );
+        assert!(matches!(result, Err(LookError::Markers(_))));
+    }
+
+    /// After signals too: it is the caller's to say the session stays open.
     #[test]
     fn a_look_that_fails_after_the_stop_is_an_error() {
         let a = session(1, 10);
@@ -444,6 +565,44 @@ mod tests {
             |_| Ok(false),
         );
         assert!(matches!(result, Err(LookError::Markers(_))));
+    }
+
+    #[test]
+    fn a_second_stop_that_fails_is_an_error() {
+        let a = session(1, 10);
+        let looked = RefCell::new(0);
+        let stops = RefCell::new(0);
+        let result = stop_marked(
+            &a,
+            Duration::ZERO,
+            || {
+                let mut n = looked.borrow_mut();
+                *n += 1;
+                Ok(match *n {
+                    1 => look(&[], &a, &[]),
+                    _ => look(&[60], &a, &[60]),
+                })
+            },
+            |_, _| {
+                let mut n = stops.borrow_mut();
+                *n += 1;
+                match *n {
+                    1 => Ok(Stopped::Clean),
+                    _ => Err(PsError::new("ps failed")),
+                }
+            },
+            |_| Ok(false),
+        );
+        assert!(matches!(result, Err(LookError::Processes(_))));
+    }
+
+    /// Whether a survivor still runs not being known, nothing shows it does
+    /// not: the stops do not come to `Clean`.
+    #[test]
+    fn a_survivor_that_cannot_be_looked_at_is_an_error() {
+        let first = Stopped::Survivors(vec![survivor(1, Why::Survived)]);
+        let result = merged(first, Stopped::Clean, |_| Err(PsError::new("ps failed")));
+        assert!(result.is_err());
     }
 
     /// Two stops of a session together: the first's survivors that still

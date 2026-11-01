@@ -51,7 +51,7 @@ impl Found {
 /// it recorded are gone (no longer listed, or listed with another start
 /// time, as after a restart of the Mac), and nothing else counts as its
 /// member. Only its end is then left to record.
-pub fn is_gone(procs: &[Proc], session: &SessionRecord) -> bool {
+pub(super) fn is_gone(procs: &[Proc], session: &SessionRecord) -> bool {
     find(procs, session, &session.tracked).is_empty()
 }
 

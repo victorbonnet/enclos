@@ -23,8 +23,8 @@ use super::listener::{NoPort, outside_proxy_range, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
-use crate::lifecycle::members::find;
-use crate::lifecycle::process::{Proc, is_same};
+use crate::lifecycle::look::Look;
+use crate::lifecycle::process::is_same;
 use crate::model::Timestamp;
 use crate::model::agent::AgentName;
 use crate::model::net::Reason;
@@ -138,7 +138,7 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
-        let network_listeners = network_listeners(look.listing(), &running);
+        let network_listeners = network_listeners(&look, &running);
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
@@ -304,12 +304,12 @@ fn dashboard(
 /// reach: nothing narrows a sandbox's listener to loopback (ADR 0028). Each
 /// pid and address once, a listener on every address (`0.0.0.0` or `[::]`)
 /// shown as `*:<port>`. A pid is named only while it is still the member
-/// `procs` listed, checked after `lsof` looked, so a pid reused meanwhile
-/// is not.
-fn network_listeners(procs: &[Proc], running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
+/// `look` listed, checked after `lsof` looked, so a pid reused meanwhile is
+/// not.
+fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
     let mut members: BTreeMap<u32, (ProcessRef, String)> = BTreeMap::new();
     for session in running.iter().filter(|s| s.kind != SessionKind::Proxy) {
-        for found in find(procs, session, &session.tracked) {
+        for found in look.members(session) {
             let member = found.member;
             let at = ProcessRef {
                 pid: member.pid,
@@ -400,9 +400,10 @@ mod tests {
         let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
         let procs = crate::lifecycle::process::processes().unwrap();
         let running = [session_of(SessionKind::Interactive, root.clone())];
-        let found = network_listeners(&procs, &running);
+        let look = Look::markers_unseen(&procs);
+        let found = network_listeners(&look, &running);
         // The proxy runs on the host, not in the sandbox: never counted.
-        let proxy = network_listeners(&procs, &[session_of(SessionKind::Proxy, root)]);
+        let proxy = network_listeners(&look, &[session_of(SessionKind::Proxy, root)]);
         let _ = child.kill();
         let _ = child.wait();
         let Fact::Known(found) = found else {

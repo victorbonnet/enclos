@@ -35,6 +35,10 @@ pub enum MarkerError {
     /// `lsof` could not run or answer: for every sandbox alike.
     #[error("cannot look at the sandbox's markers with /usr/sbin/lsof: {0}")]
     Lsof(String),
+    /// A process holds the marker of the session whose root had this pid,
+    /// and the listing made before does not show it.
+    #[error("a process that started a moment ago holds the marker of the session of pid {0}")]
+    Unlisted(u32),
 }
 
 /// A marker made for a program about to start, not yet held by it.
@@ -143,7 +147,7 @@ pub fn holders(dir: &Path) -> Result<Held, MarkerError> {
     // here, since `lsof -w` hides its own failure to open the folder and
     // answers as for one with nothing held.
     match std::fs::read_dir(dir) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Held::new()),
         Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
         Ok(_) => {}
     }
@@ -168,7 +172,7 @@ fn parse(out: &Output) -> Result<Held, MarkerError> {
     let text = String::from_utf8_lossy(&out.stdout);
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
-        (Some(1), true, true) => return Ok(BTreeMap::new()),
+        (Some(1), true, true) => return Ok(Held::new()),
         (Some(0), false, _) | (Some(1), false, true) => {}
         _ => return Err(MarkerError::Lsof(format!("{}: {why}", out.status))),
     }
