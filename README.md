@@ -73,7 +73,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
-- [Website](https://enclos.dev/): a visual introduction, everyday examples and common questions ([source](site/)).
+- [Website](https://enclos.dev/): what enclos does, how to install it and its limits ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
