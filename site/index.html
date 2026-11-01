@@ -43,15 +43,19 @@
 
         <figure class="terminal">
           <pre><code><span class="command">enclos status</span>
-1 sandbox, 3 agents, 2.6 GB in ~/.enclos
+2 sandboxes, 3 agents, 5.1 GB in ~/.enclos
 
-lab  running   Hermes, logged in
+lab   running   Hermes, logged in
   proxy running, gateway running
   policy v2 · last network 3m ago
   AGENT    LAST ACTIVE      SIZE
   default  2h ago         1.2 MB
   main     3m ago        18.4 MB
-  scout    1d ago         6.3 MB</code></pre>
+
+work  stopped   Hermes, logged in
+  policy v1 · last network 2d ago
+  AGENT    LAST ACTIVE      SIZE
+  default  2d ago         6.3 MB</code></pre>
           <figcaption>Example output, shortened.</figcaption>
         </figure>
       </section>
@@ -98,10 +102,11 @@ allow_add = ["api.telegram.org"]</code></pre>
         <article class="win win-wide">
           <div>
             <h2>See what your agents do</h2>
-            <p>One CLI lists every agent, shows which services run, and records what each sandbox connected to.</p>
+            <p>Run as many sandboxes as you need, each with its own agents, policy and proxy. One CLI lists them all, shows which services run, and records what each sandbox connected to.</p>
           </div>
           <dl class="commands">
-            <div><dt><code>enclos status</code></dt><dd>every sandbox and agent</dd></div>
+            <div><dt><code>enclos sandbox list</code></dt><dd>every sandbox, its policy version and state</dd></div>
+            <div><dt><code>enclos status</code></dt><dd>every sandbox and its agents</dd></div>
             <div><dt><code>enclos net log lab</code></dt><dd>every connection</dd></div>
             <div><dt><code>enclos net denied lab</code></dt><dd>what was refused</dd></div>
             <div><dt><code>enclos audit</code></dt><dd>every change made through enclos</dd></div>
