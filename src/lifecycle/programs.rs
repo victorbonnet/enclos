@@ -26,16 +26,17 @@ pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
 }
 
 /// Every process's program files through `list`, checked whole against
-/// what `readable` says `lsof` can read. A process `lsof` passed over while
-/// it ended or started a new program can be there before and after it
-/// looked, yet left out (seen once in a full test run on macOS 26.5.2):
-/// those alone are looked at again, and only one still there and still left
-/// out makes the listing a part.
+/// what `readable` says `lsof` can read. A process replacing its program
+/// has, for a moment, no program file for `lsof` to list (shown on macOS
+/// 26.5.2), so it can be there before and after a listing that left it out:
+/// those alone are looked at again. An empty answer does not say why it
+/// listed none, so the last `ps`, not `lsof`, says which have gone, and only
+/// one still there and still left out makes the listing a part.
 fn whole(
-    readable: impl Fn() -> Result<BTreeSet<u32>, ProgramsError>,
+    readable: impl Fn(Option<&[u32]>) -> Result<BTreeSet<u32>, ProgramsError>,
     list: impl Fn(Option<&[u32]>) -> Result<Listing, ProgramsError>,
 ) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
-    let before = readable()?;
+    let before = readable(None)?;
     let Listing { status, mut files } = list(None)?;
     // With `-w` a failure to read some processes can pass unsaid: a listing
     // without enclos itself, whose program is mapped, is not complete.
@@ -47,22 +48,34 @@ fn whole(
     // Nor one that left out another process of the user it could read,
     // there before and after it looked: `-b`, `-w` and an exit of 1 could
     // otherwise pass a part of the listing for the whole.
-    let left = left_out(&before, &readable()?, &files);
+    let mut left = left_out(&before, &readable(None)?, &files);
     if left.is_empty() {
         return Ok(files);
     }
-    let again = list(Some(&left))?;
+    let again = list(Some(&left)).map_err(|e| {
+        ProgramsError(format!(
+            "{status}, and its listing left out processes of this user it could read: {}; looking at them again: {}",
+            joined(&left, ", "),
+            e.0
+        ))
+    })?;
     files.extend(again.files);
-    let left = left_out(&left.into_iter().collect(), &readable()?, &files);
+    let still = readable(Some(&left))?;
+    left.retain(|p| still.contains(p) && !files.contains_key(p));
     if !left.is_empty() {
-        let pids: Vec<String> = left.iter().map(ToString::to_string).collect();
         return Err(ProgramsError(format!(
             "{status}, then {} looked at again, and its listings left out processes of this user it could read: {}",
             again.status,
-            pids.join(", ")
+            joined(&left, ", ")
         )));
     }
     Ok(files)
+}
+
+/// `pids` as words between `separator`s.
+fn joined(pids: &[u32], separator: &str) -> String {
+    let pids: Vec<String> = pids.iter().map(ToString::to_string).collect();
+    pids.join(separator)
 }
 
 /// What one `lsof` answered: how it exited, and the program files it listed.
@@ -79,19 +92,14 @@ fn list(only: Option<&[u32]>) -> Result<Listing, ProgramsError> {
     // about such a mount are not a failure to list the processes.
     lsof.env("LC_ALL", "C").args(["-nP", "-b", "-w"]);
     if let Some(pids) = only {
-        let pids: Vec<String> = pids.iter().map(ToString::to_string).collect();
-        lsof.args(["-a", "-p", &pids.join(",")]);
+        lsof.args(["-a", "-p", &joined(pids, ",")]);
     }
     let out =
         super::bounded::output_within(lsof.args(["-d", "txt", "-Fpn"]), super::bounded::LIMIT)
             .map_err(|e| ProgramsError(e.to_string()))?;
-    let files = match only.is_some() && all_gone(&out) {
-        true => BTreeMap::new(),
-        false => parse(&out)?,
-    };
     Ok(Listing {
         status: out.status,
-        files,
+        files: parse(&out, only.is_some())?,
     })
 }
 
@@ -102,18 +110,27 @@ fn list(only: Option<&[u32]>) -> Result<Listing, ProgramsError> {
 /// one (design §5, shown for `crontab` and `at` on macOS 26.5.2).
 const P_SUGID: u32 = 0x100;
 
-/// The processes of this user, by effective user, that `lsof` can read:
-/// neither zombies nor `P_SUGID` ones.
-fn readable_own() -> Result<BTreeSet<u32>, ProgramsError> {
+/// The processes of this user, by effective user, that `lsof` can read, or
+/// those of `only`, known to be this user's: neither zombies, nor ones
+/// exiting, nor `P_SUGID` ones.
+fn readable_own(only: Option<&[u32]>) -> Result<BTreeSet<u32>, ProgramsError> {
     let uid = rustix::process::geteuid().as_raw().to_string();
-    let out = super::bounded::output_within(
-        Command::new("/bin/ps")
-            .env("LC_ALL", "C")
-            .args(["-u", &uid, "-o", "pid=,flags=,stat="]),
-        super::bounded::LIMIT,
-    )
-    .map_err(|e| ProgramsError(format!("/bin/ps: {e}")))?;
-    if !out.status.success() {
+    let mut ps = Command::new("/bin/ps");
+    ps.env("LC_ALL", "C");
+    match only {
+        Some(pids) => ps.args(["-p", &joined(pids, ",")]),
+        None => ps.args(["-u", &uid]),
+    };
+    let out =
+        super::bounded::output_within(ps.args(["-o", "pid=,flags=,stat="]), super::bounded::LIMIT)
+            .map_err(|e| ProgramsError(format!("/bin/ps: {e}")))?;
+    // Asked for some processes that have all gone, it prints nothing and
+    // exits 1 (macOS 26.5.2).
+    let all_gone = only.is_some()
+        && out.status.code() == Some(1)
+        && out.stdout.trim_ascii().is_empty()
+        && out.stderr.trim_ascii().is_empty();
+    if !out.status.success() && !all_gone {
         return Err(ProgramsError(format!(
             "/bin/ps {}: {}",
             out.status,
@@ -123,7 +140,9 @@ fn readable_own() -> Result<BTreeSet<u32>, ProgramsError> {
     parse_readable(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// `ps -o pid=,flags=,stat=` lines, as the pids `lsof` can read.
+/// `ps -o pid=,flags=,stat=` lines, as the pids `lsof` can read. One exiting,
+/// which `ps` marks `E`, is there until it ends yet listed by no `lsof`,
+/// however often it is asked (macOS 26.5.2).
 fn parse_readable(text: &str) -> Result<BTreeSet<u32>, ProgramsError> {
     let mut pids = BTreeSet::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -137,7 +156,7 @@ fn parse_readable(text: &str) -> Result<BTreeSet<u32>, ProgramsError> {
             .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
         let flags = u32::from_str_radix(flags, 16)
             .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
-        if flags & P_SUGID == 0 && !stat.starts_with('Z') {
+        if flags & P_SUGID == 0 && !stat.starts_with('Z') && !stat.contains('E') {
             pids.insert(pid);
         }
     }
@@ -184,23 +203,18 @@ pub fn lsof_name(path: &Path) -> String {
     name
 }
 
-/// Asked for some processes (`-a -p`), `lsof` lists none, and exits 1
-/// saying nothing, when every one has gone; anything on stderr is a
-/// failure.
-fn all_gone(out: &Output) -> bool {
-    out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty()
-}
-
 /// What `lsof -d txt -Fpn` answered: a `p<pid>` line for each process, then
 /// an `n<name>` line for each of its program files. In a listing of every
-/// process `lsof` itself is listed, so an empty answer is a failure; asked
-/// for some processes, one that lists none is told apart first
-/// ([`all_gone`]). It exits 1 when a process it listed went away meanwhile,
-/// which is not.
-fn parse(out: &Output) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
+/// process `lsof` itself is listed, so an empty answer is a failure. Asked
+/// for `some` processes, it prints nothing, and says nothing, when it lists
+/// none: exiting 1 for one gone or exiting, 0 for one replacing its program
+/// (macOS 26.5.2). It exits 1 when a process it listed went away meanwhile,
+/// which is no failure either.
+fn parse(out: &Output, some: bool) -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
     let text = String::from_utf8_lossy(&out.stdout);
     let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
+        (Some(0 | 1), true, true) if some => return Ok(BTreeMap::new()),
         (Some(0), false, _) | (Some(1), false, true) => {}
         _ if why.is_empty() => {
             return Err(ProgramsError(format!("{}, with no output", out.status)));
@@ -296,11 +310,14 @@ pub(crate) mod tests {
 
     #[test]
     fn each_process_gets_its_program_files() {
-        let listed = parse(&output(
-            0,
-            "p10\nftxt\nn/bin/zsh\nftxt\nn/usr/lib/dyld\np11\nftxt\nn/a b/c\n",
-            "",
-        ))
+        let listed = parse(
+            &output(
+                0,
+                "p10\nftxt\nn/bin/zsh\nftxt\nn/usr/lib/dyld\np11\nftxt\nn/a b/c\n",
+                "",
+            ),
+            false,
+        )
         .unwrap();
         assert_eq!(listed[&10], ["/bin/zsh", "/usr/lib/dyld"]);
         assert_eq!(listed[&11], ["/a b/c"]);
@@ -308,21 +325,23 @@ pub(crate) mod tests {
 
     #[test]
     fn a_listing_that_did_not_run_is_an_error() {
-        let empty = parse(&output(1, "", "")).unwrap_err().to_string();
+        let empty = parse(&output(1, "", ""), false).unwrap_err().to_string();
         assert!(empty.contains("with no output"), "{empty}");
-        assert!(parse(&output(1, "p1\nn/x\n", "lsof: status error")).is_err());
-        assert!(parse(&output(0, "pnot-a-pid\n", "")).is_err());
-        assert!(parse(&output(1, "p1\nn/x\n", "")).is_ok());
+        assert!(parse(&output(0, "", ""), false).is_err());
+        assert!(parse(&output(1, "p1\nn/x\n", "lsof: status error"), false).is_err());
+        assert!(parse(&output(0, "pnot-a-pid\n", ""), false).is_err());
+        assert!(parse(&output(1, "p1\nn/x\n", ""), false).is_ok());
     }
 
     /// A process `lsof` could read, there before and after it looked, and
     /// left out makes the listing a part, not the whole; one gone meanwhile,
-    /// one set-user-id (`P_SUGID`) or a zombie does not.
+    /// one set-user-id (`P_SUGID`), a zombie or one exiting does not.
     #[test]
     fn a_listing_that_leaves_out_a_readable_process_is_not_whole() {
-        let readable =
-            parse_readable("  10     4004 Ss\n  11 4004104 S\n  12     4004 Z\n  13     4004 S\n")
-                .unwrap();
+        let readable = parse_readable(
+            "  10     4004 Ss\n  11 4004104 S\n  12     4004 Z\n  13     4004 S\n  14     4004 ?E\n",
+        )
+        .unwrap();
         assert_eq!(readable.into_iter().collect::<Vec<_>>(), [10, 13]);
         assert!(parse_readable("x 4004 S\n").is_err());
         let before = [10, 13, 14].into_iter().collect();
@@ -347,68 +366,122 @@ pub(crate) mod tests {
         }
     }
 
-    /// The race seen once in a full run: process 13 is readable before and
-    /// after the listing, which passed it over. Looked at again, it is
-    /// listed, or gone, or still left out: only that last is an error.
+    type Found = Result<BTreeMap<u32, Vec<String>>, ProgramsError>;
+    type Asked = Vec<Option<Vec<u32>>>;
+
+    /// The processes in `passed` are readable before and after a listing
+    /// that left them out. Each is looked at again, alone: `again` are
+    /// listed then, and `after` are still there. Gives what came of it and
+    /// which processes `lsof`, then `ps`, were asked about.
+    fn passed_over(passed: &[u32], again: &[u32], after: &[u32]) -> (Found, Asked, Asked) {
+        let me = std::process::id();
+        let around: BTreeSet<u32> = passed.iter().copied().chain([me]).collect();
+        let looks = RefCell::new(Vec::new());
+        let asked = RefCell::new(Vec::new());
+        let readable = RefCell::new(vec![
+            around.clone(),
+            around,
+            after.iter().copied().collect(),
+        ]);
+        let found = whole(
+            |only| {
+                asked.borrow_mut().push(only.map(<[u32]>::to_vec));
+                Ok(readable.borrow_mut().remove(0))
+            },
+            |only| {
+                looks.borrow_mut().push(only.map(<[u32]>::to_vec));
+                Ok(match only {
+                    None => listing(&[me]),
+                    Some(_) => listing(again),
+                })
+            },
+        );
+        (found, looks.into_inner(), asked.into_inner())
+    }
+
+    /// Looked at again, a process passed over is listed, or gone, or still
+    /// left out: only that last is an error.
     #[test]
     fn a_process_passed_over_is_looked_at_again_alone() {
-        let me = std::process::id();
-        let check = |again: &'static [u32], after_again: &'static [u32]| {
-            let looks = RefCell::new(Vec::new());
-            let readable = RefCell::new(vec![
-                BTreeSet::from([me, 13]),
-                BTreeSet::from([me, 13]),
-                after_again.iter().copied().chain([me]).collect(),
-            ]);
-            let found = whole(
-                || Ok(readable.borrow_mut().remove(0)),
-                |only| {
-                    looks.borrow_mut().push(only.map(<[u32]>::to_vec));
-                    Ok(match only {
-                        None => listing(&[me]),
-                        Some(_) => listing(again),
-                    })
-                },
-            );
-            (found, looks.into_inner())
-        };
-
-        let (found, looks) = check(&[13], &[13]);
+        let (found, looks, asked) = passed_over(&[13], &[13], &[13]);
         assert_eq!(found.unwrap()[&13], ["/p13"]);
         assert_eq!(looks, [None, Some(vec![13])]);
+        assert_eq!(asked, [None, None, Some(vec![13])]);
 
-        let (found, _) = check(&[], &[]);
+        let (found, _, _) = passed_over(&[13], &[], &[]);
         assert!(!found.unwrap().contains_key(&13));
 
-        let (found, _) = check(&[], &[13]);
+        let (found, _, _) = passed_over(&[13], &[], &[13]);
         let err = found.unwrap_err().to_string();
         assert!(
-            err.contains("then exit status: 0 looked at again, and its listings left out processes of this user it could read: 13"),
+            err.ends_with("then exit status: 0 looked at again, and its listings left out processes of this user it could read: 13"),
             "{err}"
         );
     }
 
-    /// Only an answer with nothing on stdout or stderr, exiting 1, says
-    /// every process asked for has gone.
+    /// Of several passed over, one listed the second time and one gone are
+    /// not named: only the one still left out is.
     #[test]
-    fn only_a_silent_empty_answer_says_all_have_gone() {
-        assert!(all_gone(&output(1, "", "")));
-        assert!(!all_gone(&output(1, "", "lsof: can't read")));
-        assert!(!all_gone(&output(0, "", "")));
-        assert!(!all_gone(&output(1, "p10\n", "")));
-        assert!(parse(&output(1, "", "lsof: can't read")).is_err());
+    fn only_the_process_still_left_out_is_named() {
+        let (found, looks, _) = passed_over(&[13, 14, 15], &[13], &[13, 15]);
+        assert_eq!(looks, [None, Some(vec![13, 14, 15])]);
+        let err = found.unwrap_err().to_string();
+        assert!(err.ends_with("it could read: 15"), "{err}");
     }
 
-    /// Asked again for processes that have all gone, `lsof` lists none and
-    /// exits 1: no error. Asked for this process, it lists its program.
+    /// A second look that fails says it was one, what the first exited
+    /// with, and which processes it asked about.
+    #[test]
+    fn a_failed_second_look_says_it_was_one() {
+        let me = std::process::id();
+        let around = BTreeSet::from([me, 13, 14]);
+        let err = whole(
+            |_| Ok(around.clone()),
+            |only| match only {
+                None => Ok(listing(&[me])),
+                Some(_) => Err(ProgramsError("did not answer within 5 s".to_owned())),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.ends_with("exit status: 0, and its listing left out processes of this user it could read: 13, 14; looking at them again: did not answer within 5 s"),
+            "{err}"
+        );
+    }
+
+    /// Asked for some processes, `lsof` printing nothing, on either exit it
+    /// gives then, lists none; anything else stays what it was.
+    #[test]
+    fn asked_for_some_an_empty_answer_lists_none() {
+        assert!(parse(&output(1, "", ""), true).unwrap().is_empty());
+        assert!(parse(&output(0, "", ""), true).unwrap().is_empty());
+        assert!(parse(&output(1, " \n", " \n"), true).unwrap().is_empty());
+        assert!(parse(&output(1, "", "lsof: can't read"), true).is_err());
+        assert!(parse(&output(0, "", "lsof: can't read"), true).is_err());
+        assert!(parse(&output(2, "", ""), true).is_err());
+        assert_eq!(
+            parse(&output(1, "p10\nn/x\n", ""), true).unwrap()[&10],
+            ["/x"]
+        );
+    }
+
+    /// Asked for processes that have all gone, `lsof` lists none and `ps`
+    /// shows none, and neither is an error. Asked about this process too,
+    /// `lsof` lists its program and `ps` shows it alone.
     #[test]
     fn a_second_look_at_gone_processes_lists_none() {
         let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
         let pid = gone.id();
         gone.wait().unwrap();
         assert!(list(Some(&[pid])).unwrap().files.is_empty());
+        assert!(readable_own(Some(&[pid])).unwrap().is_empty());
         let me = std::process::id();
         assert!(!list(Some(&[me, pid])).unwrap().files[&me].is_empty());
+        assert_eq!(
+            readable_own(Some(&[me, pid])).unwrap(),
+            BTreeSet::from([me])
+        );
     }
 
     /// A program in a folder whose name holds what `lsof` escapes is listed
