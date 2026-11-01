@@ -285,7 +285,7 @@ Design §15's row on network and PID namespaces, and its §14 item on the runtim
 | `dashboard-chat-check.sh`, `browser-chat.py`, `ns-conns.py` | The Chat tab as a control pair; a real Chromium driven through the listener; who holds a connection to a port, read from the host. |
 | `test_adr_status.py` | ADRs 0037 to 0040 stay proposed. CI runs it through `test_nsjoin.py`. |
 | `peerowner.py`, `test_peerowner.py` | Whose socket a connection comes from, read from `/proc/net/tcp` and `tcp6`, failing closed, and its tests on fixture tables. `host-listen.py` closes any other user's connection before a byte reaches the service. |
-| `.github/workflows/namespaces-prototype.yml` | Runs the checks on `ubuntu-latest` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
+| `.github/workflows/namespaces-prototype.yml` | Runs the checks on `ubuntu-24.04`, `ubuntu-26.04` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
 
 ### Results
 
