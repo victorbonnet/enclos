@@ -32,9 +32,8 @@ enum SandboxVerb {
         backend: BackendKind,
         /// The policy it starts from, required so the widest is never
         /// picked by leaving it out: minimal (only what is listed; from
-        /// `runtime install` on, the runtime's hosts), mcp-only (the same
-        /// for now, for assistants using remote MCP servers you allow) or
-        /// assistant (the public web) (design §7).
+        /// `runtime install` on, the runtime's hosts) or assistant (the
+        /// public web) (design §7).
         #[arg(long)]
         template: TemplateName,
     },
@@ -308,7 +307,7 @@ fn show_json(v: &SandboxView) -> Value {
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {
         println!(
-            "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|mcp-only|assistant`."
+            "No sandboxes yet. Create one with `enclos sandbox create <name> --template minimal|assistant`."
         );
         return;
     }

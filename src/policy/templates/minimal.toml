@@ -3,7 +3,9 @@
 # connection. From `enclos runtime install` on, that is the runtime
 # adapter's endpoints (for Hermes: its install sources and the
 # ChatGPT-subscription provider); add another provider's hosts, or another
-# destination, with `enclos policy allow`.
+# destination, with `enclos policy allow`, such as a remote MCP server's
+# host, then tell the runtime of it with its own commands, through
+# `enclos connect`, until `runtime configure --mcp-add` does both.
 
 [filesystem]
 write = ["{home}"]

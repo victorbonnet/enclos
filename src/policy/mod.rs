@@ -21,7 +21,6 @@ pub const DEFAULTS: &str = include_str!("templates/defaults.toml");
 /// with the runtimes it is for.
 const TEMPLATES: &[(&str, &str)] = &[
     ("minimal", include_str!("templates/minimal.toml")),
-    ("mcp-only", include_str!("templates/mcp-only.toml")),
     ("assistant", include_str!("templates/assistant.toml")),
 ];
 
@@ -272,37 +271,33 @@ mod tests {
     }
 
     #[test]
-    fn minimal_and_mcp_only_reach_only_what_is_listed() {
-        for name in ["minimal", "mcp-only"] {
-            let template: TemplateName = name.parse().unwrap();
-            let snap = resolve(&initial_overrides("lab", &template), None).unwrap();
-            assert_eq!(snap.inputs.template.as_str(), name);
-            assert_eq!(
-                snap.policy.net.mode,
-                crate::model::policy::NetMode::Allowlist
-            );
-            assert!(snap.policy.net.allow.is_empty(), "{name}");
-            assert_eq!(snap.policy.fs.write, ["{home}"]);
-            // The defaults' deny list holds under every template.
-            assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
-        }
-        assert_eq!(template_names(), ["minimal", "mcp-only", "assistant"]);
+    fn minimal_reaches_only_what_is_listed() {
+        let template: TemplateName = "minimal".parse().unwrap();
+        let snap = resolve(&initial_overrides("lab", &template), None).unwrap();
+        assert_eq!(snap.inputs.template.as_str(), "minimal");
+        assert_eq!(
+            snap.policy.net.mode,
+            crate::model::policy::NetMode::Allowlist
+        );
+        assert!(snap.policy.net.allow.is_empty());
+        assert_eq!(snap.policy.fs.write, ["{home}"]);
+        // The defaults' deny list holds under every template.
+        assert!(snap.policy.fs.read_deny.contains(&"~/.ssh".to_owned()));
+        assert_eq!(template_names(), ["minimal", "assistant"]);
     }
 
-    /// `minimal` and `mcp-only` are `assistant` with the public web closed:
-    /// the same writes, deny list and listening, and nothing else apart.
+    /// `minimal` is `assistant` with the public web closed: the same writes,
+    /// deny list and listening, and nothing else apart.
     #[test]
-    fn minimal_and_mcp_only_differ_from_assistant_only_in_the_network_mode() {
+    fn minimal_differs_from_assistant_only_in_the_network_mode() {
         let assistant = resolve(&overrides(""), None).unwrap().policy;
         assert_eq!(assistant.net.mode, crate::model::policy::NetMode::Public);
-        for name in ["minimal", "mcp-only"] {
-            let template: TemplateName = name.parse().unwrap();
-            let mut closed = resolve(&initial_overrides("home", &template), None)
-                .unwrap()
-                .policy;
-            closed.net.mode = crate::model::policy::NetMode::Public;
-            assert_eq!(closed, assistant, "{name}");
-        }
+        let template: TemplateName = "minimal".parse().unwrap();
+        let mut closed = resolve(&initial_overrides("home", &template), None)
+            .unwrap()
+            .policy;
+        closed.net.mode = crate::model::policy::NetMode::Public;
+        assert_eq!(closed, assistant);
     }
 
     /// Under `minimal`, a Hermes sandbox reaches the hosts Hermes needs to
@@ -338,7 +333,7 @@ mod tests {
         assert!(matches!(err, PolicyError::NoTemplate), "{err}");
         assert!(!err.is_refused());
         let said = err.to_string();
-        assert!(said.contains("minimal, mcp-only, assistant"), "{said}");
+        assert!(said.contains("minimal, assistant"), "{said}");
     }
 
     // The list repeats entries of `defaults.toml` on purpose: it guards against

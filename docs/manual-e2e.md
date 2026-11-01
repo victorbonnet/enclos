@@ -58,7 +58,6 @@ enclos sandbox create lab; echo "exit $?"           # no template
 enclos sandbox create --help | grep -A3 template
 enclos sandbox create lab --template assistant
 enclos sandbox create scout --template minimal
-enclos sandbox create tools --template mcp-only
 enclos --dry-run sandbox create extra --template minimal
 enclos sandbox list
 enclos sandbox show lab
@@ -66,8 +65,8 @@ enclos policy show scout
 cat "$ENCLOS_HOME/sandboxes/lab/policy.toml"
 ```
 
-- [ ] Without `--template`, `create` is a usage error (exit 1) naming `--template`, and creates nothing; its help names the three templates.
-- [ ] `lab`, `scout` and `tools` are created, each with its own proxy port; the dry run says `Would create sandbox extra`, and `extra` is not in the list.
+- [ ] Without `--template`, `create` is a usage error (exit 1) naming `--template`, and creates nothing; its help names the two templates.
+- [ ] `lab` and `scout` are created, each with its own proxy port; the dry run says `Would create sandbox extra`, and `extra` is not in the list.
 - [ ] `sandbox show lab`: `created`, policy v1, `no sessions running`.
 - [ ] `policy show scout` shows a network allowlist with nothing on it; `lab`'s `policy.toml` says `extends = "assistant"` and has empty `write_add`, `read_deny_add` and `allow_add` lists, which is where your changes go.
 
@@ -433,11 +432,10 @@ enclos exec lab -- /usr/bin/pbpaste > /dev/null; echo "pbpaste exit $?"
 ## 15. Remove everything
 
 ```bash
-enclos sandbox stop lab scout tools
+enclos sandbox stop lab scout
 enclos sandbox rm lab; echo "exit $?"       # needs confirmation
 enclos --yes sandbox rm lab
 enclos --yes sandbox rm scout
-enclos --yes sandbox rm tools
 enclos status
 launchctl list | grep "enclos\.<8 hex>\."
 ls ~/Library/LaunchAgents | grep "enclos\.<8 hex>\."
