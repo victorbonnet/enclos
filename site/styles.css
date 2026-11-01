@@ -98,6 +98,22 @@ h1 { font-size: clamp(42px, 11vw, 66px); line-height: 1.05; letter-spacing: -0.0
 .limits li { color: var(--text-muted); padding-block: 8px; }
 .limits strong { color: var(--text); font-weight: 600; }
 
+/* Guide pages */
+.doc { max-width: 760px; padding-block: 32px 64px; }
+.doc h1 { font-size: clamp(36px, 8vw, 52px); }
+.doc h2 { font-size: 24px; margin-top: 44px; }
+.doc p, .doc li { color: var(--text-muted); }
+.doc > p, .doc > ul, .doc > ol, .doc > .terminal, .doc > .table-scroll { margin-top: 14px; }
+.doc ul, .doc ol { padding-left: 22px; }
+.doc li { padding-block: 3px; }
+.doc strong { color: var(--text); font-weight: 600; }
+.doc p a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.doc :not(pre) > code { color: var(--accent); overflow-wrap: anywhere; }
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 15px; }
+th, td { padding: 10px 12px 10px 0; text-align: left; vertical-align: top; border-top: 1px solid var(--line); color: var(--text-muted); }
+th { color: var(--text); font-weight: 600; border-top: 0; }
+
 /* Footer */
 .site-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; padding-block: 20px 28px; border-top: 1px solid var(--line); font-size: 14px; color: var(--text-faint); }
 .site-footer div { display: flex; flex-wrap: wrap; gap: 0 20px; }

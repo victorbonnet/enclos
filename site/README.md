@@ -1,6 +1,6 @@
 # Website
 
-The page at <https://enclos.dev/>: what enclos does, how to install it and what to know about its limits. Keep it short: one page, leading with seeing all your agents in one place, and details left to the docs it links. It is plain HTML, CSS and JavaScript, with no build step, external font or analytics. The only request it makes is to the GitHub API, to name the latest release.
+The page at <https://enclos.dev/>: what enclos does, how to install it and what to know about its limits. Keep it short: one page, leading with seeing all your agents in one place, and details left to the two guides beside it, `getting-started.html` and `policy-compilation.html`. They are shorter versions of [getting started](../docs/getting-started.md) and [policy compilation](../docs/policy-compilation.md), written by hand: when a command or a behavior changes in those docs, change the guide too. It is plain HTML, CSS and JavaScript, with no build step, external font or analytics. The only request it makes is to the GitHub API, to name the latest release.
 
 [`pages.yml`](../.github/workflows/pages.yml) publishes this folder and [`install.sh`](../install.sh) on every change to them on `main` ([releases](../docs/releases.md#the-website)). To preview it:
 

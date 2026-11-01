@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#fafaf8">
+    <meta name="description" content="How a sandbox's policy.toml becomes what its backend enforces.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; form-action 'none'">
+    <meta name="color-scheme" content="light dark">
+    <link rel="canonical" href="https://enclos.dev/policy-compilation.html">
+    <title>How a policy compiles — enclos</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="wordmark" href="./" aria-label="enclos, home"><svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M12 4H4v8m16-8h8v8M4 20v8h8m16-8v8h-8" stroke="currentColor" stroke-width="3"/><path d="M12 12h8v8h-8z" fill="currentColor"/></svg>enclos<span class="wordmark-dot">.</span></a>
+      <nav aria-label="Main navigation">
+        <a href="./getting-started.html">Get started</a>
+        <a href="https://github.com/victorbonnet/enclos">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main" class="doc wrap">
+      <h1>How a policy compiles</h1>
+      <p class="lead">You write one small file. enclos checks it when it changes, and compiles it each time a program starts in the sandbox.</p>
+
+      <h2>1. Layers become one policy</h2>
+      <p>A sandbox’s <code>policy.toml</code> only says what differs. enclos applies four layers in order:</p>
+      <ol>
+        <li><strong>Built-in defaults:</strong> writes only to the sandbox’s home, and the list of sensitive paths it may not read.</li>
+        <li><strong>The template:</strong> <code>minimal</code>, <code>mcp-only</code> or <code>assistant</code>, which the file names with <code>extends</code>.</li>
+        <li><strong>The runtime’s needs:</strong> the hosts its install, login and model calls use.</li>
+        <li><strong>Your <code>policy.toml</code>:</strong> what you add.</li>
+      </ol>
+      <p>A list written <code>write_add</code> adds to the layers below, and one written <code>write</code> replaces them. Unknown keys are errors, so a misspelling cannot pass unnoticed.</p>
+
+      <h2>2. The policy is checked and stored</h2>
+      <p>enclos checks the result before keeping it. It refuses what it will not grant, such as dropping an entry from the sensitive list, writing to enclos’s own folders, or allowing <code>localhost</code>. It rejects what it cannot read, such as a malformed address.</p>
+      <p>A policy that passes is stored as an immutable version. <code>enclos policy history</code> lists them, and <code>enclos policy rollback</code> brings an earlier one back as a new version.</p>
+
+      <h2>3. The backend compiles it</h2>
+      <p>Each time a program starts in the sandbox, enclos takes the active version as stored, checks the sandbox’s paths as they are now, and hands the policy to the sandbox’s backend. If that backend cannot run on this computer, the command fails, with no fallback.</p>
+      <p>On macOS, the Seatbelt backend writes a file named after its content, <code>compiled/&lt;hash&gt;.sb</code>, and the program runs under it through <code>sandbox-exec</code>. Rules start from <code>(deny default)</code>, and later rules decide:</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Part of the file</th><th>What it does</th><th>From your policy?</th></tr></thead>
+        <tbody>
+          <tr><td>Writes</td><td>Denies all writes, then allows the sandbox’s home and the folders you granted</td><td>Yes</td></tr>
+          <tr><td>Sensitive paths</td><td>Denies reads and writes after the allows, so no grant reopens them</td><td>Yes</td></tr>
+          <tr><td>Network</td><td>Denies the network, then allows only the sandbox’s proxy</td><td>Only whether it may listen</td></tr>
+          <tr><td>Host services</td><td>Blocks opening apps, Apple Events, launchd jobs, the pasteboard and signals to other processes</td><td>No</td></tr>
+          <tr><td>enclos’s own files</td><td>Denies other sandboxes’ folders and enclos’s records</td><td>No</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2>4. The network stays with the proxy</h2>
+      <p>Your allowed hosts are not in the compiled file. It only sends every connection to the sandbox’s proxy, which reads the active policy for each new connection. So a change to the network applies at once, without a restart.</p>
+      <p>The compiled file is fixed for the life of a program. A change to what a sandbox may write therefore reaches running sessions only when they restart:</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>You change</th><th>New sessions</th><th>Running sessions</th></tr></thead>
+        <tbody>
+          <tr><td>Network hosts or mode</td><td>Use it</td><td>Use it at once</td></tr>
+          <tr><td>Files or listening</td><td>Use it, once it is active</td><td>Wait for <code>enclos policy apply</code></td></tr>
+        </tbody>
+      </table></div>
+
+      <h2>What a backend cannot enforce is refused</h2>
+      <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. On Seatbelt today, an <code>[exec]</code> section is refused, and so are limits on CPU time, memory, file size and CPU share.</p>
+      <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
+
+      <h2>See it for yourself</h2>
+      <div class="terminal"><pre><code><span class="comment"># the active policy: version, writes, deny list, network</span>
+<span class="command">enclos policy show lab</span>
+
+<span class="comment"># the compiled files themselves</span>
+<span class="command">ls ~/.enclos/sandboxes/lab/compiled/</span>
+
+<span class="comment"># compile it, then try known ways out from inside</span>
+<span class="command">enclos policy test lab</span></code></pre></div>
+      <p>The <a href="https://github.com/victorbonnet/enclos/blob/main/docs/policy-compilation.md">full reference</a> follows the code step by step, with a complete compiled file.</p>
+    </main>
+
+    <footer class="site-footer wrap"><span>French for an enclosure. Said “ahn-KLOH.”</span><div><a href="https://github.com/victorbonnet/enclos">Source</a><a href="https://github.com/victorbonnet/enclos/blob/main/SECURITY.md">Security</a><a href="https://github.com/victorbonnet/enclos/blob/main/LICENSE">MIT license</a></div></footer>
+  </body>
+</html>
