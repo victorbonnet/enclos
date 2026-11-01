@@ -438,6 +438,16 @@ impl Engine {
 }
 ```
 
+**Installer download**
+
+A `Downloader` gets a runtime's installer onto the host for `runtime install`; `curl` is the one enclos runs, and a test stands in for it. Nothing checks what it gets: an implementation must refuse a URL or a redirect not on HTTPS, and any version is run ([ADR 0029](adr/0029-runtime-installers-run-as-served.md)).
+
+```rust
+pub trait Downloader {
+    fn download(&self, url: &str, to: &Path) -> Result<(), DownloadFailed>;
+}
+```
+
 **Readability rules**
 
 1. One interface per file; each implementation in its own folder with its tests and fixtures.
@@ -587,7 +597,7 @@ enclos connect community -- hermes ...                     # Hermes told of the 
     (the record in state.db)   backend, template, runtime, agents, created_at (ADR 0010; no sandbox.toml)
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
     compiled/<digest>.<ext>                 what the backend received (.sb, bwrap argv), named by its text's digest
-    installers/                the runtime's installer and files for the home, checked on the host; the sandbox reads, never writes them
+    installers/                the runtime's installer, named by its hash, and files for the home, put there from the host; the sandbox reads, never writes them
     home/                      the runtime's home: agents, skills, environments, bin/, caches, tmp/
     logs/                      its services' output
 ```

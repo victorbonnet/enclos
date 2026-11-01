@@ -47,7 +47,7 @@ pub use session::{Left, SessionEnd};
 pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use staging::home_files_script;
-pub use staging::{Curl, DownloadFailed, Downloader};
+use staging::{Curl, Downloader};
 pub use state_check::{Finding, Remedy, Repair, Subject};
 pub use status::{
     AgentKind, AgentList, AgentStatus, Disk, Fact, IDLE_DAYS, NetworkListener, Presence,
@@ -210,7 +210,8 @@ impl Engine {
     }
 
     /// The same engine with another way to download an installer.
-    pub fn with_downloader(mut self, downloader: Box<dyn Downloader>) -> Engine {
+    #[cfg(test)]
+    pub(crate) fn with_downloader(mut self, downloader: Box<dyn Downloader>) -> Engine {
         self.downloader = downloader;
         self
     }

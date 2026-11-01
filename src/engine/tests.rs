@@ -17,8 +17,28 @@ fn engine_with(backends: Vec<Box<dyn Backend>>) -> (TempDir, Engine) {
     let layout = Layout::at(dir.path().join("enclos"));
     let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
     let audit = JsonlAuditLog::new(layout.audit_log());
-    let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends);
+    let engine = Engine::new(layout, Box::new(state), Box::new(audit), backends)
+        .with_downloader(Box::new(LocalFiles));
     (dir, engine)
+}
+
+/// Copies a test's `file://` installer, which curl refuses, and leaves any
+/// other URL to curl.
+struct LocalFiles;
+
+impl super::staging::Downloader for LocalFiles {
+    fn download(
+        &self,
+        url: &str,
+        to: &std::path::Path,
+    ) -> std::result::Result<(), super::staging::DownloadFailed> {
+        match url.strip_prefix("file://") {
+            Some(from) => std::fs::copy(from, to)
+                .map(|_| ())
+                .map_err(|e| super::staging::DownloadFailed::NotRun(format!("{from}: {e}"))),
+            None => super::staging::Curl.download(url, to),
+        }
+    }
 }
 
 fn engine() -> (TempDir, Engine) {

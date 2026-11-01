@@ -14,7 +14,7 @@ use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
 
 use super::Engine;
-use super::runtime::{Added, AgentAdded, hex};
+use super::runtime::{Added, AgentAdded};
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::model::agent::AgentName;
@@ -396,7 +396,11 @@ fn stream(file: &mut File, mut sink: Option<&mut File>) -> std::io::Result<Strin
             sink.write_all(&buffer[..n])?;
         }
     }
-    Ok(hex(&hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// The path of an opened file, from the file itself, with every link

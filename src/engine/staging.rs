@@ -1,20 +1,18 @@
 //! What an install puts beside the sandbox's home: the adapter's files and
 //! the runtime's installer, downloaded on the host (ADR 0029). The compiled
-//! policy denies the sandbox writes there, which is what keeps the host's
-//! plain writes from following a link the sandbox planted.
+//! policy denies the sandbox writes to `installers/`, which is what keeps
+//! the host's plain writes from following a link the sandbox planted.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sha2::{Digest, Sha256};
-
 use super::Engine;
-use super::runtime::hex;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
+use crate::policy::sha256_hex;
 use crate::runtime::{HomeFile, RuntimeAdapter, SandboxCommand};
 
 /// An installer larger than this is not an install script: refused.
@@ -22,8 +20,9 @@ const INSTALLER_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Gets a file onto the host.
 pub trait Downloader {
-    /// Downloads `url` to `to`, over HTTPS only. A failure may leave part
-    /// of it at `to`.
+    /// Downloads `url` to `to`. An implementation must refuse a URL or a
+    /// redirect not on HTTPS with [`DownloadFailed::NotHttps`]: nothing else
+    /// checks. A failure may leave part of the file at `to`.
     fn download(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed>;
 }
 
@@ -32,7 +31,7 @@ pub trait Downloader {
 pub enum DownloadFailed {
     /// The downloader could not run: what stopped it, said whole.
     NotRun(String),
-    /// The URL or a redirect is not on HTTPS.
+    /// Refused, as not on HTTPS: the URL or a redirect.
     NotHttps,
     /// It ran and failed: how it ended.
     Ended(String),
@@ -44,14 +43,15 @@ pub struct Curl;
 impl Downloader for Curl {
     fn download(&self, url: &str, to: &Path) -> std::result::Result<(), DownloadFailed> {
         let status = Command::new("/usr/bin/curl")
-            .args(download_args(url, to, cfg!(test)))
+            .args(download_args(url, to))
             .stdin(Stdio::null())
             .status()
             .map_err(|e| DownloadFailed::NotRun(format!("cannot run curl: {e}")))?;
         match status.code() {
             _ if status.success() => Ok(()),
             // curl exits 1, unsupported protocol, when `--proto` or
-            // `--proto-redir` refuses the URL or a redirect.
+            // `--proto-redir` refuses the URL or a redirect; it says what
+            // it refused itself, and exits 1 too on an HTTP/0.9 reply.
             Some(1) => Err(DownloadFailed::NotHttps),
             _ => Err(DownloadFailed::Ended(status.to_string())),
         }
@@ -150,7 +150,7 @@ fn download_installer(
     }
     let bytes =
         std::fs::read(&part).map_err(|e| failed(format!("cannot read {}: {e}", part.display())))?;
-    let sha256 = hex(&Sha256::digest(&bytes));
+    let sha256 = sha256_hex(&bytes);
     let path = dir.join(format!("{}-install-{sha256}.sh", runtime.kind()));
     std::fs::rename(&part, &path).map_err(|e| {
         failed(format!(
@@ -189,18 +189,12 @@ pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
 /// `out`. `-q` comes first, the only place curl reads it, so no `.curlrc`
 /// adds options; curl's environment variables, such as `https_proxy`, still
 /// apply. The download and every redirect must stay on HTTPS, so curl
-/// refuses any other URL, except a `file://` one when `allow_file` is set:
-/// only this crate's tests set it, to install from a file.
-fn download_args(url: &str, out: &Path, allow_file: bool) -> Vec<OsString> {
-    let proto = if allow_file && url.starts_with("file://") {
-        "=file"
-    } else {
-        "=https"
-    };
+/// refuses any other URL.
+fn download_args(url: &str, out: &Path) -> Vec<OsString> {
     vec![
         "-q".into(),
         "--proto".into(),
-        proto.into(),
+        "=https".into(),
         "--proto-redir".into(),
         "=https".into(),
         "-fsSL".into(),
@@ -256,7 +250,7 @@ mod tests {
             then: Ok(()),
         };
         let (path, sha256) = download_installer(&stub, dir.path(), &Hermes).unwrap();
-        assert_eq!(sha256, hex(&Sha256::digest(b"echo hi\n")));
+        assert_eq!(sha256, sha256_hex(b"echo hi\n"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo hi\n");
         assert_eq!(left(dir.path()), [format!("hermes-install-{sha256}.sh")]);
     }
@@ -338,7 +332,7 @@ mod tests {
             "https://example.com/install.sh",
             "http://example.com/install.sh",
         ] {
-            let args = download_args(url, Path::new("/tmp/x.part"), false);
+            let args = download_args(url, Path::new("/tmp/x.part"));
             let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
             // curl reads `-q` only as its first argument.
             assert_eq!(args[0], "-q", "{args:?}");
@@ -356,17 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn a_release_build_refuses_an_installer_url_to_a_file() {
-        let args = download_args("file:///etc/hosts", Path::new("/tmp/x.part"), false);
-        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
-        assert!(
-            args.windows(2).any(|w| w == ["--proto", "=https"]),
-            "{args:?}"
+    fn an_installer_url_to_a_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("install.sh");
+        std::fs::write(&src, "echo hi\n").unwrap();
+        let url = format!("file://{}", src.display());
+        assert_eq!(
+            Curl.download(&url, &dir.path().join("x.part")),
+            Err(DownloadFailed::NotHttps)
         );
-        assert!(!args.contains(&"=file"), "{args:?}");
-        // Only a `file://` URL gets the tests' exception.
-        let args = download_args("http://example.com/x", Path::new("/tmp/x.part"), true);
-        assert!(!args.contains(&OsString::from("=file")), "{args:?}");
     }
 
     #[test]
@@ -393,7 +385,11 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
-        let args = download_args(&url, &out, true);
+        // The real arguments, but for the protocol: a file needs no server.
+        let args: Vec<OsString> = download_args(&url, &out)
+            .into_iter()
+            .map(|a| if a == "=https" { "=file".into() } else { a })
+            .collect();
         assert!(!curl(&args).contains("CURLRC-READ"));
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "echo hi\n");
         // Without `-q` the same curl reads it, so the check above can fail.

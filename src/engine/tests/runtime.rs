@@ -784,7 +784,6 @@ fn removing_an_agent_runs_the_runtimes_delete_then_removes_the_record() {
 #[cfg(target_os = "macos")]
 #[test]
 fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded() {
-    use sha2::{Digest, Sha256};
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
     done(lab.install(INSTALLS, Confirm::Yes).unwrap());
@@ -792,7 +791,7 @@ fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded()
     let bytes: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
     let archive = lab._dir.path().join("main-20261020.tar.gz");
     std::fs::write(&archive, &bytes).unwrap();
-    let sha256 = crate::engine::runtime::hex(&Sha256::digest(&bytes));
+    let sha256 = crate::policy::sha256_hex(&bytes);
     let installers = lab.engine.layout.sandbox_dir("home").join("installers");
     let staged = installers.join(format!("agent-main.{}.tar.gz", std::process::id()));
     let planned = installers.join("agent-main.<pid>.tar.gz");

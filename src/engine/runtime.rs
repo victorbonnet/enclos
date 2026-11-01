@@ -926,8 +926,3 @@ fn needs_confirmation(kind: RuntimeKind, name: &SandboxName, also: &[String]) ->
         ),
     }
 }
-
-/// `bytes` as lowercase hex: how enclos writes a SHA-256.
-pub(super) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
