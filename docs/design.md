@@ -181,7 +181,7 @@ mode = "allowlist"                       # only what is listed; the assistant te
 allow_add = ["api.telegram.org", "printer.lan"]
 private = ["printer.lan"]                # must also be allowed; unlocks private ranges only for these hosts
 log = "metadata"                         # per tunnel: host, port, address, server name, bytes, duration; never contents
-listen = false                           # TCP listening, any port but the proxy ports (ADR 0028); the Hermes adapter sets true
+# listen = true                          # TCP listening, any port but the proxy ports (ADR 0028); the Hermes adapter sets it, and false stops its gateway
 
 [resources]                              # fixed at each process's start; Seatbelt enforces only open_files
 open_files = 1024
@@ -189,7 +189,7 @@ open_files = 1024
 [secrets]                                # every session in the sandbox receives these
 env = { API_TOKEN = "secret:home/api" }
 
-[secrets.agents.main]                    # this agent alone; a bot's token goes here
+[secrets.agents.main]                    # for this agent's service; a bot's token goes here
 env = { TELEGRAM_BOT_TOKEN = "secret:home/telegram" }
 ```
 

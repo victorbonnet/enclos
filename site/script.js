@@ -25,7 +25,7 @@ fetch("https://api.github.com/repos/victorbonnet/enclos/releases/latest", {
     if (!response.ok) return;
     const { tag_name: tag } = await response.json();
     if (typeof tag === "string" && /^v\d+\.\d+\.\d+$/.test(tag)) {
-      document.getElementById("release-state").textContent = "Latest release: " + tag;
+      document.getElementById("release-state").textContent = "Latest release: " + tag + ".";
     }
   })
   .catch(() => {});

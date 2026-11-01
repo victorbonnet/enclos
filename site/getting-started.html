@@ -47,7 +47,7 @@
 <span class="comment"># Hermes's own setup: your provider, its login, a model</span>
 <span class="command">enclos connect lab -- hermes -p default setup</span></code></pre></div>
       <p>The install runs inside the sandbox, through its proxy, so it can write only to the sandbox’s home. The sandbox cannot open a browser: when the login shows a URL, open it in your browser yourself. Every agent in the sandbox shares this login.</p>
-      <p>The <code>assistant</code> template reaches the public web on ports 80 and 443, and logs every connection. To start with only the hosts Hermes needs, use <code>--template minimal</code>. See <a href="./policy-compilation.html#templates">what each template can do</a>.</p>
+      <p>The <code>assistant</code> template reaches the public web on ports 80 and 443, and logs every connection as long as enclos can write its state. To start closed, use <code>--template minimal</code>: it reaches Hermes’s install sources and the ChatGPT subscription’s hosts, and another provider’s hosts need <code>enclos policy allow</code>. See <a href="./policy-compilation.html#templates">what each template can do</a>.</p>
 
       <h2>Add agents</h2>
       <p>Hermes comes with a built-in agent, <code>default</code>. Add more with one command:</p>
@@ -85,7 +85,7 @@
 <span class="comment"># what is in force, and every version so far</span>
 <span class="command">enclos policy show lab</span>
 <span class="command">enclos policy history lab</span></code></pre></div>
-      <p>Set <code>mode = "allowlist"</code> under <code>[network]</code> to keep a sandbox to the hosts you list. A change to the network applies at once. A change to what the sandbox may write waits for you while sessions run; <code>enclos policy apply lab</code> restarts the sandbox into it. <a href="./policy-compilation.html">How a policy compiles</a> explains why, and lists <a href="./policy-compilation.html#settings">every setting</a>.</p>
+      <p>Set <code>mode = "allowlist"</code> under <code>[network]</code> to keep a sandbox to the hosts you list and those its runtime needs. A change to the network applies at once. A change to what the sandbox may write waits as the pending policy while sessions run; <code>enclos --yes policy apply lab</code> restarts the sandbox into it. <a href="./policy-compilation.html">How a policy compiles</a> explains why, and lists <a href="./policy-compilation.html#settings">every setting</a>.</p>
 
       <h2>Run more than one</h2>
       <p>To add a sandbox, repeat the steps with another name. Each one has its own Hermes install, login, policy and proxy, and cannot read the others’ files.</p>
@@ -104,12 +104,15 @@
 <span class="command">enclos audit verify</span></code></pre></div>
 
       <h2>Give an agent a Telegram bot</h2>
-      <p>Secrets live in your Keychain, never in the sandbox’s files. Store the token from @BotFather, grant it to one agent, then connect the channel:</p>
+      <p>Secrets live in your Keychain. While a service runs, enclos writes what it is granted to a file outside the sandbox’s home that no other sandbox reads; every agent in the sandbox can read it. Store the token from @BotFather, grant it to one agent, then connect the channel:</p>
       <div class="terminal"><pre><code><span class="command">enclos secret set lab/main-telegram</span>
 
 <span class="comment"># under [secrets.agents.main] add:</span>
 <span class="comment"># env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</span>
 <span class="command">enclos policy edit lab</span>
+
+<span class="comment"># the sandbox is running, so the grant waits for this</span>
+<span class="command">enclos --yes policy apply lab</span>
 
 <span class="command">enclos runtime configure lab/main --channel telegram --allow-user &lt;your Telegram id&gt;</span>
 <span class="command">enclos sandbox start lab</span></code></pre></div>
@@ -119,10 +122,10 @@
 <span class="command">enclos sandbox stop lab</span>
 
 <span class="comment"># the sandbox and its home, with Hermes and its login</span>
-<span class="command">enclos sandbox rm lab</span></code></pre></div>
+<span class="command">enclos sandbox rm lab --yes</span></code></pre></div>
 
       <h2>What does not work yet</h2>
-      <p>Chromium does not start inside a sandbox yet, so Hermes’s browser tools are unavailable. The <a href="https://github.com/victorbonnet/enclos/releases/latest">release notes</a> list every known gap, and the <a href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md">full guide</a> covers the rest, such as bringing an agent from your Mac.</p>
+      <p>Chromium does not start inside a sandbox yet, so Hermes’s browser tools are unavailable. The <a href="https://github.com/victorbonnet/enclos/releases/latest">release notes</a> list every known gap, and the <a href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md">full guide</a> covers the rest, such as bringing in an agent you already run.</p>
     </main>
 
     <footer class="site-footer wrap"><span>French for an enclosure. Said “ahn-KLOH.”</span><div><a href="https://github.com/victorbonnet/enclos">Source</a><a href="https://github.com/victorbonnet/enclos/blob/main/SECURITY.md">Security</a><a href="https://github.com/victorbonnet/enclos/blob/main/LICENSE">MIT license</a></div></footer>

@@ -38,7 +38,7 @@
             <button class="copy-button" id="copy-install" type="button" hidden>Copy</button>
           </div>
           <span id="copy-status" class="sr-only" role="status"></span>
-          <p class="today"><span id="release-state">Latest release</span>. Today: Hermes on macOS. Next: Linux, OpenClaw.</p>
+          <p class="today">Today: Hermes on macOS. Next: Linux, OpenClaw. <span id="release-state"></span></p>
         </div>
 
         <figure class="terminal">
@@ -46,14 +46,13 @@
 2 sandboxes, 3 agents, 5.1 GB in ~/.enclos
 
 lab   running   Hermes, logged in
-  proxy running, gateway running
-  policy v2 · last network 3m ago
+  proxy running, gateway running · policy v2 · last connect 3m ago · last network 3m ago
   AGENT    LAST ACTIVE      SIZE
   default  2h ago         1.2 MB
   main     3m ago        18.4 MB
 
 work  stopped   Hermes, logged in
-  policy v1 · last network 2d ago
+  policy v1 · last connect 2d ago · last network 2d ago
   AGENT    LAST ACTIVE      SIZE
   default  2d ago         6.3 MB</code></pre>
           <figcaption>Example output, shortened.</figcaption>
@@ -147,10 +146,10 @@ allow_add = ["api.telegram.org"]</code></pre>
       <section class="limits wrap" aria-labelledby="limits-heading">
         <h2 id="limits-heading">Worth knowing</h2>
         <ul>
-          <li><strong>It limits accidents.</strong> enclos is for buggy or misled agents you mostly trust. It is not a defense against malicious code exploiting the kernel.</li>
-          <li><strong>Reads are broad.</strong> An agent writes only to its own home, but reads your files, except sensitive paths such as SSH keys.</li>
-          <li><strong>The web is open by default.</strong> An agent can send what it reads to a public website. Allowlist mode keeps it to the sites you choose and those its runtime needs.</li>
-          <li><strong>Logs show where, not what.</strong> The proxy records where an HTTPS connection goes, not its content.</li>
+          <li><strong>It limits accidents.</strong> enclos is for buggy or misled agents you mostly trust. It is not designed to contain malicious code that exploits the kernel or works hard to evade the sandbox.</li>
+          <li><strong>Reads are broad.</strong> A sandbox writes only to its own home and the folders you grant, but reads your files, except sensitive paths such as SSH keys.</li>
+          <li><strong>The <code>assistant</code> template opens the web.</strong> An agent there can send what it reads to a public website. Allowlist mode keeps it to the sites you choose and those its runtime needs.</li>
+          <li><strong>Logs show where, not what.</strong> The proxy records where an HTTPS connection goes, not its content, as long as enclos can write its state.</li>
           <li><strong>Agents share their sandbox.</strong> Use separate sandboxes for agents that need different access.</li>
         </ul>
         <p><a class="text-link" href="https://github.com/victorbonnet/enclos/blob/main/docs/adr/0014-threat-model-accidental-damage.md">Threat model <span aria-hidden="true">↗</span></a> <a class="text-link" href="https://github.com/victorbonnet/enclos/releases/latest">Known gaps <span aria-hidden="true">↗</span></a></p>

@@ -70,13 +70,13 @@ A sandbox starts from a template, named when it is created (`--template`) and ke
 - **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
 - **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
 
-Under every template, each connection goes through the sandbox's proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
+Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
 
 A `coding` template is planned (design §7) and does not exist yet.
 
 ## Every setting
 
-A `policy.toml` holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox's file with `enclos policy edit <sandbox>`; `enclos policy show <sandbox>` prints what it resolves to.
+A `policy.toml` holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox's file with `enclos policy edit <sandbox>`; `enclos policy show <sandbox>` prints the policy in force.
 
 ```toml
 extends = "assistant"
@@ -107,16 +107,18 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | --- | --- | --- |
 | `extends` | `minimal`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
 
-**`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. A change waits for sessions to restart.
+**`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
 | `write` | a list of paths | `["{home}"]` | Replaces the folders the sandbox may write. The home stays writable either way. |
-| `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders. Malformed: a folder inside the home, already writable. |
+| `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders, and a folder inside the home or another workspace. Malformed: a folder at or inside a deny-list path. |
 | `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
 | `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
 
-**`[network]`.** A change to `mode`, the lists or `log` applies at once; a change to `listen` waits for sessions to restart. A destination is `host`, `host:port` or `*.domain`, for its subdomains; the port is 443 unless written. A wildcard over everything (`*`) or a public suffix (`*.com`), and `localhost`, loopback or link-local addresses, are refused.
+There is no `read` list and no `write_deny` ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are open except `read_deny`, since agents and the tools they install read paths nobody can list upfront. Writes are closed except `write`, so there is nothing to deny, and a `read_deny` path refuses writes too.
+
+**`[network]`.** A change to `mode`, the lists or `log` applies at once, unless the same edit changes files, `listen`, secrets or limits: then it all waits as the pending policy while sessions run, as a change to `listen` does. A destination is a full domain name or an IP address, or `*.domain` for its subdomains, with `:port` when it is not 443. A wildcard over everything (`*`) or a public suffix (`*.com`), and `localhost`, loopback or link-local addresses, are refused; a private address needs `private`, and a single-label name such as `intranet` is malformed.
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
@@ -128,17 +130,17 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
 | `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. |
 
-**`[resources]`.** A limit is fixed when a process starts, so a change waits for sessions to restart. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
+**`[resources]`.** A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
 
 | Setting | Accepts | On Seatbelt |
 | --- | --- | --- |
-| `open_files` | 16 to 1048576 | Enforced, up to macOS's own ceiling for a process. |
+| `open_files` | 16 to 1048576 | Enforced. Above macOS's own ceiling for a process (`kern.maxfilesperproc`), it is refused. |
 | `file_size` | bytes, or `512K`, `100M`, `1G` | Refused. |
 | `cpu_seconds` | a number of seconds | Refused. |
 | `memory` | any value | Refused. |
 | `cpu` | any value | Refused. |
 
-**`[secrets]` and `[secrets.agents.<agent>]`.** Each grant maps a variable to `secret:<sandbox>/<name>`, a secret of this sandbox already stored with `enclos secret set`. A variable uses letters, digits and `_`, and not one enclos sets itself, such as `PATH`. A change waits for sessions to restart.
+**`[secrets]` and `[secrets.agents.<agent>]`.** Each grant maps a variable to `secret:<sandbox>/<name>`, a secret of this sandbox already stored with `enclos secret set`. A variable uses letters, digits and `_`, and not one enclos sets itself, such as `PATH`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
 
 | Setting | Accepts | Notes |
 | --- | --- | --- |
@@ -147,7 +149,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 | `agents.<agent>.env` | a table of grants | Replaces what one agent is granted. A bot's token goes here, never to the whole sandbox. |
 | `agents.<agent>.env_add` | a table of grants | Adds to them. |
 
-A variable granted to the whole sandbox cannot also be granted to an agent. An `[exec]` section is refused: no backend enforces it yet.
+A variable granted to the whole sandbox cannot also be granted to an agent. An `[exec]` section is an error: no backend enforces rules on programs yet.
 
 ## Stage 1: resolving the layers
 
@@ -349,11 +351,11 @@ compiles to this file, shortened where marked with `…` (generated by `seatbelt
 | Change | New sessions | Sessions already running |
 | --- | --- | --- |
 | `network.allow`, `network.private`, `network.mode` | the new active snapshot | at once: the proxy reads the active snapshot for each new connection |
-| `filesystem.*`, `network.listen` | a new compiled file, once the change is active: while sessions run, it waits as the pending policy | keep the file they started with until `policy apply` restarts them; `sandbox show` flags them when the active policy compiles to another file than the one they started with |
+| `filesystem.*`, `network.listen`, secrets, `resources` | a new compiled file or the new grants and limits, once the change is active: while sessions run, it waits as the pending policy | keep the file they started with until `policy apply` restarts them; `sandbox show` flags them when the active policy compiles to another file than the one they started with |
 | A new enclos version with changed compiler rules | a new compiled file, from the same snapshot | keep the file they started with |
 | A new enclos version with a changed template or built-in defaults | nothing until a command stores a new snapshot, which lists the change | nothing |
 
-A change to the filesystem rules or `listen` reaches running sessions only through `policy apply`, or the change made with `--yes`; `sandbox restart` restarts them under the active policy, leaving a pending change waiting. After an upgrade, `policy refresh` resolves the active policy's `policy.toml` again against the new templates, defaults and adapter, and lists what that changes before applying it; until then, or until another command stores a new snapshot (which lists the change), nothing changes. `policy rollback --to <version>` makes an earlier snapshot active again as a new version, through the same restart rules.
+A change to the filesystem rules, `listen`, the secrets or the limits reaches running sessions only through `policy apply`, or the change made with `--yes`; `sandbox restart` restarts them under the active policy, leaving a pending change waiting. After an upgrade, `policy refresh` resolves the active policy's `policy.toml` again against the new templates, defaults and adapter, and lists what that changes before applying it; until then, or until another command stores a new snapshot (which lists the change), nothing changes. `policy rollback --to <version>` makes an earlier snapshot active again as a new version, through the same restart rules.
 
 ## Errors
 

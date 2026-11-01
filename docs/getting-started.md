@@ -149,12 +149,12 @@ To add a second sandbox, repeat the steps with another name. Each sandbox has it
 
 ```bash
 enclos sandbox stop lab      # every service, session and process of the sandbox
-enclos sandbox rm lab        # the sandbox and its home, with Hermes and its login
+enclos sandbox rm lab --yes  # the sandbox and its home, with Hermes and its login
 ```
 
 ## Give an agent a bot, or any secret it needs
 
-Secrets live in your Keychain, never in the sandbox's files. `enclos secret set lab/<name>` stores one, typed without echo; the policy grants it, with `enclos policy edit lab`, either to every session and service of the sandbox (`[secrets] env = { NAME = "secret:lab/<name>" }`) or to one agent alone (`[secrets.agents.main] env = { NAME = "secret:lab/<name>" }`). `enclos sandbox rm` removes the sandbox's secrets too.
+Secrets live in your Keychain. While a service runs, enclos writes what it is granted to a file outside the sandbox's home that no other sandbox reads; every agent in the sandbox can read it. `enclos secret set lab/<name>` stores one, typed without echo; the policy grants it, with `enclos policy edit lab`, either to every session and service of the sandbox (`[secrets] env = { NAME = "secret:lab/<name>" }`) or to one agent alone (`[secrets.agents.main] env = { NAME = "secret:lab/<name>" }`). `enclos sandbox rm` removes the sandbox's secrets too.
 
 Each agent can have a Telegram bot of its own:
 
@@ -162,6 +162,7 @@ Each agent can have a Telegram bot of its own:
 enclos secret set lab/main-telegram     # the bot's token, from @BotFather
 enclos policy edit lab                  # [secrets.agents.main]
                                         # env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
+enclos --yes policy apply lab           # if the sandbox is running, as the grant waits for this
 enclos runtime configure lab/main --channel telegram --allow-user <your Telegram id>
 enclos sandbox start lab                # the gateway serves every agent's bot
 ```

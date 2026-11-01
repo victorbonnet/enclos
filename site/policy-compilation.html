@@ -31,7 +31,7 @@
       <ol>
         <li><strong>Built-in defaults:</strong> writes only to the sandbox’s home, and the list of sensitive paths it may not read.</li>
         <li><strong>The template:</strong> <code>minimal</code> or <code>assistant</code>, which the file names with <code>extends</code>.</li>
-        <li><strong>The runtime’s needs:</strong> the hosts its install, login and model calls use.</li>
+        <li><strong>The runtime’s needs:</strong> the hosts it lists for its install, login and model calls.</li>
         <li><strong>Your <code>policy.toml</code>:</strong> what you add.</li>
       </ol>
       <p>A list written <code>write_add</code> adds to the layers below, and one written <code>write</code> replaces them. Unknown keys are errors, so a misspelling cannot pass unnoticed.</p>
@@ -48,15 +48,15 @@
         <tbody>
           <tr><td>Writes</td><td>Denies all writes, then allows the sandbox’s home and the folders you granted</td><td>Yes</td></tr>
           <tr><td>Sensitive paths</td><td>Denies reads and writes after the allows, so no grant reopens them</td><td>Yes</td></tr>
-          <tr><td>Network</td><td>Denies the network, then allows only the sandbox’s proxy</td><td>Only whether it may listen</td></tr>
+          <tr><td>Network</td><td>Denies the network, then allows the sandbox’s proxy, and what a runtime’s listening needs</td><td>Only whether it may listen</td></tr>
           <tr><td>Host services</td><td>Blocks opening apps, Apple Events, launchd jobs, the pasteboard and signals to other processes</td><td>No</td></tr>
           <tr><td>enclos’s own files</td><td>Denies other sandboxes’ folders and enclos’s records</td><td>No</td></tr>
         </tbody>
       </table></div>
 
       <h2>4. The network stays with the proxy</h2>
-      <p>Your allowed hosts are not in the compiled file. It only sends every connection to the sandbox’s proxy, which reads the active policy for each new connection. So a change to the network applies at once, without a restart.</p>
-      <p>The compiled file is fixed for the life of a program. A change to what a sandbox may write therefore reaches running sessions only when they restart:</p>
+      <p>Your allowed hosts are not in the compiled policy. It only sends every connection to the sandbox’s proxy, which reads the active policy for each new connection. So a change to the network applies at once, without a restart.</p>
+      <p>A compiled policy is fixed for the life of a program. So a change to what a sandbox may write waits as the pending policy while sessions run:</p>
       <div class="table-scroll"><table>
         <thead><tr><th>You change</th><th>New sessions</th><th>Running sessions</th></tr></thead>
         <tbody>
@@ -66,7 +66,7 @@
       </table></div>
 
       <h2>What a backend cannot enforce is refused</h2>
-      <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. On Seatbelt today, an <code>[exec]</code> section is refused, and so are limits on CPU time, memory, file size and CPU share.</p>
+      <p>enclos refuses what a backend cannot enforce, rather than keep it and ignore it. Seatbelt holds a process to its open files only, so limits on CPU time, memory, file size and CPU share are refused. No backend enforces rules on programs yet, so an <code>[exec]</code> section is an error.</p>
       <p>The same <code>policy.toml</code> is meant to compile for every backend, each with a compiler of its own. Only Seatbelt ships today, so this is the design, not yet shown. bubblewrap on Linux is next.</p>
 
       <h2 id="templates">The templates</h2>
@@ -91,7 +91,7 @@
         <li><strong><code>minimal</code></strong> reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes, that is its install sources and the ChatGPT subscription’s hosts; another model provider’s hosts need <code>enclos policy allow</code>. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server’s host, then tell the runtime of it with its own commands.</li>
         <li><strong><code>assistant</code></strong> adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.</li>
       </ul>
-      <p>Under every template, each connection goes through the sandbox’s proxy and is logged. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
+      <p>Under every template, each connection goes through the sandbox’s proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. A runtime’s hosts can be broad: Hermes’s include <code>github.com</code> and <code>storage.googleapis.com</code>, which could carry data out.</p>
 
       <h2 id="settings">Every setting</h2>
       <p>A <code>policy.toml</code> holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox’s file with <code>enclos policy edit lab</code>.</p>
@@ -125,19 +125,20 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       </table></div>
 
       <h3>[filesystem]</h3>
-      <p>A path starts with <code>/</code>, <code>~</code>, <code>{home}</code> or <code>{tmp}</code>. A change waits for sessions to restart.</p>
+      <p>A path starts with <code>/</code>, <code>~</code>, <code>{home}</code> or <code>{tmp}</code>. While sessions run, a change waits as the pending policy until <code>enclos policy apply</code> restarts the sandbox into it.</p>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
           <tr><td><code>write</code></td><td>paths</td><td>Replaces the folders the sandbox may write. Its home stays writable either way.</td></tr>
-          <tr><td><code>write_add</code></td><td>paths</td><td>Adds folders. Each must exist before the sandbox uses it. enclos’s own folders are refused.</td></tr>
+          <tr><td><code>write_add</code></td><td>paths</td><td>Adds folders. Each must exist before the sandbox uses it. enclos’s own folders and folders inside the home are refused.</td></tr>
           <tr><td><code>read_deny</code></td><td>paths</td><td>Replaces the sensitive list, and must keep every built-in entry, so use <code>read_deny_add</code>.</td></tr>
           <tr><td><code>read_deny_add</code></td><td>paths</td><td>Adds paths the sandbox may neither read nor write.</td></tr>
         </tbody>
       </table></div>
+      <p>There is no <code>read</code> list and no <code>write_deny</code>. Reads are open except <code>read_deny</code>, since agents and the tools they install read paths nobody can list upfront. Writes are closed except <code>write</code>, so there is nothing to deny, and a <code>read_deny</code> path refuses writes too.</p>
 
       <h3>[network]</h3>
-      <p>A destination is <code>host</code>, <code>host:port</code> or <code>*.domain</code>, for its subdomains; the port is 443 unless written. <code>*</code>, <code>*.com</code>, <code>localhost</code> and loopback addresses are refused. A change applies at once, except <code>listen</code>, which waits for sessions to restart.</p>
+      <p>A destination is a full domain name or an IP address, or <code>*.domain</code> for its subdomains, with <code>:port</code> when it is not 443. <code>*</code>, <code>*.com</code>, <code>localhost</code> and loopback addresses are refused, and a private address needs <code>private</code>. A change applies at once, unless it touches <code>listen</code> or the same edit changes files, secrets or limits: then it all waits as the pending policy while sessions run.</p>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
@@ -152,11 +153,11 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       </table></div>
 
       <h3>[resources]</h3>
-      <p>A limit is fixed when a process starts, so a change waits for sessions to restart.</p>
+      <p>A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until <code>enclos policy apply</code> restarts the sandbox into it.</p>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>On Seatbelt</th></tr></thead>
         <tbody>
-          <tr><td><code>open_files</code></td><td>16 to 1048576</td><td>Enforced, up to macOS’s own ceiling.</td></tr>
+          <tr><td><code>open_files</code></td><td>16 to 1048576</td><td>Enforced. Above macOS’s own ceiling, it is refused.</td></tr>
           <tr><td><code>file_size</code></td><td>bytes, or <code>512K</code>, <code>100M</code>, <code>1G</code></td><td>Refused.</td></tr>
           <tr><td><code>cpu_seconds</code></td><td>seconds</td><td>Refused.</td></tr>
           <tr><td><code>memory</code></td><td>any value</td><td>Refused.</td></tr>
@@ -165,7 +166,7 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       </table></div>
 
       <h3>[secrets] and [secrets.agents.&lt;agent&gt;]</h3>
-      <p>A grant maps a variable to <code>secret:&lt;sandbox&gt;/&lt;name&gt;</code>, a secret of this sandbox stored first with <code>enclos secret set</code>. Variables enclos sets itself, such as <code>PATH</code>, are refused. A change waits for sessions to restart.</p>
+      <p>A grant maps a variable to <code>secret:&lt;sandbox&gt;/&lt;name&gt;</code>, a secret of this sandbox stored first with <code>enclos secret set</code>. Variables enclos sets itself, such as <code>PATH</code>, are refused. While sessions run, a change waits as the pending policy until <code>enclos policy apply</code> restarts the sandbox into it.</p>
       <div class="table-scroll"><table>
         <thead><tr><th>Setting</th><th>Accepts</th><th>Notes</th></tr></thead>
         <tbody>
@@ -180,12 +181,12 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
       <div class="terminal"><pre><code><span class="comment"># the active policy: version, writes, deny list, network</span>
 <span class="command">enclos policy show lab</span>
 
-<span class="comment"># the compiled files themselves</span>
+<span class="comment"># the compiled policies themselves</span>
 <span class="command">ls ~/.enclos/sandboxes/lab/compiled/</span>
 
 <span class="comment"># compile it, then try known ways out from inside</span>
 <span class="command">enclos policy test lab</span></code></pre></div>
-      <p>The <a href="https://github.com/victorbonnet/enclos/blob/main/docs/policy-compilation.md">full reference</a> follows the code step by step, with a complete compiled file.</p>
+      <p>The <a href="https://github.com/victorbonnet/enclos/blob/main/docs/policy-compilation.md">full reference</a> follows the code step by step, with a compiled policy, section by section.</p>
     </main>
 
     <footer class="site-footer wrap"><span>French for an enclosure. Said “ahn-KLOH.”</span><div><a href="https://github.com/victorbonnet/enclos">Source</a><a href="https://github.com/victorbonnet/enclos/blob/main/SECURITY.md">Security</a><a href="https://github.com/victorbonnet/enclos/blob/main/LICENSE">MIT license</a></div></footer>
