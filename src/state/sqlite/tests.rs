@@ -407,7 +407,7 @@ fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
         "INSERT INTO sandboxes (name, backend, state, created_at)
              VALUES ('home', 'seatbelt', 'created', '2026-01-02T03:04:05.678Z');
          INSERT INTO sessions (id, sandbox, kind, version, snapshot, root_pid, root_start, started_at)
-             VALUES (7, 'home', 'command', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
+             VALUES (7, 'home', 'exec', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
          INSERT INTO secrets (sandbox, name, created_at, updated_at)
              VALUES ('home', 'telegram', '2026-01-02T03:04:05.678Z', '2026-01-02T03:04:05.678Z');",
     )
@@ -427,15 +427,16 @@ fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
     let secret = secrets[0].secret.clone();
     assert!(!store.put_secret(&lock, &secret, StoreName::File).unwrap());
     assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::Keychain);
-    let conn = Connection::open(&store.db).unwrap();
-    let sessions: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sessions WHERE id = 7 AND cgroup IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(sessions, 1);
+    assert!(store.get(&name).unwrap().is_some());
+    let sessions = store.sessions(&name, true).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, SessionId(7));
+    assert_eq!(sessions[0].root.pid, 42);
+    assert_eq!(sessions[0].cgroup, None);
+    store.track(&lock, SessionId(7), &[]).unwrap();
+    store.end_session(&lock, SessionId(7)).unwrap();
+    assert!(store.sessions(&name, true).unwrap().is_empty());
+    assert_eq!(store.sessions(&name, false).unwrap()[0].cgroup, None);
     assert!(store.remove_secret(&lock, &secret).unwrap());
     assert!(store.secrets(&name).unwrap().is_empty());
 }
