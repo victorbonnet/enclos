@@ -1,6 +1,8 @@
 """A stand-in for `enclos dashboard <sandbox>` (M3-03): the way to Hermes's
-dashboard from the host's browser. It starts `hermes dashboard --no-open` as a
-recorded session under the sandbox's policy, reads the port that session holds
+dashboard from the host's browser. It starts a dashboard server of its own as a
+recorded session under the sandbox's policy, on a port the kernel picks and
+never attached to one another session left open (a plain `hermes dashboard`
+would report that one and exit 0), reads the port that session holds
 from the host (never from a file the sandbox writes), opens the listener on the
 host's 127.0.0.1 at the sandbox's reserved port (host-listen.py), and prints the
 URL. Ctrl-C ends both and records the end. A second run on the same sandbox
@@ -33,7 +35,7 @@ import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-COMMAND = 'export PATH="$HOME/.local/bin:$PATH"; exec hermes dashboard --no-open'
+COMMAND = 'export PATH="$HOME/.local/bin:$PATH"; exec hermes dashboard --no-open --isolated --port 0'
 LOOPBACK = "127.0.0.1,localhost,::1"
 REFUSED = 3
 START_SECONDS = 600

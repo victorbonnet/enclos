@@ -62,7 +62,7 @@ watch_terminal() {
     while :; do
         {
             date +%T
-            python3 -I "$M3/ns-conns.py" "$hpid" 9119
+            python3 -I "$M3/ns-conns.py" "$hpid" "$(cat "$dir/service.port")"
         } >>"$tmp/$label-connections.txt" 2>&1
         for p in $(python3 -I "$M3/ns-procs.py" descendants "$cmd"); do
             if [ "$(cat "/proc/$p/comm" 2>/dev/null)" != bwrap ]; then

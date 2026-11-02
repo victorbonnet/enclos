@@ -10,7 +10,9 @@
 #   c. the same user served, the token in what it got, as the control of (b);
 #   d. ssh -L on the runner: this user served, the second user refused;
 #   e. a second run refused, then SIGINT to the command this check started,
-#      leaving no listener, session or dashboard process, then a clean rerun.
+#      leaving no listener, session or dashboard process, then a clean rerun;
+#   f. a run with a plain `hermes dashboard` already open in another session,
+#      whose record is in the home they share and which holds its default port.
 #
 # verdicts.tsv says what each was expected to do and what it did. Keys and the
 # token stay in a folder outside the results, which are uploaded. Needs Hermes
@@ -140,6 +142,8 @@ want "status names the command, gives no URL" "1 0" "$(grep -c 'enclos dashboard
 if start_cmd first; then
     sleep 3
     snapshot during
+    port=$(cat "$dir/service.port" 2>/dev/null)
+    want "service.port holds the session's port" 1 "$(grep -c "^$port[[:space:]]" "$tmp/snapshot-during.txt")"
     during=$(python3 -I "$M3/ns-procs.py" descendants "$cmd")
     {
         echo "$cmd (the command)"
@@ -215,7 +219,7 @@ if start_cmd first; then
     for p in $during; do [ -d "/proc/$p" ] && left="$left $p"; done
     want "no process of the session left" "" "$left"
     want "no listener on the reserved port" 0 "$(ss -ltnH "sport = :$RESERVED" | wc -l)"
-    want "the dashboard's port is gone from the sandbox" 0 "$(grep -c '^9119' "$tmp/snapshot-after.txt")"
+    want "the dashboard's port is gone from the sandbox" 0 "$(grep -c "^$port[[:space:]]" "$tmp/snapshot-after.txt")"
     want "client refused after the end" error "$(client get "$base" | cut -f2)"
     want "no service.port or record left" "0" "$(ls "$dir/service.port" "$dir/dashboard.json" 2>/dev/null | wc -l)"
     want "the end is audited" 1 "$(grep -c '"dashboard-end"' "$audit")"
@@ -226,6 +230,30 @@ if start_cmd first; then
     else
         want "a run after the end starts" ok "failed: $(tail -1 "$tmp/third.out")"
     fi
+
+    # (f)
+    SBX_JOIN=nsenter SBX_HOLDER="$dir/holder.sock" timeout 1200 "$M3/sbx-ns.sh" -- /bin/bash -c \
+        'export PATH="$HOME/.local/bin:$PATH"; exec hermes dashboard --no-open' \
+        </dev/null >"$tmp/open-elsewhere.log" 2>&1 &
+    elsewhere=$!
+    started+=($elsewhere)
+    theirs=""
+    for _ in $(seq 150); do
+        theirs=$(python3 -I "$M3/ns-listeners.py" "$hpid" --held-by \
+            "$(python3 -I "$M3/ns-procs.py" descendants "$elsewhere" | tr ' ' ,)" --port-only)
+        [ -n "$theirs" ] && break
+        sleep 2
+    done
+    want "a dashboard is open in another session" yes "$([ -n "$theirs" ] && echo yes || echo no)"
+    if start_cmd beside; then
+        want "a run beside it starts and serves" ok "$(client get "$base" | cut -f2)"
+        want "it serves on a port of its own" yes "$([ "$(cat "$dir/service.port")" != "$theirs" ] && echo yes || echo no)"
+        kill -INT "$cmd"
+        wait "$cmd"
+    else
+        want "a run beside it starts and serves" ok "failed: $(tail -1 "$tmp/beside.out")"
+    fi
+    kill "$elsewhere" 2>/dev/null
 else
     want "the command starts" yes "no: $(tail -3 "$tmp/first.out" | tr '\n' ' ')"
 fi
