@@ -6,8 +6,10 @@
 //! A group is signalled only through its leader. Right before each signal,
 //! it checks that the target is still the same process, same pid and same
 //! start time, so a pid already reused by an unrelated process is not
-//! signalled. The check narrows the window to the moment between it and the
-//! signal; it cannot close it.
+//! signalled. On Linux a process alone is signalled through a pidfd taken
+//! before the check, which reaches no process that reused the pid. A group
+//! has no such handle, nor has a process on macOS: there the check narrows the
+//! window to the moment between it and the signal, and cannot close it.
 //!
 //! A `ps` that fails is an error, never an empty answer: "no process" from a
 //! listing that did not run would end sessions whose members still run.
@@ -225,6 +227,19 @@ impl Signal {
             Signal::Hup => "HUP",
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn number(self) -> rustix::process::Signal {
+        use rustix::process::Signal as S;
+        match self {
+            Signal::Term => S::TERM,
+            Signal::Kill => S::KILL,
+            Signal::Usr1 => S::USR1,
+            Signal::Int => S::INT,
+            Signal::Quit => S::QUIT,
+            Signal::Hup => S::HUP,
+        }
+    }
 }
 
 /// What became of a signal enclos meant to send.
@@ -257,11 +272,49 @@ pub fn signal_group(leader: &ProcessRef, pgid: u32, signal: Signal) -> Result<Si
 
 /// Sends `signal` to `process` alone, only if it is still the recorded
 /// process.
+#[cfg(not(target_os = "linux"))]
 pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
     if !is_same(process)? {
         return Ok(Signalled::Gone);
     }
     Ok(kill(signal, i64::from(process.pid)))
+}
+
+/// Sends `signal` to `process` alone, only if it is still the recorded
+/// process.
+#[cfg(target_os = "linux")]
+pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
+    through_pidfd(process, signal, || is_same(process))
+}
+
+/// Takes a pidfd on `process`, then asks `same`, so that the signal reaches
+/// the process that was checked or none.
+#[cfg(target_os = "linux")]
+fn through_pidfd(
+    process: &ProcessRef,
+    signal: Signal,
+    same: impl FnOnce() -> Result<bool, PsError>,
+) -> Result<Signalled, PsError> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, PidfdFlags, pidfd_open, pidfd_send_signal};
+    let target = i64::from(process.pid);
+    let pid = i32::try_from(process.pid).ok().and_then(Pid::from_raw);
+    let Some(pid) = pid.filter(|_| !never_signalled(target)) else {
+        return Ok(Signalled::Failed(format!("enclos never signals {target}")));
+    };
+    let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(Errno::SRCH) => return Ok(Signalled::Gone),
+        Err(e) => return Ok(Signalled::Failed(format!("cannot open pid {target}: {e}"))),
+    };
+    if !same()? {
+        return Ok(Signalled::Gone);
+    }
+    Ok(match pidfd_send_signal(&pidfd, signal.number()) {
+        Ok(()) => Signalled::Sent,
+        Err(Errno::SRCH) => Signalled::Gone,
+        Err(e) => Signalled::Failed(e.to_string()),
+    })
 }
 
 /// Targets `kill` reads as more than one process of a session: 0 is the
@@ -582,6 +635,33 @@ mod tests {
             Signalled::Sent
         );
         assert!(wait_gone(&mut child));
+    }
+
+    /// What exits right after the check is gone, and its pid, free again,
+    /// is not what the signal goes to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_that_ended_after_the_check_is_not_signalled() {
+        let mut child = own_group();
+        let recorded = now(child.id());
+        let result = through_pidfd(&recorded, Signal::Term, || {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            Ok(true)
+        });
+        assert_eq!(result.unwrap(), Signalled::Gone);
+    }
+
+    /// Nor is pid 1, which no process of a session can be.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_is_never_signalled_at_a_target_of_many() {
+        let init = ProcessRef {
+            pid: 1,
+            started: String::new(),
+        };
+        let result = through_pidfd(&init, Signal::Term, || panic!("looked at pid 1"));
+        assert!(matches!(result.unwrap(), Signalled::Failed(_)));
     }
 
     #[test]
