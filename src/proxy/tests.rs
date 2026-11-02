@@ -1799,6 +1799,33 @@ print(answer.status, answer.read().decode())
         );
     }
 
+    /// The proxy refuses and closes with the body unread, so the upload
+    /// fails while the refusal is on its way. Many times: it was a race.
+    #[test]
+    fn a_large_post_gets_the_refusal_of_a_destination_the_policy_denies() {
+        let (_proxy, port, server, _asked) = started();
+        let head = format!(
+            "POST http://{NOT_ALLOWED}:{server}/ HTTP/1.1\r\nHost: {NOT_ALLOWED}\r\n\
+             Content-Length: {BODY}\r\n\r\n"
+        );
+        const BODY: usize = 512 * 1024;
+        for _ in 0..200 {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            client.set_read_timeout(Some(PATIENCE)).unwrap();
+            let mut writer = client.try_clone().unwrap();
+            let request = [head.as_bytes(), &[0; BODY]].concat();
+            let write = std::thread::spawn(move || {
+                let _ = writer.write_all(&request);
+            });
+            let mut got = Vec::new();
+            // What the close that follows does to the read is not the point.
+            let _ = client.read_to_end(&mut got);
+            write.join().unwrap();
+            let got = String::from_utf8_lossy(&got);
+            assert!(got.starts_with("HTTP/1.1 403"), "got {got:?}");
+        }
+    }
+
     #[test]
     fn python_reaches_what_the_policy_allows() {
         let (_proxy, port, server, asked) = started();

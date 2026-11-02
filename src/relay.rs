@@ -7,7 +7,8 @@
 //! on a slow reader holds up neither the other direction nor other
 //! connections. Nothing is held beyond one read and the kernel's socket
 //! buffers, so a slow reader slows its sender. An end of input ends one
-//! direction only; a failed direction ends both.
+//! direction only, and so does a failed upload, as the proxy may still be
+//! answering; a failed download ends both.
 //!
 //! It has no idle limit: one that fired on a quiet direction would cut a
 //! long download or upload, and the proxy holds the limit on what it serves.
@@ -104,12 +105,16 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
         let _ = upstream.shutdown(Shutdown::Both);
     };
     thread::scope(|s| {
+        // A failed upload ends the upload alone: the proxy may be answering,
+        // as when it refuses a request and closes with the body unread.
         let up = thread::Builder::new().spawn_scoped(s, || {
             pass_on(
                 client,
                 upstream,
                 || upstream.shutdown(Shutdown::Write),
-                end_both,
+                || {
+                    let _ = upstream.shutdown(Shutdown::Write);
+                },
             )
         });
         if let Err(e) = up {
