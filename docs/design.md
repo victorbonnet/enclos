@@ -525,7 +525,7 @@ src/
   backend/         mod.rs (trait)  environment.rs (a session's variables, the same for every backend)  fake/  seatbelt/{compile.rs, wrap.rs, probes.rs, host-services.sb, deny-default.sb, denials.rs (later)}
   proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
-  secrets/         mod.rs (trait)  keychain.rs  file.rs
+  secrets/         mod.rs (trait)  keychain.rs  libsecret.rs  file.rs  tool.rs
   state/           mod.rs (trait)  sqlite/
   audit/           mod.rs (trait)  jsonl/
   runtime/         mod.rs (trait)  hermes.rs  claude_code.rs  codex.rs
