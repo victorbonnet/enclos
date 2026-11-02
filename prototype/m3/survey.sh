@@ -62,11 +62,7 @@ say userns.max_user_namespaces "$(or_absent "$(first /proc/sys/user/max_user_nam
 say userns.unprivileged_userns_clone "$(or_absent "$(first /proc/sys/kernel/unprivileged_userns_clone)")"
 say userns.apparmor_restrict_unprivileged_userns "$(or_absent "$(first /proc/sys/kernel/apparmor_restrict_unprivileged_userns)")"
 say apparmor.enabled "$(or_absent "$(first /sys/module/apparmor/parameters/enabled)")"
-bwrap_profile=""
-for p in /etc/apparmor.d/bwrap /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/usr.bin.bwrap; do
-    [ -e "$p" ] && bwrap_profile="$bwrap_profile $p"
-done
-say apparmor.bwrap_profile "$(or_absent "${bwrap_profile# }")"
+say apparmor.bwrap_profile "$(or_absent "$(sh "$(dirname "$0")/bwrap-profiles.sh")")"
 say kconfig.USER_NS "$(kconf CONFIG_USER_NS)"
 
 # --- bubblewrap (the package only: bwrap itself is not run)

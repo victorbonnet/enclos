@@ -7,7 +7,7 @@ trap '' PIPE
 
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
-trap 'rm -f "$tmp/busctl" "$tmp/stderr"; rmdir "$tmp"' EXIT
+trap 'rm -f "$tmp/busctl" "$tmp/stderr" "$tmp/apparmor.d/bwrap-userns-restrict"; rmdir "$tmp/apparmor.d" "$tmp"' EXIT
 failed=0
 
 # $1: the stub's body; $2: the line survey.sh must print.
@@ -35,6 +35,18 @@ expect 'echo "b false"' 'logind\.KillUserProcesses: false'
 expect 'echo "t 10000000"' 'logind\.UserStopDelayUSec: 10000000'
 expect 'exit 1' 'logind\.KillUserProcesses: unknown'
 expect 'exit 1' 'logind\.UserStopDelayUSec: unknown'
+
+# bwrap-profiles.sh: every profile named for bubblewrap in the folder, or nothing
+mkdir "$tmp/apparmor.d"
+if [ -n "$(sh "$here/bwrap-profiles.sh" "$tmp/apparmor.d")" ]; then
+    echo "bwrap-profiles.sh named a profile in an empty folder" >&2
+    failed=1
+fi
+: >"$tmp/apparmor.d/bwrap-userns-restrict"
+if [ "$(sh "$here/bwrap-profiles.sh" "$tmp/apparmor.d")" != "$tmp/apparmor.d/bwrap-userns-restrict" ]; then
+    echo "bwrap-profiles.sh missed a shipped profile" >&2
+    failed=1
+fi
 
 # Both scripts that act on the host must refuse here, before they run anything.
 # The guard's status and its message together: dash also exits 2 on a syntax error.
