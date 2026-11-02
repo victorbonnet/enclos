@@ -5,8 +5,10 @@
 //! system the descriptor is on, so unlike `lsof` it needs no time limit.
 //!
 //! Only the user's own processes can be read, as with `lsof`, and among
-//! those not one that is exiting (a zombie's folder is root's) or that made
-//! itself not dumpable. So what such a process holds is not seen.
+//! those neither a zombie, whose folder is root's, nor a process that is not
+//! dumpable, so what those hold is not seen. A process whose main thread
+//! exited has a folder like a zombie's, and is read through a thread that
+//! runs on.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,16 +73,52 @@ pub fn is_gone(e: &io::Error) -> bool {
         || e.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
 }
 
-/// The descriptors `pid` holds, under `proc`.
+/// The descriptors `pid` holds, under `proc`: through its own folder, or, when
+/// that is refused, through a thread that runs on. Threads share their memory,
+/// so one that is not dumpable is refused through each of them.
 pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
-    let entries = match std::fs::read_dir(proc.join(pid.to_string()).join("fd")) {
+    match in_folder(&proc.join(pid.to_string()))? {
+        Descriptors::Unreadable => {}
+        found => return Ok(found),
+    }
+    for thread in other_threads(proc, pid)? {
+        if let found @ Descriptors::Open(_) = in_folder(&thread)? {
+            return Ok(found);
+        }
+    }
+    Ok(Descriptors::Unreadable)
+}
+
+/// The folder of each thread of `pid`, under `proc`, but for its main thread.
+pub fn other_threads(proc: &Path, pid: u32) -> io::Result<Vec<PathBuf>> {
+    let main = pid.to_string();
+    let entries = match std::fs::read_dir(proc.join(&main).join("task")) {
+        Err(e) if is_gone(&e) => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut threads = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Err(e) if is_gone(&e) => break,
+            entry => entry?,
+        };
+        if entry.file_name() != main.as_str() {
+            threads.push(entry.path());
+        }
+    }
+    Ok(threads)
+}
+
+/// The descriptors in `folder`, a process's or a thread's.
+fn in_folder(folder: &Path) -> io::Result<Descriptors> {
+    let entries = match std::fs::read_dir(folder.join("fd")) {
         Err(e) if is_gone(&e) => return Ok(Descriptors::Gone),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
             return Ok(Descriptors::Unreadable);
         }
         entries => entries?,
     };
-    let info = proc.join(pid.to_string()).join("fdinfo");
+    let info = folder.join("fdinfo");
     let mut open = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -143,6 +181,26 @@ pub fn fake_process(proc: &Path, pid: u32, targets: &[&str]) {
     }
 }
 
+/// A folder of a test's `/proc` that refuses this user until restored.
+#[cfg(test)]
+pub struct Refused(PathBuf);
+
+#[cfg(test)]
+impl Refused {
+    pub fn restore(self) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// Has `folder` refuse this user.
+#[cfg(test)]
+pub fn refuse(folder: &Path) -> Refused {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    Refused(folder.to_owned())
+}
+
 /// `flags`, in octal, as the `fdinfo` file at `info` writes them.
 #[cfg(test)]
 pub fn fake_flags(info: &Path, flags: &str) {
@@ -182,6 +240,43 @@ mod tests {
         let err = every_process(proc.path()).unwrap_err();
         assert!(err.to_string().contains("the caller"), "{err}");
         assert!(every_process(&proc.path().join("none")).is_err());
+    }
+
+    /// A process whose main thread exited: its own folder is root's, and
+    /// the thread left on it reads what they all hold.
+    #[test]
+    fn a_process_is_read_through_a_thread_when_its_own_folder_is_refused() {
+        let proc = tempfile::tempdir().unwrap();
+        let task = proc.path().join("7/task");
+        fake_process(proc.path(), 7, &[]);
+        fake_process(&task, 7, &[]);
+        fake_process(&task, 8, &["/a"]);
+        std::fs::remove_dir(task.join("7/fd")).unwrap();
+        let fd = refuse(&proc.path().join("7/fd"));
+        let read = of(proc.path(), 7);
+        fd.restore();
+        let Descriptors::Open(open) = read.unwrap() else {
+            panic!("the thread was not read");
+        };
+        assert_eq!(open[0].target, Path::new("/a"));
+        assert!(open[0].opens().unwrap());
+    }
+
+    /// With no other thread, or none that reads, it stays unreadable.
+    #[test]
+    fn a_process_no_thread_of_which_reads_is_unreadable() {
+        let proc = tempfile::tempdir().unwrap();
+        let task = proc.path().join("7/task");
+        fake_process(proc.path(), 7, &[]);
+        fake_process(&task, 7, &[]);
+        let fd = refuse(&proc.path().join("7/fd"));
+        assert_eq!(of(proc.path(), 7).unwrap(), Descriptors::Unreadable);
+        fake_process(&task, 8, &[]);
+        let thread = refuse(&task.join("8/fd"));
+        let read = of(proc.path(), 7);
+        fd.restore();
+        thread.restore();
+        assert_eq!(read.unwrap(), Descriptors::Unreadable);
     }
 
     /// `fdinfo`'s flags say what a descriptor opens, and one that shows none
