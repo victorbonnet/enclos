@@ -424,6 +424,8 @@ mod tests {
             "~/.config/chromium",
             "~/.config/BraveSoftware",
             "~/.config/microsoft-edge",
+            "~/.config/microsoft-edge-beta",
+            "~/.config/microsoft-edge-dev",
             "~/.config/vivaldi",
             "~/.config/opera",
             "~/.mozilla",
