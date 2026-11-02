@@ -102,6 +102,20 @@ fn a_relay_that_failed_to_confine_itself_never_serves() {
     }
 }
 
+#[test]
+fn a_relay_waits_until_its_parent_has_changed() {
+    let looks = std::cell::Cell::new(0);
+    let now = || {
+        looks.set(looks.get() + 1);
+        match looks.get() {
+            1 | 2 => 7,
+            _ => 1,
+        }
+    };
+    wait_for_new_parent(7, now, Duration::ZERO);
+    assert_eq!(looks.get(), 3);
+}
+
 /// ADR 0037: seccomp's filter is the same, and the command runs.
 #[test]
 fn no_landlock_is_reported_and_the_session_goes_on() {

@@ -6,15 +6,18 @@
 #![cfg(target_os = "linux")]
 
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
 
 const PYTHON: &str = "/usr/bin/python3";
+const TRUE: &str = "/usr/bin/true";
 
 /// Reports what `unshare(CLONE_NEWUSER)` answers.
 const UNSHARE: &str = r#"
@@ -90,10 +93,6 @@ fn on_a_runner() -> bool {
 /// `allowed/` the only place to write, and a relay of its own. The program
 /// under test stays out of the execute rules, in `target/`, as an enclos in
 /// the user's home is.
-///
-/// One session each, as [`Confined::run`] takes it by value: a relay ends by
-/// a signal the kernel delivers once its session's command has gone, so a
-/// second session on its port could find it held.
 struct Confined {
     dir: TempDir,
     compiled: PathBuf,
@@ -129,16 +128,21 @@ impl Confined {
         self.dir.path().join(name)
     }
 
-    /// What the session's command left, and its folder.
-    fn run(self, command: &[&str]) -> (Output, TempDir) {
-        let output = Command::new(env!("CARGO_BIN_EXE_enclos"))
+    /// What a session's command left.
+    fn session(&self, command: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_enclos"))
             .arg("inside")
             .arg("--compiled")
             .arg(&self.compiled)
             .arg("--")
             .args(command)
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// What the session's command left, and its folder.
+    fn run(self, command: &[&str]) -> (Output, TempDir) {
+        let output = self.session(command);
         (output, self.dir)
     }
 }
@@ -151,6 +155,11 @@ fn text(bytes: &[u8]) -> String {
 fn said(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
     text(&output.stdout)
+}
+
+/// Whether a session's command ran to its end with no word from either.
+fn said_nothing(output: &Output) -> bool {
+    output.status.success() && output.stderr.is_empty()
 }
 
 fn python(script: &str) -> Output {
@@ -250,7 +259,7 @@ fn on_a_runner_a_program_outside_the_execute_rules_is_refused() {
     // for writing could reach a child a parallel test is starting, and the
     // copy then could not run (ETXTBSY).
     let copied = Command::new("/bin/cp")
-        .arg("/usr/bin/true")
+        .arg(TRUE)
         .arg(&copy)
         .status()
         .unwrap();
@@ -330,6 +339,23 @@ fn on_a_runner_the_relay_applied_the_filter_to_itself() {
     }
     let (output, _dir) = Confined::new().run(&[PYTHON, "-c", RELAY_STATUS]);
     assert_eq!(said(&output), "2 1", "{output:?}");
+}
+
+/// A relay leaves within a look at its parent of its session's end: one left
+/// behind holds the port for as long as it runs.
+#[test]
+fn on_a_runner_a_second_session_gets_the_port_of_the_first() {
+    if !on_a_runner() {
+        return;
+    }
+    let confined = Confined::new();
+    assert!(said_nothing(&confined.session(&[TRUE])));
+    let until = Instant::now() + Duration::from_secs(5);
+    while TcpListener::bind(("127.0.0.1", confined.port)).is_err() {
+        assert!(Instant::now() < until, "the first session's relay stayed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(said_nothing(&confined.session(&[TRUE])));
 }
 
 /// A relay's notice goes to its log, not to the session's terminal.
