@@ -52,6 +52,32 @@ os.waitpid(pid, 0)
 print(said.decode().split()[-1])
 "#;
 
+/// Finds the relay as [`RELAY_STATUS`] does, starts a child of this program,
+/// and reports what signalling each answers. A signal 0 is checked as any
+/// other and sends nothing.
+const SIGNALS: &str = r#"
+import errno, os, subprocess
+def signalled(pid):
+    try:
+        os.kill(pid, 0)
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+me = str(os.getpid())
+relay = None
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        status = open(f"/proc/{pid}/status").read()
+    except OSError:
+        continue
+    if f"PPid:\t{me}\n" in status:
+        relay = int(pid)
+child = subprocess.Popen(["/usr/bin/sleep", "30"])
+print(signalled(relay), signalled(child.pid))
+child.kill()
+child.wait()
+"#;
+
 /// Reports what `socket` answers for vsock, then for two families a session
 /// keeps.
 const SOCKETS: &str = r#"
@@ -414,6 +440,17 @@ fn on_a_runner_the_relay_keeps_out_of_the_commands_process_group() {
     let fields: Vec<&str> = status.split_whitespace().collect();
     assert_eq!(fields.len(), 4, "{status}");
     assert_ne!(fields[2], fields[3], "{status}");
+}
+
+/// The relay is in a Landlock domain of its own, a sibling of the command's;
+/// a child of the command shares the command's, and is the control.
+#[test]
+fn on_a_runner_a_sessions_command_cannot_signal_its_relay() {
+    if !on_a_runner() {
+        return;
+    }
+    let (output, _dir) = Confined::new().run(&[PYTHON, "-c", SIGNALS]);
+    assert_eq!(said(&output), "EPERM ok", "{output:?}");
 }
 
 /// A relay leaves within a look at its parent of its session's end: one left
