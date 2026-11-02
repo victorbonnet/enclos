@@ -40,7 +40,8 @@ fn write() -> BitFlags<AccessFs> {
         | AccessFs::Truncate
 }
 
-/// Each compiled list with its rights, as `prototype/m3/inside.py` gives them.
+/// Each compiled list with its rights, as `inside.py --proc-truncate` gives
+/// them.
 pub(super) fn grants(rules: &LandlockRules) -> Vec<Grant> {
     let lists = [
         (&rules.read, read()),
@@ -165,7 +166,7 @@ mod tests {
             .collect()
     }
 
-    /// `prototype/m3/inside.py`'s numbers, shown on Landlock's ABI 8.
+    /// `inside.py --proc-truncate`'s numbers, shown on Landlock's ABI 8.
     #[test]
     fn each_list_has_the_prototypes_rights() {
         assert_eq!(access_of("/")[0].bits(), 0b1100);

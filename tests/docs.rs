@@ -286,6 +286,17 @@ fn an_older_landlock_abi_leaves_execute_open() {
     }
 }
 
+/// The prototype's default leaves it out, so what `enclos inside` does is
+/// written down, and that it has not been shown to help Chromium.
+#[test]
+fn the_grant_of_truncate_on_proc_is_recorded() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    assert!(readme.contains("`enclos inside` grants it"));
+    assert!(design().contains("`enclos inside` grants `TRUNCATE` on `/proc`"));
+    assert!(!readme.contains("whether M3-13 should allow these writes is open"));
+}
+
 /// The code cites §5 for it.
 #[test]
 fn what_a_session_runs_first_is_in_section_5() {
