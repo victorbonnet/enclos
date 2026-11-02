@@ -297,9 +297,15 @@ fn built(
 }
 
 fn send(addr: Address, request: &str) -> (Stream, String) {
-    let mut conn = addr.connect();
+    exchange(addr.connect(), request)
+}
+
+/// Sends `request` on `conn` and reads the answer. A proxy that turned the
+/// connection away may have closed it first: on a Unix socket the write then
+/// fails, while the answer is still there to read.
+fn exchange(mut conn: Stream, request: &str) -> (Stream, String) {
     conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    conn.write_all(request.as_bytes()).unwrap();
+    let _ = conn.write_all(request.as_bytes());
     // Up to the end of the response head, or until the proxy closes.
     let mut reply = Vec::new();
     let mut buf = [0u8; 1024];
@@ -789,6 +795,18 @@ fn a_unix_socket_and_the_loopback_share_one_limit_and_one_log() {
     assert!(send_once_free(&loopback, request).starts_with("HTTP/1.1 403"));
     assert!(send_once_free(&socket, request).starts_with("HTTP/1.1 403"));
     assert_eq!(log.wait_for(2).len(), 2);
+}
+
+#[test]
+fn an_answer_from_a_proxy_that_already_closed_is_read() {
+    let (ours, mut proxys) = UnixStream::pair().unwrap();
+    proxys.write_all(b"HTTP/1.1 503 Busy\r\n\r\n").unwrap();
+    drop(proxys);
+    let (_conn, reply) = exchange(
+        Stream::Unix(ours),
+        "CONNECT a.example.com:443 HTTP/1.1\r\n\r\n",
+    );
+    assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
 }
 
 #[test]
