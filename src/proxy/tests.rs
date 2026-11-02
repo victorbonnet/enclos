@@ -450,6 +450,35 @@ fn an_allowed_name_resolving_to_a_blocked_address_is_refused_before_connecting()
     assert_eq!(events[0].address, None);
 }
 
+fn a_client_gone_after_sending_is_still_refused_and_recorded() {
+    let proxy = start(&[], LOCAL, loopback_is_global);
+    let mut conn = proxy.addr.connect();
+    conn.write_all(b"CONNECT evil.example.com:443 HTTP/1.1\r\n\r\n")
+        .unwrap();
+    drop(conn);
+    assert_eq!(proxy.log.wait_for(1)[0].host, "evil.example.com");
+}
+
+fn a_client_gone_after_sending_still_has_its_request_forwarded() {
+    let (port, received) = upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let proxy = start(
+        &[format!("plain.example.com:{port}")],
+        LOCAL,
+        loopback_is_global,
+    );
+    let mut conn = proxy.addr.connect();
+    conn.write_all(
+        format!(
+            "GET http://plain.example.com:{port}/a HTTP/1.1\r\nHost: plain.example.com\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    drop(conn);
+    let head = String::from_utf8(received.recv_timeout(PATIENCE).unwrap()).unwrap();
+    assert!(head.starts_with("GET /a HTTP/1.1\r\n"), "{head}");
+}
+
 fn plain_http_is_forwarded_in_origin_form() {
     let (port, received) = upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let proxy = start(
@@ -1626,4 +1655,6 @@ on_both_listeners!(
     a_hello_that_says_it_is_longer_than_the_cap_is_closed_at_once,
     a_hello_that_never_ends_is_closed_at_the_cap,
     a_hello_left_half_sent_goes_idle_frees_its_place_and_sends_nothing,
+    a_client_gone_after_sending_is_still_refused_and_recorded,
+    a_client_gone_after_sending_still_has_its_request_forwarded,
 );

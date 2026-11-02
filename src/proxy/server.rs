@@ -400,7 +400,13 @@ impl Read for Until<'_> {
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        self.stream.set_read_timeout(Some(left))?;
+        // A Unix peer gone already refuses it on macOS, and what it sent
+        // is still there to read.
+        if let Err(e) = self.stream.set_read_timeout(Some(left))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
+            return Err(e);
+        }
         let mut stream = self.stream;
         stream.read(buf)
     }
@@ -437,8 +443,12 @@ fn forward(
     event: &mut NetEvent,
 ) {
     // A peer that stops reading holds up a write no longer than the limit.
+    // One gone already, which refuses this as a Unix socket on macOS, holds
+    // up nothing.
     for stream in [client, upstream] {
-        if let Err(e) = stream.set_write_timeout(Some(limit)) {
+        if let Err(e) = stream.set_write_timeout(Some(limit))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
             eprintln!(
                 "enclos proxy: cannot set a timeout on a connection to {}: {e}",
                 event.host
