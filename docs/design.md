@@ -635,7 +635,8 @@ enclos connect community -- hermes ...                     # Hermes told of the 
   runtimes/<runtime>/<version>/  shared, read-only to every sandbox (planned; milestone 1 installs each runtime in its sandbox's home instead, ADR 0020)
   templates/                   user templates
   run/<sandbox>/               host-only: proxy control sockets; on Linux also the holder's sockets and port records; removed with the sandbox, whatever `--keep-data` keeps
-  run/<sandbox>/visible/       on Linux, what a session mounts, read-only: the proxy's socket, `proxy.sock`
+  run/<sandbox>/visible/       the proxy's socket, `proxy.sock`; on Linux, what a session mounts, read-only
+  run/<sandbox>.connect.lock   held while one `connect` starts the sandbox's services; `sandbox rm` leaves it
   sandboxes/<name>/
     (the record in state.db)   backend, template, runtime, agents, created_at (ADR 0010; no sandbox.toml)
     policy.toml                overrides: the input to the next policy change (snapshots in state.db)
