@@ -1,5 +1,5 @@
 //! The compiled seccomp filter as BPF programs for this architecture. Pure:
-//! nothing here loads a program, [`super::apply`] does.
+//! nothing here loads a program, [`super::Confine::apply_seccomp`] does.
 
 use seccompiler::{BpfProgram, TargetArch, sock_filter};
 use serde_json::{Value, json};
