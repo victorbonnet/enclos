@@ -198,7 +198,16 @@ fn compiled_sandbox(
     };
     let home = tidy(&ctx.home);
     let user_home = tidy(&ctx.user_home);
-    let protected: Vec<PathBuf> = ctx.protected.iter().map(|p| tidy(p)).collect();
+    // A root behind a link is two folders to hide: `--ro-bind / /` shows the
+    // real one whatever its spelling is masked with.
+    let mut protected: Vec<PathBuf> = ctx
+        .protected
+        .iter()
+        .chain(&ctx.protected_real)
+        .map(|p| tidy(p))
+        .collect();
+    protected.sort();
+    protected.dedup();
     let workspaces: Vec<PathBuf> = expand(&policy.fs.write)?
         .into_iter()
         .filter(|w| !is_within(w, &home))
@@ -410,6 +419,7 @@ mod tests {
     use super::*;
     use crate::layout::{Layout, Os};
     use crate::model::policy::TemplateName;
+    use crate::policy::paths::real_path;
     use crate::policy::{initial_overrides, resolve};
 
     const USER: &str = "/nonexistent-enclos-test/alice";
@@ -418,6 +428,7 @@ mod tests {
     fn on_linux(layout: &Layout) -> SandboxContext {
         let mut ctx = SandboxContext::new(layout, &"home".parse().unwrap(), 41001);
         ctx.protected = layout.protected_on(Os::Linux);
+        ctx.protected_real = ctx.protected.iter().map(|p| real_path(p)).collect();
         ctx
     }
 
@@ -549,6 +560,50 @@ mod tests {
             .unwrap();
         let sealed = args.iter().position(|a| a == "--remount-ro").unwrap();
         assert!(last_mount < sealed);
+    }
+
+    /// `--ro-bind / /` shows the real folder, so a mask on the spelled path
+    /// alone leaves `secrets.json` and `state.db` readable behind a link.
+    #[test]
+    fn a_protected_root_behind_a_link_is_hidden_at_its_real_path_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("ssd/enclos");
+        let user = base.join("user");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::os::unix::fs::symlink(&real, user.join("e")).unwrap();
+        let layout = Layout::at(user.join("e")).with_user_home(&user);
+        let ctx = on_linux(&layout);
+        let real = real.to_str().unwrap();
+        let c = compiled_sandbox(&policy(&["{home}"], &[]), &ctx).unwrap();
+        let args = &c.after_home_mask;
+        assert!(
+            c.home_mask
+                .denied
+                .contains(&format!("{}/e", user.display()))
+        );
+        assert!(after(args, "--tmpfs").contains(&real), "{args:?}");
+        assert!(after(args, "--remount-ro").contains(&real), "{args:?}");
+        let hidden = args.iter().position(|a| a == real).unwrap();
+        let bound = args.iter().position(|a| a == "--bind").unwrap();
+        assert!(hidden < bound, "{args:?}");
+    }
+
+    /// The real path is another protected root for a workspace too.
+    #[test]
+    fn a_workspace_on_a_protected_roots_real_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let real = base.join("ssd/enclos");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("e")).unwrap();
+        let ctx = on_linux(&Layout::at(base.join("e")).with_user_home(&base));
+        let inside = format!("{}/sandboxes", real.display());
+        let err = compiled_sandbox(&policy(&[&inside], &[]), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overlaps"), "{err}");
     }
 
     #[test]

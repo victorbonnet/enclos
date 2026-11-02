@@ -16,14 +16,14 @@ use signal_hook::consts::SIGTERM;
 use super::Engine;
 use crate::backend::{Launch, SandboxContext};
 use crate::error::{Error, Result};
-use crate::layout::LayoutError;
+use crate::layout::{LayoutError, Os};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
-    ToolCheck, not_here, outcome, probes, sandboxed_script,
+    ToolCheck, not_here, outcome, probes, sandboxed_script, with_real_paths,
 };
 
 /// What `enclos policy test` found.
@@ -312,7 +312,11 @@ impl Engine {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
-            hidden_files: self.layout.hidden_files(),
+            hidden_files: with_real_paths(
+                &self.layout.hidden_files(),
+                &self.layout.data().join("run"),
+                Os::current(),
+            ),
             sandbox_dir: self.layout.sandbox_dir(name.as_str()),
             writes,
             other_sandboxes: self

@@ -27,9 +27,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::backend::Baseline;
-use crate::layout::Layout;
+use crate::layout::{Layout, Os};
 use crate::model::sandbox::SandboxName;
-use crate::policy::paths::is_within;
+use crate::policy::paths::{is_within, real_path};
 
 /// What a program says when a backend refuses it: any one of these texts,
 /// each the backend's own: one backend may refuse in one way, another by
@@ -303,6 +303,24 @@ pub struct ReportNotes {
 /// What a backend adds to the probes every backend runs, and how it refuses.
 /// Each method places its probes in the list, so that a report reads route
 /// by route.
+/// `files`, and on Linux where a link takes one of them or `run`, its real
+/// path too: `--ro-bind / /` shows the real folder, while a read of the
+/// spelled path can fail for its mask alone. Seatbelt compiles the real path
+/// (`seatbelt/compile.rs`), so macOS keeps the list it has.
+pub fn with_real_paths(files: &[PathBuf], run: &Path, os: Os) -> Vec<PathBuf> {
+    let mut paths = files.to_vec();
+    if os == Os::Linux {
+        paths.extend(
+            files
+                .iter()
+                .map(PathBuf::as_path)
+                .chain([run])
+                .filter_map(|p| Some(real_path(p)).filter(|real| real != p)),
+        );
+    }
+    paths
+}
+
 pub trait OwnProbes {
     /// The backend's name, as a sentence says it.
     fn name(&self) -> &'static str;
@@ -928,6 +946,35 @@ mod tests {
             tag: 7,
             limits: Default::default(),
         }
+    }
+
+    /// A link is what Linux's masks can miss: the spelled path reads ENOENT
+    /// and proves nothing of the real one, which `--ro-bind / /` shows.
+    #[test]
+    fn a_protected_file_behind_a_link_is_probed_at_its_real_path_on_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("real")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("e")).unwrap();
+        let files = vec![base.join("e/state.db")];
+        let run = base.join("e/run");
+        assert_eq!(
+            with_real_paths(&files, &run, Os::Linux),
+            [
+                base.join("e/state.db"),
+                base.join("real/state.db"),
+                base.join("real/run")
+            ]
+        );
+        assert_eq!(with_real_paths(&files, &run, Os::MacOs), files);
+    }
+
+    #[test]
+    fn a_protected_file_with_no_link_gets_one_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let files = vec![base.join("state.db")];
+        assert_eq!(with_real_paths(&files, &base.join("run"), Os::Linux), files);
     }
 
     /// A protected file gets a probe by being on the list, whichever it is:
