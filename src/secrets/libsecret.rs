@@ -220,13 +220,18 @@ impl SecretStore for Libsecret {
             .arg("store")
             .arg(format!("--label=enclos secret {secret}"))
             .args(self.attributes(secret));
+        let way_out = |why: String| {
+            format!(
+                "{why}. To keep a secret not yet recorded in the file store instead, run `{BUS_VAR}= enclos secret set {secret}`"
+            )
+        };
         let out = run(&mut command, Some(value.expose().as_bytes()))
-            .map_err(|e| self.fail("store", secret, e))?;
+            .map_err(|e| self.fail("store", secret, way_out(e)))?;
         if !out.status.success() {
             return Err(SecretError {
                 // It refused, as on a locked collection, and wrote nothing.
                 untouched: out.status.code() == Some(1),
-                ..self.fail("store", secret, stderr(&out.stderr, out.status))
+                ..self.fail("store", secret, way_out(stderr(&out.stderr, out.status)))
             });
         }
         // Only reading the value back shows it was stored whole.
@@ -551,6 +556,23 @@ esac"#,
         let err = stub.store.set(&secret(), &v("a")).unwrap_err();
         assert!(!err.untouched, "{err}");
         assert!(err.what.contains("did not read back"), "{err}");
+    }
+
+    /// A host that answers but never unlocks has a way forward, and it is
+    /// the one that works: no bus named, nothing answers, and a new secret
+    /// goes to the file.
+    #[test]
+    fn a_failed_store_says_how_a_new_secret_goes_to_the_file() {
+        let stub = Stub::new("exit 1", LOCKED);
+        let err = stub.store.set(&secret(), &v("a")).unwrap_err();
+        assert!(
+            err.what
+                .contains("DBUS_SESSION_BUS_ADDRESS= enclos secret set home/telegram"),
+            "{err}"
+        );
+        let timed_out = Stub::new("exec sleep 60", LOCKED);
+        let err = timed_out.store.set(&secret(), &v("a")).unwrap_err();
+        assert!(err.what.contains("DBUS_SESSION_BUS_ADDRESS="), "{err}");
     }
 
     /// A store refused, as on a locked collection, wrote nothing; one that
