@@ -142,10 +142,8 @@ fn open_exec_session(lab: &Lab) -> SessionRecord {
     open_sessions(lab).remove(0)
 }
 
-/// Runs `program`, whose detached process is listed as a member of its
-/// session's cgroup, and is ended by `sandbox stop`, which leaves the sandbox
-/// stopped and the cgroup removed.
-fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String> {
+/// Runs `program`, and gives what it detached.
+fn detached_by(lab: &Lab, program: Vec<std::ffi::OsString>) -> ProcessRef {
     done(
         lab.engine
             .exec(&alice(), &lab.name, program, Confirm::Yes)
@@ -155,13 +153,28 @@ fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String
         .trim()
         .parse()
         .unwrap();
-    let detached = reference(pid).unwrap().expect("the detached process runs");
+    reference(pid).unwrap().expect("the detached process runs")
+}
+
+/// Runs `program`, whose detached process is listed as a member of its
+/// session's cgroup, and is ended by `sandbox stop`, which leaves the sandbox
+/// stopped and the cgroup removed. Gives the descriptors it held.
+fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String> {
+    let detached = detached_by(lab, program);
     let _ended = Ended(detached.clone());
-    let descriptors: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+    let descriptors = std::fs::read_dir(format!("/proc/{}/fd", detached.pid))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
+    is_listed_then_stopped(lab, &detached);
+    descriptors
+}
 
+/// `detached` is listed as a member of the open session's cgroup, and is
+/// ended by `sandbox stop`, which leaves the sandbox stopped and the cgroup
+/// removed.
+fn is_listed_then_stopped(lab: &Lab, detached: &ProcessRef) {
+    let pid = detached.pid;
     let session = open_exec_session(lab);
     let cgroup = session.cgroup.clone().expect("the session has a cgroup");
     let held = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
@@ -181,7 +194,7 @@ fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String
             .unwrap(),
     );
     assert!(report.survivors.is_empty(), "{:?}", report.survivors);
-    assert!(!is_same(&detached).unwrap(), "it survived the stop");
+    assert!(!is_same(detached).unwrap(), "it survived the stop");
     let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
     assert_eq!(record.state, SandboxState::Stopped);
 
@@ -191,7 +204,6 @@ fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String
         assert!(start.elapsed() < Duration::from_secs(10), "{folder}");
         std::thread::sleep(Duration::from_millis(20));
     }
-    descriptors
 }
 
 /// A start that fails once the program detached a process: nothing but the
@@ -270,6 +282,35 @@ fn on_a_runner_one_that_ignores_term_is_killed_through_the_cgroup() {
         &lab,
         detaching("signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
     );
+}
+
+/// Its main thread is gone, so `ps` writes `Zl`; a worker thread runs on, and
+/// it ignores TERM, so only the kill ends it.
+#[test]
+fn on_a_runner_one_whose_main_thread_exited_is_listed_and_stopped() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(
+        &lab,
+        detaching(
+            "import ctypes, threading
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+threading.Thread(target=time.sleep, args=(600,)).start()
+ctypes.CDLL(None).pthread_exit(None)",
+        ),
+    );
+    let _ended = Ended(detached.clone());
+    let stat = format!("/proc/{}/stat", detached.pid);
+    let start = Instant::now();
+    while !std::fs::read_to_string(&stat).unwrap().contains(") Z ") {
+        assert!(start.elapsed() < Duration::from_secs(10), "{stat}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(is_same(&detached).unwrap(), "it reads as ended");
+    is_listed_then_stopped(&lab, &detached);
 }
 
 #[test]

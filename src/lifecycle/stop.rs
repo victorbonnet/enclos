@@ -94,8 +94,9 @@ fn stop_in(
     if first.is_empty() {
         return Ok(Stopped::Gone);
     }
-    if !first.iter().any(|f| f.sure) {
-        // Nothing enclos may signal: what is only counted is reported.
+    if session.cgroup.is_none() && !first.iter().any(|f| f.sure) {
+        // Nothing enclos may signal: what is only counted is reported. A
+        // cgroup is still killed, which takes no listing.
         return Ok(survivors(first, &Signals::default(), session));
     }
     // What was found stays known while the signals end parents: a member
@@ -388,6 +389,52 @@ mod tests {
         assert!(why.contains(&(unlisted, &Why::NotListed)), "{why:?}");
         let asked = dir.path().join("s.scope/cgroup.kill");
         assert_eq!(std::fs::read_to_string(asked).unwrap(), "1");
+    }
+
+    /// Nothing `ps` lists is left to signal, and the kill of the cgroup, which
+    /// needs no listing, is still sent.
+    #[test]
+    fn a_cgroup_holding_only_what_ps_does_not_list_is_still_killed() {
+        let unlisted = u32::MAX - 1;
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        drop(root.stdin.take());
+        root.wait().unwrap();
+        let (dir, cgroups) = in_cgroup(&mut session, &[unlisted]);
+        let stopped = stop_in(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let Stopped::Survivors(left) = stopped else {
+            panic!("{stopped:?}");
+        };
+        assert_eq!(left[0].why, Why::NotListed);
+        let asked = dir.path().join("s.scope/cgroup.kill");
+        assert_eq!(std::fs::read_to_string(asked).unwrap(), "1");
+    }
+
+    /// `ps` writes `Zl` for it, and it runs on through its other threads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_is_stopped_and_not_called_gone() {
+        use crate::lifecycle::process::{headless, headless_port};
+        let mut child = headless(&mut Command::new("/usr/bin/python3"))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        headless_port(&mut child);
+        let mut session = session_of(&child);
+        let (dir, cgroups) = in_cgroup(&mut session, &[child.id()]);
+        // The stand-in does not empty itself.
+        let stopped = std::thread::scope(|s| {
+            s.spawn(|| {
+                while is_same(&session.root).unwrap() {
+                    std::thread::sleep(POLL);
+                }
+                write_cgroup(dir.path(), &[]);
+            });
+            stop_in(&cgroups, &session, GRACE).unwrap()
+        });
+        assert_eq!(stopped, Stopped::Clean);
+        assert!(!is_same(&session.root).unwrap());
+        let _ = child.wait();
     }
 
     #[test]
