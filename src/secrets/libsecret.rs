@@ -137,6 +137,15 @@ impl Libsecret {
         }
     }
 
+    /// `why`, saying so when the collection is locked: that is what to act
+    /// on, whatever the tool said.
+    fn with_lock(&self, why: String) -> String {
+        match self.locked() {
+            Ok(true) => format!("{why}; its default collection is locked"),
+            _ => why,
+        }
+    }
+
     /// The collection's `Locked` property, as `dbus-send` printed it.
     fn locked(&self) -> Result<bool, String> {
         let out = run_for(
@@ -230,11 +239,15 @@ impl SecretStore for Libsecret {
     fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         let out = self
             .lookup(secret)
-            .map_err(|e| self.fail("read", secret, e))?;
+            .map_err(|e| self.fail("read", secret, self.with_lock(e)))?;
         if !out.status.success() {
             return match found_nothing(&out) {
                 true => self.nothing_there("read", secret).map(|()| None),
-                false => Err(self.fail("read", secret, stderr(&out.stderr, out.status))),
+                false => Err(self.fail(
+                    "read",
+                    secret,
+                    self.with_lock(stderr(&out.stderr, out.status)),
+                )),
             };
         }
         let text = String::from_utf8(out.stdout)
@@ -252,13 +265,17 @@ impl SecretStore for Libsecret {
                 .args(self.attributes(secret)),
             None,
         )
-        .map_err(|e| self.fail("remove", secret, e))?;
+        .map_err(|e| self.fail("remove", secret, self.with_lock(e)))?;
         if out.status.success() {
             return Ok(true);
         }
         match found_nothing(&out) {
             true => self.nothing_there("remove", secret).map(|()| false),
-            false => Err(self.fail("remove", secret, stderr(&out.stderr, out.status))),
+            false => Err(self.fail(
+                "remove",
+                secret,
+                self.with_lock(stderr(&out.stderr, out.status)),
+            )),
         }
     }
 
@@ -310,6 +327,7 @@ impl Prober for Libsecret {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tool::ANSWER_WAIT;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -463,6 +481,19 @@ esac"#,
         let stub = Stub::new("exit 1", "echo 'Error: No such object' >&2; exit 1");
         let err = stub.store.get(&secret()).unwrap_err();
         assert!(err.what.contains("No such object"), "{err}");
+    }
+
+    /// Whatever stopped it, a locked collection is said: it is what to act on.
+    #[test]
+    fn a_failure_on_a_locked_collection_says_it_is_locked() {
+        let stub = Stub::new("echo 'secret-tool: Cannot prompt' >&2; exit 1", LOCKED);
+        for err in [
+            stub.store.get(&secret()).unwrap_err(),
+            stub.store.remove(&secret()).unwrap_err(),
+        ] {
+            assert!(err.what.contains("Cannot prompt"), "{err}");
+            assert!(err.what.contains("locked"), "{err}");
+        }
     }
 
     /// Killed, it said nothing because it did not get to say.
@@ -663,6 +694,7 @@ esac"#,
         }
         let store = on_the_runners_bus();
         store.readable().unwrap();
+        store.set(&secret(), &v("kept")).unwrap();
         let locked = Command::new(DBUS_SEND)
             .args([
                 "--session",
@@ -679,5 +711,19 @@ esac"#,
         let err = store.readable().unwrap_err();
         assert!(begun.elapsed() < LOOK_WAIT, "{:?}", begun.elapsed());
         assert!(err.what.contains("locked"), "{err}");
+        // The item is there and out of reach: neither call takes that for no
+        // value, and each ends, past a dialog nobody answers at the latest.
+        let refused = |call: &dyn Fn() -> Result<(), SecretError>| {
+            let begun = std::time::Instant::now();
+            let err = call().unwrap_err();
+            assert!(
+                begun.elapsed() < ANSWER_WAIT + LOOK_WAIT,
+                "{:?}",
+                begun.elapsed()
+            );
+            assert!(err.what.contains("locked"), "{err}");
+        };
+        refused(&|| store.get(&secret()).map(|_| ()));
+        refused(&|| store.remove(&secret()).map(|_| ()));
     }
 }
