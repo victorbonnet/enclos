@@ -93,14 +93,17 @@ fn stat_and_start(pid: u32) -> Result<Option<(String, String)>, PsError> {
         .ok_or_else(|| PsError(format!("unexpected output `{text}`")))
 }
 
-/// The start time of `pid`, or `None` when no such process runs. A process
-/// that exited but was not yet reaped by its parent (a zombie) runs
-/// nothing and holds nothing, so it does not count as running.
+/// Whether `stat`, a state as `ps` writes it, is a zombie's: a process that
+/// exited but was not yet reaped by its parent. procps writes `Zl` for one
+/// whose main thread exited while others run on, which is no zombie.
+fn is_zombie(stat: &str) -> bool {
+    stat.starts_with('Z') && !stat.contains('l')
+}
+
+/// The start time of `pid`, or `None` when no such process runs. A zombie
+/// runs nothing and holds nothing, so it does not count as running.
 pub fn start_time(pid: u32) -> Result<Option<String>, PsError> {
-    Ok(
-        stat_and_start(pid)?
-            .and_then(|(stat, started)| (!stat.starts_with('Z')).then_some(started)),
-    )
+    Ok(stat_and_start(pid)?.and_then(|(stat, started)| (!is_zombie(&stat)).then_some(started)))
 }
 
 /// A reference to a process that is running now.
@@ -152,7 +155,7 @@ fn parse_listing(line: &str) -> Option<(Proc, bool)> {
     let pid: u32 = words.next()?.parse().ok()?;
     let ppid: u32 = words.next()?.parse().ok()?;
     let pgid: u32 = words.next()?.parse().ok()?;
-    let zombie = words.next()?.starts_with('Z');
+    let zombie = is_zombie(words.next()?);
     let started = lstart(&mut words)?;
     let command = words.collect::<Vec<_>>().join(" ");
     let proc = Proc {
@@ -286,6 +289,42 @@ fn kill(signal: Signal, target: i64) -> Signalled {
     }
 }
 
+/// `python3` set to run a test's own process whose main thread exits while
+/// another runs on, listening at 127.0.0.1 and writing its port once the main
+/// thread is gone. Python, as a test program cannot end only its main thread
+/// with no `unsafe` code.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn headless(python: &mut Command) -> &mut Command {
+    const PROGRAM: &str = r#"
+import ctypes, os, socket, threading, time
+def serve():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    s.listen()
+    stat = "/proc/%d/stat" % os.getpid()
+    while open(stat).read().rsplit(") ", 1)[1][0] != "Z":
+        time.sleep(0.01)
+    print(s.getsockname()[1], flush=True)
+    time.sleep(30)
+threading.Thread(target=serve).start()
+ctypes.CDLL(None).pthread_exit(None)
+"#;
+    python
+        .args(["-I", "-c", PROGRAM])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+}
+
+/// The port [`headless`] wrote, once its main thread is gone.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn headless_port(child: &mut Child) -> u16 {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let out = child.stdout.take().unwrap();
+    std::io::BufReader::new(out).read_line(&mut line).unwrap();
+    line.trim().parse().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +448,39 @@ mod tests {
         let _ = child.wait();
         let found = listed.iter().find(|p| p.pid == child.id()).unwrap();
         assert_eq!(found.command, "a-program-with-");
+    }
+
+    /// procps writes `Zl` for a process whose main thread exited while
+    /// another runs on, and `Z` alone for one that is over.
+    #[test]
+    fn only_a_process_with_no_thread_left_is_a_zombie() {
+        let line = |stat: &str| format!("7 1 7 {stat} Thu Oct  8 09:31:55 2026 x");
+        for (stat, zombie) in [("Z", true), ("Z+", true), ("Zs", true), ("Zl", false)] {
+            assert_eq!(parse_listing(&line(stat)).unwrap().1, zombie, "{stat}");
+        }
+        assert!(!parse_listing(&line("Ss")).unwrap().1);
+        assert!(!parse_listing(&line("Sl")).unwrap().1);
+    }
+
+    /// A real one, which runs on until it is stopped: not a zombie to any
+    /// reader, and it can be signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_runs_on() {
+        let mut child = headless(&mut Command::new("/usr/bin/python3"))
+            .spawn()
+            .unwrap();
+        headless_port(&mut child);
+        let pid = child.id();
+        let (stat, _) = stat_and_start(pid).unwrap().unwrap();
+        assert!(stat.starts_with('Z') && stat.contains('l'), "{stat}");
+        let recorded = reference(pid).unwrap().expect("reads as not running");
+        assert!(processes().unwrap().iter().any(|p| p.pid == pid));
+        assert_eq!(
+            signal_process(&recorded, Signal::Term).unwrap(),
+            Signalled::Sent
+        );
+        assert!(wait_gone(&mut child));
     }
 
     #[test]
