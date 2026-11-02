@@ -190,6 +190,18 @@ fn the_namespaces_text_gives_the_prototypes_answer() {
 }
 
 #[test]
+fn a_session_sees_run_visible_and_never_the_host_only_folder() {
+    let design = design();
+    let adr_0039 = adr("0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md");
+    for text in [&design, &adr_0039] {
+        assert!(!text.contains("reads `run/`"));
+        assert!(!text.contains("reads its own `run/`"));
+        assert!(text.contains("`run/<sandbox>/visible/`"));
+        assert!(text.contains("host-only `run/<sandbox>/`, which no session mounts"));
+    }
+}
+
+#[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder
     // under `run/<sandbox>/` the design names is in §11's layout.
