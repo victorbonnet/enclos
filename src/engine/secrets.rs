@@ -439,6 +439,18 @@ impl Engine {
         Ok(vec![(var.to_owned(), named)])
     }
 
+    /// The variables with which a service reaches the stores `policy`
+    /// grants from. Nothing here looks at a store, so a start reaches no
+    /// bus for them.
+    pub(super) fn service_store_env(&self, policy: &Policy) -> Result<Vec<(String, String)>> {
+        let granted: Vec<StoreName> = self
+            .granted_stores(policy)?
+            .iter()
+            .map(|r| r.store)
+            .collect();
+        Ok(self.secrets.service_env(&granted))
+    }
+
     /// One record of what `policy` grants per store holding any of it.
     fn granted_stores(&self, policy: &Policy) -> Result<Vec<SecretRecord>> {
         let mut stores: Vec<SecretRecord> = Vec::new();

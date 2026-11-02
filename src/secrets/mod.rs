@@ -72,8 +72,9 @@ pub trait Stores {
     fn for_new(&self) -> Result<&dyn SecretStore, SecretError>;
     /// The store `name`, the one a secret's record names, if it answers.
     fn recorded(&self, name: StoreName) -> Result<&dyn SecretStore, SecretError>;
-    /// The variables with which a service reaches these stores.
-    fn service_env(&self) -> Vec<(String, String)>;
+    /// The variables with which a service reaches `granted`, the stores
+    /// holding what its policy grants.
+    fn service_env(&self, granted: &[StoreName]) -> Vec<(String, String)>;
 }
 
 /// A store alone is a host's only one.
@@ -89,7 +90,10 @@ impl<T: SecretStore> Stores for T {
         }
     }
 
-    fn service_env(&self) -> Vec<(String, String)> {
+    /// A store alone hands on its variables whatever is granted: on a Mac
+    /// that is the keychain file `ENCLOS_KEYCHAIN` named, which a service
+    /// needs from the moment a policy grants a secret.
+    fn service_env(&self, _granted: &[StoreName]) -> Vec<(String, String)> {
         self.env()
     }
 }
@@ -154,10 +158,13 @@ impl Stores for Picked {
         }
     }
 
-    fn service_env(&self) -> Vec<(String, String)> {
-        let mut env = self.preferred.env();
-        env.extend(self.otherwise.env());
-        env
+    fn service_env(&self, granted: &[StoreName]) -> Vec<(String, String)> {
+        let stores: [&dyn SecretStore; 2] = [&*self.preferred, &*self.otherwise];
+        stores
+            .into_iter()
+            .filter(|store| granted.contains(&store.name()))
+            .flat_map(|store| store.env())
+            .collect()
     }
 }
 
@@ -175,7 +182,7 @@ impl Stores for Unavailable {
         Err(self.error())
     }
 
-    fn service_env(&self) -> Vec<(String, String)> {
+    fn service_env(&self, _: &[StoreName]) -> Vec<(String, String)> {
         Vec::new()
     }
 }
@@ -311,6 +318,14 @@ impl SecretStore for Stubbed {
     fn whereabouts(&self, secret: &SecretRef) -> String {
         self.store.whereabouts(secret)
     }
+
+    fn env(&self) -> Vec<(String, String)> {
+        self.store.env()
+    }
+
+    fn readable(&self) -> Result<(), SecretError> {
+        self.store.readable()
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +427,21 @@ mod tests {
         assert!(err.untouched, "{err}");
         assert!(err.what.contains("the Secret Service"), "{err}");
         assert!(err.what.contains("does not answer"), "{err}");
+    }
+
+    /// Only what a policy grants from reaches a service, with no look.
+    #[test]
+    fn a_service_gets_only_the_variables_of_the_stores_it_is_granted_from() {
+        let picked = Picked::new(
+            Box::new(libsecret::Libsecret::new(
+                "enclos.t".into(),
+                Some("unix:path=/b".into()),
+            )),
+            Box::new(InMemory::named(StoreName::File)),
+        );
+        assert!(picked.service_env(&[]).is_empty());
+        assert!(picked.service_env(&[StoreName::File]).is_empty());
+        assert_eq!(picked.service_env(&[StoreName::Libsecret]).len(), 1);
     }
 
     #[test]
