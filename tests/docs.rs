@@ -410,6 +410,8 @@ fn what_compiling_leaves_to_later_work_stays_written_down() {
     // A workspace through a link the user made passes every check.
     assert!(to_verify.contains("`~/cargo -> ~/.cargo`"));
     assert!(!design.contains("the write checks still run on real paths"));
+    // The relay moves with the namespace, so it is more than one constant.
+    assert!(design.contains("the holder serves the one relay"));
 }
 
 #[test]
