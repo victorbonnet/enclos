@@ -52,6 +52,19 @@ os.waitpid(pid, 0)
 print(said.decode().split()[-1])
 "#;
 
+/// Reports what `socket` answers for vsock, then for two families a session
+/// keeps.
+const SOCKETS: &str = r#"
+import errno, socket
+def opened(family):
+    try:
+        socket.socket(family, socket.SOCK_STREAM).close()
+        return "ok"
+    except OSError as e:
+        return errno.errorcode[e.errno]
+print(opened(40), opened(socket.AF_UNIX), opened(socket.AF_INET))
+"#;
+
 /// Prints each child's seccomp mode, no_new_privs and process group, as the
 /// kernel shows them, then the command's own group: the relay is the only
 /// child of the command.
@@ -331,6 +344,20 @@ fn on_a_runner_a_user_namespace_is_refused() {
     assert_eq!(said(&python(UNSHARE)), "ok", "the control");
     let (inside, _dir) = Confined::new().run(&[PYTHON, "-c", UNSHARE]);
     assert_eq!(said(&inside), "EPERM");
+}
+
+/// The control is that the host does not answer as the filter does: a host
+/// with no vsock says so with another errno.
+#[test]
+fn on_a_runner_a_socket_family_outside_the_compiled_ones_is_refused() {
+    if !on_a_runner() {
+        return;
+    }
+    let host = said(&python(SOCKETS));
+    assert!(host.ends_with(" ok ok"), "the control: {host}");
+    assert!(!host.starts_with("EPERM"), "the control: {host}");
+    let (inside, _dir) = Confined::new().run(&[PYTHON, "-c", SOCKETS]);
+    assert_eq!(said(&inside), "EPERM ok ok");
 }
 
 /// Answers one connection from the relay, as a proxy would.
