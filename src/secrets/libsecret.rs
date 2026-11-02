@@ -9,7 +9,8 @@
 //! other processes could list, and comes back as it went: the tool ends a
 //! value with a line break only at a terminal. `lookup` and `clear` exit 1
 //! both when they fail, with words on standard error, and when they find or
-//! remove nothing, with none (libsecret 0.21.4's source).
+//! remove nothing, with none (libsecret 0.21.4's source), which a locked
+//! collection also gives, so only an unlocked one shows there is nothing.
 //!
 //! Nothing here may ask anything: a service has nobody to answer. Reading a
 //! locked collection would ask to unlock it, so [`Libsecret::readable`]
@@ -101,6 +102,24 @@ impl Libsecret {
         )
     }
 
+    /// Whether finding nothing means there is nothing: the tool sees only
+    /// unlocked items, so only an unlocked collection shows it.
+    fn nothing_there(&self, what: &str, secret: &SecretRef) -> Result<(), SecretError> {
+        match self.locked() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(self.fail(
+                what,
+                secret,
+                "its default collection is locked, so it may still be there",
+            )),
+            Err(e) => Err(self.fail(
+                what,
+                secret,
+                format!("it may still be there: cannot tell whether it is locked ({e})"),
+            )),
+        }
+    }
+
     /// The collection's `Locked` property, as `dbus-send` printed it.
     fn locked(&self) -> Result<bool, String> {
         let out = run_for(
@@ -123,6 +142,12 @@ impl Libsecret {
         parse_locked(&String::from_utf8_lossy(&out.stdout))
             .ok_or_else(|| "its answer does not say".to_owned())
     }
+}
+
+/// Whether `lookup` or `clear` found nothing, as far as it knows: exit 1 with
+/// no words. Killed, or any other exit, it did not get to look.
+fn found_nothing(out: &Output) -> bool {
+    out.status.code() == Some(1) && out.stderr.is_empty()
 }
 
 /// Whether what `dbus-send --print-reply` printed says locked.
@@ -181,8 +206,8 @@ impl SecretStore for Libsecret {
             .lookup(secret)
             .map_err(|e| self.fail("read", secret, e))?;
         if !out.status.success() {
-            return match out.stderr.is_empty() {
-                true => Ok(None),
+            return match found_nothing(&out) {
+                true => self.nothing_there("read", secret).map(|()| None),
                 false => Err(self.fail("read", secret, stderr(&out.stderr, out.status))),
             };
         }
@@ -205,23 +230,9 @@ impl SecretStore for Libsecret {
         if out.status.success() {
             return Ok(true);
         }
-        if !out.stderr.is_empty() {
-            return Err(self.fail("remove", secret, stderr(&out.stderr, out.status)));
-        }
-        // It removed nothing, and it removes only unlocked items: only an
-        // unlocked collection shows there was nothing to remove.
-        match self.locked() {
-            Ok(false) => Ok(false),
-            Ok(true) => Err(self.fail(
-                "remove",
-                secret,
-                "its default collection is locked, so it may still be there",
-            )),
-            Err(e) => Err(self.fail(
-                "remove",
-                secret,
-                format!("it may still be there: cannot tell whether it is locked ({e})"),
-            )),
+        match found_nothing(&out) {
+            true => self.nothing_there("remove", secret).map(|()| false),
+            false => Err(self.fail("remove", secret, stderr(&out.stderr, out.status))),
         }
     }
 
@@ -261,7 +272,7 @@ impl Prober for Libsecret {
             return false;
         };
         match run_for(command.arg("lookup").args(NO_ITEM), None, LOOK_WAIT) {
-            Ok(out) => out.status.success() || out.stderr.is_empty(),
+            Ok(out) => out.status.success() || found_nothing(&out),
             Err(_) => false,
         }
     }
@@ -282,6 +293,7 @@ mod tests {
     }
 
     const UNLOCKED: &str = "echo '   variant       boolean false'";
+    const LOCKED: &str = "echo '   variant       boolean true'";
 
     /// A stand-in for `secret-tool` and `dbus-send`, in a folder of the
     /// test's own: nothing here reaches any bus, the address being made up.
@@ -406,11 +418,45 @@ esac"#,
         assert!(err.what.contains("the service broke"), "{err}");
     }
 
+    /// A lookup in a locked collection whose unlock was dismissed says
+    /// nothing, as one that finds nothing does.
+    #[test]
+    fn a_locked_collection_is_not_taken_for_a_secret_with_no_value() {
+        let stub = Stub::new("exit 1", LOCKED);
+        let err = stub.store.get(&secret()).unwrap_err();
+        assert!(err.what.contains("locked"), "{err}");
+    }
+
+    #[test]
+    fn a_collection_that_cannot_be_looked_at_is_not_taken_for_no_value() {
+        let stub = Stub::new("exit 1", "echo 'Error: No such object' >&2; exit 1");
+        let err = stub.store.get(&secret()).unwrap_err();
+        assert!(err.what.contains("No such object"), "{err}");
+    }
+
+    /// Killed, it said nothing because it did not get to say.
+    #[test]
+    fn a_tool_killed_by_a_signal_is_no_answer() {
+        let stub = Stub::new("kill -9 $$", UNLOCKED);
+        assert!(stub.store.get(&secret()).is_err());
+        assert!(stub.store.remove(&secret()).is_err());
+        assert!(!stub.store.answers());
+    }
+
+    /// Any exit but 1 is no finding nothing either.
+    #[test]
+    fn a_tool_that_exits_otherwise_is_no_answer() {
+        let stub = Stub::new("exit 2", UNLOCKED);
+        assert!(stub.store.get(&secret()).is_err());
+        assert!(stub.store.remove(&secret()).is_err());
+        assert!(!stub.store.answers());
+    }
+
     /// `clear` removes unlocked items only, so finding none in a locked
     /// collection says nothing: the value may still be there.
     #[test]
     fn a_locked_collection_is_not_taken_for_nothing_to_remove() {
-        let stub = Stub::new("exit 1", "echo '   variant       boolean true'");
+        let stub = Stub::new("exit 1", LOCKED);
         let err = stub.store.remove(&secret()).unwrap_err();
         assert!(err.what.contains("locked"), "{err}");
     }
