@@ -20,9 +20,11 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, parent_id};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use seccompiler::{BpfProgram, TargetArch};
 
@@ -35,6 +37,9 @@ const READY: &str = "ready";
 /// This program, wherever it was installed and whatever the mounts show of
 /// that path.
 const THIS_PROGRAM: &str = "/proc/self/exe";
+
+/// How often a relay looks whether its session is still there.
+const PARENT_LOOK: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsideError {
@@ -187,6 +192,13 @@ impl Prepared {
     }
 }
 
+/// Returns once `now` gives another parent than `parent`.
+fn wait_for_new_parent(parent: u32, now: impl Fn() -> u32, every: Duration) {
+    while now() == parent {
+        thread::sleep(every);
+    }
+}
+
 /// The compiled file, and the session's command or the relay's port.
 struct Running<T> {
     prepared: Prepared,
@@ -228,13 +240,30 @@ impl SessionSteps for Running<&[OsString]> {
     }
 }
 
-impl RelaySteps for Running<TcpListener> {
+/// The port a relay serves, and the session that started it.
+struct Serving {
+    listener: TcpListener,
+    session: u32,
+}
+
+impl RelaySteps for Running<Serving> {
     fn say_ready(&mut self) -> Result<(), InsideError> {
         writeln!(io::stdout(), "{READY}").map_err(InsideError::RelayStart)
     }
 
+    /// Looks after its session from here: a parent-death signal is checked
+    /// as one the dying session sends, so where Landlock's scopes apply the
+    /// relay's own domain refuses it, and a PID namespace is not relied on.
     fn serve(&mut self) -> InsideError {
-        match self.then.try_clone() {
+        let session = self.then.session;
+        let watching = thread::Builder::new().spawn(move || {
+            wait_for_new_parent(session, parent_id, PARENT_LOOK);
+            std::process::exit(0);
+        });
+        if let Err(e) = watching {
+            return InsideError::RelayStart(e);
+        }
+        match self.then.listener.try_clone() {
             Ok(listener) => {
                 crate::relay::serve(listener, Path::new(&self.prepared.compiled.relay.socket))
             }
@@ -258,18 +287,19 @@ pub fn session(path: &Path, command: &[OsString]) -> InsideError {
 /// Serves as the session's relay. Returns only what stopped it.
 pub fn relay(path: &Path) -> InsideError {
     // The session it serves is the process that started it, and the command
-    // that process became; a PID namespace is not relied on to end it.
-    let parent_gone = rustix::process::Signal::KILL;
-    if let Err(e) = rustix::process::set_parent_process_death_signal(Some(parent_gone)) {
-        return InsideError::RelayStart(e.into());
-    }
+    // that process became. Read first: a session gone before this line leaves
+    // nobody to read `ready`, and saying it fails.
+    let session = parent_id();
     let listener = io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .map(TcpListener::from)
         .map_err(InsideError::RelayPort);
     match (Prepared::read(path), listener) {
-        (Ok(prepared), Ok(then)) => as_relay(&mut Running { prepared, then }),
+        (Ok(prepared), Ok(listener)) => as_relay(&mut Running {
+            prepared,
+            then: Serving { listener, session },
+        }),
         (Err(e), _) | (_, Err(e)) => e,
     }
 }
