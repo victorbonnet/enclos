@@ -169,3 +169,11 @@ fn ubuntu_26_04_is_not_read_as_24_04() {
     assert!(!header.contains("ubuntu-latest"), "{header}");
     assert!(header.contains("`ubuntu-26.04`"), "{header}");
 }
+
+#[test]
+fn no_runner_cell_waits_for_a_run() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    assert!(!readme.contains("to measure (CI)"));
+    assert!(!readme.contains("the next run of the workflow"));
+}
