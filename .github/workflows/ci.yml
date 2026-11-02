@@ -114,10 +114,14 @@ jobs:
           runtime_dir="/run/user/$(id -u)"
           echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
           timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
+      - name: The kernel and systemd under test
+        run: |
+          uname -r
+          systemd-run --version
       - name: Scopes in the runner's user manager
         run: |
           cargo test --locked --all-features --lib engine::tests::runtime::cgroups::on_a_runner | tee cgroups.log
-          grep -q 'test result: ok\. 9 passed' cgroups.log
+          grep -q 'test result: ok\. 10 passed' cgroups.log
 
   libsecret:
     strategy:
