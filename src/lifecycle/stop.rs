@@ -369,7 +369,10 @@ mod tests {
         let folder = root.join("s.scope");
         std::fs::create_dir_all(&folder).unwrap();
         let text: String = pids.iter().map(|p| format!("{p}\n")).collect();
-        std::fs::write(folder.join("cgroup.procs"), text).unwrap();
+        // Whole, as the kernel's: a look must not read it truncated, as empty.
+        let written = root.join("cgroup.procs.new");
+        std::fs::write(&written, text).unwrap();
+        std::fs::rename(written, folder.join("cgroup.procs")).unwrap();
     }
 
     #[test]
@@ -386,12 +389,10 @@ mod tests {
         let stopped = std::thread::scope(|s| {
             s.spawn(|| {
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                    let left: Vec<u32> = [root.id(), other.id()]
+                    let left: Vec<u32> = [&session.root, &other_ref]
                         .into_iter()
-                        .filter(|pid| {
-                            std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                                .is_ok_and(|s| !s.contains(") Z "))
-                        })
+                        .filter(|process| is_same(process).unwrap())
+                        .map(|process| process.pid)
                         .collect();
                     write_cgroup(dir.path(), &left);
                     std::thread::sleep(POLL);
