@@ -34,8 +34,8 @@ pub use stream::Listener;
 /// listeners, the state database.
 const OWN_DESCRIPTORS: u64 = 24;
 
-/// The most descriptors a proxy plans for, however many the service manager
-/// gives it: its connections and lookups also hold threads, which nothing
+/// The most descriptors a proxy plans for, however many it was given: its
+/// connections and lookups also hold threads, which nothing
 /// else bounds.
 const MOST_DESCRIPTORS: u64 = 1024;
 
@@ -131,7 +131,8 @@ impl Proxy {
         log: Box<dyn NetLogStore + Send + Sync>,
     ) -> Proxy {
         // The soft limit is the one a descriptor hits: what the service
-        // manager gave, as the proxy never raises it.
+        // manager gave, or the shell of the `connect` that started the
+        // proxy, as the proxy never raises it.
         let descriptors = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
         let (max_connections, max_lookups) = limits_for(descriptors);
         Proxy {
