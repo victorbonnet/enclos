@@ -205,21 +205,20 @@ pub fn listen(port: u16) -> Result<Vec<TcpListener>, ListenError> {
 
 /// The proxy's listener on the Unix socket at `path`, whose folder exists.
 /// A socket already there is taken over if nothing answers on it, as after
-/// a proxy that was killed. Anything else there, or a proxy answering, is
-/// an error.
+/// a proxy that was killed. Anything else there, a link included, or a proxy
+/// answering, is an error.
 pub fn listen_unix(path: &Path) -> io::Result<UnixListener> {
-    match UnixListener::bind(path) {
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            let left = std::fs::symlink_metadata(path)?.file_type().is_socket()
-                && UnixStream::connect(path).is_err();
-            if !left {
-                return Err(e);
-            }
+    // Looked at before `bind`, which on macOS follows a link to nothing and
+    // makes the socket at its target.
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(found) if found.file_type().is_socket() && UnixStream::connect(path).is_err() => {
             std::fs::remove_file(path)?;
-            UnixListener::bind(path)
         }
-        bound => bound,
+        Ok(_) => return Err(io::ErrorKind::AddrInUse.into()),
     }
+    UnixListener::bind(path)
 }
 
 #[cfg(test)]
