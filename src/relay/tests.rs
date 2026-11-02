@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{connections_for, forward, serve_up_to};
+use super::{connections_for, pass_on, serve_up_to};
 
 /// Far beyond the sockets' buffers.
 const LARGE: usize = 64 * 1024 * 1024;
@@ -223,7 +223,7 @@ fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
 #[test]
 fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction() {
     let mut sent = Vec::new();
-    forward(
+    pass_on(
         &b"last"[..],
         &mut sent,
         || Err(std::io::ErrorKind::NotConnected.into()),
