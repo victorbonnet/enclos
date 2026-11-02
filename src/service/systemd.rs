@@ -253,7 +253,7 @@ impl ServiceManager for Systemd {
         if !out.status.success() {
             return Err(ServiceError {
                 what: format!(
-                    "systemd did not answer as your user's manager, which runs enclos's services: {}",
+                    "systemd did not answer as your user's manager, which runs enclos's services: {}; log in as this user directly, not through `su` or `sudo`, so that `XDG_RUNTIME_DIR` is set",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
             });
@@ -503,6 +503,17 @@ WantedBy=default.target
         );
     }
 
+    /// What the stub does when asked for `UnitPath`: `exit 1`, or print it.
+    fn answer(unit_path: &str, units_dir: &Path) -> String {
+        match unit_path {
+            "exit 1" => "exit 1".to_owned(),
+            line => format!(
+                "printf '%s\\n' '{}'",
+                line.replace("UNITS", &units_dir.display().to_string())
+            ),
+        }
+    }
+
     /// A `Systemd` whose `systemctl` is a script in a folder of the test's:
     /// it logs its arguments and answers `show` with these lines, so nothing
     /// reaches a real manager.
@@ -520,9 +531,9 @@ WantedBy=default.target
             let log = dir.path().join("calls");
             let script = dir.path().join("systemctl");
             let text = format!(
-                "#!/bin/sh\necho \"$*\" >>'{log}'\ncase \"$*\" in\n*UnitPath*) printf '%s\\n' '{unit_path}' ;;\n*show*) printf '%s\\n' '{shown}' ;;\nesac\n",
+                "#!/bin/sh\necho \"$*\" >>'{log}'\ncase \"$*\" in\n*UnitPath*) {unit_path} ;;\n*show*) printf '%s\\n' '{shown}' ;;\nesac\n",
                 log = log.display(),
-                unit_path = unit_path.replace("UNITS", &units_dir.display().to_string()),
+                unit_path = answer(unit_path, &units_dir),
             );
             std::fs::write(&script, text).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -570,6 +581,14 @@ WantedBy=default.target
         }
         assert!(!stub.systemd.units_dir.exists());
         assert!(!stub.called("daemon-reload"));
+    }
+
+    #[test]
+    fn a_manager_that_does_not_answer_says_how_to_reach_it() {
+        let stub = Stub::new("exit 1", LOADED);
+        let err = stub.systemd.available().unwrap_err();
+        assert!(err.what.contains("not through `su` or `sudo`"), "{err}");
+        assert!(err.what.contains("XDG_RUNTIME_DIR"), "{err}");
     }
 
     #[test]
