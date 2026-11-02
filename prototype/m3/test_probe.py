@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 M3 = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, M3)
@@ -46,6 +46,60 @@ class ExecProbeTest(unittest.TestCase):
         for path in glob.glob(os.path.join(M3, "*.sh")):
             with open(path) as f:
                 self.assertIsNone(re.search(rf"\bcp\s+\S*/({COREUTILS})\s", f.read()), path)
+
+
+class RoutesAroundTheExecuteRuleTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(tmp.cleanup)
+        self.copy = os.path.join(tmp.name, "sh-copy")
+        shutil.copy(os.path.realpath("/bin/sh"), self.copy)
+
+    def test_the_loader_runs_a_program_as_its_argument(self):
+        self.assertEqual(probe.p_exec_loader(self.copy), ("ok", ""))
+
+    def test_a_memfd_runs_what_was_copied_into_it(self):
+        self.assertEqual(probe.p_exec_memfd(self.copy), ("ok", ""))
+
+    def test_a_program_that_is_not_there_reads_as_refused_not_as_broken(self):
+        self.assertEqual(probe.p_exec_memfd(self.copy + "-gone")[0], "ENOENT")
+
+    def test_sandbox_check_runs_them_on_the_copy_the_execute_rule_refuses(self):
+        with open(os.path.join(M3, "sandbox-check.sh")) as f:
+            check = f.read()
+        self.assertIn('"exec-loader $WORK/sh-copy"', check)
+        self.assertIn('"exec-memfd $WORK/sh-copy"', check)
+
+
+class VsockTest(unittest.TestCase):
+    """A stand-in for the socket: making a real one can load a kernel module."""
+
+    def result(self, **kinds):
+        sock = MagicMock()
+        sock.connect.side_effect = kinds.get("connect")
+        make = MagicMock(return_value=sock, side_effect=kinds.get("make"))
+        with patch.object(probe.socket, "socket", make):
+            return probe.p_connect_vsock("2", "9"), sock
+
+    def test_it_connects_to_the_cid_and_port_it_is_given(self):
+        result, sock = self.result()
+        self.assertEqual(result, ("ok", "connected"))
+        sock.connect.assert_called_once_with((2, 9))
+        sock.close.assert_called_once()
+
+    def test_a_refused_connection_reports_its_error(self):
+        result, _ = self.result(connect=OSError(errno.ECONNRESET, "reset"))
+        self.assertEqual(result, ("ECONNRESET", ""))
+
+    def test_no_such_family_reports_its_error(self):
+        result, _ = self.result(make=OSError(errno.EAFNOSUPPORT, "not supported"))
+        self.assertEqual(result, ("EAFNOSUPPORT", ""))
+
+    def test_sandbox_check_asks_for_the_hypervisor_and_the_local_cid(self):
+        with open(os.path.join(M3, "sandbox-check.sh")) as f:
+            check = f.read()
+        self.assertIn('"connect-vsock 2 ', check)
+        self.assertIn('"connect-vsock 1 ', check)
 
 
 class UnshareTest(unittest.TestCase):

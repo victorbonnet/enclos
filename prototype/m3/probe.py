@@ -33,6 +33,10 @@ NR = {
                 "io_uring_setup": 425},
 }[platform.machine()]
 
+# The dynamic loader, which runs the program it is given in its own process.
+LOADER = {"x86_64": "/lib64/ld-linux-x86-64.so.2",
+          "aarch64": "/lib/ld-linux-aarch64.so.1"}[platform.machine()]
+
 
 def err(e):
     return errno.errorcode.get(e, str(e))
@@ -89,12 +93,37 @@ def p_leave(path):
         return err(e.errno), ""
 
 
-def p_exec(path):
+def run_program(argv, pass_fds=()):
     try:
-        out = subprocess.run([path], stdin=subprocess.DEVNULL, capture_output=True, timeout=20, text=True)
+        out = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+                             text=True, pass_fds=pass_fds)
         return ("ok" if out.returncode == 0 else f"exit {out.returncode}"), out.stdout.strip()
     except OSError as e:
         return err(e.errno), ""
+
+
+def p_exec(path):
+    return run_program([path])
+
+
+def p_exec_loader(path):
+    """Have the loader run it: the exec is of the loader, not of the path."""
+    return run_program([LOADER, path])
+
+
+def p_exec_memfd(path):
+    """Copy it to a memfd and exec that, which is on no path a rule names."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return err(e.errno), ""
+    fd = os.memfd_create("probe", 0)  # not close-on-exec: the exec goes through it
+    try:
+        os.write(fd, data)
+        return run_program([f"/proc/self/fd/{fd}"], pass_fds=(fd,))
+    finally:
+        os.close(fd)
 
 
 def p_rename(path):
@@ -225,6 +254,23 @@ def p_connect_tcp(host, port):
         return err(e.errno) if e.errno else "timeout", ""
 
 
+def p_connect_vsock(cid, port):
+    """To a CID (2 the hypervisor, 1 this kernel), which is no network
+    interface, so a network namespace may not hold it."""
+    try:
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    except OSError as e:
+        return err(e.errno), ""
+    s.settimeout(3)
+    try:
+        s.connect((int(cid), int(port)))
+        return "ok", "connected"
+    except OSError as e:
+        return err(e.errno) if e.errno else "timeout", ""
+    finally:
+        s.close()
+
+
 def p_dns(name):
     try:
         addrs = {a[4][0] for a in socket.getaddrinfo(name, 443, type=socket.SOCK_STREAM)}
@@ -235,11 +281,11 @@ def p_dns(name):
 
 PROBES = {
     "read": p_read, "exists": p_exists, "write": p_write, "open-write": p_open_write, "leave": p_leave,
-    "exec": p_exec, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
+    "exec": p_exec, "exec-loader": p_exec_loader, "exec-memfd": p_exec_memfd, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
     "mount": p_mount, "keyctl": p_keyctl, "bpf": p_bpf, "perf_event_open": p_perf,
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,
     "ptrace": p_ptrace, "connect-unix": p_connect_unix,
-    "connect-tcp": p_connect_tcp, "dns": p_dns,
+    "connect-tcp": p_connect_tcp, "connect-vsock": p_connect_vsock, "dns": p_dns,
 }
 
 
