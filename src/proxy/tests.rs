@@ -326,6 +326,8 @@ fn the_limits_are_sized_from_the_descriptors_the_proxy_was_given() {
     assert_eq!(limits_for(Some(256)), (100, 32));
     // systemd's usual soft limit.
     assert_eq!(limits_for(Some(1024)), (431, 137));
+    // What a `connect` started from a shell with a low limit passes on.
+    assert_eq!(limits_for(Some(64)), (17, 5));
     // Past it, or without any limit, threads are what must stay bounded.
     assert_eq!(limits_for(Some(1 << 20)), limits_for(Some(1024)));
     assert_eq!(limits_for(None), limits_for(Some(1024)));
