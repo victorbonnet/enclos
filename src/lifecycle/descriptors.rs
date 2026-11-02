@@ -55,6 +55,9 @@ pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 return Ok(Descriptors::Unreadable);
             }
+            // Deeper than `/proc` can write: anyone can make such a path, and
+            // no marker or socket has one.
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()) => {}
             Err(e) => return Err(e),
         }
     }
@@ -124,6 +127,33 @@ mod tests {
         let err = every_process(proc.path()).unwrap_err();
         assert!(err.to_string().contains("the caller"), "{err}");
         assert!(every_process(&proc.path().join("none")).is_err());
+    }
+
+    /// A descriptor on a folder deeper than `/proc` can write, past any page
+    /// a kernel may use: one such descriptor anywhere must not fail the look
+    /// at every process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_too_deep_to_name_is_left_out() {
+        use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "d".repeat(255);
+        let read = OFlags::RDONLY | OFlags::DIRECTORY;
+        let mut deep = open(dir.path(), read, Mode::empty()).unwrap();
+        for _ in 0..300 {
+            mkdirat(&deep, &name, Mode::RWXU).unwrap();
+            deep = openat(&deep, &name, read, Mode::empty()).unwrap();
+        }
+        let proc = Path::new(PROC);
+        let link = proc.join("self/fd").join(deep.as_raw_fd().to_string());
+        let err = std::fs::read_link(&link).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(rustix::io::Errno::NAMETOOLONG.raw_os_error())
+        );
+        let found = every_process(proc).unwrap();
+        assert!(found.iter().any(|(pid, _)| *pid == me()));
     }
 
     #[cfg(target_os = "linux")]
