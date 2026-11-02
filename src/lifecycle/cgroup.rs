@@ -169,6 +169,14 @@ fn parse_systemd_version(text: &str) -> Option<u32> {
     version[..digits.unwrap_or(version.len())].parse().ok()
 }
 
+/// What to say of a host with no `systemd_run`.
+pub fn no_systemd_run(systemd_run: &Path) -> String {
+    format!(
+        "{} is missing: every session on Linux runs through it, and needs a user manager",
+        systemd_run.display()
+    )
+}
+
 /// The systemd on this host, against [`SYSTEMD_NEEDED`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Systemd {
@@ -192,6 +200,9 @@ impl Systemd {
         let name = systemd_run.display();
         let out = match out {
             Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Systemd::Unreadable(no_systemd_run(systemd_run));
+            }
             Err(e) => return Systemd::Unreadable(format!("cannot run {name}: {e}")),
         };
         let text = String::from_utf8_lossy(&out.stdout);
