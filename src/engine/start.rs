@@ -295,7 +295,7 @@ impl Engine {
             self.name_marker(name, marked, &root)?;
             // An error ends the program, as any failure to record it does.
             if let Some(scope) = &scope {
-                cgroup = Some(scope.cgroup_of(child.id())?);
+                cgroup = Some(scope.cgroup_of(child.id(), &self.cgroups)?);
             }
             let (kind, service) = starting.recorded_as();
             let mut session = SessionRecord {
