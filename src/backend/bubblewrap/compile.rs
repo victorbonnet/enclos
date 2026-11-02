@@ -520,6 +520,66 @@ mod tests {
         compiled_sandbox(p, &ctx()).unwrap_err().to_string()
     }
 
+    /// A real Linux layout with its data outside the home: two roots and
+    /// the unit folders, none spelled as [`Layout::at`] spells them.
+    fn resolved_linux() -> Layout {
+        Layout::resolve(Os::Linux, |name| match name {
+            "HOME" => Some(USER.into()),
+            "XDG_DATA_HOME" => Some("/srv/alice-data".into()),
+            "XDG_CONFIG_HOME" => Some(format!("{USER}/.config").into()),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    fn resolved_linux_case() -> (Policy, SandboxContext) {
+        let name: TemplateName = "minimal".parse().unwrap();
+        let mut p = resolve(&initial_overrides("home", &name), None)
+            .unwrap()
+            .policy;
+        p.fs.write.push("~/proj".to_owned());
+        p.fs.read_deny.push("~/proj/config/.env".to_owned());
+        p.fs.read_deny.push("/opt/secrets".to_owned());
+        (p, on_linux(&resolved_linux()))
+    }
+
+    /// `Layout::at` has one root, so dropping any later one would pass the
+    /// template snapshots: this compares a real layout's whole output.
+    #[test]
+    fn a_resolved_linux_layout_compiles_to_its_snapshot() {
+        let (p, ctx) = resolved_linux_case();
+        let text = compile(&p, &ctx).unwrap().text;
+        if std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some() {
+            let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/backend/bubblewrap/resolved-linux.snapshot");
+            std::fs::write(file, &text).unwrap();
+            return;
+        }
+        assert_eq!(text, include_str!("resolved-linux.snapshot"));
+    }
+
+    /// Every root of the layout, each folder of it, and before anything is
+    /// bound: a `--bind` first would be covered, or uncover the root.
+    #[test]
+    fn every_protected_root_is_hidden_before_the_first_bind() {
+        let (p, ctx) = resolved_linux_case();
+        assert_eq!(ctx.protected.len(), 4, "{:?}", ctx.protected);
+        let c = compiled_sandbox(&p, &ctx).unwrap();
+        let args = &c.after_home_mask;
+        let first_bind = args.iter().position(|a| a.starts_with("--bind")).unwrap();
+        for root in &ctx.protected {
+            let root = root.to_str().unwrap();
+            if root.starts_with(USER) {
+                assert!(c.home_mask.denied.contains(&root.to_owned()), "{root}");
+            } else {
+                let at = args.iter().position(|a| a == root).unwrap();
+                assert_eq!(args[at - 1], "--tmpfs", "{root}");
+                assert!(at < first_bind, "{root}: {args:?}");
+                assert!(after(args, "--remount-ro").contains(&root), "{root}");
+            }
+        }
+    }
+
     /// Runs on every system against one file each, so a template's output
     /// that came to depend on the host fails on the others.
     #[test]
