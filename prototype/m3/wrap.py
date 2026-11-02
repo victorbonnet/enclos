@@ -16,6 +16,25 @@ def grant_paths(mask):
     return [g["path"] for g in mask["grants"]]
 
 
+def hidden_paths(mask, resolved):
+    """The paths the home's folders leave out: each deny entry and, where a
+    link takes it elsewhere, what it resolves to. Seatbelt compiles the resolved
+    path, so the same policy hides the target on both (design §15). A target a
+    grant holds is masked there instead. One neither under the home nor in a
+    grant stays readable through the broad read, so it stops the session until
+    §15 decides that case. The home is given with no link in its path."""
+    roots = [resolved[g] for g in grant_paths(mask)]
+    hidden = set(mask["denied"])
+    for d in mask["denied"]:
+        target = resolved[d]
+        if any(under(target, root) for root in roots):
+            continue
+        if target == mask["home"] or not under(target, mask["home"]):
+            sys.exit(f"wrap.py: deny entry {d} resolves to {target}, which cannot be hidden")
+        hidden.add(target)
+    return hidden
+
+
 def masked_in_grants(mask, resolved):
     """(path, writable) for each denied path a grant holds, under the grant's
     own name for it. Paths compare resolved: a grant may be reached through a
@@ -30,13 +49,15 @@ def masked_in_grants(mask, resolved):
 
 def read_host(compiled):
     """What this session's mounts depend on. `entries`: each real folder from
-    the home down that holds a denied path outside a grant, its names mapped
-    to a link's target or None. `resolved`: each denied path and grant with
-    links resolved. `kinds`: what is now at each path masked in a grant, "dir",
+    the home down that holds a hidden path (hidden_paths) outside a grant, its
+    names mapped to a link's target or None. `resolved`: each denied path and
+    grant with links resolved. `kinds`: what is now at each path masked in a grant, "dir",
     "file" or None. A folder that went away lists nothing; one that cannot be
     read stops the session, since what it holds cannot be hidden."""
     mask = compiled["home_mask"]
     grants = grant_paths(mask)
+    resolved = {p: os.path.realpath(p) for p in mask["denied"] + grants}
+    hidden = hidden_paths(mask, resolved)
     entries = {}
 
     def walk(folder):
@@ -51,11 +72,10 @@ def read_host(compiled):
                 found[name] = os.readlink(path)
             except OSError:
                 found[name] = None
-                if path not in grants and any(under(d, path) and d != path for d in mask["denied"]):
+                if path not in grants and any(under(d, path) and d != path for d in hidden):
                     walk(path)
 
     walk(mask["home"])
-    resolved = {p: os.path.realpath(p) for p in mask["denied"] + grants}
     kinds = {}
     for path, _ in masked_in_grants(mask, resolved):
         kinds[path] = "dir" if os.path.isdir(path) else "file" if os.path.lexists(path) else None
@@ -111,7 +131,7 @@ def arguments(compiled, listing):
     remount = []
     for arg in compiled["bwrap"]:
         if arg == "@HOME_MASK@":
-            hide(mask["home"], set(mask["denied"]), listing["entries"], args, remount)
+            hide(mask["home"], hidden_paths(mask, resolved), listing["entries"], args, remount)
         elif arg == "@GRANT_MASK@":
             mask_in_grants(mask, listing, args, remount)
         else:
