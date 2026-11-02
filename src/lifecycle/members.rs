@@ -321,7 +321,7 @@ mod tests {
         // the session's; what the engine found in the cgroup is, for sure.
         let procs = vec![proc(31, 1, 30), proc(40, 1, 40)];
         let mut s = session(30, Some(30));
-        s.cgroup = Some("/s.scope".into());
+        s.cgroup = Some("/s.scope".parse().unwrap());
         assert!(is_gone(&procs, &s));
         assert_eq!(pids(&find(&procs, &s, &[at(40)])), [(40, true)]);
     }
