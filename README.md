@@ -73,11 +73,11 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 ## Documentation
 
-- [Website](https://enclos.dev/): a visual introduction, everyday examples and common questions ([source](site/)).
+- [Website](https://enclos.dev/): what enclos does, how to install it and its limits ([source](site/)).
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
-- [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under.
+- [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under, and [every setting](docs/policy-compilation.md#every-setting) it can hold.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.
 - [Decisions](docs/adr/): one short record per architecture decision.
 - [Glossary](GLOSSARY.md): the words enclos uses.

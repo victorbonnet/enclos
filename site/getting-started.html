@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#fafaf8">
+    <meta name="description" content="Install enclos, create a sandbox, install Hermes in it and talk to an agent.">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'none'; form-action 'none'">
+    <meta name="color-scheme" content="light dark">
+    <link rel="canonical" href="https://enclos.dev/getting-started.html">
+    <title>Getting started — enclos</title>
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header wrap">
+      <a class="wordmark" href="./" aria-label="enclos, home"><svg class="brand-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M12 4H4v8m16-8h8v8M4 20v8h8m16-8v8h-8" stroke="currentColor" stroke-width="3"/><path d="M12 12h8v8h-8z" fill="currentColor"/></svg>enclos<span class="wordmark-dot">.</span></a>
+      <nav aria-label="Main navigation">
+        <a href="./policy-compilation.html">Policy</a>
+        <a href="https://github.com/victorbonnet/enclos">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main" class="doc wrap">
+      <h1>Getting started</h1>
+      <p class="lead">From install to talking to an agent. This guide runs Hermes in a sandbox called <code>lab</code>, on a Mac, which is what enclos runs today.</p>
+
+      <h2>Before you start</h2>
+      <ul>
+        <li>An Apple silicon Mac on macOS 15 or later.</li>
+        <li>An account with a model provider Hermes supports.</li>
+        <li>About 2.5 GB free per sandbox: each one gets its own Hermes install.</li>
+      </ul>
+
+      <h2>Install enclos</h2>
+      <div class="terminal"><pre><code><span class="command">curl -fsSL https://enclos.dev/install.sh | bash</span></code></pre></div>
+      <p>The installer takes the latest release, checks its SHA-256 checksum and version, and puts <code>enclos</code> in <code>~/.local/bin</code>. If that folder is not on your PATH, run the <code>export</code> line it prints. It never uses sudo, edits your shell files or creates sandboxes.</p>
+
+      <h2>Create a sandbox and install Hermes</h2>
+      <div class="terminal"><pre><code><span class="command">enclos init</span>
+<span class="command">enclos sandbox create lab --template assistant</span>
+
+<span class="comment"># takes a few minutes</span>
+<span class="command">enclos runtime install hermes --sandbox lab</span>
+
+<span class="comment"># Hermes's own setup: your provider, its login, a model</span>
+<span class="command">enclos connect lab -- hermes -p default setup</span></code></pre></div>
+      <p>The install runs inside the sandbox, through its proxy, so it can write only to the sandbox’s home. The sandbox cannot open a browser: when the login shows a URL, open it in your browser yourself. Every agent in the sandbox shares this login.</p>
+      <p>The <code>assistant</code> template reaches the public web on ports 80 and 443, and logs every connection as long as enclos can write its state. To start closed, use <code>--template minimal</code>: it reaches Hermes’s install sources and the ChatGPT subscription’s hosts, and another provider’s hosts need <code>enclos policy allow</code>. See <a href="./policy-compilation.html#templates">what each template can do</a>.</p>
+
+      <h2>Add agents</h2>
+      <p>Hermes comes with a built-in agent, <code>default</code>. Add more with one command:</p>
+      <div class="terminal"><pre><code><span class="command">enclos agent add lab/main</span>
+<span class="command">enclos agent add lab/scout</span>
+<span class="command">enclos agent list lab</span></code></pre></div>
+      <p>Agents in a sandbox share its runtime, policy, proxy and login, and can read each other’s files. Use separate sandboxes for agents that need different access.</p>
+
+      <h2>Check the sandbox</h2>
+      <div class="terminal"><pre><code><span class="command">enclos policy test lab</span></code></pre></div>
+      <p>This tries known ways out from inside the sandbox, such as reading <code>~/.ssh</code>, writing outside its home or going around the proxy. Every probe must fail. The last line says <code>READY</code> when none got out, or <code>NOT READY</code> and why.</p>
+
+      <h2>Talk to an agent</h2>
+      <div class="terminal"><pre><code><span class="comment"># the proxy and the Hermes gateway, now and at each login</span>
+<span class="command">enclos sandbox start lab</span>
+
+<span class="comment"># talk to the agent main</span>
+<span class="command">enclos connect lab -- main</span>
+
+<span class="comment"># a shell in the sandbox, for anything else</span>
+<span class="command">enclos connect lab</span></code></pre></div>
+      <p>Whatever a runtime’s documentation tells you to run, put <code>enclos connect lab --</code> in front of it.</p>
+
+      <h2>See what it reached</h2>
+      <p>Ask your agent something that needs the web, then look at the log:</p>
+      <div class="terminal"><pre><code><span class="command">enclos net log lab</span>
+<span class="command">enclos net denied lab</span></code></pre></div>
+      <p>If something you trust was refused, allow it. It applies at once, and the agent cannot do this itself:</p>
+      <div class="terminal"><pre><code><span class="command">enclos policy allow lab api.example.com:8443</span></code></pre></div>
+
+      <h2>Change what a sandbox may do</h2>
+      <div class="terminal"><pre><code><span class="comment"># opens policy.toml in your editor</span>
+<span class="command">enclos policy edit lab</span>
+
+<span class="comment"># what is in force, and every version so far</span>
+<span class="command">enclos policy show lab</span>
+<span class="command">enclos policy history lab</span></code></pre></div>
+      <p>Set <code>mode = "allowlist"</code> under <code>[network]</code> to keep a sandbox to the hosts you list and those its runtime needs. A change to the network applies at once. A change to what the sandbox may write waits as the pending policy while sessions run; <code>enclos --yes policy apply lab</code> restarts the sandbox into it. <a href="./policy-compilation.html">How a policy compiles</a> explains why, and lists <a href="./policy-compilation.html#settings">every setting</a>.</p>
+
+      <h2>Run more than one</h2>
+      <p>To add a sandbox, repeat the steps with another name. Each one has its own Hermes install, login, policy and proxy, and cannot read the others’ files.</p>
+      <div class="terminal"><pre><code><span class="command">enclos sandbox list</span>
+<span class="command">enclos status</span></code></pre></div>
+
+      <h2>Keep an eye on it</h2>
+      <div class="terminal"><pre><code><span class="comment"># state, policy version, sessions and their processes</span>
+<span class="command">enclos sandbox show lab</span>
+
+<span class="comment"># the background services' logs</span>
+<span class="command">enclos logs lab -f</span>
+
+<span class="comment"># every command that changed something, and a check of the log</span>
+<span class="command">enclos audit</span>
+<span class="command">enclos audit verify</span></code></pre></div>
+
+      <h2>Give an agent a Telegram bot</h2>
+      <p>Secrets live in your Keychain. While a service runs, enclos writes what it is granted to a file outside the sandbox’s home that no other sandbox reads; every agent in the sandbox can read it. Store the token from @BotFather, grant it to one agent, then connect the channel:</p>
+      <div class="terminal"><pre><code><span class="command">enclos secret set lab/main-telegram</span>
+
+<span class="comment"># under [secrets.agents.main] add:</span>
+<span class="comment"># env = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</span>
+<span class="command">enclos policy edit lab</span>
+
+<span class="comment"># the sandbox is running, so the grant waits for this</span>
+<span class="command">enclos --yes policy apply lab</span>
+
+<span class="command">enclos runtime configure lab/main --channel telegram --allow-user &lt;your Telegram id&gt;</span>
+<span class="command">enclos sandbox start lab</span></code></pre></div>
+
+      <h2>Stop and remove</h2>
+      <div class="terminal"><pre><code><span class="comment"># every service, session and process of the sandbox</span>
+<span class="command">enclos sandbox stop lab</span>
+
+<span class="comment"># the sandbox and its home, with Hermes and its login</span>
+<span class="command">enclos sandbox rm lab --yes</span></code></pre></div>
+
+      <h2>What does not work yet</h2>
+      <p>Chromium does not start inside a sandbox yet, so Hermes’s browser tools are unavailable. The <a href="https://github.com/victorbonnet/enclos/releases/latest">release notes</a> list every known gap, and the <a href="https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md">full guide</a> covers the rest, such as bringing in an agent you already run.</p>
+    </main>
+
+    <footer class="site-footer wrap"><span>French for an enclosure. Said “ahn-KLOH.”</span><div><a href="https://github.com/victorbonnet/enclos">Source</a><a href="https://github.com/victorbonnet/enclos/blob/main/SECURITY.md">Security</a><a href="https://github.com/victorbonnet/enclos/blob/main/LICENSE">MIT license</a></div></footer>
+  </body>
+</html>

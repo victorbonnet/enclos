@@ -49,6 +49,108 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | Compile | `connect` and `exec`, `enclos launch` for a service, `policy test`; `sandbox show` in memory only | `src/engine/compile.rs`, `src/backend/seatbelt/compile.rs` | `compiled/<hash>.sb` |
 | Apply | the same, right after compiling | `src/backend/seatbelt/wrap.rs` | `sandbox-exec` running the program |
 
+## The templates
+
+A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. The two differ only in what the sandbox reaches on the network:
+
+| Can it… | `minimal` | `assistant` |
+| --- | --- | --- |
+| Write to its own home | yes | yes |
+| Write to other folders | only those added | only those added |
+| Read your files, except sensitive paths | yes | yes |
+| Read sensitive paths, such as SSH keys | no | no |
+| Run programs, and install them in its home | yes | yes |
+| Reach what its runtime needs, once installed | yes | yes |
+| **Reach the public web** | **only what is listed** | **yes, ports 80 and 443** |
+| Reach other ports | only if listed | only if listed |
+| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` |
+| Reach your computer's own services or cloud metadata | no | no |
+| Open apps, send Apple Events or signal other processes | no | no |
+
+- **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
+- **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
+
+Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
+
+A `coding` template is planned (design §7) and does not exist yet.
+
+## Every setting
+
+A `policy.toml` holds what differs from its template. These are all the keys there are: any other key or section is an error. Change a sandbox's file with `enclos policy edit <sandbox>`; `enclos policy show <sandbox>` prints the policy in force.
+
+```toml
+extends = "assistant"
+
+[filesystem]
+write_add = ["~/Documents/notes"]
+read_deny_add = ["~/work"]
+
+[network]
+mode = "allowlist"
+allow_add = ["api.example.com", "api.example.com:8443", "*.example.org", "printer.lan"]
+private_add = ["printer.lan"]
+log = "metadata"
+
+[resources]
+open_files = 1024
+
+[secrets]
+env_add = { API_TOKEN = "secret:lab/api" }
+
+[secrets.agents.main]
+env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
+```
+
+**At the top level:**
+
+| Setting | Accepts | Notes |
+| --- | --- | --- |
+| `extends` | `minimal`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
+
+**`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
+
+| Setting | Accepts | Default | Notes |
+| --- | --- | --- | --- |
+| `write` | a list of paths | `["{home}"]` | Replaces the folders the sandbox may write. The home stays writable either way. |
+| `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders, and a folder inside the home or another workspace. Malformed: a folder at or inside a deny-list path. |
+| `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
+| `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
+
+There is no `read` list and no `write_deny` ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are open except `read_deny`, since agents and the tools they install read paths nobody can list upfront. Writes are closed except `write`, so there is nothing to deny, and a `read_deny` path refuses writes too.
+
+**`[network]`.** A change to `mode`, the lists or `log` applies at once, unless the same edit changes files, `listen`, secrets or limits: then it all waits as the pending policy while sessions run, as a change to `listen` does. A destination is a full domain name or an IP address, or `*.domain` for its subdomains, with `:port` when it is not 443. A wildcard over everything (`*`) or a public suffix (`*.com`), and `localhost`, loopback or link-local addresses, are refused; a private address needs `private`, and a single-label name such as `intranet` is malformed.
+
+| Setting | Accepts | Default | Notes |
+| --- | --- | --- | --- |
+| `mode` | `public`, `allowlist` | from the template: `assistant` is `public`, `minimal` is `allowlist` | `public` reaches any public address on ports 80 and 443, as well as what is listed. `allowlist` reaches only what is listed. |
+| `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
+| `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
+| `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
+| `private_add` | a list of hosts | none | Adds to that list. |
+| `log` | `metadata` | `metadata` | The only value: host, port, address, verdict, bytes and duration, never contents. |
+| `listen` | `true`, `false` | `false`; the Hermes adapter sets `true` | Whether the sandbox may listen on TCP, on any port but the proxy ports. Leave it to the adapter: `false` here wins over it, and Hermes's gateway exits if it cannot listen. |
+
+**`[resources]`.** A limit is fixed when a process starts. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it. A limit the backend cannot enforce is refused ([ADR 0033](adr/0033-a-limit-the-backend-cannot-enforce-is-refused-outright.md)).
+
+| Setting | Accepts | On Seatbelt |
+| --- | --- | --- |
+| `open_files` | 16 to 1048576 | Enforced. Above macOS's own ceiling for a process (`kern.maxfilesperproc`), it is refused. |
+| `file_size` | bytes, or `512K`, `100M`, `1G` | Refused. |
+| `cpu_seconds` | a number of seconds | Refused. |
+| `memory` | any value | Refused. |
+| `cpu` | any value | Refused. |
+
+**`[secrets]` and `[secrets.agents.<agent>]`.** Each grant maps a variable to `secret:<sandbox>/<name>`, a secret of this sandbox already stored with `enclos secret set`. A variable uses letters, digits and `_`, and not one enclos sets itself, such as `PATH`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
+
+| Setting | Accepts | Notes |
+| --- | --- | --- |
+| `env` | a table of grants | Replaces what the layers below grant every session and service of the sandbox. |
+| `env_add` | a table of grants | Adds to them. |
+| `agents.<agent>.env` | a table of grants | Replaces what one agent is granted. A bot's token goes here, never to the whole sandbox. |
+| `agents.<agent>.env_add` | a table of grants | Adds to them. |
+
+A variable granted to the whole sandbox cannot also be granted to an agent. An `[exec]` section is an error: no backend enforces rules on programs yet.
+
 ## Stage 1: resolving the layers
 
 `policy::resolve(overrides, adapter)` reads four layers, each a TOML file of the same shape (`PolicyFile`), and applies them in order on top of an empty policy:
@@ -56,7 +158,7 @@ The compiled policy does not hold the network allowlist. It only sends every con
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `mcp-only` and `assistant` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal` and `assistant` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
 | 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is an error (`names no template`) |
 
@@ -115,7 +217,7 @@ It resolves to `write = ["{home}"]`, the built-in read-deny list, `mode = "publi
 - `policy allow` adds the entry to `[network] allow_add` (keeping the file's comments), then resolves the whole file against the current template and adapter. When the result changes more than that entry (edits to `policy.toml` not stored yet, or a newer template or built-in defaults), it lists each change and asks first.
 - `policy edit` opens a copy of `policy.toml` (`policy.toml.edit`, beside it, with the file it started from in `policy.toml.edit.base`) in the user's editor, then resolves the copy. An edit not applied (refused, an editor that failed, a dry run) stays, and the next `policy edit` opens it again, unless `policy.toml` changed since it began: then it is refused, as it would undo that change, and so is an edit whose `policy.toml` changed while the editor was open. `policy discard` drops a kept edit.
 
-`allow` and `edit` record the result through `Engine::propose` (`src/engine/pending.rs`): it becomes the active version at once, unless it changes the rules a session keeps from its start (`Policy::same_at_launch`: the filesystem rules, `listen` and the secrets granted) while a session runs under a compiled policy. Then it is saved as the pending policy, beside the active one; a change of network rules alone (a destination `policy allow` adds, or a `policy edit` that touches only the network while a change waits) still applies at once, resolved from the active snapshot's `policy.toml` with that change, provided the result differs from the active policy by exactly it; it is part of the pending one too. Without `--yes` nothing is asked interactively, so such a change waits; with `--yes`, a change that itself brings the rules sessions keep restarts the sandbox into it (`Engine::restart_into`: `sandbox stop`, then the pending policy made active, then `sandbox start` when services were installed). `policy apply` does the same for a change already waiting, and `policy discard` drops it, writing back the `policy.toml` the active snapshot was resolved from (each snapshot keeps that text) and keeping the replaced file as `policy.toml.discarded`. `runtime install` is refused while a change waits, since it resolves `policy.toml` on its own. `store_policy` writes `policy.toml` first and records the version second; if recording fails, the file goes back to what it was.
+`allow` and `edit` record the result through `Engine::propose` (`src/engine/pending.rs`): it becomes the active version at once, unless it changes the rules a session keeps from its start (`Policy::same_at_launch`: the filesystem rules, `listen`, the secrets granted and the limits) while a session runs under a compiled policy. Then it is saved as the pending policy, beside the active one; a change of network rules alone (a destination `policy allow` adds, or a `policy edit` that touches only the network while a change waits) still applies at once, resolved from the active snapshot's `policy.toml` with that change, provided the result differs from the active policy by exactly it; it is part of the pending one too. Without `--yes` nothing is asked interactively, so such a change waits; with `--yes`, a change that itself brings the rules sessions keep restarts the sandbox into it (`Engine::restart_into`: `sandbox stop`, then the pending policy made active, then `sandbox start` when services were installed). `policy apply` does the same for a change already waiting, and `policy discard` drops it, writing back the `policy.toml` the active snapshot was resolved from (each snapshot keeps that text) and keeping the replaced file as `policy.toml.discarded`. `runtime install` is refused while a change waits, since it resolves `policy.toml` on its own. `store_policy` writes `policy.toml` first and records the version second; if recording fails, the file goes back to what it was.
 
 ## Stage 3: compiling
 
@@ -249,11 +351,11 @@ compiles to this file, shortened where marked with `…` (generated by `seatbelt
 | Change | New sessions | Sessions already running |
 | --- | --- | --- |
 | `network.allow`, `network.private`, `network.mode` | the new active snapshot | at once: the proxy reads the active snapshot for each new connection |
-| `filesystem.*`, `network.listen` | a new compiled file, once the change is active: while sessions run, it waits as the pending policy | keep the file they started with until `policy apply` restarts them; `sandbox show` flags them when the active policy compiles to another file than the one they started with |
+| `filesystem.*`, `network.listen`, secrets, `resources` | a new compiled file or the new grants and limits, once the change is active: while sessions run, it waits as the pending policy | keep the file they started with until `policy apply` restarts them; `sandbox show` flags them when the active policy compiles to another file than the one they started with |
 | A new enclos version with changed compiler rules | a new compiled file, from the same snapshot | keep the file they started with |
 | A new enclos version with a changed template or built-in defaults | nothing until a command stores a new snapshot, which lists the change | nothing |
 
-A change to the filesystem rules or `listen` reaches running sessions only through `policy apply`, or the change made with `--yes`; `sandbox restart` restarts them under the active policy, leaving a pending change waiting. After an upgrade, `policy refresh` resolves the active policy's `policy.toml` again against the new templates, defaults and adapter, and lists what that changes before applying it; until then, or until another command stores a new snapshot (which lists the change), nothing changes. `policy rollback --to <version>` makes an earlier snapshot active again as a new version, through the same restart rules.
+A change to the filesystem rules, `listen`, the secrets or the limits reaches running sessions only through `policy apply`, or the change made with `--yes`; `sandbox restart` restarts them under the active policy, leaving a pending change waiting. After an upgrade, `policy refresh` resolves the active policy's `policy.toml` again against the new templates, defaults and adapter, and lists what that changes before applying it; until then, or until another command stores a new snapshot (which lists the change), nothing changes. `policy rollback --to <version>` makes an earlier snapshot active again as a new version, through the same restart rules.
 
 ## Errors
 
