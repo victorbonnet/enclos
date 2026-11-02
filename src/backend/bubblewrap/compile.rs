@@ -685,6 +685,7 @@ mod tests {
             "--unshare-user",
             "--disable-userns",
             "--unshare-pid",
+            "--as-pid-1",
             "--unshare-net",
             "--unshare-ipc",
             "--clearenv",

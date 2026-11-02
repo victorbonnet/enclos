@@ -121,6 +121,29 @@ class SeccompTest(unittest.TestCase):
         self.assertEqual(module.loaded, [])
 
 
+class StayPid1Test(unittest.TestCase):
+    """Starts its own child; the stand-in for libc keeps this process dumpable."""
+
+    def stay(self, cmd, prctl=0):
+        libc = types.SimpleNamespace(prctl=lambda *a: prctl)
+        with patch.object(inside, "libc", libc):
+            return inside.stay_pid_1(cmd)
+
+    def test_the_commands_exit_code_comes_back(self):
+        self.assertEqual(self.stay(["true"]), 0)
+        self.assertEqual(self.stay(["false"]), 1)
+
+    def test_a_child_it_inherited_does_not_end_it_early(self):
+        orphan = os.fork()
+        if orphan == 0:
+            os._exit(7)
+        self.assertEqual(self.stay(["sh", "-c", "sleep 0.2; exit 3"]), 3)
+
+    def test_it_stops_before_the_command_if_it_stays_dumpable(self):
+        with self.assertRaises(SystemExit):
+            self.stay(["true"], prctl=-1)
+
+
 class ServiceForward(unittest.TestCase):
     """The forward forks a child of this test, stopped at the end."""
 
