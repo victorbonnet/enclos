@@ -435,7 +435,8 @@ mod tests {
         let picked = Picked::new(
             Box::new(libsecret::Libsecret::new(
                 "enclos.t".into(),
-                Some("unix:path=/b".into()),
+                Some("/r".to_owned()).map(|dir| format!("unix:path={dir}/bus")),
+                Some("/r".into()),
             )),
             Box::new(InMemory::named(StoreName::File)),
         );
