@@ -286,6 +286,17 @@ fn an_older_landlock_abi_leaves_execute_open() {
     }
 }
 
+/// The code cites §5 for it.
+#[test]
+fn what_a_session_runs_first_is_in_section_5() {
+    let design = design();
+    let at = |text: &str| design.find(text).expect(text);
+    let block = at("**What a session runs first**");
+    assert!(at("## 5. Isolation backends") < block);
+    assert!(block < at("### Seatbelt specifics"));
+    assert!(design.contains("and `enclos inside --relay` for the one a session starts"));
+}
+
 /// `enclos inside` handles the rights of `LANDLOCK_ABI_NEEDED`, so a right of
 /// a newer ABI is lost on no host, a host without Landlock included.
 #[test]
