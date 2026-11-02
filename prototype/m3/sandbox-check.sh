@@ -159,6 +159,20 @@ for m in "${modes[@]}"; do
 done
 SBX_NEW_SESSION=1 SBX_SECCOMP=off tio "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" tiocsti >"$tmp/tio-newsession.tsv"
 
+# PID 1, on the case with nothing else in the way: no Landlock, and Yama, which
+# refuses an ancestor at its default of 1, set to 0. The control is bubblewrap's
+# own reaper as PID 1; the fix is what `enclos inside` is to do. Each must end
+# with no process of the namespace reachable that lacks the filter.
+yama=/proc/sys/kernel/yama/ptrace_scope
+scope=$(cat "$yama" 2>/dev/null || echo absent)
+[ "$scope" = absent ] || sudo sysctl -qw kernel.yama.ptrace_scope=0
+pid1=("ptrace 1" "open-write /proc/1/mem")
+SBX_LANDLOCK=off "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" "${pid1[@]}" \
+    >"$tmp/pid1-reaper.tsv" 2>"$tmp/pid1-reaper.err"
+SBX_LANDLOCK=off SBX_AS_PID_1=1 "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" "${pid1[@]}" \
+    >"$tmp/pid1-inside.tsv" 2>"$tmp/pid1-inside.err"
+[ "$scope" = absent ] || sudo sysctl -qw "kernel.yama.ptrace_scope=$scope"
+
 cols=("host=$tmp/host.tsv")
 tcols=("host=$tmp/tio-host.tsv")
 for m in "${modes[@]}"; do
@@ -190,6 +204,10 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent). At 0 the kernel refuses TIOCSTI to every unprivileged process (EIO). seccomp runs before the ioctl, so EPERM where the others read EIO shows the filter matched; whether --new-session alone refuses it needs a host with the setting at 1 (a VM)."
     echo
     python3 -I "$M3/table.py" "${tcols[@]}"
+    section "Attaching to PID 1, no Landlock, ptrace_scope 0 (was $scope)"
+    echo "Must not read \`ok\` in the second column. In the first, \`ok\` shows the hole \`--as-pid-1\` closes."
+    echo
+    python3 -I "$M3/table.py" "bubblewrap's reaper=$tmp/pid1-reaper.tsv" "--as-pid-1, inside.py stays=$tmp/pid1-inside.tsv"
     section "A file left in the sandbox's /tmp"
     printf -- '- %s\n' "${left[@]}"
     section "The compiled policy (full mode)"

@@ -252,7 +252,7 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 - `unshare` and `clone` refused with `EPERM` when their flags hold any of `CLONE_NEWNS`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWIPC`, `CLONE_NEWUTS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`.
 - `socket` refused with `EPERM` for any family but `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`: a network namespace may not hold vsock (design §14). Added after these runs, so none of the results here shows it.
 - `clone3` refused with `ENOSYS`, since its flags are in memory seccomp cannot read; the C library then falls back to `clone`.
-- `ptrace` is not refused: the PID namespace leaves nothing outside to trace (the probe tries a host process), and debuggers inside keep working.
+- `ptrace` is not refused, so debuggers inside keep working, and the PID namespace leaves nothing outside to trace (the probe tries a host process). What is inside is another matter: these runs have no `--as-pid-1`, so bubblewrap's reaper is PID 1, with neither filter nor Landlock, and it is dumpable. Landlock refuses an attach to it, and so does Yama at `ptrace_scope` 1, since PID 1 is an ancestor; a host with neither, such as Raspberry Pi OS by the survey, has nothing in the way. Refusing `ptrace` alone would not do, because `/proc/1/mem` stays open. So the compiled arguments hold `--as-pid-1`, and what runs first confines itself and stays as PID 1 (`inside.py --stay-pid-1`, not dumpable). `sandbox-check.sh` compares the two with no Landlock and `ptrace_scope` 0; no run has shown it yet.
 
 The errno is a choice for the backend: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
 
