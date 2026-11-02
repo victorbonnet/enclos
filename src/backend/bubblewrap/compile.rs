@@ -193,7 +193,14 @@ fn compiled_sandbox(
     let expand = |entries: &[String]| -> Result<Vec<PathBuf>, CompileError> {
         entries
             .iter()
-            .map(|e| paths.expand(e).map(|p| tidy(&p)).map_err(refused))
+            .map(|entry| {
+                if Path::new(entry).components().any(|c| c == Component::ParentDir) {
+                    return Err(refused(format!(
+                        "`{entry}` holds `..`, which a link can make name another path than the one checked: write the path it means"
+                    )));
+                }
+                paths.expand(entry).map(|p| tidy(&p)).map_err(refused)
+            })
             .collect()
     };
     let home = tidy(&ctx.home);
@@ -372,20 +379,9 @@ fn undoes_a_masked_host_path(workspace: &Path) -> bool {
             .any(|p| is_within(workspace, Path::new(p)))
 }
 
-/// `path` without `.`, a trailing `/` or `..`, as written: nothing is
-/// looked up, so `..` climbs the name before it, whatever that is.
+/// `path` without `.` or a trailing `/`, as written: nothing is looked up.
 fn tidy(path: &Path) -> PathBuf {
-    let mut tidied = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                tidied.pop();
-            }
-            Component::CurDir => {}
-            other => tidied.push(other),
-        }
-    }
-    tidied
+    path.components().collect()
 }
 
 fn text(path: &Path) -> Result<String, CompileError> {
@@ -858,9 +854,24 @@ mod tests {
         assert_eq!(compile(&p, &ctx).unwrap().text, first);
     }
 
+    /// With `~/l -> /data/x/y`, `validate` reads `~/l/../secret` as
+    /// `/data/x/secret`: taking `..` on the text would mask `~/secret`.
+    #[test]
+    fn an_entry_holding_dot_dot_is_refused() {
+        for (write, deny) in [
+            (vec!["{home}"], vec!["~/l/../secret"]),
+            (vec!["{home}", "~/l/../work"], vec![]),
+            (vec!["{home}"], vec!["{home}/../x"]),
+        ] {
+            let err = refusal(&policy(&write, &deny));
+            assert!(err.contains("`..`"), "{write:?} {deny:?}: {err}");
+        }
+    }
+
     #[test]
     fn tidying_a_path_only_reads_its_text() {
-        assert_eq!(tidy(Path::new("/a/./b/../c/")), Path::new("/a/c"));
+        assert_eq!(tidy(Path::new("/a/./b/c/")), Path::new("/a/b/c"));
+        assert_eq!(tidy(Path::new("/a/../b")), Path::new("/a/../b"));
     }
 
     #[test]
