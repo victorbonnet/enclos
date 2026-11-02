@@ -2,6 +2,7 @@
 
 use super::policy::with_sandbox_on;
 use super::*;
+use crate::probes::OwnProbes as _;
 
 #[test]
 fn the_active_policy_compiles_once_into_the_sandbox_folder() {
@@ -148,10 +149,9 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
         inputs.workspaces,
         [user.join("a"), user.join("b"), user.join("later")]
     );
-    let own = FakeBackend::available(BackendKind::Seatbelt)
-        .own_probes(None)
-        .unwrap();
-    let names: Vec<String> = crate::probes::probes(&inputs, own.as_ref())
+    let own =
+        crate::backend::seatbelt::probes::SeatbeltProbes::on(crate::backend::Baseline::DenyDefault);
+    let names: Vec<String> = crate::probes::probes(&inputs, &own)
         .into_iter()
         .filter(|p| p.route == "writable folders")
         .map(|p| p.name)
@@ -166,12 +166,18 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
             rename(&user.join("b")),
         ]
     );
-    let missing = crate::probes::missing_workspaces(&inputs);
+    let missing = own.folders_not_run(&inputs);
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].name, rename(&user.join("later")));
     assert!(
         matches!(&missing[0].outcome, crate::probes::Outcome::NotRun(why) if why.contains("create it on the host"))
     );
+    // A backend with no such probe has none to call not run, which would
+    // fail its test.
+    let fake = FakeBackend::available(BackendKind::Seatbelt)
+        .own_probes(None)
+        .unwrap();
+    assert!(fake.folders_not_run(&inputs).is_empty());
 }
 
 /// A backend with no probes of its own runs the shared set through its
