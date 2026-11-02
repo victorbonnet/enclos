@@ -5,10 +5,12 @@
     ],
     "read_deny": [
       "/run/user",
+      "~/.1password",
       "~/.aws",
       "~/.azure",
       "~/.bash_history",
       "~/.bash_sessions",
+      "~/.bitwarden-ssh-agent.sock",
       "~/.cache/huggingface/stored_tokens",
       "~/.cache/huggingface/token",
       "~/.cargo/credentials",

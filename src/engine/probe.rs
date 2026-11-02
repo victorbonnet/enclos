@@ -561,6 +561,8 @@ fn host_sockets(user_home: &std::path::Path) -> Vec<PathBuf> {
         .into_iter()
         .collect();
     sockets.push(user_home.join(".docker/run/docker.sock"));
+    sockets.push(user_home.join(".1password/agent.sock"));
+    sockets.push(user_home.join(".bitwarden-ssh-agent.sock"));
     sockets.push(PathBuf::from("/var/run/docker.sock"));
     sockets.into_iter().filter(|s| s.exists()).collect()
 }
@@ -571,6 +573,21 @@ mod tests {
     use crate::backend::seatbelt::Baseline;
     use crate::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, SeatbeltProbes, notes_on};
     use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn a_password_managers_ssh_agent_in_the_home_is_a_host_socket() {
+        let home = tempfile::tempdir().unwrap();
+        let (one, bit) = (
+            home.path().join(".1password/agent.sock"),
+            home.path().join(".bitwarden-ssh-agent.sock"),
+        );
+        assert!(!host_sockets(home.path()).contains(&one));
+        std::fs::create_dir(one.parent().unwrap()).unwrap();
+        std::fs::write(&one, "").unwrap();
+        std::fs::write(&bit, "").unwrap();
+        let found = host_sockets(home.path());
+        assert!(found.contains(&one) && found.contains(&bit), "{found:?}");
+    }
 
     fn report(outcomes: Vec<Outcome>) -> TestReport {
         TestReport {

@@ -121,6 +121,9 @@ read_deny = [
     "~/.config/keepassxc",
     "~/.password-store",
     "~/.config/op",
+    # Their SSH agents' sockets, which their folders above do not hold
+    "~/.1password",
+    "~/.bitwarden-ssh-agent.sock",
     # Launch agents: Hermes finds the real home through the user database, not
     # $HOME, and read the host's own gateway job here (prototype, issue #5).
     "~/Library/LaunchAgents",
