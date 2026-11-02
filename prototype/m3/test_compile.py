@@ -48,7 +48,7 @@ def view(args, path):
 class Case(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        h = self.h = os.path.join(self.tmp.name, "home")
+        h = self.h = os.path.join(os.path.realpath(self.tmp.name), "home")
         for d in [".ssh", ".config/google-chrome", ".config/other", "work", "proj"]:
             os.makedirs(os.path.join(h, d))
         open(os.path.join(h, "notes.txt"), "w").close()
@@ -216,6 +216,81 @@ class CompileTest(Case):
         with patch.object(wrap.os, "listdir", side_effect=PermissionError), \
                 self.assertRaises(PermissionError):
             wrap.read_host(c)
+
+
+class LinkedDenyEntryTest(Case):
+    """A deny entry that is a link, or sits under one, names its target too
+    (design §15): Seatbelt compiles the resolved path, so the same policy must
+    hide the target here."""
+
+    def linked_home(self):
+        h = self.h
+        os.rmdir(f"{h}/.ssh")
+        os.makedirs(f"{h}/dotfiles/ssh")
+        open(f"{h}/dotfiles/vimrc", "w").close()
+        os.symlink("dotfiles/ssh", f"{h}/.ssh")
+
+    def test_an_entry_that_is_a_link_hides_its_target_in_the_home(self):
+        h = self.h
+        self.linked_home()
+        args = self.compiled()["bwrap"]
+        binds = self.pairs(args, "--ro-bind-try")
+        self.assertNotIn(f"{h}/dotfiles", binds)
+        self.assertNotIn(f"{h}/dotfiles/ssh", binds)
+        self.assertIn(f"{h}/dotfiles/vimrc", binds)
+        self.assertIn(f"{h}/dotfiles", self.pairs(args, "--tmpfs"))
+        self.assertNotIn("dotfiles/ssh", self.pairs(args, "--symlink"))
+
+    def test_an_entry_in_a_workspace_that_links_out_of_it_hides_its_target(self):
+        h = self.h
+        os.makedirs(f"{h}/secrets")
+        for name in ["token", "other"]:
+            open(f"{h}/secrets/{name}", "w").close()
+        os.symlink("../secrets/token", f"{h}/proj/token")
+        args = self.compiled("--deny", f"{h}/proj/token")["bwrap"]
+        binds = self.pairs(args, "--ro-bind-try")
+        self.assertNotIn(f"{h}/secrets", binds)
+        self.assertNotIn(f"{h}/secrets/token", binds)
+        self.assertIn(f"{h}/secrets/other", binds)
+
+    def test_an_entry_under_a_linked_folder_hides_its_target(self):
+        h = self.h
+        os.rmdir(f"{h}/.config/google-chrome")
+        os.rmdir(f"{h}/.config/other")
+        os.rmdir(f"{h}/.config")
+        os.makedirs(f"{h}/data/google-chrome")
+        os.symlink("data", f"{h}/.config")
+        binds = self.pairs(self.compiled()["bwrap"], "--ro-bind-try")
+        self.assertNotIn(f"{h}/data", binds)
+        self.assertNotIn(f"{h}/data/google-chrome", binds)
+
+    def test_an_entry_that_links_into_a_workspace_is_masked_there(self):
+        h = self.h
+        os.rmdir(f"{h}/.ssh")
+        os.makedirs(f"{h}/proj/keys")
+        os.symlink("proj/keys", f"{h}/.ssh")
+        args = self.compiled()["bwrap"]
+        self.assertEqual(view(args, f"{h}/proj/keys"), ("--tmpfs", False))
+        self.assertEqual(view(args, f"{h}/proj/kept"), ("--bind", True))
+
+    def test_an_entry_that_links_into_a_grant_outside_the_home_is_masked_there(self):
+        h = self.h
+        outside = f"{self.tmp.name}/outside"
+        os.makedirs(f"{outside}/keys")
+        os.rmdir(f"{h}/.ssh")
+        os.symlink(f"{outside}/keys", f"{h}/.ssh")
+        args = self.compiled("--read-only", outside)["bwrap"]
+        self.assertEqual(view(args, f"{outside}/keys"), ("--tmpfs", False))
+
+    def test_an_entry_that_resolves_elsewhere_stops_the_session(self):
+        h = self.h
+        os.rmdir(f"{h}/.ssh")
+        for target in [f"{self.tmp.name}/outside", h]:
+            with self.subTest(target=target):
+                os.symlink(target, f"{h}/.ssh")
+                with self.assertRaises(SystemExit):
+                    self.compiled()
+                os.unlink(f"{h}/.ssh")
 
 
 class DenyInsideAGrantTest(Case):
