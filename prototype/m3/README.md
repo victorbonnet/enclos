@@ -59,7 +59,7 @@ Nothing is left for the runners' columns. Run 41361920294 filled the last of the
 - **In a VM** (Ubuntu 24.04 x86_64 and arm64, Ubuntu 26.04 on Ubuntu's own kernel, Debian 12 and 13): `survey.sh` for the "to measure (VM)" cells, then `bwrap-check.sh`'s steps by hand (it refuses outside a runner by design).
 - **A kernel without Landlock is unproven.** The no-Landlock mode has so far run only as Landlock switched off on a kernel that has it (the Azure runner kernel): nothing has shown that mode on a kernel without Landlock, such as Raspberry Pi OS's, where only bubblewrap's harmless start-up has run. What `survey.sh` reads on seccomp says what the kernel offers, not that the filter holds.
 - **Without Landlock** (in a VM booted with Landlock left out of the active LSM list, then on Raspberry Pi OS): that bubblewrap's mounts alone refuse every write outside the home and workspaces (ADR 0037, design §14).
-- **`doctor`'s fixes** (design §14): `cgroup_enable=memory` on Raspberry Pi OS, which needs a reboot; the `Delegate=` drop-in and `lsm=landlock,…` in a VM.
+- **`doctor`'s fixes** (design §14): `cgroup_enable=memory` on Raspberry Pi OS, which needs a reboot; the `Delegate=` drop-in and `lsm=landlock,…` in a VM; on Ubuntu 24.04 in a VM, the narrower of `bwrap-check.sh`'s profile and `bwrap-userns-restrict`.
 - **On Raspberry Pi OS** (they act on the host, so not on one in use): whether bubblewrap runs as an unprivileged user, and what a logout does to a unit, without and with lingering.
 
 ## Sources
