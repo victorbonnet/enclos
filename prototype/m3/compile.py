@@ -29,7 +29,7 @@ EXEC_SYSTEM = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "
 
 # The sandbox's own, empty places, each a tmpfs: they hide the host's
 # sockets there (/run/user/<uid>, the system bus, resolved, Docker,
-# /tmp/.X11-unix) and give the sandbox somewhere to write temporary files.
+# /tmp/.X11-unix) and give what ignores TMPDIR somewhere to write.
 OWN_TMPFS = ["/tmp", "/var/tmp", "/run", "/dev/shm"]
 
 # seccomp: system calls refused outright (design §14's list, then the kernel
@@ -113,7 +113,7 @@ def compile_policy(o):
     env = {
         "HOME": home,
         "PATH": f"{home}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-        "TMPDIR": "/tmp",
+        "TMPDIR": f"{home}/tmp/",  # inside the home, ADR 0015
         "LANG": "C.UTF-8",
         "TERM": "xterm-256color",
         "HTTPS_PROXY": proxy, "HTTP_PROXY": proxy,

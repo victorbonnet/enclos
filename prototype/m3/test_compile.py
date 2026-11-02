@@ -110,6 +110,13 @@ class CompileTest(Case):
         self.assertIn(home, c["landlock"]["execute"])
         self.assertNotIn(f"{self.h}/proj", c["landlock"]["execute"])
 
+    def test_temporary_files_go_inside_the_sandbox_home(self):
+        # ADR 0015 and design §5: not the system temp folders.
+        args = self.compiled()["bwrap"]
+        self.assertEqual(args[args.index("TMPDIR") + 1], os.path.join(self.sbx, "home", "tmp") + "/")
+        with open(os.path.join(os.path.dirname(os.path.abspath(comp.__file__)), "lib.sh")) as f:
+            self.assertIn('mkdir -p "$SBX_HOME/tmp"', f.read())
+
     def test_namespaces_and_no_user_namespace_inside(self):
         args = self.compiled()["bwrap"]
         for opt in ["--unshare-user", "--disable-userns", "--unshare-pid", "--unshare-net",
