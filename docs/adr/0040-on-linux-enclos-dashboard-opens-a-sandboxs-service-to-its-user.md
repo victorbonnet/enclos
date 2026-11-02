@@ -10,7 +10,7 @@ Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for 
 
 Decision (proposed), on the bubblewrap backend:
 
-- **`enclos dashboard <sandbox>` is the way in.** It starts `hermes dashboard --no-open --isolated --port 0` as a recorded session under the sandbox's policy, reads the port that session holds from the host, opens a listener on the host's 127.0.0.1 at the sandbox's reserved port, and prints the URL. Each connection goes through a Unix socket on the host to a relay in the sandbox's network namespace, then to that port.
+- **`enclos dashboard <sandbox>` is the way in.** It starts `hermes dashboard --no-open --isolated --port 0` as a recorded session under the sandbox's policy, reads the port that session holds from the host, opens a listener on the host's 127.0.0.1 at the sandbox's reserved port, and prints the URL. Each connection goes through a Unix socket in the host-only `run/<sandbox>/` to a relay in the sandbox's network namespace, then to that port.
 - **It serves only the user running it.** The listener reads the owner of each connection's socket and closes any other's before a byte reaches the service. Loopback and the owner check are hard-coded, with no setting. On a remote host the user runs it over ssh with `-L`.
 - **It lives as long as the command.** Ctrl-C ends the session and the listener and records the end. Start and end are audited, and a second run on the same sandbox is refused, naming the first.
 - **Its server is its own.** A plain `hermes dashboard` reports one another session left open and exits 0, so `--isolated` and `--port 0` keep that session, and any session holding Hermes's default port, from stopping the command.

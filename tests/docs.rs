@@ -223,6 +223,18 @@ fn the_namespaces_text_gives_the_prototypes_answer() {
 }
 
 #[test]
+fn a_session_sees_run_visible_and_never_the_host_only_folder() {
+    let design = design();
+    let adr_0039 = adr("0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md");
+    for text in [&design, &adr_0039] {
+        assert!(!text.contains("reads `run/`"));
+        assert!(!text.contains("reads its own `run/`"));
+        assert!(text.contains("`run/<sandbox>/visible/`"));
+        assert!(text.contains("host-only `run/<sandbox>/`, which no session mounts"));
+    }
+}
+
+#[test]
 fn an_older_landlock_abi_leaves_execute_open() {
     let (adr_0037, adr_0038, design) = (adr(ADR_0037), adr(ADR_0038), design());
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");

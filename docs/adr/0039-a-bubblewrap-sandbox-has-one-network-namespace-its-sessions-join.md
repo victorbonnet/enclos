@@ -10,8 +10,9 @@ A session with a network namespace of its own cannot reach the port its runtime'
 
 Decision (proposed, not accepted):
 
-- **One network namespace per sandbox, kept by a holder.** The holder runs in bubblewrap, without `--dev /dev`, in user, PID and network namespaces of its own. It keeps the network namespace in being, runs the sandbox's relay to the proxy on its 127.0.0.1, and hands its namespaces out as descriptors over a Unix socket.
+- **One network namespace per sandbox, kept by a holder.** The holder runs in bubblewrap, without `--dev /dev`, in user, PID and network namespaces of its own. It keeps the network namespace in being, runs the sandbox's relay to the proxy on its 127.0.0.1, and hands its namespaces out as descriptors over a Unix socket that no session can reach.
 - **Each session joins it the `nsenter` way.** `nsenter` enters the holder's user and network namespaces, then bubblewrap makes the session's nested user namespace. Every session, a service's included, keeps its own PID and IPC namespaces.
+- **What a session sees.** It mounts `run/<sandbox>/visible/` read-only, which holds the proxy's socket. The holder's sockets, which hand out the sandbox's namespace descriptors and are the host's way to the service, and the records of the service's port stay in the host-only `run/<sandbox>/`, which no session mounts.
 - **The service's port is not relayed.** A session reaches the service on 127.0.0.1, as on macOS, and a runtime's client finds it as it does there.
 - **enclos reads that port from the host**, by 0028's rule and the socket's holder: in a shared namespace another session can listen in the ephemeral range too, so it is the port the service's own program holds, read from the holder's `/proc/<pid>/net/tcp` and the program's socket descriptors, not from `lsof`.
 - **The holder is a service of its own**, `enclos.<install>.<sandbox>.holder`. `connect` installs it when it is not installed, also for a runtime with no service, and it stays until `sandbox stop`. A runtime that declares a service named `holder` is refused. The code for that is M3-16's.
