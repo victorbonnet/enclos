@@ -27,7 +27,9 @@ use crate::model::sandbox::BackendKind;
 use crate::policy::paths::{FsPaths, PathContext, is_within};
 
 /// Programs may run from these where Landlock applies, and from the
-/// sandbox's home, where the runtime installs itself; workspaces may not.
+/// sandbox's home, where the runtime installs itself. A workspace may not,
+/// unless it lies under one of these: Landlock's rights add up, so `/opt`
+/// grants execute to `/opt/proj` as well.
 const EXEC_SYSTEM: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/snap",
 ];
@@ -760,6 +762,20 @@ mod tests {
         );
         assert!(c.landlock.execute.contains(&home));
         assert!(!c.landlock.execute.contains(&proj));
+    }
+
+    /// Landlock's rights add up: the rule on `/opt` covers what lies under
+    /// it, so `/opt/proj` runs programs where `~/proj` does not.
+    #[test]
+    fn a_workspace_under_a_system_folder_is_not_kept_from_running_programs() {
+        let c = compiled(&policy(&["{home}", "/opt/proj"], &[]));
+        assert!(c.landlock.write.contains(&"/opt/proj".to_owned()));
+        assert!(
+            c.landlock
+                .execute
+                .iter()
+                .any(|root| is_within(Path::new("/opt/proj"), Path::new(root)))
+        );
     }
 
     #[test]

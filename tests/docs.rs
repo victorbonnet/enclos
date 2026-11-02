@@ -354,6 +354,8 @@ fn what_compiling_leaves_to_later_work_stays_written_down() {
     assert!(!design.contains("the write checks still run on real paths"));
     // The relay moves with the namespace, so it is more than one constant.
     assert!(design.contains("the holder serves the one relay"));
+    // Landlock's rights add up, so a workspace under `/opt` runs programs.
+    assert!(design.contains("A workspace under one of them can run programs"));
 }
 
 #[test]
