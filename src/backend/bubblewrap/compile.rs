@@ -42,6 +42,16 @@ const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 /// would not last.
 const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
 
+/// What a later `--bind` must not uncover: a workspace may not be at or hold
+/// one of these. `/var/run` is the host's `/run` through a link.
+const MASKED_HOST_PATHS: &[&str] = &[
+    "/tmp", "/var/tmp", "/run", "/var/run", "/dev/shm", "/dev", "/proc",
+];
+
+/// Whose every folder is the host's: a workspace may not lie inside one,
+/// where `/tmp` and `/var/tmp` allow a folder of the host's for a project.
+const NO_WORKSPACE_INSIDE: &[&str] = &["/run", "/var/run", "/dev", "/proc"];
+
 /// Refused with `EPERM`: design §14's list, then the kernel module, reboot
 /// and swap calls, and io_uring, whose operations seccomp does not see.
 /// The same on every architecture: the program that applies the filter
@@ -131,6 +141,8 @@ pub struct HomeMask {
     /// Deny entries inside the sandbox's home, which is bound writable:
     /// masked one by one after that bind.
     pub in_sandbox_home: Vec<String>,
+    /// Deny entries inside a workspace, masked the same way after its bind.
+    pub in_workspace: Vec<String>,
 }
 
 /// What each kind of access is granted beneath; all else is refused.
@@ -194,15 +206,28 @@ fn compiled_sandbox(
     let deny = expand(&policy.fs.read_deny)?;
 
     for workspace in &workspaces {
-        if let Some(hit) = deny
+        if undoes_a_masked_host_path(workspace) {
+            return Err(refused(format!(
+                "workspace {} would bring back the host's {}, which the sandbox has its own of",
+                workspace.display(),
+                MASKED_HOST_PATHS.join(", ")
+            )));
+        }
+        if let Some(entry) = deny.iter().find(|d| is_within(workspace, d)) {
+            return Err(refused(format!(
+                "workspace {} is at or inside {}, which the deny list hides, so the sandbox could write nothing there",
+                workspace.display(),
+                entry.display()
+            )));
+        }
+        if let Some(root) = protected
             .iter()
-            .chain(&protected)
-            .find(|d| is_within(d, workspace) || is_within(workspace, d))
+            .find(|p| is_within(p, workspace) || is_within(workspace, p))
         {
             return Err(refused(format!(
-                "workspace {} overlaps {}: bubblewrap has no way to keep it out of a folder bound writable",
+                "workspace {} overlaps {}, which no sandbox may write",
                 workspace.display(),
-                hit.display()
+                root.display()
             )));
         }
     }
@@ -219,9 +244,13 @@ fn compiled_sandbox(
     let mut denied = in_user_home.clone();
     let mut denied_elsewhere = Vec::new();
     let mut in_sandbox_home = Vec::new();
+    let mut in_workspace = Vec::new();
     for entry in deny {
         if is_within(&entry, &home) {
             in_sandbox_home.push(entry);
+        // First of the rest: a workspace's bind undoes the arms below it.
+        } else if workspaces.iter().any(|w| is_within(&entry, w)) {
+            in_workspace.push(entry);
         } else if OWN_TMPFS.iter().any(|t| is_within(&entry, Path::new(t)))
             || protected.iter().any(|root| is_within(&entry, root))
         {
@@ -250,6 +279,8 @@ fn compiled_sandbox(
     denied_elsewhere.dedup();
     in_sandbox_home.sort();
     in_sandbox_home.dedup();
+    in_workspace.sort();
+    in_workspace.dedup();
 
     let mut after = args(&["--dev", "/dev", "--proc", "/proc"]);
     for place in OWN_TMPFS {
@@ -292,6 +323,7 @@ fn compiled_sandbox(
             denied: texts(&denied)?,
             denied_elsewhere: texts(&denied_elsewhere)?,
             in_sandbox_home: texts(&in_sandbox_home)?,
+            in_workspace: texts(&in_workspace)?,
         },
         after_home_mask: after,
         landlock: LandlockRules {
@@ -315,6 +347,17 @@ fn compiled_sandbox(
         },
         unenforced: proposed::unenforced(policy),
     })
+}
+
+/// `--bind` comes after the masks of the sandbox's own places, so a workspace
+/// at, holding or inside one puts the host's folder and sockets back.
+fn undoes_a_masked_host_path(workspace: &Path) -> bool {
+    MASKED_HOST_PATHS
+        .iter()
+        .any(|p| is_within(Path::new(p), workspace))
+        || NO_WORKSPACE_INSIDE
+            .iter()
+            .any(|p| is_within(workspace, Path::new(p)))
 }
 
 /// `path` without `.`, a trailing `/` or `..`, as written: nothing is
@@ -616,10 +659,85 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_that_overlaps_a_deny_entry_is_refused() {
-        for workspace in ["~/dev", "~/dev/work", "~/dev/work/child"] {
+    fn a_workspace_at_or_inside_a_deny_entry_is_refused() {
+        for workspace in ["~/dev/work", "~/dev/work/child"] {
             let err = refusal(&policy(&[workspace], &["~/dev/work"]));
-            assert!(err.contains("overlaps"), "{workspace}: {err}");
+            assert!(err.contains("deny list hides"), "{workspace}: {err}");
+        }
+    }
+
+    /// The default list's Photos entry must not stop `~/Pictures` on Linux.
+    #[test]
+    fn a_deny_entry_inside_a_workspace_is_kept_for_a_mask_after_its_bind() {
+        let entry = format!("{USER}/Pictures/Photos Library.photoslibrary");
+        let c = compiled(&policy(
+            &["~/Pictures"],
+            &["~/Pictures/Photos Library.photoslibrary"],
+        ));
+        assert_eq!(c.home_mask.in_workspace, [entry.clone()]);
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
+        assert!(!c.after_home_mask.contains(&entry));
+    }
+
+    /// Before the arms for what is hidden already: the workspace's bind
+    /// brings back what the tmpfs or a protected root would have hidden.
+    #[test]
+    fn a_deny_entry_inside_a_workspace_under_the_sandboxs_own_tmpfs_is_masked() {
+        let c = compiled(&policy(&["/tmp/proj"], &["/tmp/proj/.env"]));
+        assert_eq!(c.home_mask.in_workspace, ["/tmp/proj/.env"]);
+    }
+
+    /// `~/.cargo` granted: the login the host trusts must not be writable,
+    /// whether or not it exists yet, and nothing here looks.
+    #[test]
+    fn a_deny_entry_inside_a_workspace_is_listed_whether_or_not_it_exists() {
+        let c = compiled(&policy(
+            &["~/.cargo", "/nonexistent-enclos-test/proj"],
+            &[
+                "~/.cargo/credentials.toml",
+                "/nonexistent-enclos-test/proj/.env",
+            ],
+        ));
+        assert_eq!(
+            c.home_mask.in_workspace,
+            [
+                "/nonexistent-enclos-test/alice/.cargo/credentials.toml",
+                "/nonexistent-enclos-test/proj/.env"
+            ]
+        );
+    }
+
+    /// `--tmpfs /tmp` then `--bind /tmp /tmp` would bring back the host's
+    /// X11 and agent sockets; `/var/run` the host's `/run`.
+    #[test]
+    fn a_workspace_that_would_undo_a_masked_host_path_is_refused() {
+        for workspace in [
+            "/",
+            "/tmp",
+            "/var",
+            "/var/tmp",
+            "/run",
+            "/var/run",
+            "/dev",
+            "/dev/shm",
+            "/proc",
+            "/run/user",
+            "/run/user/1000",
+            "/var/run/docker",
+            "/dev/shm/x",
+            "/dev/pts",
+            "/proc/self",
+        ] {
+            let err = refusal(&policy(&[workspace], &[]));
+            assert!(err.contains("host's"), "{workspace}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_workspace_in_a_temporary_place_is_allowed() {
+        for workspace in ["/tmp/proj", "/var/tmp/proj"] {
+            let c = compiled(&policy(&[workspace], &[]));
+            assert!(c.landlock.write.contains(&workspace.to_owned()));
         }
     }
 

@@ -146,7 +146,8 @@
       "/var/lib/lxd",
       "/var/snap/lxd"
     ],
-    "in_sandbox_home": []
+    "in_sandbox_home": [],
+    "in_workspace": []
   },
   "after_home_mask": [
     "--dev",
