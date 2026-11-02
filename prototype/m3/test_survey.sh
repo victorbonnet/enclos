@@ -36,10 +36,18 @@ expect 'echo "t 10000000"' 'logind\.UserStopDelayUSec: 10000000'
 expect 'exit 1' 'logind\.KillUserProcesses: unknown'
 expect 'exit 1' 'logind\.UserStopDelayUSec: unknown'
 
-# bwrap-check.sh must refuse here, before it runs anything
-if env -u GITHUB_ACTIONS -u RUNNER_ENVIRONMENT sh "$here/bwrap-check.sh" 2>/dev/null; then
-    echo "bwrap-check.sh ran outside a GitHub-hosted runner" >&2
-    failed=1
-fi
+# Both scripts that act on the host must refuse here, before they run anything.
+# The guard's status and its message together: dash also exits 2 on a syntax error.
+refuses() {
+    status=0
+    out=$(env -u GITHUB_ACTIONS -u RUNNER_ENVIRONMENT sh "$here/$1" 2>&1) || status=$?
+    if [ "$status" -ne 2 ] || [ "$out" != "$1 runs only on a GitHub-hosted runner (it changes host settings)" ]; then
+        echo "$1 did not refuse outside a GitHub-hosted runner: exit $status: $out" >&2
+        failed=1
+    fi
+}
+
+refuses bwrap-check.sh
+refuses logout-check.sh
 
 exit "$failed"
