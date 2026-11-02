@@ -116,6 +116,23 @@ fn a_relay_waits_until_its_parent_has_changed() {
     assert_eq!(looks.get(), 3);
 }
 
+#[test]
+fn a_relays_last_line_says_why_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("relay.log");
+    std::fs::write(&log, "enclos: a notice\nerror: Landlock: refused\n\n").unwrap();
+    assert_eq!(last_line(&log), "Landlock: refused");
+}
+
+#[test]
+fn a_relay_that_left_no_log_or_an_empty_one_is_said_to_have_left_no_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("relay.log");
+    assert!(last_line(&log).contains("no word"));
+    std::fs::write(&log, "").unwrap();
+    assert!(last_line(&log).contains("no word"));
+}
+
 /// ADR 0037: seccomp's filter is the same, and the command runs.
 #[test]
 fn no_landlock_is_reported_and_the_session_goes_on() {
