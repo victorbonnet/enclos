@@ -58,6 +58,16 @@ impl Libsecret {
         }
     }
 
+    /// A store running `secret_tool` and `dbus_send`, a test's stand-ins.
+    #[cfg(test)]
+    pub fn with_tools(service: String, secret_tool: String, dbus_send: String) -> Libsecret {
+        Libsecret {
+            secret_tool,
+            dbus_send,
+            ..Libsecret::new(service, Some("unix:path=/nowhere/bus".to_owned()))
+        }
+    }
+
     /// On the session bus the environment names.
     pub fn from_env(service: String) -> Libsecret {
         let bus = std::env::var(BUS_VAR).ok().filter(|v| !v.is_empty());
@@ -192,7 +202,11 @@ impl SecretStore for Libsecret {
         let out = run(&mut command, Some(value.expose().as_bytes()))
             .map_err(|e| self.fail("store", secret, e))?;
         if !out.status.success() {
-            return Err(self.fail("store", secret, stderr(&out.stderr, out.status)));
+            return Err(SecretError {
+                // It refused, as on a locked collection, and wrote nothing.
+                untouched: out.status.code() == Some(1),
+                ..self.fail("store", secret, stderr(&out.stderr, out.status))
+            });
         }
         // Only reading the value back shows it was stored whole.
         match self.get(secret)? {
@@ -489,6 +503,18 @@ esac"#,
         let err = stub.store.set(&secret(), &v("a")).unwrap_err();
         assert!(!err.untouched, "{err}");
         assert!(err.what.contains("did not read back"), "{err}");
+    }
+
+    /// A store refused, as on a locked collection, wrote nothing; one that
+    /// ran out of time or did not read back may have.
+    #[test]
+    fn a_store_that_exits_1_changed_nothing() {
+        let stub = Stub::new("exit 1", LOCKED);
+        let err = stub.store.set(&secret(), &v("a")).unwrap_err();
+        assert!(err.untouched, "{err}");
+        let stub = Stub::new("exit 2", LOCKED);
+        let err = stub.store.set(&secret(), &v("a")).unwrap_err();
+        assert!(!err.untouched, "{err}");
     }
 
     #[test]
