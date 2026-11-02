@@ -879,7 +879,7 @@ mod tests {
             &["~/Pictures"],
             &["~/Pictures/Photos Library.photoslibrary"],
         ));
-        assert_eq!(c.home_mask.in_workspace, [entry.clone()]);
+        assert_eq!(c.home_mask.in_workspace, std::slice::from_ref(&entry));
         assert_eq!(c.home_mask.denied, protected_and(&[]));
         assert!(!c.after_home_mask.contains(&entry));
     }
