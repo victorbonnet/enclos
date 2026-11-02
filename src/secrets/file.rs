@@ -344,14 +344,19 @@ mod tests {
 
     #[test]
     fn a_write_that_fails_leaves_the_file_and_nothing_beside_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileStore::new(dir.path().join("secrets.json"));
+        let (dir, store) = store();
         store.set(&secret(), &v("a")).unwrap();
-        let bad = FileStore::new(dir.path().join("nowhere/secrets.json"));
-        let err = bad.set(&secret(), &v("b")).unwrap_err();
+        chmod(dir.path(), 0o500);
+        let err = store.set(&secret(), &v("b")).unwrap_err();
+        chmod(dir.path(), 0o700);
         assert!(err.untouched, "{err}");
         assert!(err.what.contains("cannot write"), "{err}");
         assert_eq!(store.get(&secret()).unwrap(), Some(v("a")));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["secrets.json"]);
     }
 
     /// What `Drop` runs, and it reaches every value.
