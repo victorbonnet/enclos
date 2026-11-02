@@ -327,19 +327,36 @@ From run [41073883978](https://github.com/victorbonnet/enclos/actions/runs/41073
 
 **Not shown by this run:** Hermes under `nsenter`; what restarts do to open sessions; that `--disable-userns` holds in a joined session without seccomp behind it; a kernel without Landlock.
 
-#### The next run: the Chat tab, a control pair (pending)
+#### The sixth run: the Chat tab, a control pair, and `ubuntu-26.04`
 
-**Pending run: nothing in this list is measured yet.** The fifth run's first row is what this tests. `dashboard-chat-check.sh`, started last by `dashboard-cmd-check.sh`, runs one round twice through the stand-in: `as-is`, the dashboard's session as it is, and `fixed`, that session alone with `NO_PROXY=127.0.0.1,localhost,::1` and `no_proxy` (`--no-proxy-loopback`). No other session changes. It writes `76-dashboard-chat.md`, whose first line reads the pair, and each verdict in `dashboard-chat/verdicts.tsv` is what a working dashboard must do, so `as-is` rows are expected to fail if the proxy is the cause.
+From run [41361921288](https://github.com/victorbonnet/enclos/actions/runs/41361921288), at `1a49214` on PR #114, the first on three runners; run [41402916503](https://github.com/victorbonnet/enclos/actions/runs/41402916503) gave the same on every row. All three jobs passed, which means the scripts ran. `dashboard-chat-check.sh`, started last by `dashboard-cmd-check.sh`, runs one round twice through the stand-in: `as-is`, the dashboard's session as it is, and `fixed`, that session alone with `NO_PROXY=127.0.0.1,localhost,::1` and `no_proxy` (`--no-proxy-loopback`). Each verdict is what a working dashboard must do.
 
-| Question | Artifact (`dashboard-chat/`, for `as-is` and `fixed`) |
+**The proxy's part is shown; a chat through the dashboard is not.** The session's `NODE_USE_ENV_PROXY=1` with `NO_PROXY` empty keeps the terminal's program from its backend, and `NO_PROXY` for loopback gives it that connection. Nothing showed the program answering a prompt in either round, which says nothing of why: the rows count words on a terminal for 45 s. So every `enclos dashboard` on the compiled environment, which has `NO_PROXY` empty, has a Chat tab that cannot reach its backend. The change is M3-20's (design §14). `src/backend/seatbelt/wrap.rs` sets the same variables, so macOS may fail the same way; that was not observed here.
+
+| Question | Ubuntu 24.04 runner, x86_64 | Ubuntu 24.04 runner, arm64 | Ubuntu 26.04 runner, x86_64 |
+| --- | --- | --- | --- |
+| `as-is`: loopback denials in the proxy log while the terminal is used | 62 | 62 | 61 |
+| `as-is`: a sandbox process connected to the dashboard's port | None in any sample, and no WebSocket in `gui.log` | same | same |
+| `as-is`: rows failed | 4 of 7 | same | same |
+| `fixed`: loopback denials | 0 | 0 | 0 |
+| `fixed`: a sandbox process connected to the dashboard's port | `node`, among 24 connections sampled, and one WebSocket in `gui.log` | same | same |
+| `fixed`: rows failed | 2 of 7, both "gets an answer" | same | same |
+| What the terminal showed after the prompt, `fixed` | Only the typed prompt coming back (86 bytes), on `/api/pty`; in Chromium only status-line counters (1872 bytes) | same (86, 1872) | same (86, 1819) |
+| `/api/ws` from the host, both rounds | 101, `prompt.submit` accepted, then `error`: "Hermes could not start the assistant for this session. Details: Hermes is not connected to any AI provider yet. Run `hermes model` to pick one, type `/login` in chat, or add a key with…" (the run cut it at 200 characters). This client is not the terminal. | same | same |
+| The page's terminal socket in Chromium, both rounds | Opens | same | same |
+| `enclos dashboard`'s stand-in, end to end | 41 of 41 verdicts | 41 of 41 | 41 of 41 |
+
+**`ubuntu-26.04`.** Ubuntu 26.04.1, kernel `7.0.0-1017-azure`, bubblewrap 0.11.1, util-linux 2.41.3's `nsenter`, Python 3.14.4, Landlock ABI 8, AppArmor's restriction on with bubblewrap run as installed (no setting, design §14), Hermes Agent v0.22.5 (`bf0203a794a0`). `nsenter` started and shared holder A's namespace in both modes. Abstract sockets as on 24.04: EPERM with Landlock, connected without it. Hermes's chat under `nsenter` reached the gateway and stopped at the model. The earlier runs' 24.04 columns stand for 24.04 alone.
+
+**Changed since that run, not yet run.** The window for an answer is 120 s, `could not start` counts as one, the summary keeps `/api/ws`'s whole error, and `chat-reading.py` reads the pair from the backend rows alone; those rows printed "NO_PROXY is not the whole cause", which the run did not support. `dashboard-cmd.py` starts its server with `--isolated --port 0`, and `dashboard-cmd-check.sh` adds 4 rows, so the 41 becomes 45.
+
+| Artifact (`dashboard-chat/`, for `as-is` and `fixed`) | Holds |
 | --- | --- |
-| No loopback denial in the proxy log while the terminal is used | `proxy.jsonl`, `<round>-measures.tsv` |
-| The terminal program's backend connection is established: who holds a connection to the dashboard's port, read from the host | `<round>-connections.txt` |
-| The terminal program's environment, and the address it was given | `<round>-environment.txt` |
-| The whole terminal, and the answer to a typed prompt | `<round>-terminal`, `<round>-terminal.txt`, `<round>-terminal.tsv` |
-| The Chat tab in a real Chromium: the page's own socket, its frames, a typed prompt, a screenshot | `<round>-browser.txt`, `<round>-browser.png`, `<round>-browser.tsv`, `<round>-browser.err` |
-| What stops the turn: an `error` event's text | `<round>-chat.tsv` |
-| What the dashboard logged | `<round>-gui-log.txt`, `<round>-session.log` |
+| `proxy.jsonl`, `<round>-measures.tsv` | The proxy's denials, and every count above |
+| `<round>-connections.txt`, `<round>-environment.txt` | Who holds a connection to the dashboard's port, and the terminal program's environment, read from the host |
+| `<round>-terminal`, `<round>-terminal.txt`, `<round>-terminal.tsv` | The whole terminal, and what came after a typed prompt |
+| `<round>-browser.txt`, `<round>-browser.png`, `<round>-browser.tsv`, `<round>-browser.err` | The Chat tab in a real Chromium |
+| `<round>-chat.tsv`, `<round>-gui-log.txt`, `<round>-session.log` | What stopped the turn, and what the dashboard logged |
 
 A model's reply stays out of reach, since CI has no account: an answer here is Hermes saying what is missing.
 
@@ -349,7 +366,7 @@ From run [41121124650](https://github.com/victorbonnet/enclos/actions/runs/41121
 
 | Question | Ubuntu 24.04 runner, x86_64 | Ubuntu 24.04 runner, arm64 |
 | --- | --- | --- |
-| **The terminal's own connection to its backend** | **Refused, not covered by a verdict.** The proxy logged 30 `GET http://127.0.0.1:9119` denied (`blocked-address`), in two bursts of about 35 s, each while `/api/pty` was open and at no other time. Hermes gives the terminal's process `HERMES_TUI_GATEWAY_URL`, a `ws://127.0.0.1:<port>/api/ws` address, and the session sets `NODE_USE_ENV_PROXY=1` with `NO_PROXY` empty. So the terminal's process very likely dials its backend through the proxy, which refuses loopback, and retries. The terminal's text was not kept past 60 characters, so what it showed the user is not known. **A chat through the dashboard's terminal is not shown working, and is expected to fail as things stand.** | The same, 31 denied. |
+| **The terminal's own connection to its backend** | **Refused, not covered by a verdict.** The proxy logged 30 `GET http://127.0.0.1:9119` denied (`blocked-address`), in two bursts of about 35 s, each while `/api/pty` was open and at no other time. Hermes gives the terminal's process `HERMES_TUI_GATEWAY_URL`, a `ws://127.0.0.1:<port>/api/ws` address, and the session sets `NODE_USE_ENV_PROXY=1` with `NO_PROXY` empty. So the terminal's process very likely dials its backend through the proxy, which refuses loopback, and retries. The terminal's text was not kept past 60 characters, so what it showed the user is not known. **A chat through the dashboard's terminal is not shown working; the sixth run measures this.** | The same, 31 denied. |
 | Page and assets through the listener and through `ssh -L` | 200 (1385 bytes), 10 of 10 assets (1.3 MB), `/api/status` and `/api/auth/me` 200. | same |
 | `/api/ws` from the host | 101. `session.create` gives a session, `prompt.submit` is accepted, and the turn's events include `error` and `message.complete`. No model reply, since CI has no account. The row meant to say what stopped it caught a `session.info` frame, so the error's text is not recorded. This is the check's client on the host, not the page's chat. | same, events in another order |
 | `/api/pty` | 101, 2507 bytes of output (Hermes's banner). Typed text comes back (67 bytes), which shows the input box echoing, not that the terminal has a backend. | 2539 and 89 bytes. |

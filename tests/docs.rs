@@ -139,6 +139,27 @@ fn milestone_3_awaiting_verification_holds_only_what_is_still_to_show() {
 }
 
 #[test]
+fn the_chat_tabs_control_pair_is_recorded_as_measured() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    assert!(!readme.contains("Pending run"));
+    assert!(!readme.contains("expected to fail as things stand"));
+    let table = readme
+        .lines()
+        .find(|line| line.starts_with("| Question | Ubuntu 24.04 runner, x86_64 | Ubuntu 24.04 runner, arm64 | Ubuntu 26.04"))
+        .expect("the control pair's table");
+    assert!(table.contains("x86_64 |"), "{table}");
+    let design = design();
+    let item = design
+        .lines()
+        .find(|line| line.starts_with("- The dashboard's terminal"))
+        .expect("§14's item");
+    for part in ["M3-20", "`NO_PROXY` for loopback is needed", "not shown"] {
+        assert!(item.contains(part), "{part}");
+    }
+}
+
+#[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder
     // under `run/<sandbox>/` the design names is in §11's layout.
