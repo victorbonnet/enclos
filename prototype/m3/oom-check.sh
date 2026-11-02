@@ -46,7 +46,7 @@ run with SBX_PROC_TRUNCATE=1
         echo "- $key: $(grep -h '^inside:' "$tmp/$key.err" | tr '\n' ' ')"
     done
     section "Writes to /proc/self/oom_score_adj"
-    echo "Going below the value a process starts with takes a privilege the job lacks, so if the first row is not 0, read a refusal against the host and no-Landlock columns."
+    echo "The first row is the value each column starts from. Read a refusal against the host and no-Landlock columns, which make the same writes."
     echo
     python3 -I "$M3/table.py" "host=$tmp/host.tsv" "no Landlock=$tmp/nolandlock.tsv" \
         "Landlock, /proc without TRUNCATE=$tmp/without.tsv" "Landlock, /proc with TRUNCATE=$tmp/with.tsv"
