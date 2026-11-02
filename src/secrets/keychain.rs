@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use super::tool::{run, run_for, scrub, stderr};
 use super::{SecretError, SecretStore};
-use crate::model::secret::{SecretRef, SecretValue};
+use crate::model::secret::{SecretRef, SecretValue, StoreName};
 
 const SECURITY: &str = "/usr/bin/security";
 /// What `security` exits with when no such item exists.
@@ -229,6 +229,10 @@ impl Keychain {
 }
 
 impl SecretStore for Keychain {
+    fn name(&self) -> StoreName {
+        StoreName::Keychain
+    }
+
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
         // Refused before `security` runs: the keychain is as it was.
         let untouched = |e: SecretError| SecretError {

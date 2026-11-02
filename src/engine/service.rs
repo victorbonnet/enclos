@@ -232,7 +232,7 @@ impl Engine {
                                     .layout
                                     .env()
                                     .into_iter()
-                                    .chain(self.secrets.env())
+                                    .chain(self.secrets.service_env())
                                     .collect(),
                                 stop_timeout: STOP_TIMEOUT,
                             })

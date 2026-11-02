@@ -26,7 +26,7 @@ use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::secret::{SecretRecord, SecretRef};
+use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
 
 /// How long `lock` waits for another enclos command to release the lock.
@@ -531,9 +531,9 @@ impl StateStore for SqliteStateStore {
         agents::list(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 
-    fn put_secret(&self, _lock: &StateLock, secret: &SecretRef) -> Result<bool> {
+    fn put_secret(&self, _lock: &StateLock, secret: &SecretRef, store: StoreName) -> Result<bool> {
         let conn = self.open()?;
-        secrets::put(&conn, secret, now()).map_err(self.sqlite_err())
+        secrets::put(&conn, secret, store, now()).map_err(self.sqlite_err())
     }
 
     fn remove_secret(&self, _lock: &StateLock, secret: &SecretRef) -> Result<bool> {

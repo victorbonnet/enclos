@@ -43,10 +43,53 @@ impl FromStr for SecretName {
     }
 }
 
+/// Which secret store holds a secret's value (design §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreName {
+    Keychain,
+    Libsecret,
+    File,
+}
+
+impl StoreName {
+    /// As `state.db` and `--json` write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreName::Keychain => "keychain",
+            StoreName::Libsecret => "libsecret",
+            StoreName::File => "file",
+        }
+    }
+
+    /// As a sentence names it.
+    pub fn shown(self) -> &'static str {
+        match self {
+            StoreName::Keychain => "the Keychain",
+            StoreName::Libsecret => "the Secret Service",
+            StoreName::File => "the file store",
+        }
+    }
+}
+
+impl FromStr for StoreName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "keychain" => Ok(StoreName::Keychain),
+            "libsecret" => Ok(StoreName::Libsecret),
+            "file" => Ok(StoreName::File),
+            other => Err(format!("`{other}` is no secret store")),
+        }
+    }
+}
+
 /// A secret a sandbox has: enclos's record of it, never its value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRecord {
     pub secret: SecretRef,
+    /// The store its value went to, the only one that holds it.
+    pub store: StoreName,
     pub created_at: Timestamp,
     /// When its value was last set.
     pub updated_at: Timestamp,

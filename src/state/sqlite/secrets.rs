@@ -6,10 +6,16 @@ use rusqlite::{Connection, params};
 use super::policy::ReadError;
 use crate::model::Timestamp;
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::{SecretRecord, SecretRef};
+use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 
-/// Records `secret` as set at `at`; true when it is new.
-pub fn put(conn: &Connection, secret: &SecretRef, at: Timestamp) -> rusqlite::Result<bool> {
+/// Records `secret` as set at `at`, in `store` when it is new: a secret stays
+/// in the store it first went to. True when it is new.
+pub fn put(
+    conn: &Connection,
+    secret: &SecretRef,
+    store: StoreName,
+    at: Timestamp,
+) -> rusqlite::Result<bool> {
     let existed = conn.execute(
         "UPDATE secrets SET updated_at = ?3 WHERE sandbox = ?1 AND name = ?2",
         params![
@@ -20,11 +26,12 @@ pub fn put(conn: &Connection, secret: &SecretRef, at: Timestamp) -> rusqlite::Re
     )? > 0;
     if !existed {
         conn.execute(
-            "INSERT INTO secrets (sandbox, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            "INSERT INTO secrets (sandbox, name, created_at, updated_at, store) VALUES (?1, ?2, ?3, ?3, ?4)",
             params![
                 secret.sandbox.as_str(),
                 secret.name.as_str(),
-                at.to_string()
+                at.to_string(),
+                store.as_str()
             ],
         )?;
     }
@@ -41,13 +48,13 @@ pub fn remove(conn: &Connection, secret: &SecretRef) -> rusqlite::Result<bool> {
 
 pub fn list(conn: &Connection, sandbox: &SandboxName) -> Result<Vec<SecretRecord>, ReadError> {
     let mut stmt = conn.prepare(
-        "SELECT name, created_at, updated_at FROM secrets WHERE sandbox = ?1 ORDER BY name",
+        "SELECT name, created_at, updated_at, store FROM secrets WHERE sandbox = ?1 ORDER BY name",
     )?;
     let mut rows = stmt.query(params![sandbox.as_str()])?;
     let mut secrets = Vec::new();
     while let Some(row) = rows.next()? {
-        let (name, created, updated): (String, String, String) =
-            (row.get(0)?, row.get(1)?, row.get(2)?);
+        let (name, created, updated, store): (String, String, String, String) =
+            (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
         let time = |at: &str| {
             at.parse()
                 .map_err(|e| ReadError::Corrupt(format!("secret time `{at}`: {e}")))
@@ -59,6 +66,7 @@ pub fn list(conn: &Connection, sandbox: &SandboxName) -> Result<Vec<SecretRecord
                     .parse()
                     .map_err(|e| ReadError::Corrupt(format!("{e}")))?,
             },
+            store: store.parse().map_err(ReadError::Corrupt)?,
             created_at: time(&created)?,
             updated_at: time(&updated)?,
         });

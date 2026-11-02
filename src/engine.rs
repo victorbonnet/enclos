@@ -90,7 +90,7 @@ pub struct Engine {
     exe: Option<std::path::PathBuf>,
     services: Box<dyn crate::service::ServiceManager>,
     /// Where secrets' values are kept (ADR 0022).
-    secrets: Box<dyn crate::secrets::SecretStore>,
+    secrets: Box<dyn crate::secrets::Stores>,
     /// How an installer reaches the host.
     downloader: Box<dyn Downloader>,
     /// How a session's members are stopped when `enclos launch` is told to
@@ -170,7 +170,7 @@ impl Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
         let services = crate::service::host(&layout);
-        let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
+        let secrets: Box<dyn crate::secrets::Stores> = match layout.install_id() {
             Ok(install) => crate::secrets::host(format!("enclos.{install}"), layout.secrets_file()),
             Err(e) => Box::new(crate::secrets::Unavailable {
                 why: format!("enclos cannot tell this install apart from others: {e}"),
@@ -210,7 +210,7 @@ impl Engine {
     }
 
     /// The same engine with another secret store.
-    pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::SecretStore>) -> Engine {
+    pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::Stores>) -> Engine {
         self.secrets = secrets;
         self
     }

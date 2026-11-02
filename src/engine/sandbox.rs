@@ -14,8 +14,10 @@ use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
 use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
+use crate::model::secret::StoreName;
 use crate::model::session::{Member, SessionId, SessionRecord};
 use crate::policy;
+use crate::secrets::SecretError;
 use crate::service::ServiceLabel;
 use std::path::{Path, PathBuf};
 
@@ -556,10 +558,31 @@ impl Engine {
                 // secrets from goes before the record (ADR 0034).
                 self.remove_secrets_file(name)?;
                 let secrets = self.state.secrets(name)?;
+                // The records go with the sandbox's, and are all that leads
+                // to a value: on a Linux host's stores it stays while one
+                // cannot be removed. A secret in the Keychain goes after it,
+                // named if it cannot, as it always has.
+                let (keychain, linux): (Vec<_>, Vec<_>) = secrets
+                    .iter()
+                    .cloned()
+                    .partition(|r| r.store == StoreName::Keychain);
+                let stay = self.forget_secrets(&linux);
+                if !stay.is_empty() {
+                    return Err(Error::Secret(SecretError {
+                        what: format!(
+                            "sandbox {name} was not removed, as these secrets could not be: {}. Run `enclos sandbox rm {name}` again where their store answers",
+                            stay.iter()
+                                .map(|l| l.why.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                        untouched: false,
+                    }));
+                }
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
-                let left = self.forget_secrets(&secrets);
+                let left = self.forget_secrets(&keychain);
                 // Nothing in it outlives the sandbox's proxy, whatever
                 // `keep_data` keeps; left behind, the next proxy of the name
                 // takes its socket over.
