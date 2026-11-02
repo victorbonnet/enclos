@@ -128,6 +128,10 @@ class CompileTest(Case):
         self.assertNotIn("--new-session", args)
         self.assertIn("--new-session", self.compiled("--new-session")["bwrap"])
 
+    def test_as_pid_1_is_asked_for_alone(self):
+        self.assertNotIn("--as-pid-1", self.compiled()["bwrap"])
+        self.assertIn("--as-pid-1", self.compiled("--as-pid-1")["bwrap"])
+
     def test_seccomp_refuses_the_listed_calls(self):
         s = self.compiled()["seccomp"]
         for call in ["keyctl", "bpf", "perf_event_open", "userfaultfd", "mount", "setns"]:
@@ -169,7 +173,7 @@ class CompileTest(Case):
                 patch.object(comp.os, "stat", side_effect=refused):
             c = comp.compile_policy(argparse.Namespace(
                 host_home=self.h, sandbox_dir=self.sbx, workspace=[f"{self.h}/proj"], read_only=[],
-                deny=[f"{self.h}/.ssh"], relay_port=18080, new_session=False))
+                deny=[f"{self.h}/.ssh"], relay_port=18080, new_session=False, as_pid_1=False))
         self.assertIn("@HOME_MASK@", c["bwrap"])
         self.assertIn("@GRANT_MASK@", c["bwrap"])
 

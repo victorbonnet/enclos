@@ -8,11 +8,16 @@ use crate::backend::{Capabilities, Enforcement};
 use crate::model::policy::Policy;
 
 /// ADR 0039: every session its own namespaces, a service's included. No
-/// user namespace is made inside (`--disable-userns`).
+/// user namespace is made inside (`--disable-userns`). `--as-pid-1`: without
+/// it bubblewrap's own reaper is PID 1, with no filter and no Landlock, and a
+/// member on a host with neither Landlock nor Yama could attach to it and run
+/// what the filter refuses. So what bubblewrap runs must confine itself, then
+/// stay as PID 1, fork the command and reap (M3-14).
 pub(super) const NAMESPACES: &[&str] = &[
     "--unshare-user",
     "--disable-userns",
     "--unshare-pid",
+    "--as-pid-1",
     "--unshare-net",
     "--unshare-ipc",
     "--unshare-uts",

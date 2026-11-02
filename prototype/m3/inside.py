@@ -4,7 +4,8 @@ rules where the kernel has Landlock (ADR 0037), then the seccomp filter,
 then starts the relay, confined like the rest, and runs the command.
 
     python3 -I inside.py --compiled compiled.json [--landlock auto|off]
-        [--seccomp on|off] [--proc-truncate] [--relay] [--setns-net-fd N] [--close-fd N]...
+        [--seccomp on|off] [--proc-truncate] [--relay] [--stay-pid-1]
+        [--setns-net-fd N] [--close-fd N]...
         [--service-forward FD PORT_FILE] [--service-relay PORT SOCKET]
         -- command...
 
@@ -22,6 +23,11 @@ folder, which the sandbox cannot write) and forwards each connection to
 read the port from the service's own listeners. In every other session,
 --service-relay listens on 127.0.0.1:PORT and forwards each connection to
 that socket, as the proxy's relay does.
+
+With --stay-pid-1, for bubblewrap's --as-pid-1, it stays as PID 1 once
+confined, forks the command and reaps, so no process in the namespace lacks the
+filter. Without that bubblewrap's reaper is PID 1, unconfined and dumpable,
+and a member on a host with neither Landlock nor Yama can attach to it.
 
 Landlock goes through its three system calls with ctypes (stdlib only);
 seccomp through libseccomp's Python binding (`python3-seccomp`). Each line it
@@ -48,6 +54,7 @@ libc.syscall.restype = ctypes.c_long
 SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
 CREATE_RULESET_VERSION = 1
 RULE_PATH_BENEATH = 1
+PR_SET_DUMPABLE = 4
 PR_SET_NO_NEW_PRIVS = 38
 PR_CAPBSET_DROP = 24
 PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
@@ -283,6 +290,21 @@ def start_service_relay(port, path):
     say(f"service-relay=127.0.0.1:{port} -> {path}")
 
 
+def stay_pid_1(cmd):
+    """Run `cmd` as a child and reap until it ends; returns its exit code. Not
+    dumpable, so nothing attaches to it or opens its /proc/1/mem. The child's
+    exec makes the command dumpable again, as any process of this user."""
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        sys.exit(f"inside: prctl(PR_SET_DUMPABLE): {errno.errorcode.get(ctypes.get_errno(), '?')}")
+    command = os.fork()
+    if command == 0:
+        os.execvp(cmd[0], cmd)
+    while True:
+        pid, status = os.wait()
+        if pid == command:
+            return os.waitstatus_to_exitcode(status)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--compiled", required=True)
@@ -290,6 +312,7 @@ def main():
     p.add_argument("--seccomp", choices=["on", "off"], default="on")
     p.add_argument("--proc-truncate", action="store_true")
     p.add_argument("--relay", action="store_true")
+    p.add_argument("--stay-pid-1", action="store_true")
     p.add_argument("--setns-net-fd", type=int)
     p.add_argument("--close-fd", type=int, action="append", default=[])
     p.add_argument("--service-forward", nargs=2, metavar=("FD", "PORT_FILE"))
@@ -333,6 +356,9 @@ def main():
         start_service_forward(int(o.service_forward[0]), o.service_forward[1])
     if o.service_relay:
         start_service_relay(int(o.service_relay[0]), o.service_relay[1])
+    if o.stay_pid_1:
+        code = stay_pid_1(cmd)
+        sys.exit(code if code >= 0 else 128 - code)
     os.execvp(cmd[0], cmd)
 
 
