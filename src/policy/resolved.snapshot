@@ -5,6 +5,9 @@
     ],
     "read_deny": [
       "/run/user",
+      "/var/lib/incus",
+      "/var/lib/lxd",
+      "/var/snap/lxd",
       "~/.1password",
       "~/.aws",
       "~/.azure",
