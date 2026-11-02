@@ -174,10 +174,10 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
-    /// The relay cannot hold its port in the session's network.
     /// `enclos inside` could not bring a session up, before its command ran.
     #[error("{why}")]
     Inside { why: String },
+    /// The relay cannot hold its port in the session's network.
     #[error("the relay cannot listen on 127.0.0.1:{port}: {source}")]
     RelayListen { port: u16, source: std::io::Error },
     /// The path the relay passes connections to can never be a Unix socket's.
