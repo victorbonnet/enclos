@@ -74,11 +74,19 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
     // Each said once until it clears, not for every connection.
     let unreachable = Arc::new(AtomicBool::new(false));
     let mut full = false;
+    let mut failing = false;
     loop {
-        let Ok((client, _)) = listener.accept() else {
-            thread::sleep(ACCEPT_BACKOFF);
-            continue;
+        let client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(e) => {
+                if !std::mem::replace(&mut failing, true) {
+                    say(format_args!("cannot accept a connection: {e}"));
+                }
+                thread::sleep(ACCEPT_BACKOFF);
+                continue;
+            }
         };
+        failing = false;
         let Some(slot) = Slot::take(&open, max) else {
             if !std::mem::replace(&mut full, true) {
                 say(format_args!(
