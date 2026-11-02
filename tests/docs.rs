@@ -368,6 +368,37 @@ const SHARED_DENIES: &[&str] = &[
     "~/.local/share/opencode",
 ];
 
+/// A `wrap` that kept the old order would let a later `--bind` uncover a mask.
+#[test]
+fn masks_in_a_writable_folder_come_after_the_arguments_that_bind_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
+    for (doc, anchor) in [
+        (design(), "**The order `wrap` keeps:**"),
+        (
+            read("docs/policy-compilation.md"),
+            "`wrap` runs `before_home_mask`",
+        ),
+        (
+            read("src/backend/bubblewrap/compile.rs"),
+            "The arguments `wrap` runs are",
+        ),
+    ] {
+        let text = &doc[doc.find(anchor).expect(anchor)..];
+        let order: Vec<usize> = [
+            "before_home_mask",
+            "after_home_mask",
+            "`unmovable`",
+            "`in_sandbox_home` and `in_workspace`",
+            "`--remount-ro`",
+        ]
+        .iter()
+        .map(|word| text.find(word).expect(word))
+        .collect();
+        assert!(order.is_sorted(), "{anchor}: {order:?}");
+    }
+}
+
 #[test]
 fn every_deny_entry_named_from_memory_is_listed_to_verify() {
     let defaults = fs::read_to_string(
