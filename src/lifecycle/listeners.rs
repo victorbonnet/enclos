@@ -134,29 +134,59 @@ fn held_in_proc(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, Lis
     Ok(found.into_iter().collect())
 }
 
-/// Every process under `proc` that this user can read listening at
-/// 127.0.0.1 port `port`, in this process's network namespace.
+/// Every process under `proc` listening at 127.0.0.1 port `port`, in this
+/// process's network namespace.
 fn holders_in_proc(proc: &Path, port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
     let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let net: PathBuf = proc.join("self").join("net");
-    let sockets = listening_sockets(&net)?
-        .ok_or_else(|| proc_error(format!("{} shows no TCP table", net.display())))?;
-    let sockets: BTreeSet<u64> = sockets
-        .into_iter()
-        .filter_map(|(inode, addr)| (addr == at).then_some(inode))
-        .collect();
+    let listening = || {
+        let sockets = listening_sockets(&net)?
+            .ok_or_else(|| proc_error(format!("{} shows no TCP table", net.display())))?;
+        Ok(sockets
+            .into_iter()
+            .filter_map(|(inode, addr)| (addr == at).then_some(inode))
+            .collect())
+    };
+    let held = || {
+        let processes = descriptors::every_process(proc).map_err(proc_error)?;
+        Ok(processes
+            .into_iter()
+            .map(|(pid, open)| {
+                let sockets = open.iter().filter_map(|d| socket_inode(&d.target));
+                (pid, sockets.collect())
+            })
+            .collect())
+    };
+    holders_among(at, listening, held)
+}
+
+/// The processes `held`, each with its sockets, that hold a socket `listening`
+/// gives at `at`. A socket no process shown holds, and that still listens
+/// after the look, is a process that cannot be read: a look that could not
+/// happen is not a port with fewer holders.
+fn holders_among(
+    at: SocketAddr,
+    listening: impl Fn() -> Result<BTreeSet<u64>, ListenersError>,
+    held: impl FnOnce() -> Result<Vec<(u32, BTreeSet<u64>)>, ListenersError>,
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    let sockets = listening()?;
     if sockets.is_empty() {
         return Ok(Vec::new());
     }
     let mut found = BTreeSet::new();
-    for (pid, open) in descriptors::every_process(proc).map_err(proc_error)? {
-        if open
-            .iter()
-            .filter_map(|d| socket_inode(&d.target))
-            .any(|inode| sockets.contains(&inode))
-        {
+    let mut matched = BTreeSet::new();
+    for (pid, open) in held()? {
+        let shared: Vec<u64> = open.intersection(&sockets).copied().collect();
+        if !shared.is_empty() {
             found.insert((pid, at));
+            matched.extend(shared);
         }
+    }
+    let unmatched: BTreeSet<u64> = sockets.difference(&matched).copied().collect();
+    if !unmatched.is_empty() && !unmatched.is_disjoint(&listening()?) {
+        return Err(proc_error(format!(
+            "a listener at {at} belongs to a process that cannot be read"
+        )));
     }
     Ok(found.into_iter().collect())
 }
@@ -534,6 +564,45 @@ mod tests {
         let at: SocketAddr = "127.0.0.1:61374".parse().unwrap();
         assert_eq!(holders_in_proc(proc, 61374).unwrap(), [(7, at), (8, at)]);
         assert!(holders_in_proc(proc, 61375).unwrap().is_empty());
+    }
+
+    /// A socket at the port that no process shown holds is one of a process
+    /// that cannot be read: not a port with one holder.
+    #[test]
+    fn a_listener_of_a_process_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        let tcp = [
+            socket("0100007F:EFBE", "0A", 11),
+            socket("0100007F:EFBE", "0A", 13),
+        ]
+        .concat();
+        fake_net(&proc.join("self/net"), &tcp);
+        descriptors::fake_process(proc, std::process::id(), &[]);
+        descriptors::fake_process(proc, 7, &["socket:[11]"]);
+        let err = holders_in_proc(proc, 61374).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("a listener at 127.0.0.1:61374 belongs to a process that cannot be read"),
+            "{err}"
+        );
+    }
+
+    /// One that closed during the look, which is why it was not found, is
+    /// no process that cannot be read.
+    #[test]
+    fn a_listener_closed_during_the_look_is_no_error() {
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 61374));
+        let looks = std::cell::Cell::new(0);
+        let listening = || {
+            looks.set(looks.get() + 1);
+            Ok(match looks.get() {
+                1 => BTreeSet::from([11, 13]),
+                _ => BTreeSet::from([11, 14]),
+            })
+        };
+        let held = holders_among(at, listening, || Ok(vec![(7, BTreeSet::from([11]))]));
+        assert_eq!(held.unwrap(), [(7, at)]);
     }
 
     #[test]
