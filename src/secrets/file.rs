@@ -15,7 +15,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::OFlags;
-use zeroize::Zeroizing;
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{SecretError, SecretStore};
 use crate::model::secret::{SecretRef, SecretValue, StoreName};
@@ -26,8 +27,23 @@ pub struct FileStore {
     file: PathBuf,
 }
 
-/// The file's values, by secret.
-type Values = BTreeMap<String, String>;
+/// The file's values, by secret, zeroed once done with: reading one secret
+/// holds every sandbox's.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct Values(BTreeMap<String, String>);
+
+impl Values {
+    fn zero(&mut self) {
+        self.0.values_mut().for_each(Zeroize::zeroize);
+    }
+}
+
+impl Drop for Values {
+    fn drop(&mut self) {
+        self.zero();
+    }
+}
 
 impl FileStore {
     pub fn new(file: PathBuf) -> FileStore {
@@ -76,7 +92,7 @@ impl FileStore {
 
     fn load(&self) -> Result<Values, SecretError> {
         let Some(mut file) = self.open()? else {
-            return Ok(Values::new());
+            return Ok(Values::default());
         };
         self.check(&file)?;
         let mut text = Zeroizing::new(String::new());
@@ -128,12 +144,16 @@ impl SecretStore for FileStore {
 
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
         let mut values = self.load()?;
-        values.insert(secret.to_string(), value.expose().to_owned());
+        let replaced = values
+            .0
+            .insert(secret.to_string(), value.expose().to_owned());
+        drop(replaced.map(Zeroizing::new));
         self.save(&values)
     }
 
     fn get(&self, secret: &SecretRef) -> Result<Option<SecretValue>, SecretError> {
         self.load()?
+            .0
             .remove(&secret.to_string())
             .map(|value| {
                 SecretValue::new(value)
@@ -144,8 +164,8 @@ impl SecretStore for FileStore {
 
     fn remove(&self, secret: &SecretRef) -> Result<bool, SecretError> {
         let mut values = self.load()?;
-        let had = values.remove(&secret.to_string()).is_some();
-        match had {
+        let had = values.0.remove(&secret.to_string()).map(Zeroizing::new);
+        match had.is_some() {
             true => self.save(&values).map(|()| true),
             false => Ok(false),
         }
@@ -296,6 +316,26 @@ mod tests {
         assert!(err.untouched, "{err}");
         assert!(err.what.contains("cannot write"), "{err}");
         assert_eq!(store.get(&secret()).unwrap(), Some(v("a")));
+    }
+
+    /// What `Drop` runs, and it reaches every value.
+    #[test]
+    fn the_values_are_zeroed_all_of_them() {
+        let mut values = Values::default();
+        values.0.insert("home/a".to_owned(), "one".to_owned());
+        values.0.insert("lab/b".to_owned(), "two".to_owned());
+        values.zero();
+        assert!(values.0.values().all(String::is_empty));
+    }
+
+    /// The form a file has on disk is the plain object it always was.
+    #[test]
+    fn the_file_holds_one_plain_object() {
+        let (_dir, store) = store();
+        store.set(&secret(), &v("a")).unwrap();
+        let text = std::fs::read_to_string(&store.file).unwrap();
+        let read: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+        assert_eq!(read["home/telegram"], "a");
     }
 
     #[test]
