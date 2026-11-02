@@ -72,7 +72,9 @@ pub fn find(procs: &[Proc], session: &SessionRecord, tracked: &[ProcessRef]) -> 
     // above, or the pid was reused and the group is no longer the
     // session's.) In the group of the `enclos` holding the terminal, which
     // is not a member, only what lost its parent counts: a pager piped
-    // from `enclos` is the caller's.
+    // from `enclos` is the caller's. `ppid == 1` is macOS's rule: on desktop
+    // Linux an orphan goes to `systemd --user` and is missed here, which only
+    // leaves it uncounted, as these are never signalled.
     let mut counted: BTreeSet<u32> = match session.pgid {
         None => BTreeSet::new(),
         Some(pgid) => {
