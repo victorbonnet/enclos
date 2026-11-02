@@ -286,6 +286,20 @@ fn an_older_landlock_abi_leaves_execute_open() {
     }
 }
 
+/// `enclos inside` handles the rights of `LANDLOCK_ABI_NEEDED`, so a right of
+/// a newer ABI is lost on no host, a host without Landlock included.
+#[test]
+fn no_right_the_rules_never_ask_for_is_listed_as_lost() {
+    let design = design();
+    let row = design
+        .lines()
+        .find(|line| line.starts_with("| No Landlock: not built"))
+        .expect("the degraded control's row");
+    assert!(!row.contains("ABI 9"), "{row}");
+    assert!(!row.contains("host sockets"), "{row}");
+    assert!(!adr(ADR_0037).contains("ABI 9"));
+}
+
 #[test]
 fn doctor_weighs_the_profile_before_printing_it() {
     let design = design();
