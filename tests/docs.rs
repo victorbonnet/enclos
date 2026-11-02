@@ -179,6 +179,27 @@ fn no_runner_cell_waits_for_a_run() {
 }
 
 #[test]
+fn the_chat_tabs_control_pair_is_recorded_as_measured() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    assert!(!readme.contains("Pending run"));
+    assert!(!readme.contains("expected to fail as things stand"));
+    let table = readme
+        .lines()
+        .find(|line| line.starts_with("| Question | Ubuntu 24.04 runner, x86_64 | Ubuntu 24.04 runner, arm64 | Ubuntu 26.04"))
+        .expect("the control pair's table");
+    assert!(table.contains("x86_64 |"), "{table}");
+    let design = design();
+    let item = design
+        .lines()
+        .find(|line| line.starts_with("- The dashboard's terminal"))
+        .expect("§14's item");
+    for part in ["M3-20", "`NO_PROXY` for loopback is needed", "not shown"] {
+        assert!(item.contains(part), "{part}");
+    }
+}
+
+#[test]
 fn an_older_landlock_abi_leaves_execute_open() {
     let (adr_0037, adr_0038, design) = (adr(ADR_0037), adr(ADR_0038), design());
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
