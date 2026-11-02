@@ -359,7 +359,7 @@ mod tests {
     /// and `session` in it.
     fn in_cgroup(session: &mut SessionRecord, pids: &[u32]) -> (tempfile::TempDir, Hierarchy) {
         let dir = tempfile::tempdir().unwrap();
-        session.cgroup = Some("/s.scope".to_owned());
+        session.cgroup = Some("/s.scope".parse().unwrap());
         write_cgroup(dir.path(), pids);
         let cgroups = Hierarchy::at(dir.path());
         (dir, cgroups)

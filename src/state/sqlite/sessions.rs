@@ -6,7 +6,7 @@ use super::policy::ReadError;
 use crate::model::Timestamp;
 use crate::model::policy::SnapshotId;
 use crate::model::sandbox::SandboxName;
-use crate::model::session::{ProcessRef, SessionId, SessionRecord};
+use crate::model::session::{Cgroup, ProcessRef, SessionId, SessionRecord};
 
 pub fn insert(conn: &Connection, s: &SessionRecord) -> rusqlite::Result<SessionId> {
     conn.execute(
@@ -25,7 +25,7 @@ pub fn insert(conn: &Connection, s: &SessionRecord) -> rusqlite::Result<SessionI
             encode(&s.tracked),
             s.started_at.to_string(),
             s.service,
-            s.cgroup,
+            s.cgroup.as_ref().map(Cgroup::as_str),
         ],
     )?;
     Ok(SessionId(conn.last_insert_rowid()))
@@ -76,6 +76,7 @@ fn session(row: &Row<'_>) -> Result<SessionRecord, ReadError> {
     let tracked: String = row.get(9)?;
     let started_at: String = row.get(10)?;
     let ended_at: Option<String> = row.get(11)?;
+    let cgroup: Option<String> = row.get(13)?;
     let time = |t: &str| {
         t.parse::<Timestamp>()
             .map_err(|e| corrupt(format!("session time `{t}`: {e}")))
@@ -93,7 +94,11 @@ fn session(row: &Row<'_>) -> Result<SessionRecord, ReadError> {
             started: row.get(7)?,
         },
         pgid: row.get(8)?,
-        cgroup: row.get(13)?,
+        cgroup: cgroup
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(corrupt)?,
         tracked: decode(&tracked)?,
         started_at: time(&started_at)?,
         ended_at: ended_at.as_deref().map(time).transpose()?,

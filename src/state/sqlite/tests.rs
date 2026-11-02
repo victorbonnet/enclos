@@ -615,7 +615,7 @@ fn sessions_keep_their_members_until_they_end() {
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
         root: at(10),
         pgid: None,
-        cgroup: Some("/enclos.1f2e3d4c.home.slice/s.scope".into()),
+        cgroup: Some("/enclos.1f2e3d4c.home.slice/s.scope".parse().unwrap()),
         tracked: vec![at(11)],
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -639,6 +639,46 @@ fn sessions_keep_their_members_until_they_end() {
     // Removing the sandbox removes its sessions.
     store.remove(&lock, &name).unwrap();
     assert!(store.sessions(&name, false).unwrap().is_empty());
+}
+
+/// A row is no way around what a `Cgroup` promises: `kill` writes to it.
+#[test]
+fn a_cgroup_in_the_database_that_is_no_scope_is_a_read_error() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let session = SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: None,
+        root: ProcessRef {
+            pid: 10,
+            started: "start".into(),
+        },
+        pgid: None,
+        cgroup: None,
+        tracked: Vec::new(),
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    store.put_session(&lock, &session).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    for path in ["/", "/user.slice", "../up.scope"] {
+        conn.execute("UPDATE sessions SET cgroup = ?1", [path])
+            .unwrap();
+        let err = store.sessions(&name, true).unwrap_err();
+        assert!(
+            err.to_string().contains("is not the path of a scope"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
