@@ -29,6 +29,15 @@ PROBE = f"import sys; sys.path.insert(0, {M3!r}); import probe; print(probe.p_ex
 COREUTILS = "true|false|cat|cp|echo|env|id|ls|mv|rm|sleep|touch"
 
 
+class SocketFamilyTest(unittest.TestCase):
+    def test_a_family_let_through_reads_ok(self):
+        self.assertEqual(probe.p_socket_family("1")[0], "ok")
+
+    def test_a_refusal_reads_as_its_error(self):
+        with patch.object(probe.socket, "socket", side_effect=PermissionError(errno.EPERM, "")):
+            self.assertEqual(probe.p_socket_family("40")[0], "EPERM")
+
+
 class ExecProbeTest(unittest.TestCase):
     def test_a_copied_shell_runs_and_ends_with_stdin_left_open(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:

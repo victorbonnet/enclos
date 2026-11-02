@@ -63,6 +63,11 @@ CLONE_NEW = {
 }
 
 
+# The only families socket(2) may open: a network namespace may not hold vsock,
+# which on a host that is itself a VM reaches the hypervisor past the proxy.
+SOCKET_FAMILIES = {"AF_UNIX": 1, "AF_INET": 2, "AF_INET6": 10, "AF_NETLINK": 16}
+
+
 def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
@@ -149,6 +154,7 @@ def compile_policy(o):
             "ioctl": SECCOMP_IOCTL,
             "clone_flags": CLONE_NEW,
             "enosys": ["clone3"],
+            "socket_families": SOCKET_FAMILIES,
         },
         "relay": {"port": o.relay_port, "socket": env["ENCLOS_PROXY_SOCKET"]},
     }

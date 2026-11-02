@@ -274,7 +274,13 @@
     },
     "enosys": [
       "clone3"
-    ]
+    ],
+    "socket_families": {
+      "AF_INET": 2,
+      "AF_INET6": 10,
+      "AF_NETLINK": 16,
+      "AF_UNIX": 1
+    }
   },
   "relay": {
     "port": 41001,

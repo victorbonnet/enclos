@@ -250,6 +250,7 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 - refused with `EPERM`: `keyctl`, `add_key`, `request_key`; `bpf`, `perf_event_open`, `userfaultfd`; `mount`, `umount2`, `pivot_root`, `move_mount`, `open_tree`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`; `setns`; `kexec_load`, `kexec_file_load`, `init_module`, `finit_module`, `delete_module`, `reboot`, `swapon`, `swapoff`, `acct`, `quotactl`, `quotactl_fd`, `ioperm`, `iopl`, `open_by_handle_at`, `uselib`; `io_uring_setup`, `io_uring_enter`, `io_uring_register` (seccomp does not see io_uring's operations). A fixed set of calls an architecture lacks is skipped, and `inside.py` says which; any other rule that cannot be added stops the session.
 - `ioctl` refused with `EPERM` when its request's low 32 bits are `TIOCSTI` (`0x5412`) or `TIOCLINUX` (`0x541C`).
 - `unshare` and `clone` refused with `EPERM` when their flags hold any of `CLONE_NEWNS`, `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWIPC`, `CLONE_NEWUTS`, `CLONE_NEWCGROUP`, `CLONE_NEWTIME`.
+- `socket` refused with `EPERM` for any family but `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`: a network namespace may not hold vsock (design §14). Added after these runs, so none of the results here shows it.
 - `clone3` refused with `ENOSYS`, since its flags are in memory seccomp cannot read; the C library then falls back to `clone`.
 - `ptrace` is not refused: the PID namespace leaves nothing outside to trace (the probe tries a host process), and debuggers inside keep working.
 
