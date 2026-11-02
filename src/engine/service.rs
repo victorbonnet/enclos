@@ -93,6 +93,14 @@ impl Engine {
     /// as one a runtime no longer declares.
     pub(super) fn installed_labels(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
         let mut labels = self.services.installed(&self.label_prefix(name)?)?;
+        // Recorded running with nothing to show: it may be that the manager
+        // is looking elsewhere, and calling that nothing to stop would leave
+        // units running and starting at each login.
+        if labels.is_empty()
+            && matches!(self.state.get(name)?, Some(r) if r.state == SandboxState::Running)
+        {
+            self.services.can_list()?;
+        }
         let proxy = self.label(name, Unit::Proxy)?;
         labels.sort_by_key(|l| (*l == proxy, l.clone()));
         Ok(labels)

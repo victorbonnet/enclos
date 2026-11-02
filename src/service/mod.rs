@@ -102,6 +102,11 @@ pub struct ServiceError {
 pub trait ServiceManager {
     /// Whether this manager can install units now; the reason when not.
     fn available(&self) -> Result<(), ServiceError>;
+    /// Whether `installed` shows what this manager runs; the reason when
+    /// not, for a caller that expected something and got an empty list.
+    fn can_list(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
     /// Installs the unit so it starts now and again at each login.
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError>;
     /// Stops the unit and removes it, so it does not start at login.
