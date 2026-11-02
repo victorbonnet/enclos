@@ -56,6 +56,16 @@ class Status(unittest.TestCase):
         self.assertIn("ssh", text)
 
 
+class ItsOwnServer(unittest.TestCase):
+    def test_it_never_attaches_to_a_dashboard_of_another_session(self):
+        self.assertIn("hermes dashboard --no-open --isolated --port 0", cmd.COMMAND)
+
+    def test_the_checks_read_the_port_rather_than_name_hermess_default(self):
+        for name in ("dashboard-cmd-check.sh", "dashboard-chat-check.sh"):
+            with open(f"{HERE}/{name}") as f:
+                self.assertNotIn("9119", f.read(), name)
+
+
 class ControlPair(unittest.TestCase):
     def test_only_the_fixed_half_sets_no_proxy_and_both_run_the_dashboard(self):
         self.assertNotIn("NO_PROXY", cmd.command(False))
