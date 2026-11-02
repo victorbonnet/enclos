@@ -1,6 +1,7 @@
 //! Compiling a sandbox's active policy into the sandbox's folder.
 
 use super::policy::with_sandbox_on;
+use super::sandbox::{with_backends, without_backend};
 use super::*;
 use crate::probes::OwnProbes as _;
 
@@ -178,6 +179,35 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
         .own_probes(None)
         .unwrap();
     assert!(fake.folders_not_run(&inputs).is_empty());
+}
+
+/// A dry run asks nothing of the host, so a backend this host cannot run
+/// still counts its probes; one not in this build has none to count.
+#[test]
+fn a_policy_test_dry_run_counts_on_an_unavailable_backend_and_needs_it_in_the_build() {
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let unavailable = without_backend(&engine);
+    let Planned::DryRun(plan) = unavailable
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.starts_with("run ") && c.contains(" escape probes in sandbox home ")),
+        "{:?}",
+        plan.changes
+    );
+    let not_in_this_build = with_backends(&engine, Vec::new());
+    let err = not_in_this_build
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::BackendUnavailable { reason, .. } if reason.contains("does not include it")),
+        "{err}"
+    );
 }
 
 /// A backend with no probes of its own runs the shared set through its
