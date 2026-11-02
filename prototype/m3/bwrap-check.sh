@@ -10,6 +10,7 @@ if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-ho
     exit 2
 fi
 
+here=$(cd "$(dirname "$0")" && pwd)
 say() { printf '%s: %s\n' "$1" "$2"; }
 
 # One try: a read-only root, every namespace bubblewrap makes, `true` inside.
@@ -55,6 +56,10 @@ try bwrap.as_installed
 if [ "$restrict" = 1 ]; then
     # A profile that lets /usr/bin/bwrap alone make user namespaces, written
     # as Ubuntu's own profiles for chrome and others are (apparmor.d/chrome).
+    # A profile already there is named: on the Ubuntu 26.04 runner, where one
+    # is shipped, bubblewrap runs without this step and fails with it.
+    shipped=$(sh "$here/bwrap-profiles.sh")
+    say bwrap.with_userns_profile.shipped_profile "${shipped:-none}"
     profile=/etc/apparmor.d/enclos-survey-bwrap
     sudo tee "$profile" >/dev/null <<'EOF'
 abi <abi/4.0>,

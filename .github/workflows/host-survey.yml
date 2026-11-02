@@ -36,6 +36,8 @@ jobs:
         run: sh prototype/m3/survey.sh | tee -a survey.txt
       - name: bubblewrap as an unprivileged user
         run: sh prototype/m3/bwrap-check.sh | tee -a survey.txt
+      - name: The profile step names a profile already there
+        run: grep '^bwrap\.with_userns_profile\.shipped_profile: ' survey.txt
       - name: systemd --user at logout
         run: sh prototype/m3/logout-check.sh | tee -a survey.txt
       - name: Summary

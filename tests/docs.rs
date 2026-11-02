@@ -154,3 +154,18 @@ fn the_host_survey_fails_when_a_script_does() {
     // GitHub adds pipefail only for a named shell; `| tee` hides the status otherwise
     assert!(workflow.contains("    defaults:\n      run:\n        shell: bash\n"));
 }
+
+#[test]
+fn ubuntu_26_04_is_not_read_as_24_04() {
+    let design = design();
+    assert!(!design.contains("Ubuntu 24.04 and later"));
+    assert!(design.contains("`/etc/apparmor.d/bwrap-userns-restrict`"));
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    let header = readme
+        .lines()
+        .find(|line| line.starts_with("| | Ubuntu 24.04"))
+        .expect("the results table");
+    assert!(!header.contains("ubuntu-latest"), "{header}");
+    assert!(header.contains("`ubuntu-26.04`"), "{header}");
+}
