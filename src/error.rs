@@ -145,7 +145,10 @@ pub enum Error {
     },
     /// The proxy cannot open the Unix socket a session with a network of
     /// its own reaches it on, so it does not start.
-    #[error("the proxy of sandbox `{sandbox}` cannot listen on {path}: {source}")]
+    #[error(
+        "the proxy of sandbox `{sandbox}` cannot listen on {path}: {source}{next}",
+        next = proxy_socket_next_step(.source)
+    )]
     ProxySocket {
         sandbox: String,
         path: PathBuf,
@@ -331,6 +334,20 @@ impl std::fmt::Display for HomeFound {
             HomeFound::NotAFolder => f.write_str("not a folder"),
             HomeFound::Missing => f.write_str("missing"),
         }
+    }
+}
+
+/// What to do about a socket the proxy could not open, where that is known.
+fn proxy_socket_next_step(source: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::{AddrInUse, AlreadyExists, InvalidInput, NotADirectory};
+    match source.kind() {
+        InvalidInput => {
+            ". The path is too long for a Unix socket: set ENCLOS_HOME to a shorter folder, or use a shorter sandbox name"
+        }
+        AddrInUse | AlreadyExists | NotADirectory => {
+            ". Something else is at that path or in its way: move it aside, then start the proxy again"
+        }
+        _ => "",
     }
 }
 
