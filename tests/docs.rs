@@ -328,6 +328,20 @@ fn holder_means_the_namespace_holder_alone() {
     }
 }
 
+/// `enclos inside` handles the rights of `LANDLOCK_ABI_NEEDED`, so a right of
+/// a newer ABI is lost on no host, a host without Landlock included.
+#[test]
+fn no_right_the_rules_never_ask_for_is_listed_as_lost() {
+    let design = design();
+    let row = design
+        .lines()
+        .find(|line| line.starts_with("| No Landlock: not built"))
+        .expect("the degraded control's row");
+    assert!(!row.contains("ABI 9"), "{row}");
+    assert!(!row.contains("host sockets"), "{row}");
+    assert!(!adr("0037-landlock-where-the-kernel-has-it.md").contains("ABI 9"));
+}
+
 #[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder

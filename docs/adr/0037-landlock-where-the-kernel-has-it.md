@@ -18,7 +18,7 @@ Decision (proposed): Landlock is optional on Linux.
 
 `enclos doctor` reports each case in full: what is not enforced, the risk, and the fix (design §5, Degraded controls on Linux).
 
-- **What is not enforced, and the risk.** Without Landlock, any program the sandbox can read can be run, including one it downloaded or wrote into its home or a workspace. Writes outside the home and workspaces rest on one layer, the mount layout, with no second check if a path is mounted writable by mistake. Landlock's refusal of host Unix sockets (ABI 9) is not there to back up their masking. With an older ABI, what the rights it lacks would hold rests on the mounts alone.
+- **What is not enforced, and the risk.** Without Landlock, any program the sandbox can read can be run, including one it downloaded or wrote into its home or a workspace. Writes outside the home and workspaces rest on one layer, the mount layout, with no second check if a path is mounted writable by mistake. With an older ABI, what the rights it lacks would hold rests on the mounts alone.
 - **The fix.** A kernel built with `CONFIG_SECURITY_LANDLOCK=y` and `landlock` in its active LSM list. For too old an ABI, the ABI needed and the kernel version that brings it.
 
 Reason: writes, which matter most for [0014](0014-threat-model-accidental-damage.md)'s accidental damage, are held by the mounts with or without Landlock. Landlock is their second layer, and the only control on what runs. A Raspberry Pi OS install gets a sandbox whose gaps are named, rather than none, and every host whose kernel has Landlock keeps what its ABI offers.
