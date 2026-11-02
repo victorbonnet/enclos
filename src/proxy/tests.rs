@@ -871,6 +871,18 @@ fn a_file_in_a_sockets_place_is_kept() {
 }
 
 #[test]
+fn a_link_in_a_sockets_place_is_kept_and_not_followed() {
+    let folder = tempfile::tempdir().unwrap();
+    let path = folder.path().join("proxy.sock");
+    let target = folder.path().join("elsewhere.sock");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let e = listen_unix(&path).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+    assert!(path.is_symlink());
+    assert!(!target.exists(), "a socket at the link's target");
+}
+
+#[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
     // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
     let squatter = tcp_listener(Ipv6Addr::LOCALHOST);
