@@ -648,16 +648,57 @@ WantedBy=default.target
     /// user's manager, so only on a throwaway runner: CI's `systemd-units`
     /// job sets `ENCLOS_SYSTEMD_UNIT_TESTS`, and they refuse anywhere else.
     fn on_a_runner() -> bool {
-        if std::env::var("ENCLOS_SYSTEMD_UNIT_TESTS").as_deref() != Ok("1") {
+        runs_real_units(|name| std::env::var(name).unwrap_or_default())
+    }
+
+    fn runs_real_units(var: impl Fn(&str) -> String) -> bool {
+        if var("ENCLOS_SYSTEMD_UNIT_TESTS") != "1" {
+            // That job passing with nothing tested would look like a pass.
+            assert_ne!(
+                var("GITHUB_JOB"),
+                "systemd-units",
+                "the systemd-units job lost ENCLOS_SYSTEMD_UNIT_TESTS"
+            );
             eprintln!("systemd unit tests not run: CI's systemd-units job runs them");
             return false;
         }
-        let var = |name: &str| std::env::var(name).unwrap_or_default();
         assert!(
             var("GITHUB_ACTIONS") == "true" && var("RUNNER_ENVIRONMENT") == "github-hosted",
             "these tests install real units: they run only on a GitHub-hosted runner"
         );
         true
+    }
+
+    fn with(vars: &[(&str, &str)], name: &str) -> String {
+        let value = vars.iter().find(|(k, _)| *k == name);
+        value.map_or(String::new(), |(_, v)| (*v).to_owned())
+    }
+
+    #[test]
+    fn real_units_run_only_when_asked_and_only_on_a_hosted_runner() {
+        assert!(!runs_real_units(|name| with(&[], name)));
+        assert!(!runs_real_units(|name| with(
+            &[("GITHUB_JOB", "test")],
+            name
+        )));
+        let hosted = [
+            ("ENCLOS_SYSTEMD_UNIT_TESTS", "1"),
+            ("GITHUB_ACTIONS", "true"),
+            ("RUNNER_ENVIRONMENT", "github-hosted"),
+        ];
+        assert!(runs_real_units(|name| with(&hosted, name)));
+    }
+
+    #[test]
+    #[should_panic(expected = "only on a GitHub-hosted runner")]
+    fn real_units_are_refused_off_a_hosted_runner() {
+        runs_real_units(|name| with(&[("ENCLOS_SYSTEMD_UNIT_TESTS", "1")], name));
+    }
+
+    #[test]
+    #[should_panic(expected = "lost ENCLOS_SYSTEMD_UNIT_TESTS")]
+    fn the_systemd_units_job_cannot_pass_without_running_them() {
+        runs_real_units(|name| with(&[("GITHUB_JOB", "systemd-units")], name));
     }
 
     /// A service running `script` on the runner's manager.
