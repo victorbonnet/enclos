@@ -160,6 +160,29 @@ fn connect_waits_for_installed_services_and_starts_nothing() {
 
 /// A limit no program could start under refuses the start before any
 /// service is removed or installed.
+/// A manager that reads another folder than this shell lists nothing here,
+/// and its units keep running: `stop` says so rather than saying it stopped.
+#[test]
+fn stopping_a_running_sandbox_whose_manager_looks_elsewhere_fails() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    fake.started.borrow_mut().clear();
+    *fake.refuse_list.borrow_mut() = true;
+    let err = engine
+        .stop_sandbox(&alice(), &name, Confirm::Yes)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("looks elsewhere"), "{err}");
+    assert_eq!(state_of(&engine, &name), SandboxState::Running);
+}
+
+#[test]
+fn a_stopped_sandbox_with_nothing_installed_does_not_ask_the_manager() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    *fake.refuse_list.borrow_mut() = true;
+    assert!(engine.installed_labels(&name).unwrap().is_empty());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_under_a_limit_no_program_could_run_under_installs_nothing() {

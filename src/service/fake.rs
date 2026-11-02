@@ -31,6 +31,9 @@ pub struct FakeServices {
     pub refuse_status: RefCell<bool>,
     /// The manager is not available, as with no login session.
     pub refuse_available: RefCell<bool>,
+    /// `installed` cannot be trusted, as when the manager reads another
+    /// folder than this process.
+    pub refuse_list: RefCell<bool>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -54,6 +57,15 @@ impl ServiceManager for FakeServices {
         if *self.refuse_available.borrow() {
             return Err(ServiceError {
                 what: "launchd has no login session".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn can_list(&self) -> Result<(), ServiceError> {
+        if *self.refuse_list.borrow() {
+            return Err(ServiceError {
+                what: "the manager looks elsewhere".into(),
             });
         }
         Ok(())
@@ -130,6 +142,10 @@ impl ServiceManager for FakeServices {
 impl ServiceManager for std::rc::Rc<FakeServices> {
     fn available(&self) -> Result<(), ServiceError> {
         self.as_ref().available()
+    }
+
+    fn can_list(&self) -> Result<(), ServiceError> {
+        (**self).can_list()
     }
 
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {

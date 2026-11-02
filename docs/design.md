@@ -61,7 +61,7 @@ Templates are reusable policies: `minimal`, `assistant`, `coding`.
 
 ## 4. Architecture
 
-There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's services, its proxy and its runtime's, are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that `sandbox start` installs. A `connect` with no proxy running and no services installed starts one as a plain process and records it as a session, which `sandbox stop` ends. Interactive sessions run in the user's terminal.
+There is no daemon ([ADR 0002](adr/0002-no-daemon.md)). The CLI is a thin layer over a core library. A sandbox's services, its proxy and its runtime's, are ordinary launchd agents (macOS, in the user's login session) or systemd user units (Linux) that `sandbox start` installs. A `connect` with no proxy running and no services installed starts one as a plain process and records it as a session, which `sandbox stop` ends. On Linux the folder units go in comes from the caller's `XDG_CONFIG_HOME`, and the user's manager searches by its own environment: `sandbox start` refuses, before anything is written, when the manager's `UnitPath` does not hold that folder, and a sandbox recorded running with nothing in the folder is refused the same way, since its units may be running from another one. Interactive sessions run in the user's terminal.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="diagrams/architecture-dark.svg">

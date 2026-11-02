@@ -10,6 +10,7 @@ use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUn
 pub struct Systemd {
     /// The folder unit files go in.
     units_dir: PathBuf,
+    systemctl: PathBuf,
 }
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -27,6 +28,7 @@ impl Systemd {
     pub fn for_user(units_dir: &Path) -> Systemd {
         Systemd {
             units_dir: units_dir.to_owned(),
+            systemctl: SYSTEMCTL.into(),
         }
     }
 
@@ -34,10 +36,21 @@ impl Systemd {
         self.units_dir.join(unit_name(label))
     }
 
+    fn systemctl(&self, args: &[&str]) -> Result<Output, ServiceError> {
+        Command::new(&self.systemctl)
+            .arg("--user")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| ServiceError {
+                what: format!("cannot run systemctl: {e}"),
+            })
+    }
+
     /// `systemctl --user <args>`; an error when it refuses, saying `what`
     /// it was asked.
     fn must(&self, what: &str, args: &[&str]) -> Result<(), ServiceError> {
-        let out = systemctl(args)?;
+        let out = self.systemctl(args)?;
         if !out.status.success() {
             return Err(ServiceError {
                 what: format!(
@@ -52,7 +65,7 @@ impl Systemd {
     /// What the manager says of the unit now.
     fn show(&self, label: &ServiceLabel) -> Result<Shown, ServiceError> {
         let name = unit_name(label);
-        let out = systemctl(&["show", &name, "--property=LoadState,ActiveState,MainPID"])?;
+        let out = self.systemctl(&["show", &name, "--property=LoadState,ActiveState,MainPID"])?;
         if !out.status.success() {
             return Err(ServiceError {
                 what: format!(
@@ -90,15 +103,14 @@ fn unit_name(label: &ServiceLabel) -> String {
     format!("{label}.service")
 }
 
-fn systemctl(args: &[&str]) -> Result<Output, ServiceError> {
-    Command::new(SYSTEMCTL)
-        .arg("--user")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| ServiceError {
-            what: format!("cannot run systemctl: {e}"),
-        })
+/// Removes `file`, which may not be there.
+fn remove(file: &Path) -> Result<(), ServiceError> {
+    match std::fs::remove_file(file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(ServiceError {
+            what: format!("cannot remove {}: {e}", file.display()),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// The properties `systemctl --user show` printed for a unit.
@@ -135,6 +147,26 @@ fn parse_show(text: &str) -> Shown {
         }
     }
     shown
+}
+
+/// The folders of `UnitPath=` in what `systemctl show` printed: separated
+/// by spaces, with a folder that holds a space or `$` double-quoted.
+fn search_path(text: &str) -> Vec<String> {
+    let Some(value) = text.lines().find_map(|l| l.strip_prefix("UnitPath=")) else {
+        return Vec::new();
+    };
+    let mut folders = vec![String::new()];
+    let mut in_quotes = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '\\' if in_quotes => folders.last_mut().unwrap().extend(chars.next()),
+            ' ' if !in_quotes => folders.push(String::new()),
+            c => folders.last_mut().unwrap().push(c),
+        }
+    }
+    folders
 }
 
 /// `text` as one quoted word of a unit file, which systemd reads back with
@@ -212,14 +244,40 @@ WantedBy=default.target
 }
 
 impl ServiceManager for Systemd {
+    /// That the user's manager answers and searches the folder units go in.
+    /// That folder comes from this process's environment and the manager
+    /// reads its own, so they can differ, and a unit written elsewhere would
+    /// never load.
     fn available(&self) -> Result<(), ServiceError> {
-        self.must(
-            "answer as your user's manager, which runs enclos's services",
-            &["show", "--property=Version"],
-        )
+        let out = self.systemctl(&["show", "--property=UnitPath"])?;
+        if !out.status.success() {
+            return Err(ServiceError {
+                what: format!(
+                    "systemd did not answer as your user's manager, which runs enclos's services: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            });
+        }
+        let searched = search_path(&String::from_utf8_lossy(&out.stdout));
+        if !searched.iter().any(|f| Path::new(f) == self.units_dir) {
+            return Err(ServiceError {
+                what: format!(
+                    "your user's manager does not look for units in {}: run enclos with XDG_CONFIG_HOME as the manager has it (`systemctl --user show --property=UnitPath` lists where it looks)",
+                    self.units_dir.display()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// `installed` reads a folder named by this process's environment, so it
+    /// shows nothing when the manager's is another.
+    fn can_list(&self) -> Result<(), ServiceError> {
+        self.available()
     }
 
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
+        self.available()?;
         let failed = |what: String| ServiceError { what };
         let text = unit_file(unit)?;
         std::fs::create_dir_all(&self.units_dir)
@@ -238,23 +296,28 @@ impl ServiceManager for Systemd {
 
     fn stop(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
         let name = unit_name(label);
-        if self.status(label)? != ServiceStatus::NotLoaded {
+        let loaded = self.status(label)? != ServiceStatus::NotLoaded;
+        if loaded {
             // Waits while the manager sends TERM, then KILL after the
             // unit's stop timeout.
             self.must(&format!("stop {label}"), &["stop", &name])?;
             // A unit that ended in failure stays listed until told; there
             // is nothing to reset otherwise, which systemctl calls an error.
-            systemctl(&["reset-failed", &name])?;
+            self.systemctl(&["reset-failed", &name])?;
         }
         let path = self.unit_path(label);
+        if !loaded {
+            // A file the manager has not read, perhaps in a folder it does
+            // not search: `disable` would refuse it.
+            let link = self.units_dir.join("default.target.wants").join(&name);
+            return [link, path].iter().try_for_each(|file| remove(file));
+        }
         if path.exists() {
             self.must(
                 &format!("disable {label}"),
                 &["disable", "--no-reload", &name],
             )?;
-            std::fs::remove_file(&path).map_err(|e| ServiceError {
-                what: format!("cannot remove {}: {e}", path.display()),
-            })?;
+            remove(&path)?;
             self.must("read its unit files again", &["daemon-reload"])?;
         }
         Ok(())
@@ -419,9 +482,7 @@ WantedBy=default.target
     #[test]
     fn installed_labels_are_the_unit_files_with_the_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let systemd = Systemd {
-            units_dir: dir.path().join("systemd/user"),
-        };
+        let systemd = Systemd::for_user(&dir.path().join("systemd/user"));
         assert!(systemd.installed("enclos.").unwrap().is_empty());
         std::fs::create_dir_all(systemd.units_dir.join("default.target.wants")).unwrap();
         for file in [
@@ -440,6 +501,121 @@ WantedBy=default.target
                 label("enclos.12345678.home.proxy")
             ]
         );
+    }
+
+    /// A `Systemd` whose `systemctl` is a script in a folder of the test's:
+    /// it logs its arguments and answers `show` with these lines, so nothing
+    /// reaches a real manager.
+    struct Stub {
+        systemd: Systemd,
+        log: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Stub {
+        fn new(unit_path: &str, shown: &str) -> Stub {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let units_dir = dir.path().join("units");
+            let log = dir.path().join("calls");
+            let script = dir.path().join("systemctl");
+            let text = format!(
+                "#!/bin/sh\necho \"$*\" >>'{log}'\ncase \"$*\" in\n*UnitPath*) printf '%s\\n' '{unit_path}' ;;\n*show*) printf '%s\\n' '{shown}' ;;\nesac\n",
+                log = log.display(),
+                unit_path = unit_path.replace("UNITS", &units_dir.display().to_string()),
+            );
+            std::fs::write(&script, text).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Another test's child may hold the script open for a moment.
+            while Command::new(&script).arg("ready").status().is_err() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::remove_file(&log).unwrap();
+            Stub {
+                systemd: Systemd {
+                    units_dir,
+                    systemctl: script,
+                },
+                log,
+                _dir: dir,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        fn called(&self, what: &str) -> bool {
+            self.calls().iter().any(|call| call.contains(what))
+        }
+    }
+
+    const LOADED: &str = "LoadState=loaded\nActiveState=inactive\nMainPID=0";
+    const NOT_FOUND: &str = "LoadState=not-found\nActiveState=inactive\nMainPID=0";
+
+    #[test]
+    fn a_manager_that_does_not_search_the_folder_is_refused_before_anything_is_written() {
+        let stub = Stub::new("UnitPath=/etc/systemd/user /elsewhere/systemd/user", LOADED);
+        for err in [
+            stub.systemd.available().unwrap_err(),
+            stub.systemd.start(&proxy()).unwrap_err(),
+        ] {
+            let folder = stub.systemd.units_dir.display().to_string();
+            assert!(err.what.contains(&folder), "{err}");
+            assert!(err.what.contains("XDG_CONFIG_HOME"), "{err}");
+        }
+        assert!(!stub.systemd.units_dir.exists());
+        assert!(!stub.called("daemon-reload"));
+    }
+
+    #[test]
+    fn a_manager_that_searches_the_folder_gets_the_unit() {
+        let stub = Stub::new("UnitPath=/etc/systemd/user UNITS /run/systemd/user", LOADED);
+        stub.systemd.available().unwrap();
+        stub.systemd.start(&proxy()).unwrap();
+        assert!(stub.systemd.unit_path(&proxy().label).exists());
+        assert!(stub.called("enable --now enclos.12345678.home.proxy.service"));
+    }
+
+    #[test]
+    fn stopping_a_unit_the_manager_has_not_loaded_removes_its_files_without_asking_it() {
+        let stub = Stub::new("UnitPath=/etc/systemd/user", NOT_FOUND);
+        let unit = proxy();
+        let wants = stub.systemd.units_dir.join("default.target.wants");
+        std::fs::create_dir_all(&wants).unwrap();
+        let path = stub.systemd.unit_path(&unit.label);
+        std::fs::write(&path, "").unwrap();
+        let link = wants.join(unit_name(&unit.label));
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        stub.systemd.stop(&unit.label).unwrap();
+        assert!(!path.exists());
+        assert!(link.symlink_metadata().is_err());
+        assert!(!stub.called("disable"), "{:?}", stub.calls());
+    }
+
+    #[test]
+    fn stopping_a_loaded_unit_disables_it_through_the_manager() {
+        let stub = Stub::new("UnitPath=UNITS", LOADED);
+        let unit = proxy();
+        std::fs::create_dir_all(&stub.systemd.units_dir).unwrap();
+        std::fs::write(stub.systemd.unit_path(&unit.label), "").unwrap();
+        stub.systemd.stop(&unit.label).unwrap();
+        assert!(stub.called("disable --no-reload"), "{:?}", stub.calls());
+        assert!(stub.called("daemon-reload"), "{:?}", stub.calls());
+        assert!(!stub.systemd.unit_path(&unit.label).exists());
+    }
+
+    #[test]
+    fn the_search_path_is_read_as_systemctl_quotes_it() {
+        assert_eq!(
+            search_path("UnitPath=/a/b \"/my config/sys\\$temd\" /c\n"),
+            ["/a/b", "/my config/sys$temd", "/c"]
+        );
+        assert!(search_path("Version=255\n").is_empty());
     }
 
     /// Whether to run the tests below, which install real units in the
