@@ -246,6 +246,7 @@ fn an_older_landlock_abi_leaves_execute_open() {
     assert!(!adr_0037.contains("left to the code"));
     assert!(!adr_0038.contains("too old a Landlock"));
     assert!(design.contains("the rights that ABI has apply as a layer over the mounts"));
+    assert!(design.contains("no mount holds `IOCTL_DEV` or a scope"));
     assert!(!design.contains("or its ABI is older than the backend's rules need, writes are held"));
 
     // Both options stay on the table: the open row names them, and nothing
