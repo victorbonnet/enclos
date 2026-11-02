@@ -46,6 +46,7 @@ DENY=(
     "$WORK/denied-folder"                  # inside a workspace (design §5):
     "$WORK/denied-file"                    # hidden, the workspace still writable
     "$WORK/denied-missing"                 # not on the host: masked as a folder
+    "$WORK/denied-holder/secret"           # its folder may not move, or the mask would
     "$H/proto-linked-entry"                # a link: its target stays hidden too
     "$WORK/denied-link"                    # a link out of the workspace, the same
 )

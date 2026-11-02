@@ -10,8 +10,10 @@
 //!
 //! The deny list is not mounted. The arguments `wrap` runs are
 //! `before_home_mask`, what it makes of [`HomeMask`]'s `denied` and
-//! `denied_elsewhere`, `after_home_mask`, then its `--remount-ro` for each
-//! folder it made.
+//! `denied_elsewhere`, `after_home_mask`, its binds of `unmovable`, its masks
+//! of `in_sandbox_home` and `in_workspace`, which a later `--bind` would
+//! uncover, then its `--remount-ro` for each folder it made. So a mask comes
+//! after the bind of the folder that holds it, and before anything is sealed.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -22,7 +24,7 @@ use super::proposed::{self, Unenforced};
 use crate::backend::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
-use crate::policy::paths::{PathContext, is_within};
+use crate::policy::paths::{FsPaths, PathContext, is_within};
 
 /// Programs may run from these where Landlock applies, and from the
 /// sandbox's home, where the runtime installs itself; workspaces may not.
@@ -155,6 +157,11 @@ pub struct HomeMask {
     pub in_sandbox_home: Vec<String>,
     /// Deny entries inside a workspace, masked the same way after its bind.
     pub in_workspace: Vec<String>,
+    /// The folders inside the sandbox's home or a workspace that hold a mask.
+    /// A mask names a path and the sandbox writes every folder above it, so
+    /// `wrap` binds each on itself, after the grant's bind and before its
+    /// masks: renaming or removing one then gets `EBUSY`.
+    pub unmovable: Vec<String>,
 }
 
 /// What each kind of access is granted beneath; all else is refused.
@@ -324,6 +331,21 @@ fn compiled_sandbox(
     in_workspace.sort();
     in_workspace.dedup();
 
+    // The home and workspaces are mounts already.
+    let unmovable: Vec<PathBuf> = FsPaths {
+        home: home.clone(),
+        writes: workspaces.clone(),
+        read_deny: in_sandbox_home
+            .iter()
+            .chain(&in_workspace)
+            .cloned()
+            .collect(),
+    }
+    .unmovable()
+    .into_iter()
+    .filter(|folder| *folder != home && !workspaces.contains(folder))
+    .collect();
+
     let mut after = args(&["--dev", "/dev", "--proc", "/proc"]);
     for place in OWN_TMPFS {
         after.extend(args(&["--tmpfs", place]));
@@ -364,6 +386,7 @@ fn compiled_sandbox(
             denied_elsewhere: texts(&denied_elsewhere)?,
             in_sandbox_home: texts(&in_sandbox_home)?,
             in_workspace: texts(&in_workspace)?,
+            unmovable: texts(&unmovable)?,
         },
         after_home_mask: after,
         landlock: LandlockRules {
@@ -886,6 +909,35 @@ mod tests {
             let err = refusal(&policy(&["{home}"], &[entry]));
             assert!(err.contains("cannot be held"), "{entry}: {err}");
         }
+    }
+
+    /// A mask names a path, so each folder above it stays where it is:
+    /// sorted, so a folder's bind comes before those of what it holds.
+    #[test]
+    fn the_folders_that_hold_a_mask_are_listed_above_it() {
+        let c = compiled(&policy(
+            &["{home}", "~/proj"],
+            &["~/proj/config/deep/.env", "{home}/a/key"],
+        ));
+        assert_eq!(
+            c.home_mask.unmovable,
+            [
+                format!("{USER}/.enclos/sandboxes/home/home/a"),
+                format!("{USER}/proj/config"),
+                format!("{USER}/proj/config/deep"),
+            ]
+        );
+    }
+
+    /// A workspace and the home are mounts already, so bound once.
+    #[test]
+    fn a_folder_with_no_mask_below_it_is_not_listed() {
+        let c = compiled(&policy(&["{home}", "~/proj"], &["~/proj/.env", "{home}/x"]));
+        assert!(
+            c.home_mask.unmovable.is_empty(),
+            "{:?}",
+            c.home_mask.unmovable
+        );
     }
 
     /// Other sandboxes' folders are not bound in: hidden is true of them.
