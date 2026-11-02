@@ -293,7 +293,7 @@ impl Engine {
             })?;
             if text.is_some_and(|t| holds_variable(&t, variable)) {
                 return Err(session(format!(
-                    "{file} in sandbox {name} holds {variable} in plain text, as {shown}'s own setup writes it, where every agent of the sandbox reads it: remove that line ({}), then run `enclos runtime configure` again, which gives the token from the Keychain",
+                    "{file} in sandbox {name} holds {variable} in plain text, as {shown}'s own setup writes it, where every agent of the sandbox reads it: remove that line ({}), then run `enclos runtime configure` again, which gives the token from the secret store",
                     home.join(file.as_path()).display()
                 )));
             }
