@@ -18,7 +18,7 @@ use rustix::fs::OFlags;
 use zeroize::Zeroizing;
 
 use super::{SecretError, SecretStore};
-use crate::model::secret::{SecretRef, SecretValue};
+use crate::model::secret::{SecretRef, SecretValue, StoreName};
 
 const MODE: u32 = 0o600;
 
@@ -122,6 +122,10 @@ impl FileStore {
 }
 
 impl SecretStore for FileStore {
+    fn name(&self) -> StoreName {
+        StoreName::File
+    }
+
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
         let mut values = self.load()?;
         values.insert(secret.to_string(), value.expose().to_owned());

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use super::tool::{run, run_for, stderr};
 use super::{Prober, SecretError, SecretStore};
-use crate::model::secret::{SecretRef, SecretValue};
+use crate::model::secret::{SecretRef, SecretValue, StoreName};
 
 const SECRET_TOOL: &str = "/usr/bin/secret-tool";
 const DBUS_SEND: &str = "/usr/bin/dbus-send";
@@ -138,6 +138,10 @@ fn parse_locked(printed: &str) -> Option<bool> {
 }
 
 impl SecretStore for Libsecret {
+    fn name(&self) -> StoreName {
+        StoreName::Libsecret
+    }
+
     fn set(&self, secret: &SecretRef, value: &SecretValue) -> Result<(), SecretError> {
         if value.expose().len() > MAX_VALUE {
             return Err(SecretError {

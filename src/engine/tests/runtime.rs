@@ -223,14 +223,14 @@ impl Lab {
     }
 
     /// A lab whose engine keeps secrets in `secrets`.
-    fn with_secrets(secrets: Box<dyn crate::secrets::SecretStore>) -> Lab {
+    fn with_secrets(secrets: Box<dyn crate::secrets::Stores>) -> Lab {
         Lab::build(None, None, Some(secrets))
     }
 
     fn build(
         services: Option<Box<dyn crate::service::ServiceManager>>,
         stop: Option<crate::engine::StopMembers>,
-        secrets: Option<Box<dyn crate::secrets::SecretStore>>,
+        secrets: Option<Box<dyn crate::secrets::Stores>>,
     ) -> Lab {
         let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let engine = match services {

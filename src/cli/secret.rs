@@ -56,6 +56,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SecretArgs) -> R
                 (Planned::Done(set), true) => output::emit(&json!({
                     "secret": secret.to_string(),
                     "new": set.new,
+                    "store": set.store.as_str(),
                     "granted_as": grants_json(&set.granted_as),
                     "pending_as": grants_json(&set.pending_as),
                     "running_sessions_keep_old_value": set.running,
@@ -473,8 +474,11 @@ impl Drop for Quiet<'_> {
 
 fn print_set(secret: &SecretRef, set: &SecretSet) {
     match set.new {
-        true => println!("Stored secret {secret} in the secret store."),
-        false => println!("Replaced the value of secret {secret} in the secret store."),
+        true => println!("Stored secret {secret} in {}.", set.store.shown()),
+        false => println!(
+            "Replaced the value of secret {secret} in {}.",
+            set.store.shown()
+        ),
     }
     let sandbox = &secret.sandbox;
     let shown = |grants: &[&Grant]| {

@@ -7,7 +7,7 @@ use super::sandbox::{Sleeping, put, session_of};
 use super::*;
 use crate::engine::ChangeOutcome;
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::{SecretRef, SecretValue};
+use crate::model::secret::{SecretRef, SecretValue, StoreName};
 use crate::secrets::{InMemory, SecretStore, Unavailable};
 
 const VALUE: &str = "123456:telegram-token-value";
@@ -443,6 +443,9 @@ fn a_dry_run_of_set_stores_nothing() {
 struct WritesThenFails(Rc<InMemory>);
 
 impl SecretStore for WritesThenFails {
+    fn name(&self) -> StoreName {
+        self.0.name()
+    }
     fn set(
         &self,
         secret: &SecretRef,
@@ -490,6 +493,9 @@ fn a_new_value_a_failed_store_left_goes_again() {
 struct RefusesFirst(Rc<InMemory>);
 
 impl SecretStore for RefusesFirst {
+    fn name(&self) -> StoreName {
+        self.0.name()
+    }
     fn set(
         &self,
         _: &SecretRef,
@@ -574,4 +580,199 @@ fn with_no_secret_service_the_secret_commands_keep_values_in_the_file() {
     done(engine.secret_rm(&alice(), &token, Confirm::Yes).unwrap());
     assert!(!std::fs::read_to_string(&file).unwrap().contains("other"));
     assert!(engine.secret_list(&name).unwrap().is_empty());
+}
+
+/// An engine on a Linux host's two stores, its Secret Service answering or
+/// not, as a command run from cron, `su -` or another login finds it.
+struct TwoStores {
+    service: Rc<InMemory>,
+    file: Rc<InMemory>,
+}
+
+impl TwoStores {
+    fn new() -> TwoStores {
+        TwoStores {
+            service: Rc::new(InMemory::named(StoreName::Libsecret)),
+            file: Rc::new(InMemory::named(StoreName::File)),
+        }
+    }
+
+    fn on(&self, engine: Engine, answers: bool) -> Engine {
+        engine.with_secrets(Box::new(crate::secrets::Picked::new(
+            Box::new(crate::secrets::Stubbed {
+                answers,
+                looks: Rc::default(),
+                store: Rc::clone(&self.service),
+            }),
+            Box::new(Rc::clone(&self.file)),
+        )))
+    }
+}
+
+/// The store each secret went to is recorded, and says which it was.
+#[test]
+fn a_new_secret_records_the_store_it_went_to() {
+    let (_dir, engine, _, name) = with_store();
+    let stores = TwoStores::new();
+    let engine = stores.on(engine, true);
+    assert_eq!(
+        set(&engine, &secret("home/telegram"), VALUE).store,
+        StoreName::Libsecret
+    );
+    let engine = stores.on(engine, false);
+    let filed = set(&engine, &secret("home/mail"), "other");
+    assert_eq!(filed.store, StoreName::File);
+    let listed = engine.secret_list(&name).unwrap();
+    let store_of = |text: &str| {
+        listed
+            .iter()
+            .find(|s| s.record.secret == secret(text))
+            .unwrap()
+            .record
+            .store
+    };
+    assert_eq!(store_of("home/telegram"), StoreName::Libsecret);
+    assert_eq!(store_of("home/mail"), StoreName::File);
+}
+
+/// A rotation from where the service does not answer: never the file, which
+/// would leave every reader on the old value.
+#[test]
+fn a_replaced_value_goes_to_the_recorded_store_or_nowhere() {
+    let (_dir, engine, _, _) = with_store();
+    let stores = TwoStores::new();
+    let telegram = secret("home/telegram");
+    let engine = stores.on(engine, true);
+    set(&engine, &telegram, VALUE);
+
+    let engine = stores.on(engine, false);
+    let err = engine
+        .secret_set(&alice(), &telegram, Some(&value("new")), Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("does not answer"), "{err}");
+    assert!(err.to_string().contains("home/telegram"), "{err}");
+    assert!(stores.file.0.borrow().is_empty());
+    assert_eq!(stores.service.get(&telegram).unwrap(), Some(value(VALUE)));
+
+    let engine = stores.on(engine, true);
+    let again = set(&engine, &telegram, "new");
+    assert_eq!(again.store, StoreName::Libsecret);
+    assert!(!again.new);
+    assert_eq!(stores.service.get(&telegram).unwrap(), Some(value("new")));
+}
+
+/// One first stored in the file stays there once a service answers.
+#[test]
+fn a_secret_in_the_file_stays_there_when_a_service_starts_answering() {
+    let (_dir, engine, _, _) = with_store();
+    let stores = TwoStores::new();
+    let telegram = secret("home/telegram");
+    let engine = stores.on(engine, false);
+    set(&engine, &telegram, VALUE);
+    let engine = stores.on(engine, true);
+    assert_eq!(set(&engine, &telegram, "new").store, StoreName::File);
+    assert_eq!(stores.file.get(&telegram).unwrap(), Some(value("new")));
+    assert!(stores.service.0.borrow().is_empty());
+}
+
+/// A removal from where the service does not answer keeps the record: it is
+/// all that leads to the value.
+#[test]
+fn a_secret_is_removed_from_the_recorded_store_or_stays_recorded() {
+    let (_dir, engine, _, name) = with_store();
+    let stores = TwoStores::new();
+    let telegram = secret("home/telegram");
+    let engine = stores.on(engine, true);
+    set(&engine, &telegram, VALUE);
+
+    let engine = stores.on(engine, false);
+    let err = engine
+        .secret_rm(&alice(), &telegram, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("does not answer"), "{err}");
+    assert_eq!(engine.secret_list(&name).unwrap().len(), 1);
+    assert!(stores.service.get(&telegram).unwrap().is_some());
+
+    let engine = stores.on(engine, true);
+    done(engine.secret_rm(&alice(), &telegram, Confirm::Yes).unwrap());
+    assert!(engine.secret_list(&name).unwrap().is_empty());
+    assert_eq!(stores.service.get(&telegram).unwrap(), None);
+}
+
+/// The same for the whole sandbox, whose records go with it.
+#[test]
+fn a_sandbox_stays_while_a_secret_of_a_linux_store_cannot_be_removed() {
+    let (_dir, engine, _, name) = with_store();
+    let stores = TwoStores::new();
+    let telegram = secret("home/telegram");
+    let engine = stores.on(engine, true);
+    set(&engine, &telegram, VALUE);
+
+    let engine = stores.on(engine, false);
+    let err = engine
+        .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("was not removed"), "{err}");
+    assert!(err.to_string().contains("home/telegram"), "{err}");
+    assert_eq!(engine.secret_list(&name).unwrap().len(), 1);
+    assert!(stores.service.get(&telegram).unwrap().is_some());
+
+    let engine = stores.on(engine, true);
+    let left = done(
+        engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(stores.service.get(&telegram).unwrap(), None);
+}
+
+/// Reading goes to the recorded store; one that does not answer is no empty
+/// file, so a session and a service are told why, and no `secret set` is
+/// advised for a value that is there.
+#[test]
+fn a_granted_secret_is_read_from_its_recorded_store_or_refused() {
+    let (_dir, engine, _, name) = with_store();
+    let stores = TwoStores::new();
+    let telegram = secret("home/telegram");
+    let engine = stores.on(engine, true);
+    set(&engine, &telegram, VALUE);
+    grant(&engine, &name, "TOKEN = \"secret:home/telegram\"").unwrap();
+    let policy = engine.policy(&name).unwrap().snapshot.policy;
+    assert_eq!(
+        engine.secret_env(&policy).unwrap(),
+        [("TOKEN".to_owned(), value(VALUE))]
+    );
+
+    let engine = stores.on(engine, false);
+    let err = engine.secret_env(&policy).unwrap_err();
+    assert!(!matches!(err, Error::SecretMissing { .. }), "{err}");
+    assert!(err.to_string().contains("does not answer"), "{err}");
+    let err = engine
+        .service_secrets(
+            &name,
+            crate::model::runtime::RuntimeKind::Hermes,
+            "gateway",
+            &policy,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::SecretsLocked { .. }), "{err}");
+    assert!(err.to_string().contains("does not answer"), "{err}");
+}
+
+/// A secret from before this store was recorded is in the Keychain, which a
+/// Linux host does not have: refused, not looked for elsewhere.
+#[test]
+fn a_secret_recorded_in_a_store_this_host_lacks_is_refused() {
+    let (_dir, engine, _, name) = with_store();
+    let telegram = secret("home/telegram");
+    set(&engine, &telegram, VALUE);
+    let stores = TwoStores::new();
+    let engine = stores.on(engine, true);
+    let err = engine
+        .secret_set(&alice(), &telegram, Some(&value("new")), Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("the Keychain"), "{err}");
+    assert!(stores.service.0.borrow().is_empty());
+    assert_eq!(engine.secret_list(&name).unwrap().len(), 1);
 }

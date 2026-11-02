@@ -99,6 +99,9 @@ pub const MIGRATIONS: &[&str] = &[
     // (design §6, server name check)
     "ALTER TABLE net_events ADD COLUMN name_seen TEXT;
     ALTER TABLE net_events ADD COLUMN server_name TEXT;",
+    // 10: the secret store holding each secret's value (design §12); every
+    // secret before this was in the Keychain
+    "ALTER TABLE secrets ADD COLUMN store TEXT NOT NULL DEFAULT 'keychain';",
 ];
 
 /// The schema version this enclos reads and writes.

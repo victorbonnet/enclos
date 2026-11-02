@@ -329,16 +329,97 @@ fn a_secret_set_again_keeps_when_it_was_made_and_goes_with_its_sandbox() {
         .create_sandbox(&lock, &record("home"), &snap, &by)
         .unwrap();
     let secret: SecretRef = "home/telegram".parse().unwrap();
-    assert!(store.put_secret(&lock, &secret).unwrap());
+    assert!(
+        store
+            .put_secret(&lock, &secret, StoreName::Keychain)
+            .unwrap()
+    );
     let first = store.secrets(&name).unwrap().remove(0);
     std::thread::sleep(std::time::Duration::from_millis(5));
-    assert!(!store.put_secret(&lock, &secret).unwrap());
+    assert!(
+        !store
+            .put_secret(&lock, &secret, StoreName::Keychain)
+            .unwrap()
+    );
     let again = store.secrets(&name).unwrap().remove(0);
     assert_eq!(again.created_at, first.created_at);
     assert!(again.updated_at > first.updated_at, "{again:?}");
     store.remove(&lock, &name).unwrap();
     assert!(store.secrets(&name).unwrap().is_empty());
     assert!(!store.remove_secret(&lock, &secret).unwrap());
+}
+
+/// A secret stays in the store it first went to, whatever replaces its value.
+#[test]
+fn a_secret_records_its_store_when_it_is_new_only() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let by = crate::model::audit::Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+    store
+        .create_sandbox(&lock, &record("home"), &snap, &by)
+        .unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let secret: SecretRef = "home/telegram".parse().unwrap();
+    store.put_secret(&lock, &secret, StoreName::File).unwrap();
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::File);
+    store
+        .put_secret(&lock, &secret, StoreName::Libsecret)
+        .unwrap();
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::File);
+}
+
+/// The migrations of the last release, 0.2.0: what a user's database holds.
+const RELEASED_MIGRATIONS: usize = 9;
+
+/// A database as the release left it, rows and all, opens through `migrate`,
+/// and every secret it holds was in the Keychain.
+#[test]
+fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
+    let (_dir, store) = store();
+    let conn = Connection::open(&store.db).unwrap();
+    for sql in &schema::MIGRATIONS[..RELEASED_MIGRATIONS] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", RELEASED_MIGRATIONS as u32)
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO sandboxes (name, backend, state, created_at)
+             VALUES ('home', 'seatbelt', 'created', '2026-01-02T03:04:05.678Z');
+         INSERT INTO sessions (id, sandbox, kind, version, snapshot, root_pid, root_start, started_at)
+             VALUES (7, 'home', 'command', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
+         INSERT INTO secrets (sandbox, name, created_at, updated_at)
+             VALUES ('home', 'telegram', '2026-01-02T03:04:05.678Z', '2026-01-02T03:04:05.678Z');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let lock = store.lock().unwrap();
+    let migrated = store.migrate(&lock).unwrap();
+    assert_eq!(migrated.from, RELEASED_MIGRATIONS as u32);
+    assert_eq!(migrated.to, schema::current());
+
+    let name: SandboxName = "home".parse().unwrap();
+    let secrets = store.secrets(&name).unwrap();
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0].secret.to_string(), "home/telegram");
+    assert_eq!(secrets[0].store, StoreName::Keychain);
+    let secret = secrets[0].secret.clone();
+    assert!(!store.put_secret(&lock, &secret, StoreName::File).unwrap());
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::Keychain);
+    let conn = Connection::open(&store.db).unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions WHERE id = 7", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sessions, 1);
+    assert!(store.remove_secret(&lock, &secret).unwrap());
+    assert!(store.secrets(&name).unwrap().is_empty());
 }
 
 #[test]
