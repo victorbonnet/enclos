@@ -458,6 +458,9 @@ mod tests {
             "~/.config/containers",
             "~/.local/share/containers",
             "~/.local/share/docker",
+            "/var/snap/lxd",
+            "/var/lib/lxd",
+            "/var/lib/incus",
         ] {
             assert!(
                 snap.policy.fs.read_deny.contains(&entry.to_owned()),
