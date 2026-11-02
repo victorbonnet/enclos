@@ -368,9 +368,10 @@ mod tests {
             stopped
         });
         assert_eq!(stopped, Stopped::Clean);
+        // Before the waits: closing its input would end it whatever `stop` did.
+        assert!(!is_same(&other_ref).unwrap());
         let _ = root.wait();
         let _ = other.wait();
-        assert!(!is_same(&other_ref).unwrap());
     }
 
     #[test]
