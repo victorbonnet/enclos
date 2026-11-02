@@ -31,38 +31,35 @@ pub struct Host {
 }
 
 /// What the backend is built to enforce on `host` (design §5's table): a
-/// declaration, which the escape probes have yet to show (M3-17). Landlock
-/// missing or too old weakens the file and program rows (ADR 0037). `listen
-/// = false` is not held (ADR 0040). Limits are M3-18's, the memory controller
-/// included (ADR 0038).
+/// declaration, which the escape probes have yet to show, so nothing reads
+/// as enforced before M3-17 passes. Landlock missing or too old weakens the
+/// file and program rows (ADR 0037): M3-14 applies what an older ABI has.
+/// `listen = false` is not held (ADR 0040). Limits are M3-18's, the memory
+/// controller included (ADR 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
-    let full_landlock = host
-        .landlock_abi
-        .is_some_and(|abi| abi >= LANDLOCK_ABI_NEEDED);
-    let (fs, exec) = match full_landlock {
-        true => (
-            Enforcement::Enforced,
-            Enforcement::Partial {
-                note: "programs that are mounted, and Landlock's execute rules".to_owned(),
-            },
+    let (fs, exec) = match host.landlock_abi {
+        Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
+            "the mounts and Landlock, unproven until M3-17",
+            "programs that are mounted, and Landlock's execute rules",
         ),
-        false => (
-            Enforcement::Partial {
-                note: "writes held by the mounts alone, with no second layer".to_owned(),
-            },
-            Enforcement::Partial {
-                note: "any program that is mounted: no Landlock execute rules".to_owned(),
-            },
+        Some(_) => (
+            "the mounts, and what this ABI has of Landlock, unproven until M3-17",
+            "programs that are mounted; execute rules on an older ABI are open",
+        ),
+        None => (
+            "writes held by the mounts alone, with no second layer, unproven until M3-17",
+            "any program that is mounted: no Landlock execute rules",
         ),
     };
+    let partial = |note: &str| Enforcement::Partial {
+        note: note.to_owned(),
+    };
     Capabilities {
-        fs,
-        network: Enforcement::Partial {
-            note: "through the proxy; `listen = false` is not held".to_owned(),
-        },
-        exec,
+        fs: partial(fs),
+        network: partial("through the proxy; `listen = false` is not held"),
+        exec: partial(exec),
         resources: Enforcement::Unsupported,
-        members: Enforcement::Enforced,
+        members: partial("a session's cgroup, unproven until M3-17"),
     }
 }
 
@@ -110,17 +107,49 @@ mod tests {
         }
     }
 
+    /// CLAUDE.md: nothing reads as enforced before a probe shows it.
+    #[test]
+    fn no_area_reads_as_enforced_before_the_escape_probes_pass() {
+        for landlock_abi in [
+            None,
+            Some(1),
+            Some(LANDLOCK_ABI_NEEDED - 1),
+            Some(LANDLOCK_ABI_NEEDED),
+        ] {
+            let declared = capabilities(&Host { landlock_abi });
+            assert!(
+                partial_note(&declared.fs).contains("M3-17"),
+                "{landlock_abi:?}"
+            );
+            assert!(
+                partial_note(&declared.members).contains("M3-17"),
+                "{landlock_abi:?}"
+            );
+        }
+    }
+
     #[test]
     fn landlock_missing_or_too_old_declares_the_weaker_controls() {
         let full = capabilities(&Host {
             landlock_abi: Some(LANDLOCK_ABI_NEEDED),
         });
-        assert_eq!(full.fs, Enforcement::Enforced);
         assert!(partial_note(&full.exec).contains("Landlock's execute rules"));
-        for landlock_abi in [None, Some(LANDLOCK_ABI_NEEDED - 1)] {
-            let degraded = capabilities(&Host { landlock_abi });
-            assert!(partial_note(&degraded.fs).contains("mounts alone"));
-            assert!(partial_note(&degraded.exec).contains("no Landlock"));
+        let none = capabilities(&Host { landlock_abi: None });
+        assert!(partial_note(&none.fs).contains("mounts alone"));
+        assert!(partial_note(&none.fs).contains("no second layer"));
+        assert!(partial_note(&none.exec).contains("no Landlock"));
+    }
+
+    /// M3-14 applies what an older ABI has, so "no second layer" would be
+    /// false there; whether that takes in execute rules is open (design §15).
+    #[test]
+    fn an_older_landlock_abi_is_not_declared_as_no_landlock() {
+        for landlock_abi in [Some(1), Some(LANDLOCK_ABI_NEEDED - 1)] {
+            let older = capabilities(&Host { landlock_abi });
+            assert!(partial_note(&older.fs).contains("what this ABI has"));
+            assert!(!partial_note(&older.fs).contains("no second layer"));
+            assert!(partial_note(&older.exec).contains("older ABI"));
+            assert!(!partial_note(&older.exec).contains("no Landlock"));
         }
     }
 
