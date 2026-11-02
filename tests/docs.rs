@@ -200,6 +200,29 @@ fn the_chat_tabs_control_pair_is_recorded_as_measured() {
 }
 
 #[test]
+fn the_namespaces_text_gives_the_prototypes_answer() {
+    let design = design();
+    for stale in [
+        "no way tried of joining",
+        "own network, PID and IPC namespaces",
+        "the relayed port",
+        "reached from inside the sandbox",
+        "will be rewritten before they are accepted",
+    ] {
+        assert!(!design.contains(stale), "{stale}");
+    }
+    let adr_0039 = adr("0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md");
+    assert!(adr_0039.contains("`nsenter`"));
+    assert!(adr_0039.contains("only Landlock's scope separates them"));
+    assert!(!adr_0039.contains("Review correction"));
+    let adr_0040 = adr("0040-on-linux-enclos-dashboard-opens-a-sandboxs-service-to-its-user.md");
+    assert!(adr_0040.contains("`enclos dashboard <sandbox>`"));
+    let glossary_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("GLOSSARY.md");
+    let glossary = fs::read_to_string(glossary_path).unwrap();
+    assert!(!glossary.contains("the session's own 127.0.0.1"));
+}
+
+#[test]
 fn an_older_landlock_abi_leaves_execute_open() {
     let (adr_0037, adr_0038, design) = (adr(ADR_0037), adr(ADR_0038), design());
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
