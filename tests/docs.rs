@@ -192,3 +192,13 @@ fn an_older_landlock_abi_has_one_answer() {
     assert!(design.contains("the rights that ABI has apply as a layer over the mounts"));
     assert!(!design.contains("or its ABI is older than the backend's rules need, writes are held"));
 }
+
+#[test]
+fn doctor_weighs_the_profile_before_printing_it() {
+    let design = design();
+    let item = design
+        .lines()
+        .find(|line| line.starts_with("- That bubblewrap runs as an unprivileged user"))
+        .expect("§14's item on bubblewrap");
+    assert!(item.contains("the narrower of the two tried on Ubuntu 24.04, in a VM"));
+}
