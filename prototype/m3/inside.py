@@ -235,12 +235,14 @@ def start_service_forward(fd, port_file):
     srv = socket.socket(fileno=fd)
 
     def one(conn):
+        port = relay.read_port(port_file)
+        if port is None:
+            conn.close()
+            return
         try:
-            with open(port_file) as f:
-                port = int(f.read().strip())
             up = socket.create_connection(("127.0.0.1", port), timeout=10)
             up.settimeout(None)
-        except (OSError, ValueError):
+        except OSError:
             conn.close()
             return
         relay.pump(conn, up)
