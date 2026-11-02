@@ -38,6 +38,9 @@ read_deny = [
     "~/Library/Keychains",
     "~/.local/share/keyrings",
     "~/.local/share/kwalletd",
+    # Chromium's NSS database, with client certificates and their private keys
+    "~/.pki",
+    "~/.local/share/pki",
     # Hugging Face's login at its default location, not its download cache
     "~/.cache/huggingface/token",
     "~/.cache/huggingface/stored_tokens",
