@@ -304,7 +304,9 @@ fn send(addr: Address, request: &str) -> (Stream, String) {
 /// connection away may have closed it first: on a Unix socket the write then
 /// fails, while the answer is still there to read.
 fn exchange(mut conn: Stream, request: &str) -> (Stream, String) {
-    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // macOS refuses (EINVAL) a timeout on a socket whose peer has closed it
+    // already; the read below then ends at once, so the timeout is not needed.
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = conn.write_all(request.as_bytes());
     // Up to the end of the response head, or until the proxy closes.
     let mut reply = Vec::new();
