@@ -12,6 +12,7 @@ use super::service::PROXY_WAIT;
 use super::session::SessionEnd;
 use super::start::{Started, Starting};
 use crate::error::{Error, Result};
+use crate::layout::Os;
 use crate::lifecycle::process::{group_of, is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::now;
@@ -69,6 +70,16 @@ impl Drop for EndOn {
     }
 }
 
+/// The command that unsets the comparison baseline in `os`'s service
+/// manager's environment.
+fn unset_baseline(os: Os) -> String {
+    use crate::backend::seatbelt::BASELINE_VAR;
+    match os {
+        Os::MacOs => format!("launchctl unsetenv {BASELINE_VAR}"),
+        Os::Linux => format!("systemctl --user unset-environment {BASELINE_VAR}"),
+    }
+}
+
 impl Engine {
     /// A runtime service's process: runs the command the sandbox's runtime
     /// declares under `service` in the sandbox, in a process group of its
@@ -90,7 +101,8 @@ impl Engine {
         if let Some(why) = why {
             return Err(Error::Session {
                 what: format!(
-                    "{why}: a service runs only on (deny default) (`launchctl unsetenv {BASELINE_VAR}` unsets it in the service manager's environment)"
+                    "{why}: a service runs only on (deny default) (`{}` unsets it in the service manager's environment)",
+                    unset_baseline(Os::current()),
                 ),
             });
         }
@@ -325,5 +337,18 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn the_baseline_is_unset_with_the_systems_own_manager() {
+        let var = crate::backend::seatbelt::BASELINE_VAR;
+        assert_eq!(
+            unset_baseline(Os::MacOs),
+            format!("launchctl unsetenv {var}")
+        );
+        assert_eq!(
+            unset_baseline(Os::Linux),
+            format!("systemctl --user unset-environment {var}")
+        );
     }
 }
