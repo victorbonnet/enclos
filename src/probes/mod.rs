@@ -288,6 +288,8 @@ pub struct ReportNotes {
     /// What moves a folder that cannot move, as the probes try it, or nothing
     /// for a backend with no such probes.
     pub folder_moves: &'static str,
+    /// What listening opens, for a policy that allows it (ADR 0028).
+    pub listening: &'static str,
     /// Who else can close a probe, for a test where nothing else did: `,
     /// only by ... if any`, or nothing.
     pub only_apart: &'static str,
@@ -1381,6 +1383,7 @@ mod tests {
             ReportNotes {
                 host: "this host",
                 folder_moves: "",
+                listening: "Open by the policy: listening on TCP.",
                 only_apart: "",
                 host_service_routes: &[],
                 not_probed: &[],

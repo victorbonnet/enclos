@@ -118,10 +118,14 @@ pub struct KeychainItem {
 pub const KEYCHAIN_PROBE_VALUE: &str = "enclos-probe";
 const KEYCHAIN_PROBE_HEX: &str = "656e636c6f732d70726f6265";
 
+/// What listening opens, for a policy that allows it.
+const LISTENING: &str = "Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.";
+
 /// What a report says of Seatbelt's probes.
 pub const NOTES: ReportNotes = ReportNotes {
     host: "this Mac",
     folder_moves: "renames and clones",
+    listening: LISTENING,
     only_apart: ", only by Seatbelt itself or the (deny default) baseline if any",
     host_service_routes: HOST_SERVICE_ROUTES,
     not_probed: NOT_PROBED,
