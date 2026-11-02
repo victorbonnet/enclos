@@ -146,3 +146,11 @@ fn the_host_adrs_stay_proposed() {
         assert!(proposed.iter().any(|name| name == adr), "{adr}");
     }
 }
+
+#[test]
+fn the_host_survey_fails_when_a_script_does() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/host-survey.yml");
+    let workflow = fs::read_to_string(path).unwrap();
+    // GitHub adds pipefail only for a named shell; `| tee` hides the status otherwise
+    assert!(workflow.contains("    defaults:\n      run:\n        shell: bash\n"));
+}
