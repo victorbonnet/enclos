@@ -355,6 +355,33 @@ fn on_a_runner_one_that_ignores_term_is_killed_through_the_cgroup() {
     );
 }
 
+/// No signal is sent: the write to `cgroup.kill` alone empties the cgroup.
+#[test]
+fn on_a_runner_a_write_to_cgroup_kill_ends_what_ignores_term() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(
+        &lab,
+        detaching("signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
+    );
+    let _ended = Ended(detached.clone());
+    let cgroup = open_exec_session(&lab).cgroup.expect("it has a cgroup");
+    let host = Hierarchy::host();
+    assert!(host.pids(&cgroup).unwrap().contains(&detached.pid));
+    host.kill(&cgroup).expect("cgroup.kill can be written");
+    let start = Instant::now();
+    while !host.pids(&cgroup).unwrap().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{cgroup}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!is_same(&detached).unwrap(), "it survived the kill");
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+}
+
 /// Its main thread is gone, so `ps` writes `Zl`; a worker thread runs on, and
 /// it ignores TERM, so only the kill ends it.
 #[test]
