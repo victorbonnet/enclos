@@ -139,8 +139,8 @@ pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
 }
 
 /// A process as one listing shows it. `command` is what `ps` calls `comm`, to
-/// show to the user and never to compare: a path on macOS, and on Linux the
-/// program's file name cut at 15 characters.
+/// show to the user and never to compare: what the process is called, which
+/// it may choose, and on Linux cut at 15 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proc {
     pub pid: u32,
