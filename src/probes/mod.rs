@@ -50,8 +50,7 @@ impl Refusal {
     /// longer line came from something else, such as the shell or the loader
     /// failing to start the program.
     fn is_the_last_line_of(&self, output: &str) -> bool {
-        let last = last_line(output);
-        self.0.iter().any(|text| last == *text)
+        self.0.contains(&last_line(output))
     }
 
     /// As the report says it.
