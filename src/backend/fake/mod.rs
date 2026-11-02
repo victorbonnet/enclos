@@ -44,6 +44,7 @@ impl OwnProbes for FakeProbes {
         ReportNotes {
             host: "this host",
             folder_moves: "",
+            listening: "Open by the policy: listening on TCP.",
             only_apart: "",
             host_service_routes: &[],
             not_probed: &[],
