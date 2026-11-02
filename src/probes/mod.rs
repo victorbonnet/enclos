@@ -46,6 +46,14 @@ impl Refusal {
         self.0.iter().any(|text| output.contains(text.as_str()))
     }
 
+    /// Strict, for a script that prints the error alone: a text inside a
+    /// longer line came from something else, such as the shell or the loader
+    /// failing to start the program.
+    fn is_the_last_line_of(&self, output: &str) -> bool {
+        let last = last_line(output);
+        self.0.iter().any(|text| last == *text)
+    }
+
     /// As the report says it.
     pub fn shown(&self) -> String {
         self.0.join(" or ")
@@ -89,8 +97,8 @@ pub enum Expect {
     /// A folder renamed or cloned into itself, which the filesystem refuses
     /// (`Invalid argument`; a volume that cannot clone refuses a clone with
     /// another error), so nothing moves or is copied even when the rule does
-    /// not hold. Closed on the backend's refusal, which comes first; the
-    /// filesystem's means the call got past `backend`: open. Any other
+    /// not hold. Closed on the backend's refusal, alone on the last line as
+    /// the script prints it, which comes first; the filesystem's means the call got past `backend`: open. Any other
     /// failure is inconclusive. The control is the same call on the host,
     /// which works when the filesystem refuses it there.
     IntoItself {
@@ -973,7 +981,9 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             line if line.is_empty() => "it succeeded".to_owned(),
             line => line,
         }),
-        Expect::IntoItself { refusal, .. } if refusal.is_in(output) => Outcome::Closed,
+        Expect::IntoItself { refusal, .. } if refusal.is_the_last_line_of(output) => {
+            Outcome::Closed
+        }
         Expect::IntoItself { backend, .. } if output.contains("Invalid argument") => {
             Outcome::Open(format!(
                 "the filesystem refused it (Invalid argument), so {backend} let the call through"
@@ -1514,6 +1524,40 @@ mod tests {
         assert_eq!(proven(dns, ran(true, "")), Outcome::Closed);
     }
 
+    /// The call into itself prints a bare `$!`, so the refusal must be all of
+    /// its last line: with anything around it, the text came from something
+    /// else, such as the shell or the loader failing to start perl, and the
+    /// call was never tried.
+    #[test]
+    fn a_call_into_itself_is_closed_only_by_the_refusal_alone_on_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = into_itself("renames", "rename", "1", dir.path(), 7, &Plain);
+        for refusal in [
+            "No such file or directory",
+            "Read-only file system\n",
+            "a warning first\nNo such file or directory",
+        ] {
+            assert_eq!(
+                proven(&p, ran(false, refusal)),
+                Outcome::Closed,
+                "{refusal}"
+            );
+        }
+        for never_tried in [
+            "/bin/sh: 1: /usr/bin/perl: No such file or directory",
+            "/usr/bin/perl: error while loading shared libraries: libperl.so: cannot open shared object file: No such file or directory",
+            "No such file or directory\nand then something else",
+        ] {
+            assert!(
+                matches!(
+                    proven(&p, ran(false, never_tried)),
+                    Outcome::Inconclusive(_)
+                ),
+                "{never_tried}"
+            );
+        }
+    }
+
     /// A backend with no probes of its own, refusing as one that leaves
     /// things out of the sandbox does.
     struct Plain;
@@ -1583,10 +1627,7 @@ mod tests {
         let list = super::probes(&inputs(dir.path()), &Plain);
         for route in ["terminals", "writable folders", "renames"] {
             let p = find(&list, route);
-            for refusal in [
-                "/bin/sh: x: No such file or directory",
-                "Read-only file system",
-            ] {
+            for refusal in ["No such file or directory", "Read-only file system"] {
                 assert_eq!(proven(p, ran(false, refusal)), Outcome::Closed, "{route}");
             }
             assert!(
