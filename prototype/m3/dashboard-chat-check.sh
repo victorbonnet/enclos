@@ -25,7 +25,7 @@ PROMPT="Reply with exactly one word: ok"
 base="http://127.0.0.1:$RESERVED"
 log="$tmp/proxy.jsonl"
 gui="$SBX_HOME/.hermes/logs/gui.log"
-ANSWER='provider|hermes model|/login|not processed|not connected'
+ANSWER='provider|hermes model|/login|not processed|not connected|could not start'
 
 python3 -I "$M3/unix-proxy.py" --socket "$PROXY_SOCK" --learn --log "$log" >"$tmp/proxy.out" 2>&1 &
 started=($!)
@@ -163,18 +163,16 @@ round fixed --no-proxy-loopback
 
 as=$(grep -c "^as-is: .*	FAIL	" "$tmp/verdicts.tsv")
 fx=$(grep -c "^fixed: .*	FAIL	" "$tmp/verdicts.tsv")
-if [ "$as" -gt 0 ] && [ "$fx" = 0 ]; then
-    reading="The run shows the failure and the fix: the session's proxy environment is the cause."
-elif [ "$as" = 0 ] && [ "$fx" = 0 ]; then
-    reading="Both rounds pass: this run does not reproduce the failure, so the fix is not shown to matter."
-else
-    reading="The fix does not make every row pass: read the rows; NO_PROXY is not the whole cause."
-fi
+reading=$(python3 -I "$M3/chat-reading.py" "$tmp/verdicts.tsv")
 
 {
     echo "# The dashboard's Chat tab, as it is and with NO_PROXY for loopback ($(uname -m))"
     echo
-    echo "**$reading** Failed rows as it is: $as; with the fix: $fx."
+    echo "$reading" | sed -n 1p | sed 's/.*/**&**/'
+    echo
+    echo "$reading" | sed -n 2p
+    echo
+    echo "Failed rows as it is: $as; with the fix: $fx."
     section "Verdicts"
     echo "Each is written as what a working dashboard must do, so the as-is rows are expected to fail if the proxy is the cause."
     echo
@@ -191,6 +189,7 @@ fi
         echo
         python3 -I "$M3/table.py" "$label=$tmp/$label-chat.tsv"
         echo
+        awk -F'\t' '$1 == "chat: what stopped it" { print $3 }' "$tmp/$label-chat.tsv" | fence
         echo "The terminal, by host-client.py:"
         echo
         python3 -I "$M3/table.py" "$label=$tmp/$label-terminal.tsv"

@@ -30,7 +30,7 @@ client = importlib.util.module_from_spec(spec)
 sys.path.insert(0, HERE)
 spec.loader.exec_module(client)
 
-WAIT_READY, WAIT_ANSWER = 30, 45
+WAIT_READY, WAIT_ANSWER = 30, client.ANSWER_SECONDS
 PTY = "/api/pty"
 FOCUS = "document.querySelector('.xterm-helper-textarea')?.focus(); !!document.activeElement"
 

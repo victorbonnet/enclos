@@ -37,6 +37,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wsmini  # noqa: E402
 
+ANSWER_SECONDS = 120  # how long a typed prompt is given, on /api/pty and in the Chat tab
 TOKEN = re.compile(r'__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"')
 ASSET = re.compile(r'(?:src|href)="((?:/|\./|assets/)[^"#]+)"')
 
@@ -156,7 +157,7 @@ def turn_end(kind, payload, last):
     if not isinstance(payload, dict):
         return last
     if kind == "error":
-        return str(payload.get("message") or payload.get("error") or payload)[:200]
+        return str(payload.get("message") or payload.get("error") or payload)
     if kind == "message.complete" and not last:
         return str(payload.get("text") or payload.get("rendered") or "")[:200]
     return last
@@ -172,7 +173,7 @@ def pty_chat(base, out, prompt):
     send(s, "\x1b[RESIZE:120;40]")
     before = b"".join(body for _, body in frames(s, rest, 30))
     send(s, prompt + "\r")
-    after = b"".join(body for _, body in frames(s, b"", 45))
+    after = b"".join(body for _, body in frames(s, b"", ANSWER_SECONDS))
     s.close()
 
     def clean(data):
