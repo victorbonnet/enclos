@@ -230,6 +230,14 @@ impl Scope {
     }
 }
 
+/// Whether `e`, from reading a cgroup's folder, says the cgroup was removed.
+/// Once systemd removes an emptied cgroup, kernfs answers ENODEV for a file
+/// opened or read as that happens, and ENOENT only after.
+fn removed(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+        || e.raw_os_error() == Some(rustix::io::Errno::NODEV.raw_os_error())
+}
+
 /// The cgroup hierarchy of this host, or a folder standing in for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hierarchy {
@@ -252,8 +260,8 @@ impl Hierarchy {
     }
 
     /// The pids in `cgroup` and every cgroup below it, where a same-user
-    /// process may have moved. A cgroup removed is empty: systemd removes
-    /// one once nothing is left in it. Any other failure is an error, never
+    /// process may have moved. A cgroup removed, or being removed, is empty:
+    /// systemd removes one once nothing is left in it. Any other failure is an error, never
     /// an empty answer.
     pub fn pids(&self, cgroup: &str) -> Result<BTreeSet<u32>, PsError> {
         let mut pids = BTreeSet::new();
@@ -262,17 +270,19 @@ impl Hierarchy {
             let failed = |e: std::io::Error| {
                 PsError::Cgroup(format!("cannot read {}: {e}", folder.display()))
             };
-            let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
             match std::fs::read_to_string(folder.join("cgroup.procs")) {
-                Err(e) if gone(&e) => {}
+                Err(e) if removed(&e) => {}
                 text => pids.extend(parse_procs(&text.map_err(failed)?)?),
             }
             let entries = match std::fs::read_dir(&folder) {
-                Err(e) if gone(&e) => continue,
+                Err(e) if removed(&e) => continue,
                 entries => entries.map_err(failed)?,
             };
             for entry in entries {
-                let entry = entry.map_err(failed)?;
+                let entry = match entry {
+                    Err(e) if removed(&e) => break,
+                    entry => entry.map_err(failed)?,
+                };
                 if entry.path().is_dir() {
                     folders.push(entry.path());
                 }
@@ -532,6 +542,19 @@ mod tests {
         assert!(cgroups.pids("/bad.scope").is_err());
         std::fs::create_dir_all(dir.path().join("dir.scope/cgroup.procs")).unwrap();
         assert!(cgroups.pids("/dir.scope").is_err());
+    }
+
+    #[test]
+    fn a_cgroup_being_removed_reads_as_removed_and_nothing_else_does() {
+        use rustix::io::Errno;
+        use std::io::{Error, ErrorKind};
+        assert!(removed(&Error::from(ErrorKind::NotFound)));
+        assert!(removed(&Error::from_raw_os_error(
+            Errno::NODEV.raw_os_error()
+        )));
+        for other in [Errno::ACCESS, Errno::IO, Errno::PERM] {
+            assert!(!removed(&Error::from_raw_os_error(other.raw_os_error())));
+        }
     }
 
     #[test]
