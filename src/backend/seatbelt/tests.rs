@@ -892,6 +892,8 @@ const DENIED_FAKES: &[&str] = &[
     ".gemini/oauth_creds.json",
     ".config/google-chrome/Default/Cookies",
     ".local/share/keyrings/login.keyring",
+    ".var/app/org.mozilla.firefox/.mozilla/firefox/x/logins.json",
+    "snap/firefox/common/.mozilla/firefox/x/logins.json",
     ".local/share/opencode/auth.json",
     "Library/HTTPStorages/com.example.app/httpstorages.sqlite",
     "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",

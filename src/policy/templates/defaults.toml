@@ -84,10 +84,10 @@ read_deny = [
     "~/.config/opera",
     "~/.mozilla",
     "~/.config/mozilla",
-    # Ubuntu installs its browsers and mail as snaps, each with its own data
-    "~/snap/firefox",
-    "~/snap/chromium",
-    "~/snap/thunderbird",
+    # Sandboxed apps' private data, whichever app: Ubuntu installs its browsers
+    # and mail as snaps, and Flathub carries browsers, mail and password managers
+    "~/snap",
+    "~/.var/app",
     # Cookies and site data apps keep through macOS's own web stack
     "~/Library/Cookies",
     "~/Library/HTTPStorages",
