@@ -83,6 +83,7 @@
       "~/.ssh",
       "~/.terraform.d/credentials.tfrc.json",
       "~/.thunderbird",
+      "~/.var/app",
       "~/.vault-token",
       "~/.zhistory",
       "~/.zsh_history",
@@ -123,9 +124,7 @@
       "~/Library/Safari",
       "~/Library/WebKit",
       "~/Pictures/Photos Library.photoslibrary",
-      "~/snap/chromium",
-      "~/snap/firefox",
-      "~/snap/thunderbird"
+      "~/snap"
     ]
   },
   "net": {
