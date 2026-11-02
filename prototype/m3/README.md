@@ -127,6 +127,8 @@ From the first three `bwrap-prototype` runs, on PR #113: in each, both jobs pass
 
 **Modes.** The probes ran on the host as their control, then in the sandbox with bubblewrap only, with seccomp but no Landlock (ADR 0037's path), with Landlock but no seccomp, and with both ("full"). `inside.py` reported `landlock=applied abi=8 handled=0xffff scoped=0x3` (17 rules on x86_64, 15 on arm64, where `/lib32` and `/libx32` do not exist) and `seccomp=applied deny=35` on x86_64, `deny=32` on arm64, naming the three calls arm64 lacks (`ioperm`, `iopl`, `uselib`).
 
+**Not rerun: `TMPDIR`.** Every run quoted here set `TMPDIR=/tmp`, the sandbox's own tmpfs, where Landlock refuses execute. ADR 0015 and design §5 put it inside the home, and `compile.py` now sets `<sandbox home>/tmp/`, which persists and can execute. So the rows on the installer, pip, uv and Chromium, and §14's `mktemp` question, were measured under a `TMPDIR` a real session will not have. No run has used the new value yet; a row it changes gets recorded here.
+
 | Question (design §14) | Check | Ubuntu 24.04 runner (x86_64) | Ubuntu 24.04 runner (arm64) | Elsewhere |
 | --- | --- | --- | --- | --- |
 | The setting bubblewrap needs on the runners | `setup-runner.sh` | As installed it fails (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`). An AppArmor profile for `/usr/bin/bwrap` holding `userns,` is enough; the restriction stays on. | same | Ubuntu 24.04 desktop: to measure (VM) |
@@ -222,7 +224,7 @@ M3-09 may take the behaviour, which `test_relay.py` states: an EOF ends one dire
 | `--unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try` | Its own processes, an empty network (loopback only), IPC, host name and cgroup view. Whether a sandbox's sessions share one network and PID namespace is M3-03's question. |
 | `--die-with-parent` | Ends with the session. |
 | `--new-session` (option) | Its own session, no controlling terminal: closes TIOCSTI, and costs an interactive shell its job control. Measured with and without above. |
-| `--clearenv`, `--setenv` for `HOME`, `PATH`, `TMPDIR`, `LANG`, `TERM`, the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY` and lower case, to the relay), `NO_PROXY` empty, `NODE_USE_ENV_PROXY=1`, `ENCLOS_PROXY_SOCKET` | The emptied environment. |
+| `--clearenv`, `--setenv` for `HOME`, `PATH`, `TMPDIR` (`<sandbox home>/tmp/`, ADR 0015), `LANG`, `TERM`, the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY` and lower case, to the relay), `NO_PROXY` empty, `NODE_USE_ENV_PROXY=1`, `ENCLOS_PROXY_SOCKET` | The emptied environment. |
 | `--chdir <sandbox home>` | |
 
 **Landlock rules**, applied by `inside.py` where the kernel has Landlock (ADR 0037). Every right of the kernel's ABI is handled (ABI 1's thirteen, `REFER` from ABI 2, `TRUNCATE` from 3, `IOCTL_DEV` from 5), so whatever no rule grants is refused:
