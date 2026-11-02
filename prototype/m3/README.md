@@ -294,7 +294,7 @@ Design §15's row on network and PID namespaces, and its §14 item on the runtim
 | `host-listen.py`, `host-client.py`, `ns-webservice.py`, `wsmini.py`, `test_host_path.py` | The listener on the host's loopback; a client that does what a browser does; a stand-in with a page, an asset and a WebSocket; WebSocket frames on the standard library; tests of the pure parts, which run anywhere. `ns-listeners.py --held-by` reads a port by who holds it. |
 | `dashboard-cmd.py`, `dashboard-cmd-check.sh`, `test_dashboard_cmd.py` | A stand-in for `enclos dashboard <sandbox>`, its check end to end, and tests of its pure parts. |
 | `dashboard-chat-check.sh`, `browser-chat.py`, `ns-conns.py` | The Chat tab as a control pair; a real Chromium driven through the listener; who holds a connection to a port, read from the host. |
-| `test_adr_status.py` | ADRs 0037 to 0040 stay proposed. CI runs it through `test_nsjoin.py`. |
+| `test_adr_status.py` | ADRs 0037 to 0040 stay proposed. `ci.yml` runs it on every change, one that edits nothing but an ADR included. |
 | `peerowner.py`, `test_peerowner.py` | Whose socket a connection comes from, read from `/proc/net/tcp` and `tcp6`, failing closed, and its tests on fixture tables. `host-listen.py` closes any other user's connection before a byte reaches the service. |
 | `.github/workflows/namespaces-prototype.yml` | Runs the checks on `ubuntu-24.04`, `ubuntu-26.04` and `ubuntu-24.04-arm` and uploads `m3-results/` as `m3-namespaces-<runner>`. It does not gate merges. |
 

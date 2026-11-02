@@ -43,6 +43,9 @@ jobs:
       ENCLOS_HOST_SERVICE_PROBES: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Here, since the prototype's workflows skip a change to docs/adr/ alone
+      - name: ADRs 0037 to 0040 stay proposed
+        run: python3 -I prototype/m3/test_adr_status.py
       - name: Installer tests (no downloads, nothing installed)
         if: runner.os == 'macOS'
         run: python3 tests/test_install.py
