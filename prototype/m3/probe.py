@@ -147,6 +147,15 @@ def p_socket_family(family, kind=socket.SOCK_STREAM):
     return "ok", "opened"
 
 
+def p_move(path, to):
+    """Rename a folder and leave it there, for the next session to find."""
+    try:
+        os.rename(path, to)
+    except OSError as e:
+        return err(e.errno), ""
+    return "ok", "moved"
+
+
 def p_tiocsti():
     """Push two characters into the terminal's input, then read them back."""
     import fcntl
@@ -444,7 +453,7 @@ def p_nsopen(path):
 
 PROBES = {
     "read": p_read, "exists": p_exists, "write": p_write, "open-write": p_open_write, "leave": p_leave,
-    "exec": p_exec, "exec-loader": p_exec_loader, "exec-memfd": p_exec_memfd, "rename": p_rename, "tiocsti": p_tiocsti, "unshare": p_unshare,
+    "exec": p_exec, "exec-loader": p_exec_loader, "exec-memfd": p_exec_memfd, "rename": p_rename, "move": p_move, "tiocsti": p_tiocsti, "unshare": p_unshare,
     "mount": p_mount, "keyctl": p_keyctl, "bpf": p_bpf, "perf_event_open": p_perf,
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,
     "ptrace": p_ptrace, "connect-unix": p_connect_unix,

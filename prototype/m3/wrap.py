@@ -47,14 +47,45 @@ def masked_in_grants(mask, resolved):
                 yield os.path.normpath(os.path.join(grant["path"], rel)), grant["write"]
 
 
+def holders_in_grants(mask, resolved):
+    """The folders between each writable grant and a denied path it holds,
+    under the grant's own name, parents first."""
+    folders = set()
+    for grant in mask["grants"]:
+        root = resolved[grant["path"]]
+        for d in mask["denied"]:
+            if grant["write"] and under(resolved[d], root) and resolved[d] != root:
+                parts = os.path.relpath(resolved[d], root).split(os.sep)[:-1]
+                for i in range(1, len(parts) + 1):
+                    folders.add(os.path.join(grant["path"], *parts[:i]))
+    return sorted(folders)
+
+
+def refuse_links_to_masks(mask):
+    """Stop the session if a link sits between a grant and an entry written
+    inside it. The sandbox writes every folder there, so it could have made
+    the link, and bubblewrap would follow it when it places the mask. The
+    entry itself may be a link: its target is hidden (hidden_paths)."""
+    for grant in mask["grants"]:
+        for d in mask["denied"]:
+            if under(d, grant["path"]) and d != grant["path"]:
+                parts = os.path.relpath(d, grant["path"]).split(os.sep)[:-1]
+                for i in range(1, len(parts) + 1):
+                    folder = os.path.join(grant["path"], *parts[:i])
+                    if os.path.islink(folder):
+                        sys.exit(f"wrap.py: {folder} is a link between grant {grant['path']} and deny entry {d}")
+
+
 def read_host(compiled):
     """What this session's mounts depend on. `entries`: each real folder from
     the home down that holds a hidden path (hidden_paths), stopping at a grant
     whichever name it is reached by, its names mapped to a link's target or None. `resolved`: each denied path and
     grant with links resolved. `kinds`: what is now at each path masked in a grant, "dir",
-    "file" or None. A folder that went away lists nothing; one that cannot be
-    read stops the session, since what it holds cannot be hidden."""
+    "file" or None. `holders`: the folders holders_in_grants() names that are
+    there. A folder that went away lists nothing; one that cannot be read
+    stops the session, since what it holds cannot be hidden."""
     mask = compiled["home_mask"]
+    refuse_links_to_masks(mask)
     grants = grant_paths(mask)
     resolved = {p: os.path.realpath(p) for p in mask["denied"] + grants}
     hidden = hidden_paths(mask, resolved)
@@ -82,7 +113,8 @@ def read_host(compiled):
     kinds = {}
     for path, _ in masked_in_grants(mask, resolved):
         kinds[path] = "dir" if os.path.isdir(path) else "file" if os.path.lexists(path) else None
-    return {"entries": entries, "resolved": resolved, "kinds": kinds}
+    holders = [f for f in holders_in_grants(mask, resolved) if os.path.isdir(f)]
+    return {"entries": entries, "resolved": resolved, "kinds": kinds, "holders": holders}
 
 
 def hide(folder, denied, entries, args, remount):
@@ -111,7 +143,10 @@ def mask_in_grants(mask, listing, args, remount):
     be opened, and a device on a read-only mount still takes writes. A path
     that does not exist gets the tmpfs in a writable grant, or the sandbox
     could make it there; a read-only grant cannot take a mount point, and the
-    sandbox cannot make the path."""
+    sandbox cannot make the path. First each folder that holds a mask is bound
+    on itself, so that renaming it gets EBUSY and the mask stays on its path."""
+    for folder in listing.get("holders", []):
+        args += ["--bind", folder, folder]
     for path, writable in masked_in_grants(mask, listing["resolved"]):
         kind = listing["kinds"].get(path)
         if kind == "dir" or kind is None and writable:
