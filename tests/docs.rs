@@ -179,18 +179,54 @@ fn no_runner_cell_waits_for_a_run() {
 }
 
 #[test]
-fn an_older_landlock_abi_has_one_answer() {
+fn an_older_landlock_abi_leaves_execute_open() {
     let (adr_0037, adr_0038, design) = (adr(ADR_0037), adr(ADR_0038), design());
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
     assert!(adr_0037.contains("- **Where it is missing**, the backend still runs."));
     assert!(adr_0037.contains(
         "The rights that ABI has apply, as a layer over the mounts, and the rights it lacks rest on the mounts alone."
     ));
-    assert!(adr_0037.contains("With an older ABI its rules apply, so it needs no acceptance."));
     assert!(!adr_0037.contains("left to the code"));
     assert!(!adr_0038.contains("too old a Landlock"));
-    assert!(adr_0038.contains("an `[exec]` section is applied and needs no acceptance"));
     assert!(design.contains("the rights that ABI has apply as a layer over the mounts"));
     assert!(!design.contains("or its ABI is older than the backend's rules need, writes are held"));
+
+    // Both options stay on the table: the open row names them, and nothing
+    // else in these documents takes either side.
+    let row = design
+        .lines()
+        .find(|line| line.starts_with("| Execute rules on an older Landlock ABI"))
+        .expect("the open decision in §15");
+    assert!(row.contains("A: execute rules apply on every ABI, with no acceptance"));
+    assert!(row.contains(
+        "B: an older ABI declares the weaker execute control and `[exec]` needs `--accept-unenforced exec`"
+    ));
+    let design_without_row = design.replace(row, "");
+    for (name, text) in [
+        ("ADR 0037", &adr_0037),
+        ("ADR 0038", &adr_0038),
+        ("the design", &design_without_row),
+        ("the README", &readme),
+    ] {
+        assert!(
+            text.contains("open (design §15)") || text.contains("open (§15)"),
+            "{name}"
+        );
+        for answer in [
+            "execute rules apply on every ABI",
+            "needs no acceptance",
+            "keep the execute control",
+            "execute included",
+            "execute among them",
+            "declares the weaker execute control and",
+        ] {
+            assert!(!text.contains(answer), "{name}: {answer}");
+        }
+    }
+    for text in [&adr_0037, &adr_0038] {
+        assert!(text.lines().any(|line| line == "status: proposed"));
+    }
 }
 
 #[test]
