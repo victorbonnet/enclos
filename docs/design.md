@@ -512,7 +512,7 @@ src/
   net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
   lifecycle/       process.rs  members.rs (which processes are a session's)  marker.rs  look.rs (one look at a sandbox: the listing, then the markers)  stop.rs  listeners.rs  programs.rs  bounded.rs
   probes/          mod.rs (escape probes for `policy test`, run by engine/probe.rs)
-  backend/         mod.rs (trait)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, deny-default.sb, denials.rs (later)}
+  backend/         mod.rs (trait)  environment.rs (a session's variables, the same for every backend)  fake/  seatbelt/{compile.rs, wrap.rs, host-services.sb, deny-default.sb, denials.rs (later)}
   proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  control.rs (later)
   service/         mod.rs (trait)  launchd.rs  systemd.rs
   secrets/         mod.rs (trait)  keychain.rs  file.rs
