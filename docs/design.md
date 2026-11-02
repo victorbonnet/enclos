@@ -172,7 +172,7 @@ A policy that sets what the host does not enforce (an `[exec]` section, `memory`
 - **`in_sandbox_home`:** a deny entry inside the sandbox's home, listed whether or not it exists, for `wrap` to mask.
 - **`in_workspace`:** a deny entry inside a workspace, so a workspace that holds one works, as on Seatbelt, and as the prototype showed (run 41120146313). It stays out of the home's masks, and `wrap` masks it after the workspace's bind, whether or not it exists (§15). Each entry is sorted here before the arms for the sandbox's own places and the protected paths, or a workspace's bind would bring back what they call hidden.
 - **The Landlock rules and the seccomp filter**, as `prototype/m3/README.md`'s draft lists them, for M3-14 to apply. The calls of another architecture stay in the list, so the output does not depend on the one that compiles it.
-- **`unenforced`:** the policy's fields nothing holds, and on which hosts. Each dependence on a proposed ADR is in `src/backend/bubblewrap/proposed.rs`, the capabilities included, which depend on the host's Landlock ABI ([ADR 0037](adr/0037-landlock-where-the-kernel-has-it.md)).
+- **`unenforced`:** the policy's fields nothing holds, and on which hosts. Each dependence on a proposed ADR is in `src/backend/bubblewrap/proposed.rs`, the capabilities included, which depend on the host's Landlock ABI ([ADR 0037](adr/0037-landlock-where-the-kernel-has-it.md)). They are a declaration: files and members stay `Partial` until the escape probes pass (M3-17), and an ABI older than the rules need says what that ABI has, not "no second layer", since M3-14 applies it.
 
 ### Seatbelt specifics (first backend)
 
