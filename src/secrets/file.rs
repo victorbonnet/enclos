@@ -3,18 +3,19 @@
 //! to value. It is on the sandboxes' hidden files, under the protected paths,
 //! and any process of the user can read it, as with the Keychain (ADR 0014).
 //!
-//! Its mode is checked on every read, through the open file: a wider one is
-//! refused, naming the file, for a value that may have been read is no longer
-//! the user's alone. Every write holds the state lock, and replaces the file
+//! Its mode and owner are checked on every read, through the open file: a
+//! wider mode or another owner is refused, naming the file, for a value that
+//! may have been read is no longer the user's alone. Every write holds the state lock, and replaces the file
 //! whole by a rename, so a read sees one state or the other.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::OFlags;
+use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -69,17 +70,39 @@ impl FileStore {
         {
             Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(self.refused(format!("cannot open it ({e}); a link is never followed"))),
+            Err(e) => {
+                let me = geteuid().as_raw();
+                match std::fs::symlink_metadata(&self.file) {
+                    Ok(about) if about.uid() != me => Err(self.foreign(about.uid(), me)),
+                    _ => {
+                        Err(self.refused(format!("cannot open it ({e}); a link is never followed")))
+                    }
+                }
+            }
         }
     }
 
-    /// Refuses `file` unless it is a plain file only the user reads.
+    fn foreign(&self, owner: u32, me: u32) -> SecretError {
+        self.refused(format!(
+            "it belongs to user id {owner}, not to this user ({me}), as when enclos ran under `sudo`; check it, then give it back with `chown`"
+        ))
+    }
+
+    /// Refuses `file` unless it is a plain file only this user reads.
     fn check(&self, file: &File) -> Result<(), SecretError> {
         let about = file
             .metadata()
             .map_err(|e| self.refused(format!("cannot look at it ({e})")))?;
+        self.check_about(&about, geteuid().as_raw())
+    }
+
+    /// Refuses `about` unless it is of a plain file `uid` alone reads.
+    fn check_about(&self, about: &Metadata, uid: u32) -> Result<(), SecretError> {
         if !about.is_file() {
             return Err(self.refused("it is not a plain file"));
+        }
+        if about.uid() != uid {
+            return Err(self.foreign(about.uid(), uid));
         }
         let mode = about.mode() & 0o7777;
         if mode & !MODE != 0 {
@@ -304,6 +327,19 @@ mod tests {
         let err = store.get(&secret()).unwrap_err();
         assert!(err.what.contains("not a file enclos wrote"), "{err}");
         assert!(!err.what.contains("cut-off"), "{err}");
+    }
+
+    /// As `sudo -E enclos secret set` would leave it.
+    #[test]
+    fn a_file_of_another_owner_is_refused_naming_the_owner() {
+        let (_dir, store) = store();
+        store.set(&secret(), &v("a")).unwrap();
+        let about = std::fs::metadata(&store.file).unwrap();
+        store.check_about(&about, about.uid()).unwrap();
+        let err = store.check_about(&about, about.uid() + 1).unwrap_err();
+        assert!(err.untouched, "{err}");
+        assert!(err.what.contains("belongs to user id"), "{err}");
+        assert!(!err.what.contains("link"), "{err}");
     }
 
     #[test]
