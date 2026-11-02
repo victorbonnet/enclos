@@ -300,9 +300,8 @@ fn launch_agents(i: &ProbeInputs) -> PathBuf {
 }
 
 // These probes rest on Seatbelt's order of checks: it refuses before the
-// filesystem answers, and on macOS `mv` stays on one volume. On Linux a
-// bind-mounted folder makes `mv` copy into itself, and the filesystem's answer
-// to a rename into itself comes before a backend's: see design §14.
+// filesystem answers, and on macOS `mv` stays on one volume. Linux would
+// answer otherwise, which is not observed yet: see design §14.
 
 /// A change to a folder itself that the file system refuses anyway (a
 /// folder that is not empty cannot be removed, nor moved inside itself), so
