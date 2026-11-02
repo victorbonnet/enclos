@@ -221,7 +221,7 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
-    /// What runs keeps here, one folder per sandbox.
+    /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
     }
