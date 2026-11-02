@@ -202,11 +202,26 @@ fn a_client_that_stops_reading_holds_up_no_other_connection() {
     let relay = Relay::start();
     let stalled = relay.client();
     let upstream = relay.accepted();
+    upstream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (wrote, flooded) = mpsc::channel();
     let flood = thread::spawn(move || {
         let chunk = pattern(64 * 1024, 1);
-        // Ends when the test's end closes the stalled client.
-        while (&upstream).write_all(&chunk).is_ok() {}
+        let mut total = 0;
+        // Stops at the end of the room the relay and the sockets leave.
+        let stopped = loop {
+            match (&upstream).write(&chunk) {
+                Ok(read) if total < LARGE => total += read,
+                Ok(_) => break None,
+                Err(e) => break Some(e.kind()),
+            }
+        };
+        wrote.send((total, stopped)).unwrap();
     });
+    let (total, stopped) = flooded.recv_timeout(PATIENCE).unwrap();
+    assert!(total < LARGE, "the relay took all {total} bytes");
+    assert_eq!(stopped, Some(ErrorKind::WouldBlock));
     let mut other = relay.client();
     let answering = relay.accepted();
     other.write_all(b"ping").unwrap();
