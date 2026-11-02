@@ -194,7 +194,7 @@ impl Layout {
         self.protected_on(Os::current())
     }
 
-    fn protected_on(&self, os: Os) -> Vec<PathBuf> {
+    pub(crate) fn protected_on(&self, os: Os) -> Vec<PathBuf> {
         let mut protected = self.roots();
         if os == Os::Linux {
             protected.extend([self.units_dir.clone(), self.data_units_dir.clone()]);
