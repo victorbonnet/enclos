@@ -231,7 +231,7 @@ fn parse_table(text: &str) -> Result<BTreeMap<u64, SocketAddr>, ListenersError> 
 }
 
 /// `0100007F:1F90`, or 32 hexadecimal digits before the colon for IPv6: each
-/// group of 8 is a 32-bit word of the address as this machine's `%08X` prints
+/// group of 8 is a 32-bit word of the address as this host's `%08X` prints
 /// it, and the port is hexadecimal. A wildcard is given as `0.0.0.0`, as
 /// from `lsof`; a v4-mapped address as the IPv4 one, which it is.
 fn table_address(text: &str) -> Option<SocketAddr> {
