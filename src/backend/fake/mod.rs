@@ -43,7 +43,7 @@ impl OwnProbes for FakeProbes {
     fn notes(&self) -> ReportNotes {
         ReportNotes {
             host: "this host",
-            folder_moves: "renames",
+            folder_moves: "",
             only_apart: "",
             host_service_routes: &[],
             not_probed: &[],

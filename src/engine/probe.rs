@@ -23,7 +23,7 @@ use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
-    ToolCheck, missing_workspaces, not_here, outcome, probes, sandboxed_script,
+    ToolCheck, not_here, outcome, probes, sandboxed_script,
 };
 
 /// What `enclos policy test` found.
@@ -278,7 +278,7 @@ impl Engine {
                 let outcome = run_probe(&probe, run_in_sandbox, &mut target.0);
                 results.push(ProbeResult::of(probe, outcome));
             }
-            results.extend(missing_workspaces(&inputs));
+            results.extend(own.folders_not_run(&inputs));
             Ok(TestReport {
                 results,
                 host_services,
