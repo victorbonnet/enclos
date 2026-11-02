@@ -38,7 +38,7 @@ fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
         compiled: None,
         root,
         pgid: None,
-        cgroup: Some("/s.scope".into()),
+        cgroup: Some("/s.scope".parse().unwrap()),
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,
@@ -486,7 +486,7 @@ fn on_a_runner_the_manager_is_told_no_command_line() {
     let detached = detached_by(&lab, detaching("pass"));
     let _ended = Ended(detached);
     let cgroup = open_exec_session(&lab).cgroup.expect("it has a cgroup");
-    let unit = cgroup.rsplit('/').next().unwrap().to_owned();
+    let unit = cgroup.unit().to_owned();
     let shown = Command::new("/usr/bin/systemctl")
         .args(["--user", "show", "--property=Description", &unit])
         .stdin(Stdio::null())
@@ -561,7 +561,7 @@ fn on_a_runner_a_service_runs_in_a_scope_of_its_own() {
     let service = sessions.iter().find(|s| s.kind == SessionKind::Service);
     let cgroup = service.and_then(|s| s.cgroup.clone());
     assert!(
-        cgroup.is_some_and(|c| c.ends_with(".scope")),
+        cgroup.is_some_and(|c| c.as_str().ends_with(".scope")),
         "{sessions:?}"
     );
 }

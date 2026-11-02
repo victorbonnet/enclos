@@ -30,7 +30,7 @@ use crate::lifecycle::cgroup::{Hierarchy, Scope, Systemd, no_systemd_run};
 use crate::lifecycle::process::{PsError, reference_of_child};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
-use crate::model::session::{SessionId, SessionKind, SessionRecord};
+use crate::model::session::{Cgroup, SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
 /// How long what a failed start left in its cgroup has to die of the kill.
@@ -174,7 +174,7 @@ fn fresh_tmp(tmp: &Path) -> io::Result<()> {
 fn end_unrecorded(
     cgroups: &Hierarchy,
     child: Child,
-    left: impl FnOnce() -> std::result::Result<Option<String>, PsError>,
+    left: impl FnOnce() -> std::result::Result<Option<Cgroup>, PsError>,
     error: Error,
     what: &str,
 ) -> Error {
@@ -372,7 +372,7 @@ mod tests {
     fn a_failed_start_ends_the_program_and_its_cgroup() {
         let (dir, cgroups, child) = started_in_cgroup("");
         let pid = child.id();
-        let cgroup = || Ok(Some("/s.scope".to_owned()));
+        let cgroup = || Ok(Some("/s.scope".parse().unwrap()));
         let e = end_unrecorded(&cgroups, child, cgroup, failed(), "the program");
         assert!(matches!(e, Error::Session { .. }), "{e}");
         assert_eq!(crate::lifecycle::process::reference(pid).unwrap(), None);

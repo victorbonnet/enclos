@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::descriptors::PROC;
 use super::process::PsError;
+use crate::model::session::Cgroup;
 
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -68,22 +69,14 @@ pub fn scope_name(install: &str, sandbox: &str, session: &str) -> String {
 }
 
 /// The unified hierarchy's path in the text of `/proc/<pid>/cgroup`.
-fn parse_proc_cgroup(text: &str) -> Option<String> {
+fn parse_proc_cgroup(text: &str) -> Option<Cgroup> {
     let path = text.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
-    safe_path(path)
-}
-
-/// `path`, when it names a place under the hierarchy's root.
-fn safe_path(path: &str) -> Option<String> {
-    let parts = path.strip_prefix('/')?.split('/');
-    let safe = !path.ends_with('/') && parts.into_iter().all(|p| !p.is_empty() && p != "..");
-    safe.then(|| path.to_owned())
+    path.strip_suffix(" (deleted)").unwrap_or(path).parse().ok()
 }
 
 /// The cgroup in what `systemctl --user show --property=ControlGroup`
 /// printed: none for a scope with nothing left in it.
-fn parse_control_group(text: &str) -> Result<Option<String>, PsError> {
+fn parse_control_group(text: &str) -> Result<Option<Cgroup>, PsError> {
     let Some(value) = text.lines().find_map(|l| l.strip_prefix("ControlGroup=")) else {
         return Err(PsError::Cgroup(format!(
             "systemctl did not print a control group: `{}`",
@@ -93,9 +86,10 @@ fn parse_control_group(text: &str) -> Result<Option<String>, PsError> {
     if value.is_empty() {
         return Ok(None);
     }
-    safe_path(value)
+    value
+        .parse()
         .map(Some)
-        .ok_or_else(|| PsError::Cgroup(format!("systemd gave the control group `{value}`")))
+        .map_err(|_| PsError::Cgroup(format!("systemd gave the control group `{value}`")))
 }
 
 /// The pids in the text of a `cgroup.procs` file. A line that does not parse
@@ -126,7 +120,12 @@ fn has_ended(folder: &Path) -> bool {
 /// hybrid host the unified hierarchy is elsewhere, and a root that does not
 /// hold it would read every session as empty, and so as stopped. A cgroup not
 /// there is only right once the program ended, as systemd then removes it.
-fn in_hierarchy(cgroups: &Hierarchy, proc: &Path, pid: u32, cgroup: &str) -> Result<(), PsError> {
+fn in_hierarchy(
+    cgroups: &Hierarchy,
+    proc: &Path,
+    pid: u32,
+    cgroup: &Cgroup,
+) -> Result<(), PsError> {
     let procs = cgroups.folder(cgroup).join("cgroup.procs");
     if procs.exists() || has_ended(&proc.join(pid.to_string())) {
         return Ok(());
@@ -149,8 +148,8 @@ fn cgroup_from(
     pid: u32,
     unit: &str,
     wait: Duration,
-    ask: &dyn Fn() -> Result<Option<String>, PsError>,
-) -> Result<String, PsError> {
+    ask: &dyn Fn() -> Result<Option<Cgroup>, PsError>,
+) -> Result<Cgroup, PsError> {
     let folder = proc.join(pid.to_string());
     let started = Instant::now();
     loop {
@@ -158,7 +157,7 @@ fn cgroup_from(
         let path = std::fs::read_to_string(folder.join("cgroup"))
             .ok()
             .and_then(|text| parse_proc_cgroup(&text));
-        if let Some(path) = path.filter(|p| p.rsplit('/').next() == Some(unit)) {
+        if let Some(path) = path.filter(|p| p.unit() == unit) {
             return Ok(path);
         }
         if ended {
@@ -318,7 +317,7 @@ impl Scope {
 
     /// The cgroup of the scope `pid` was started in. A scope that never
     /// started is an error, and so is a cgroup `cgroups` does not show.
-    pub fn cgroup_of(&self, pid: u32, cgroups: &Hierarchy) -> Result<String, PsError> {
+    pub fn cgroup_of(&self, pid: u32, cgroups: &Hierarchy) -> Result<Cgroup, PsError> {
         let proc = Path::new(PROC);
         let cgroup = cgroup_from(proc, pid, &self.unit, SCOPE_WAIT, &|| self.control_group())?;
         in_hierarchy(cgroups, proc, pid, &cgroup)?;
@@ -327,7 +326,7 @@ impl Scope {
 
     /// What systemd says of the scope's cgroup: none once nothing is left
     /// in it. It takes no pid, so it holds for a program already reaped.
-    pub fn control_group(&self) -> Result<Option<String>, PsError> {
+    pub fn control_group(&self) -> Result<Option<Cgroup>, PsError> {
         let out = Command::new(SYSTEMCTL)
             .args(["--user", "show", "--property=ControlGroup", &self.unit])
             .stdin(Stdio::null())
@@ -369,15 +368,15 @@ impl Hierarchy {
         }
     }
 
-    fn folder(&self, cgroup: &str) -> PathBuf {
-        self.root.join(cgroup.trim_start_matches('/'))
+    fn folder(&self, cgroup: &Cgroup) -> PathBuf {
+        self.root.join(cgroup.as_str().trim_start_matches('/'))
     }
 
     /// The pids in `cgroup` and every cgroup below it, where a same-user
     /// process may have moved. A cgroup removed, or being removed, is empty:
     /// systemd removes one once nothing is left in it. Any other failure is an error, never
     /// an empty answer.
-    pub fn pids(&self, cgroup: &str) -> Result<BTreeSet<u32>, PsError> {
+    pub fn pids(&self, cgroup: &Cgroup) -> Result<BTreeSet<u32>, PsError> {
         let mut pids = BTreeSet::new();
         let mut folders = vec![self.folder(cgroup)];
         while let Some(folder) = folders.pop() {
@@ -408,7 +407,7 @@ impl Hierarchy {
     /// Kills everything in `cgroup` and below it at once, so that a member
     /// forking meanwhile is not missed. `cgroup.kill` needs Linux 5.14. A
     /// cgroup already removed holds nothing to kill.
-    pub fn kill(&self, cgroup: &str) -> std::io::Result<()> {
+    pub fn kill(&self, cgroup: &Cgroup) -> std::io::Result<()> {
         match std::fs::write(self.folder(cgroup).join("cgroup.kill"), "1") {
             Err(e) if removed(&e) => Ok(()),
             written => written,
@@ -417,7 +416,7 @@ impl Hierarchy {
 
     /// Kills everything in `cgroup`, and waits up to `wait` for it to be
     /// empty. What stays, as on a kernel with no `cgroup.kill`, is an error.
-    pub fn end(&self, cgroup: &str, wait: Duration) -> Result<(), PsError> {
+    pub fn end(&self, cgroup: &Cgroup, wait: Duration) -> Result<(), PsError> {
         let killed = self.kill(cgroup);
         let started = Instant::now();
         loop {
@@ -441,6 +440,10 @@ impl Hierarchy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(path: &str) -> Cgroup {
+        path.parse().unwrap()
+    }
 
     #[test]
     fn a_slice_is_named_after_the_install_and_the_sandbox() {
@@ -612,9 +615,9 @@ mod tests {
     #[test]
     fn proc_gives_the_unified_hierarchys_path() {
         let text = format!("1:name=systemd:/other\n0::{IN_SCOPE}\n");
-        assert_eq!(parse_proc_cgroup(&text).as_deref(), Some(IN_SCOPE));
+        assert_eq!(parse_proc_cgroup(&text), Some(at(IN_SCOPE)));
         let ended = format!("0::{IN_SCOPE} (deleted)\n");
-        assert_eq!(parse_proc_cgroup(&ended).as_deref(), Some(IN_SCOPE));
+        assert_eq!(parse_proc_cgroup(&ended), Some(at(IN_SCOPE)));
     }
 
     #[test]
@@ -633,10 +636,7 @@ mod tests {
     #[test]
     fn systemctl_gives_the_scopes_cgroup_or_none() {
         let shown = format!("ControlGroup={IN_SCOPE}\n");
-        assert_eq!(
-            parse_control_group(&shown).unwrap().as_deref(),
-            Some(IN_SCOPE)
-        );
+        assert_eq!(parse_control_group(&shown).unwrap(), Some(at(IN_SCOPE)));
         assert_eq!(parse_control_group("ControlGroup=\n").unwrap(), None);
         assert!(parse_control_group("Other=1\n").is_err());
         assert!(parse_control_group("ControlGroup=../x\n").is_err());
@@ -665,7 +665,7 @@ mod tests {
         dir
     }
 
-    fn never_asked() -> Result<Option<String>, PsError> {
+    fn never_asked() -> Result<Option<Cgroup>, PsError> {
         panic!("systemd was asked")
     }
 
@@ -673,7 +673,7 @@ mod tests {
     fn a_scopes_cgroup_is_read_from_proc_once_the_program_is_in_it() {
         let proc = proc_with(7, "0::/a.slice/s.scope\n", "7 (x) S 1");
         let found = cgroup_from(proc.path(), 7, "s.scope", SCOPE_WAIT, &never_asked);
-        assert_eq!(found.unwrap(), "/a.slice/s.scope");
+        assert_eq!(found.unwrap(), at("/a.slice/s.scope"));
     }
 
     /// Its `stat` says it ended, and its `cgroup` says where it was: a quick
@@ -682,7 +682,7 @@ mod tests {
     fn a_program_that_ended_in_its_scope_is_read_from_proc_with_the_cgroup_removed() {
         let proc = proc_with(7, "0::/a.slice/s.scope (deleted)\n", "7 (x) Z 1");
         let found = cgroup_from(proc.path(), 7, "s.scope", SCOPE_WAIT, &never_asked);
-        assert_eq!(found.unwrap(), "/a.slice/s.scope");
+        assert_eq!(found.unwrap(), at("/a.slice/s.scope"));
     }
 
     #[test]
@@ -701,9 +701,9 @@ mod tests {
     #[test]
     fn a_program_that_ended_first_leaves_systemd_to_say() {
         let zombie = proc_with(7, "0::/caller.scope\n", "7 (x) Z 1");
-        let left = || Ok(Some("/a.slice/s.scope".to_owned()));
+        let left = || Ok(Some(at("/a.slice/s.scope")));
         let found = cgroup_from(zombie.path(), 7, "s.scope", SCOPE_WAIT, &left);
-        assert_eq!(found.unwrap(), "/a.slice/s.scope");
+        assert_eq!(found.unwrap(), at("/a.slice/s.scope"));
     }
 
     /// `systemd-run` died before the scope: not a session whose program failed.
@@ -732,8 +732,8 @@ mod tests {
     fn a_running_program_whose_cgroup_the_hierarchy_does_not_show_is_refused() {
         let proc = proc_with(7, "0::/s.scope\n", "7 (x) S 1");
         let (_dir, cgroups) = hierarchy(&[("s.scope", "7\n")]);
-        in_hierarchy(&cgroups, proc.path(), 7, "/s.scope").unwrap();
-        let wrong = in_hierarchy(&cgroups, proc.path(), 7, "/other.scope").unwrap_err();
+        in_hierarchy(&cgroups, proc.path(), 7, &at("/s.scope")).unwrap();
+        let wrong = in_hierarchy(&cgroups, proc.path(), 7, &at("/other.scope")).unwrap_err();
         assert!(
             wrong.to_string().contains("unified cgroup hierarchy"),
             "{wrong}"
@@ -745,22 +745,25 @@ mod tests {
     fn a_program_that_ended_may_have_taken_its_cgroup_with_it() {
         let proc = proc_with(7, "0::/s.scope (deleted)\n", "7 (x) Z 1");
         let (_dir, cgroups) = hierarchy(&[]);
-        in_hierarchy(&cgroups, proc.path(), 7, "/s.scope").unwrap();
+        in_hierarchy(&cgroups, proc.path(), 7, &at("/s.scope")).unwrap();
     }
 
     #[test]
     fn a_cgroups_pids_include_those_of_the_cgroups_below_it() {
         let (_dir, cgroups) = hierarchy(&[("s.scope", "1\n2\n"), ("s.scope/sub/more", "3\n")]);
-        assert_eq!(cgroups.pids("/s.scope").unwrap(), BTreeSet::from([1, 2, 3]));
+        assert_eq!(
+            cgroups.pids(&at("/s.scope")).unwrap(),
+            BTreeSet::from([1, 2, 3])
+        );
     }
 
     #[test]
     fn a_removed_cgroup_is_empty_and_one_that_cannot_be_read_is_an_error() {
         let (dir, cgroups) = hierarchy(&[("bad.scope", "x\n")]);
-        assert!(cgroups.pids("/gone.scope").unwrap().is_empty());
-        assert!(cgroups.pids("/bad.scope").is_err());
+        assert!(cgroups.pids(&at("/gone.scope")).unwrap().is_empty());
+        assert!(cgroups.pids(&at("/bad.scope")).is_err());
         std::fs::create_dir_all(dir.path().join("dir.scope/cgroup.procs")).unwrap();
-        assert!(cgroups.pids("/dir.scope").is_err());
+        assert!(cgroups.pids(&at("/dir.scope")).is_err());
     }
 
     #[test]
@@ -779,7 +782,7 @@ mod tests {
     #[test]
     fn kill_asks_the_kernel_to_end_the_cgroup() {
         let (dir, cgroups) = hierarchy(&[("s.scope", "1\n")]);
-        cgroups.kill("/s.scope").unwrap();
+        cgroups.kill(&at("/s.scope")).unwrap();
         let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
         assert_eq!(asked.unwrap(), "1");
     }
@@ -787,18 +790,18 @@ mod tests {
     #[test]
     fn a_kill_that_cannot_be_written_fails_and_a_removed_cgroup_needs_none() {
         let (dir, cgroups) = hierarchy(&[("s.scope", "1\n")]);
-        assert!(cgroups.kill("/gone.scope").is_ok());
+        assert!(cgroups.kill(&at("/gone.scope")).is_ok());
         // A folder cannot be written to.
         std::fs::create_dir(dir.path().join("s.scope/cgroup.kill")).unwrap();
-        assert!(cgroups.kill("/s.scope").is_err());
-        let left = cgroups.end("/s.scope", Duration::ZERO).unwrap_err();
+        assert!(cgroups.kill(&at("/s.scope")).is_err());
+        let left = cgroups.end(&at("/s.scope"), Duration::ZERO).unwrap_err();
         assert!(left.to_string().contains("which failed"), "{left}");
     }
 
     #[test]
     fn ending_a_cgroup_kills_it_and_waits_until_it_is_empty() {
         let (dir, cgroups) = hierarchy(&[("s.scope", "")]);
-        cgroups.end("/s.scope", Duration::ZERO).unwrap();
+        cgroups.end(&at("/s.scope"), Duration::ZERO).unwrap();
         let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
         assert_eq!(asked.unwrap(), "1");
     }
@@ -806,8 +809,8 @@ mod tests {
     #[test]
     fn a_cgroup_that_stays_after_the_kill_or_cannot_be_read_is_not_ended() {
         let (_dir, cgroups) = hierarchy(&[("s.scope", "1\n"), ("bad.scope", "x\n")]);
-        let left = cgroups.end("/s.scope", Duration::ZERO).unwrap_err();
+        let left = cgroups.end(&at("/s.scope"), Duration::ZERO).unwrap_err();
         assert!(left.to_string().contains("/s.scope"), "{left}");
-        assert!(cgroups.end("/bad.scope", Duration::ZERO).is_err());
+        assert!(cgroups.end(&at("/bad.scope"), Duration::ZERO).is_err());
     }
 }

@@ -467,7 +467,7 @@ mod tests {
         let folder = dir.path().join("s.scope");
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("cgroup.procs"), text).unwrap();
-        a.cgroup = Some("/s.scope".into());
+        a.cgroup = Some("/s.scope".parse().unwrap());
         let cgroups = Hierarchy::at(dir.path());
         (dir, cgroups)
     }
