@@ -104,6 +104,8 @@ pub struct Engine {
     scopes: bool,
     /// Where a session's cgroup is read.
     cgroups: crate::lifecycle::cgroup::Hierarchy,
+    /// The `systemd-run` asked for the host's systemd version.
+    systemd_run: PathBuf,
 }
 
 /// Stops a session's members within a grace period, as
@@ -212,6 +214,7 @@ impl Engine {
             downloader: Box::new(Curl),
             scopes: false,
             cgroups: crate::lifecycle::cgroup::Hierarchy::host(),
+            systemd_run: crate::lifecycle::cgroup::SYSTEMD_RUN.into(),
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),

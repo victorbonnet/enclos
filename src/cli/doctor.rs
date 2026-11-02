@@ -8,6 +8,7 @@ use enclos::engine::{
     MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
+use enclos::lifecycle::cgroup::{SYSTEMD_NEEDED, Systemd};
 use enclos::model::agent::AgentName;
 use enclos::runtime::RuntimeAgentName;
 
@@ -189,11 +190,22 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             "sandboxes": list.iter().map(sandbox).collect::<Vec<_>>(),
         }),
     };
-    json!({
+    let mut report = json!({
         "problems": doctor.has_problems(),
         "backends": backends,
         "records": sandboxes,
-    })
+    });
+    if let Some(systemd) = &doctor.systemd {
+        report["systemd"] = json!({
+            "version": match systemd {
+                Systemd::Enough(version) | Systemd::TooOld(version) => Some(version),
+                Systemd::Unreadable(_) => None,
+            },
+            "needed": SYSTEMD_NEEDED,
+            "problem": systemd.refusal(),
+        });
+    }
+    report
 }
 
 /// The report as text, one line per fact.
@@ -201,6 +213,9 @@ pub fn shown(doctor: &Doctor) -> String {
     let mut out = String::from("Backends\n");
     for b in &doctor.backends {
         out += &backend(b);
+    }
+    if let Some(systemd) = &doctor.systemd {
+        out += &format!("\nSystemd\n  {}\n", hanging(&systemd_line(systemd), 2));
     }
     out += "\nSandboxes\n";
     match &doctor.sandboxes {
@@ -218,6 +233,15 @@ pub fn shown(doctor: &Doctor) -> String {
         }
     }
     out
+}
+
+fn systemd_line(systemd: &Systemd) -> String {
+    match systemd {
+        Systemd::Enough(version) => {
+            format!("systemd {version}: enclos needs {SYSTEMD_NEEDED} or later")
+        }
+        other => other.refusal().unwrap_or_default(),
+    }
 }
 
 fn backend(b: &BackendCheck) -> String {
@@ -496,6 +520,7 @@ mod tests {
 
     fn doctor(check: SandboxCheck) -> Doctor {
         Doctor {
+            systemd: None,
             backends: vec![BackendCheck {
                 kind: BackendKind::Seatbelt,
                 state: BackendState::Runs,
@@ -540,6 +565,47 @@ mod tests {
 
     /// Each capability is a line of its own, its value in one column, and a
     /// long note wraps within that column, never back to the margin.
+    /// Where sessions run in no scope, as on macOS, nothing is said of it.
+    #[test]
+    fn a_host_with_no_scopes_says_nothing_of_systemd() {
+        let d = doctor(compiles());
+        assert!(!shown(&d).contains("ystemd"), "{}", shown(&d));
+        assert!(json(&d).get("systemd").is_none());
+    }
+
+    #[test]
+    fn the_systemd_found_is_shown_with_what_enclos_needs() {
+        let mut d = doctor(compiles());
+        d.systemd = Some(Systemd::Enough(257));
+        assert!(!d.has_problems());
+        let text = shown(&d);
+        assert!(
+            text.contains("systemd 257: enclos needs 254 or later"),
+            "{text}"
+        );
+        assert_eq!(json(&d)["systemd"]["version"], 257);
+        assert_eq!(json(&d)["systemd"]["needed"], 254);
+        assert!(json(&d)["systemd"]["problem"].is_null());
+    }
+
+    #[test]
+    fn a_systemd_too_old_or_unreadable_is_a_problem() {
+        let mut d = doctor(compiles());
+        d.systemd = Some(Systemd::TooOld(252));
+        assert!(d.has_problems());
+        let text = shown(&d).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("this host has 252"), "{text}");
+        assert!(text.contains("Debian 13 or Ubuntu 24.04 work"), "{text}");
+        assert_eq!(json(&d)["systemd"]["version"], 252);
+        assert!(json(&d)["systemd"]["problem"].is_string());
+
+        d.systemd = Some(Systemd::Unreadable("no such file".into()));
+        assert!(d.has_problems());
+        let text = shown(&d).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("no such file"), "{text}");
+        assert!(json(&d)["systemd"]["version"].is_null());
+    }
+
     #[test]
     fn each_capability_is_a_line_and_a_long_note_keeps_its_column() {
         let mut d = doctor(compiles());

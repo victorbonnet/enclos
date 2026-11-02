@@ -14,6 +14,10 @@ The words used here:
 - An account with a model provider Hermes supports, for its login.
 - About 2.5 GB of free disk space per sandbox: each sandbox gets its own Hermes install.
 
+## Linux requirements
+
+enclos's Linux support is in development and is not in a release yet. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
+
 ## Install enclos
 
 ```bash

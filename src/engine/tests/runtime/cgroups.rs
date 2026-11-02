@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::lifecycle::cgroup::Hierarchy;
+use crate::lifecycle::cgroup::{Hierarchy, Systemd};
 use crate::lifecycle::process::{Signal, is_same, reference, signal_process};
 use crate::model::sandbox::SandboxState;
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
@@ -63,6 +63,77 @@ fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
     assert!(view.sessions[0].gone(), "{:?}", view.sessions[0]);
     member.kill().unwrap();
     member.wait().unwrap();
+}
+
+/// A `systemd-run` that prints `first line` for `--version`, and that nothing
+/// reaches a manager through.
+fn systemd_run_printing(first_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("systemd-run");
+    std::fs::write(&path, format!("#!/bin/sh\necho '{first_line}'\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, path)
+}
+
+/// `exec` on a host with this `systemd-run` fails with what it says, and no
+/// program starts and no session is recorded.
+fn refused_exec(first_line: &str) -> String {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let (_dir, stub) = systemd_run_printing(first_line);
+    lab.engine.scopes = true;
+    lab.engine.systemd_run = stub;
+    let ran = lab.home.join("ran");
+    let script = format!("/usr/bin/touch {}", ran.display());
+    let err = lab
+        .engine
+        .exec(
+            &alice(),
+            &lab.name,
+            vec!["/bin/sh".into(), "-c".into(), script.into()],
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(!ran.exists(), "the program ran");
+    assert!(
+        lab.engine
+            .state
+            .sessions(&lab.name, false)
+            .unwrap()
+            .is_empty()
+    );
+    err.to_string()
+}
+
+#[test]
+fn a_systemd_too_old_refuses_a_session_before_its_program_starts() {
+    let why = refused_exec("systemd 252 (252.39-1~deb12u2)");
+    assert!(
+        why.contains("enclos needs systemd 254 or later; this host has 252."),
+        "{why}"
+    );
+    assert!(why.contains("Debian 13 or Ubuntu 24.04 work."), "{why}");
+}
+
+#[test]
+fn a_systemd_version_that_cannot_be_read_refuses_a_session_and_says_so() {
+    let why = refused_exec("nonsense");
+    assert!(why.contains("cannot tell which this host has"), "{why}");
+    assert!(why.contains("nonsense"), "{why}");
+}
+
+#[test]
+fn doctor_fails_on_a_systemd_too_old_and_only_where_sessions_run_in_scopes() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let (_dir, stub) = systemd_run_printing("systemd 252 (252.39-1~deb12u2)");
+    lab.engine.systemd_run = stub;
+    assert_eq!(lab.engine.doctor().systemd, None);
+    lab.engine.scopes = true;
+    let doctor = lab.engine.doctor();
+    assert_eq!(doctor.systemd, Some(Systemd::TooOld(252)));
+    assert!(doctor.has_problems());
 }
 
 /// Whether to run the tests below, which start scopes in the user's systemd
@@ -342,6 +413,38 @@ fn on_a_runner_a_program_keeps_its_exit_status_and_gets_no_way_to_the_manager() 
         assert!(!seen.contains(variable), "{seen}");
     }
     assert!(seen.contains("HOME="), "{seen}");
+}
+
+/// systemd 258 and later expand a scope's command line unless told not to, so
+/// these would reach the program as an empty word and a pid.
+#[test]
+fn on_a_runner_a_programs_arguments_reach_it_with_their_dollars() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let seen = lab.home.join("seen");
+    let script = format!("printf '%s\\n' \"$1\" \"$2\" > {}", seen.display());
+    let end = done(
+        lab.engine
+            .exec(
+                &alice(),
+                &lab.name,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    script.into(),
+                    "sh".into(),
+                    "${HOME}".into(),
+                    "$$".into(),
+                ],
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(end.exit, 0);
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "${HOME}\n$$\n");
 }
 
 #[test]
