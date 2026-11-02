@@ -96,11 +96,11 @@ A background process of a sandbox that the host's service manager runs while the
 _Avoid_: daemon, job, unit (the service manager's words), agent service
 
 **Relay**:
-On Linux, the part of enclos inside a session that listens on the session's own 127.0.0.1 and passes each connection to a Unix socket outside it: the sandbox's proxy, or its runtime's listening service.
+On Linux, the part of enclos that passes connections between 127.0.0.1 in a sandbox's network namespace and a Unix socket outside it: to the sandbox's proxy, or from the host to its runtime's listening service.
 _Avoid_: forwarder, port forward, tunnel (the proxy's word for a connection it carries)
 
 **Holder**:
-On Linux, the process that keeps a sandbox's network namespace in being while its proxy service runs, so that every session of the sandbox can join it.
+On Linux, the process that keeps a sandbox's network namespace in being, so that every session of the sandbox can join it.
 
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
