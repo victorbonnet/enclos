@@ -312,6 +312,7 @@ impl Engine {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
+            hidden_files: self.layout.hidden_files(),
             sandbox_dir: self.layout.sandbox_dir(name.as_str()),
             writes,
             other_sandboxes: self
@@ -700,6 +701,7 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            hidden_files: crate::probes::hidden_in(&dir.join("enclos")),
             sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: Vec::new(),
             writes: Vec::new(),
