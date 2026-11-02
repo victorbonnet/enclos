@@ -49,8 +49,8 @@ def masked_in_grants(mask, resolved):
 
 def read_host(compiled):
     """What this session's mounts depend on. `entries`: each real folder from
-    the home down that holds a hidden path (hidden_paths) outside a grant, its
-    names mapped to a link's target or None. `resolved`: each denied path and
+    the home down that holds a hidden path (hidden_paths), stopping at a grant
+    whichever name it is reached by, its names mapped to a link's target or None. `resolved`: each denied path and
     grant with links resolved. `kinds`: what is now at each path masked in a grant, "dir",
     "file" or None. A folder that went away lists nothing; one that cannot be
     read stops the session, since what it holds cannot be hidden."""
@@ -58,9 +58,12 @@ def read_host(compiled):
     grants = grant_paths(mask)
     resolved = {p: os.path.realpath(p) for p in mask["denied"] + grants}
     hidden = hidden_paths(mask, resolved)
+    roots = [resolved[g] for g in grants]
     entries = {}
 
     def walk(folder):
+        if any(under(os.path.realpath(folder), root) for root in roots):
+            return  # the grant's bind replaces it, whichever name it goes by
         try:
             names = os.listdir(folder)
         except (FileNotFoundError, NotADirectoryError):
@@ -72,7 +75,7 @@ def read_host(compiled):
                 found[name] = os.readlink(path)
             except OSError:
                 found[name] = None
-                if path not in grants and any(under(d, path) and d != path for d in hidden):
+                if any(under(d, path) and d != path for d in hidden):
                     walk(path)
 
     walk(mask["home"])
@@ -131,18 +134,17 @@ def arguments(compiled, listing):
     remount = []
     for arg in compiled["bwrap"]:
         if arg == "@HOME_MASK@":
-            hide(mask["home"], hidden_paths(mask, resolved), listing["entries"], args, remount)
+            if mask["home"] in listing["entries"]:
+                hide(mask["home"], hidden_paths(mask, resolved), listing["entries"], args, remount)
         elif arg == "@GRANT_MASK@":
             mask_in_grants(mask, listing, args, remount)
         else:
             args.append(arg)
     # The tmpfs that hide denied paths were writable while bubblewrap made
-    # mount points in them; nothing may write there afterwards. Only those:
-    # a tmpfs at a grant's own path is gone under the grant's bind, whichever
-    # name the grant reaches it by.
+    # mount points in them; nothing may write there afterwards. A grant's bind
+    # replaces none of these: read_host() lists nothing a grant holds.
     for folder in remount:
-        if folder not in {resolved[g] for g in grants}:
-            args += ["--remount-ro", folder]
+        args += ["--remount-ro", folder]
     return args
 
 
