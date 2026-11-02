@@ -161,8 +161,9 @@ impl ClosedBy {
     }
 }
 
-/// A `/bin/sh -c` script run on the host, outside the sandbox. Only this
-/// module makes one, and each is harmless whatever the policy says.
+/// A `/bin/sh -c` script run on the host, outside the sandbox. Only the probes
+/// make one, in this module and in a backend's own, and each is harmless
+/// whatever the policy says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostScript(String);
 
@@ -637,7 +638,7 @@ pub(crate) fn curl_through_proxy(url: &str) -> String {
 
 /// The probes that are harmless even if a rule does not hold, every
 /// backend's and `own`'s: run wherever `policy test` runs, the user's own
-/// machine included.
+/// host included.
 pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     let mut list = Vec::new();
     let refusal = own.refusal();
@@ -1582,8 +1583,8 @@ mod tests {
         }
     }
 
-    /// The shared set names no route, command or word of another backend's,
-    /// and needs none of its own to be complete.
+    /// The shared set names no route or word of another backend's, and needs
+    /// none of its own to be complete.
     #[test]
     fn a_backend_with_no_probes_of_its_own_gets_the_shared_set() {
         let dir = tempfile::tempdir().unwrap();
