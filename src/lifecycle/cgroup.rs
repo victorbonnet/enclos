@@ -118,27 +118,34 @@ fn is_zombie(stat: &str) -> bool {
 }
 
 /// Where `pid` is once `unit` holds it. Until then it is `systemd-run`, in
-/// the cgroup of whoever started it. A program that ended before it was
-/// seen there leaves `ask` to say what is left of the scope.
+/// the cgroup of whoever started it. A program that ended stays readable
+/// until it is waited for, so `ended` is read first: one that ended and was
+/// never seen in the scope leaves `ask` to say what is left of the scope, and
+/// with nothing left the scope never started, which is an error: exit 1 would
+/// otherwise read as the program's own failure.
 fn cgroup_from(
     proc: &Path,
     pid: u32,
     unit: &str,
     wait: Duration,
     ask: &dyn Fn() -> Result<Option<String>, PsError>,
-) -> Result<Option<String>, PsError> {
+) -> Result<String, PsError> {
     let folder = proc.join(pid.to_string());
     let started = Instant::now();
     loop {
+        let ended = std::fs::read_to_string(folder.join("stat")).map_or(true, |s| is_zombie(&s));
         let path = std::fs::read_to_string(folder.join("cgroup"))
             .ok()
             .and_then(|text| parse_proc_cgroup(&text));
         if let Some(path) = path.filter(|p| p.rsplit('/').next() == Some(unit)) {
-            return Ok(Some(path));
+            return Ok(path);
         }
-        let ended = std::fs::read_to_string(folder.join("stat")).map_or(true, |s| is_zombie(&s));
         if ended {
-            return ask();
+            return ask()?.ok_or_else(|| {
+                PsError::Cgroup(format!(
+                    "pid {pid} ended before {unit} started, so the program did not run"
+                ))
+            });
         }
         if started.elapsed() >= wait {
             return Err(PsError::Cgroup(format!(
@@ -277,9 +284,9 @@ impl Scope {
         self.around(command, &manager)
     }
 
-    /// The cgroup of the scope `pid` was started in, or none when the scope
-    /// ended with its program.
-    pub fn cgroup_of(&self, pid: u32) -> Result<Option<String>, PsError> {
+    /// The cgroup of the scope `pid` was started in. A scope that never
+    /// started is an error.
+    pub fn cgroup_of(&self, pid: u32) -> Result<String, PsError> {
         cgroup_from(Path::new(PROC), pid, &self.unit, SCOPE_WAIT, &|| {
             self.control_group()
         })
@@ -620,7 +627,16 @@ mod tests {
     fn a_scopes_cgroup_is_read_from_proc_once_the_program_is_in_it() {
         let proc = proc_with(7, "0::/a.slice/s.scope\n", "7 (x) S 1");
         let found = cgroup_from(proc.path(), 7, "s.scope", SCOPE_WAIT, &never_asked);
-        assert_eq!(found.unwrap().as_deref(), Some("/a.slice/s.scope"));
+        assert_eq!(found.unwrap(), "/a.slice/s.scope");
+    }
+
+    /// Its `stat` says it ended, and its `cgroup` says where it was: a quick
+    /// program is no scope that failed.
+    #[test]
+    fn a_program_that_ended_in_its_scope_is_read_from_proc_with_the_cgroup_removed() {
+        let proc = proc_with(7, "0::/a.slice/s.scope (deleted)\n", "7 (x) Z 1");
+        let found = cgroup_from(proc.path(), 7, "s.scope", SCOPE_WAIT, &never_asked);
+        assert_eq!(found.unwrap(), "/a.slice/s.scope");
     }
 
     #[test]
@@ -641,10 +657,18 @@ mod tests {
         let zombie = proc_with(7, "0::/caller.scope\n", "7 (x) Z 1");
         let left = || Ok(Some("/a.slice/s.scope".to_owned()));
         let found = cgroup_from(zombie.path(), 7, "s.scope", SCOPE_WAIT, &left);
-        assert_eq!(found.unwrap().as_deref(), Some("/a.slice/s.scope"));
+        assert_eq!(found.unwrap(), "/a.slice/s.scope");
+    }
+
+    /// `systemd-run` died before the scope: not a session whose program failed.
+    #[test]
+    fn a_scope_that_never_started_is_an_error() {
         let reaped = tempfile::tempdir().unwrap();
         let found = cgroup_from(reaped.path(), 7, "s.scope", SCOPE_WAIT, &|| Ok(None));
-        assert_eq!(found.unwrap(), None);
+        assert!(found.unwrap_err().to_string().contains("s.scope"));
+        let zombie = proc_with(7, "0::/caller.scope\n", "7 (x) Z 1");
+        let found = cgroup_from(zombie.path(), 7, "s.scope", SCOPE_WAIT, &|| Ok(None));
+        assert!(found.is_err());
     }
 
     fn hierarchy(procs: &[(&str, &str)]) -> (tempfile::TempDir, Hierarchy) {
