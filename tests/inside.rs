@@ -5,8 +5,10 @@
 //! The rest of `enclos inside` is `src/backend/bubblewrap/inside/`'s tests.
 #![cfg(target_os = "linux")]
 
-use std::io::{Read, Write};
+use std::fs::Permissions;
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -18,6 +20,7 @@ use tempfile::TempDir;
 
 const PYTHON: &str = "/usr/bin/python3";
 const TRUE: &str = "/usr/bin/true";
+const TOUCH: &str = "/usr/bin/touch";
 
 /// Reports what `unshare(CLONE_NEWUSER)` answers.
 const UNSHARE: &str = r#"
@@ -198,6 +201,35 @@ fn a_compiled_file_that_is_not_there_stops_a_session_before_its_command() {
         text(&output.stderr).contains("cannot read the compiled file"),
         "{output:?}"
     );
+    assert!(!marker.exists());
+}
+
+/// A rule on a path nobody may look at stops the relay at that rule, before
+/// it restricts anything and before the session does, so this one runs
+/// anywhere: it is the real start of a relay that never says it is ready. The
+/// control is what keeps it so, as a root that can look would apply the rules.
+#[test]
+fn a_relay_that_cannot_confine_itself_stops_the_session_and_says_why() {
+    let confined = Confined::new();
+    let locked = confined.path("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let file = std::fs::read_to_string(&confined.compiled).unwrap();
+    let mut compiled: Value = serde_json::from_str(&file).unwrap();
+    let rule = compiled["landlock"]["write"].as_array_mut().unwrap();
+    rule.push(serde_json::json!(locked.join("inside")));
+    std::fs::write(&confined.compiled, compiled.to_string()).unwrap();
+    std::fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
+    let looked = std::fs::metadata(locked.join("inside")).unwrap_err();
+    assert_eq!(looked.kind(), ErrorKind::PermissionDenied, "the control");
+
+    let marker = confined.path("allowed/ran");
+    let output = confined.session(&[TOUCH, marker.to_str().unwrap()]);
+    std::fs::set_permissions(&locked, Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(output.status.code(), Some(125), "{output:?}");
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("the relay did not start: "), "{stderr}");
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert!(stderr.contains("locked/inside"), "{stderr}");
     assert!(!marker.exists());
 }
 
