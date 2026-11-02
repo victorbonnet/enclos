@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::{connections_for, pass_on, serve_up_to};
+use crate::proxy::IDLE_TIMEOUT;
 
 /// Far beyond the sockets' buffers.
 const LARGE: usize = 64 * 1024 * 1024;
@@ -26,13 +27,17 @@ struct Relay {
 
 impl Relay {
     fn up_to(max: usize) -> Relay {
+        Relay::limited(max, IDLE_TIMEOUT)
+    }
+
+    fn limited(max: usize, limit: Duration) -> Relay {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("proxy.sock");
         let upstream = UnixListener::bind(&path).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let socket = path.clone();
-        thread::spawn(move || serve_up_to(listener, &socket, max));
+        thread::spawn(move || serve_up_to(listener, &socket, max, limit));
         Relay {
             port,
             upstream,
@@ -221,6 +226,52 @@ fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
     // The client is still open: only the relay can have freed the place.
     relay.served_again();
     drop(client);
+}
+
+/// Short, so the tests below see it fire. The tests that must outlast it
+/// wait a few times as long.
+const SHORT: Duration = Duration::from_millis(300);
+
+#[test]
+fn a_client_that_says_nothing_after_upstream_left_frees_its_place() {
+    let relay = Relay::limited(1, SHORT);
+    let client = relay.client();
+    drop(relay.accepted());
+    // Told at once; only the limit can end what still reads from it.
+    assert_eq!(all_of(&client), b"");
+    relay.served_again();
+    drop(client);
+}
+
+#[test]
+fn a_client_that_stops_reading_loses_the_connection_and_frees_its_place() {
+    let relay = Relay::limited(1, SHORT);
+    let client = relay.client();
+    let upstream = relay.accepted();
+    let chunk = pattern(64 * 1024, 5);
+    let ended = loop {
+        if let Err(e) = (&upstream).write_all(&chunk) {
+            break e;
+        }
+    };
+    assert_eq!(ended.kind(), ErrorKind::BrokenPipe);
+    relay.served_again();
+    drop(client);
+}
+
+#[test]
+fn a_quiet_connection_outlasts_the_limit() {
+    let relay = Relay::limited(1, SHORT);
+    let mut client = relay.client();
+    let upstream = relay.accepted();
+    thread::sleep(SHORT * 3);
+    client.write_all(b"ping").unwrap();
+    let mut got = [0; 4];
+    (&upstream).read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"ping");
+    (&upstream).write_all(b"pong").unwrap();
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"pong");
 }
 
 /// A proxy refusing a request whose body it did not read: the upload fails
