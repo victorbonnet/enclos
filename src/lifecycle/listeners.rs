@@ -79,8 +79,9 @@ fn proc_error(e: impl std::fmt::Display) -> ListenersError {
 }
 
 /// The listening sockets in the network tables `net` holds, by inode.
-/// `tcp6` is missing on a kernel without IPv6; `tcp` missing means the
-/// process is gone (a zombie has no network tables), so `None`.
+/// `tcp6` is missing on a kernel without IPv6; `tcp` missing means no running
+/// thread is behind `net`, so `None`: the process is gone, as a zombie has no
+/// network tables, or, in a process's own folder, its main thread exited.
 fn listening_sockets(net: &Path) -> Result<Option<BTreeMap<u64, SocketAddr>>, ListenersError> {
     let read = |table: &str| match std::fs::read_to_string(net.join(table)) {
         Ok(text) => Ok(Some(text)),
@@ -95,6 +96,21 @@ fn listening_sockets(net: &Path) -> Result<Option<BTreeMap<u64, SocketAddr>>, Li
         sockets.extend(parse_table(&v6)?);
     }
     Ok(Some(sockets))
+}
+
+/// The listening sockets `pid` sees, under `proc`: through its own folder, or
+/// through a thread's when its main thread exited and others run on. `None`
+/// only when no thread answers, so the process is gone.
+fn tables_of(proc: &Path, pid: u32) -> Result<Option<BTreeMap<u64, SocketAddr>>, ListenersError> {
+    if let Some(sockets) = listening_sockets(&proc.join(pid.to_string()).join("net"))? {
+        return Ok(Some(sockets));
+    }
+    for thread in descriptors::other_threads(proc, pid).map_err(proc_error)? {
+        if let Some(sockets) = listening_sockets(&thread.join("net"))? {
+            return Ok(Some(sockets));
+        }
+    }
+    Ok(None)
 }
 
 /// The inode of a descriptor's target, when it is a socket.
@@ -112,8 +128,7 @@ fn socket_inode(target: &Path) -> Option<u64> {
 fn held_in_proc(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
     let mut found = BTreeSet::new();
     for &pid in pids {
-        let net = proc.join(pid.to_string()).join("net");
-        let Some(sockets) = listening_sockets(&net)? else {
+        let Some(sockets) = tables_of(proc, pid)? else {
             continue;
         };
         match descriptors::of(proc, pid).map_err(proc_error)? {
@@ -125,7 +140,7 @@ fn held_in_proc(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, Lis
             Descriptors::Gone => {}
             // It exited since its tables were read, or it is one that cannot
             // be read: a look that could not happen is not "no listener".
-            Descriptors::Unreadable if listening_sockets(&net)?.is_none() => {}
+            Descriptors::Unreadable if tables_of(proc, pid)?.is_none() => {}
             Descriptors::Unreadable => {
                 return Err(proc_error(format!("pid {pid} cannot be read")));
             }
@@ -603,6 +618,41 @@ mod tests {
         };
         let held = holders_among(at, listening, || Ok(vec![(7, BTreeSet::from([11]))]));
         assert_eq!(held.unwrap(), [(7, at)]);
+    }
+
+    /// A process whose main thread exited has no tables and no descriptors
+    /// of its own: they are read through a thread that runs.
+    #[test]
+    fn a_process_is_seen_listening_through_a_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        let task = proc.join("7/task");
+        descriptors::fake_process(proc, 7, &[]);
+        descriptors::fake_process(&task, 7, &[]);
+        descriptors::fake_process(&task, 8, &["socket:[11]"]);
+        fake_net(&task.join("8/net"), &socket("0100007F:EFBE", "0A", 11));
+        let fd = descriptors::refuse(&proc.join("7/fd"));
+        let read = held_in_proc(proc, &[7]);
+        fd.restore();
+        assert_eq!(read.unwrap(), [(7, "127.0.0.1:61374".parse().unwrap())]);
+    }
+
+    /// A real one, read by pid and by port.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_is_seen_listening() {
+        use crate::lifecycle::process::{headless, headless_port};
+        let mut child = headless(&mut Command::new("/usr/bin/python3"))
+            .spawn()
+            .unwrap();
+        let port = headless_port(&mut child);
+        let by_pid = tcp_listeners(child.id());
+        let by_port = tcp_listeners_at(port);
+        let _ = child.kill();
+        let _ = child.wait();
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        assert_eq!(by_pid.unwrap(), [at]);
+        assert!(by_port.unwrap().contains(&(child.id(), at)));
     }
 
     #[test]
