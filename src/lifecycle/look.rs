@@ -1,13 +1,15 @@
 //! One look at what runs of a sandbox's sessions (ADR 0019, ADR 0030).
 //!
 //! A session's members are found from a listing of the host's processes,
-//! then from the processes `lsof` or `/proc` shows holding its marker, always
-//! in that order: each holder is known by the start time the listing gave its
-//! pid, so one that exits and whose pid is reused fails the same-process check
-//! before a signal. With the look at the markers first, the listing would give
-//! it the start time of the process that reused the pid, and that process
-//! would be signalled. A [`Look`] that holds markers can only be made that way, and
-//! it answers for every session of the sandbox from the same listing.
+//! then from the processes `lsof`, on macOS, or `/proc/<pid>/fd`, on Linux,
+//! shows holding its marker, always in that order: each holder is known by the
+//! start time the listing gave its pid, so one that exits and whose pid is
+//! reused fails the same-process check before a signal. With the look at the
+//! markers first, the listing would give it the start time of the process that
+//! reused the pid, and that process would be signalled. A [`Look`] that holds
+//! markers can only be made that way, and it answers for every session of the
+//! sandbox from the same listing. On Linux that look cannot see a zombie or a
+//! process it cannot read, so such a process can hold a marker unseen.
 //!
 //! A look that fails says nothing about any session, so it is an error
 //! rather than an answer, and what it means is the caller's to decide:
@@ -289,8 +291,8 @@ mod tests {
         }
     }
 
-    /// The listing comes first, whatever the markers' look answers: that order is what
-    /// keeps a pid reused from being signalled (ADR 0030).
+    /// The listing comes first, whatever the look at the markers answers: that
+    /// order is what keeps a pid reused from being signalled (ADR 0030).
     #[test]
     fn a_look_lists_the_processes_before_it_looks_at_the_markers() {
         let steps = RefCell::new(Vec::new());
@@ -360,9 +362,9 @@ mod tests {
         assert_eq!(pids(&seen.left(&a).unwrap()), [50]);
     }
 
-    /// A holder `lsof` names that the listing, made first, does not show
-    /// started after it: this look has no start time to know it by, so it
-    /// is no member to signal, but the session is not over.
+    /// A holder the look at the markers names that the listing, made first,
+    /// does not show started after it: this look has no start time to know it
+    /// by, so it is no member to signal, but the session is not over.
     #[test]
     fn a_holder_the_listing_does_not_show_keeps_the_session_open() {
         let a = session(1, 10);
