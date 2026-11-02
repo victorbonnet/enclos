@@ -248,6 +248,16 @@ mod tests {
     /// sandbox's policy.
     const RESOLVED: &str = include_str!("resolved.snapshot");
 
+    /// Compares against a snapshot, or writes it to `write_to` instead: the
+    /// compiled-in text is out of date until the next build.
+    fn same_as_snapshot(got: &str, expected: &str, write_to: Option<&std::path::Path>) {
+        if let Some(file) = write_to {
+            std::fs::write(file, format!("{got}\n")).unwrap();
+            return;
+        }
+        assert_eq!(got.trim_end(), expected.trim_end());
+    }
+
     /// A new sandbox's `policy.toml` with `allow_add` set to `allow`.
     fn overrides(allow: &str) -> String {
         initial_overrides("home", &"assistant".parse().unwrap())
@@ -451,12 +461,18 @@ mod tests {
     fn a_policy_file_resolves_to_the_same_policy_on_every_system() {
         let snap = resolve(&overrides("\"api.example.com\""), None).unwrap();
         let resolved = serde_json::to_string_pretty(&snap.policy).unwrap();
-        if std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some() {
-            let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/policy/resolved.snapshot");
-            std::fs::write(file, format!("{resolved}\n")).unwrap();
-        }
-        assert_eq!(resolved.trim_end(), RESOLVED.trim_end());
+        let file =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/policy/resolved.snapshot");
+        let write = std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some();
+        same_as_snapshot(&resolved, RESOLVED, write.then_some(&file));
+    }
+
+    #[test]
+    fn writing_a_snapshot_does_not_compare_against_the_one_compiled_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("resolved.snapshot");
+        same_as_snapshot("new", "old", Some(&file));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
     }
 
     #[test]
