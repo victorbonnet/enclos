@@ -32,6 +32,8 @@ jobs:
         run: python3 -I prototype/m3/test_compile.py
       - name: The relay's tests (loopback sockets, no host access)
         run: python3 -I prototype/m3/test_relay.py
+      - name: What inside.py does on a failure (a stand-in for the kernel, no host access)
+        run: python3 -I prototype/m3/test_inside.py
       - name: The exec probes' tests (a temporary folder, no host access)
         run: python3 -I prototype/m3/test_probe.py
       - name: The workflow's text
