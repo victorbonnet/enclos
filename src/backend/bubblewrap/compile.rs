@@ -298,8 +298,11 @@ fn compiled_sandbox(
     for root in &elsewhere {
         after.extend(["--tmpfs".to_owned(), text(root)?]);
     }
-    for writable in std::iter::once(&home).chain(&workspaces) {
-        after.extend(["--bind".to_owned(), text(writable)?, text(writable)?]);
+    after.extend(["--bind".to_owned(), text(&home)?, text(&home)?]);
+    // `-try`: a workspace not made yet does not stop the session, as on
+    // Seatbelt, where `policy test` reports it as not run (design §5).
+    for workspace in &workspaces {
+        after.extend(["--bind-try".to_owned(), text(workspace)?, text(workspace)?]);
     }
     // Read-only, for this sandbox alone. Connecting to a socket needs no
     // write access to its mount (ADR 0004). `secrets/` is there only while
@@ -511,6 +514,20 @@ mod tests {
         assert!(!c.after_home_mask.iter().any(|a| a.contains("/.ssh")));
     }
 
+    /// A session starts without a workspace not made yet, as on Seatbelt,
+    /// and `policy test` reports it as not run (design §5). The sandbox's
+    /// home is enclos's own, so a missing one stops the session.
+    #[test]
+    fn a_workspace_not_made_yet_does_not_stop_the_session() {
+        let c = compiled(&policy(&["{home}", "~/proj"], &[]));
+        let args = &c.after_home_mask;
+        assert_eq!(
+            after(args, "--bind"),
+            [format!("{USER}/.enclos/sandboxes/home/home")]
+        );
+        assert_eq!(after(args, "--bind-try"), [format!("{USER}/proj")]);
+    }
+
     /// `/run/user` is on the default deny list, and `--tmpfs /run` hides it.
     #[test]
     fn a_deny_entry_under_the_sandboxs_own_tmpfs_needs_no_mask() {
@@ -611,10 +628,8 @@ mod tests {
         let c = compiled(&policy(&["{home}", "~/proj"], &[]));
         let args = &c.after_home_mask;
         let sandbox = format!("{USER}/.enclos/sandboxes/home");
-        assert_eq!(
-            after(args, "--bind"),
-            [format!("{sandbox}/home"), format!("{USER}/proj")]
-        );
+        assert_eq!(after(args, "--bind"), [format!("{sandbox}/home")]);
+        assert_eq!(after(args, "--bind-try"), [format!("{USER}/proj")]);
         assert_eq!(
             after(args, "--ro-bind"),
             [
