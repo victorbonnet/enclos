@@ -352,6 +352,30 @@ class DenyInsideAGrantTest(Case):
         args = self.compiled("--workspace", f"{h}/d", "--deny", f"{h}/dev/work")["bwrap"]
         self.assertNotIn(f"{h}/dev", self.pairs(args, "--remount-ro"))
 
+    def test_no_remount_lands_two_levels_down_in_a_workspace_reached_through_a_link(self):
+        h = self.h
+        os.symlink("dev", f"{h}/d")
+        args = self.compiled("--workspace", f"{h}/d", "--deny", f"{h}/dev/deep/er")["bwrap"]
+        remounts = self.pairs(args, "--remount-ro")
+        self.assertNotIn(f"{h}/dev", remounts)
+        self.assertNotIn(f"{h}/dev/deep", remounts)
+        self.assertNotIn(f"{h}/dev/deep", self.pairs(args, "--tmpfs"))
+        self.assertEqual(view(args, f"{h}/d/deep/er"), ("--tmpfs", False))
+
+    def test_a_grant_above_the_home_replaces_the_home_and_no_remount_lands_on_it(self):
+        h = self.h
+        above = os.path.dirname(h)
+        args = self.compiled("--read-only", above)["bwrap"]
+        self.assertNotIn(h, self.pairs(args, "--remount-ro"))
+        self.assertNotIn(h, self.pairs(args, "--tmpfs"))
+        self.assertEqual(view(args, f"{h}/.ssh"), ("--tmpfs", False))
+
+    def test_the_listing_holds_nothing_a_grant_replaces(self):
+        h = self.h
+        os.symlink("dev", f"{h}/d")
+        c = self.bare("--workspace", f"{h}/d", "--deny", f"{h}/dev/deep/er")
+        self.assertEqual(set(wrap.read_host(c)["entries"]), {h, f"{h}/.config"})
+
     def test_the_users_whole_home_as_a_workspace(self):
         h = self.h
         args = self.compiled("--workspace", h)["bwrap"]
