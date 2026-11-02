@@ -9,7 +9,9 @@
 //! copy open: the processes holding it are the program and what it started,
 //! unless one closed it or passed it on, or a process outside the sandbox
 //! changed its mode and opened it. `lsof` names them on macOS, and
-//! `/proc/<pid>/fd` on Linux (see `descriptors`).
+//! `/proc/<pid>/fd` on Linux (see `descriptors`). There, `O_PATH` takes no
+//! permission on the file, so any process that reaches the folder can name a
+//! marker with a descriptor; such a descriptor opens nothing and holds nothing.
 //!
 //! A marker is made in the sandbox's `members/` folder before the program
 //! starts, and named after the session's root process (its pid and start
@@ -198,10 +200,14 @@ fn holders_in_proc(
     let processes =
         descriptors::every_process(proc).map_err(|e| MarkerError::Proc(e.to_string()))?;
     for (pid, open) in processes {
-        for target in open {
+        for descriptor in open {
+            let target = &descriptor.target;
             if target.parent() == Some(real.as_path())
                 && let Some(name) = target.file_name().and_then(|n| n.to_str())
                 && markers.contains(name)
+                && descriptor
+                    .opens()
+                    .map_err(|e| MarkerError::Proc(e.to_string()))?
             {
                 held.entry(name.to_owned()).or_default().insert(pid);
             }
@@ -300,6 +306,57 @@ mod tests {
         assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
         assert_eq!(held["root-9-b"], BTreeSet::from([200]));
         assert_eq!(held.len(), 2, "{held:?}");
+    }
+
+    /// `O_PATH` takes no permission on the file, so a process of the user
+    /// passing through the folder must not read as a member; a descriptor
+    /// closed since the folder was read holds nothing.
+    #[test]
+    fn a_descriptor_that_only_names_a_marker_does_not_hold_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().canonicalize().unwrap().join("members");
+        std::fs::create_dir(&members).unwrap();
+        std::fs::write(members.join("root-7-a"), "").unwrap();
+        let path = members.join("root-7-a");
+        let path = path.to_str().unwrap();
+        let proc = dir.path().join("proc");
+        descriptors::fake_process(&proc, std::process::id(), &[]);
+        descriptors::fake_process(&proc, 100, &[path]);
+        descriptors::fake_process(&proc, 200, &[path]);
+        descriptors::fake_process(&proc, 300, &[path]);
+        descriptors::fake_flags(&proc.join("200/fdinfo/0"), "012000000");
+        std::fs::remove_file(proc.join("300/fdinfo/0")).unwrap();
+        let held = holders_in_proc(&proc, &members, std::fs::read_dir(&members).unwrap()).unwrap();
+        assert_eq!(held["root-7-a"], BTreeSet::from([100]));
+    }
+
+    /// The same with the kernel's own `/proc`: the program holds its marker,
+    /// and this process, which opened it `O_PATH` as any process of the user
+    /// can whatever its mode, does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_o_path_descriptor_holds_no_marker() {
+        use rustix::fs::{Mode, OFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().join("members");
+        let marker = Marker::new(&members).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").stdin(Stdio::null());
+        let (mut child, started) = marker.spawn(&mut command).unwrap();
+        let root = ProcessRef {
+            pid: child.id(),
+            started: "Wed Oct 22 12:00:00 2026".to_owned(),
+        };
+        started.name(&root).unwrap();
+        let path = members.join(name_of(&root));
+        let named = rustix::fs::open(&path, OFlags::PATH, Mode::empty()).unwrap();
+        let held = holders(&members);
+        drop(named);
+        let _ = child.kill();
+        let _ = child.wait();
+        let pids = held.unwrap().remove(&name_of(&root)).unwrap_or_default();
+        assert!(pids.contains(&child.id()), "{pids:?}");
+        assert!(!pids.contains(&std::process::id()), "{pids:?}");
     }
 
     #[test]
