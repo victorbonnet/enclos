@@ -187,7 +187,7 @@ From the first three `bwrap-prototype` runs, on PR #113: in each, both jobs pass
 These need an account, so they cannot run in CI. In a disposable VM (Ubuntu 24.04 or Debian 13, x86_64 or arm64), with this repository checked out:
 
 1. `export ENCLOS_PROTO_DISPOSABLE_VM=1`, then `bash prototype/m3/setup-runner.sh`, which installs the packages and finds the AppArmor setting, and `bash prototype/m3/hermes-check.sh`, which installs Hermes in the sandbox's home (`~/.enclos/sandboxes/proto/home`).
-2. Start the proxy in `--learn` mode on the sandbox's socket: `python3 -I prototype/m3/unix-proxy.py --socket ~/.enclos/sandboxes/proto/run/proxy.sock --learn --log login.jsonl &`
+2. Start the proxy in `--learn` mode on the sandbox's socket: `python3 -I prototype/m3/unix-proxy.py --socket ~/.enclos/sandboxes/proto/run/visible/proxy.sock --learn --log login.jsonl &`
 3. Open a shell in the sandbox, full mode, with the relay: `SBX_RELAY=1 prototype/m3/sbx.sh -- /bin/bash`. Its first lines say what `inside.py` applied.
 4. In it, `export PATH="$HOME/.local/bin:$PATH"`, then the device-code login, as the milestone 1 prototype ran it: `hermes auth add openai-codex --no-browser`. Open the URL it prints on another machine and enter the code.
 5. A model call: `hermes -z "Reply with exactly one word: ok" --provider openai-codex -m <a model the account offers>`.
