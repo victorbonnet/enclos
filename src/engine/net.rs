@@ -84,11 +84,11 @@ impl Engine {
     }
 
     /// The proxy's listener on the sandbox's Unix socket, in a folder made
-    /// for it. A failure of either goes by what the sandbox's sessions need. A Seatbelt session
-    /// reaches the proxy over TCP and has no use for the socket, so the
-    /// failure is said on stderr and the proxy serves its port alone: None.
-    /// A session on any other backend would have no way out, so it is an
-    /// error.
+    /// for it. A failure of either goes by what the sandbox's sessions need.
+    /// A Seatbelt session reaches the proxy over TCP and has no use for the
+    /// socket, so the failure is said on stderr and the proxy serves its
+    /// port alone: None. A session on any other backend would have no way
+    /// out, so it is an error.
     pub(super) fn proxy_socket(
         &self,
         name: &SandboxName,
