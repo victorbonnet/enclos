@@ -8,11 +8,14 @@ they run anywhere:
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+M3 = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, M3)
 import compile as comp  # noqa: E402
 import inside
 import wrap
@@ -402,6 +405,38 @@ class DenyInsideAGrantTest(Case):
         h = self.h
         args = self.compiled("--read-only", f"{h}/dev", "--deny", f"{h}/dev/not-yet")["bwrap"]
         self.assertEqual(view(args, f"{h}/dev/not-yet"), ("--ro-bind", False))
+
+
+class SbxWrapStepTest(unittest.TestCase):
+    """sbx.sh in a temporary folder, with a stand-in for lib.sh, the wrap step
+    and bubblewrap, so nothing is sandboxed and no guard is passed."""
+
+    def run_sbx(self, wrap_body):
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            shutil.copy(os.path.join(M3, "sbx.sh"), tmp)
+            with open(f"{tmp}/lib.sh", "w") as f:
+                f.write(f'M3={tmp}\nSBX_COMPILED={tmp}\ncompile_policy() {{ :; }}\n')
+            with open(f"{tmp}/wrap.py", "w") as f:
+                f.write(wrap_body)
+            os.mkdir(f"{tmp}/bin")
+            ran = f"{tmp}/bwrap-ran"
+            with open(f"{tmp}/bin/bwrap", "w") as f:
+                f.write(f'#!/bin/sh\necho "$1" >{ran}\n')
+            os.chmod(f"{tmp}/bin/bwrap", 0o755)
+            env = {**os.environ, "PATH": f"{tmp}/bin:{os.environ['PATH']}"}
+            r = subprocess.run(["bash", f"{tmp}/sbx.sh", "--", "true"], env=env,
+                               capture_output=True, text=True, timeout=20)
+            if not os.path.exists(ran):
+                return r.returncode, None
+            with open(ran) as f:
+                return r.returncode, f.read().strip()
+
+    def test_a_refused_wrap_step_stops_before_bubblewrap(self):
+        self.assertEqual(self.run_sbx("import sys\nsys.exit('refused')\n"), (1, None))
+
+    def test_bubblewrap_gets_what_the_wrap_step_lists(self):
+        code = "import sys\nsys.stdout.write('--listed\\0')\n"
+        self.assertEqual(self.run_sbx(code), (0, "--listed"))
 
 
 if __name__ == "__main__":

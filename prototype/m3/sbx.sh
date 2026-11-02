@@ -19,6 +19,7 @@ extra=()
 [ "${SBX_NEW_SESSION:-0}" = 1 ] && extra+=(--new-session)
 compile_policy "${extra[@]}" || exit 1
 mapfile -d '' args < <(python3 -I "$M3/wrap.py" "$SBX_COMPILED/compiled.json")
+wait $! || exit 1
 
 inside=(--compiled "$SBX_COMPILED/compiled.json"
     --landlock "${SBX_LANDLOCK:-auto}" --seccomp "${SBX_SECCOMP:-on}")
