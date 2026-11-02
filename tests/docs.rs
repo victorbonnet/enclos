@@ -294,3 +294,58 @@ fn doctor_weighs_the_profile_before_printing_it() {
         .expect("§14's item on bubblewrap");
     assert!(item.contains("the narrower of the two tried on Ubuntu 24.04, in a VM"));
 }
+
+/// Paths on the deny list since before Linux's were added, checked or listed
+/// on their own: the rest of `~/.config` and `~/.local` is Linux's.
+const SHARED_DENIES: &[&str] = &[
+    "~/.config/gcloud",
+    "~/.config/gh",
+    "~/.config/hub",
+    "~/.config/glab-cli",
+    "~/.config/rclone",
+    "~/.config/op",
+    "~/.config/opencode",
+    "~/.local/share/fish",
+    "~/.local/share/atuin",
+    "~/.local/share/opencode",
+];
+
+#[test]
+fn every_deny_entry_named_from_memory_is_listed_to_verify() {
+    let defaults = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/policy/templates/defaults.toml"),
+    )
+    .unwrap();
+    let design = design();
+    let to_verify = design
+        .split("Awaiting prototype verification")
+        .last()
+        .unwrap();
+    let elsewhere = [
+        "~/.pki",
+        "~/.mozilla",
+        "~/.thunderbird",
+        "~/snap",
+        "~/.var/app",
+        "~/.1password",
+        "~/.bitwarden-ssh-agent.sock",
+        "~/Library/Application Support/Signal",
+        "~/Library/Application Support/Slack",
+        "~/Library/Application Support/discord",
+        "~/Library/Application Support/Telegram Desktop",
+    ];
+    let entries = defaults
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.strip_suffix("\","))
+        .filter(|entry| {
+            entry.starts_with('/')
+                || entry.starts_with("~/.config/")
+                || entry.starts_with("~/.local/")
+                || elsewhere.contains(entry)
+        })
+        .filter(|entry| !SHARED_DENIES.contains(entry));
+    let missing: Vec<&str> = entries
+        .filter(|entry| !to_verify.contains(&format!("`{entry}`")))
+        .collect();
+    assert!(missing.is_empty(), "not listed to verify: {missing:?}");
+}
