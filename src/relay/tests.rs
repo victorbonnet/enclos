@@ -1,6 +1,6 @@
 //! The relay over a loopback port and a Unix socket in a temporary folder.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -103,6 +103,11 @@ fn accepted_within(listener: &UnixListener, patience: Duration) -> UnixStream {
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
+}
+
+/// `len` bytes of `chunk` over and over.
+fn pattern_of(chunk: &[u8], len: usize) -> Vec<u8> {
+    chunk.iter().copied().cycle().take(len).collect()
 }
 
 fn all_of(mut from: impl Read) -> Vec<u8> {
@@ -218,6 +223,40 @@ fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
     drop(client);
 }
 
+/// A proxy refusing a request whose body it did not read: the upload fails
+/// on a closed socket while the refusal is still on its way down.
+#[test]
+fn a_failed_upload_leaves_the_answer_on_its_way_to_the_client() {
+    let relay = Relay::start();
+    let mut client = relay.client();
+    let upstream = relay.accepted();
+    let writer = client.try_clone().unwrap();
+    let write = thread::spawn(move || {
+        let chunk = pattern(64 * 1024, 3);
+        while (&writer).write_all(&chunk).is_ok() {}
+    });
+    // The client reads nothing yet, so the relay stops on it with the rest
+    // of the answer still in the socket when upstream closes.
+    upstream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let chunk = pattern(64 * 1024, 4);
+    let mut answered = 0;
+    let stopped = loop {
+        match (&upstream).write(&chunk) {
+            Ok(wrote) => answered += wrote,
+            Err(e) => break e,
+        }
+        assert!(answered < LARGE, "nothing held the answer back");
+    };
+    assert_eq!(stopped.kind(), ErrorKind::WouldBlock);
+    drop(upstream);
+    let mut got = vec![0; answered];
+    client.read_exact(&mut got).unwrap();
+    assert!(got == pattern_of(&chunk, answered), "the answer changed");
+    write.join().unwrap();
+}
+
 /// macOS answers ENOTCONN to telling a peer that has closed, and Linux does
 /// not: the other direction may still be carrying that peer's last bytes.
 #[test]
@@ -226,7 +265,7 @@ fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction()
     pass_on(
         &b"last"[..],
         &mut sent,
-        || Err(std::io::ErrorKind::NotConnected.into()),
+        || Err(ErrorKind::NotConnected.into()),
         || panic!("the other direction was ended"),
     );
     assert_eq!(sent, b"last");
