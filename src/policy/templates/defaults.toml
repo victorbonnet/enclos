@@ -109,6 +109,15 @@ read_deny = [
     "~/.thunderbird",
     "~/.config/evolution",
     "~/.local/share/evolution",
+    # Messaging apps: chats and logged-in sessions
+    "~/Library/Application Support/Signal",
+    "~/Library/Application Support/Slack",
+    "~/Library/Application Support/discord",
+    "~/Library/Application Support/Telegram Desktop",
+    "~/.config/Signal",
+    "~/.config/Slack",
+    "~/.config/discord",
+    "~/.local/share/TelegramDesktop",
     # Password managers
     "~/Library/Application Support/1Password",
     "~/Library/Group Containers/2BUA8C4S2C.com.1password",
