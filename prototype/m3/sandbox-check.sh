@@ -14,7 +14,8 @@
 #   + seccomp, no Landlock what ADR 0037 runs where the kernel has no Landlock
 #   + Landlock, no seccomp what Landlock alone adds
 #   full                   Landlock and seccomp, as on Ubuntu and Debian
-#   full, --new-session    the same, bubblewrap's setsid on (TIOCSTI only)
+#   --new-session          Landlock, no seccomp, bubblewrap's setsid on
+#                          (TIOCSTI only)
 #
 # Acts on the host (plants files in the home, runs bubblewrap): CI only.
 set -u
