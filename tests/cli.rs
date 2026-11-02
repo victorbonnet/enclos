@@ -4885,6 +4885,30 @@ fn a_relay_whose_stderr_was_closed_lives_through_what_it_cannot_say() {
     drop(held);
 }
 
+/// With the listener its last descriptor, every accept fails. The smallest
+/// limit it can listen on depends on what the system's startup keeps open.
+#[test]
+fn a_relay_that_cannot_accept_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let mut relay = (4..16)
+        .find_map(|limit| RelayCommand::with_descriptors(&path, Some(limit)))
+        .expect("it never listened");
+    // Its backoff is 100 ms: several tries.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    relay.child.kill().unwrap();
+    relay.child.wait().unwrap();
+    let mut said = String::new();
+    let stderr = relay.child.stderr.as_mut().unwrap();
+    std::io::Read::read_to_string(stderr, &mut said).unwrap();
+    assert_eq!(
+        said.matches("cannot accept a connection").count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(said.lines().count(), 1, "{said}");
+}
+
 #[test]
 fn a_relay_port_already_taken_is_an_error_naming_it() {
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
