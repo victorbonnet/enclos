@@ -169,7 +169,7 @@ impl Engine {
     pub fn open(layout: Layout) -> Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
-        let services = crate::service::host(layout.user_home());
+        let services = crate::service::host(&layout);
         let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
             Ok(install) => crate::secrets::host(format!("enclos.{install}")),
             Err(e) => Box::new(crate::secrets::Unavailable {

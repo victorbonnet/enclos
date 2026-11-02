@@ -10,8 +10,10 @@ pub mod systemd;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::layout::Layout;
 
 /// A service's name for the service manager, unique on the host:
 /// `enclos.<install>.<sandbox>.<service>`, such as
@@ -115,21 +117,21 @@ pub trait ServiceManager {
 /// This host's service manager: launchd on macOS, systemd on Linux. Other
 /// systems have none, and refuse to start services.
 #[cfg(target_os = "macos")]
-pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
-    Box::new(launchd::Launchd::for_user(user_home))
+pub fn host(layout: &Layout) -> Box<dyn ServiceManager> {
+    Box::new(launchd::Launchd::for_user(layout.user_home()))
 }
 
 /// This host's service manager: launchd on macOS, systemd on Linux. Other
 /// systems have none, and refuse to start services.
 #[cfg(target_os = "linux")]
-pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
-    Box::new(systemd::Systemd::for_user(user_home))
+pub fn host(layout: &Layout) -> Box<dyn ServiceManager> {
+    Box::new(systemd::Systemd::for_user(layout.units_dir()))
 }
 
 /// This host's service manager: launchd on macOS, systemd on Linux. Other
 /// systems have none, and refuse to start services.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn host(_user_home: &Path) -> Box<dyn ServiceManager> {
+pub fn host(_layout: &Layout) -> Box<dyn ServiceManager> {
     Box::new(Unsupported {
         why: "enclos runs background services only on macOS and Linux",
     })
@@ -175,7 +177,7 @@ mod tests {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn this_system_has_no_service_manager() {
-        let host = host(Path::new("/home/alice"));
+        let host = host(&Layout::at("/home/alice/.enclos"));
         let err = host.available().unwrap_err();
         assert!(err.what.contains("only on macOS and Linux"), "{err}");
         assert!(host.installed(LABEL_PREFIX).unwrap().is_empty());
