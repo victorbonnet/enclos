@@ -150,6 +150,11 @@ read_deny = [
     "~/.config/containers",
     "~/.local/share/containers",
     "~/.local/share/docker",
+    # LXD's and Incus's sockets, as much a way to root as Docker's, and in
+    # folders of `/var` the sandbox's own `/run` and `/tmp` do not cover
+    "/var/snap/lxd",
+    "/var/lib/lxd",
+    "/var/lib/incus",
     # The host's own assistant tools' configuration and logins
     "~/.claude",
     "~/.claude.json",
