@@ -198,9 +198,12 @@ fn exec_word(text: &str) -> String {
 /// its output in the unit's log. systemd sleeps `RestartSec` before every
 /// restart, where launchd's throttle only spaces two starts, so the first
 /// waits a second and a crash loop grows to the 10 launchd takes. `stop`
-/// sends TERM to the program alone, which may be stopping what it runs, and KILL to what is left when it
-/// exits or after the unit's stop timeout. An error when the log's path
-/// cannot be written in a unit file, where `append:` takes no quoting.
+/// sends TERM to the program alone, which may be stopping what it runs, and
+/// KILL to what stays in the unit's cgroup when it exits or after the unit's
+/// stop timeout: the proxy, or `enclos launch` itself. A runtime service's
+/// program runs in a scope of its own (design §8), so it is `launch`'s to stop.
+/// An error when the log's path cannot be written in a unit file, where
+/// `append:` takes no quoting.
 pub fn unit_file(unit: &ServiceUnit) -> Result<String, ServiceError> {
     let log = unit.log.display().to_string();
     if log.chars().any(|c| c.is_control()) {
