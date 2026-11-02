@@ -277,7 +277,9 @@ mod tests {
     }
 
     /// The folder's markers held under a `/proc` of the test's own: each
-    /// process's descriptors, whatever they name, sorted out by marker.
+    /// process's descriptors, whatever they name, sorted out by marker. The
+    /// folder is asked for through a link, as a home may be, and `/proc`
+    /// writes real paths.
     #[test]
     fn proc_gives_each_sessions_holders() {
         let dir = tempfile::tempdir().unwrap();
@@ -302,7 +304,9 @@ mod tests {
                 "/elsewhere/root-7-a",
             ],
         );
-        let held = holders_in_proc(&proc, &members, std::fs::read_dir(&members).unwrap()).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&members, &link).unwrap();
+        let held = holders_in_proc(&proc, &link, std::fs::read_dir(&link).unwrap()).unwrap();
         assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
         assert_eq!(held["root-9-b"], BTreeSet::from([200]));
         assert_eq!(held.len(), 2, "{held:?}");
