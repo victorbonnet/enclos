@@ -809,6 +809,7 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            hidden_files: crate::probes::hidden_in(&dir.join("enclos")),
             sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: vec![dir.join("enclos/sandboxes/lab")],
             writes: vec![dir.join("enclos/sandboxes/home/home")],

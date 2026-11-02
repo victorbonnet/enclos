@@ -471,11 +471,12 @@ fn users_alone(dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A sandbox never reads the file store, its leftovers included: a hidden
-    /// file covers every name that starts with it.
+    /// The file store is on the list Seatbelt's rules and the probes read.
+    /// That a sandbox cannot read it is for the backend's rules and those
+    /// probes to show, not this list.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_file_store_is_hidden_from_sandboxes() {
+    fn the_file_store_is_on_the_hidden_files() {
         let layout = Layout::at("/data/enclos");
         assert!(layout.hidden_files().contains(&layout.secrets_file()));
         assert!(layout.secrets_file().starts_with(layout.data()));

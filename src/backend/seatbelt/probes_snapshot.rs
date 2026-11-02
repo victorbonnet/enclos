@@ -51,6 +51,7 @@ fn inputs(dir: &Path, listen: bool) -> ProbeInputs {
         user_home: user.clone(),
         data: data.clone(),
         config_file: data.join("config.toml"),
+        hidden_files: crate::probes::hidden_in(&data),
         sandbox_dir: sandbox.clone(),
         other_sandboxes: vec![data.join("sandboxes/lab")],
         writes: vec![sandbox.join("home"), work.clone()],
