@@ -119,7 +119,7 @@ fn held_in_proc(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, Lis
         match descriptors::of(proc, pid).map_err(proc_error)? {
             Descriptors::Open(open) => found.extend(
                 open.iter()
-                    .filter_map(|t| sockets.get(&socket_inode(t)?))
+                    .filter_map(|d| sockets.get(&socket_inode(&d.target)?))
                     .map(|addr| (pid, *addr)),
             ),
             Descriptors::Gone => {}
@@ -152,7 +152,7 @@ fn holders_in_proc(proc: &Path, port: u16) -> Result<Vec<(u32, SocketAddr)>, Lis
     for (pid, open) in descriptors::every_process(proc).map_err(proc_error)? {
         if open
             .iter()
-            .filter_map(|t| socket_inode(t))
+            .filter_map(|d| socket_inode(&d.target))
             .any(|inode| sockets.contains(&inode))
         {
             found.insert((pid, at));

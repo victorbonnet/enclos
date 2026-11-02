@@ -14,12 +14,50 @@ use std::path::{Path, PathBuf};
 /// Where the kernel shows its processes.
 pub const PROC: &str = "/proc";
 
+/// `O_PATH` as `fdinfo` writes it, on x86-64 and arm64.
+const O_PATH: u32 = 0o10000000;
+
+/// One open descriptor of a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Descriptor {
+    /// What it names, as `/proc` writes it: a real path, ` (deleted)` after
+    /// one removed, `socket:[<inode>]` for a socket.
+    pub target: PathBuf,
+    /// Where `/proc` gives its flags.
+    info: PathBuf,
+}
+
+impl Descriptor {
+    /// Whether it opens what it names. An `O_PATH` descriptor does not, and
+    /// it takes no permission on the file, so it proves nothing about who
+    /// holds it. One closed since, or of a process that can no longer be
+    /// read, opens nothing that can be seen.
+    pub fn opens(&self) -> io::Result<bool> {
+        let text = match std::fs::read_to_string(&self.info) {
+            Err(e) if is_gone(&e) || e.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(false);
+            }
+            text => text?,
+        };
+        let flags = text
+            .lines()
+            .find_map(|line| line.strip_prefix("flags:"))
+            .and_then(|flags| u32::from_str_radix(flags.trim(), 8).ok());
+        match flags {
+            Some(flags) => Ok(flags & O_PATH == 0),
+            None => Err(io::Error::other(format!(
+                "{} shows no flags",
+                self.info.display()
+            ))),
+        }
+    }
+}
+
 /// What a look at one process's descriptors found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Descriptors {
-    /// The target of each open descriptor, as `/proc` writes it: a real
-    /// path, ` (deleted)` after one removed, `socket:[<inode>]` for a socket.
-    Open(Vec<PathBuf>),
+    /// Each open descriptor.
+    Open(Vec<Descriptor>),
     /// No such process.
     Gone,
     /// The process exists, but this user cannot read its descriptors.
@@ -42,6 +80,7 @@ pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
         }
         entries => entries?,
     };
+    let info = proc.join(pid.to_string()).join("fdinfo");
     let mut open = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -49,7 +88,10 @@ pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
             entry => entry?,
         };
         match std::fs::read_link(entry.path()) {
-            Ok(target) => open.push(target),
+            Ok(target) => open.push(Descriptor {
+                target,
+                info: info.join(entry.file_name()),
+            }),
             // Closed since the folder was read.
             Err(e) if is_gone(&e) => {}
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -67,7 +109,7 @@ pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
 /// The descriptors of every process this user can read, by pid. A listing
 /// where this process itself cannot be read shows nothing it can be trusted
 /// for, so it is an error, as `process::processes` treats its own.
-pub fn every_process(proc: &Path) -> io::Result<Vec<(u32, Vec<PathBuf>)>> {
+pub fn every_process(proc: &Path) -> io::Result<Vec<(u32, Vec<Descriptor>)>> {
     let me = std::process::id();
     let mut found = Vec::new();
     for entry in std::fs::read_dir(proc)? {
@@ -87,14 +129,24 @@ pub fn every_process(proc: &Path) -> io::Result<Vec<(u32, Vec<PathBuf>)>> {
     }
 }
 
-/// A `/proc` of a test's own: a process with these descriptor targets.
+/// A `/proc` of a test's own: a process with these descriptor targets, each
+/// open for reading and writing.
 #[cfg(test)]
 pub fn fake_process(proc: &Path, pid: u32, targets: &[&str]) {
     let fd = proc.join(pid.to_string()).join("fd");
+    let info = proc.join(pid.to_string()).join("fdinfo");
     std::fs::create_dir_all(&fd).unwrap();
+    std::fs::create_dir_all(&info).unwrap();
     for (n, target) in targets.iter().enumerate() {
         std::os::unix::fs::symlink(target, fd.join(n.to_string())).unwrap();
+        fake_flags(&info.join(n.to_string()), "0100002");
     }
+}
+
+/// `flags`, in octal, as the `fdinfo` file at `info` writes them.
+#[cfg(test)]
+pub fn fake_flags(info: &Path, flags: &str) {
+    std::fs::write(info, format!("pos:\t0\nflags:\t{flags}\nmnt_id:\t1\n")).unwrap();
 }
 
 #[cfg(test)]
@@ -116,7 +168,10 @@ mod tests {
         let found = every_process(proc.path()).unwrap();
         let held = found.iter().find(|(pid, _)| *pid == 7).unwrap();
         assert_eq!(held.1.len(), 2, "{found:?}");
-        assert!(held.1.contains(&PathBuf::from("socket:[12]")), "{found:?}");
+        assert!(
+            held.1.iter().any(|d| d.target == Path::new("socket:[12]")),
+            "{found:?}"
+        );
         assert_eq!(found.len(), 2, "{found:?}");
     }
 
@@ -127,6 +182,32 @@ mod tests {
         let err = every_process(proc.path()).unwrap_err();
         assert!(err.to_string().contains("the caller"), "{err}");
         assert!(every_process(&proc.path().join("none")).is_err());
+    }
+
+    /// `fdinfo`'s flags say what a descriptor opens, and one that shows none
+    /// is a look that failed.
+    #[test]
+    fn a_descriptor_opens_its_target_unless_it_is_o_path_or_closed() {
+        let proc = tempfile::tempdir().unwrap();
+        fake_process(proc.path(), 7, &["/a", "/b", "/c", "/d"]);
+        let info = proc.path().join("7/fdinfo");
+        fake_flags(&info.join("1"), "012000000");
+        std::fs::remove_file(info.join("2")).unwrap();
+        std::fs::write(info.join("3"), "pos:\t0\n").unwrap();
+        let Descriptors::Open(mut open) = of(proc.path(), 7).unwrap() else {
+            panic!("the process cannot be read");
+        };
+        open.sort_by(|a, b| a.target.cmp(&b.target));
+        assert!(open[0].opens().unwrap());
+        assert!(!open[1].opens().unwrap());
+        assert!(!open[2].opens().unwrap());
+        assert!(open[3].opens().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn o_path_is_the_kernels() {
+        assert_eq!(O_PATH, rustix::fs::OFlags::PATH.bits());
     }
 
     /// A descriptor on a folder deeper than `/proc` can write, past any page
