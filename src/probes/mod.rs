@@ -60,7 +60,7 @@ impl Refusal {
     }
 
     /// A `case` pattern that matches an output with any of the texts.
-    fn case_pattern(&self) -> String {
+    pub(crate) fn case_pattern(&self) -> String {
         let each: Vec<String> = self.0.iter().map(|text| format!("*'{text}'*")).collect();
         each.join("|")
     }
@@ -97,10 +97,11 @@ pub enum Expect {
     /// A folder renamed or cloned into itself, which the filesystem refuses
     /// (`Invalid argument`; a volume that cannot clone refuses a clone with
     /// another error), so nothing moves or is copied even when the rule does
-    /// not hold. Closed on the backend's refusal, alone on the last line as
-    /// the script prints it, which comes first; the filesystem's means the call got past `backend`: open. Any other
-    /// failure is inconclusive. The control is the same call on the host,
-    /// which works when the filesystem refuses it there.
+    /// not hold. Fits a backend that refuses before the filesystem does: closed
+    /// on its refusal, alone on the last line as the script prints it; the
+    /// filesystem's means the call got past `backend`: open. Any other failure
+    /// is inconclusive. The control is the same call on the host, which works
+    /// when the filesystem refuses it there.
     IntoItself {
         refusal: Refusal,
         backend: &'static str,
@@ -284,7 +285,8 @@ impl ProbeResult {
 pub struct ReportNotes {
     /// The host, as a sentence says it.
     pub host: &'static str,
-    /// What moves a folder that cannot move, as the probes try it.
+    /// What moves a folder that cannot move, as the probes try it, or nothing
+    /// for a backend with no such probes.
     pub folder_moves: &'static str,
     /// Who else can close a probe, for a test where nothing else did: `,
     /// only by ... if any`, or nothing.
@@ -319,8 +321,18 @@ pub trait OwnProbes {
     /// Stands in for [`OwnProbes::set_up`] on a dry run, only to count the
     /// probes.
     fn count_only(&mut self, _name: &SandboxName) {}
-    /// Probes of a folder that cannot move, beside its rename.
+    /// Probes of a folder that cannot move, in the order of
+    /// [`ProbeInputs::unmovable`].
     fn of_folder(&self, _folder: &Path, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// Probes that the home and each workspace stay where they are, after
+    /// the writes.
+    fn folders(&self, _i: &ProbeInputs) -> Vec<Probe> {
+        Vec::new()
+    }
+    /// What [`OwnProbes::folders`] could not try, each as a probe not run.
+    fn folders_not_run(&self, _i: &ProbeInputs) -> Vec<ProbeResult> {
         Vec::new()
     }
     /// Network probes, after the shared ones.
@@ -493,131 +505,6 @@ fn denied_under_grant_probe(path: &Path, tag: u32) -> Probe {
     }
 }
 
-/// A change to a folder itself that the file system refuses anyway (a
-/// folder that is not empty cannot be removed, nor moved inside itself), so
-/// the probe changes nothing whether the rule holds or not. The backend
-/// checks before the file system does, so only its refusal is the policy's;
-/// any other answer means the policy let the change through, which the
-/// script reports as a success, so the probe reads as open. `prepare` runs
-/// first, and if it fails the probe is inconclusive, never closed. The
-/// control runs the same on the host, where the change must fail without
-/// that refusal: then the refusal inside is the policy's, not a file flag's
-/// or another rule's.
-fn folder_probe(
-    name: impl Into<String>,
-    prepare: Option<String>,
-    change: String,
-    refusal: &Refusal,
-) -> Probe {
-    let prepare = prepare.map_or(String::new(), |p| {
-        format!("{p} 2>/dev/null || {{ echo 'could not prepare the probe'; exit 2; }}; ")
-    });
-    let refused = format!(
-        "out=$({change} 2>&1); case \"$out\" in {}) echo \"$out\"; exit 1;; esac",
-        refusal.case_pattern()
-    );
-    probe(
-        "writable folders",
-        name,
-        format!("{prepare}{refused}; echo \"the policy let it through: $out\""),
-        Expect::FailsWith(refusal.clone()),
-        format!("{prepare}{refused}"),
-    )
-}
-
-/// Probes that the home and each workspace stay where they are: the
-/// sandbox may neither remove nor rename them (design §5).
-fn folder_probes(i: &ProbeInputs, refusal: &Refusal) -> Vec<Probe> {
-    // The home holds `tmp/`, made again first so that it is never empty and
-    // the removal never happens.
-    let mut list = vec![folder_probe(
-        "remove the sandbox home",
-        Some(format!("/bin/mkdir -p {}", sh_quote(&i.home.join("tmp")))),
-        format!("/bin/rmdir {}", sh_quote(&i.home)),
-        refusal,
-    )];
-    // A workspace not made yet has nothing to rename: see
-    // `missing_workspaces`.
-    let workspaces = i.workspaces.iter().filter(|w| w.is_dir());
-    for folder in std::iter::once(&i.home).chain(workspaces) {
-        list.push(folder_probe(
-            format!("rename {}", folder.display()),
-            None,
-            format!(
-                "/bin/mv {} {}",
-                sh_quote(folder),
-                sh_quote(&folder.join("enclos-probe-moved"))
-            ),
-            refusal,
-        ));
-    }
-    list
-}
-
-/// The workspaces that are not folders yet, each as a probe not run: the
-/// sandbox may not create a workspace (design §5), so the user must, and
-/// until then the report says why it was not probed.
-pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
-    i.workspaces
-        .iter()
-        .filter(|w| !w.is_dir())
-        .map(|w| ProbeResult {
-            route: "writable folders",
-            name: format!("rename {}", w.display()),
-            outcome: Outcome::NotRun(
-                "it is not a folder yet, and the sandbox may not create it: create it on the host"
-                    .into(),
-            ),
-            closed_by: None,
-        })
-        .collect()
-}
-
-/// Renames `folder` into itself, with rename(2) through perl: the filesystem
-/// refuses that whatever the policy, so the folder never moves, and the
-/// same call on the host is the control.
-fn rename_probe(folder: &Path, tag: u32, own: &dyn OwnProbes) -> Probe {
-    into_itself(
-        "renames",
-        "rename",
-        "rename($ARGV[0], $ARGV[1])",
-        folder,
-        tag,
-        own,
-    )
-}
-
-/// A probe whose perl `call` acts on `folder` and a path inside it
-/// (`$ARGV[0]`, `$ARGV[1]`): see [`Expect::IntoItself`]. Both the probe and
-/// its control print why they failed, and say what a success may have left.
-pub(crate) fn into_itself(
-    route: &'static str,
-    verb: &str,
-    call: &str,
-    folder: &Path,
-    tag: u32,
-    own: &dyn OwnProbes,
-) -> Probe {
-    let script = |on_success: &str, on_failure: &str| {
-        format!(
-            "/usr/bin/perl -e 'if ({call}) {{ print \"it succeeded, so $ARGV[1] may now exist\\n\"; {on_success} }} {on_failure}' {} {}",
-            sh_quote(folder),
-            sh_quote(&folder.join(format!("enclos-probe-{tag}")))
-        )
-    };
-    probe(
-        route,
-        format!("{verb} {}", folder.display()),
-        script("exit 0", "die \"$!\\n\""),
-        Expect::IntoItself {
-            refusal: own.refusal(),
-            backend: own.name(),
-        },
-        // The filesystem's refusal is the control working.
-        script("exit 1", "exit 0 if $!{EINVAL}; die \"$!\\n\""),
-    )
-}
-
 /// A request through the sandbox's proxy, which must answer 403. Even with
 /// `NO_PROXY` set in the sandbox, curl is told to use the proxy.
 fn proxy_probe(name: &str, url: &str) -> Probe {
@@ -655,7 +542,6 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
         list.push(denied_under_grant_probe(path, i.tag));
     }
     for folder in i.unmovable.iter().filter(|f| f.is_dir()) {
-        list.push(rename_probe(folder, i.tag, own));
         list.extend(own.of_folder(folder, i));
     }
     for path in [
@@ -710,7 +596,7 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
         "write outside the home",
         i.user_home.join(format!("enclos-probe-{}", i.tag)),
     ));
-    list.extend(folder_probes(i, &refusal));
+    list.extend(own.folders(i));
 
     // Refused in either network mode (ADR 0025): a port public mode does not
     // open, and addresses no mode reaches, asked for by name through the proxy.
@@ -829,10 +715,10 @@ pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
         ));
     }
     let not_folders = i.unmovable.iter().filter(|f| !f.is_dir()).count();
-    if not_folders > 0 {
+    let folder_moves = own.notes().folder_moves;
+    if not_folders > 0 && !folder_moves.is_empty() {
         absent.push(format!(
-            "{} of {not_folders} of the {} folders that cannot move (they are not folders here)",
-            own.notes().folder_moves,
+            "{folder_moves} of {not_folders} of the {} folders that cannot move (they are not folders here)",
             i.unmovable.len()
         ));
     }
@@ -1014,7 +900,6 @@ pub(crate) fn last_line(output: &str) -> String {
 mod tests {
     use super::*;
     use crate::backend::seatbelt::probes::SeatbeltProbes;
-    use std::process::Command;
 
     fn inputs(dir: &Path) -> ProbeInputs {
         std::fs::create_dir_all(dir.join("it's here")).unwrap();
@@ -1280,89 +1165,6 @@ mod tests {
     }
 
     #[test]
-    fn the_home_and_each_workspace_are_probed_and_only_the_policy_closes_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut i = inputs(dir.path());
-        // Only a workspace that exists has anything to rename.
-        i.workspaces.push(dir.path().join("not-made-yet"));
-        std::fs::create_dir(dir.path().join("work")).unwrap();
-        let list = probes(&i);
-        let folders: Vec<&Probe> = list
-            .iter()
-            .filter(|p| p.route == "writable folders")
-            .collect();
-        let names: Vec<&str> = folders.iter().map(|p| p.name.as_str()).collect();
-        let home = dir.path().join("enclos/sandboxes/home/home");
-        assert_eq!(
-            names,
-            [
-                "remove the sandbox home".to_owned(),
-                format!("rename {}", home.display()),
-                format!("rename {}", dir.path().join("work").display()),
-            ]
-        );
-        let missing = missing_workspaces(&i);
-        assert_eq!(missing.len(), 1);
-        assert!(matches!(&missing[0].outcome, Outcome::NotRun(_)));
-        std::fs::create_dir_all(&home).unwrap();
-        let on_host = |p: &Probe| {
-            let Proof::Control { control, .. } = &p.proof else {
-                panic!("{}", p.name)
-            };
-            Command::new("/bin/sh")
-                .args(["-c", control.as_str()])
-                .status()
-                .unwrap()
-                .success()
-        };
-        for p in &folders {
-            // Each change is one the file system refuses anyway (a removal
-            // of a folder made non-empty first, or a move inside itself),
-            // and on the host it fails without the policy's refusal.
-            assert!(on_host(p), "{}", p.name);
-            assert!(matches!(
-                proven(p, ran(false, "could not prepare the probe")),
-                Outcome::Inconclusive(_)
-            ));
-            assert_eq!(
-                proven(p, ran(false, "rmdir: x: Operation not permitted")),
-                Outcome::Closed
-            );
-            // The file system's own refusal means the policy let it through.
-            assert!(matches!(
-                proven(
-                    p,
-                    ran(true, "the policy let it through: Directory not empty")
-                ),
-                Outcome::Open(_)
-            ));
-        }
-        for folder in [&home, &dir.path().join("work")] {
-            assert!(folder.is_dir() && !folder.join("enclos-probe-moved").exists());
-        }
-        // A home the host itself may not remove (a file flag): its control
-        // fails, so `Operation not permitted` inside would prove nothing.
-        // `chflags` and the user immutable flag are macOS's; Linux has no
-        // such flag a user can set without root.
-        #[cfg(target_os = "macos")]
-        {
-            let flag = |f: &str| {
-                assert!(
-                    Command::new("/usr/bin/chflags")
-                        .args([f, home.to_str().unwrap()])
-                        .status()
-                        .unwrap()
-                        .success()
-                );
-            };
-            flag("uchg");
-            let removal = on_host(folders[0]);
-            flag("nouchg");
-            assert!(!removal);
-        }
-    }
-
-    #[test]
     fn without_a_target_there_is_no_signal_probe() {
         let dir = tempfile::tempdir().unwrap();
         let mut i = inputs(dir.path());
@@ -1531,8 +1333,11 @@ mod tests {
     /// call was never tried.
     #[test]
     fn a_call_into_itself_is_closed_only_by_the_refusal_alone_on_the_last_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = into_itself("renames", "rename", "1", dir.path(), 7, &Plain);
+        let expect = Expect::IntoItself {
+            refusal: Plain.refusal(),
+            backend: Plain.name(),
+        };
+        let p = probe("renames", "rename", "true", expect, "true");
         for refusal in [
             "No such file or directory",
             "Read-only file system\n",
@@ -1575,7 +1380,7 @@ mod tests {
         fn notes(&self) -> ReportNotes {
             ReportNotes {
                 host: "this host",
-                folder_moves: "renames",
+                folder_moves: "",
                 only_apart: "",
                 host_service_routes: &[],
                 not_probed: &[],
@@ -1592,11 +1397,9 @@ mod tests {
         let list = super::probes(&i, &Plain);
         let routes: Vec<&str> = list.iter().map(|p| p.route).collect();
         for route in [
-            "renames",
             "other sandboxes",
             "enclos files",
             "writes",
-            "writable folders",
             "network",
             "dns",
             "host sockets",
@@ -1605,18 +1408,31 @@ mod tests {
         ] {
             assert!(routes.contains(&route), "{route}");
         }
-        for route in ["clones", "keychain", "pasteboard", "crontab", "at"] {
+        // How a folder answers a rename is the filesystem's and the mount's,
+        // so moving one is each backend's probe.
+        for route in [
+            "renames",
+            "writable folders",
+            "clones",
+            "keychain",
+            "pasteboard",
+            "crontab",
+            "at",
+        ] {
             assert!(!routes.contains(&route), "{route}");
         }
         for p in &list {
             assert!(!p.script.contains("Operation not permitted"), "{}", p.name);
+            assert!(!p.script.contains("/bin/mv"), "{}", p.name);
             assert_eq!(p.closed_by, None, "{}", p.name);
         }
         assert!(Plain.host_services(&i).is_empty());
+        assert!(Plain.folders(&i).is_empty() && Plain.folders_not_run(&i).is_empty());
+        // No folder probes, so no sentence about what they left out.
         assert!(
-            super::not_here(&i, &Plain)
+            !super::not_here(&i, &Plain)
                 .join("; ")
-                .contains("renames of 1 of the 2 folders")
+                .contains("folders that cannot move")
         );
     }
 
@@ -1626,30 +1442,16 @@ mod tests {
     fn a_probe_is_closed_by_any_refusal_of_its_backend_and_no_other() {
         let dir = tempfile::tempdir().unwrap();
         let list = super::probes(&inputs(dir.path()), &Plain);
-        for route in ["terminals", "writable folders", "renames"] {
-            let p = find(&list, route);
-            for refusal in ["No such file or directory", "Read-only file system"] {
-                assert_eq!(proven(p, ran(false, refusal)), Outcome::Closed, "{route}");
-            }
-            assert!(
-                matches!(
-                    proven(p, ran(false, "Operation not permitted")),
-                    Outcome::Inconclusive(why) if why.contains("No such file or directory or Read-only file system")
-                ),
-                "{route}"
-            );
+        let p = find(&list, "terminals");
+        for refusal in [
+            "/bin/sh: x: No such file or directory",
+            "Read-only file system",
+        ] {
+            assert_eq!(proven(p, ran(false, refusal)), Outcome::Closed);
         }
-        // What the filesystem says of a folder into itself is the backend's
-        // letting it through, whichever backend it is.
         assert!(matches!(
-            proven(find(&list, "renames"), ran(false, "Invalid argument")),
-            Outcome::Open(why) if why.contains("Plain let the call through")
+            proven(p, ran(false, "Operation not permitted")),
+            Outcome::Inconclusive(why) if why.contains("No such file or directory or Read-only file system")
         ));
-        // Each refusal in the script, so that either stops the folder probe.
-        assert!(
-            find(&list, "writable folders").script.contains(
-                "case \"$out\" in *'No such file or directory'*|*'Read-only file system'*)"
-            )
-        );
     }
 }
