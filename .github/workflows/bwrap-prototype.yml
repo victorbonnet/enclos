@@ -34,7 +34,9 @@ jobs:
         run: python3 -I prototype/m3/test_relay.py
       - name: What inside.py does on a failure (a stand-in for the kernel, no host access)
         run: python3 -I prototype/m3/test_inside.py
-      - name: The exec probes' tests (a temporary folder, no host access)
+      - name: The probes' tests (a temporary folder, a namespace in a process of its own)
+        env:
+          ENCLOS_PROTO_NAMESPACES: "1"
         run: python3 -I prototype/m3/test_probe.py
       - name: The workflow's text
         run: python3 -I prototype/m3/test_workflow.py

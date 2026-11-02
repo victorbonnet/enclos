@@ -7,8 +7,10 @@ in each mode, so a refusal is read against what the host does.
     python3 -I probe.py 'read /home/u/.ssh/id' 'write /usr/x' 'tiocsti' ...
 
 Probes that would change something undo it: a file written is removed, a
-folder renamed is renamed back, a ptrace attach is detached at once. The only
-signal sent is signal 0, which checks a process exists and delivers nothing.
+folder renamed is renamed back, a ptrace attach is detached at once. unshare
+cannot be undone, so it runs in a process of its own, and the probes after it
+stay as they started. The only signal sent is signal 0, which checks a process
+exists and delivers nothing.
 """
 
 import ctypes
@@ -122,12 +124,19 @@ def p_tiocsti():
 
 
 def p_unshare(which):
+    """In a forked process, which reports the errno as its exit status."""
     flag = {"user": os.CLONE_NEWUSER, "mount": os.CLONE_NEWNS, "net": os.CLONE_NEWNET}[which]
-    try:
-        os.unshare(flag)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.unshare(flag)
+            os._exit(0)
+        except OSError as e:
+            os._exit(e.errno)
+    code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+    if code == 0:
         return "ok", f"made a {which} namespace"
-    except OSError as e:
-        return err(e.errno), ""
+    return (err(code), "") if code > 0 else (f"signal {-code}", "")
 
 
 def p_mount():
