@@ -225,7 +225,7 @@ M3-09 may take the behaviour, which `test_relay.py` states: an EOF ends one dire
 | `--unshare-user --disable-userns` | A user namespace for the sandbox, and none made inside it. |
 | `--unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try` | Its own processes, an empty network (loopback only), IPC, host name and cgroup view. Whether a sandbox's sessions share one network and PID namespace is M3-03's question. |
 | `--die-with-parent` | Ends with the session. |
-| `--new-session` (option) | Its own session, no controlling terminal: closes TIOCSTI, and costs an interactive shell its job control. Measured with and without above. |
+| `--new-session` (option) | Its own session, no controlling terminal: meant to close TIOCSTI, not shown (results above, needs `legacy_tiocsti` at 1). It costs an interactive shell its job control. |
 | `--clearenv`, `--setenv` for `HOME`, `PATH`, `TMPDIR` (`<sandbox home>/tmp/`, ADR 0015), `LANG`, `TERM`, the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY` and lower case, to the relay), `NO_PROXY` empty, `NODE_USE_ENV_PROXY=1`, `ENCLOS_PROXY_SOCKET` | The emptied environment. |
 | `--chdir <sandbox home>` | |
 
