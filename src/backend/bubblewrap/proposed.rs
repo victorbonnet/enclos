@@ -1,13 +1,16 @@
 //! What the backend rests on that is still proposed: each dependence on
-//! ADRs 0037 to 0040 is here, so that a change to one of them changes this
-//! file alone.
+//! ADRs 0037 to 0040 that compiling has is here. Accepting ADR 0039 reaches
+//! further than [`NAMESPACES`]: see its note.
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Capabilities, Enforcement};
 use crate::model::policy::Policy;
 
-/// ADR 0039: every session its own namespaces, a service's included. No
+/// ADR 0039: every session its own namespaces for now, a service's included,
+/// until M3-16 has them join the holder's network namespace. That takes more
+/// than `--unshare-net` out of this list: the holder serves the one relay, so
+/// `relay` in the compiled file and M3-14's per-session relay change too. No
 /// user namespace is made inside (`--disable-userns`). `--as-pid-1`: without
 /// it bubblewrap's own reaper is PID 1, with no filter and no Landlock, and a
 /// member on a host with neither Landlock nor Yama could attach to it and run

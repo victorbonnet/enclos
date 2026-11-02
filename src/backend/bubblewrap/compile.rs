@@ -187,7 +187,8 @@ pub struct SeccompFilter {
     pub socket_families: BTreeMap<String, u64>,
 }
 
-/// The relay to the sandbox's proxy, in a session's own network namespace.
+/// The relay to the sandbox's proxy, in a session's own network namespace
+/// until M3-16, when the holder serves one for the sandbox (ADR 0039).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relay {
     pub port: u16,
