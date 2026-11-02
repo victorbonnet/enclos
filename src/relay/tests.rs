@@ -221,7 +221,7 @@ fn a_client_that_stops_reading_holds_up_no_other_connection() {
 }
 
 #[test]
-fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
+fn an_upstream_gone_frees_the_connections_place() {
     let relay = Relay::up_to(1);
     let client = relay.client();
     let upstream = relay.accepted();
@@ -239,6 +239,29 @@ fn a_failed_direction_ends_the_other_and_frees_the_connections_place() {
     // The client is still open: only the relay can have freed the place.
     relay.served_again();
     drop(client);
+}
+
+/// The upload is blocked on an upstream that never reads, so it cannot end
+/// by itself: only the failed download can end it.
+#[test]
+fn a_failed_download_ends_the_upload_and_frees_the_connections_place() {
+    let relay = Relay::up_to(1);
+    let client = relay.client();
+    let upstream = relay.accepted();
+    client
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let chunk = pattern(64 * 1024, 6);
+    let stopped = loop {
+        if let Err(e) = (&client).write_all(&chunk) {
+            break e;
+        }
+    };
+    assert_eq!(stopped.kind(), ErrorKind::WouldBlock);
+    let _ = client.shutdown(Shutdown::Both);
+    drop(client);
+    assert_ends(&upstream, &chunk);
+    relay.served_again();
 }
 
 /// Short, so the tests below see it fire. The tests that must outlast it
