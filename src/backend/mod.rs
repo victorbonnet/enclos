@@ -17,6 +17,7 @@ use std::process::Command;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::policy::paths::real_path;
 use crate::probes::OwnProbes;
 
 /// Whether a backend can run on this host.
@@ -57,6 +58,9 @@ pub struct SandboxContext {
     pub user_home: PathBuf,
     /// The enclos data and config folders (ADR 0010).
     pub protected: Vec<PathBuf>,
+    /// Where each of `protected` really is, read as the context is made so
+    /// that compiling looks at nothing.
+    pub protected_real: Vec<PathBuf>,
     /// The folder holding every sandbox's folder.
     pub sandboxes: PathBuf,
     /// Files the sandbox may not read, each with every file whose name
@@ -83,6 +87,7 @@ impl SandboxContext {
             home: layout.sandbox_home(name.as_str()),
             user_home: layout.user_home().to_owned(),
             protected: layout.protected(),
+            protected_real: layout.protected().iter().map(|p| real_path(p)).collect(),
             sandboxes: layout.sandboxes_dir(),
             hidden_files: layout.hidden_files(),
             hidden_dirs: layout.hidden_dirs(),
