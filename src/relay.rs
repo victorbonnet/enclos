@@ -170,7 +170,21 @@ fn pass_on(
         Ok(_) => {
             let _ = done();
         }
-        Err(_) => failed(),
+        Err(e) => {
+            say_lost(&e, &mut io::stderr());
+            failed();
+        }
+    }
+}
+
+/// Says why a direction failed, on `to`, unless it is a peer leaving, which
+/// is how many connections end.
+fn say_lost(e: &io::Error, to: &mut impl Write) {
+    if !matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    ) {
+        let _ = writeln!(to, "enclos relay: lost a connection: {e}");
     }
 }
 

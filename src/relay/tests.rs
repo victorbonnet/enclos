@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{connections_for, pass_on, serve_up_to};
+use super::{connections_for, pass_on, say_lost, serve_up_to};
 use crate::proxy::IDLE_TIMEOUT;
 
 /// Far beyond the sockets' buffers.
@@ -376,6 +376,27 @@ fn a_connection_over_the_limit_is_closed_and_its_place_comes_back() {
     drop(first);
     drop(upstream);
     relay.served_again();
+}
+
+#[test]
+fn a_failed_direction_is_said_unless_its_peer_just_left() {
+    let said = |kind: ErrorKind| {
+        let mut out = Vec::new();
+        say_lost(&kind.into(), &mut out);
+        String::from_utf8(out).unwrap()
+    };
+    for left in [
+        ErrorKind::ConnectionReset,
+        ErrorKind::BrokenPipe,
+        ErrorKind::NotConnected,
+    ] {
+        assert_eq!(said(left), "");
+    }
+    let timed_out = said(ErrorKind::WouldBlock);
+    assert!(
+        timed_out.starts_with("enclos relay: lost a connection: "),
+        "{timed_out}"
+    );
 }
 
 #[test]
