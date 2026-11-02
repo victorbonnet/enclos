@@ -4769,23 +4769,35 @@ impl RelayCommand {
     /// `enclos relay` on a port that was free, to `socket`. Its home is
     /// relative, which every command that opens the enclos folder refuses.
     fn start(socket: &Path) -> RelayCommand {
+        Self::with_descriptors(socket, None).expect("the relay ended")
+    }
+
+    /// As `start`, limited to `descriptors` open files if given; `None` if
+    /// that left it too few to listen.
+    fn with_descriptors(socket: &Path, descriptors: Option<u64>) -> Option<RelayCommand> {
         let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = free.local_addr().unwrap().port();
         drop(free);
-        let child = Command::new(env!("CARGO_BIN_EXE_enclos"))
+        let limit = descriptors.map_or(":".to_string(), |n| format!("ulimit -n {n}"));
+        let child = Command::new("sh")
+            .args(["-c", &format!(r#"{limit} && exec "$@""#), "sh"])
+            .arg(env!("CARGO_BIN_EXE_enclos"))
             .args(["relay", "--port", &port.to_string(), "--socket"])
             .arg(socket)
             .env("ENCLOS_HOME", "not/absolute")
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let relay = RelayCommand { child, port };
+        let mut relay = RelayCommand { child, port };
         let started = std::time::Instant::now();
         while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if relay.child.try_wait().unwrap().is_some() {
+                return None;
+            }
             assert!(started.elapsed().as_secs() < 30, "the relay never listened");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        relay
+        Some(relay)
     }
 }
 
@@ -4835,6 +4847,42 @@ fn the_relay_listens_on_127_0_0_1_alone() {
         let conn = std::net::TcpStream::connect((address, relay.port));
         assert!(conn.is_err(), "it answers on {address}");
     }
+}
+
+/// The next connection on `socket`, polled so a relay that died fails the
+/// test instead of hanging it.
+fn relay_opened(socket: &std::os::unix::net::UnixListener) -> std::os::unix::net::UnixStream {
+    socket.set_nonblocking(true).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        match socket.accept() {
+            Ok((conn, _)) => return conn,
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        assert!(started.elapsed().as_secs() < 30, "no connection came");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_relay_whose_stderr_was_closed_lives_through_what_it_cannot_say() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // Ten descriptors make a limit of one connection.
+    let mut relay = RelayCommand::with_descriptors(&path, Some(10)).unwrap();
+    drop(relay.child.stderr.take());
+    // Starting it left one connection, already closed.
+    drop(relay_opened(&socket));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let held = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    let _upstream = relay_opened(&socket);
+    let mut over = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    assert_eq!(std::io::Read::read(&mut over, &mut [0; 1]).unwrap_or(0), 0);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(relay.child.try_wait().unwrap(), None, "the relay ended");
+    drop(held);
 }
 
 #[test]

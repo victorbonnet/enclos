@@ -38,6 +38,12 @@ const MOST_DESCRIPTORS: u64 = 1024;
 /// when the process is out of file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// Says `what` on stderr, if anyone is there: `eprintln!` panics on a closed
+/// pipe, and the accepting thread is the relay.
+fn say(what: std::fmt::Arguments) {
+    let _ = writeln!(io::stderr(), "enclos relay: {what}");
+}
+
 /// The most connections a relay carries at once in a process limited to
 /// `descriptors` (none: no limit). Each holds two; never none.
 fn connections_for(descriptors: Option<u64>) -> usize {
@@ -75,9 +81,9 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
         };
         let Some(slot) = Slot::take(&open, max) else {
             if !std::mem::replace(&mut full, true) {
-                eprintln!(
-                    "enclos relay: {max} connections are open; closing new ones until one ends"
-                );
+                say(format_args!(
+                    "{max} connections are open; closing new ones until one ends"
+                ));
             }
             continue;
         };
@@ -93,13 +99,13 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
                 }
                 Err(e) => {
                     if !unreachable.swap(true, Ordering::Relaxed) {
-                        eprintln!("enclos relay: cannot reach {}: {e}", socket.display());
+                        say(format_args!("cannot reach {}: {e}", socket.display()));
                     }
                 }
             }
         });
         if let Err(e) = started {
-            eprintln!("enclos relay: cannot start a thread for a connection: {e}");
+            say(format_args!("cannot start a thread for a connection: {e}"));
         }
     }
 }
@@ -131,7 +137,7 @@ fn carry(client: &TcpStream, upstream: &UnixStream, limit: Duration) {
             )
         });
         if let Err(e) = up {
-            eprintln!("enclos relay: cannot start a thread for a connection: {e}");
+            say(format_args!("cannot start a thread for a connection: {e}"));
             return;
         }
         pass_on(
