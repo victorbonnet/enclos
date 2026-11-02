@@ -257,6 +257,13 @@ fn compiled_sandbox(
         .iter()
         .cloned()
         .partition(|root| is_within(root, &user_home) && *root != user_home);
+    // Read-only, for this sandbox alone. Connecting to a socket needs no
+    // write access to its mount (ADR 0004). `secrets/` is there only while
+    // the sandbox's services run (ADR 0034, ADR 0036), and a session may
+    // start without them.
+    let visible = ctx.proxy_socket.parent().unwrap_or(&ctx.proxy_socket);
+    let compiled = ctx.dir.join("compiled");
+    let bound_back = [visible, compiled.as_path(), ctx.secrets.as_path()];
     let mut denied = in_user_home.clone();
     let mut denied_elsewhere = Vec::new();
     let mut in_sandbox_home = Vec::new();
@@ -267,6 +274,11 @@ fn compiled_sandbox(
         // First of the rest: a workspace's bind undoes the arms below it.
         } else if workspaces.iter().any(|w| is_within(&entry, w)) {
             in_workspace.push(entry);
+        } else if bound_back.iter().any(|b| is_within(&entry, b)) {
+            return Err(refused(format!(
+                "deny entry {} cannot be held: enclos binds that folder into the sandbox",
+                entry.display()
+            )));
         } else if OWN_TMPFS.iter().any(|t| is_within(&entry, Path::new(t)))
             || protected.iter().any(|root| is_within(&entry, root))
         {
@@ -311,13 +323,8 @@ fn compiled_sandbox(
     for workspace in &workspaces {
         after.extend(["--bind-try".to_owned(), text(workspace)?, text(workspace)?]);
     }
-    // Read-only, for this sandbox alone. Connecting to a socket needs no
-    // write access to its mount (ADR 0004). `secrets/` is there only while
-    // the sandbox's services run (ADR 0034, ADR 0036), and a session may
-    // start without them.
-    let visible = text(ctx.proxy_socket.parent().unwrap_or(&ctx.proxy_socket))?;
-    let compiled = text(&ctx.dir.join("compiled"))?;
-    let secrets = text(&ctx.secrets)?;
+    let [visible, compiled, secrets] = bound_back.map(text);
+    let (visible, compiled, secrets) = (visible?, compiled?, secrets?);
     after.extend(args(&["--ro-bind", &visible, &visible]));
     after.extend(args(&["--ro-bind", &compiled, &compiled]));
     after.extend(args(&["--ro-bind-try", &secrets, &secrets]));
@@ -831,6 +838,29 @@ mod tests {
         let c = compiled(&policy(&["{home}"], &["~/.enclos/sandboxes"]));
         assert_eq!(c.home_mask.denied, protected_and(&[]));
         assert!(after(&c.after_home_mask, "--bind")[0].ends_with("/sandboxes/home/home"));
+    }
+
+    /// These folders are bound back after a protected root is hidden, so
+    /// such an entry would be dropped as hidden and silently not held.
+    #[test]
+    fn a_deny_entry_in_what_compile_binds_back_is_refused() {
+        for entry in [
+            "~/.enclos/sandboxes/home/secrets",
+            "~/.enclos/sandboxes/home/secrets/bot.env",
+            "~/.enclos/sandboxes/home/compiled",
+            "~/.enclos/run/home/visible",
+            "~/.enclos/run/home/visible/proxy.sock",
+        ] {
+            let err = refusal(&policy(&["{home}"], &[entry]));
+            assert!(err.contains("cannot be held"), "{entry}: {err}");
+        }
+    }
+
+    /// Other sandboxes' folders are not bound in: hidden is true of them.
+    #[test]
+    fn a_deny_entry_under_a_protected_root_and_not_bound_back_stays_hidden() {
+        let c = compiled(&policy(&["{home}"], &["~/.enclos/sandboxes/other/secrets"]));
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
     }
 
     /// Nothing of the host reaches the output: a link stays as written, and
