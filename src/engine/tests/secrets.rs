@@ -807,3 +807,60 @@ fn a_store_refused_on_a_locked_collection_reports_nothing_left() {
     assert!(!text.contains("no record"), "{text}");
     assert!(matches!(err, Error::Secret(_)), "{err:?}");
 }
+
+/// A sandbox granted nothing starts with no look at any bus, and no address
+/// in its units; one granted a secret of the Secret Service gets the address.
+#[test]
+fn a_start_hands_on_a_stores_variables_only_when_the_policy_grants_from_it() {
+    let (_dir, engine, fake, name) =
+        super::services::sandbox_with_services(Some(crate::model::runtime::RuntimeKind::Hermes));
+    let looks = Rc::new(std::cell::Cell::new(0));
+    let engine = engine.with_secrets(Box::new(crate::secrets::Picked::new(
+        Box::new(crate::secrets::Stubbed {
+            answers: true,
+            looks: Rc::clone(&looks),
+            store: Rc::new(InMemory::named(StoreName::Libsecret)),
+        }),
+        Box::new(InMemory::named(StoreName::File)),
+    )));
+    engine.start_sandbox(&alice(), &name).unwrap();
+    assert_eq!(looks.get(), 0);
+    let bare = engine.layout.env();
+    for unit in fake.started.borrow().iter() {
+        assert_eq!(unit.env, bare, "{}", unit.label);
+    }
+
+    let engine = engine.with_secrets(Box::new(crate::secrets::Picked::new(
+        Box::new(crate::secrets::libsecret::Libsecret::with_tools(
+            "enclos.test".to_owned(),
+            "/nowhere/secret-tool".to_owned(),
+            "/nowhere/dbus-send".to_owned(),
+        )),
+        Box::new(InMemory::named(StoreName::File)),
+    )));
+    let telegram = secret("home/telegram");
+    engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| {
+                engine
+                    .state
+                    .put_secret(lock, &telegram, StoreName::Libsecret)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+    grant(&engine, &name, "TOKEN = \"secret:home/telegram\"").unwrap();
+    engine.start_sandbox(&alice(), &name).unwrap();
+    let mut expected = bare;
+    expected.push((
+        "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+        "unix:path=/nowhere/bus".to_owned(),
+    ));
+    for unit in fake.started.borrow().iter() {
+        assert_eq!(unit.env, expected, "{}", unit.label);
+    }
+}

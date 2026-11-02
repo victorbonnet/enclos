@@ -206,6 +206,8 @@ impl Engine {
                         ),
                         &mut Vec::new(),
                     )?;
+                    let store_env =
+                        self.service_store_env(&self.policy(name)?.snapshot.policy)?;
                     let units = Self::units(&record)
                         .into_iter()
                         .map(|unit| {
@@ -232,7 +234,7 @@ impl Engine {
                                     .layout
                                     .env()
                                     .into_iter()
-                                    .chain(self.secrets.service_env())
+                                    .chain(store_env.iter().cloned())
                                     .collect(),
                                 stop_timeout: STOP_TIMEOUT,
                             })
