@@ -54,12 +54,6 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route the baseline closed, on something it
-    /// refuses the tool before the rule the probe tests is reached.
-    pub fn closed_by_baseline(&self) -> usize {
-        self.count_closed(|r| closer(r) == Some(Closer::Baseline))
-    }
-
     /// The closed probes that show something other than their route's
     /// rule, as the report says them: ` (1 by Seatbelt itself, 2 by the
     /// (deny default) baseline)`, or nothing.
@@ -81,23 +75,13 @@ impl TestReport {
         }
     }
 
-    /// Closed probes whose route the backend itself closes, whatever the
-    /// compiled policy says: they show no rule enclos adds.
-    pub fn closed_by_backend(&self) -> usize {
-        self.count_closed(|r| closer(r) == Some(Closer::Backend))
-    }
-
     /// Closed probes their route's own rule closed: neither the backend
     /// itself nor the baseline, which closes a route whether or not its rule
     /// is there, so shows nothing of the rule.
     pub fn closed_by_rule(&self) -> usize {
-        self.count_closed(|r| r.closed_by.is_none())
-    }
-
-    fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
         self.results
             .iter()
-            .filter(|r| r.outcome == Outcome::Closed && which(r))
+            .filter(|r| r.outcome == Outcome::Closed && r.closed_by.is_none())
             .count()
     }
 
@@ -653,7 +637,6 @@ mod tests {
             r.closed_apart(),
             " (1 by Seatbelt itself, 2 by the (deny default) baseline)"
         );
-        assert_eq!((r.closed_by_backend(), r.closed_by_baseline()), (1, 2));
         assert_eq!(report(vec![Outcome::Closed]).closed_apart(), "");
         let mut baseline_only = report(vec![Outcome::Closed]);
         baseline_only.results[0].closed_by = Some(BEFORE_THE_RULE);
@@ -682,15 +665,13 @@ mod tests {
             r.closed_by = Some(ITSELF);
         }
         assert!(!platform.passed());
-        assert_eq!(platform.closed_by_backend(), 1);
+        assert_eq!(platform.closed_apart(), " (1 by Seatbelt itself)");
         platform
             .results
             .extend(report(vec![Outcome::Closed]).results);
         assert!(platform.passed());
-        assert_eq!(
-            (platform.closed_by_backend(), platform.closed_by_rule()),
-            (1, 1)
-        );
+        assert_eq!(platform.closed_apart(), " (1 by Seatbelt itself)");
+        assert_eq!(platform.closed_by_rule(), 1);
         assert!(!report(vec![Outcome::Closed, Outcome::Open("x".into())]).passed());
         // Nothing closed is nothing shown.
         assert!(!report(vec![Outcome::Inconclusive("x".into()); 2]).passed());
