@@ -1,19 +1,25 @@
 #!/bin/sh
 # Checks survey.sh, which is read-only, so this is safe on any host. busctl is
-# stubbed on the PATH.
+# stubbed on the PATH. SIGPIPE is ignored, as on the runners, so a reader that
+# leaves early shows as errors from survey.sh.
 set -eu
+trap '' PIPE
 
 here=$(cd "$(dirname "$0")" && pwd)
 tmp=$(mktemp -d)
-trap 'rm -f "$tmp/busctl"; rmdir "$tmp"' EXIT
+trap 'rm -f "$tmp/busctl" "$tmp/stderr"; rmdir "$tmp"' EXIT
 failed=0
 
 # $1: the stub's body; $2: the line survey.sh must print.
 expect() {
     printf '#!/bin/sh\n%s\n' "$1" >"$tmp/busctl"
     chmod +x "$tmp/busctl"
-    if ! PATH="$tmp:$PATH" sh "$here/survey.sh" | grep -qx -- "$2"; then
+    if ! PATH="$tmp:$PATH" sh "$here/survey.sh" 2>"$tmp/stderr" | grep -x -- "$2" >/dev/null; then
         echo "expected the line: $2" >&2
+        failed=1
+    fi
+    if grep -q 'I/O error' "$tmp/stderr"; then
+        echo "survey.sh's output was cut off while looking for: $2" >&2
         failed=1
     fi
 }
