@@ -244,9 +244,10 @@ mod tests {
     use super::*;
 
     /// What [`a_policy_file_resolves_to_the_same_policy_on_every_system`]'s
-    /// file resolves to; regenerate only for a change meant to show in every
-    /// sandbox's policy.
+    /// file resolves to, alone and through Hermes's adapter; regenerate only
+    /// for a change meant to show in every sandbox's policy.
     const RESOLVED: &str = include_str!("resolved.snapshot");
+    const RESOLVED_HERMES: &str = include_str!("resolved-hermes.snapshot");
 
     /// Compares against a snapshot, or writes it to `write_to` instead: the
     /// compiled-in text is out of date until the next build.
@@ -469,16 +470,35 @@ mod tests {
         }
     }
 
-    // Linux and macOS both run this against one file, so a difference between
-    // the systems fails on one of them.
+    /// The snapshot `name` holds what `adapter` and the test's file resolve to.
+    fn resolves_as(name: &str, expected: &str, adapter: Option<&AdapterLayer>) {
+        let snap = resolve(&overrides("\"api.example.com\""), adapter).unwrap();
+        let resolved = serde_json::to_string_pretty(&snap.policy).unwrap();
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/policy")
+            .join(name);
+        let write = std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some();
+        same_as_snapshot(&resolved, expected, write.then_some(&file));
+    }
+
+    // Linux and macOS both run these against one file. Each layer is text
+    // built in, so what can differ is a `cfg` added to a layer or to `resolve`:
+    // one of the two systems then fails. The adapter is where a Linux-only
+    // destination would arrive.
     #[test]
     fn a_policy_file_resolves_to_the_same_policy_on_every_system() {
-        let snap = resolve(&overrides("\"api.example.com\""), None).unwrap();
-        let resolved = serde_json::to_string_pretty(&snap.policy).unwrap();
-        let file =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/policy/resolved.snapshot");
-        let write = std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some();
-        same_as_snapshot(&resolved, RESOLVED, write.then_some(&file));
+        resolves_as("resolved.snapshot", RESOLVED, None);
+    }
+
+    #[test]
+    fn a_policy_file_resolves_through_hermes_to_the_same_policy_on_every_system() {
+        use crate::runtime::RuntimeAdapter;
+        let hermes = AdapterLayer {
+            runtime: "hermes".into(),
+            version: crate::runtime::hermes::Hermes.version().into(),
+            text: crate::runtime::hermes::Hermes.endpoints().into(),
+        };
+        resolves_as("resolved-hermes.snapshot", RESOLVED_HERMES, Some(&hermes));
     }
 
     #[test]
