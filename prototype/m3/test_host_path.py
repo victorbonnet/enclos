@@ -77,6 +77,11 @@ class TurnEnd(unittest.TestCase):
         client = load("host-client")
         self.assertEqual(client.turn_end("error", {"message": "no provider"}, "earlier"), "no provider")
 
+    def test_the_error_is_kept_whole(self):
+        client = load("host-client")
+        text = "Details: " + "x" * 500
+        self.assertEqual(client.turn_end("error", {"message": text}, ""), text)
+
     def test_a_session_info_frame_never_is(self):
         client = load("host-client")
         self.assertEqual(client.turn_end("session.info", {"provider": "", "model": ""}, ""), "")
