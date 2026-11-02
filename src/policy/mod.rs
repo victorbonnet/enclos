@@ -414,6 +414,8 @@ mod tests {
             "~/.local/share/com.vercel.cli",
             "~/.local/share/keyrings",
             "~/.local/share/kwalletd",
+            "~/.pki",
+            "~/.local/share/pki",
             "~/.config/google-chrome",
             "~/.config/google-chrome-beta",
             "~/.config/google-chrome-unstable",
