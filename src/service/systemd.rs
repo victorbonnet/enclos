@@ -1,7 +1,6 @@
 //! systemd user units (Linux): one unit file per service in the user's
 //! systemd folder, run by the user's own manager through `systemctl --user`.
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -25,10 +24,9 @@ const REPLACE_WAIT: Duration = Duration::from_secs(10);
 const REPLACE_POLL: Duration = Duration::from_millis(100);
 
 impl Systemd {
-    pub fn for_user(user_home: &Path) -> Systemd {
-        let config_home = std::env::var_os("XDG_CONFIG_HOME");
+    pub fn for_user(units_dir: &Path) -> Systemd {
         Systemd {
-            units_dir: units_dir(user_home, config_home.as_deref()),
+            units_dir: units_dir.to_owned(),
         }
     }
 
@@ -137,17 +135,6 @@ fn parse_show(text: &str) -> Shown {
         }
     }
     shown
-}
-
-/// The folder unit files go in, as the user's manager looks for it:
-/// `$XDG_CONFIG_HOME/systemd/user` when that is an absolute path, else
-/// `~/.config/systemd/user`.
-fn units_dir(user_home: &Path, config_home: Option<&OsStr>) -> PathBuf {
-    config_home
-        .map(Path::new)
-        .filter(|path| path.is_absolute())
-        .map_or_else(|| user_home.join(".config"), Path::to_path_buf)
-        .join("systemd/user")
 }
 
 /// `text` as one quoted word of a unit file, which systemd reads back with
@@ -402,24 +389,6 @@ WantedBy=default.target
     }
 
     #[test]
-    fn units_go_where_the_users_manager_looks_for_them() {
-        let home = Path::new("/home/alice");
-        assert_eq!(
-            units_dir(home, None),
-            Path::new("/home/alice/.config/systemd/user")
-        );
-        assert_eq!(
-            units_dir(home, Some(OsStr::new("/srv/config"))),
-            Path::new("/srv/config/systemd/user")
-        );
-        assert_eq!(
-            units_dir(home, Some(OsStr::new("relative"))),
-            Path::new("/home/alice/.config/systemd/user"),
-            "the XDG rules ignore a relative path"
-        );
-    }
-
-    #[test]
     fn a_unit_runs_when_the_manager_shows_its_main_process() {
         let shown = |load: &str, active: &str, pid: u32| {
             parse_show(&format!(
@@ -499,8 +468,8 @@ WantedBy=default.target
 
     impl Started {
         fn new(case: &str, script: &str, stop_timeout: Duration) -> Started {
-            let home = std::env::var_os("HOME").unwrap();
-            let systemd = Systemd::for_user(Path::new(&home));
+            let layout = crate::layout::Layout::from_env().unwrap();
+            let systemd = Systemd::for_user(layout.units_dir());
             systemd.available().unwrap();
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("service.log");
