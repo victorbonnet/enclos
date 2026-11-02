@@ -2,7 +2,7 @@
 # The prototype sandbox's files, programs and system calls (design §14,
 # M3-02): broad reads with the deny list not mounted, denied paths inside the
 # workspace masked (planted, or missing and so a folder) with the rest of it
-# as granted, writes to the home and the workspace only, the home and
+# as granted, deny entries that are links with their targets hidden, writes to the home and the workspace only, the home and
 # workspace unmovable, programs run from the
 # workspace, the seccomp list, other processes (whether /proc/<pid> exists is
 # the control: the host's own read of a process's environ never worked), the
@@ -29,6 +29,8 @@ for d in "${DENY[@]}"; do
     [ "$d" = "$H/.enclos" ] && continue
     [ "$d" = "$WORK/denied-file" ] && continue
     [ "$d" = "$WORK/denied-missing" ] && continue
+    [ "$d" = "$H/proto-linked-entry" ] && continue
+    [ "$d" = "$WORK/denied-link" ] && continue
     mkdir -p "$d"
     echo planted >"$d/enclos-proto-planted"
     planted+=("$d/enclos-proto-planted")
@@ -36,6 +38,17 @@ done
 echo planted >"$WORK/denied-file"
 rm -rf "$WORK/denied-missing"  # the first run leaves the mask's mount point there
 echo kept >"$WORK/kept-file"
+# Deny entries that are links, as GNU stow sets a home up: their targets, here
+# or out of the workspace, must not read through a folder bound back.
+mkdir -p "$H/proto-linked-target"
+mkdir -p "$H/proto-linked-holder/entry"
+echo planted >"$H/proto-linked-holder/entry/enclos-proto-planted"
+echo kept >"$H/proto-linked-holder/enclos-proto-beside"
+echo planted >"$H/proto-linked-target/workspace-token"
+echo kept >"$H/proto-linked-target/enclos-proto-beside"
+rm -rf "$H/proto-linked-entry" "$WORK/denied-link"
+ln -s proto-linked-holder/entry "$H/proto-linked-entry"
+ln -s ../proto-linked-target/workspace-token "$WORK/denied-link"
 mkdir -p "$WORK/kept-folder"
 other="$H/.enclos/sandboxes/other/home"
 mkdir -p "$other"
@@ -65,6 +78,12 @@ probes+=(
     "read $WORK/denied-missing"
     "write $WORK/denied-missing/enclos-proto-w"
     "rename $WORK/denied-missing"
+    "read $H/proto-linked-entry/enclos-proto-planted"
+    "read $H/proto-linked-holder/entry/enclos-proto-planted"
+    "read $H/proto-linked-holder/enclos-proto-beside"
+    "read $WORK/denied-link"
+    "read $H/proto-linked-target/workspace-token"
+    "read $H/proto-linked-target/enclos-proto-beside"
     "read $WORK/kept-file"
     "write $WORK/kept-folder/enclos-proto-w"
     "rename $WORK/kept-folder"
