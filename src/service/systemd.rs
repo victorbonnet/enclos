@@ -14,14 +14,14 @@ pub struct Systemd {
 }
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
-/// How long `start` waits for a run of the same label to end before it
-/// starts its own. `start` runs under enclos's state lock, which a runtime
+/// How long `start` waits for what runs under the same label to end before
+/// it starts its own. `start` runs under enclos's state lock, which a runtime
 /// service being ended needs to record its end, so it does not wait long:
 /// the engine removes a sandbox's services before it starts them, outside
 /// the lock, so a unit still running here was started by another command
 /// meanwhile.
 const REPLACE_WAIT: Duration = Duration::from_secs(10);
-/// How often the manager is asked whether the run has ended meanwhile.
+/// How often the manager is asked whether what runs has ended meanwhile.
 const REPLACE_POLL: Duration = Duration::from_millis(100);
 
 impl Systemd {
@@ -67,9 +67,9 @@ impl Systemd {
         Ok(parse_show(&String::from_utf8_lossy(&out.stdout)))
     }
 
-    /// Ends a run of the unit, if there is one, without waiting past
-    /// `REPLACE_WAIT`.
-    fn end_previous_run(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
+    /// Ends what runs under the unit, if anything does, without waiting
+    /// past `REPLACE_WAIT`.
+    fn end_what_runs(&self, label: &ServiceLabel) -> Result<(), ServiceError> {
         let name = unit_name(label);
         self.must(&format!("stop {label}"), &["stop", "--no-block", &name])?;
         let deadline = Instant::now() + REPLACE_WAIT;
@@ -240,8 +240,8 @@ impl ServiceManager for Systemd {
         std::fs::write(&path, text)
             .map_err(|e| failed(format!("cannot write {}: {e}", path.display())))?;
         self.must("read its unit files again", &["daemon-reload"])?;
-        // Replace a previous run of the same unit.
-        self.end_previous_run(&unit.label)?;
+        // Replace what runs under the same label.
+        self.end_what_runs(&unit.label)?;
         self.must(
             &format!("start {}", unit.label),
             &["enable", "--now", &unit_name(&unit.label)],
