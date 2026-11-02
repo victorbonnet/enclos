@@ -431,7 +431,7 @@ fn check_default_denies(policy: &Policy, problems: &mut Vec<Problem>) {
         .collect();
     if !dropped.is_empty() {
         problems.push(Problem::Refused(format!(
-            "filesystem.read_deny leaves out paths enclos always hides: {}; add your own with read_deny_add instead",
+            "filesystem.read_deny leaves out paths enclos always hides: {}; add your own with read_deny_add instead, and a version from before enclos hid them cannot be restored: make its change again with `policy edit`",
             dropped.join(", ")
         )));
     }
