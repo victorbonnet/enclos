@@ -31,6 +31,7 @@ WORK="$H/proto-workspace"                  # one workspace, bound writable
 PROXY_SOCK="$SBX_RUN/proxy.sock"
 RELAY_PORT=18080
 mkdir -p "$SBX_HOME" "$SBX_RUN" "$SBX_COMPILED" "$WORK"
+mkdir -p "$SBX_HOME/tmp"                   # TMPDIR (ADR 0015)
 
 # The deny list the checks plant files under: a few of the default list's
 # Linux entries (M3-07) and enclos's own folder, which is protected.
