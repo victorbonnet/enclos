@@ -472,14 +472,18 @@ impl Drop for Quiet<'_> {
     }
 }
 
-fn print_set(secret: &SecretRef, set: &SecretSet) {
+/// What `secret set` did, naming the store: a token may have gone to a plain
+/// file, which the user must be told.
+fn stored_line(secret: &SecretRef, set: &SecretSet) -> String {
+    let store = set.store.shown();
     match set.new {
-        true => println!("Stored secret {secret} in {}.", set.store.shown()),
-        false => println!(
-            "Replaced the value of secret {secret} in {}.",
-            set.store.shown()
-        ),
+        true => format!("Stored secret {secret} in {store}."),
+        false => format!("Replaced the value of secret {secret} in {store}."),
     }
+}
+
+fn print_set(secret: &SecretRef, set: &SecretSet) {
+    println!("{}", stored_line(secret, set));
     let sandbox = &secret.sandbox;
     let shown = |grants: &[&Grant]| {
         grants
@@ -573,9 +577,34 @@ fn print_list(sandbox: &SandboxName, secrets: &[SecretView]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclos::model::secret::StoreName;
 
     fn keys(bytes: &[u8]) -> std::io::Result<Typed> {
         typed(&mut bytes.iter().map(|b| Ok(*b))).map(|(typed, _)| typed)
+    }
+
+    #[test]
+    fn a_set_names_the_store_for_a_new_value_and_a_replaced_one() {
+        let secret: SecretRef = "home/telegram".parse().unwrap();
+        let set = |new, store| SecretSet {
+            new,
+            store,
+            granted_as: Vec::new(),
+            pending_as: Vec::new(),
+            running: 0,
+        };
+        assert_eq!(
+            stored_line(&secret, &set(true, StoreName::File)),
+            "Stored secret home/telegram in the file store."
+        );
+        assert_eq!(
+            stored_line(&secret, &set(false, StoreName::Libsecret)),
+            "Replaced the value of secret home/telegram in the Secret Service."
+        );
+        assert_eq!(
+            stored_line(&secret, &set(true, StoreName::Keychain)),
+            "Stored secret home/telegram in the Keychain."
+        );
     }
 
     #[test]
