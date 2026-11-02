@@ -196,9 +196,12 @@ fn exec_word(text: &str) -> String {
 /// with its output in the unit's log; restarted after a non-zero exit or a
 /// signal (systemd counts SIGHUP, SIGINT, SIGPIPE and SIGTERM as clean
 /// unless told otherwise), never after exit 0, the delay growing from 1
-/// second to 10. `stop` sends TERM to the program alone and KILL to what is
-/// left when it exits or after the unit's stop timeout. An error when the
-/// log's path holds a control character, which `append:` cannot quote.
+/// second to 10. `stop` sends TERM to the program alone, which may be
+/// stopping what it runs, and KILL to what stays in the unit's cgroup when it
+/// exits or after the unit's stop timeout: the proxy, or `enclos launch`
+/// itself. A runtime service's program runs in a scope of its own (design
+/// §8), so it is `launch`'s to stop. An error when the log's path holds a
+/// control character, which `append:` cannot quote.
 pub fn unit_file(unit: &ServiceUnit) -> Result<String, ServiceError> {
     let log = unit.log.display().to_string();
     if log.chars().any(|c| c.is_control()) {
