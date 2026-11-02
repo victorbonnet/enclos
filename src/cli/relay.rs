@@ -1,7 +1,8 @@
 //! `enclos relay`: a session's way to the proxy's Unix socket from its own
-//! 127.0.0.1 (design §5, Linux networking). Started by enclos itself inside
-//! the session, not typed by people. It runs where the enclos folder is out
-//! of sight, so it opens none of it.
+//! 127.0.0.1 (design §5, Linux networking). Started by enclos itself, not
+//! typed by people; until M3-16 a session's relay is `enclos inside --relay`
+//! instead. It runs where the enclos folder is out of sight, so it opens none
+//! of it.
 
 use std::path::PathBuf;
 
