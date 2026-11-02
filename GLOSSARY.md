@@ -124,7 +124,7 @@ A host folder outside the sandbox home that a policy lets the sandbox write, suc
 _Avoid_: mount, share, volume
 
 **Mask**:
-An empty, read-only stand-in over a denied path that a grant holds, so the path exists but shows nothing and the rest of the grant stays as granted.
+An empty, read-only stand-in over a denied path that cannot be left out, such as one a grant holds, so the path exists but shows nothing and what is around it stays as it was.
 _Avoid_: stub, overlay
 
 **Protected path**:
