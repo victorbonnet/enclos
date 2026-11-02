@@ -113,6 +113,18 @@ const CLONE_NEW: &[(&str, u64)] = &[
 /// the C library fall back to `clone`.
 const SECCOMP_ENOSYS: &[&str] = &["clone3"];
 
+/// The only families `socket` may open. `--unshare-net` holds these, and may
+/// not hold others: `AF_VSOCK` reaches a host's hypervisor past the proxy, and
+/// `AF_ALG` and the like are kernel surface nothing here uses. What is listed
+/// is what ADR 0004's "no network except a Unix socket" leaves, with loopback
+/// and netlink, which C libraries and Chromium ask for.
+const SOCKET_FAMILIES: &[(&str, u64)] = &[
+    ("AF_INET", 2),
+    ("AF_INET6", 10),
+    ("AF_NETLINK", 16),
+    ("AF_UNIX", 1),
+];
+
 /// What the file in `compiled/` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledSandbox {
@@ -164,6 +176,8 @@ pub struct SeccompFilter {
     pub ioctl: BTreeMap<String, u64>,
     pub clone_flags: BTreeMap<String, u64>,
     pub enosys: Vec<String>,
+    /// The families `socket` may open; M3-14 refuses any other, with `errno`.
+    pub socket_families: BTreeMap<String, u64>,
 }
 
 /// The relay to the sandbox's proxy, in a session's own network namespace.
@@ -366,6 +380,7 @@ fn compiled_sandbox(
             ioctl: named(SECCOMP_IOCTL),
             clone_flags: named(CLONE_NEW),
             enosys: strings(SECCOMP_ENOSYS),
+            socket_families: named(SOCKET_FAMILIES),
         },
         relay: Relay {
             port: ctx.proxy_port,
@@ -677,6 +692,22 @@ mod tests {
         ] {
             assert!(c.after_home_mask.iter().any(|a| a == option), "{option}");
         }
+    }
+
+    /// A network namespace may not hold vsock, so the filter does, for a
+    /// host that is itself a VM: only these families may be opened.
+    #[test]
+    fn the_filter_allows_only_the_socket_families_a_session_uses() {
+        let families = compiled(&Policy::default()).seccomp.socket_families;
+        assert_eq!(
+            families.into_iter().collect::<Vec<_>>(),
+            [
+                ("AF_INET".to_owned(), 2),
+                ("AF_INET6".to_owned(), 10),
+                ("AF_NETLINK".to_owned(), 16),
+                ("AF_UNIX".to_owned(), 1)
+            ]
+        );
     }
 
     #[test]

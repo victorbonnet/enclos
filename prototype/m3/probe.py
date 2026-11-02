@@ -138,6 +138,15 @@ def p_rename(path):
     return "ok", "renamed (and back)"
 
 
+def p_socket_family(family, kind=socket.SOCK_STREAM):
+    """Open a socket of that family, and close it: is the family let through?"""
+    try:
+        socket.socket(int(family), int(kind)).close()
+    except OSError as e:
+        return err(e.errno), ""
+    return "ok", "opened"
+
+
 def p_tiocsti():
     """Push two characters into the terminal's input, then read them back."""
     import fcntl
@@ -439,7 +448,7 @@ PROBES = {
     "mount": p_mount, "keyctl": p_keyctl, "bpf": p_bpf, "perf_event_open": p_perf,
     "userfaultfd": p_userfaultfd, "io_uring": p_io_uring, "kill": p_kill,
     "ptrace": p_ptrace, "connect-unix": p_connect_unix,
-    "connect-tcp": p_connect_tcp, "connect-vsock": p_connect_vsock, "dns": p_dns,
+    "connect-tcp": p_connect_tcp, "connect-vsock": p_connect_vsock, "socket-family": p_socket_family, "dns": p_dns,
     "netns": p_netns, "find": p_find, "peer-kill": p_peer_kill, "peer-ptrace": p_peer_ptrace,
     "peer-environ": p_peer_environ, "listen-tcp": p_listen_tcp, "http": p_http, "fds": p_fds,
     "nsopen": p_nsopen, "setns-net": p_setns_net, "net-admin": p_net_admin, "status": p_status,

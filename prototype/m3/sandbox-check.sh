@@ -125,6 +125,8 @@ probes+=(
     "connect-tcp 1.1.1.1 443"
     "connect-vsock 2 9"
     "connect-vsock 1 9"
+    "socket-family 40"
+    "socket-family 38 5"
     "dns example.com"
 )
 
@@ -181,7 +183,7 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo
     echo "\`read $WORK/denied-file\` reads 0 bytes where the mask holds, and 8 on the host. The host column's \`denied-missing\` rows come after the sandbox modes, so they show the empty folder a mask leaves there."
     echo
-    echo "\`exec-loader\` and \`exec-memfd\` run the copy \`exec\` runs: \`ok\` where \`exec $WORK/sh-copy\` is refused shows a way round the execute rule. \`connect-vsock\` is read against the host's column: the same error in the sandbox shows a network namespace does not stand in its way."
+    echo "\`exec-loader\` and \`exec-memfd\` run the copy \`exec\` runs: \`ok\` where \`exec $WORK/sh-copy\` is refused shows a way round the execute rule. \`connect-vsock\` is read against the host's column: the same error in the sandbox shows a network namespace does not stand in its way. \`socket-family 40\` is \`AF_VSOCK\` and \`socket-family 38 5\` \`AF_ALG\`: EPERM with the filter, and any other answer without it, shows the rule on families."
     echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
