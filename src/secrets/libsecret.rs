@@ -44,15 +44,18 @@ pub struct Libsecret {
     /// The attribute `service` of every item: `enclos.<install>`.
     service: String,
     bus: Option<String>,
+    /// Where systemd keeps the user's bus: `XDG_RUNTIME_DIR`.
+    runtime_dir: Option<String>,
     secret_tool: String,
     dbus_send: String,
 }
 
 impl Libsecret {
-    pub fn new(service: String, bus: Option<String>) -> Libsecret {
+    pub fn new(service: String, bus: Option<String>, runtime_dir: Option<String>) -> Libsecret {
         Libsecret {
             service,
             bus,
+            runtime_dir,
             secret_tool: SECRET_TOOL.to_owned(),
             dbus_send: DBUS_SEND.to_owned(),
         }
@@ -64,14 +67,18 @@ impl Libsecret {
         Libsecret {
             secret_tool,
             dbus_send,
-            ..Libsecret::new(service, Some("unix:path=/nowhere/bus".to_owned()))
+            ..Libsecret::new(
+                service,
+                Some("unix:path=/nowhere/bus".to_owned()),
+                Some("/nowhere".to_owned()),
+            )
         }
     }
 
     /// On the session bus the environment names.
     pub fn from_env(service: String) -> Libsecret {
         let bus = std::env::var(BUS_VAR).ok().filter(|v| !v.is_empty());
-        Libsecret::new(service, bus)
+        Libsecret::new(service, bus, std::env::var("XDG_RUNTIME_DIR").ok())
     }
 
     fn fail(&self, what: &str, secret: &SecretRef, why: impl std::fmt::Display) -> SecretError {
@@ -152,6 +159,11 @@ impl Libsecret {
         parse_locked(&String::from_utf8_lossy(&out.stdout))
             .ok_or_else(|| "its answer does not say".to_owned())
     }
+}
+
+/// Whether `bus` is systemd's, at the path it has at every login.
+fn lasts(bus: &str, runtime_dir: Option<&str>) -> bool {
+    runtime_dir.is_some_and(|dir| bus == format!("unix:path={dir}/bus"))
 }
 
 /// Whether `lookup` or `clear` found nothing, as far as it knows: exit 1 with
@@ -257,9 +269,13 @@ impl SecretStore for Libsecret {
         )
     }
 
+    /// Only systemd's own bus, whose address never changes: a unit outlives
+    /// a login, and a bus that came with one would stay named in it, dead,
+    /// over the manager's own. A service then takes the manager's.
     fn env(&self) -> Vec<(String, String)> {
         self.bus
             .iter()
+            .filter(|bus| lasts(bus, self.runtime_dir.as_deref()))
             .map(|bus| (BUS_VAR.to_owned(), bus.clone()))
             .collect()
     }
@@ -328,6 +344,7 @@ mod tests {
             let store = Libsecret {
                 service: "enclos.test".to_owned(),
                 bus: Some("unix:path=/nowhere/bus".to_owned()),
+                runtime_dir: None,
                 secret_tool: script("secret-tool", secret_tool),
                 dbus_send: script("dbus-send", dbus_send),
             };
@@ -568,10 +585,33 @@ esac"#,
 
     #[test]
     fn services_reach_the_same_bus() {
+        let bus = "unix:path=/run/user/1000/bus".to_owned();
         assert_eq!(
-            Libsecret::new("enclos.t".into(), Some("unix:path=/b".into())).env(),
-            [(BUS_VAR.to_owned(), "unix:path=/b".to_owned())]
+            Libsecret::new(
+                "enclos.t".into(),
+                Some(bus.clone()),
+                Some("/run/user/1000".into())
+            )
+            .env(),
+            [(BUS_VAR.to_owned(), bus)]
         );
+    }
+
+    /// A bus that came with this login, as from `dbus-launch`: named in a
+    /// unit it would outlive itself, so the unit takes the manager's.
+    #[test]
+    fn a_bus_of_one_login_is_not_handed_on() {
+        let run = Some("/run/user/1000".to_owned());
+        for bus in ["unix:path=/tmp/dbus-x", "unix:abstract=/tmp/dbus-y,guid=1"] {
+            let store = Libsecret::new("enclos.t".into(), Some(bus.into()), run.clone());
+            assert!(store.env().is_empty(), "{bus}");
+        }
+        let store = Libsecret::new(
+            "enclos.t".into(),
+            Some("unix:path=/run/user/1000/bus".into()),
+            None,
+        );
+        assert!(store.env().is_empty());
     }
 
     /// Whether to run the tests below, which need a Secret Service, so only
