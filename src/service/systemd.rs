@@ -195,7 +195,10 @@ fn exec_word(text: &str) -> String {
 /// The unit file: started now and at each login, restarted after a non-zero
 /// exit or a signal (systemd counts SIGHUP, SIGINT, SIGPIPE and SIGTERM as
 /// clean unless told otherwise) but never after exit 0, however often, with
-/// its output in the unit's log. `stop` sends TERM to the program alone,
+/// its output in the unit's log. systemd sleeps `RestartSec` before every
+/// restart, where launchd's throttle only spaces two starts, so the first
+/// waits a second and a crash loop grows to the 10 launchd takes; a systemd
+/// older than 254 ignores the two keys that grow it. `stop` sends TERM to the program alone,
 /// which may be stopping what it runs, and KILL to what is left when it
 /// exits or after the unit's stop timeout. An error when the log's path
 /// cannot be written in a unit file, where `append:` takes no quoting.
@@ -227,7 +230,9 @@ StartLimitIntervalSec=0
 ExecStart={exec}
 {env}Restart=on-failure
 RestartForceExitStatus=SIGHUP SIGINT SIGPIPE SIGTERM
-RestartSec=10
+RestartSec=1
+RestartSteps=4
+RestartMaxDelaySec=10
 KillMode=mixed
 TimeoutStopSec={timeout}
 StandardOutput=append:{log}
@@ -401,7 +406,9 @@ ExecStart="/usr/local/bin/enclos" "proxy" "run" "home" "--port" "41000"
 Environment="ENCLOS_HOME=/home/alice/.enclos"
 Restart=on-failure
 RestartForceExitStatus=SIGHUP SIGINT SIGPIPE SIGTERM
-RestartSec=10
+RestartSec=1
+RestartSteps=4
+RestartMaxDelaySec=10
 KillMode=mixed
 TimeoutStopSec=95
 StandardOutput=append:/home/alice/.enclos/sandboxes/home/logs/proxy.log
@@ -736,8 +743,11 @@ WantedBy=default.target
         if !on_a_runner() {
             return;
         }
+        let began = Instant::now();
         let service = Started::new("exits75", "echo ran; exit 75", STOP_TIMEOUT);
         service.wait_for_lines(2);
+        // A settings change costs a second, not launchd's whole throttle.
+        assert!(began.elapsed() < Duration::from_secs(8), "{:?}", began.elapsed());
         service.stop_leaves_nothing_installed();
     }
 
