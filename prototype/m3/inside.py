@@ -85,6 +85,10 @@ WRITE = (WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG
          | MAKE_SOCK | MAKE_FIFO | MAKE_SYM | REFER | TRUNCATE)
 
 
+# Above every family a kernel has: socket(2) answers EAFNOSUPPORT from here up.
+SOCKET_FAMILY_LIMIT = 64
+
+
 def say(msg):
     print(f"inside: {msg}", file=sys.stderr, flush=True)
 
@@ -198,6 +202,11 @@ def enter_netns(fd):
     say(f"netns=joined {before} -> {after}; capabilities after: {capabilities()}")
 
 
+def refused_families(allowed):
+    """One rule each: libseccomp ORs its rules, and cannot say "none of"."""
+    return [f for f in range(SOCKET_FAMILY_LIMIT) if f not in allowed.values()]
+
+
 def apply_seccomp(spec):
     import seccomp  # python3-seccomp
 
@@ -224,6 +233,8 @@ def apply_seccomp(spec):
             f.add_rule(refuse, call, seccomp.Arg(0, seccomp.MASKED_EQ, flag, flag))
     for name in spec["enosys"]:
         f.add_rule(seccomp.ERRNO(errno.ENOSYS), name)
+    for family in refused_families(spec["socket_families"]):
+        f.add_rule(refuse, "socket", seccomp.Arg(0, seccomp.EQ, family))
     f.load()  # sets no_new_privs first
     note = f" (not on this architecture: {' '.join(skipped)})" if skipped else ""
     say(f"seccomp=applied deny={len(spec['deny']) - len(skipped)}{note}")
