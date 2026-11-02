@@ -429,6 +429,20 @@ mod tests {
         assert!(err.what.contains("does not answer"), "{err}");
     }
 
+    /// Whether it answers is all that picks: one that answers but cannot be
+    /// read without asking is refused, and the file never hears of it.
+    #[test]
+    fn a_service_that_answers_but_is_locked_is_refused_not_sent_to_the_file() {
+        let case = case(true);
+        case.service.1.set(true);
+        let store = case.picked.for_new().unwrap();
+        assert_eq!(store.name(), StoreName::Libsecret);
+        assert!(store.readable().is_err());
+        let recorded = case.picked.recorded(StoreName::Libsecret).unwrap();
+        assert!(recorded.readable().is_err());
+        assert!(case.file.0.borrow().is_empty());
+    }
+
     /// Only what a policy grants from reaches a service, with no look.
     #[test]
     fn a_service_gets_only_the_variables_of_the_stores_it_is_granted_from() {
