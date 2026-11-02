@@ -447,6 +447,33 @@ fn on_a_runner_a_programs_arguments_reach_it_with_their_dollars() {
     assert_eq!(std::fs::read_to_string(seen).unwrap(), "${HOME}\n$$\n");
 }
 
+/// While a detached process keeps the scope alive, the manager holds the
+/// fixed text and no word of the command line.
+#[test]
+fn on_a_runner_the_manager_is_told_no_command_line() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(&lab, detaching("pass"));
+    let _ended = Ended(detached);
+    let cgroup = open_exec_session(&lab).cgroup.expect("it has a cgroup");
+    let unit = cgroup.rsplit('/').next().unwrap().to_owned();
+    let shown = Command::new("/usr/bin/systemctl")
+        .args(["--user", "show", "--property=Description", &unit])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        "Description=enclos session\n"
+    );
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+}
+
 #[test]
 fn on_a_runner_a_sandbox_with_a_hyphen_has_a_slice_of_its_own_with_no_parent() {
     if !on_a_runner() {
