@@ -31,6 +31,10 @@ const SCOPE_VARIABLES: [&str; 1] = ["INVOCATION_ID"];
 /// The oldest systemd enclos runs on: `--expand-environment=` came in 254, and
 /// from 258 `systemd-run --scope` expands a program's arguments without it.
 pub const SYSTEMD_NEEDED: u32 = 254;
+/// What a scope is described as. Left out, `systemd-run` sends the whole
+/// command line, whose arguments may be secrets, to the user's manager, which
+/// shows it and logs it. The unit's name already names the sandbox.
+const DESCRIPTION: &str = "enclos session";
 /// How long a program has to reach its scope. `start` waits under the state
 /// lock, and the program does not run before it is there.
 const SCOPE_WAIT: Duration = Duration::from_secs(15);
@@ -242,6 +246,7 @@ impl Scope {
         scoped
             .args(["--user", "--scope", "--quiet", "--collect"])
             .arg("--expand-environment=no")
+            .arg(format!("--description={DESCRIPTION}"))
             .arg(format!("--slice={}", self.slice))
             .arg(format!("--unit={}", self.unit))
             .args(["--", ENV]);
@@ -458,6 +463,7 @@ mod tests {
                 "--quiet",
                 "--collect",
                 "--expand-environment=no",
+                "--description=enclos session",
                 "--slice=enclos.1f2e3d4c.home.slice",
                 "--unit=enclos.1f2e3d4c.home.session-1.scope",
                 "--",
