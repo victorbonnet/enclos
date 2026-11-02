@@ -229,6 +229,10 @@ pub fn reserved_variable(name: &str) -> bool {
         || name.starts_with("LC_")
         || name.starts_with("ENCLOS_")
         || name.starts_with("DYLD_")
+        // Read by Linux's dynamic linker in every host process that carries
+        // a session's variables, before any sandbox and whatever `bash -p`
+        // ignores.
+        || name.starts_with("LD_")
         || name.starts_with("XDG_")
         || name.starts_with("BASH_FUNC_")
 }
@@ -319,6 +323,10 @@ mod tests {
             "LC_ALL",
             "ENCLOS_HOME",
             "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_SDK_KEY",
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
             "BROWSER",
