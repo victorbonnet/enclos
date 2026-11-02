@@ -10,15 +10,17 @@
 //! direction only, and so does a failed upload, as the proxy may still be
 //! answering; a failed download ends both.
 //!
-//! It has no idle limit: one that fired on a quiet direction would cut a
-//! long download or upload, and the proxy holds the limit on what it serves.
+//! A quiet connection stays: a limit on reading would cut a long download or
+//! upload, and the proxy holds the limit on what it serves. The relay holds
+//! one on what the proxy cannot see: a write that moves nothing, and a client
+//! that sends nothing more after the proxy has left.
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -52,10 +54,15 @@ fn connections_for(descriptors: Option<u64>) -> usize {
 pub fn serve(listener: TcpListener, socket: &Path) -> ! {
     // The soft limit is the one a descriptor hits: the session's.
     let descriptors = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-    serve_up_to(listener, socket, connections_for(descriptors))
+    serve_up_to(
+        listener,
+        socket,
+        connections_for(descriptors),
+        crate::proxy::IDLE_TIMEOUT,
+    )
 }
 
-fn serve_up_to(listener: TcpListener, socket: &Path, max: usize) -> ! {
+fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration) -> ! {
     let socket: Arc<Path> = Arc::from(socket);
     let open = Arc::new(AtomicUsize::new(0));
     // Each said once until it clears, not for every connection.
@@ -82,7 +89,7 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize) -> ! {
             match UnixStream::connect(&socket) {
                 Ok(upstream) => {
                     unreachable.store(false, Ordering::Relaxed);
-                    carry(&client, &upstream);
+                    carry(&client, &upstream, limit);
                 }
                 Err(e) => {
                     if !unreachable.swap(true, Ordering::Relaxed) {
@@ -97,17 +104,23 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize) -> ! {
     }
 }
 
-/// Carries both directions of one connection until both have ended.
-fn carry(client: &TcpStream, upstream: &UnixStream) {
+/// Carries both directions of one connection until both have ended. A read
+/// has no limit, as a quiet connection is not a stuck one, but a write has
+/// `limit`, and so does the upload once the proxy has left.
+fn carry(client: &TcpStream, upstream: &UnixStream, limit: Duration) {
+    let _ = client.set_write_timeout(Some(limit));
+    let _ = upstream.set_write_timeout(Some(limit));
     // Wakes the other direction, which may be blocked.
     let end_both = || {
         let _ = client.shutdown(Shutdown::Both);
         let _ = upstream.shutdown(Shutdown::Both);
     };
+    let (up_ended, wait_up) = mpsc::channel::<()>();
     thread::scope(|s| {
         // A failed upload ends the upload alone: the proxy may be answering,
         // as when it refuses a request and closes with the body unread.
-        let up = thread::Builder::new().spawn_scoped(s, || {
+        let up = thread::Builder::new().spawn_scoped(s, move || {
+            let _ended = up_ended;
             pass_on(
                 client,
                 upstream,
@@ -124,7 +137,14 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
         pass_on(
             upstream,
             client,
-            || client.shutdown(Shutdown::Write),
+            || {
+                let told = client.shutdown(Shutdown::Write);
+                // A read on the client cannot see that the proxy left, so a
+                // client that sends nothing more would hold its place.
+                let _ = wait_up.recv_timeout(limit);
+                let _ = client.shutdown(Shutdown::Both);
+                told
+            },
             end_both,
         );
     });
@@ -133,8 +153,7 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
 /// Copies one direction to its end of input, then tells the other side with
 /// `done`; `failed` runs when the copy goes wrong. A `done` that fails ends
 /// nothing: macOS answers ENOTCONN when that side has closed already, while
-/// the other direction may still carry the last of what it sent, and each
-/// direction sees for itself a peer that is really gone.
+/// the other direction may still carry the last of what it sent.
 fn pass_on(
     mut from: impl Read,
     mut to: impl Write,

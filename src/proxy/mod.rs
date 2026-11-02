@@ -61,7 +61,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// without reading, before the proxy closes it. Generous on purpose, for
 /// long-lived streams and model requests sent without streaming (design §6,
 /// Limits).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Where the proxy gets the policy it enforces.
 pub trait PolicySource: Send + Sync {
