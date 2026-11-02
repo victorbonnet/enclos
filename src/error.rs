@@ -278,9 +278,10 @@ pub enum Error {
         variable: String,
     },
     /// A service's secrets cannot be read without a dialog nobody would
-    /// see: the service is not started, and not started again.
+    /// see, or their store does not answer: the service is not started, and
+    /// not started again.
     #[error(
-        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; unlock it (logging in to the Mac does), then run `enclos sandbox start {sandbox}`"
+        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; once it can be read (logging in usually unlocks it), run `enclos sandbox start {sandbox}`"
     )]
     SecretsLocked {
         sandbox: String,

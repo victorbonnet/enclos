@@ -332,7 +332,9 @@ impl Prober for Libsecret {
 
 #[cfg(test)]
 mod tests {
+    use super::super::file::FileStore;
     use super::super::tool::ANSWER_WAIT;
+    use super::super::{Picked, Stores};
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -667,8 +669,9 @@ esac"#,
         assert!(store.env().is_empty());
     }
 
-    /// Whether to run the tests below, which need a Secret Service, so only
-    /// in CI's `libsecret` job, on a private bus with a throwaway keyring:
+    /// Whether to run the tests below, which write to a Secret Service or
+    /// the bus's lack of one, so only in CI's `libsecret` job, on a private
+    /// bus with a throwaway keyring or none:
     /// it sets `ENCLOS_LIBSECRET_TESTS`, and they refuse anywhere else, for
     /// any other bus is a user's real one.
     fn on_a_runner() -> bool {
@@ -706,6 +709,24 @@ esac"#,
         assert_eq!(store.get(&secret()).unwrap(), Some(v("456")));
         assert!(store.remove(&secret()).unwrap());
         assert_eq!(store.get(&secret()).unwrap(), None);
+    }
+
+    /// Run by CI on a bus nothing can start a Secret Service on: the real
+    /// tool, where the tests above use a stand-in, gives the cue to the file.
+    #[test]
+    fn on_a_runner_a_bus_with_no_secret_service_uses_the_file() {
+        if !on_a_runner() {
+            return;
+        }
+        let store = on_the_runners_bus();
+        assert!(!store.answers());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secrets.json");
+        let picked = Picked::new(Box::new(store), Box::new(FileStore::new(file.clone())));
+        let chosen = picked.for_new().unwrap();
+        assert_eq!(chosen.name(), StoreName::File);
+        chosen.set(&secret(), &v("tok-123")).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().contains("tok-123"));
     }
 
     /// Run on a bus of its own by CI: a locked collection stays locked.
