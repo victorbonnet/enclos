@@ -56,9 +56,11 @@ impl Relay {
     /// frees on the relay's own threads: until then each is closed.
     fn served_again(&self) {
         let (done, wait) = mpsc::channel();
+        // Dropped when this gives up, which ends the loop below.
+        let (_trying, given_up) = mpsc::channel::<()>();
         let port = self.port;
         thread::spawn(move || {
-            loop {
+            while given_up.try_recv() == Err(mpsc::TryRecvError::Empty) {
                 let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
                 let _ = client.write_all(b"x");
                 // macOS refuses the option (EINVAL) on a connection already
@@ -80,11 +82,23 @@ impl Relay {
 
     /// The upstream end of the connection the relay opens next.
     fn accepted(&self) -> UnixStream {
-        let (conn, _) = self.upstream.accept().unwrap();
+        let conn = accepted_within(&self.upstream, PATIENCE);
         conn.set_read_timeout(Some(PATIENCE)).unwrap();
         conn.set_write_timeout(Some(PATIENCE)).unwrap();
         conn
     }
+}
+
+/// The next connection on `listener`. Failing after `patience`, on a thread
+/// of its own, as `accept` has no timeout and would hang the test.
+fn accepted_within(listener: &UnixListener, patience: Duration) -> UnixStream {
+    let listener = listener.try_clone().unwrap();
+    let (got, wait) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = got.send(listener.accept());
+    });
+    let accepted = wait.recv_timeout(patience);
+    accepted.expect("no connection came").unwrap().0
 }
 
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
@@ -227,7 +241,7 @@ fn a_socket_nobody_answers_on_closes_the_client_and_is_tried_again() {
     let upstream = UnixListener::bind(&relay.path).unwrap();
     let mut client = relay.client();
     client.write_all(b"back").unwrap();
-    let (conn, _) = upstream.accept().unwrap();
+    let conn = accepted_within(&upstream, PATIENCE);
     let mut got = [0; 4];
     (&conn).read_exact(&mut got).unwrap();
     assert_eq!(&got, b"back");
@@ -244,6 +258,13 @@ fn a_connection_over_the_limit_is_closed_and_its_place_comes_back() {
     drop(first);
     drop(upstream);
     relay.served_again();
+}
+
+#[test]
+#[should_panic(expected = "no connection came")]
+fn a_connection_that_never_comes_fails_the_test_rather_than_hanging_it() {
+    let relay = Relay::start();
+    accepted_within(&relay.upstream, Duration::from_millis(50));
 }
 
 #[test]
