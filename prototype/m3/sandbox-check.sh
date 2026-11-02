@@ -4,9 +4,9 @@
 # workspace masked (planted, or missing and so a folder) with the rest of it
 # as granted, deny entries that are links with their targets hidden, writes to the home and the workspace only, the home and
 # workspace unmovable, programs run from the
-# workspace, the seccomp list, other processes (whether /proc/<pid> exists is
+# workspace (directly, through the loader and from a memfd), the seccomp list, other processes (whether /proc/<pid> exists is
 # the control: the host's own read of a process's environ never worked), the
-# host's loopback and DNS. Each probe runs on the host as
+# host's loopback, DNS and vsock. Each probe runs on the host as
 # its control, then in the sandbox in five modes:
 #
 #   bubblewrap only        no Landlock, no seccomp: what the mounts and
@@ -106,6 +106,8 @@ probes+=(
     "exec $SBX_HOME/sh-copy"
     "exec $WORK/sh-copy"
     "exec $WORK/hello.sh"
+    "exec-loader $WORK/sh-copy"
+    "exec-memfd $WORK/sh-copy"
     "unshare user"
     "unshare mount"
     "unshare net"
@@ -120,6 +122,8 @@ probes+=(
     "exists /proc/$sleeper"
     "connect-tcp 127.0.0.1 18999"
     "connect-tcp 1.1.1.1 443"
+    "connect-vsock 2 9"
+    "connect-vsock 1 9"
     "dns example.com"
 )
 
@@ -175,6 +179,8 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo "Where the host column already refuses, the row shows nothing about the sandbox: read \`bpf\`, \`perf_event_open\` and \`userfaultfd\` against the host's sysctls in 00-setup.md, and what seccomp adds against the bubblewrap-only column, since the filter's errno (EPERM) is also the kernel's."
     echo
     echo "\`read $WORK/denied-file\` reads 0 bytes where the mask holds, and 8 on the host. The host column's \`denied-missing\` rows come after the sandbox modes, so they show the empty folder a mask leaves there."
+    echo
+    echo "\`exec-loader\` and \`exec-memfd\` run the copy \`exec\` runs: \`ok\` where \`exec $WORK/sh-copy\` is refused shows a way round the execute rule. \`connect-vsock\` is read against the host's column: the same error in the sandbox shows a network namespace does not stand in its way."
     echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
