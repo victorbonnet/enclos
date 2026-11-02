@@ -323,7 +323,7 @@ From run [41073883978](https://github.com/victorbonnet/enclos/actions/runs/41073
 | Hermes: `own` and `relay` | `hermes-ns-check.sh` | `own`: `Gateway connection failed; no local fallback` (exit 1). `relay`: as `userns-net`. As in the second run. | same |
 | Hermes under `nsenter` | | **Not run**: the check left it out after the first run. See the fourth run. | same |
 
-**Decided from this (the owner's decision; ADR 0039 and 0040 are still as written):** one network namespace per sandbox, held by a holder and joined the `nsenter` way; each session keeps its own PID and IPC namespaces. Rejected: `nsenter-pid`, whose sessions listed the host's processes, and the `userns` ways, which need `CAP_SYS_ADMIN` during setup.
+**Decided from this (the owner's decision; ADR 0039 and 0040, both proposed, now say so):** one network namespace per sandbox, held by a holder and joined the `nsenter` way; each session keeps its own PID and IPC namespaces. Rejected: `nsenter-pid`, whose sessions listed the host's processes, and the `userns` ways, which need `CAP_SYS_ADMIN` during setup.
 
 **Not shown by this run:** Hermes under `nsenter`; what restarts do to open sessions; that `--disable-userns` holds in a joined session without seccomp behind it; a kernel without Landlock.
 
