@@ -696,12 +696,8 @@ mod tests {
         let found = tcp_listeners(std::process::id()).unwrap();
         assert!(found.iter().any(|a| a.port() == port), "{found:?}");
         let holders = tcp_listeners_at(port).unwrap();
-        assert_eq!(
-            holders,
-            [(
-                std::process::id(),
-                SocketAddr::from((Ipv4Addr::LOCALHOST, port))
-            )]
-        );
+        // Another test's program between fork and exec may hold a copy.
+        let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        assert!(holders.contains(&(std::process::id(), at)), "{holders:?}");
     }
 }
