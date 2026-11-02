@@ -4,7 +4,7 @@ file still counts. Pure, so it runs anywhere:
 
     python3 -I prototype/m3/test_adr_status.py
 
-CI runs it through test_nsjoin.py, which imports this class.
+ci.yml runs it on every change, one that edits nothing but an ADR included.
 """
 
 import glob
