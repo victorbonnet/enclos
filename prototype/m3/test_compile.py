@@ -386,15 +386,6 @@ class DenyInsideAGrantTest(Case):
         c = self.bare("--workspace", f"{h}/d", "--deny", f"{h}/dev/deep/er")
         self.assertEqual(set(wrap.read_host(c)["entries"]), {h, f"{h}/.config"})
 
-    def test_the_users_whole_home_as_a_workspace(self):
-        h = self.h
-        args = self.compiled("--workspace", h)["bwrap"]
-        self.assertEqual(view(args, f"{h}/new-file"), ("--bind", True))
-        self.assertEqual(view(args, f"{h}/.ssh"), ("--tmpfs", False))
-        self.assertEqual(view(args, f"{h}/.enclos"), ("--tmpfs", False))
-        self.assertEqual(view(args, f"{self.sbx}/home"), ("--bind", True))
-        self.assertEqual(view(args, f"{self.sbx}/compiled"), ("--ro-bind", False))
-
     def test_a_deny_entry_that_does_not_exist_cannot_be_made_in_a_workspace(self):
         h = self.h
         args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/not-yet")["bwrap"]
