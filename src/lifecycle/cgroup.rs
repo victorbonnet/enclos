@@ -117,6 +117,27 @@ fn is_zombie(stat: &str) -> bool {
         .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
 }
 
+/// Whether the process in `folder` of `/proc` ended, or is gone.
+fn has_ended(folder: &Path) -> bool {
+    std::fs::read_to_string(folder.join("stat")).map_or(true, |s| is_zombie(&s))
+}
+
+/// Checks that `cgroups` shows `cgroup`, where a running `pid` sits. On a
+/// hybrid host the unified hierarchy is elsewhere, and a root that does not
+/// hold it would read every session as empty, and so as stopped. A cgroup not
+/// there is only right once the program ended, as systemd then removes it.
+fn in_hierarchy(cgroups: &Hierarchy, proc: &Path, pid: u32, cgroup: &str) -> Result<(), PsError> {
+    let procs = cgroups.folder(cgroup).join("cgroup.procs");
+    if procs.exists() || has_ended(&proc.join(pid.to_string())) {
+        return Ok(());
+    }
+    Err(PsError::Cgroup(format!(
+        "pid {pid} runs in {cgroup}, and {} is not there: enclos needs the unified cgroup hierarchy at {}",
+        procs.display(),
+        cgroups.root.display()
+    )))
+}
+
 /// Where `pid` is once `unit` holds it. Until then it is `systemd-run`, in
 /// the cgroup of whoever started it. A program that ended stays readable
 /// until it is waited for, so `ended` is read first: one that ended and was
@@ -133,7 +154,7 @@ fn cgroup_from(
     let folder = proc.join(pid.to_string());
     let started = Instant::now();
     loop {
-        let ended = std::fs::read_to_string(folder.join("stat")).map_or(true, |s| is_zombie(&s));
+        let ended = has_ended(&folder);
         let path = std::fs::read_to_string(folder.join("cgroup"))
             .ok()
             .and_then(|text| parse_proc_cgroup(&text));
@@ -296,11 +317,12 @@ impl Scope {
     }
 
     /// The cgroup of the scope `pid` was started in. A scope that never
-    /// started is an error.
-    pub fn cgroup_of(&self, pid: u32) -> Result<String, PsError> {
-        cgroup_from(Path::new(PROC), pid, &self.unit, SCOPE_WAIT, &|| {
-            self.control_group()
-        })
+    /// started is an error, and so is a cgroup `cgroups` does not show.
+    pub fn cgroup_of(&self, pid: u32, cgroups: &Hierarchy) -> Result<String, PsError> {
+        let proc = Path::new(PROC);
+        let cgroup = cgroup_from(proc, pid, &self.unit, SCOPE_WAIT, &|| self.control_group())?;
+        in_hierarchy(cgroups, proc, pid, &cgroup)?;
+        Ok(cgroup)
     }
 
     /// What systemd says of the scope's cgroup: none once nothing is left
@@ -691,6 +713,26 @@ mod tests {
         }
         let hierarchy = Hierarchy::at(dir.path());
         (dir, hierarchy)
+    }
+
+    #[test]
+    fn a_running_program_whose_cgroup_the_hierarchy_does_not_show_is_refused() {
+        let proc = proc_with(7, "0::/s.scope\n", "7 (x) S 1");
+        let (_dir, cgroups) = hierarchy(&[("s.scope", "7\n")]);
+        in_hierarchy(&cgroups, proc.path(), 7, "/s.scope").unwrap();
+        let wrong = in_hierarchy(&cgroups, proc.path(), 7, "/other.scope").unwrap_err();
+        assert!(
+            wrong.to_string().contains("unified cgroup hierarchy"),
+            "{wrong}"
+        );
+    }
+
+    /// systemd removed it: a quick program is no wrong root.
+    #[test]
+    fn a_program_that_ended_may_have_taken_its_cgroup_with_it() {
+        let proc = proc_with(7, "0::/s.scope (deleted)\n", "7 (x) Z 1");
+        let (_dir, cgroups) = hierarchy(&[]);
+        in_hierarchy(&cgroups, proc.path(), 7, "/s.scope").unwrap();
     }
 
     #[test]
