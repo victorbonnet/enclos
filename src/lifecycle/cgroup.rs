@@ -272,8 +272,9 @@ impl Scope {
     }
 
     /// `command` as a program of this scope: `systemd-run` joins the scope,
-    /// then becomes the program, so the pid, the group, the terminal and the
-    /// inherited descriptors stay the same. `manager` holds the variables
+    /// then becomes the program, so the pid and the group stay the same, and
+    /// the terminal and the inherited descriptors are expected to (design
+    /// §14). `manager` holds the variables
     /// that reach the user's manager, which `/usr/bin/env` removes again.
     /// Nothing may expand the program's arguments on the way: they reach it
     /// as they are.
