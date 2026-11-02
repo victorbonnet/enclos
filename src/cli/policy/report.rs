@@ -104,7 +104,7 @@ fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
         ));
     }
     if report.listens {
-        line("Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.".to_owned());
+        line(report.notes.listening.to_owned());
     }
     line("Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.".to_owned());
     if report.inconclusive() > 0 {
@@ -261,6 +261,18 @@ mod tests {
         ] {
             assert_eq!(print_test(&home, &report(failing)), exit::ERROR);
         }
+    }
+
+    /// A sentence true of one backend's probes is that backend's to say.
+    #[test]
+    fn what_a_report_says_of_listening_is_the_backend_s() {
+        let mut listens = report(Outcome::Closed);
+        listens.listens = true;
+        listens.notes.listening = "Open by the policy: another backend's sentence.";
+        let name = "lab".parse().unwrap();
+        let text = test_text(&name, &listens);
+        assert!(text.contains(listens.notes.listening), "{text}");
+        assert!(!text.contains("bind probes"), "{text}");
     }
 
     /// The report of each kind of test on Seatbelt, as it was before the
