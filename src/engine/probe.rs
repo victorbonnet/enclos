@@ -477,6 +477,8 @@ fn present(check: &HostCheck) -> std::result::Result<bool, String> {
     }
 }
 
+/// Whether `tool` finds what it looks up, or, by one of its `absent`
+/// messages, says it is not there.
 fn listed(tool: &ToolCheck) -> std::result::Result<bool, String> {
     let out = Command::new(tool.program)
         .args(&tool.look)
@@ -484,7 +486,8 @@ fn listed(tool: &ToolCheck) -> std::result::Result<bool, String> {
         .output()
         .map_err(|e| format!("cannot run {}: {e}", tool.program))?;
     let text = output(&out);
-    match (out.status.success(), text.contains(tool.absent)) {
+    let says_absent = tool.absent.iter().any(|message| text.contains(message));
+    match (out.status.success(), says_absent) {
         (true, _) => Ok(true),
         (false, true) => Ok(false),
         (false, false) => Err(format!(
@@ -618,6 +621,23 @@ mod tests {
         let domain = crate::backend::seatbelt::probes::preferences_domain(&label);
         assert_eq!(present(&HostCheck::Tool(job)), Ok(false));
         assert_eq!(present(&HostCheck::Tool(domain)), Ok(false));
+    }
+
+    /// Either wording of a missing domain reads absent, whatever the macOS
+    /// here says; any other failure cannot tell (#136).
+    #[test]
+    fn a_preferences_domain_is_absent_by_either_message_of_defaults() {
+        let saying = |message: &str| {
+            let script = format!("echo \"{message}\" >&2; exit 1");
+            HostCheck::Tool(ToolCheck {
+                program: "/bin/sh",
+                look: vec!["-c".to_owned(), script],
+                ..crate::backend::seatbelt::probes::preferences_domain("x")
+            })
+        };
+        assert_eq!(present(&saying("Domain 'x' not found.")), Ok(false));
+        assert_eq!(present(&saying("Domain x does not exist")), Ok(false));
+        assert!(present(&saying("Could not read it")).is_err());
     }
 
     /// What closed apart from a route's rule is said by who, and a test the

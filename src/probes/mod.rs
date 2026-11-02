@@ -192,9 +192,9 @@ pub struct ToolCheck {
     pub what: String,
     pub program: &'static str,
     /// `program`'s arguments to look it up: it succeeds when it is there,
-    /// and says `absent` when it is not.
+    /// and says one of `absent` when it is not.
     pub look: Vec<String>,
-    pub absent: &'static str,
+    pub absent: &'static [&'static str],
     /// `program`'s arguments to remove it.
     pub remove: Vec<String>,
     /// How the user removes it if that failed.
