@@ -109,6 +109,22 @@ fn rejects_a_newer_schema() {
 }
 
 #[test]
+fn a_new_database_has_each_sessions_cgroup() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    let declared: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('sessions') WHERE name = 'cgroup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(declared, "TEXT");
+}
+
+#[test]
 fn rejects_a_schema_its_migrations_do_not_make() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();
@@ -413,9 +429,11 @@ fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
     assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::Keychain);
     let conn = Connection::open(&store.db).unwrap();
     let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions WHERE id = 7", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE id = 7 AND cgroup IS NULL",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(sessions, 1);
     assert!(store.remove_secret(&lock, &secret).unwrap());
