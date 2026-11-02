@@ -50,6 +50,8 @@ pub enum Why {
     NotSent(String),
     /// Its session's cgroup holds it, and `ps` does not list it.
     NotListed,
+    /// `why`, and the write to `cgroup.kill` failed, with this error.
+    KillFailed { why: Box<Why>, error: String },
 }
 
 impl Why {
@@ -61,6 +63,18 @@ impl Why {
             Why::Survived => "still runs after TERM and KILL".to_owned(),
             Why::NotSent(why) => format!("could not be signalled: {why}"),
             Why::NotListed => "still in the session's cgroup, and not listed by ps".to_owned(),
+            Why::KillFailed { why, error } => {
+                format!("{}; cgroup.kill failed: {error}", why.describe())
+            }
+        }
+    }
+
+    /// Whether enclos tried to signal it.
+    pub fn signalled(&self) -> bool {
+        match self {
+            Why::NotSignalled | Why::NotListed => false,
+            Why::Survived | Why::NotSent(_) => true,
+            Why::KillFailed { why, .. } => why.signalled(),
         }
     }
 }
@@ -109,14 +123,34 @@ fn stop_in(
     if wait_empty(&now, grace)? {
         return Ok(Stopped::Clean);
     }
-    if let Some(cgroup) = &session.cgroup {
-        cgroups.kill(cgroup);
-    }
+    let killed = match &session.cgroup {
+        Some(cgroup) => cgroups.kill(cgroup),
+        None => Ok(()),
+    };
     signals.send(&now()?, Signal::Kill)?;
     if wait_empty(&now, grace)? {
         return Ok(Stopped::Clean);
     }
-    Ok(survivors(now()?, &signals, session))
+    let left = survivors(now()?, &signals, session);
+    Ok(match killed {
+        Ok(()) => left,
+        Err(e) => with_failed_kill(left, &e),
+    })
+}
+
+/// `stopped`, each survivor saying the kill of its cgroup failed.
+fn with_failed_kill(stopped: Stopped, error: &std::io::Error) -> Stopped {
+    let Stopped::Survivors(left) = stopped else {
+        return stopped;
+    };
+    let left = left.into_iter().map(|s| Survivor {
+        member: s.member,
+        why: Why::KillFailed {
+            why: Box::new(s.why),
+            error: error.to_string(),
+        },
+    });
+    Stopped::Survivors(left.collect())
 }
 
 /// The members of `session` now, with what its cgroup holds as sure members.
@@ -390,6 +424,25 @@ mod tests {
         assert!(why.contains(&(unlisted, &Why::NotListed)), "{why:?}");
         let asked = dir.path().join("s.scope/cgroup.kill");
         assert_eq!(std::fs::read_to_string(asked).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_kill_of_the_cgroup_that_fails_is_said_with_what_survived() {
+        let unlisted = u32::MAX - 1;
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), unlisted]);
+        std::fs::create_dir(dir.path().join("s.scope/cgroup.kill")).unwrap();
+        let stopped = stop_in(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let _ = root.wait();
+        let Stopped::Survivors(left) = stopped else {
+            panic!("{stopped:?}");
+        };
+        let what = left.iter().find(|s| s.member.pid == unlisted).unwrap();
+        assert!(!what.why.signalled());
+        let said = what.why.describe();
+        assert!(said.contains("not listed by ps"), "{said}");
+        assert!(said.contains("cgroup.kill failed"), "{said}");
     }
 
     /// Nothing `ps` lists is left to signal, and the kill of the cgroup, which

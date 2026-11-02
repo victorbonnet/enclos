@@ -406,17 +406,19 @@ impl Hierarchy {
     }
 
     /// Kills everything in `cgroup` and below it at once, so that a member
-    /// forking meanwhile is not missed. Best effort: `cgroup.kill` needs
-    /// Linux 5.14, and the caller then signals what it lists and checks what
-    /// remains.
-    pub fn kill(&self, cgroup: &str) {
-        let _ = std::fs::write(self.folder(cgroup).join("cgroup.kill"), "1");
+    /// forking meanwhile is not missed. `cgroup.kill` needs Linux 5.14. A
+    /// cgroup already removed holds nothing to kill.
+    pub fn kill(&self, cgroup: &str) -> std::io::Result<()> {
+        match std::fs::write(self.folder(cgroup).join("cgroup.kill"), "1") {
+            Err(e) if removed(&e) => Ok(()),
+            written => written,
+        }
     }
 
     /// Kills everything in `cgroup`, and waits up to `wait` for it to be
     /// empty. What stays, as on a kernel with no `cgroup.kill`, is an error.
     pub fn end(&self, cgroup: &str, wait: Duration) -> Result<(), PsError> {
-        self.kill(cgroup);
+        let killed = self.kill(cgroup);
         let started = Instant::now();
         loop {
             let left = self.pids(cgroup)?;
@@ -424,9 +426,11 @@ impl Hierarchy {
                 return Ok(());
             }
             if started.elapsed() >= wait {
+                let failed = killed.err().map(|e| format!(", which failed: {e}"));
                 return Err(PsError::Cgroup(format!(
-                    "{cgroup} still holds {} process(es) after a kill",
-                    left.len()
+                    "{cgroup} still holds {} process(es) after a kill{}",
+                    left.len(),
+                    failed.unwrap_or_default()
                 )));
             }
             std::thread::sleep(SCOPE_POLL);
@@ -766,9 +770,20 @@ mod tests {
     #[test]
     fn kill_asks_the_kernel_to_end_the_cgroup() {
         let (dir, cgroups) = hierarchy(&[("s.scope", "1\n")]);
-        cgroups.kill("/s.scope");
+        cgroups.kill("/s.scope").unwrap();
         let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
         assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn a_kill_that_cannot_be_written_fails_and_a_removed_cgroup_needs_none() {
+        let (dir, cgroups) = hierarchy(&[("s.scope", "1\n")]);
+        assert!(cgroups.kill("/gone.scope").is_ok());
+        // A folder cannot be written to.
+        std::fs::create_dir(dir.path().join("s.scope/cgroup.kill")).unwrap();
+        assert!(cgroups.kill("/s.scope").is_err());
+        let left = cgroups.end("/s.scope", Duration::ZERO).unwrap_err();
+        assert!(left.to_string().contains("which failed"), "{left}");
     }
 
     #[test]

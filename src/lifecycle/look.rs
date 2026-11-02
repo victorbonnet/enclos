@@ -37,7 +37,7 @@ use super::cgroup::Hierarchy;
 use super::marker::{Held, MarkerError, holders, is_held, name_of};
 use super::members::{Found, find, is_gone};
 use super::process::{Proc, PsError, processes};
-use super::stop::{Stopped, Survivor, Why};
+use super::stop::{Stopped, Survivor};
 use crate::model::session::{ProcessRef, SessionRecord};
 
 /// Why a look, or a stop that depends on one, failed.
@@ -204,7 +204,7 @@ pub fn stop_marked(
     // the marker or lost their parent.
     let signalled = survivors(&first)
         .iter()
-        .filter(|s| !matches!(s.why, Why::NotSignalled | Why::NotListed))
+        .filter(|s| s.why.signalled())
         .map(|s| ProcessRef {
             pid: s.member.pid,
             started: s.member.started.clone(),
@@ -255,6 +255,7 @@ fn merged(
 
 #[cfg(test)]
 mod tests {
+    use super::super::stop::Why;
     use super::*;
     use crate::model::now;
     use crate::model::session::{Member, SessionId, SessionKind};
