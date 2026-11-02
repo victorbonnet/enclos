@@ -399,6 +399,19 @@ fn masks_in_a_writable_folder_come_after_the_arguments_that_bind_it() {
     }
 }
 
+/// What compiling leaves open stays written down for the work that picks it up.
+#[test]
+fn what_compiling_leaves_to_later_work_stays_written_down() {
+    let design = design();
+    let to_verify = design
+        .split("Awaiting prototype verification")
+        .last()
+        .unwrap();
+    // A workspace through a link the user made passes every check.
+    assert!(to_verify.contains("`~/cargo -> ~/.cargo`"));
+    assert!(!design.contains("the write checks still run on real paths"));
+}
+
 #[test]
 fn every_deny_entry_named_from_memory_is_listed_to_verify() {
     let defaults = fs::read_to_string(
