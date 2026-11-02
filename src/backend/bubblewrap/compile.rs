@@ -9,8 +9,9 @@
 //! variables, which `environment` reads from the host.
 //!
 //! The deny list is not mounted. The arguments `wrap` runs are
-//! `before_home_mask`, what it makes of [`HomeMask`], `after_home_mask`,
-//! then its `--remount-ro` for each folder it made.
+//! `before_home_mask`, what it makes of [`HomeMask`]'s `denied` and
+//! `denied_elsewhere`, `after_home_mask`, then its `--remount-ro` for each
+//! folder it made.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -36,6 +37,10 @@ const OWN_TMPFS: &[&str] = &["/tmp", "/var/tmp", "/run", "/dev/shm"];
 
 /// The ones of [`OWN_TMPFS`] the sandbox writes temporary files in.
 const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
+
+/// The sandbox's own too, and mounted after any mask, so a mask under one
+/// would not last.
+const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
 
 /// Refused with `EPERM`: design §14's list, then the kernel module, reboot
 /// and swap calls, and io_uring, whose operations seccomp does not see.
@@ -118,6 +123,11 @@ pub struct HomeMask {
     /// read-only, so a denied path does not exist in the sandbox.
     pub home: String,
     pub denied: Vec<String>,
+    /// Deny entries outside the user's home that nothing the sandbox mounts
+    /// covers. `wrap` masks each after the `/` bind: a tmpfs on a folder,
+    /// `/dev/null` on a file, nothing if it is missing, since this area is
+    /// read-only to the sandbox and it cannot be made there.
+    pub denied_elsewhere: Vec<String>,
     /// Deny entries inside the sandbox's home, which is bound writable:
     /// masked one by one after that bind.
     pub in_sandbox_home: Vec<String>,
@@ -207,6 +217,7 @@ fn compiled_sandbox(
         .cloned()
         .partition(|root| is_within(root, &user_home) && *root != user_home);
     let mut denied = in_user_home.clone();
+    let mut denied_elsewhere = Vec::new();
     let mut in_sandbox_home = Vec::new();
     for entry in deny {
         if is_within(&entry, &home) {
@@ -217,16 +228,26 @@ fn compiled_sandbox(
             // Hidden already.
         } else if is_within(&entry, &user_home) && entry != user_home {
             denied.push(entry);
-        } else {
+        } else if is_within(&user_home, &entry) {
             return Err(refused(format!(
-                "deny entry {} is not inside the home {}, where a denied path can be left out",
+                "deny entry {} cannot be held: it is the home {} or holds it",
                 entry.display(),
                 user_home.display()
             )));
+        } else if OWN_MOUNTS.iter().any(|m| is_within(&entry, Path::new(m))) {
+            return Err(refused(format!(
+                "deny entry {} cannot be held: the sandbox mounts its own {}",
+                entry.display(),
+                OWN_MOUNTS.join(" and ")
+            )));
+        } else {
+            denied_elsewhere.push(entry);
         }
     }
     denied.sort();
     denied.dedup();
+    denied_elsewhere.sort();
+    denied_elsewhere.dedup();
     in_sandbox_home.sort();
     in_sandbox_home.dedup();
 
@@ -269,6 +290,7 @@ fn compiled_sandbox(
         home_mask: HomeMask {
             home: text(&user_home)?,
             denied: texts(&denied)?,
+            denied_elsewhere: texts(&denied_elsewhere)?,
             in_sandbox_home: texts(&in_sandbox_home)?,
         },
         after_home_mask: after,
@@ -343,15 +365,36 @@ fn refused(reason: String) -> CompileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Layout;
+    use crate::layout::{Layout, Os};
     use crate::model::policy::TemplateName;
     use crate::policy::{initial_overrides, resolve};
 
     const USER: &str = "/nonexistent-enclos-test/alice";
 
+    /// `layout` as Linux protects it, whichever system runs the test.
+    fn on_linux(layout: &Layout) -> SandboxContext {
+        let mut ctx = SandboxContext::new(layout, &"home".parse().unwrap(), 41001);
+        ctx.protected = layout.protected_on(Os::Linux);
+        ctx
+    }
+
     fn ctx() -> SandboxContext {
-        let layout = Layout::at(format!("{USER}/.enclos"));
-        SandboxContext::new(&layout, &"home".parse().unwrap(), 41001)
+        on_linux(&Layout::at(format!("{USER}/.enclos")))
+    }
+
+    /// What every compile masks in the home of [`ctx`], and `also`.
+    fn protected_and(also: &[&str]) -> Vec<String> {
+        let mut denied: Vec<String> = [
+            ".config/systemd/user",
+            ".enclos",
+            ".local/share/systemd/user",
+        ]
+        .iter()
+        .chain(also)
+        .map(|e| format!("{USER}/{e}"))
+        .collect();
+        denied.sort();
+        denied
     }
 
     fn policy(write: &[&str], deny: &[&str]) -> Policy {
@@ -408,11 +451,7 @@ mod tests {
         assert_eq!(c.home_mask.home, USER);
         assert_eq!(
             c.home_mask.denied,
-            [
-                format!("{USER}/.config/google-chrome"),
-                format!("{USER}/.enclos"),
-                format!("{USER}/.ssh"),
-            ]
+            protected_and(&[".config/google-chrome", ".ssh"])
         );
         assert_eq!(c.before_home_mask, ["--ro-bind", "/", "/"]);
         assert!(!c.after_home_mask.iter().any(|a| a.contains("/.ssh")));
@@ -422,7 +461,8 @@ mod tests {
     #[test]
     fn a_deny_entry_under_the_sandboxs_own_tmpfs_needs_no_mask() {
         let c = compiled(&policy(&["{home}"], &["/run/user", "/tmp/x"]));
-        assert_eq!(c.home_mask.denied, [format!("{USER}/.enclos")]);
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
+        assert!(c.home_mask.denied_elsewhere.is_empty());
     }
 
     #[test]
@@ -440,7 +480,7 @@ mod tests {
     #[test]
     fn the_protected_paths_are_masked_whatever_the_policy_says() {
         let c = compiled(&policy(&[], &[]));
-        assert_eq!(c.home_mask.denied, [format!("{USER}/.enclos")]);
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
     }
 
     /// Outside the home no mask reaches them, so each gets its own tmpfs,
@@ -448,10 +488,16 @@ mod tests {
     #[test]
     fn protected_folders_outside_the_home_are_hidden_and_sealed() {
         let layout = Layout::at("/srv/enclos").with_user_home(USER);
-        let ctx = SandboxContext::new(&layout, &"home".parse().unwrap(), 41001);
+        let ctx = on_linux(&layout);
         let c = compiled_sandbox(&policy(&["{home}"], &[]), &ctx).unwrap();
         let args = &c.after_home_mask;
-        assert!(c.home_mask.denied.is_empty());
+        assert_eq!(
+            c.home_mask.denied,
+            [
+                format!("{USER}/.config/systemd/user"),
+                format!("{USER}/.local/share/systemd/user")
+            ]
+        );
         assert!(after(args, "--tmpfs").contains(&"/srv/enclos"));
         assert_eq!(after(args, "--remount-ro"), ["/srv/enclos"]);
         let last_mount = args
@@ -527,11 +573,45 @@ mod tests {
         assert_eq!(s.enosys, ["clone3"]);
     }
 
+    /// A Mac's `/opt/secrets` and LXD's folder are held the same way:
+    /// nothing else stops `connect` to a socket a read-only mount shows.
     #[test]
-    fn a_deny_entry_that_cannot_be_left_out_is_refused() {
-        for entry in ["/etc/shadow", "~", "/nonexistent-enclos-test"] {
+    fn a_deny_entry_outside_the_home_is_listed_for_a_mask() {
+        let c = compiled(&policy(
+            &["{home}"],
+            &["/opt/secrets", "/var/snap/lxd", "/var/run/docker.sock"],
+        ));
+        assert_eq!(
+            c.home_mask.denied_elsewhere,
+            ["/opt/secrets", "/var/run/docker.sock", "/var/snap/lxd"]
+        );
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
+    }
+
+    #[test]
+    fn the_default_list_compiles_with_its_entries_outside_the_home_masked() {
+        let name: TemplateName = "minimal".parse().unwrap();
+        let snap = resolve(&initial_overrides("home", &name), None).unwrap();
+        let c = compiled(&snap.policy);
+        assert_eq!(
+            c.home_mask.denied_elsewhere,
+            ["/var/lib/incus", "/var/lib/lxd", "/var/snap/lxd"]
+        );
+    }
+
+    /// The home, or what holds it, cannot be masked and still be the home;
+    /// and `/dev` and `/proc` are the sandbox's own, mounted after any mask.
+    #[test]
+    fn a_deny_entry_that_cannot_be_held_is_refused() {
+        for entry in [
+            "~",
+            "/nonexistent-enclos-test",
+            "/",
+            "/proc/sys",
+            "/dev/sda",
+        ] {
             let err = refusal(&policy(&["{home}"], &[entry]));
-            assert!(err.contains("is not inside the home"), "{entry}: {err}");
+            assert!(err.contains("cannot be held"), "{entry}: {err}");
         }
     }
 
@@ -565,7 +645,7 @@ mod tests {
     #[test]
     fn an_entry_that_holds_the_home_leaves_it_bound() {
         let c = compiled(&policy(&["{home}"], &["~/.enclos/sandboxes"]));
-        assert_eq!(c.home_mask.denied, [format!("{USER}/.enclos")]);
+        assert_eq!(c.home_mask.denied, protected_and(&[]));
         assert!(after(&c.after_home_mask, "--bind")[0].ends_with("/sandboxes/home/home"));
     }
 

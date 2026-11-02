@@ -26,9 +26,16 @@ list_sockets() {
     }' /proc/net/unix | sort -u
 }
 
+# Where LXD and Incus keep theirs (§14), named whether or not this host lists
+# them: no runner runs either, so their rows read ENOENT until a VM that does.
+list_container_sockets() {
+    printf '%s\tstream\n' /var/snap/lxd/common/lxd/unix.socket \
+        /var/lib/lxd/unix.socket /var/lib/incus/unix.socket
+}
+
 run_round() {  # name
     local name=$1 probes=() path kind
-    list_sockets >"$tmp/$name.list"
+    { list_sockets; list_container_sockets; } | sort -u >"$tmp/$name.list"
     while IFS=$'\t' read -r path kind; do
         case "$path" in *" "*) continue ;; esac
         probes+=("connect-unix $path $kind")
