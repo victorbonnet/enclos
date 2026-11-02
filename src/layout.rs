@@ -239,8 +239,8 @@ impl Layout {
     }
 
     /// Creates the folder of the sandbox's proxy socket.
-    pub fn create_proxy_socket_dir(&self, name: &str) -> Result<(), LayoutError> {
-        create_dir(&self.sandbox_run_dir(name).join("visible"))
+    pub fn create_proxy_socket_dir(&self, name: &str) -> std::io::Result<()> {
+        users_alone(&self.sandbox_run_dir(name).join("visible"))
     }
 
     /// Files no sandbox may read (ADR 0010). Each covers every file whose
@@ -403,14 +403,15 @@ fn absolute(var: &'static str, path: PathBuf) -> Result<PathBuf, LayoutError> {
 
 /// Creates `dir` and its missing parents, readable only by the user.
 fn create_dir(dir: &Path) -> Result<(), LayoutError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|source| LayoutError::Io {
-            path: dir.to_owned(),
-            source,
-        })
+    users_alone(dir).map_err(|source| LayoutError::Io {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// Creates `dir` and its parents, for the user alone.
+fn users_alone(dir: &Path) -> std::io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(test)]

@@ -83,8 +83,8 @@ impl Engine {
         })
     }
 
-    /// The proxy's listener on the sandbox's Unix socket. A failure to open
-    /// it goes by what the sandbox's sessions need. A Seatbelt session
+    /// The proxy's listener on the sandbox's Unix socket, in a folder made
+    /// for it. A failure of either goes by what the sandbox's sessions need. A Seatbelt session
     /// reaches the proxy over TCP and has no use for the socket, so the
     /// failure is said on stderr and the proxy serves its port alone: None.
     /// A session on any other backend would have no way out, so it is an
@@ -94,9 +94,12 @@ impl Engine {
         name: &SandboxName,
         backend: BackendKind,
     ) -> Result<Option<UnixListener>> {
-        self.layout.create_proxy_socket_dir(name.as_str())?;
         let path = self.layout.proxy_socket(name.as_str());
-        match listen_unix(&path) {
+        let opened = self
+            .layout
+            .create_proxy_socket_dir(name.as_str())
+            .and_then(|()| listen_unix(&path));
+        match opened {
             Ok(listener) => Ok(Some(listener)),
             Err(e) if backend == BackendKind::Seatbelt => {
                 eprintln!(
