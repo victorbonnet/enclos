@@ -493,6 +493,15 @@ mod tests {
         }
     }
 
+    /// `systemd-run` would read such a secret on the host, and `env` would
+    /// remove it, so the program would never get it.
+    #[test]
+    fn no_secret_is_given_as_a_variable_the_wrappers_read_or_remove() {
+        for name in MANAGER_VARIABLES.iter().chain(&SCOPE_VARIABLES) {
+            assert!(crate::model::secret::reserved_variable(name), "{name}");
+        }
+    }
+
     #[test]
     fn a_program_runs_through_systemd_run_with_no_way_to_the_manager() {
         let mut program = Command::new("/bin/prog");

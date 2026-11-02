@@ -257,6 +257,14 @@ pub fn reserved_variable(name: &str) -> bool {
         "IFS",
         "CDPATH",
         "GLOBIGNORE",
+        // Read by glibc in `systemd-run` and `env`, which run a Linux
+        // session's program on the host, before any sandbox.
+        "GLIBC_TUNABLES",
+        // `systemd-run` reaches the user's manager through this one, which
+        // `env` then removes, so a program never gets it; the same for what
+        // `systemd-run` sets itself (see `lifecycle::cgroup`).
+        "DBUS_SESSION_BUS_ADDRESS",
+        "INVOCATION_ID",
         // Where Hermes's services find their secrets (ADR 0034).
         "HERMES_MANAGED_DIR",
         "HTTP_PROXY",
@@ -277,6 +285,8 @@ pub fn reserved_variable(name: &str) -> bool {
         // included), before any sandbox.
         || name.starts_with("LD_")
         || name.starts_with("XDG_")
+        // Read by `systemd-run`, on the host, as a session starts.
+        || name.starts_with("SYSTEMD_")
         || name.starts_with("BASH_FUNC_")
 }
 
@@ -385,6 +395,12 @@ mod tests {
             "CDPATH",
             "GLOBIGNORE",
             "BASH_FUNC_ulimit%%",
+            // What `systemd-run` and `env` read on the host, or remove.
+            "GLIBC_TUNABLES",
+            "SYSTEMD_LOG_LEVEL",
+            "SYSTEMD_PAGER",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "INVOCATION_ID",
         ] {
             assert!(reserved_variable(reserved), "{reserved}");
         }
