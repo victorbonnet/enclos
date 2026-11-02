@@ -112,6 +112,8 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 
 /// Writes until the relay ends the connection under `to`, which shows as a
 /// reset when what was written is left unread, and as a broken pipe if not.
+/// macOS answers a socket the relay already shut down with ENOTCONN, which
+/// the relay counts as a peer leaving too.
 /// A write that times out instead means nothing ended it.
 fn assert_ends(mut to: &UnixStream, chunk: &[u8]) {
     let ended = loop {
@@ -122,7 +124,7 @@ fn assert_ends(mut to: &UnixStream, chunk: &[u8]) {
     assert!(
         matches!(
             ended.kind(),
-            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected
         ),
         "{ended}"
     );
