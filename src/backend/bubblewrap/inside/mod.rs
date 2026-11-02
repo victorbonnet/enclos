@@ -169,9 +169,12 @@ impl Prepared {
                 path: relay.log.clone(),
                 source,
             })?;
+        // In a group of its own: in a terminal the session's is the foreground
+        // one, whose Ctrl-C is the program's to hear, and would end the relay.
         let child = Command::new(THIS_PROGRAM)
             .args(["inside", "--relay", "--compiled"])
             .arg(&self.path)
+            .process_group(0)
             .stdin(Stdio::from(OwnedFd::from(listener)))
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log))

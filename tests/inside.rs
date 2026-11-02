@@ -52,8 +52,9 @@ os.waitpid(pid, 0)
 print(said.decode().split()[-1])
 "#;
 
-/// Prints each child's seccomp mode and no_new_privs, as the kernel shows
-/// them: the relay is the only child of the command.
+/// Prints each child's seccomp mode, no_new_privs and process group, as the
+/// kernel shows them, then the command's own group: the relay is the only
+/// child of the command.
 const RELAY_STATUS: &str = r#"
 import os
 me = str(os.getpid())
@@ -64,7 +65,7 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
         continue
     fields = dict(line.split(":\t", 1) for line in status.splitlines() if ":\t" in line)
     if fields.get("PPid") == me:
-        print(fields["Seccomp"], fields["NoNewPrivs"])
+        print(fields["Seccomp"], fields["NoNewPrivs"], fields["NSpgid"], os.getpgid(0))
 "#;
 
 /// Ports for relays, one each. They lie below the kernel's ephemeral ports,
@@ -370,7 +371,22 @@ fn on_a_runner_the_relay_applied_the_filter_to_itself() {
         return;
     }
     let (output, _dir) = Confined::new().run(&[PYTHON, "-c", RELAY_STATUS]);
-    assert_eq!(said(&output), "2 1", "{output:?}");
+    let status = said(&output);
+    let fields: Vec<&str> = status.split_whitespace().collect();
+    assert_eq!(fields[..2], ["2", "1"], "{output:?}");
+}
+
+/// A terminal signals the foreground group, which is the command's.
+#[test]
+fn on_a_runner_the_relay_keeps_out_of_the_commands_process_group() {
+    if !on_a_runner() {
+        return;
+    }
+    let (output, _dir) = Confined::new().run(&[PYTHON, "-c", RELAY_STATUS]);
+    let status = said(&output);
+    let fields: Vec<&str> = status.split_whitespace().collect();
+    assert_eq!(fields.len(), 4, "{status}");
+    assert_ne!(fields[2], fields[3], "{status}");
 }
 
 /// A relay leaves within a look at its parent of its session's end: one left
