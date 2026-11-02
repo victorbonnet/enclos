@@ -71,6 +71,8 @@ fn a_path_too_long_for_a_socket_stops_a_proxy_that_needs_it() {
         .proxy_socket(&"home".parse().unwrap(), BackendKind::Bubblewrap)
         .unwrap_err();
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
+    assert!(err.to_string().contains("ENCLOS_HOME"), "{err}");
+    assert!(err.to_string().contains("shorter sandbox name"), "{err}");
 }
 
 /// A file where the sandbox's proxy's socket goes.
@@ -100,6 +102,7 @@ fn a_socket_that_cannot_be_opened_is_named() {
         .unwrap_err();
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
     assert!(err.to_string().contains("proxy.sock"), "{err}");
+    assert!(err.to_string().contains("move it aside"), "{err}");
 }
 
 /// A sandbox on `backend`.
@@ -156,6 +159,7 @@ fn a_folder_that_cannot_be_made_stops_a_proxy_that_needs_it() {
         .unwrap_err();
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
     assert!(err.to_string().contains("visible"), "{err}");
+    assert!(err.to_string().contains("move it aside"), "{err}");
 }
 
 #[test]
