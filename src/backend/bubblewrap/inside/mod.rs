@@ -68,8 +68,8 @@ pub enum InsideError {
     RelayLog { path: String, source: io::Error },
     #[error("cannot start the relay: {0}")]
     RelayStart(#[source] io::Error),
-    #[error("the relay did not start: see {log}")]
-    RelayNotReady { log: String },
+    #[error("the relay did not start: {why}")]
+    RelayNotReady { why: String },
     #[error("the relay's port is not on its stdin: {0}")]
     RelayPort(#[source] io::Error),
     #[error("no command to run")]
@@ -178,8 +178,9 @@ impl Prepared {
             .spawn()
             .map_err(InsideError::RelayStart)?;
         let mut said = String::new();
+        // Read here, as the log goes with the session's own `/tmp`.
         let not_ready = || InsideError::RelayNotReady {
-            log: relay.log.clone(),
+            why: last_line(Path::new(&relay.log)),
         };
         let stdout = child.stdout.ok_or_else(not_ready)?;
         BufReader::new(stdout)
@@ -189,6 +190,16 @@ impl Prepared {
             true => Ok(()),
             false => Err(not_ready()),
         }
+    }
+}
+
+/// What a relay's log ends with, which is what stopped it.
+fn last_line(log: &Path) -> String {
+    let text = std::fs::read(log).unwrap_or_default();
+    let text = String::from_utf8_lossy(&text);
+    match text.lines().rfind(|line| !line.trim().is_empty()) {
+        Some(line) => line.trim_start_matches("error: ").to_owned(),
+        None => "it left no word in its log".to_owned(),
     }
 }
 
