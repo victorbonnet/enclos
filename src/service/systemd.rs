@@ -167,7 +167,8 @@ fn quoted(text: &str) -> String {
     word
 }
 
-/// One word of `ExecStart=`, where systemd also expands variables.
+/// An argument of `ExecStart=`, where systemd also expands variables. The
+/// program's own path is not expanded, so it is only [`quoted`].
 fn exec_word(text: &str) -> String {
     quoted(text).replace('$', "$$")
 }
@@ -190,7 +191,7 @@ pub fn unit_file(unit: &ServiceUnit) -> Result<String, ServiceError> {
         });
     }
     let log = log.replace('%', "%%");
-    let mut exec = vec![exec_word(&unit.program.display().to_string())];
+    let mut exec = vec![quoted(&unit.program.display().to_string())];
     exec.extend(unit.args.iter().map(|a| exec_word(&a.to_string_lossy())));
     let env: String = unit
         .env
@@ -365,13 +366,13 @@ WantedBy=default.target
     #[test]
     fn systemds_own_characters_in_values_stay_literal() {
         let mut unit = proxy();
-        unit.program = "/opt/my tools/enclos".into();
+        unit.program = "/opt/my $tools/enclos".into();
         unit.args = vec!["100%".into(), "$HOME".into(), "a\"b\\c\nd".into()];
         unit.env = vec![("NAME".into(), "50% $off\"\n".into())];
         unit.log = "/home/alice/my logs/100%/proxy.log".into();
         let text = unit_file(&unit).unwrap();
         assert!(
-            text.contains(r#"ExecStart="/opt/my tools/enclos" "100%%" "$$HOME" "a\"b\\c\x0ad""#),
+            text.contains(r#"ExecStart="/opt/my $tools/enclos" "100%%" "$$HOME" "a\"b\\c\x0ad""#),
             "{text}"
         );
         assert!(
