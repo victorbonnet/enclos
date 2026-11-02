@@ -56,7 +56,7 @@ impl Landlock {
         match self {
             Self::Full => None,
             Self::Older { abi } => Some(format!(
-                "enclos: this kernel's Landlock has ABI {abi}, and the rules need {LANDLOCK_ABI_NEEDED}: applied what it has, and the mounts hold the rest"
+                "enclos: this kernel's Landlock has ABI {abi}, and the rules need {LANDLOCK_ABI_NEEDED}: applied what it has; the rights and scopes it lacks are not held"
             )),
             Self::Missing => Some(
                 "enclos: this kernel has no Landlock: writes are held by the mounts alone, and any program that is mounted can run"
@@ -177,7 +177,11 @@ mod tests {
         assert_eq!(Landlock::Full.notice(), None);
         let older = Landlock::on(Some(4));
         assert_eq!(older, Landlock::Older { abi: 4 });
-        assert!(older.notice().unwrap().contains("ABI 4"));
+        let said = older.notice().unwrap();
+        assert!(said.contains("ABI 4"), "{said}");
+        // No mount holds `IOCTL_DEV` or the scopes.
+        assert!(said.contains("are not held"), "{said}");
+        assert!(!said.contains("mounts"), "{said}");
         let missing = Landlock::on(None).notice().unwrap();
         assert!(missing.contains("mounts alone"), "{missing}");
     }
