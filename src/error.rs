@@ -147,7 +147,8 @@ pub enum Error {
     /// would receive its traffic. Ports are the host's, so it may be the
     /// proxy of another user's or another enclos install's sandbox, say.
     #[error(
-        "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names it), or recreate the sandbox to get another port"
+        "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`{names}` names it), or recreate the sandbox to get another port",
+        names = port_holders_command(*.port)
     )]
     ProxyPortTaken {
         sandbox: String,
@@ -407,6 +408,14 @@ impl Error {
     }
 }
 
+/// What names the program holding `port`, on this host.
+fn port_holders_command(port: u16) -> String {
+    match cfg!(target_os = "macos") {
+        true => format!("lsof -nP -iTCP:{port} -sTCP:LISTEN"),
+        false => format!("ss -ltnp sport = :{port}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +471,22 @@ mod tests {
             done: "y".into(),
         };
         assert_eq!(after.exit_code(), 2);
+    }
+
+    /// The way to name what holds a port is one this host has.
+    #[test]
+    fn a_port_in_use_says_how_to_find_what_holds_it() {
+        let taken = Error::ProxyPortTaken {
+            sandbox: "home".into(),
+            port: 8080,
+            loopback: "127.0.0.1".into(),
+        }
+        .to_string();
+        let names = match cfg!(target_os = "macos") {
+            true => "`lsof -nP -iTCP:8080 -sTCP:LISTEN` names it",
+            false => "`ss -ltnp sport = :8080` names it",
+        };
+        assert!(taken.contains(names), "{taken}");
     }
 
     #[test]
