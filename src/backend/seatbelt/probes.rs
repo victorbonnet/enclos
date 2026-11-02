@@ -133,7 +133,7 @@ pub(crate) fn launchd_job(label: &str) -> ToolCheck {
         what: format!("the launchd job {label}"),
         program: "/bin/launchctl",
         look: vec!["list".to_owned(), label.to_owned()],
-        absent: "Could not find service",
+        absent: &["Could not find service"],
         remove: vec!["remove".to_owned(), label.to_owned()],
         by_hand: format!("remove it with `launchctl remove {label}`"),
     }
@@ -145,7 +145,8 @@ pub(crate) fn preferences_domain(domain: &str) -> ToolCheck {
         what: format!("the preferences domain {domain}"),
         program: "/usr/bin/defaults",
         look: vec!["read".to_owned(), domain.to_owned()],
-        absent: "does not exist",
+        // `does not exist` to macOS 26, `not found` on macOS 27.
+        absent: &["does not exist", "not found"],
         remove: vec!["delete".to_owned(), domain.to_owned()],
         by_hand: format!("delete it with `defaults delete {domain}`"),
     }
