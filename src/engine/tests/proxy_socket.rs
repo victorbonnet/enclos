@@ -132,6 +132,32 @@ fn run_proxy_of(
     })
 }
 
+/// A file where the sandbox's run folder goes.
+fn block_the_run_folder(engine: &Engine, name: &SandboxName) {
+    let run = engine.layout.sandbox_run_dir(name.as_str());
+    std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+    std::fs::write(&run, "not a folder").unwrap();
+}
+
+#[test]
+fn a_folder_that_cannot_be_made_leaves_a_seatbelt_proxy_its_port() {
+    let (_dir, engine, name) = with_sandbox();
+    block_the_run_folder(&engine, &name);
+    let socket = engine.proxy_socket(&name, BackendKind::Seatbelt).unwrap();
+    assert!(socket.is_none());
+}
+
+#[test]
+fn a_folder_that_cannot_be_made_stops_a_proxy_that_needs_it() {
+    let (_dir, engine, name) = with_sandbox();
+    block_the_run_folder(&engine, &name);
+    let err = engine
+        .proxy_socket(&name, BackendKind::Bubblewrap)
+        .unwrap_err();
+    assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
+    assert!(err.to_string().contains("visible"), "{err}");
+}
+
 #[test]
 fn a_proxy_goes_by_its_sandboxs_backend_when_its_socket_cannot_be_opened() {
     let (_dir, engine, name) = on_backend(BackendKind::Bubblewrap);
