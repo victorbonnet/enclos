@@ -7,6 +7,7 @@ anywhere:
 
 import hashlib
 import os
+import select
 import socket
 import sys
 import tempfile
@@ -19,6 +20,20 @@ import relay  # noqa: E402
 CHUNK = 64 * 1024
 LARGE = 64 * 1024 * 1024  # far beyond the sockets' buffers
 LIMIT = 30  # seconds; the old relay never ended, so a hang is a failure
+SETTLE = 0.5  # seconds a socket stays unwritable before the relay counts as blocked
+
+
+def fill(sock):
+    """Send until the relay has stopped taking data, because nobody reads the
+    other end; the relay is then blocked in sendall."""
+    sock.setblocking(False)
+    block = bytes(CHUNK)
+    while select.select([], [sock], [], SETTLE)[1]:
+        try:
+            sock.send(block)
+        except BlockingIOError:
+            pass
+    sock.settimeout(LIMIT)
 
 
 class RelayTest(unittest.TestCase):
@@ -139,6 +154,25 @@ class RelayTest(unittest.TestCase):
         c.shutdown(socket.SHUT_WR)
         self.assertEqual(wait(), b"still here")
 
+    def test_a_blocked_direction_holds_up_neither_the_other_nor_another_connection(self):
+        is_blocked = threading.Event()
+
+        def blocked_towards_the_client(conn):
+            fill(conn)  # the client below never reads
+            is_blocked.set()
+            return conn.recv(CHUNK)
+
+        wait = self.proxy_side(blocked_towards_the_client)
+        blocked = self.client()
+        self.assertTrue(is_blocked.wait(LIMIT), "the relay never stopped taking data")
+        echoed = self.proxy_side(lambda conn: conn.sendall(conn.recv(CHUNK)))
+        other = self.client()
+        other.sendall(b"ping")
+        self.assertEqual(other.recv(CHUNK), b"ping")
+        echoed()
+        blocked.sendall(b"still moving")
+        self.assertEqual(wait(), b"still moving")
+
     def test_a_refused_proxy_closes_the_client(self):
         os.unlink(self.proxy.getsockname())
         c = self.client()
@@ -146,20 +180,21 @@ class RelayTest(unittest.TestCase):
 
 
 class PumpTest(unittest.TestCase):
-    def test_a_reset_ends_both_directions(self):
+    def test_a_failed_direction_wakes_the_other_blocked_in_sendall(self):
         left, relay_left = socket.socketpair()
         right, relay_right = socket.socketpair()
         self.addCleanup(left.close)
         self.addCleanup(right.close)
         t = threading.Thread(target=relay.pump, args=(relay_left, relay_right), daemon=True)
         t.start()
-        right.close()  # no half-close: the far end is gone
-        left.settimeout(LIMIT)
+        fill(right)  # nobody reads left: right to left is stuck in sendall
+        right.close()
+        # This byte fails on its way to right, the only event that can wake
+        # the stuck direction; nothing reads left, so no EOF frees it.
         left.sendall(b"x")
-        self.assertEqual(left.recv(1), b"")
-        left.close()
         t.join(LIMIT)
-        self.assertFalse(t.is_alive())
+        self.assertFalse(t.is_alive(), "the blocked direction was never woken")
+        self.assertEqual((relay_left.fileno(), relay_right.fileno()), (-1, -1), "pump broke off")
 
 
 if __name__ == "__main__":
