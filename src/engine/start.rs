@@ -26,7 +26,7 @@ use super::proxy::abandon;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::cgroup::{Hierarchy, Scope, Systemd};
+use crate::lifecycle::cgroup::{Hierarchy, Scope, Systemd, no_systemd_run};
 use crate::lifecycle::process::{PsError, reference_of_child};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -191,6 +191,15 @@ fn end_unrecorded(
     }
 }
 
+/// Why `named` did not start. In a scope, what ran is `systemd_run`: with none
+/// there, that is the failure, not a program the user named.
+fn failed_spawn(named: &str, systemd_run: Option<&Path>, e: &io::Error) -> String {
+    match systemd_run {
+        Some(path) if e.kind() == io::ErrorKind::NotFound && !path.exists() => no_systemd_run(path),
+        _ => format!("could not start {named}: {e}"),
+    }
+}
+
 impl Engine {
     /// `wrapped` as the program of a new scope in sandbox `name`'s slice,
     /// and that scope, when this engine runs programs in scopes (design §8).
@@ -274,7 +283,7 @@ impl Engine {
         }
         let marker = self.new_marker(name)?;
         let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
-            what: format!("could not start {named}: {e}"),
+            what: failed_spawn(&named, scope.is_some().then_some(&*self.systemd_run), &e),
         })?;
         // Known from here on, for a failure to end it.
         let mut cgroup = None;
@@ -389,6 +398,25 @@ mod tests {
         };
         assert!(matches!(*error, Error::Session { .. }));
         assert!(left.contains("what the program started"), "{left}");
+    }
+
+    #[test]
+    fn a_missing_systemd_run_is_named_and_not_the_users_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("systemd-run");
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        let what = failed_spawn("/bin/sh in lab", Some(&missing), &not_found);
+        assert!(
+            what.contains("user manager") && !what.contains("/bin/sh"),
+            "{what}"
+        );
+        // Not in a scope, the program itself was not found.
+        let what = failed_spawn("/bin/sh in lab", None, &not_found);
+        assert!(what.contains("could not start /bin/sh in lab"), "{what}");
+        // There, something else was: the folder the program starts in.
+        std::fs::write(&missing, "").unwrap();
+        let what = failed_spawn("/bin/sh in lab", Some(&missing), &not_found);
+        assert!(what.contains("could not start /bin/sh in lab"), "{what}");
     }
 
     #[test]
