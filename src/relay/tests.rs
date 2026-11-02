@@ -110,6 +110,24 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8 ^ seed).collect()
 }
 
+/// Writes until the relay ends the connection under `to`, which shows as a
+/// reset when what was written is left unread, and as a broken pipe if not.
+/// A write that times out instead means nothing ended it.
+fn assert_ends(mut to: &UnixStream, chunk: &[u8]) {
+    let ended = loop {
+        if let Err(e) = to.write_all(chunk) {
+            break e;
+        }
+    };
+    assert!(
+        matches!(
+            ended.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+        ),
+        "{ended}"
+    );
+}
+
 fn all_of(mut from: impl Read) -> Vec<u8> {
     let mut got = Vec::new();
     from.read_to_end(&mut got).unwrap();
@@ -244,12 +262,7 @@ fn a_client_that_stops_reading_loses_the_connection_and_frees_its_place() {
     let client = relay.client();
     let upstream = relay.accepted();
     let chunk = pattern(64 * 1024, 5);
-    let ended = loop {
-        if let Err(e) = (&upstream).write_all(&chunk) {
-            break e;
-        }
-    };
-    assert_eq!(ended.kind(), ErrorKind::BrokenPipe);
+    assert_ends(&upstream, &chunk);
     relay.served_again();
     drop(client);
 }
