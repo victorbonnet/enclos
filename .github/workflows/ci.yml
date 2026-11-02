@@ -82,7 +82,13 @@ jobs:
           runtime_dir="/run/user/$(id -u)"
           echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
           timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
-      - run: cargo test --locked --all-features --lib service::systemd::tests::on_a_runner
+      # A test renamed away would leave the filter matching nothing, and
+      # cargo test passing all the same, so the count is checked too.
+      - name: Real units, all of them
+        shell: bash
+        run: |
+          cargo test --locked --all-features --lib service::systemd::tests::on_a_runner | tee units.log
+          grep -q 'test result: ok\. 10 passed' units.log
 
   secrets:
     runs-on: ubuntu-24.04
