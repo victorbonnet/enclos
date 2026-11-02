@@ -35,8 +35,7 @@ pub use stream::Listener;
 const OWN_DESCRIPTORS: u64 = 24;
 
 /// The most descriptors a proxy plans for, however many it was given: its
-/// connections and lookups also hold threads, which nothing
-/// else bounds.
+/// connections and lookups also hold threads, which nothing else bounds.
 const MOST_DESCRIPTORS: u64 = 1024;
 
 /// The most client connections a proxy serves at once, and the most name

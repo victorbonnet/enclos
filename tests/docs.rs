@@ -349,3 +349,9 @@ fn every_deny_entry_named_from_memory_is_listed_to_verify() {
         .collect();
     assert!(missing.is_empty(), "not listed to verify: {missing:?}");
 }
+
+/// `run/` holds more than a folder per sandbox.
+#[test]
+fn the_tree_lists_each_sandboxs_connect_lock() {
+    assert!(design().contains("run/<sandbox>.connect.lock"));
+}
