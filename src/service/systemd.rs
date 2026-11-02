@@ -670,27 +670,42 @@ WantedBy=default.target
 
     impl Started {
         fn new(case: &str, script: &str, stop_timeout: Duration) -> Started {
+            Started::program(case, "/bin/sh".into(), script, stop_timeout)
+        }
+
+        /// `program -c script`, for a `program` that is not `/bin/sh`.
+        fn program(case: &str, program: PathBuf, script: &str, stop_timeout: Duration) -> Started {
             let layout = crate::layout::Layout::from_env().unwrap();
             let systemd = Systemd::for_user(layout.units_dir());
             systemd.available().unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("service.log");
-            let label = label(&format!("enclos.ci{}.{case}.test", std::process::id()));
-            systemd
+            let started = Started {
+                systemd,
+                label: label(&format!("enclos.ci{}.{case}.test", std::process::id())),
+                log: dir.path().join("service.log"),
+                _dir: dir,
+            };
+            started.start(program, script, stop_timeout);
+            started
+        }
+
+        fn start(&self, program: PathBuf, script: &str, stop_timeout: Duration) {
+            self.systemd
                 .start(&ServiceUnit {
-                    label: label.clone(),
-                    program: "/bin/sh".into(),
+                    label: self.label.clone(),
+                    program,
                     args: vec!["-c".into(), script.into()],
-                    log: log.clone(),
+                    log: self.log.clone(),
                     env: Vec::new(),
                     stop_timeout,
                 })
                 .unwrap();
-            Started {
-                systemd,
-                label,
-                log,
-                _dir: dir,
+        }
+
+        fn running(&self) -> u32 {
+            match self.systemd.status(&self.label).unwrap() {
+                ServiceStatus::Running { pid } => pid,
+                status => panic!("{} is not running: {status:?}", self.label),
             }
         }
 
@@ -747,7 +762,11 @@ WantedBy=default.target
         let service = Started::new("exits75", "echo ran; exit 75", STOP_TIMEOUT);
         service.wait_for_lines(2);
         // A settings change costs a second, not launchd's whole throttle.
-        assert!(began.elapsed() < Duration::from_secs(8), "{:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_secs(8),
+            "{:?}",
+            began.elapsed()
+        );
         service.stop_leaves_nothing_installed();
     }
 
@@ -786,13 +805,112 @@ WantedBy=default.target
         let script = "trap 'echo term' TERM; echo ready; while :; do sleep 1; done";
         let service = Started::new("ignores", script, STOP_TIMEOUT);
         service.wait_for_lines(1);
-        let ServiceStatus::Running { pid } = service.systemd.status(&service.label).unwrap() else {
-            panic!("{} is not running", service.label);
-        };
+        let pid = service.running();
         let began = Instant::now();
         service.stop_leaves_nothing_installed();
         assert!(began.elapsed() >= STOP_TIMEOUT, "{:?}", began.elapsed());
         assert_eq!(service.lines(), ["ready", "term"]);
         assert!(!Path::new("/proc").join(pid.to_string()).exists());
+    }
+
+    /// Whether process `pid` is gone within a moment: the manager reaps it.
+    fn gone(pid: u32) -> bool {
+        let proc = Path::new("/proc").join(pid.to_string());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while proc.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !proc.exists()
+    }
+
+    #[test]
+    fn on_a_runner_start_enables_the_unit_for_the_next_login() {
+        if !on_a_runner() {
+            return;
+        }
+        let service = Started::new("enabled", "echo ran; exec sleep 300", STOP_TIMEOUT);
+        let name = unit_name(&service.label);
+        let dir = &service.systemd.units_dir;
+        let wanted = dir.join("default.target.wants").join(&name);
+        assert!(wanted.symlink_metadata().is_ok(), "{}", wanted.display());
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_starting_a_running_unit_replaces_it() {
+        if !on_a_runner() {
+            return;
+        }
+        let service = Started::new("replaced", "echo first; exec sleep 300", STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        let first = service.running();
+        service.start(
+            "/bin/sh".into(),
+            "echo second; exec sleep 300",
+            STOP_TIMEOUT,
+        );
+        service.wait_for_lines(2);
+        assert_eq!(service.lines(), ["first", "second"]);
+        assert_ne!(service.running(), first);
+        assert!(gone(first));
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_stop_leaves_no_process_the_program_started() {
+        if !on_a_runner() {
+            return;
+        }
+        let script = "sleep 300 & echo $!; wait";
+        let service = Started::new("stray", script, STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        let stray: u32 = service.lines()[0].parse().unwrap();
+        assert!(Path::new("/proc").join(stray.to_string()).exists());
+        service.stop_leaves_nothing_installed();
+        assert!(gone(stray));
+    }
+
+    #[test]
+    fn on_a_runner_a_dollar_in_the_programs_path_runs_that_path() {
+        use std::os::unix::fs::PermissionsExt;
+        if !on_a_runner() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("$tools");
+        std::fs::create_dir(&folder).unwrap();
+        let program = folder.join("service");
+        std::fs::write(&program, "#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = Started::program("dollar", program, "", STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        service.stop_leaves_nothing_installed();
+    }
+
+    #[test]
+    fn on_a_runner_a_folder_the_manager_does_not_search_is_refused() {
+        if !on_a_runner() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let systemd = Systemd::for_user(&dir.path().join("systemd/user"));
+        let err = systemd.available().unwrap_err();
+        assert!(err.what.contains("does not look for units"), "{err}");
+    }
+
+    #[test]
+    fn on_a_runner_stop_removes_a_file_the_manager_never_read() {
+        if !on_a_runner() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let units_dir = dir.path().join("systemd/user");
+        std::fs::create_dir_all(&units_dir).unwrap();
+        let systemd = Systemd::for_user(&units_dir);
+        let label = label(&format!("enclos.ci{}.unread.test", std::process::id()));
+        let path = systemd.unit_path(&label);
+        std::fs::write(&path, "[Service]\nExecStart=/bin/true\n").unwrap();
+        systemd.stop(&label).unwrap();
+        assert!(!path.exists());
     }
 }
