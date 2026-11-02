@@ -691,6 +691,34 @@ mod tests {
         "No application knows how to open URL file:///System/ (Error Domain=NSOSStatusErrorDomain Code=-10661 \"kLSApplicationNotFoundErr: E.g. no application claims the file\")"
     }
 
+    /// The snapshot shows only `what` of a host check, and a mistake in
+    /// `remove` would leave a real escape's job or domain on the host.
+    #[test]
+    fn the_host_tools_look_up_and_remove_what_a_probe_left() {
+        assert_eq!(
+            launchd_job("x"),
+            ToolCheck {
+                what: "the launchd job x".to_owned(),
+                program: "/bin/launchctl",
+                look: vec!["list".to_owned(), "x".to_owned()],
+                absent: &["Could not find service"],
+                remove: vec!["remove".to_owned(), "x".to_owned()],
+                by_hand: "remove it with `launchctl remove x`".to_owned(),
+            }
+        );
+        assert_eq!(
+            preferences_domain("x"),
+            ToolCheck {
+                what: "the preferences domain x".to_owned(),
+                program: "/usr/bin/defaults",
+                look: vec!["read".to_owned(), "x".to_owned()],
+                absent: &["does not exist", "not found"],
+                remove: vec!["delete".to_owned(), "x".to_owned()],
+                by_hand: "delete it with `defaults delete x`".to_owned(),
+            }
+        );
+    }
+
     #[test]
     fn host_service_probes_are_apart_and_the_harmless_ones_never_use_a_host_service() {
         let dir = tempfile::tempdir().unwrap();
