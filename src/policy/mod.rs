@@ -435,6 +435,8 @@ mod tests {
             "~/.config/Bitwarden CLI",
             "~/.config/Proton Pass",
             "~/.config/keepassxc",
+            "~/.1password",
+            "~/.bitwarden-ssh-agent.sock",
             "~/.config/Claude",
             "~/.config/Cursor",
             // What starts programs for the user outside the sandbox
