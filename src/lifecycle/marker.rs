@@ -359,6 +359,30 @@ mod tests {
         assert!(!pids.contains(&std::process::id()), "{pids:?}");
     }
 
+    /// A process whose main thread exited still holds what it held, and
+    /// its session is not over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_holds_its_marker() {
+        use crate::lifecycle::process::{headless, headless_port};
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().join("members");
+        let marker = Marker::new(&members).unwrap();
+        let mut python = Command::new("/usr/bin/python3");
+        let (mut child, started) = marker.spawn(headless(&mut python)).unwrap();
+        headless_port(&mut child);
+        let root = ProcessRef {
+            pid: child.id(),
+            started: "Wed Oct 22 12:00:00 2026".to_owned(),
+        };
+        started.name(&root).unwrap();
+        let held = holders(&members);
+        let _ = child.kill();
+        let _ = child.wait();
+        let held = held.unwrap();
+        assert!(held[&name_of(&root)].contains(&child.id()), "{held:?}");
+    }
+
     #[test]
     fn a_proc_that_cannot_be_read_is_an_error() {
         let members = tempfile::tempdir().unwrap();
