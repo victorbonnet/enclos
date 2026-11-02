@@ -177,3 +177,18 @@ fn no_runner_cell_waits_for_a_run() {
     assert!(!readme.contains("to measure (CI)"));
     assert!(!readme.contains("the next run of the workflow"));
 }
+
+#[test]
+fn an_older_landlock_abi_has_one_answer() {
+    let (adr_0037, adr_0038, design) = (adr(ADR_0037), adr(ADR_0038), design());
+    assert!(adr_0037.contains("- **Where it is missing**, the backend still runs."));
+    assert!(adr_0037.contains(
+        "The rights that ABI has apply, as a layer over the mounts, and the rights it lacks rest on the mounts alone."
+    ));
+    assert!(adr_0037.contains("With an older ABI its rules apply, so it needs no acceptance."));
+    assert!(!adr_0037.contains("left to the code"));
+    assert!(!adr_0038.contains("too old a Landlock"));
+    assert!(adr_0038.contains("an `[exec]` section is applied and needs no acceptance"));
+    assert!(design.contains("the rights that ABI has apply as a layer over the mounts"));
+    assert!(!design.contains("or its ABI is older than the backend's rules need, writes are held"));
+}
