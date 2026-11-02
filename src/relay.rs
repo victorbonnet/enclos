@@ -105,7 +105,7 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
     };
     thread::scope(|s| {
         let up = thread::Builder::new().spawn_scoped(s, || {
-            forward(
+            pass_on(
                 client,
                 upstream,
                 || upstream.shutdown(Shutdown::Write),
@@ -116,7 +116,7 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
             eprintln!("enclos relay: cannot start a thread for a connection: {e}");
             return;
         }
-        forward(
+        pass_on(
             upstream,
             client,
             || client.shutdown(Shutdown::Write),
@@ -130,7 +130,7 @@ fn carry(client: &TcpStream, upstream: &UnixStream) {
 /// nothing: macOS answers ENOTCONN when that side has closed already, while
 /// the other direction may still carry the last of what it sent, and each
 /// direction sees for itself a peer that is really gone.
-fn forward(
+fn pass_on(
     mut from: impl Read,
     mut to: impl Write,
     done: impl FnOnce() -> io::Result<()>,
