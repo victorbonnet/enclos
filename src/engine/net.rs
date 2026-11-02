@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::model::Timestamp;
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::proxy::{ActivePolicy, Listener, Proxy, listen, listen_unix};
 use crate::state::sqlite::SqliteStateStore;
 
@@ -31,13 +31,15 @@ impl Engine {
     /// its Unix socket, until the process ends. With `record`, it records
     /// itself as the sandbox's proxy once `listen` holds the port (on both
     /// loopbacks, or on 127.0.0.1 alone where `[::1]` is not configured)
-    /// and the socket is open, never before: a recorded proxy owns its port.
+    /// and the socket is open or given up on, as `proxy_socket`
+    /// says, never before: a recorded proxy owns its port.
     /// When the sandbox's reserved port is taken, it says whether by the
     /// sandbox's own proxy or by another program, and on which loopback.
     /// It reads the active policy for each new connection, so policy
     /// changes apply without a restart.
     pub fn run_proxy(&self, name: &SandboxName, port: u16, record: Option<&Actor>) -> Result<()> {
-        let reserved = self.record(name)?.proxy_port;
+        let sandbox = self.record(name)?;
+        let reserved = sandbox.proxy_port;
         self.policy(name)?;
         let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
         let policy = ActivePolicy {
@@ -63,7 +65,7 @@ impl Engine {
         })?;
         // After the port, which only one proxy holds: so a socket found
         // here is not the running proxy's.
-        let socket = self.proxy_socket(name)?;
+        let socket = self.proxy_socket(name, sandbox.backend)?;
         if let Some(by) = record {
             self.record_proxy(by, name)?;
         }
@@ -81,18 +83,24 @@ impl Engine {
         })
     }
 
-    /// The proxy's listener on the sandbox's Unix socket. None where its
-    /// path is too long for a Unix socket, which is said on stderr: a session
-    /// that needs the socket then has no way out, while one that reaches the
-    /// proxy over TCP has no use for it.
-    pub(super) fn proxy_socket(&self, name: &SandboxName) -> Result<Option<UnixListener>> {
+    /// The proxy's listener on the sandbox's Unix socket. A failure to open
+    /// it goes by what the sandbox's sessions need. A Seatbelt session
+    /// reaches the proxy over TCP and has no use for the socket, so the
+    /// failure is said on stderr and the proxy serves its port alone: None.
+    /// A session on any other backend would have no way out, so it is an
+    /// error.
+    pub(super) fn proxy_socket(
+        &self,
+        name: &SandboxName,
+        backend: BackendKind,
+    ) -> Result<Option<UnixListener>> {
         self.layout.create_proxy_socket_dir(name.as_str())?;
         let path = self.layout.proxy_socket(name.as_str());
         match listen_unix(&path) {
             Ok(listener) => Ok(Some(listener)),
-            Err(e) if e.kind() == ErrorKind::InvalidInput => {
+            Err(e) if backend == BackendKind::Seatbelt => {
                 eprintln!(
-                    "enclos proxy: {} is too long for a Unix socket, so sandbox {name}'s proxy serves its port alone: {e}",
+                    "enclos proxy: cannot listen on {}, so sandbox {name}'s proxy serves its port alone: {e}",
                     path.display()
                 );
                 Ok(None)
