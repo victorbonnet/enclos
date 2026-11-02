@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::descriptors::PROC;
 use super::process::PsError;
 
-const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const ENV: &str = "/usr/bin/env";
 /// Where the kernel shows the cgroup hierarchy.
@@ -28,6 +28,9 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MANAGER_VARIABLES: [&str; 2] = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
 /// What `systemd-run` itself may add to the program's environment.
 const SCOPE_VARIABLES: [&str; 1] = ["INVOCATION_ID"];
+/// The oldest systemd enclos runs on: `--expand-environment=` came in 254, and
+/// from 258 `systemd-run --scope` expands a program's arguments without it.
+pub const SYSTEMD_NEEDED: u32 = 254;
 /// How long a program has to reach its scope. `start` waits under the state
 /// lock, and the program does not run before it is there.
 const SCOPE_WAIT: Duration = Duration::from_secs(15);
@@ -143,6 +146,69 @@ fn cgroup_from(
     }
 }
 
+/// The major version in what `systemd-run --version` printed, whose first
+/// line is `systemd 257 (257.13-1)`.
+fn parse_systemd_version(text: &str) -> Option<u32> {
+    let mut words = text.lines().next()?.split_whitespace();
+    if words.next()? != "systemd" {
+        return None;
+    }
+    let version = words.next()?;
+    let digits = version.find(|c: char| !c.is_ascii_digit());
+    version[..digits.unwrap_or(version.len())].parse().ok()
+}
+
+/// The systemd on this host, against [`SYSTEMD_NEEDED`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Systemd {
+    /// Recent enough, at this version.
+    Enough(u32),
+    /// Older than enclos needs, at this version.
+    TooOld(u32),
+    /// Its version could not be read, and why.
+    Unreadable(String),
+}
+
+impl Systemd {
+    /// What `systemd_run --version` says of this host.
+    pub fn at(systemd_run: &Path) -> Systemd {
+        let out = super::bounded::output_within(
+            Command::new(systemd_run)
+                .arg("--version")
+                .stdin(Stdio::null()),
+            super::bounded::LIMIT,
+        );
+        let name = systemd_run.display();
+        let out = match out {
+            Ok(out) => out,
+            Err(e) => return Systemd::Unreadable(format!("cannot run {name}: {e}")),
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        match parse_systemd_version(&text).filter(|_| out.status.success()) {
+            Some(version) if version >= SYSTEMD_NEEDED => Systemd::Enough(version),
+            Some(version) => Systemd::TooOld(version),
+            None => Systemd::Unreadable(format!(
+                "{name} --version ended with {} and printed `{}`",
+                out.status,
+                text.lines().next().unwrap_or_default().trim()
+            )),
+        }
+    }
+
+    /// Why no session can start on this host, with what to do.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            Systemd::Enough(_) => None,
+            Systemd::TooOld(version) => Some(format!(
+                "enclos needs systemd {SYSTEMD_NEEDED} or later; this host has {version}. Debian 12 ships 252: Debian 13 or Ubuntu 24.04 work."
+            )),
+            Systemd::Unreadable(why) => Some(format!(
+                "enclos needs systemd {SYSTEMD_NEEDED} or later, and cannot tell which this host has: {why}"
+            )),
+        }
+    }
+}
+
 /// The scope a session's program runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
@@ -167,12 +233,15 @@ impl Scope {
     /// then becomes the program, so the pid, the group, the terminal and the
     /// inherited descriptors stay the same. `manager` holds the variables
     /// that reach the user's manager, which `/usr/bin/env` removes again.
+    /// Nothing may expand the program's arguments on the way: they reach it
+    /// as they are.
     /// `command` gave the whole environment the program runs with, as a
     /// backend's `wrap` does for a Linux host, and no standard stream yet.
     fn around(&self, command: &Command, manager: &[(OsString, OsString)]) -> Command {
         let mut scoped = Command::new(SYSTEMD_RUN);
         scoped
             .args(["--user", "--scope", "--quiet", "--collect"])
+            .arg("--expand-environment=no")
             .arg(format!("--slice={}", self.slice))
             .arg(format!("--unit={}", self.unit))
             .args(["--", ENV]);
@@ -388,6 +457,7 @@ mod tests {
                 "--scope",
                 "--quiet",
                 "--collect",
+                "--expand-environment=no",
                 "--slice=enclos.1f2e3d4c.home.slice",
                 "--unit=enclos.1f2e3d4c.home.session-1.scope",
                 "--",
@@ -422,6 +492,59 @@ mod tests {
             ]
         );
         assert_eq!(command.get_current_dir(), Some(Path::new("/h")));
+    }
+
+    #[test]
+    fn systemd_run_prints_the_version_on_its_first_line() {
+        for (text, version) in [
+            ("systemd 252 (252.39-1~deb12u2)\n+PAM +AUDIT\n", 252),
+            ("systemd 253 (253.1)\n", 253),
+            ("systemd 254 (254)\n", 254),
+            ("systemd 257 (257.13-1~deb13u1)\n+PAM\n", 257),
+            ("systemd 258~rc3 (258~rc3-1)\n", 258),
+        ] {
+            assert_eq!(parse_systemd_version(text), Some(version), "{text}");
+        }
+        for text in ["", "\n", "systemd\n", "systemd x\n", "bash 5.2\n", "257\n"] {
+            assert_eq!(parse_systemd_version(text), None, "{text:?}");
+        }
+    }
+
+    /// A `systemd-run` printing `text` and exiting with `code`.
+    fn systemd_run_printing(text: &str, code: u8) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("systemd-run");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{text}'\nexit {code}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn systemd_from_254_is_enough_and_an_older_one_is_refused_with_what_to_do() {
+        let (_dir, new) = systemd_run_printing("systemd 254 (254.1)", 0);
+        assert_eq!(Systemd::at(&new), Systemd::Enough(254));
+        assert_eq!(Systemd::at(&new).refusal(), None);
+        let (_dir, old) = systemd_run_printing("systemd 253 (253.1)", 0);
+        assert_eq!(Systemd::at(&old), Systemd::TooOld(253));
+        assert_eq!(
+            Systemd::TooOld(252).refusal().unwrap(),
+            "enclos needs systemd 254 or later; this host has 252. Debian 12 ships 252: Debian 13 or Ubuntu 24.04 work."
+        );
+    }
+
+    #[test]
+    fn a_version_that_cannot_be_read_is_refused_and_said_so() {
+        let (dir, garbage) = systemd_run_printing("not a version", 0);
+        let (_other, failed) = systemd_run_printing("systemd 257 (257.1)", 1);
+        let missing = dir.path().join("none");
+        for path in [garbage, failed, missing] {
+            let why = Systemd::at(&path).refusal().unwrap();
+            assert!(
+                why.contains("needs systemd 254") && why.contains("cannot tell"),
+                "{why}"
+            );
+        }
     }
 
     const IN_SCOPE: &str =

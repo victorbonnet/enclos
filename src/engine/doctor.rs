@@ -6,7 +6,8 @@
 //! enclos adds when it compiles a policy writes a new file at the next
 //! session start, without asking (ADR 0018); this is where that change is
 //! shown. It also looks for secrets in the runtime's settings files in the
-//! sandbox home.
+//! sandbox home. On a host where sessions run in scopes, it says which
+//! systemd it found.
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
 use crate::layout::LayoutError;
+use crate::lifecycle::cgroup::Systemd;
 use crate::lifecycle::look::Look;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
@@ -31,6 +33,8 @@ use crate::state::StateError;
 pub struct Doctor {
     /// Every backend this build has.
     pub backends: Vec<BackendCheck>,
+    /// The host's systemd, where sessions run in scopes: on Linux.
+    pub systemd: Option<Systemd>,
     pub sandboxes: Sandboxes,
 }
 
@@ -210,7 +214,7 @@ pub const MAX_LINES: usize = 2000;
 
 impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
-    /// enclos's records cannot be read, or a sandbox's backend does not
+    /// systemd is too old or cannot be read, enclos's records cannot be read, or a sandbox's backend does not
     /// run, its next session cannot compile its policy, or enclos could not
     /// look at all of it. A compiled policy that changed, and a secret found
     /// in a runtime's settings, are reported, not problems.
@@ -224,6 +228,7 @@ impl Doctor {
                 || !s.unreadable.is_empty()
         };
         !self.backends.iter().any(BackendCheck::runs_here)
+            || self.systemd.as_ref().is_some_and(|s| s.refusal().is_some())
             || match &self.sandboxes {
                 Sandboxes::NotInitialized => false,
                 Sandboxes::Unreadable { .. } => true,
@@ -278,6 +283,7 @@ impl Engine {
         };
         Doctor {
             backends,
+            systemd: self.scopes.then(|| Systemd::at(&self.systemd_run)),
             sandboxes,
         }
     }

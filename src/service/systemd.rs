@@ -197,9 +197,8 @@ fn exec_word(text: &str) -> String {
 /// clean unless told otherwise) but never after exit 0, however often, with
 /// its output in the unit's log. systemd sleeps `RestartSec` before every
 /// restart, where launchd's throttle only spaces two starts, so the first
-/// waits a second and a crash loop grows to the 10 launchd takes; a systemd
-/// older than 254 ignores the two keys that grow it. `stop` sends TERM to the program alone,
-/// which may be stopping what it runs, and KILL to what is left when it
+/// waits a second and a crash loop grows to the 10 launchd takes. `stop`
+/// sends TERM to the program alone, which may be stopping what it runs, and KILL to what is left when it
 /// exits or after the unit's stop timeout. An error when the log's path
 /// cannot be written in a unit file, where `append:` takes no quoting.
 pub fn unit_file(unit: &ServiceUnit) -> Result<String, ServiceError> {

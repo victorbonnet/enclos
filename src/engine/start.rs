@@ -3,7 +3,8 @@
 //! launch`. What differs between them is [`Starting`] and what they do
 //! once the program runs and before it is recorded.
 //!
-//! The order is load-bearing. The program does not start until the policy
+//! The order is load-bearing. On a host whose systemd is too old for a scope
+//! nothing starts, so the check comes first. The program does not start until the policy
 //! compiles and the secrets are read; the proxy a command needs starts
 //! between the two, and stays if a later step fails. The program starts
 //! holding a marker, which is named after it before the session is
@@ -25,7 +26,7 @@ use super::proxy::abandon;
 use crate::backend::Launch;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::cgroup::{Hierarchy, Scope};
+use crate::lifecycle::cgroup::{Hierarchy, Scope, Systemd};
 use crate::lifecycle::process::{PsError, reference_of_child};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -217,6 +218,11 @@ impl Engine {
         starting: Starting,
         before_recording: impl FnOnce() -> Result<T>,
     ) -> Result<Started<T>> {
+        if self.scopes
+            && let Some(what) = Systemd::at(&self.systemd_run).refusal()
+        {
+            return Err(Error::Session { what });
+        }
         let mut record = self.record(name)?;
         let compiled = self.compile_policy(name, record.proxy_port)?;
         if matches!(starting, Starting::Command { .. }) {
