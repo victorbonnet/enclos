@@ -16,6 +16,7 @@ import ctypes
 import errno
 import json
 import os
+import platform
 import socket
 import struct
 import sys
@@ -50,6 +51,14 @@ REFER = 1 << 13      # ABI 2
 TRUNCATE = 1 << 14   # ABI 3
 IOCTL_DEV = 1 << 15  # ABI 5
 SCOPES = {"abstract_unix_socket": 1 << 0, "signal": 1 << 1}  # ABI 6
+
+# What landlock_create_ruleset answers where Landlock is missing: not built, or
+# built and not active. Any other error stops the session (ADR 0037 covers a
+# missing Landlock, not an outer filter's EPERM or an ENOMEM).
+LANDLOCK_MISSING = {errno.errorcode[errno.ENOSYS], errno.errorcode[errno.EOPNOTSUPP]}
+# seccomp: the calls of the deny list an architecture does not have. Any other
+# rule that cannot be added stops the session.
+SECCOMP_ABSENT = {"aarch64": {"ioperm", "iopl", "uselib"}}
 
 READ = READ_FILE | READ_DIR
 WRITE = (WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG
@@ -100,6 +109,8 @@ def landlock_grants(rules, proc_truncate=False):
 def apply_landlock(rules, proc_truncate=False):
     abi, err = landlock_abi()
     if abi is None:
+        if err not in LANDLOCK_MISSING:
+            sys.exit(f"inside: landlock_create_ruleset: {err}")
         say(f"landlock=missing ({err}): writes held by bubblewrap's mounts alone")
         return
     handled = handled_for(abi)
@@ -145,20 +156,20 @@ def apply_seccomp(spec):
 
     refuse = seccomp.ERRNO(getattr(errno, spec["errno"]))
     f = seccomp.SyscallFilter(defaction=seccomp.ALLOW)
+    absent = SECCOMP_ABSENT.get(platform.machine(), set())
     skipped = []
     for name in spec["deny"]:
+        if name in absent:
+            skipped.append(name)
+            continue
         # libseccomp knows every name on every architecture, and silently
         # drops a rule for a call this one lacks (a negative number here).
         try:
             if seccomp.resolve_syscall(seccomp.Arch.NATIVE, name) < 0:
-                skipped.append(name)
-                continue
-        except (RuntimeError, ValueError, TypeError, AttributeError):
-            pass
-        try:
+                sys.exit(f"inside: seccomp: {name} is not a system call here")
             f.add_rule(refuse, name)
-        except (RuntimeError, ValueError, OSError):
-            skipped.append(name)  # not a system call on this architecture
+        except (RuntimeError, ValueError, OSError) as e:
+            sys.exit(f"inside: seccomp rule for {name}: {e}")
     for value in spec["ioctl"].values():
         f.add_rule(refuse, "ioctl", seccomp.Arg(1, seccomp.MASKED_EQ, 0xFFFFFFFF, value))
     for flag in spec["clone_flags"].values():
