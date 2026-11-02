@@ -147,7 +147,8 @@
       "/var/snap/lxd"
     ],
     "in_sandbox_home": [],
-    "in_workspace": []
+    "in_workspace": [],
+    "unmovable": []
   },
   "after_home_mask": [
     "--dev",
