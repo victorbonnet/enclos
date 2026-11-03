@@ -15,8 +15,7 @@ use crate::engine::start::{CommandKind, Group, Starting};
 static HOST_PORTS: crate::host_ports::HostPorts = crate::host_ports::HostPorts;
 
 fn script(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scripts::write_script(path, body);
 }
 
 /// A bubblewrap sandbox whose programs are stand-ins in `dir`: `bwrap`
