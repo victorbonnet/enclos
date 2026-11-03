@@ -543,3 +543,72 @@ fn an_enclos_the_sandbox_does_not_see_refuses_the_session() {
     .to_string();
     assert!(why.contains("does not see"), "{why}");
 }
+
+/// What `/proc/self/status` says the stand-in bubblewrap ignores, and the
+/// arguments it was given, for a launch in a terminal or not.
+fn as_bubblewrap_ran(in_terminal: bool) -> (u64, String) {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let bwrap = home.dir.path().join("bwrap");
+    crate::test_scripts::write_script(
+        &bwrap,
+        "grep '^SigIgn:' /proc/self/status | cut -f2; printf '%s\\n' \"$@\"",
+    );
+    let programs = Programs {
+        bwrap: &bwrap,
+        enclos: Path::new("/usr/bin/enclos"),
+    };
+    let mut launch = launch(Vec::new());
+    launch.in_terminal = in_terminal;
+    let out = command(
+        &programs,
+        Path::new("/c.json"),
+        &c,
+        &host,
+        &ctx(&home),
+        &launch,
+    )
+    .unwrap()
+    .output()
+    .unwrap();
+    let said = String::from_utf8(out.stdout).unwrap();
+    let (mask, args) = said.split_once('\n').unwrap();
+    (
+        u64::from_str_radix(mask.trim(), 16).unwrap(),
+        args.to_owned(),
+    )
+}
+
+/// SIGINT is signal 2 and SIGQUIT 3: bits 1 and 2 of the mask.
+const INT_AND_QUIT: u64 = 0b110;
+
+/// A terminal's Ctrl-C reaches bubblewrap's outer process, in the session's
+/// group: it ignores it, and `enclos inside` is told to hand it back.
+#[cfg(target_os = "linux")]
+#[test]
+fn in_a_terminal_bubblewrap_ignores_ctrl_c_and_the_command_gets_it_back() {
+    let (ignored, args) = as_bubblewrap_ran(true);
+    assert_eq!(ignored & INT_AND_QUIT, INT_AND_QUIT, "{ignored:x}");
+    let args: Vec<&str> = args.lines().collect();
+    let at = args.iter().position(|a| *a == "inside").unwrap();
+    assert_eq!(
+        &args[at..at + 5],
+        [
+            "inside",
+            "--compiled",
+            "/c.json",
+            "--restore-interrupts",
+            "--"
+        ]
+    );
+}
+
+/// A service or a probe has no terminal, and runs as it was started.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_terminal_nothing_is_ignored_or_handed_back() {
+    let (ignored, args) = as_bubblewrap_ran(false);
+    assert_eq!(ignored & INT_AND_QUIT, 0, "{ignored:x}");
+    assert!(!args.contains("--restore-interrupts"), "{args}");
+}

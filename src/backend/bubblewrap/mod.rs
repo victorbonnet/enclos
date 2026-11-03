@@ -24,6 +24,11 @@ use crate::probes::OwnProbes;
 pub use compile::{CompiledSandbox, compile};
 pub use proposed::{Host, capabilities};
 
+/// What `wrap` passes `enclos inside` in a terminal's session, whose
+/// bubblewrap outer process ignores Ctrl-C and Ctrl-\: hand them back to
+/// the command.
+pub const INTERRUPTS_FLAG: &str = "--restore-interrupts";
+
 /// Where Debian's and Ubuntu's `bubblewrap` package installs it.
 pub const BWRAP: &str = "/usr/bin/bwrap";
 

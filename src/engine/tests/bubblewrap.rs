@@ -139,6 +139,8 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
             "inside",
             "--compiled",
             compiled.as_str(),
+            // A command's session: its Ctrl-C is the command's (`wrap`).
+            "--restore-interrupts",
             "--",
             "/bin/sh",
             "-c",
