@@ -147,7 +147,19 @@ fn hold_port(port: u16, socket: &Path, go: &Path, log: &Path, opens: bool) -> st
     command
         .args([
             "-c",
-            "import os, socket, sys
+            "import os, socket, sys, threading
+
+
+def drain(listener):
+    # A real proxy accepts: a listener that never does stops answering once
+    # its queue holds 129 connections, which the engine's polling reaches.
+    while True:
+        try:
+            listener.accept()[0].close()
+        except OSError:
+            return
+
+
 port, path, go, opens = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == 'opens'
 t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(('127.0.0.1', port))
 os.mkfifo(go)
@@ -155,10 +167,12 @@ print('holding', flush=True)
 heard = open(go).read()
 print('heard', repr(heard), file=sys.stderr, flush=True)
 t.listen()
+threading.Thread(target=drain, args=(t,), daemon=True).start()
 print('listening on', port, file=sys.stderr, flush=True)
 if opens:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     u = socket.socket(socket.AF_UNIX); u.bind(path); u.listen()
+    threading.Thread(target=drain, args=(u,), daemon=True).start()
     print('listening on', path, file=sys.stderr, flush=True)
 sys.stdin.read()",
         ])

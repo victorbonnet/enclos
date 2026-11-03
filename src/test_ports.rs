@@ -17,26 +17,37 @@ const TRIES: usize = 64;
 
 /// The first of what `next` gives, each with its port, whose port is outside
 /// the proxy range. Panics after [`TRIES`].
-pub(crate) fn clear_of_proxies<T>(mut next: impl FnMut() -> (T, u16)) -> T {
+pub(crate) fn clear_of_proxies<T>(next: impl FnMut() -> (T, u16)) -> T {
+    try_clear_of_proxies(next)
+        .unwrap_or_else(|| panic!("no port outside {PORT_FIRST} to {PORT_LAST} in {TRIES} tries"))
+}
+
+/// [`clear_of_proxies`], or `None` after [`TRIES`] ports inside the range.
+fn try_clear_of_proxies<T>(mut next: impl FnMut() -> (T, u16)) -> Option<T> {
     let mut rejected = Vec::new();
     for _ in 0..TRIES {
         let (held, port) = next();
         if !(PORT_FIRST..=PORT_LAST).contains(&port) {
-            return held;
+            return Some(held);
         }
         rejected.push(held);
     }
-    panic!("no port outside {PORT_FIRST} to {PORT_LAST} in {TRIES} tries");
+    None
 }
 
 /// A TCP listener at `address`, on a port the system chooses.
 pub(crate) fn tcp_listener(address: impl Into<IpAddr>) -> TcpListener {
     let address = address.into();
-    clear_of_proxies(|| {
+    // The system's choice first. Should it keep to the proxy range (a host
+    // whose ephemeral range is mostly inside it), ask for ports by number
+    // from just above the range, which a test cannot be given by chance.
+    try_clear_of_proxies(|| {
         let listener = TcpListener::bind((address, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, port)
     })
+    .or_else(|| (PORT_LAST + 1..=u16::MAX).find_map(|port| TcpListener::bind((address, port)).ok()))
+    .unwrap_or_else(|| panic!("no port outside {PORT_FIRST} to {PORT_LAST} to listen on"))
 }
 
 /// Perl defining `listener($address, $port, $reuse)`: a listening socket at
