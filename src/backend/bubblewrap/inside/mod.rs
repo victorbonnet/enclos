@@ -76,6 +76,10 @@ pub enum InsideError {
     NoCommand,
     #[error("cannot run {command}: {source}")]
     Command { command: String, source: io::Error },
+    #[error("cannot keep the session's processes off this one: {0}")]
+    NotDumpable(io::Error),
+    #[error("lost the session's command: {0}")]
+    Reap(io::Error),
 }
 
 /// What a session and its relay both do.
@@ -88,7 +92,8 @@ trait Confine {
 /// What a session does besides, each step returning what stops it.
 trait SessionSteps: Confine {
     fn start_relay(&mut self) -> Result<(), InsideError>;
-    fn run_command(&mut self) -> InsideError;
+    /// Runs the command to its end: its exit code, as a shell gives it.
+    fn run_command(&mut self) -> Result<u8, InsideError>;
 }
 
 /// What the relay does besides.
@@ -106,12 +111,10 @@ fn confine(steps: &mut impl Confine) -> Result<(), InsideError> {
     steps.apply_seccomp()
 }
 
-fn in_session(steps: &mut impl SessionSteps) -> InsideError {
-    let confined = steps.start_relay().and_then(|()| confine(steps));
-    match confined {
-        Ok(()) => steps.run_command(),
-        Err(e) => e,
-    }
+fn in_session(steps: &mut impl SessionSteps) -> Result<u8, InsideError> {
+    steps.start_relay()?;
+    confine(steps)?;
+    steps.run_command()
 }
 
 fn as_relay(steps: &mut impl RelaySteps) -> InsideError {
@@ -206,6 +209,46 @@ fn last_line(log: &Path) -> String {
     }
 }
 
+/// How a child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Exited(i32),
+    Killed(i32),
+    /// Stopped or continued, which `wait` does not report unless asked.
+    Neither,
+}
+
+impl Ended {
+    fn of(status: rustix::process::WaitStatus) -> Ended {
+        match (status.exit_status(), status.terminating_signal()) {
+            (Some(code), _) => Ended::Exited(code),
+            (None, Some(signal)) => Ended::Killed(signal),
+            (None, None) => Ended::Neither,
+        }
+    }
+}
+
+/// Reaps what `next` finds ended, every orphan of the session included, until
+/// `command` ends, then gives its exit code as a shell does: 128 and the
+/// signal for one a signal ended. A call a signal cut short is made again.
+fn reap_until(
+    command: u32,
+    mut next: impl FnMut() -> io::Result<Option<(u32, Ended)>>,
+) -> Result<u8, InsideError> {
+    loop {
+        match next() {
+            Ok(Some((pid, ended))) if pid == command => match ended {
+                Ended::Exited(code) => return Ok(code.clamp(0, 255) as u8),
+                Ended::Killed(signal) => return Ok((128 + signal).clamp(0, 255) as u8),
+                Ended::Neither => {}
+            },
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(InsideError::Reap(e)),
+        }
+    }
+}
+
 /// Returns once `now` gives another parent than `parent`.
 fn wait_for_new_parent(parent: u32, now: impl Fn() -> u32, every: Duration) {
     while now() == parent {
@@ -242,15 +285,34 @@ impl SessionSteps for Running<&[OsString]> {
         self.prepared.start_relay()
     }
 
-    fn run_command(&mut self) -> InsideError {
+    /// Not dumpable, so no process of the session attaches to this one or
+    /// writes its memory, then the command as a child of its own, which a
+    /// terminal's Ctrl-C reaches with its own handlers: as PID 1 the kernel
+    /// would drop every signal it does not catch. Every orphan of the
+    /// session is reaped here, until the command ends.
+    fn run_command(&mut self) -> Result<u8, InsideError> {
         let Some((program, args)) = self.then.split_first() else {
-            return InsideError::NoCommand;
+            return Err(InsideError::NoCommand);
         };
-        let source = Command::new(program).args(args).exec();
-        InsideError::Command {
-            command: program.to_string_lossy().into_owned(),
-            source,
-        }
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(|e| InsideError::NotDumpable(e.into()))?;
+        let child =
+            Command::new(program)
+                .args(args)
+                .spawn()
+                .map_err(|source| InsideError::Command {
+                    command: program.to_string_lossy().into_owned(),
+                    source,
+                })?;
+        reap_until(child.id(), || {
+            rustix::process::wait(rustix::process::WaitOptions::empty())
+                .map(|found| {
+                    found.map(|(pid, status)| {
+                        (pid.as_raw_nonzero().get().unsigned_abs(), Ended::of(status))
+                    })
+                })
+                .map_err(io::Error::from)
+        })
     }
 }
 
@@ -286,16 +348,13 @@ impl RelaySteps for Running<Serving> {
     }
 }
 
-/// Brings a session up on `path`'s file and becomes `command`. Returns only
-/// what stopped it: no command has run then.
-pub fn session(path: &Path, command: &[OsString]) -> InsideError {
-    match Prepared::read(path) {
-        Ok(prepared) => in_session(&mut Running {
-            prepared,
-            then: command,
-        }),
-        Err(e) => e,
-    }
+/// Brings a session up on `path`'s file and runs `command` to its end: its
+/// exit code, or what stopped it, when no command has run.
+pub fn session(path: &Path, command: &[OsString]) -> Result<u8, InsideError> {
+    in_session(&mut Running {
+        prepared: Prepared::read(path)?,
+        then: command,
+    })
 }
 
 /// The kernel's Landlock ABI, up to the one the rules need, if it has

@@ -40,9 +40,9 @@ impl SessionSteps for Recorded {
         self.step("relay")
     }
 
-    fn run_command(&mut self) -> InsideError {
+    fn run_command(&mut self) -> Result<u8, InsideError> {
         self.calls.push("command");
-        InsideError::NoCommand
+        Ok(0)
     }
 }
 
@@ -84,7 +84,7 @@ fn no_command_runs_once_a_step_has_failed() {
             fails: Some(fails),
             ..Recorded::default()
         };
-        let stopped = in_session(&mut steps).to_string();
+        let stopped = in_session(&mut steps).unwrap_err().to_string();
         assert!(stopped.contains(fails), "{stopped}");
         assert_eq!(steps.calls, reached);
     }
@@ -183,4 +183,35 @@ fn what_compile_writes_is_what_is_read() {
     assert_eq!(prepared.compiled.relay.port, 41001);
     assert!(prepared.grants.iter().any(|g| g.path == "/dev"));
     assert!(!prepared.programs.is_empty());
+}
+
+/// Every orphan the session leaves is reaped here, PID 1 of its namespace,
+/// until the command ends, whose code is the session's.
+#[test]
+fn the_session_reaps_its_orphans_until_its_command_ends() {
+    let mut found = vec![
+        Ok(Some((9, Ended::Exited(0)))),
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Ok(Some((7, Ended::Neither))),
+        Ok(Some((8, Ended::Killed(9)))),
+        Ok(Some((7, Ended::Exited(3)))),
+        Ok(Some((7, Ended::Exited(4)))),
+    ]
+    .into_iter();
+    let code = reap_until(7, || found.next().unwrap()).unwrap();
+    assert_eq!(code, 3);
+    assert_eq!(found.len(), 1, "it went on past its command");
+}
+
+/// As a shell gives it, so `connect` reports the same either way.
+#[test]
+fn a_command_a_signal_ended_gives_128_and_the_signal() {
+    let mut found = [Ok(Some((7, Ended::Killed(2))))].into_iter();
+    assert_eq!(reap_until(7, || found.next().unwrap()).unwrap(), 130);
+}
+
+#[test]
+fn a_session_that_lost_its_children_says_so() {
+    let e = reap_until(7, || Err(io::Error::from_raw_os_error(10))).unwrap_err();
+    assert!(e.to_string().contains("lost the session's command"), "{e}");
 }
