@@ -31,13 +31,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq bubblewrap
       - name: The survey's own tests
-        run: sh prototype/m3/test_survey.sh
+        run: |
+          sh prototype/m3/test_survey.sh
+          python3 -I prototype/m3/test_workflows_parse.py
       - name: Survey (read-only)
         run: sh prototype/m3/survey.sh | tee -a survey.txt
       - name: bubblewrap as an unprivileged user
         run: sh prototype/m3/bwrap-check.sh | tee -a survey.txt
       - name: The profile step names a profile already there
-        run: grep '^bwrap\.with_userns_profile\.shipped_profile: ' survey.txt
+        run: |
+          grep '^bwrap\.with_userns_profile\.shipped_profile: ' survey.txt
       - name: systemd --user at logout
         run: sh prototype/m3/logout-check.sh | tee -a survey.txt
       - name: Summary
