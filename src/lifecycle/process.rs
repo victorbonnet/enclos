@@ -349,11 +349,9 @@ fn kill(signal: Signal, target: i64) -> Signalled {
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) fn headless(python: &mut Command) -> &mut Command {
     const PROGRAM: &str = r#"
-import ctypes, os, socket, threading, time
+import ctypes, os, threading, time
 def serve():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    s.listen()
+    s = listener()
     stat = "/proc/%d/stat" % os.getpid()
     while open(stat).read().rsplit(") ", 1)[1][0] != "Z":
         time.sleep(0.01)
@@ -363,7 +361,11 @@ threading.Thread(target=serve).start()
 ctypes.CDLL(None).pthread_exit(None)
 "#;
     python
-        .args(["-I", "-c", PROGRAM])
+        .args([
+            "-I",
+            "-c",
+            &format!("{}{PROGRAM}", crate::test_ports::python_listener()),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
 }

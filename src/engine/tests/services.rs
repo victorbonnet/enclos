@@ -408,7 +408,10 @@ fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
         .args([
             "-MSocket",
             "-e",
-            "sleep 1; socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; sleep 30",
+            &format!(
+                "{}sleep 1; my $s = listener(INADDR_LOOPBACK); sleep 30",
+                crate::test_ports::perl_listener()
+            ),
         ])
         .spawn()
         .unwrap();

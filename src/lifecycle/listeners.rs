@@ -457,8 +457,7 @@ mod tests {
     fn the_ephemeral_ports_are_the_systems() {
         let ports = ephemeral_ports().unwrap();
         // A bind on port 0 lands in them.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
+        let port = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST)
             .local_addr()
             .unwrap()
             .port();
@@ -691,7 +690,7 @@ mod tests {
 
     #[test]
     fn this_process_is_seen_listening_by_pid_and_by_port() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
         let port = listener.local_addr().unwrap().port();
         let found = tcp_listeners(std::process::id()).unwrap();
         assert!(found.iter().any(|a| a.port() == port), "{found:?}");

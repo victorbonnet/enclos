@@ -24,7 +24,8 @@ fn perl(script: &str, ports: usize) -> (std::process::Child, Vec<u16>) {
 /// gateway binds `127.0.0.1:0`.
 fn listening(ports: usize, at: &str) -> String {
     format!(
-        "for (1..{ports}) {{ socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, inet_aton(\"{at}\"))) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30"
+        "{}for (1..{ports}) {{ my $s = listener(inet_aton(\"{at}\")); push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30",
+        crate::test_ports::perl_listener()
     )
 }
 
@@ -156,7 +157,7 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
     let (_dir, engine, name) = with_sandbox();
     // This test process listens, under the gateway's recorded pid but
     // not its start time, as when the pid was reused.
-    let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
     let root = ProcessRef {
         pid: std::process::id(),
         started: "Thu Jan  1 00:00:00 1970".to_owned(),
@@ -189,10 +190,13 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
     // Sharing 127.0.0.1 at its port with another process (SO_REUSEPORT):
     // a session could reach that one too.
     let (_dir, engine, name) = with_sandbox();
-    let shared = "socket(my $s, PF_INET, SOCK_STREAM, 0) or die; setsockopt($s, SOL_SOCKET, SO_REUSEPORT, 1) or die; bind($s, sockaddr_in($ARGV[0] // 0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30";
-    let (owner, port) = perl(shared, 1);
+    let shared = format!(
+        "{}my $s = listener(INADDR_LOOPBACK, $ARGV[0], 1); print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30",
+        crate::test_ports::perl_listener()
+    );
+    let (owner, port) = perl(&shared, 1);
     let mut other = std::process::Command::new("/usr/bin/perl")
-        .args(["-MSocket=:all", "-e", shared, &port[0].to_string()])
+        .args(["-MSocket=:all", "-e", &shared, &port[0].to_string()])
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
