@@ -28,7 +28,10 @@ pub fn run(args: InsideArgs) -> Result<u8> {
     use enclos::backend::bubblewrap::inside;
     let failed = match args.relay {
         true => inside::relay(&args.compiled),
-        false => inside::session(&args.compiled, &args.command),
+        false => match inside::session(&args.compiled, &args.command) {
+            Ok(code) => return Ok(code),
+            Err(e) => e,
+        },
     };
     Err(Error::Inside {
         why: failed.to_string(),
