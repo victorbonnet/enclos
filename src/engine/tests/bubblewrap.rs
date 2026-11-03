@@ -138,8 +138,9 @@ impl Stood {
 /// A process that holds `port` without listening on it, so that the engine
 /// finds it free, and, once the stand-in proxy writes to the pipe at `go`,
 /// listens on it and then, if `opens`, on `socket`, as `proxy run` does.
-/// What it does, and any error, it writes to `log`. Returns once it holds
-/// the port, waiting at most 30 seconds.
+/// What it does, and any error, it writes to `log`. It holds no session's
+/// marker, so another test ending its session never ends it. Returns once
+/// it holds the port, waiting at most 30 seconds.
 fn hold_port(port: u16, socket: &Path, go: &Path, log: &Path, opens: bool) -> std::process::Child {
     use std::io::BufRead;
     let mut command = std::process::Command::new("/usr/bin/python3");
@@ -168,7 +169,7 @@ sys.stdin.read()",
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::fs::File::create(log).unwrap());
-    let mut holder = command.spawn().unwrap();
+    let mut holder = crate::lifecycle::marker::spawn_unmarked(&mut command).unwrap();
     let stdout = holder.stdout.take().unwrap();
     let (said, heard) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
