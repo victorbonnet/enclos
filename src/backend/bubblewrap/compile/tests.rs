@@ -174,7 +174,7 @@ fn bubblewraps_arguments_are_held_in_the_order_wrap_joins_them() {
     let b = &c.bubblewrap;
     for option in proposed::NAMESPACES
         .iter()
-        .chain(&["--die-with-parent", "--clearenv", "--chdir"])
+        .chain(&["--die-with-parent", "--chdir"])
     {
         assert!(b.options.iter().any(|a| a == option), "{option}");
         assert!(!b.mounts.iter().any(|a| a == option), "{option}");
@@ -367,7 +367,7 @@ fn a_workspace_under_a_system_folder_is_not_kept_from_running_programs() {
 }
 
 #[test]
-fn a_session_has_its_own_namespaces_an_empty_environment_and_no_user_namespace() {
+fn a_session_has_its_own_namespaces_and_no_user_namespace() {
     let c = compiled(&Policy::default());
     for option in [
         "--unshare-user",
@@ -376,11 +376,13 @@ fn a_session_has_its_own_namespaces_an_empty_environment_and_no_user_namespace()
         "--as-pid-1",
         "--unshare-net",
         "--unshare-ipc",
-        "--clearenv",
         "--die-with-parent",
     ] {
         assert!(c.bubblewrap.options.iter().any(|a| a == option), "{option}");
     }
+    // `wrap` empties the environment (`wrap::tests`), on the process,
+    // where a secret is not on a command line.
+    assert!(!c.bubblewrap.options.iter().any(|a| a == "--clearenv"));
 }
 
 /// A network namespace may not hold vsock, so the filter does, for a

@@ -193,6 +193,9 @@
       "in_sandbox_home": [],
       "in_workspace": [
         "/nonexistent-enclos-test/alice/proj/config/.env"
+      ],
+      "workspaces": [
+        "/nonexistent-enclos-test/alice/proj"
       ]
     },
     "options": [
@@ -205,7 +208,6 @@
       "--unshare-uts",
       "--unshare-cgroup-try",
       "--die-with-parent",
-      "--clearenv",
       "--chdir",
       "/srv/alice-data/enclos/sandboxes/home/home"
     ]

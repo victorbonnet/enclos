@@ -177,7 +177,8 @@
     "grant_masks": {
       "unmovable": [],
       "in_sandbox_home": [],
-      "in_workspace": []
+      "in_workspace": [],
+      "workspaces": []
     },
     "options": [
       "--unshare-user",
@@ -189,7 +190,6 @@
       "--unshare-uts",
       "--unshare-cgroup-try",
       "--die-with-parent",
-      "--clearenv",
       "--chdir",
       "/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home"
     ]
