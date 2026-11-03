@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Stdio;
 use std::process::{Child, Command, Output};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::descriptors;
@@ -46,6 +47,19 @@ pub enum MarkerError {
     /// `/proc` could not be read: for every sandbox alike.
     #[error("cannot look at the sandbox's markers in /proc: {0}")]
     Proc(String),
+}
+
+/// Taken by [`Marker::spawn`] alone, and by [`spawn_unmarked`] together:
+/// the copy of a marker a program starts with reaches any program started
+/// at the same moment, by another thread, as tests running in parallel do.
+static STARTS: RwLock<()> = RwLock::new(());
+
+/// Starts `command` as [`Command::spawn`] does, never while a program
+/// starts holding a marker, so that it inherits none: a process holding a
+/// session's marker is one of its members, and ends with it.
+pub fn spawn_unmarked(command: &mut Command) -> io::Result<Child> {
+    let _turn = STARTS.read().unwrap_or_else(|e| e.into_inner());
+    command.spawn()
 }
 
 /// A marker made for a program about to start, not yet held by it.
@@ -74,12 +88,14 @@ impl Marker {
     /// Starts `command` holding the marker. The descriptor it inherits is a
     /// copy made without close-on-exec just before, and enclos closes both
     /// its copies once the program runs. Another thread of enclos starting
-    /// a program at that moment would inherit it too: the CLI starts nothing
-    /// else meanwhile; tests running in parallel threads may.
+    /// a program at that moment would inherit it too, unless it starts it
+    /// through [`spawn_unmarked`]: the CLI starts nothing else meanwhile;
+    /// tests running in parallel threads may.
     pub fn spawn(self, command: &mut Command) -> io::Result<(Child, Started)> {
         let started = Started {
             path: Some(self.path),
         };
+        let _turn = STARTS.write().unwrap_or_else(|e| e.into_inner());
         let inherited = rustix::io::dup(&self.file)?;
         let child = command.spawn();
         drop(inherited);
@@ -467,5 +483,60 @@ mod tests {
         assert!(!pids.contains(&std::process::id()), "enclos holds it");
         remove(&members, &root).unwrap();
         assert!(!path.exists());
+    }
+
+    /// A program started through `spawn_unmarked` while another thread
+    /// starts programs holding markers holds none of them, so that ending
+    /// their sessions never signals it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_started_unmarked_holds_no_marker_starting_meanwhile() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        // `/proc` writes real paths.
+        let members = dir.path().canonicalize().unwrap().join("members");
+        let done = Arc::new(AtomicBool::new(false));
+        let marking = {
+            let (done, members) = (done.clone(), members.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let mut command = Command::new("/bin/true");
+                    let marker = Marker::new(&members).unwrap();
+                    let (mut child, _started) = marker.spawn(&mut command).unwrap();
+                    child.wait().unwrap();
+                }
+            })
+        };
+        let mut held = Vec::new();
+        for _ in 0..200 {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "echo ready; read x"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            let mut child = spawn_unmarked(&mut command).unwrap();
+            // Past its start: until then it may still show the descriptors
+            // close-on-exec closes as its program starts.
+            let mut ready = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(child.stdout.take().unwrap()),
+                &mut ready,
+            )
+            .unwrap();
+            assert_eq!(ready, "ready\n");
+            let fds = std::fs::read_dir(format!("/proc/{}/fd", child.id())).unwrap();
+            for fd in fds {
+                let target = std::fs::read_link(fd.unwrap().path()).unwrap_or_default();
+                if target.starts_with(&members) {
+                    held.push(target);
+                }
+            }
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        marking.join().unwrap();
+        assert!(held.is_empty(), "{held:?}");
     }
 }
