@@ -53,7 +53,7 @@ mod tests {
             let done = done.clone();
             std::thread::spawn(move || {
                 while !done.load(Ordering::Relaxed) {
-                    Command::new("/bin/true").status().unwrap();
+                    Command::new("/usr/bin/true").status().unwrap();
                 }
             })
         };

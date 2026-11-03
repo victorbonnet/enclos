@@ -545,6 +545,7 @@ fn an_enclos_the_sandbox_does_not_see_refuses_the_session() {
 
 /// What `/proc/self/status` says the stand-in bubblewrap ignores, and the
 /// arguments it was given, for a launch in a terminal or not.
+#[cfg(target_os = "linux")]
 fn as_bubblewrap_ran(in_terminal: bool) -> (u64, String) {
     let home = Home::new();
     let c = compiled(&home, Lists::default());
@@ -580,6 +581,7 @@ fn as_bubblewrap_ran(in_terminal: bool) -> (u64, String) {
 }
 
 /// SIGINT is signal 2 and SIGQUIT 3: bits 1 and 2 of the mask.
+#[cfg(target_os = "linux")]
 const INT_AND_QUIT: u64 = 0b110;
 
 /// A terminal's Ctrl-C reaches bubblewrap's outer process, in the session's
