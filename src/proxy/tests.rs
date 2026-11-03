@@ -11,6 +11,7 @@ use super::*;
 use crate::model::Timestamp;
 use crate::model::net::{DeniedDestination, NameSeen, NetEvent, Reason, Verdict};
 use crate::state::Result as StateResult;
+use crate::test_ports::tcp_listener;
 
 struct FixedPolicy(Arc<Mutex<Policy>>);
 
@@ -143,7 +144,7 @@ fn loopback_is_global(ip: IpAddr) -> AddrClass {
 /// A local server that answers each connection with `reply` after reading
 /// one chunk, and hands back what it read.
 fn upstream(reply: &'static [u8]) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -174,7 +175,7 @@ fn start_with(
     tweak: impl FnOnce(&mut Proxy),
 ) -> Running {
     let (proxy, log, policy) = built(allow, resolver, check, tweak);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let addr = listener.local_addr().unwrap();
     let proxy = Arc::new(proxy);
     std::thread::spawn(move || proxy.serve_all(vec![listener]));
@@ -188,13 +189,17 @@ fn start_on_both_loopbacks(tweak: impl FnOnce(&mut Proxy)) -> (u16, MemoryLog, A
     // Any port, so no other test can take it between choosing and binding.
     // The port chosen on [::1] can be taken on 127.0.0.1 by another
     // program: then another one is chosen.
-    let listeners = (0..20)
-        .find_map(|_| match listen(0) {
-            Ok(listeners) => Some(listeners),
-            Err(e) if e.source.kind() == io::ErrorKind::AddrInUse => None,
-            Err(e) => panic!("{e:?}"),
-        })
-        .expect("a port free on both loopbacks");
+    let listeners = crate::test_ports::clear_of_proxies(|| {
+        let listeners = (0..20)
+            .find_map(|_| match listen(0) {
+                Ok(listeners) => Some(listeners),
+                Err(e) if e.source.kind() == io::ErrorKind::AddrInUse => None,
+                Err(e) => panic!("{e:?}"),
+            })
+            .expect("a port free on both loopbacks");
+        let port = listeners[0].local_addr().unwrap().port();
+        (listeners, port)
+    });
     let port = listeners[0].local_addr().unwrap().port();
     assert_eq!(listeners.len(), 2);
     // `[::1]` first, so that once 127.0.0.1 answers, both are held.
@@ -390,7 +395,7 @@ fn plain_http_is_forwarded_in_origin_form() {
 /// A local server that reads each connection until the client is done
 /// sending, then answers `reply` and hands back all it read.
 fn upstream_reading_all(reply: &'static [u8]) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -670,14 +675,14 @@ fn both_loopbacks_share_one_connection_limit() {
 #[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
     // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
-    let squatter = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    let squatter = tcp_listener(Ipv6Addr::LOCALHOST);
     let port = squatter.local_addr().unwrap().port();
     let e = listen(port).unwrap_err();
     assert_eq!(e.addr, (Ipv6Addr::LOCALHOST, port).into());
     assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
     assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
     // Taken on 127.0.0.1: the `[::1]` listener it already had is let go.
-    let squatter = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let squatter = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = squatter.local_addr().unwrap().port();
     let e = listen(port).unwrap_err();
     assert_eq!(e.addr, (Ipv4Addr::LOCALHOST, port).into());
@@ -709,7 +714,7 @@ fn serving_ends_when_any_accept_thread_ends_even_by_panicking() {
 
 #[test]
 fn a_head_sent_slowly_still_has_one_deadline() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let (server, _) = listener.accept().unwrap();
     std::thread::spawn(move || {
@@ -755,7 +760,7 @@ impl Resolve for HangingResolver {
 /// A local server that sends back what it is sent, until the other end
 /// closes.
 fn echo() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -770,7 +775,7 @@ fn echo() -> u16 {
 /// A local server that streams `n` bytes to each connection, one every
 /// `every`, then closes: model output arriving slowly.
 fn ticker(n: usize, every: Duration) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for mut conn in listener.incoming().flatten() {
@@ -870,7 +875,7 @@ fn a_tunnel_that_keeps_moving_bytes_one_way_stays_open() {
 
 #[test]
 fn plain_http_waiting_on_a_silent_server_is_closed_when_idle() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     // Accepts and holds each connection, never reads or answers.
     std::thread::spawn(move || {
@@ -928,7 +933,7 @@ fn a_resolver_that_hangs_is_cut_at_the_deadline() {
 /// A local server that sends as fast as it can and drops what it is sent,
 /// until the other end closes.
 fn flood() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
@@ -1191,7 +1196,7 @@ fn a_server_name_is_logged_escaped_and_cut() {
 
 #[test]
 fn a_tunnel_whose_server_speaks_first_works_and_is_logged_as_not_tls() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     let (tx, received) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1237,7 +1242,7 @@ fn a_tunnel_whose_server_speaks_first_works_and_is_logged_as_not_tls() {
 
 #[test]
 fn a_client_done_before_it_sent_anything_still_gets_the_servers_answer() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tcp_listener(Ipv4Addr::LOCALHOST);
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         if let Some(mut conn) = listener.incoming().flatten().next() {

@@ -382,13 +382,18 @@ mod tests {
     /// Listens on every address and on loopback, and says both ports. Perl,
     /// which macOS signs, so the firewall asks nothing of whoever runs the
     /// tests.
-    const LISTENS: &str = "use Socket; for my $a (INADDR_ANY, INADDR_LOOPBACK) { socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, $a)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); } $| = 1; STDOUT->flush; sleep 30";
+    fn listens() -> String {
+        format!(
+            "{}for my $a (INADDR_ANY, INADDR_LOOPBACK) {{ my $s = listener($a); push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30",
+            crate::test_ports::perl_listener()
+        )
+    }
 
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
         let mut child = std::process::Command::new("/usr/bin/perl")
-            .args(["-e", LISTENS])
+            .args(["-e", &listens()])
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
