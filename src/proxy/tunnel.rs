@@ -506,11 +506,11 @@ mod tests {
     #[test]
     fn a_hello_trickled_in_is_stopped_at_the_deadline() {
         use std::io::Write;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpStream;
         use std::time::{Duration, Instant};
 
         let pair = || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
             (near, far)
@@ -558,11 +558,11 @@ mod tests {
     #[test]
     fn an_answer_from_a_connection_closed_both_ways_is_copied() {
         use std::io::{Read, Write};
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::{Shutdown, TcpStream};
         use std::time::Duration;
 
         let pair = || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
             (near, far)
