@@ -805,7 +805,7 @@ fn a_unix_socket_and_the_loopback_share_one_limit_and_one_log() {
         unreachable!()
     };
     let unix = listen_unix(path).unwrap();
-    let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = tcp_listener(Ipv4Addr::LOCALHOST);
     let loopback = Address::Tcp(tcp.local_addr().unwrap());
     let (proxy, log, _) = built(&[], Box::new(NoResolver), classify, |p| {
         p.max_connections = 1
