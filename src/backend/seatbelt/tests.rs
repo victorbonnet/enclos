@@ -3,7 +3,6 @@
 //! policy denies. Only processes these tests start are ever signalled.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -1319,8 +1318,13 @@ fn the_mktemp_wrapper_puts_temp_files_under_the_sandbox_tmp() {
     let bin = w.ctx.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shim = bin.join("mktemp");
-    std::fs::write(&shim, include_str!("../../runtime/hermes/mktemp")).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_scripts::copy_program(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime/hermes/mktemp"
+        )),
+        &shim,
+    );
     let tmp = w.ctx.home.join("tmp").display().to_string();
     for (call, prefix) in [
         ("mktemp", "tmp."),
