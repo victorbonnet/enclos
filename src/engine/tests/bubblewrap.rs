@@ -61,10 +61,14 @@ impl Stood {
         let audit = JsonlAuditLog::new(layout.audit_log());
         let socket = layout.proxy_socket("lab");
         // The proxy only tells `holder` to listen: an interpreter starting
-        // under load could take longer than the engine waits.
+        // under load could take longer than the engine waits. What it did
+        // is in its log, for a test that fails.
         script(
             &at("proxy"),
-            &format!("printf go > '{go}'\nexec sleep 60", go = at("go").display()),
+            &format!(
+                "echo \"proxy started: $*\" >&2\nprintf go > '{go}' && echo 'proxy wrote go' >&2\nexec sleep 60",
+                go = at("go").display()
+            ),
         );
         let engine = Engine::new(
             layout,
@@ -82,13 +86,34 @@ impl Stood {
         };
         done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
         let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
-        let holder = hold_port(port, &socket, &at("go"), opens);
+        let holder = hold_port(port, &socket, &at("go"), &at("holder.log"), opens);
         Stood {
             dir,
             engine,
             name,
             holder,
         }
+    }
+
+    /// What the stand-in proxy and `holder` did, for a test that fails.
+    fn said(&mut self) -> String {
+        let log = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) if text.is_empty() => "(empty)".to_owned(),
+            Ok(text) => text,
+            Err(e) => format!("({e})"),
+        };
+        let go = self.dir.path().join("go");
+        format!(
+            "proxy.log:\n{}\nholder (pid {}, {:?}):\n{}\ngo: {}",
+            log(&self.engine.proxy_log(&self.name)),
+            self.holder.id(),
+            self.holder.try_wait(),
+            log(&self.dir.path().join("holder.log")),
+            match std::fs::symlink_metadata(&go) {
+                Ok(m) => format!("{:?}", m.file_type()),
+                Err(e) => e.to_string(),
+            },
+        )
     }
 
     fn read(&self, name: &str) -> String {
@@ -113,10 +138,12 @@ impl Stood {
 /// A process that holds `port` without listening on it, so that the engine
 /// finds it free, and, once the stand-in proxy writes to the pipe at `go`,
 /// listens on it and then, if `opens`, on `socket`, as `proxy run` does.
-/// Returns once it holds the port, waiting at most 30 seconds.
-fn hold_port(port: u16, socket: &Path, go: &Path, opens: bool) -> std::process::Child {
+/// What it does, and any error, it writes to `log`. Returns once it holds
+/// the port, waiting at most 30 seconds.
+fn hold_port(port: u16, socket: &Path, go: &Path, log: &Path, opens: bool) -> std::process::Child {
     use std::io::BufRead;
-    let mut holder = std::process::Command::new("/usr/bin/python3")
+    let mut command = std::process::Command::new("/usr/bin/python3");
+    command
         .args([
             "-c",
             "import os, socket, sys
@@ -124,11 +151,14 @@ port, path, go, opens = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] 
 t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(('127.0.0.1', port))
 os.mkfifo(go)
 print('holding', flush=True)
-open(go).read()
+heard = open(go).read()
+print('heard', repr(heard), file=sys.stderr, flush=True)
 t.listen()
+print('listening on', port, file=sys.stderr, flush=True)
 if opens:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     u = socket.socket(socket.AF_UNIX); u.bind(path); u.listen()
+    print('listening on', path, file=sys.stderr, flush=True)
 sys.stdin.read()",
         ])
         .arg(port.to_string())
@@ -137,8 +167,8 @@ sys.stdin.read()",
         .arg(if opens { "opens" } else { "port" })
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(std::fs::File::create(log).unwrap());
+    let mut holder = command.spawn().unwrap();
     let stdout = holder.stdout.take().unwrap();
     let (said, heard) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -267,7 +297,7 @@ fn a_session_the_host_refuses_at_launch_starts_nothing() {
 #[test]
 fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let stood = Stood::with_proxy_socket(false);
+    let mut stood = Stood::with_proxy_socket(false);
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
@@ -287,7 +317,8 @@ fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
     let socket = stood.engine.layout.proxy_socket("lab");
     assert!(
         why.contains(&format!("did not start listening on {}", socket.display())),
-        "{why}"
+        "{why}\n{}",
+        stood.said()
     );
     assert!(!stood.dir.path().join("args").exists());
     // Ended, not left running where no `stop` finds it.
