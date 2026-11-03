@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::Engine;
 use super::service::PROXY_WAIT;
 use crate::error::{Error, Result};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::lifecycle::process::{is_same, reference_of_child};
 use crate::model::now;
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
@@ -143,20 +144,22 @@ impl Engine {
         {
             return Err(Error::proxy_port_taken(record.name.as_str(), taken));
         }
-        let child = Command::new(exe)
-            .args([
-                "proxy",
-                "run",
-                record.name.as_str(),
-                "--port",
-                &record.proxy_port.to_string(),
-            ])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
+        // Holding no session's marker, it never ends with one.
+        let child = spawn_unmarked(
+            Command::new(exe)
+                .args([
+                    "proxy",
+                    "run",
+                    record.name.as_str(),
+                    "--port",
+                    &record.proxy_port.to_string(),
+                ])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(log),
+        )
+        .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
         let mut child = child;
         match self.record_started_proxy(lock, record, &mut child, addr, &log_path) {
             Ok(()) => Ok(()),
