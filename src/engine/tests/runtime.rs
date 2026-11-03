@@ -248,12 +248,10 @@ impl Lab {
             None => engine,
         };
         let proxy = dir.path().join("proxy.sh");
-        std::fs::write(
+        crate::test_scripts::write_script(
             &proxy,
-            "#!/bin/sh\necho \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"",
+        );
         let home = engine.layout.sandbox_home("home");
         Lab {
             _dir: dir,
