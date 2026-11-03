@@ -455,6 +455,43 @@ fn on_a_runner_enclos_inside_is_not_dumpable() {
     assert_eq!(said(&output), "0 True", "{output:?}");
 }
 
+/// The signals `/proc/self/status` says the command ignores, when the
+/// session was started with SIGINT and SIGQUIT ignored, as `wrap` starts
+/// bubblewrap in a terminal, with and without the flag that hands them back.
+fn ignored_by_the_command(restore: bool) -> u64 {
+    let confined = Confined::new();
+    let mut inside = vec!["inside", "--compiled", confined.compiled.to_str().unwrap()];
+    if restore {
+        inside.push("--restore-interrupts");
+    }
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' INT QUIT; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_enclos"))
+        .args(&inside)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "grep '^SigIgn:' /proc/self/status | cut -f2",
+        ])
+        .output()
+        .unwrap();
+    u64::from_str_radix(&said(&out), 16).unwrap()
+}
+
+/// Ctrl-C and Ctrl-\ reach the command again, which bubblewrap's outer
+/// process ignores; without the flag they stay ignored, the control.
+#[test]
+fn on_a_runner_the_command_gets_back_the_interrupts_bubblewrap_ignores() {
+    if !on_a_runner() {
+        return;
+    }
+    const INT_AND_QUIT: u64 = 0b110;
+    assert_eq!(ignored_by_the_command(false) & INT_AND_QUIT, INT_AND_QUIT);
+    assert_eq!(ignored_by_the_command(true) & INT_AND_QUIT, 0);
+}
+
 /// A terminal signals the foreground group, which is the command's.
 #[test]
 fn on_a_runner_the_relay_keeps_out_of_the_commands_process_group() {

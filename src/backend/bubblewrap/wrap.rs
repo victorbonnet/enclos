@@ -433,8 +433,15 @@ pub(super) fn command(
         .arg(enclos)
         .args(["inside", "--compiled"])
         .arg(compiled_path);
+    if launch.in_terminal {
+        bwrap.arg(super::INTERRUPTS_FLAG);
+    }
     bwrap.arg("--").arg(&launch.program).args(&launch.args);
-    let mut command = under_limits(bwrap, &launch.limits);
+    let command = match launch.in_terminal {
+        true => out_of_reach_of_interrupts(bwrap),
+        false => bwrap,
+    };
+    let mut command = under_limits(command, &launch.limits);
     command.env_clear();
     // The secrets the policy grants first, as on every backend.
     for (name, value) in &launch.env {
@@ -448,6 +455,26 @@ pub(super) fn command(
     }
     command.current_dir(&ctx.home);
     Ok(command)
+}
+
+/// `bwrap` with Ctrl-C and Ctrl-\ ignored, for a command's session, which
+/// a terminal may run in, or `connect` passes the signals it catches to.
+/// bubblewrap's outer process stays in the session's process group, which a
+/// terminal's Ctrl-C reaches, and
+/// handles only SIGCHLD: ended so, it would take the whole session with it
+/// through `--die-with-parent`, a program that catches SIGINT included,
+/// where `connect` waits for its program through Ctrl-C (design §8). An
+/// ignored signal stays ignored through `exec`, so `enclos inside` hands
+/// both back to the command ([`super::INTERRUPTS_FLAG`]). `/bin/sh` reads no
+/// startup file when it runs a command, and none of the sandbox's
+/// variables can name a function.
+fn out_of_reach_of_interrupts(bwrap: Command) -> Command {
+    let mut sh = Command::new("/bin/sh");
+    sh.arg("-c")
+        .arg("trap '' INT QUIT; exec \"$0\" \"$@\"")
+        .arg(bwrap.get_program())
+        .args(bwrap.get_args());
+    sh
 }
 
 #[cfg(test)]

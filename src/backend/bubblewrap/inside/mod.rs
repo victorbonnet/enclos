@@ -80,6 +80,8 @@ pub enum InsideError {
     NotDumpable(io::Error),
     #[error("lost the session's command: {0}")]
     Reap(io::Error),
+    #[error("cannot hand Ctrl-C back to the command: {0}")]
+    Interrupts(io::Error),
 }
 
 /// What a session and its relay both do.
@@ -209,6 +211,23 @@ fn last_line(log: &Path) -> String {
     }
 }
 
+/// The signals bubblewrap's outer process ignores in a terminal's session
+/// (`wrap`): ignored here too, as an ignored signal stays so through
+/// `exec`, until this hands them back.
+const INTERRUPTS: [i32; 2] = [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT];
+
+/// Catches [`INTERRUPTS`], with nothing done when they come: a caught
+/// signal is reset to its default by `exec`, so the command gets them as a
+/// program run from a terminal does, while this process, which only reaps,
+/// goes on.
+fn hand_back_interrupts() -> Result<(), InsideError> {
+    let heard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for signal in INTERRUPTS {
+        signal_hook::flag::register(signal, heard.clone()).map_err(InsideError::Interrupts)?;
+    }
+    Ok(())
+}
+
 /// How a child ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ended {
@@ -280,7 +299,13 @@ impl<T> Confine for Running<T> {
     }
 }
 
-impl SessionSteps for Running<&[OsString]> {
+/// The session's command, and whether to hand Ctrl-C and Ctrl-\ back to it.
+struct Session<'a> {
+    command: &'a [OsString],
+    restore_interrupts: bool,
+}
+
+impl SessionSteps for Running<Session<'_>> {
     fn start_relay(&mut self) -> Result<(), InsideError> {
         self.prepared.start_relay()
     }
@@ -291,11 +316,14 @@ impl SessionSteps for Running<&[OsString]> {
     /// would drop every signal it does not catch. Every orphan of the
     /// session is reaped here, until the command ends.
     fn run_command(&mut self) -> Result<u8, InsideError> {
-        let Some((program, args)) = self.then.split_first() else {
+        let Some((program, args)) = self.then.command.split_first() else {
             return Err(InsideError::NoCommand);
         };
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(|e| InsideError::NotDumpable(e.into()))?;
+        if self.then.restore_interrupts {
+            hand_back_interrupts()?;
+        }
         let child =
             Command::new(program)
                 .args(args)
@@ -349,11 +377,20 @@ impl RelaySteps for Running<Serving> {
 }
 
 /// Brings a session up on `path`'s file and runs `command` to its end: its
-/// exit code, or what stopped it, when no command has run.
-pub fn session(path: &Path, command: &[OsString]) -> Result<u8, InsideError> {
+/// exit code, or what stopped it, when no command has run. With
+/// `restore_interrupts`, the command gets Ctrl-C and Ctrl-\, which
+/// bubblewrap's outer process was started ignoring.
+pub fn session(
+    path: &Path,
+    command: &[OsString],
+    restore_interrupts: bool,
+) -> Result<u8, InsideError> {
     in_session(&mut Running {
         prepared: Prepared::read(path)?,
-        then: command,
+        then: Session {
+            command,
+            restore_interrupts,
+        },
     })
 }
 
