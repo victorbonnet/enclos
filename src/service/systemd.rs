@@ -534,23 +534,16 @@ WantedBy=default.target
 
     impl Stub {
         fn new(unit_path: &str, shown: &str) -> Stub {
-            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let units_dir = dir.path().join("units");
             let log = dir.path().join("calls");
             let script = dir.path().join("systemctl");
             let text = format!(
-                "#!/bin/sh\necho \"$*\" >>'{log}'\ncase \"$*\" in\n*UnitPath*) {unit_path} ;;\n*show*) printf '%s\\n' '{shown}' ;;\nesac\n",
+                "echo \"$*\" >>'{log}'\ncase \"$*\" in\n*UnitPath*) {unit_path} ;;\n*show*) printf '%s\\n' '{shown}' ;;\nesac",
                 log = log.display(),
                 unit_path = answer(unit_path, &units_dir),
             );
-            std::fs::write(&script, text).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-            // Another test's child may hold the script open for a moment.
-            while Command::new(&script).arg("ready").status().is_err() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            std::fs::remove_file(&log).unwrap();
+            crate::test_scripts::write_script(&script, &text);
             Stub {
                 systemd: Systemd {
                     units_dir,
@@ -915,7 +908,6 @@ WantedBy=default.target
 
     #[test]
     fn on_a_runner_a_dollar_in_the_programs_path_runs_that_path() {
-        use std::os::unix::fs::PermissionsExt;
         if !on_a_runner() {
             return;
         }
@@ -923,8 +915,7 @@ WantedBy=default.target
         let folder = dir.path().join("$tools");
         std::fs::create_dir(&folder).unwrap();
         let program = folder.join("service");
-        std::fs::write(&program, "#!/bin/sh\necho ran\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scripts::write_script(&program, "echo ran");
         let service = Started::program("dollar", program, "", STOP_TIMEOUT);
         service.wait_for_lines(1);
         service.stop_leaves_nothing_installed();
