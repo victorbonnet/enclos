@@ -256,6 +256,7 @@ impl Engine {
                     };
                     backend
                         .wrap(&compiled, &ctx, &launch)
+                        .map_err(std::io::Error::other)?
                         .stdin(Stdio::null())
                         .output()
                 };

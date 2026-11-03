@@ -148,6 +148,7 @@
     ],
     "in_sandbox_home": [],
     "in_workspace": [],
+    "workspaces": [],
     "unmovable": []
   },
   "after_home_mask": [
@@ -184,7 +185,6 @@
     "--unshare-uts",
     "--unshare-cgroup-try",
     "--die-with-parent",
-    "--clearenv",
     "--chdir",
     "/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home"
   ],

@@ -262,6 +262,12 @@ pub(crate) fn max_files_per_process() -> Option<u64> {
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
+/// Why a program cannot start in a sandbox as the host stands at launch,
+/// when a backend reads the host then (bubblewrap's masks).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct WrapError(pub String);
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompileError {
     #[error("cannot compile the policy for {backend}: {reason}")]
@@ -284,8 +290,14 @@ pub trait Backend {
     fn capabilities(&self) -> Capabilities;
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
-    /// The command that runs `launch` inside the sandbox under `compiled`.
-    fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
+    /// The command that runs `launch` inside the sandbox under `compiled`,
+    /// or why it cannot start as the host stands now.
+    fn wrap(
+        &self,
+        compiled: &Path,
+        ctx: &SandboxContext,
+        launch: &Launch,
+    ) -> Result<Command, WrapError>;
     /// Its own escape probes and how it refuses, for a sandbox compiled to
     /// `compiled`, or on a dry run, which compiles nothing, for none. Says
     /// why not when that text is not what it compiles.

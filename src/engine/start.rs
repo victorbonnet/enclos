@@ -275,7 +275,12 @@ impl Engine {
             service_port,
             limits: self.launch_limits(&record, &snapshot.policy)?,
         };
-        let wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
+        let wrapped = self
+            .backend_of(name)?
+            .wrap(&compiled, &ctx, &launch)
+            .map_err(|e| Error::Session {
+                what: format!("cannot start {named}: {e}"),
+            })?;
         let (mut wrapped, scope) = self.in_scope(name, wrapped)?;
         let group = starting.group();
         if group == Group::Own {

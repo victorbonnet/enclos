@@ -5,8 +5,8 @@
 use std::io;
 
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, LandlockStatus,
+    PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use super::InsideError;
@@ -97,6 +97,33 @@ fn kernel_abi(status: LandlockStatus) -> Option<u32> {
             kernel_abi,
         } => Some(kernel_abi.unwrap_or(effective_abi as i32).unsigned_abs()),
     }
+}
+
+/// The kernel's ABI, up to [`NEEDED`], or none without Landlock: each ABI's
+/// rights asked with no compromise, which the crate checks against the
+/// kernel's own answer. No ruleset is made, and nothing is restricted.
+pub(super) fn host_abi() -> Option<u32> {
+    let has = |abi: ABI| -> bool {
+        let ruleset = Ruleset::default().set_compatibility(CompatLevel::HardRequirement);
+        let fs = AccessFs::from_all(abi);
+        let Ok(ruleset) = ruleset.handle_access(fs) else {
+            return false;
+        };
+        let net = AccessNet::from_all(abi);
+        let ruleset = match net.is_empty() {
+            true => ruleset,
+            false => match ruleset.handle_access(net) {
+                Ok(ruleset) => ruleset,
+                Err(_) => return false,
+            },
+        };
+        let scopes = Scope::from_all(abi);
+        scopes.is_empty() || ruleset.scope(scopes).is_ok()
+    };
+    [ABI::V6, ABI::V5, ABI::V4, ABI::V3, ABI::V2, ABI::V1]
+        .into_iter()
+        .find(|abi| has(*abi))
+        .map(|abi| abi as u32)
 }
 
 /// What was held, from what the kernel answered. A kernel with every right

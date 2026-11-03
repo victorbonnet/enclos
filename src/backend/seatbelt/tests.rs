@@ -164,7 +164,9 @@ impl World {
             service_port,
             limits: Default::default(),
         };
-        let mut command: Command = Seatbelt::default().wrap(&self.compiled, &self.ctx, &launch);
+        let mut command: Command = Seatbelt::default()
+            .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap();
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().unwrap().success()
     }
@@ -182,6 +184,7 @@ impl World {
         };
         let out = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap()
             .stderr(Stdio::null())
             .output()
             .unwrap();
@@ -362,6 +365,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                 };
                 let out = Seatbelt::default()
                     .wrap(&w.compiled, &w.ctx, &launch)
+                    .unwrap()
                     .stdin(Stdio::null())
                     .output()
                     .unwrap();
@@ -684,7 +688,8 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 service_port: None,
                 limits: Default::default(),
             };
-            let (ok, stdout, stderr) = output(Seatbelt::default().wrap(compiled, &w.ctx, &launch));
+            let (ok, stdout, stderr) =
+                output(Seatbelt::default().wrap(compiled, &w.ctx, &launch).unwrap());
             let Proof::Control { control, .. } = &p.proof else {
                 panic!("{} has no control", p.name);
             };
