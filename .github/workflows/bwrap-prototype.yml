@@ -40,6 +40,8 @@ jobs:
         run: python3 -I prototype/m3/test_probe.py
       - name: The workflow's text
         run: python3 -I prototype/m3/test_workflow.py
+      - name: Every workflow file is valid YAML
+        run: python3 -I prototype/m3/test_workflows_parse.py
       - name: The Landlock grants' tests (no host access)
         run: python3 -I prototype/m3/test_oom.py GrantsTest
       - name: Landlock proc O_TRUNC regression
