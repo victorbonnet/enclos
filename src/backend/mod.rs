@@ -307,8 +307,30 @@ pub trait Backend {
 /// Every backend this build of enclos ships, in order of preference.
 ///
 /// This is the one explicit list of implementations.
+/// bubblewrap is in Linux builds alone, so a Mac's `doctor` and `sandbox
+/// create` stay as they were.
 pub fn registered() -> Vec<Box<dyn Backend>> {
-    vec![Box::new(seatbelt::Seatbelt::from_env())]
+    let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(seatbelt::Seatbelt::from_env())];
+    if cfg!(target_os = "linux") {
+        backends.push(Box::new(bubblewrap::Bubblewrap::on_host()));
+    }
+    backends
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::*;
+
+    /// Seatbelt first, so a Mac's default and `doctor` stay as they were;
+    /// bubblewrap on Linux alone. Making the list probes nothing.
+    #[test]
+    fn linux_builds_register_bubblewrap_after_seatbelt() {
+        let kinds: Vec<BackendKind> = registered().iter().map(|b| b.kind()).collect();
+        match cfg!(target_os = "linux") {
+            true => assert_eq!(kinds, [BackendKind::Seatbelt, BackendKind::Bubblewrap]),
+            false => assert_eq!(kinds, [BackendKind::Seatbelt]),
+        }
+    }
 }
 
 #[cfg(test)]
