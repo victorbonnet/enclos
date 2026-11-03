@@ -18,6 +18,10 @@ pub struct InsideArgs {
     /// port it holds.
     #[arg(long, conflicts_with = "command")]
     relay: bool,
+    /// Hand Ctrl-C and Ctrl-\ back to the command, which bubblewrap's outer
+    /// process was started ignoring, in a terminal's session.
+    #[arg(long, conflicts_with = "relay")]
+    restore_interrupts: bool,
     /// The session's command.
     #[arg(last = true, required_unless_present = "relay")]
     command: Vec<OsString>,
@@ -28,7 +32,7 @@ pub fn run(args: InsideArgs) -> Result<u8> {
     use enclos::backend::bubblewrap::inside;
     let failed = match args.relay {
         true => inside::relay(&args.compiled),
-        false => match inside::session(&args.compiled, &args.command) {
+        false => match inside::session(&args.compiled, &args.command, args.restore_interrupts) {
             Ok(code) => return Ok(code),
             Err(e) => e,
         },
@@ -40,7 +44,12 @@ pub fn run(args: InsideArgs) -> Result<u8> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn run(args: InsideArgs) -> Result<u8> {
-    drop((args.compiled, args.relay, args.command));
+    drop((
+        args.compiled,
+        args.relay,
+        args.restore_interrupts,
+        args.command,
+    ));
     Err(Error::Inside {
         why: "`enclos inside` is the bubblewrap backend's, on Linux".to_owned(),
     })
