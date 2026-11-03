@@ -1,7 +1,7 @@
 //! The relay over a loopback port and a Unix socket in a temporary folder.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
