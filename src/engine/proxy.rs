@@ -4,7 +4,9 @@
 use std::fs::OpenOptions;
 use std::net::{Ipv6Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,12 +15,27 @@ use super::service::PROXY_WAIT;
 use crate::error::{Error, Result};
 use crate::lifecycle::process::{is_same, reference_of_child};
 use crate::model::now;
-use crate::model::sandbox::{SandboxName, SandboxRecord};
+use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
 /// How long the proxy has to start listening.
 const PROXY_START: Duration = Duration::from_secs(5);
+
+/// Whether the proxy answers where the sandbox's sessions reach it: at
+/// `addr`, and on `socket` for a backend whose sessions reach it there.
+/// `run_proxy` opens the socket after the port, so the port answering says
+/// nothing of the socket.
+fn proxy_answers(addr: SocketAddr, socket: Option<&Path>) -> bool {
+    TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+        && socket.is_none_or(|socket| UnixStream::connect(socket).is_ok())
+}
+
+/// The socket a sandbox's sessions reach its proxy on, if they do: every
+/// backend's but Seatbelt's, whose sessions reach its port (design §5).
+fn socket_of(backend: BackendKind, socket: PathBuf) -> Option<PathBuf> {
+    (backend != BackendKind::Seatbelt).then_some(socket)
+}
 
 /// Ends `child`, which this command started but could not record, so that
 /// it does not run where no `stop` finds it; `error` stays the reason.
@@ -157,6 +174,10 @@ impl Engine {
         log_path: &std::path::Path,
     ) -> Result<()> {
         let failed = |what: String| Error::Session { what };
+        let socket = socket_of(
+            record.backend,
+            self.layout.proxy_socket(record.name.as_str()),
+        );
         let start = Instant::now();
         loop {
             // Listening is not enough: it must be this proxy, still running.
@@ -180,14 +201,18 @@ impl Engine {
             // it could. The answer itself could come from another program
             // that took 127.0.0.1 just before the proxy did; the proxy then
             // exits, which the second look usually catches.
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            if proxy_answers(addr, socket.as_deref()) {
                 std::thread::sleep(Duration::from_millis(50));
                 exited(child)?;
                 break;
             }
             if start.elapsed() > PROXY_START {
+                let missing = match (&socket, proxy_answers(addr, None)) {
+                    (Some(socket), true) => socket.display().to_string(),
+                    _ => addr.to_string(),
+                };
                 return Err(failed(format!(
-                    "the proxy of sandbox {} did not start listening on {addr}; see {}",
+                    "the proxy of sandbox {} did not start listening on {missing}; see {}",
                     record.name,
                     log_path.display()
                 )));
@@ -212,5 +237,35 @@ impl Engine {
         };
         self.state.put_session(lock, &session)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::os::unix::net::UnixListener;
+
+    /// The #119 review: a proxy that holds its port and has not opened its
+    /// socket yet is not one a bubblewrap session can reach.
+    #[test]
+    fn a_proxy_answers_once_its_socket_does_too_where_sessions_use_it() {
+        let port = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let addr = port.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        assert!(proxy_answers(addr, None));
+        assert!(!proxy_answers(addr, Some(&path)));
+        let _socket = UnixListener::bind(&path).unwrap();
+        assert!(proxy_answers(addr, Some(&path)));
+        drop(port);
+        assert!(!proxy_answers(addr, Some(&path)));
+    }
+
+    #[test]
+    fn a_seatbelt_session_reaches_the_port_and_any_other_the_socket() {
+        let path = PathBuf::from("/x/proxy.sock");
+        assert_eq!(socket_of(BackendKind::Seatbelt, path.clone()), None);
+        assert_eq!(socket_of(BackendKind::Bubblewrap, path.clone()), Some(path));
     }
 }
