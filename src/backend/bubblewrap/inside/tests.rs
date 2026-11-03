@@ -62,7 +62,7 @@ impl RelaySteps for Recorded {
 #[test]
 fn the_relay_starts_before_the_rules_and_the_command_after_them() {
     let mut steps = Recorded::default();
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
 }
 
@@ -140,7 +140,7 @@ fn no_landlock_is_reported_and_the_session_goes_on() {
         landlock: Some(Landlock::Missing),
         ..Recorded::default()
     };
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
     assert_eq!(steps.said.len(), 1);
     assert!(steps.said[0].contains("no Landlock"), "{:?}", steps.said);
@@ -149,7 +149,7 @@ fn no_landlock_is_reported_and_the_session_goes_on() {
 #[test]
 fn every_rule_held_says_nothing() {
     let mut steps = Recorded::default();
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert!(steps.said.is_empty());
 }
 
