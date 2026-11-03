@@ -336,7 +336,6 @@ mod tests {
     use super::super::tool::ANSWER_WAIT;
     use super::super::{Picked, Stores};
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     fn v(text: &str) -> SecretValue {
@@ -362,8 +361,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let script = |name: &str, text: &str| {
                 let path = dir.path().join(name);
-                std::fs::write(&path, format!("#!/bin/sh\n{text}\n")).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                crate::test_scripts::write_script(&path, text);
                 path.display().to_string()
             };
             let store = Libsecret {
