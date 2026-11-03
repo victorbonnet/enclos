@@ -117,7 +117,6 @@ pub(super) fn landlock_abi() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A host with stand-ins for both programs, each a script printing
     /// `said` and exiting with `code`, and `/proc/sys` holding `settings`.
@@ -136,9 +135,7 @@ mod tests {
         }
 
         fn script(&self, name: &str, body: &str) {
-            let path = self.dir.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_scripts::write_script(&self.dir.path().join(name), body);
         }
 
         fn systemd(&self, version: u32) {
