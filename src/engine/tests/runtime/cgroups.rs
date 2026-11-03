@@ -123,11 +123,9 @@ fn a_stop_reads_and_kills_the_cgroup_the_engine_looks_at() {
 /// A `systemd-run` that prints `first line` for `--version`, and that nothing
 /// reaches a manager through.
 fn systemd_run_printing(first_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("systemd-run");
-    std::fs::write(&path, format!("#!/bin/sh\necho '{first_line}'\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scripts::write_script(&path, &format!("echo '{first_line}'"));
     (dir, path)
 }
 
