@@ -25,6 +25,15 @@ struct Stood {
     dir: TempDir,
     engine: Engine,
     name: SandboxName,
+    /// What the stand-in proxy listens through, already running.
+    holder: std::process::Child,
+}
+
+impl Drop for Stood {
+    fn drop(&mut self) {
+        let _ = self.holder.kill();
+        let _ = self.holder.wait();
+    }
 }
 
 impl Stood {
@@ -51,18 +60,11 @@ impl Stood {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
         let socket = layout.proxy_socket("lab");
-        // The proxy listens on its port and its socket, as `proxy run` does.
-        let unix = match opens {
-            true => "u = socket.socket(socket.AF_UNIX); u.bind(sys.argv[1]); u.listen()",
-            false => "",
-        };
+        // The proxy only tells `holder` to listen: an interpreter starting
+        // under load could take longer than the engine waits.
         script(
             &at("proxy"),
-            &format!(
-                "mkdir -p '{folder}'\nexec /usr/bin/python3 -c 'import socket, sys, time\nt = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind((\"127.0.0.1\", int(sys.argv[2]))); t.listen()\n{unix}\ntime.sleep(60)' '{socket}' \"$5\"",
-                folder = socket.parent().unwrap().display(),
-                socket = socket.display()
-            ),
+            &format!("printf go > '{go}'\nexec sleep 60", go = at("go").display()),
         );
         let engine = Engine::new(
             layout,
@@ -79,7 +81,14 @@ impl Stood {
             template: "minimal".parse().unwrap(),
         };
         done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
-        Stood { dir, engine, name }
+        let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
+        let holder = hold_port(port, &socket, &at("go"), opens);
+        Stood {
+            dir,
+            engine,
+            name,
+            holder,
+        }
     }
 
     fn read(&self, name: &str) -> String {
@@ -97,6 +106,51 @@ impl Stood {
                 );
                 self.engine.state.end_session(&lock, session.id).unwrap();
             }
+        }
+    }
+}
+
+/// A process that holds `port` without listening on it, so that the engine
+/// finds it free, and, once the stand-in proxy writes to the pipe at `go`,
+/// listens on it and then, if `opens`, on `socket`, as `proxy run` does.
+/// Returns once it holds the port, waiting at most 30 seconds.
+fn hold_port(port: u16, socket: &Path, go: &Path, opens: bool) -> std::process::Child {
+    use std::io::BufRead;
+    let mut holder = std::process::Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import os, socket, sys
+port, path, go, opens = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == 'opens'
+t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(('127.0.0.1', port))
+os.mkfifo(go)
+print('holding', flush=True)
+open(go).read()
+t.listen()
+if opens:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    u = socket.socket(socket.AF_UNIX); u.bind(path); u.listen()
+sys.stdin.read()",
+        ])
+        .arg(port.to_string())
+        .arg(socket)
+        .arg(go)
+        .arg(if opens { "opens" } else { "port" })
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = holder.stdout.take().unwrap();
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = said.send(line);
+    });
+    match heard.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(line) if line == "holding\n" => holder,
+        other => {
+            let _ = holder.kill();
+            panic!("the stand-in proxy did not hold port {port}: {other:?}");
         }
     }
 }
