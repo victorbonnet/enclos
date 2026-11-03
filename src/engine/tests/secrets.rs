@@ -805,6 +805,7 @@ fn a_store_refused_on_a_locked_collection_reports_nothing_left() {
     let text = err.to_string();
     assert!(!text.contains("cleaning up"), "{text}");
     assert!(!text.contains("no record"), "{text}");
+    assert!(!text.contains("Broken pipe"), "{text}");
     assert!(matches!(err, Error::Secret(_)), "{err:?}");
 }
 

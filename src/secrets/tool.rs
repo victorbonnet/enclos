@@ -78,7 +78,9 @@ pub(super) fn run_for(
 }
 
 /// Gives `child` its input, which it reads before anything it could wait
-/// on, and waits for it to end, for at most `wait`.
+/// on, and waits for it to end, for at most `wait`. A child that closed its
+/// input first did not want it: how it exits is the answer, as when it
+/// refuses before reading, so a closed pipe is no failure here.
 fn wait_for(
     child: &mut Child,
     program: &str,
@@ -87,9 +89,12 @@ fn wait_for(
 ) -> Result<ExitStatus, String> {
     if let Some(input) = input {
         let mut stdin = child.stdin.take().expect("piped");
-        stdin
-            .write_all(input)
-            .map_err(|e| format!("cannot give {program} its input: {e}"))?;
+        match stdin.write_all(input) {
+            Err(e) if e.kind() != io::ErrorKind::BrokenPipe => {
+                return Err(format!("cannot give {program} its input: {e}"));
+            }
+            _ => {}
+        }
     }
     let started = Instant::now();
     loop {
@@ -138,4 +143,38 @@ pub(super) fn scrub(text: &str, value: &str) -> String {
     }
     out.pop();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// More than any pipe holds, so writing it to a tool that never reads
+    /// meets a closed pipe however fast the tool exits.
+    fn past_a_pipe() -> Vec<u8> {
+        vec![b'k'; 4 << 20]
+    }
+
+    /// A tool that exits before reading its input refused it: what it said
+    /// and how it exited are the answer, not the pipe it left closed.
+    #[test]
+    fn a_tool_that_exits_before_reading_its_input_answers_with_its_exit() {
+        let input = past_a_pipe();
+        let out = run(
+            Command::new("/bin/sh").args(["-c", "echo 'it is locked' >&2; exit 1"]),
+            Some(&input),
+        )
+        .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stderr(&out.stderr, out.status), "it is locked");
+    }
+
+    /// Exiting 0 without reading is still told as it is: a caller that
+    /// needs its input taken checks for it, as a store reads its value back.
+    #[test]
+    fn a_tool_that_exits_0_before_reading_its_input_answers_with_its_exit() {
+        let input = past_a_pipe();
+        let out = run(Command::new("/bin/sh").args(["-c", "exit 0"]), Some(&input)).unwrap();
+        assert!(out.status.success());
+    }
 }
