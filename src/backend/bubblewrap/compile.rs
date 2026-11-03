@@ -37,7 +37,7 @@ const EXEC_SYSTEM: &[&str] = &[
 /// The sandbox's own, empty places. They hide the host's sockets there
 /// (`/run/user/<uid>`, the system bus, systemd-resolved, Docker,
 /// `/tmp/.X11-unix`), so a deny entry under one needs no mask.
-const OWN_TMPFS: &[&str] = &["/tmp", "/var/tmp", "/run", "/dev/shm"];
+pub(super) const OWN_TMPFS: &[&str] = &["/tmp", "/var/tmp", "/run", "/dev/shm"];
 
 /// The ones of [`OWN_TMPFS`] the sandbox writes temporary files in.
 const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
@@ -163,6 +163,10 @@ pub struct HomeMask {
     pub in_sandbox_home: Vec<String>,
     /// Deny entries inside a workspace, masked the same way after its bind.
     pub in_workspace: Vec<String>,
+    /// The workspaces, as written: `wrap` resolves each at every launch, and
+    /// masks a deny entry whose real path one holds at the workspace's own
+    /// name for it.
+    pub workspaces: Vec<String>,
     /// The folders inside the sandbox's home or a workspace that hold a mask.
     /// A mask names a path and the sandbox writes every folder above it, so
     /// `wrap` binds each on itself, after the grant's bind and before its
@@ -378,7 +382,9 @@ fn compiled_sandbox(
         after.extend(["--remount-ro".to_owned(), text(root)?]);
     }
     after.extend(args(proposed::NAMESPACES));
-    after.extend(args(&["--die-with-parent", "--clearenv"]));
+    // No `--clearenv`: `wrap` empties bubblewrap's own environment and sets
+    // the session's there, so no secret is on its command line.
+    after.extend(args(&["--die-with-parent"]));
     after.extend(["--chdir".to_owned(), text(&home)?]);
 
     let mut execute = strings(EXEC_SYSTEM);
@@ -394,6 +400,7 @@ fn compiled_sandbox(
             denied_elsewhere: texts(&denied_elsewhere)?,
             in_sandbox_home: texts(&in_sandbox_home)?,
             in_workspace: texts(&in_workspace)?,
+            workspaces: texts(&workspaces)?,
             unmovable: texts(&unmovable)?,
         },
         after_home_mask: after,
@@ -785,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_has_its_own_namespaces_an_empty_environment_and_no_user_namespace() {
+    fn a_session_has_its_own_namespaces_and_no_user_namespace() {
         let c = compiled(&Policy::default());
         for option in [
             "--unshare-user",
@@ -794,11 +801,13 @@ mod tests {
             "--as-pid-1",
             "--unshare-net",
             "--unshare-ipc",
-            "--clearenv",
             "--die-with-parent",
         ] {
             assert!(c.after_home_mask.iter().any(|a| a == option), "{option}");
         }
+        // `wrap` empties the environment (`wrap::tests`), on the process,
+        // where a secret is not on a command line.
+        assert!(!c.after_home_mask.iter().any(|a| a == "--clearenv"));
     }
 
     /// A network namespace may not hold vsock, so the filter does, for a

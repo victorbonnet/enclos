@@ -298,6 +298,12 @@ pub fn session(path: &Path, command: &[OsString]) -> InsideError {
     }
 }
 
+/// The kernel's Landlock ABI, up to the one the rules need, if it has
+/// Landlock (ADR 0037). Restricts nothing.
+pub fn landlock_abi() -> Option<u32> {
+    rules::host_abi()
+}
+
 /// Serves as the session's relay. Returns only what stopped it.
 pub fn relay(path: &Path) -> InsideError {
     // The session it serves is the process that started it, and the command

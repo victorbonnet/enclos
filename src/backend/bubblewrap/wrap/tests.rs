@@ -1,0 +1,544 @@
+use std::os::unix::fs::{PermissionsExt, symlink};
+
+use super::*;
+use crate::backend::bubblewrap::compile::HomeMask;
+use crate::backend::{LaunchLimits, SandboxContext};
+use crate::layout::Layout;
+use crate::model::secret::SecretValue;
+
+/// A user's home in a folder of its own, with the sandbox's home inside it
+/// as enclos keeps it.
+struct Home {
+    dir: tempfile::TempDir,
+}
+
+impl Home {
+    fn new() -> Home {
+        let home = Home {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        std::fs::create_dir_all(home.sandbox_home()).unwrap();
+        home
+    }
+
+    fn user(&self) -> PathBuf {
+        self.dir.path().join("alice")
+    }
+
+    fn at(&self, rest: &str) -> PathBuf {
+        self.user().join(rest)
+    }
+
+    fn sandbox_home(&self) -> PathBuf {
+        self.at(".enclos/sandboxes/lab/home")
+    }
+
+    fn folder(&self, rest: &str) -> PathBuf {
+        let path = self.at(rest);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn file(&self, rest: &str) -> PathBuf {
+        let path = self.at(rest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "x").unwrap();
+        path
+    }
+}
+
+fn text(path: &Path) -> String {
+    path.to_str().unwrap().to_owned()
+}
+
+fn texts(paths: &[PathBuf]) -> Vec<String> {
+    paths.iter().map(|p| text(p)).collect()
+}
+
+/// A compiled file for `home`, as compile lists it: `denied` in the home,
+/// with the protected root, and the rest as given.
+#[derive(Default)]
+struct Lists {
+    denied: Vec<PathBuf>,
+    elsewhere: Vec<PathBuf>,
+    in_sandbox_home: Vec<PathBuf>,
+    in_workspace: Vec<PathBuf>,
+    workspaces: Vec<PathBuf>,
+    unmovable: Vec<PathBuf>,
+}
+
+fn compiled(home: &Home, lists: Lists) -> CompiledSandbox {
+    let mut denied = lists.denied;
+    denied.push(home.at(".enclos"));
+    denied.sort();
+    let mut after = vec![
+        "--bind".to_owned(),
+        text(&home.sandbox_home()),
+        text(&home.sandbox_home()),
+    ];
+    for w in &lists.workspaces {
+        after.extend(["--bind-try".to_owned(), text(w), text(w)]);
+    }
+    after.push("--die-with-parent".to_owned());
+    CompiledSandbox {
+        before_home_mask: vec!["--ro-bind".into(), "/".into(), "/".into()],
+        home_mask: HomeMask {
+            home: text(&home.user()),
+            denied: texts(&denied),
+            denied_elsewhere: texts(&lists.elsewhere),
+            in_sandbox_home: texts(&lists.in_sandbox_home),
+            in_workspace: texts(&lists.in_workspace),
+            workspaces: texts(&lists.workspaces),
+            unmovable: texts(&lists.unmovable),
+        },
+        after_home_mask: after,
+        landlock: serde_json::from_value(serde_json::json!({
+            "read": [], "execute": [], "write": [], "devices": [], "proc_write": [], "scoped": []
+        }))
+        .unwrap(),
+        seccomp: serde_json::from_value(serde_json::json!({
+            "errno": "EPERM", "deny": [], "ioctl": {}, "clone_flags": {}, "enosys": [],
+            "socket_families": {}
+        }))
+        .unwrap(),
+        relay: serde_json::from_value(serde_json::json!({
+            "port": 41001, "socket": "/x/proxy.sock", "log": "/tmp/enclos-relay.log"
+        }))
+        .unwrap(),
+        unenforced: Vec::new(),
+    }
+}
+
+fn read(home: &Home, c: &CompiledSandbox, ssh: Option<&Path>) -> Result<Host, WrapError> {
+    read_host(c, &home.sandbox_home(), ssh)
+}
+
+fn strings(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|a| a.to_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Where `words` start in `args`, in order.
+fn position(args: &[String], words: &[&str]) -> usize {
+    args.windows(words.len())
+        .position(|w| w == words)
+        .unwrap_or_else(|| panic!("{words:?} not in {args:?}"))
+}
+
+#[test]
+fn a_denied_path_in_the_home_is_left_out_of_its_folders_and_the_rest_bound_back() {
+    let home = Home::new();
+    home.file(".ssh/id_ed25519");
+    home.file(".config/gh/hosts.yml");
+    home.file(".config/kept.toml");
+    home.file("notes.txt");
+    symlink("notes.txt", home.at("link")).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".ssh"), home.at(".config/gh")],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let user = text(&home.user());
+    let config = text(&home.at(".config"));
+    // Each folder on the way to a denied path becomes a tmpfs.
+    position(&args, &["--tmpfs", &user]);
+    position(&args, &["--tmpfs", &config]);
+    let kept = text(&home.at("notes.txt"));
+    position(&args, &["--ro-bind-try", &kept, &kept]);
+    let kept = text(&home.at(".config/kept.toml"));
+    position(&args, &["--ro-bind-try", &kept, &kept]);
+    position(&args, &["--symlink", "notes.txt", &text(&home.at("link"))]);
+    for denied in [".ssh", ".config/gh", ".enclos"] {
+        let denied = text(&home.at(denied));
+        assert!(!args.contains(&denied), "{denied}: {args:?}");
+    }
+    // Read-only once bubblewrap has made its mount points, and last.
+    let sealed = position(&args, &["--remount-ro", &user]);
+    assert!(sealed > position(&args, &["--die-with-parent"]));
+    position(&args, &["--remount-ro", &config]);
+}
+
+#[test]
+fn the_home_is_masked_after_the_root_and_before_the_compiled_rest() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let user = text(&home.user());
+    assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
+    assert_eq!(&args[3..5], ["--tmpfs", user.as_str()]);
+    let home_bind = position(&args, &["--bind", &text(&home.sandbox_home())]);
+    assert!(home_bind > position(&args, &["--tmpfs", &user]));
+}
+
+#[test]
+fn a_deny_entry_elsewhere_is_masked_by_its_kind_after_the_root() {
+    let home = Home::new();
+    let outside = tempfile::tempdir().unwrap();
+    let folder = outside.path().join("lxd");
+    std::fs::create_dir(&folder).unwrap();
+    let file = outside.path().join("token");
+    std::fs::write(&file, "x").unwrap();
+    let missing = outside.path().join("missing");
+    let c = compiled(
+        &home,
+        Lists {
+            elsewhere: vec![folder.clone(), file.clone(), missing.clone()],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let rest = position(&args, &["--bind", &text(&home.sandbox_home())]);
+    assert!(position(&args, &["--tmpfs", &text(&folder)]) < rest);
+    assert!(position(&args, &["--ro-bind", "/dev/null", &text(&file)]) < rest);
+    assert!(!args.contains(&text(&missing)), "{args:?}");
+    position(&args, &["--remount-ro", &text(&folder)]);
+}
+
+/// Inside a workspace, after its bind, which would uncover a mask made
+/// before it; a missing entry gets a folder, so the sandbox cannot make it.
+#[test]
+fn a_deny_entry_in_a_workspace_is_masked_after_its_bind_whether_or_not_it_is_there() {
+    let home = Home::new();
+    let workspace = home.folder("proj");
+    let env = home.file("proj/config/.env");
+    let keys = home.folder("proj/keys");
+    let missing = home.at("proj/.netrc");
+    let c = compiled(
+        &home,
+        Lists {
+            in_workspace: vec![env.clone(), keys.clone(), missing.clone()],
+            workspaces: vec![workspace.clone()],
+            unmovable: vec![home.at("proj/config")],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let bound = position(&args, &["--bind-try", &text(&workspace)]);
+    let config = text(&home.at("proj/config"));
+    let unmovable = position(&args, &["--bind", &config, &config]);
+    let file = position(&args, &["--ro-bind", "/dev/null", &text(&env)]);
+    let folder = position(&args, &["--tmpfs", &text(&keys)]);
+    let made = position(&args, &["--tmpfs", &text(&missing)]);
+    assert!(bound < unmovable, "{args:?}");
+    assert!(
+        unmovable < file && unmovable < folder && unmovable < made,
+        "{args:?}"
+    );
+    let sealed = position(&args, &["--remount-ro", &text(&keys)]);
+    assert!(sealed > made);
+    position(&args, &["--remount-ro", &text(&missing)]);
+}
+
+#[test]
+fn a_deny_entry_in_the_sandbox_home_is_masked_after_its_bind() {
+    let home = Home::new();
+    let entry = home.sandbox_home().join(".ssh");
+    let c = compiled(
+        &home,
+        Lists {
+            in_sandbox_home: vec![entry.clone()],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let bound = position(&args, &["--bind", &text(&home.sandbox_home())]);
+    assert!(position(&args, &["--tmpfs", &text(&entry)]) > bound);
+}
+
+/// bubblewrap binds none, so there is nothing to mask, and a mount point
+/// there would fail the session.
+#[test]
+fn a_workspace_not_made_yet_gets_no_mask() {
+    let home = Home::new();
+    let workspace = home.at("later");
+    let entry = home.at("later/.env");
+    let c = compiled(
+        &home,
+        Lists {
+            in_workspace: vec![entry.clone()],
+            workspaces: vec![workspace],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    assert!(host.in_grants.is_empty(), "{host:?}");
+    assert!(!strings(&arguments(&c, &host)).contains(&text(&entry)));
+}
+
+/// `~/cargo -> ~/.cargo` with `write = ["~/cargo"]`: the bind reaches the
+/// real folder, so the entry is masked at the workspace's name for it
+/// (design §14).
+#[test]
+fn a_workspace_through_a_link_has_the_entry_it_reaches_masked_at_its_own_name() {
+    let home = Home::new();
+    home.file(".cargo/credentials.toml");
+    home.file(".cargo/config.toml");
+    symlink(home.at(".cargo"), home.at("cargo")).unwrap();
+    let credentials = home.at(".cargo/credentials.toml");
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![credentials],
+            workspaces: vec![home.at("cargo")],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host));
+    let through = text(&home.at("cargo/credentials.toml"));
+    let mask = position(&args, &["--ro-bind", "/dev/null", &through]);
+    assert!(mask > position(&args, &["--bind-try", &text(&home.at("cargo"))]));
+    // The real folder is the workspace's: its bind replaces it, so it is
+    // not listed for the home's mask.
+    assert!(!host.entries.contains_key(&home.at(".cargo")), "{host:?}");
+}
+
+#[test]
+fn a_workspace_that_reaches_a_deny_entry_through_a_link_is_refused() {
+    let home = Home::new();
+    home.file(".ssh/id_ed25519");
+    symlink(home.at(".ssh"), home.at("keys")).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".ssh")],
+            workspaces: vec![home.at("keys")],
+            ..Lists::default()
+        },
+    );
+    let why = read(&home, &c, None).unwrap_err().to_string();
+    assert!(why.contains("which the deny list hides"), "{why}");
+}
+
+/// The sandbox writes every folder of its workspace, so it could make one a
+/// link, and the mask would follow it.
+#[test]
+fn a_link_between_a_workspace_and_its_deny_entry_refuses_the_session() {
+    let home = Home::new();
+    let workspace = home.folder("proj");
+    let elsewhere = home.folder("elsewhere");
+    symlink(&elsewhere, home.at("proj/config")).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            in_workspace: vec![home.at("proj/config/.env")],
+            workspaces: vec![workspace],
+            ..Lists::default()
+        },
+    );
+    let why = read(&home, &c, None).unwrap_err().to_string();
+    assert!(why.contains("is a link between"), "{why}");
+    assert!(why.contains("proj/config"), "{why}");
+}
+
+#[test]
+fn a_link_between_the_sandbox_home_and_its_deny_entry_refuses_the_session() {
+    let home = Home::new();
+    let elsewhere = home.folder("elsewhere");
+    symlink(&elsewhere, home.sandbox_home().join(".config")).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            in_sandbox_home: vec![home.sandbox_home().join(".config/gh")],
+            ..Lists::default()
+        },
+    );
+    let why = read(&home, &c, None).unwrap_err().to_string();
+    assert!(why.contains("is a link between"), "{why}");
+}
+
+#[test]
+fn the_agents_socket_is_masked_wherever_the_host_puts_it() {
+    let home = Home::new();
+    let in_home = home.file(".agent/agent.sock");
+    // Outside `/tmp`, where every temporary folder is.
+    let elsewhere = PathBuf::from("/nonexistent-enclos-test/agent.sock");
+    let c = compiled(&home, Lists::default());
+
+    let host = read(&home, &c, Some(&in_home)).unwrap();
+    assert!(host.hidden.contains(&in_home), "{host:?}");
+    let args = strings(&arguments(&c, &host));
+    position(&args, &["--tmpfs", &text(&home.at(".agent"))]);
+    assert!(!args.contains(&text(&in_home)), "{args:?}");
+
+    // Masked as any deny entry elsewhere is, by its kind.
+    let host = read(&home, &c, Some(&elsewhere)).unwrap();
+    assert_eq!(host.elsewhere, [(elsewhere, Kind::Missing)]);
+
+    // The sandbox's own `/tmp` hides one there already.
+    let host = read(&home, &c, Some(Path::new("/tmp/ssh-x/agent.1"))).unwrap();
+    assert!(host.elsewhere.is_empty(), "{host:?}");
+}
+
+#[test]
+fn a_folder_that_cannot_be_listed_refuses_the_session() {
+    let home = Home::new();
+    let config = home.folder(".config");
+    home.file(".config/gh/hosts.yml");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".config/gh")],
+            ..Lists::default()
+        },
+    );
+    let got = read(&home, &c, None);
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Root reads it all the same.
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let why = got.unwrap_err().to_string();
+    assert!(why.contains("cannot look at"), "{why}");
+}
+
+fn ctx(home: &Home) -> SandboxContext {
+    let layout = Layout::at(home.at(".enclos"));
+    let mut ctx = SandboxContext::new(&layout, &"lab".parse().unwrap(), 41001);
+    ctx.home = home.sandbox_home();
+    ctx
+}
+
+fn launch(env: Vec<(String, SecretValue)>) -> Launch {
+    Launch {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "echo hi".into()],
+        env,
+        in_terminal: false,
+        service_port: None,
+        limits: LaunchLimits::default(),
+    }
+}
+
+/// bubblewrap runs `enclos inside` first, with the compiled file, then the
+/// session's command as it was given.
+#[test]
+fn bubblewrap_runs_enclos_inside_then_the_command() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let programs = Programs {
+        bwrap: Path::new("/usr/bin/bwrap"),
+        enclos: Path::new("/usr/bin/enclos"),
+    };
+    let file = Path::new("/c/compiled/x.json");
+    let command = command(&programs, file, &c, &host, &ctx(&home), &launch(Vec::new())).unwrap();
+    assert_eq!(command.get_program(), "/usr/bin/bwrap");
+    let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+    let at = args.iter().position(|a| *a == "/usr/bin/enclos").unwrap();
+    assert_eq!(
+        &args[at..],
+        [
+            "/usr/bin/enclos",
+            "inside",
+            "--compiled",
+            "/c/compiled/x.json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo hi"
+        ]
+    );
+    assert_eq!(
+        command.get_current_dir(),
+        Some(home.sandbox_home().as_path())
+    );
+}
+
+/// The environment is set on bubblewrap's own process, emptied first: a
+/// secret given as `--setenv` would be on a command line every process of
+/// the host reads.
+#[test]
+fn the_environment_is_emptied_and_no_secret_is_on_the_command_line() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let programs = Programs {
+        bwrap: Path::new("/usr/bin/bwrap"),
+        enclos: Path::new("/usr/bin/enclos"),
+    };
+    let secret = SecretValue::new("sk-in-the-environment".to_owned()).unwrap();
+    let env = vec![("API_KEY".to_owned(), secret)];
+    let ctx = ctx(&home);
+    let command = command(
+        &programs,
+        Path::new("/c.json"),
+        &c,
+        &host,
+        &ctx,
+        &launch(env),
+    )
+    .unwrap();
+    assert!(
+        !command
+            .get_args()
+            .any(|a| a.to_string_lossy().contains("sk-in-the-environment"))
+    );
+    assert!(!command.get_args().any(|a| a == "--setenv"));
+    let set: BTreeMap<_, _> = command
+        .get_envs()
+        .map(|(k, v)| (k.to_str().unwrap().to_owned(), v.map(|v| v.to_owned())))
+        .collect();
+    assert_eq!(
+        set["API_KEY"].as_deref(),
+        Some(std::ffi::OsStr::new("sk-in-the-environment"))
+    );
+    assert_eq!(
+        set["HOME"].as_deref(),
+        Some(home.sandbox_home().as_os_str())
+    );
+    // Nothing of this process's own variables but those every backend keeps.
+    let run = command.get_envs().count();
+    let expected = 1 + environment::from_host().len() + environment::variables(&ctx).len();
+    assert!(run <= expected, "{run} variables set, {expected} expected");
+    // `env_clear` leaves no inherited variable: run it and look.
+    let mut shown = Command::new("/usr/bin/env");
+    shown.env_clear();
+    for (k, v) in command.get_envs() {
+        if let Some(v) = v {
+            shown.env(k, v);
+        }
+    }
+    let out = String::from_utf8(shown.output().unwrap().stdout).unwrap();
+    assert!(!out.contains("CARGO_PKG_NAME"), "{out}");
+}
+
+#[test]
+fn an_enclos_the_sandbox_does_not_see_refuses_the_session() {
+    let home = Home::new();
+    home.file(".hidden-tools/enclos");
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".hidden-tools")],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let enclos = home.at(".hidden-tools/enclos");
+    let programs = Programs {
+        bwrap: Path::new("/usr/bin/bwrap"),
+        enclos: &enclos,
+    };
+    let why = command(
+        &programs,
+        Path::new("/c.json"),
+        &c,
+        &host,
+        &ctx(&home),
+        &launch(Vec::new()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(why.contains("does not see"), "{why}");
+}
