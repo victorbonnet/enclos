@@ -589,6 +589,25 @@ esac"#,
         assert!(!err.untouched, "{err}");
     }
 
+    /// `secret-tool` can refuse before it reads the value: its refusal is
+    /// the answer, and it wrote nothing. Whether the value meets the pipe
+    /// open or closed is a race; either way the answer is the same.
+    #[test]
+    fn a_store_refused_before_the_value_is_read_is_the_tools_refusal() {
+        let stub = Stub::new(
+            "exec 0<&-; echo 'secret-tool: Cannot create an item in a locked collection' >&2; exit 1",
+            LOCKED,
+        );
+        let err = stub
+            .store
+            .set(&secret(), &v(&"k".repeat(MAX_VALUE)))
+            .unwrap_err();
+        assert!(err.untouched, "{err}");
+        assert!(err.what.contains("in a locked collection"), "{err}");
+        assert!(!err.what.contains("Broken pipe"), "{err}");
+        assert!(!err.what.contains("its input"), "{err}");
+    }
+
     #[test]
     fn a_lookup_that_finds_nothing_is_a_service_that_answers() {
         assert!(Stub::new("exit 1", "").store.answers());
