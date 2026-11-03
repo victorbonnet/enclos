@@ -1701,7 +1701,7 @@ mod through_the_relay {
         let Address::Unix(socket) = proxy.addr.clone() else {
             unreachable!("started on a Unix socket");
         };
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tcp_listener(Ipv4Addr::LOCALHOST);
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || crate::relay::serve(listener, &socket));
         (proxy, port, server, asked)
