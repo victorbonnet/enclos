@@ -257,3 +257,38 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+    use std::os::unix::net::UnixListener;
+
+    /// The #119 review: a proxy that holds its port and has not opened its
+    /// socket yet is not one a bubblewrap session can reach.
+    #[test]
+    fn a_proxy_answers_once_its_socket_does_too_where_sessions_use_it() {
+        let port = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let addr = port.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        let socket = Reached::Socket(path.clone());
+        assert!(Reached::Port(addr).answers());
+        assert!(!socket.answers());
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(socket.answers());
+        drop(listener);
+        drop(port);
+        assert!(!Reached::Port(addr).answers());
+    }
+
+    /// A start that fails names where the sessions reach the proxy: the
+    /// socket where they use it, the port elsewhere.
+    #[test]
+    fn a_start_that_fails_names_the_socket_or_the_port() {
+        let path = PathBuf::from("/x/proxy.sock");
+        assert_eq!(Reached::Socket(path).to_string(), "/x/proxy.sock");
+        let addr = SocketAddr::from(([127, 0, 0, 1], 41001));
+        assert_eq!(Reached::Port(addr).to_string(), "127.0.0.1:41001");
+    }
+}
