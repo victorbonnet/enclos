@@ -261,7 +261,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::net::UnixListener;
 
     /// The #119 review: a proxy that holds its port and has not opened its
@@ -277,9 +277,32 @@ mod tests {
         assert!(!socket.answers());
         let listener = UnixListener::bind(&path).unwrap();
         assert!(socket.answers());
+        // The port still answers, the socket no longer does.
         drop(listener);
-        drop(port);
-        assert!(!Reached::Port(addr).answers());
+        std::fs::remove_file(&path).unwrap();
+        assert!(Reached::Port(addr).answers());
+        assert!(!socket.answers());
+        // The socket answers, the port does not: one this test holds without
+        // listening on it, which no other test can take meanwhile, unlike a
+        // port let go a moment ago.
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(socket.answers());
+        let (closed, _held) = held_closed();
+        assert!(!Reached::Port(closed).answers());
+    }
+
+    /// An address on 127.0.0.1 nothing listens on, held as long as what
+    /// comes with it: the local end of a connection to a listener, which a
+    /// connection to that address does not reach.
+    fn held_closed() -> (SocketAddr, (TcpListener, TcpStream)) {
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let to = listener.local_addr().unwrap();
+        let stream = crate::test_ports::clear_of_proxies(|| {
+            let stream = TcpStream::connect(to).unwrap();
+            let port = stream.local_addr().unwrap().port();
+            (stream, port)
+        });
+        (stream.local_addr().unwrap(), (listener, stream))
     }
 
     /// A start that fails names where the sessions reach the proxy: the
