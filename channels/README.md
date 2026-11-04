@@ -1,6 +1,6 @@
 # Channel plugins
 
-The mobile app's channel for each runtime (`docs/protocol.md`, [ADR 0041](../docs/adr/0041-a-bridge-on-each-host-serves-the-mobile-app.md), proposed): the code that runs inside a sandbox, in the runtime's own process, and listens for enclos's bridge on a Unix socket in the sandbox home.
+The mobile app's channel for each runtime (`docs/protocol.md`, [ADR 0042](../docs/adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md), proposed): the code that runs inside a sandbox, in the runtime's own process, and listens for enclos's bridge on a Unix socket in the sandbox home.
 
 | Folder | Runtime | What it is |
 | --- | --- | --- |
