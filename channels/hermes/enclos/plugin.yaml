@@ -1,0 +1,24 @@
+name: enclos
+label: enclos app
+kind: platform
+version: 0.1.0
+description: >
+  The enclos mobile app's channel. Listens on a Unix socket in the sandbox
+  home, where enclos's bridge on the host connects with the agent's token.
+  Written into the sandbox by `enclos runtime configure <sandbox>/<agent>
+  --channel app`; see docs/protocol.md in the enclos repository.
+author: enclos
+requires_env:
+  - name: ENCLOS_APP_SOCKET
+    description: "Path of the Unix socket to listen on, in the sandbox home"
+    prompt: "Socket path"
+    password: false
+  - name: ENCLOS_APP_TOKEN
+    description: "The agent's token, which the bridge presents"
+    prompt: "Token"
+    password: true
+optional_env:
+  - name: ENCLOS_APP_HOME_CHANNEL
+    description: "Conversation that cron jobs with no origin deliver to"
+    prompt: "Home conversation id (or empty)"
+    password: false
