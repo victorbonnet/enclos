@@ -377,7 +377,7 @@ impl Engine {
         policy: &Policy,
         pending: Option<&Policy>,
         confirm: Confirm,
-    ) -> Result<(ChannelSet, Vec<SandboxCommand>, Vec<(String, String)>)> {
+    ) -> Result<AppChannelPlan> {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
@@ -495,6 +495,10 @@ fn referenced(value: &str) -> Vec<&str> {
     }
     found
 }
+
+/// What sets up an app channel: what `runtime configure` reports, the
+/// commands that put the plugin in place, then its settings.
+type AppChannelPlan = (ChannelSet, Vec<SandboxCommand>, Vec<(String, String)>);
 
 /// What a dry run says of a channel whose host the policy does not reach.
 fn unreachable(name: &SandboxName, channel: Channel) -> String {
