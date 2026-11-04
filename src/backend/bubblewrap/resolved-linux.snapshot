@@ -190,10 +190,6 @@
     "--ro-bind-try",
     "/srv/alice-data/enclos/sandboxes/home/secrets",
     "/srv/alice-data/enclos/sandboxes/home/secrets",
-    "--remount-ro",
-    "/srv/alice-data/enclos",
-    "--remount-ro",
-    "/srv/alice-data/systemd/user",
     "--unshare-user",
     "--disable-userns",
     "--unshare-pid",
@@ -205,6 +201,10 @@
     "--die-with-parent",
     "--chdir",
     "/srv/alice-data/enclos/sandboxes/home/home"
+  ],
+  "sealed": [
+    "/srv/alice-data/enclos",
+    "/srv/alice-data/systemd/user"
   ],
   "landlock": {
     "read": [

@@ -188,6 +188,7 @@
     "--chdir",
     "/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home"
   ],
+  "sealed": [],
   "landlock": {
     "read": [
       "/"

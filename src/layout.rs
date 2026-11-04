@@ -226,6 +226,12 @@ impl Layout {
             .join(format!("{agent}{AGENT_SECRETS_SUFFIX}"))
     }
 
+    /// What enclos stages for an install or an import, beside the home:
+    /// the host writes it, and the sandbox reads it and never writes it.
+    pub fn sandbox_installers(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("installers")
+    }
+
     /// The sandbox's home folder: the runtime's home and the one place it may
     /// write by default.
     pub fn sandbox_home(&self, name: &str) -> PathBuf {

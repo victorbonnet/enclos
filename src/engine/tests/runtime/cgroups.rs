@@ -289,6 +289,7 @@ fn on_a_runner_a_failed_start_ends_what_the_program_forked() {
     let starting = crate::engine::start::Starting::Command {
         kind: crate::engine::start::CommandKind::Exec,
         group: crate::engine::start::Group::Own,
+        reads: &[],
     };
     let detached = std::cell::OnceCell::new();
     let failed = lab.engine.write(

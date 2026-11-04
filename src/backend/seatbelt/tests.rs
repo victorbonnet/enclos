@@ -39,6 +39,7 @@ fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
         in_terminal: false,
         service_port: None,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
         .stdin(Stdio::null())
@@ -162,6 +163,7 @@ impl World {
             in_terminal: false,
             service_port,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let mut command: Command = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
@@ -180,6 +182,7 @@ impl World {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
@@ -361,6 +364,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     in_terminal: false,
                     service_port: None,
                     limits: Default::default(),
+                    reads: Vec::new(),
                 };
                 let out = Seatbelt::default()
                     .wrap(&w.compiled, &w.ctx, &launch)
@@ -669,6 +673,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         target: None,
         tag: 7,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let output = |mut command: Command| {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -686,6 +691,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 in_terminal: false,
                 service_port: None,
                 limits: Default::default(),
+                reads: Vec::new(),
             };
             let (ok, stdout, stderr) =
                 output(Seatbelt::default().wrap(compiled, &w.ctx, &launch).unwrap());
@@ -828,6 +834,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         target: None,
         tag: 7,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
@@ -1109,6 +1116,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
             .stdout(Stdio::null())
@@ -1162,6 +1170,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())
