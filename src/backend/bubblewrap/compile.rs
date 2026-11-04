@@ -46,7 +46,7 @@ const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
 /// The sandbox's own too, and mounted after any mask, so a mask under one
 /// would not last.
-const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
+pub(super) const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
 
 /// What a later `--bind` must not uncover: a workspace may not be at or hold
 /// one of these. `/var/run` is the host's `/run` through a link.

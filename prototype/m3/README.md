@@ -178,7 +178,7 @@ From the first three `bwrap-prototype` runs, on PR #113: in each, both jobs pass
   - TIOCSTI with `--new-session` alone;
   - around a mask: renaming the file mask, removing a mask, a mask in a read-only grant;
   - whether Chromium opens `oom_score_adj` with `O_TRUNC`, and whether `TRUNCATE` ends its refusals: `oom-check.sh` and `test_oom.py` cover a shell's write to its own file only, and Chromium itself is still unchecked;
-  - open, not decided (design §15): renaming a folder that holds a deny entry, for which Linux has no mechanism (design §5 says it cannot be renamed; nothing here stops it), and a deny entry that is a link or sits under one: `wrap.py` hides its resolved path under the home, masks it in a grant, and refuses the session when it resolves anywhere else, a draft of one option until §15 decides. `sandbox-check.sh` plants both kinds of link; no run has shown them yet;
+  - open, not decided (design §15): renaming a folder that holds a deny entry, for which Linux has no mechanism (design §5 says it cannot be renamed; nothing here stops it), and a deny entry that is a link or sits under one: `wrap.py` hides its resolved path under the home, masks it in a grant, and refuses the session when it resolves anywhere else, a draft of one option; §15 has since decided that the backend's `wrap` masks the resolved path wherever it is, as Seatbelt does. `sandbox-check.sh` plants both kinds of link; no run has shown them yet;
   - whether a program runs through the dynamic loader or from a `memfd` where Landlock refuses its exec, and whether vsock reaches the hypervisor from the sandbox;
   - a real desktop session's sockets;
   - a kernel without Landlock;
