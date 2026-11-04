@@ -87,6 +87,9 @@ pub struct SandboxContext {
     /// The socket its proxy listens on for a session with a network of its
     /// own.
     pub proxy_socket: PathBuf,
+    /// What enclos stages for an install or an import, which the sandbox
+    /// reads and never writes.
+    pub installers: PathBuf,
 }
 
 impl SandboxContext {
@@ -105,6 +108,7 @@ impl SandboxContext {
             proxy_port,
             secrets: layout.sandbox_secrets_dir(name.as_str()),
             proxy_socket: layout.proxy_socket(name.as_str()),
+            installers: layout.sandbox_installers(name.as_str()),
         }
     }
 }
@@ -139,6 +143,11 @@ pub struct Launch {
     pub service_port: Option<u16>,
     /// The limits each of its processes runs under (design §7).
     pub limits: LaunchLimits,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the program reads, as an installer and an import do; none for any
+    /// other. A backend whose sandbox does not see that folder shows each
+    /// read-only, and no more of it.
+    pub reads: Vec<PathBuf>,
 }
 
 /// The limits a program runs under, as a backend sets them: only those a

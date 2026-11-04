@@ -9,7 +9,7 @@ pub mod home;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
@@ -53,7 +53,13 @@ impl HomeFile {
 /// its words out, so an adapter's command cannot be started on the host by
 /// mistake.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxCommand(Vec<OsString>);
+pub struct SandboxCommand {
+    words: Vec<OsString>,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the command reads, which a backend whose sandbox does not see that
+    /// folder shows it read-only.
+    reads: Vec<PathBuf>,
+}
 
 /// `word` as a shell reads it back: quoted when it holds anything a shell
 /// would read otherwise, such as `${VAR}`, which it would expand, or starts
@@ -72,20 +78,35 @@ fn shell_word(word: &str) -> String {
 
 impl SandboxCommand {
     pub fn new(words: Vec<OsString>) -> SandboxCommand {
-        SandboxCommand(words)
+        SandboxCommand {
+            words,
+            reads: Vec::new(),
+        }
     }
 
     pub fn from_words(words: &[&str]) -> SandboxCommand {
-        SandboxCommand(words.iter().map(OsString::from).collect())
+        SandboxCommand::new(words.iter().map(OsString::from).collect())
+    }
+
+    /// The command, reading `staged`, files enclos put in the sandbox's
+    /// `installers/` folder.
+    pub fn reading(mut self, staged: Vec<PathBuf>) -> SandboxCommand {
+        self.reads = staged;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.words.is_empty()
+    }
+
+    /// The staged files it reads.
+    pub fn reads(&self) -> &[PathBuf] {
+        &self.reads
     }
 
     /// The command as a person would type it.
     pub fn shown(&self) -> String {
-        self.0
+        self.words
             .iter()
             .map(|w| shell_word(&w.to_string_lossy()))
             .collect::<Vec<_>>()
@@ -93,9 +114,15 @@ impl SandboxCommand {
     }
 
     /// The words to start it with: only the engine's code that starts a
-    /// program in a sandbox (sessions, and the service runner).
+    /// program in a sandbox (sessions, and the service runner, whose
+    /// commands are the adapter's and read nothing staged).
     pub(crate) fn into_words(self) -> Vec<OsString> {
-        self.0
+        self.into_parts().0
+    }
+
+    /// Its words and the staged files it reads, for the code that starts it.
+    pub(crate) fn into_parts(self) -> (Vec<OsString>, Vec<PathBuf>) {
+        (self.words, self.reads)
     }
 }
 

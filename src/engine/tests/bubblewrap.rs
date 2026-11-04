@@ -4,11 +4,12 @@
 //! `bubblewrap` job runs the real one (`tests/bubblewrap.rs`).
 
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::backend::bubblewrap::Bubblewrap;
 use crate::engine::start::{CommandKind, Group, Starting};
+use crate::model::agent::AgentName;
 
 /// These tests start stand-in proxies on their sandboxes' reserved ports:
 /// one at a time, with every other test run of this user too.
@@ -48,8 +49,9 @@ impl Stood {
         script(
             &at("bwrap"),
             &format!(
-                "[ \"$*\" = '--ro-bind / / true' ] && exit 0\nprintf '%s\\n' \"$@\" > '{args}'\nenv > '{env}'\nwhile [ $# -gt 0 ]; do a=$1; shift; [ \"$a\" = -- ] && exec \"$@\"; done\nexit 99",
+                "[ \"$*\" = '--ro-bind / / true' ] && exit 0\nprintf '%s\\n' \"$@\" > '{args}'\n{{ printf '%s\\n' \"$@\"; echo ===; }} >> '{calls}'\nenv > '{env}'\nwhile [ $# -gt 0 ]; do a=$1; shift; [ \"$a\" = -- ] && exec \"$@\"; done\nexit 99",
                 args = at("args").display(),
+                calls = at("calls").display(),
                 env = at("env").display()
             ),
         );
@@ -76,7 +78,8 @@ impl Stood {
             Box::new(audit),
             vec![Box::new(backend)],
         )
-        .with_exe(at("proxy"));
+        .with_exe(at("proxy"))
+        .with_downloader(Box::new(LocalFiles));
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "lab".parse().unwrap();
         let spec = crate::engine::SandboxSpec {
@@ -216,6 +219,7 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
+        reads: &[],
     };
     let lock = stood.engine.state.lock().unwrap();
     let started = stood
@@ -277,6 +281,7 @@ fn a_session_the_host_refuses_at_launch_starts_nothing() {
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
+        reads: &[],
     };
     let lock = stood.engine.state.lock().unwrap();
     let started =
@@ -316,6 +321,7 @@ fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
+        reads: &[],
     };
     let lock = stood.engine.state.lock().unwrap();
     let started =
@@ -345,4 +351,129 @@ fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// The bubblewrap sandbox does not see enclos's data folder, where an
+/// install stages its files, beside the home: `wrap` binds back what the
+/// install reads, each file alone and read-only, so the installer that runs
+/// is the file whose SHA-256 was recorded. An ordinary session is shown none
+/// of it.
+#[test]
+fn an_install_session_is_shown_its_staged_files_read_only_and_no_other_session_is() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let runtime = super::runtime::TestRuntime::new(
+        stood.dir.path(),
+        "#!/bin/sh\necho \"installed $*\" > \"$HOME/installed\"\n",
+    );
+    let installed =
+        stood
+            .engine
+            .install_runtime_with(&alice(), &stood.name, &runtime, Confirm::Yes);
+    let args = stood.read("args");
+    let Planned::Done(end) = installed.unwrap() else {
+        panic!("a dry run");
+    };
+    assert!(end.installed, "{end:?}\n{args}");
+    let installers = stood.engine.layout.sandbox_installers("lab");
+    let installer = installers.join(format!("hermes-install-{}.sh", runtime.sha256));
+    let staged = [installers.join("home-0"), installer];
+    let home = stood.engine.sandbox_home(&stood.name);
+    assert!(home.join("bin/mktemp").is_file());
+    assert_eq!(
+        std::fs::read_to_string(home.join("installed")).unwrap(),
+        "installed --non-interactive\n"
+    );
+    assert_eq!(bound_in(&args, &installers), staged, "{args}");
+
+    // The proxy the install started still runs, and serves this session.
+    let starting = Starting::Command {
+        kind: CommandKind::Exec,
+        group: Group::Own,
+        reads: &[],
+    };
+    let lock = stood.engine.state.lock().unwrap();
+    let started =
+        stood
+            .engine
+            .start_session(&lock, &stood.name, &["/bin/true".into()], starting, || {
+                Ok(())
+            });
+    drop(lock);
+    let waited = started.map(|mut s| s.child.wait());
+    stood.end_proxy();
+    assert!(waited.unwrap().unwrap().success());
+    let args = stood.read("args");
+    assert!(!args.contains(installers.to_str().unwrap()), "{args}");
+}
+
+/// What bubblewrap's arguments mount from `folder`, each a file mounted
+/// read-only at its own path: a mount of anything else of it, or of the
+/// folder itself, is named instead, so the comparison fails.
+fn bound_in(args: &str, folder: &Path) -> Vec<PathBuf> {
+    let args: Vec<&str> = args.lines().collect();
+    let mut bound = Vec::new();
+    for (at, arg) in args.iter().enumerate() {
+        let Some(path) = args.get(at + 1).map(Path::new) else {
+            continue;
+        };
+        if !arg.starts_with("--") || !path.starts_with(folder) {
+            continue;
+        }
+        match (*arg, args.get(at + 2)) {
+            ("--ro-bind", Some(to)) if Path::new(to) == path && path != folder => {
+                bound.push(path.to_owned())
+            }
+            _ => bound.push(PathBuf::from(format!("{arg} {}", path.display()))),
+        }
+    }
+    bound
+}
+
+/// An import's copy of its archive is in the same hidden folder: its
+/// session is shown that one file, read-only, and not the folder.
+#[test]
+fn an_import_session_is_shown_its_copy_of_the_archive_read_only() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let runtime = super::runtime::TestRuntime::new(stood.dir.path(), super::runtime::INSTALLS);
+    let installed =
+        stood
+            .engine
+            .install_runtime_with(&alice(), &stood.name, &runtime, Confirm::Yes);
+    let Planned::Done(end) = installed.unwrap() else {
+        panic!("a dry run");
+    };
+    assert!(end.installed, "{end:?}");
+    let archive = stood.dir.path().join("main.tar.gz");
+    std::fs::write(&archive, b"an export").unwrap();
+    let main: AgentName = "main".parse().unwrap();
+    let imported = stood
+        .engine
+        .import_agent(&alice(), &stood.name, main, &archive, Confirm::Yes);
+    let calls = stood.read("calls");
+    stood.end_proxy();
+    imported.unwrap();
+    let installers = stood.engine.layout.sandbox_installers("lab");
+    let copy = installers.join(format!("agent-main.{}.tar.gz", std::process::id()));
+    // Every call bubblewrap got, the install's and the import's sessions,
+    // then Hermes's own commands that set the agent up.
+    let calls: Vec<&str> = calls.split("===\n").filter(|c| !c.is_empty()).collect();
+    let import = calls
+        .iter()
+        .position(|c| c.contains("\nhermes\nprofile\nimport\n"))
+        .unwrap_or_else(|| panic!("no import: {calls:?}"));
+    assert_eq!(
+        bound_in(calls[import], &installers),
+        [copy],
+        "{}",
+        calls[import]
+    );
+    for after in &calls[import + 1..] {
+        assert_eq!(
+            bound_in(after, &installers),
+            Vec::<PathBuf>::new(),
+            "{after}"
+        );
+    }
 }

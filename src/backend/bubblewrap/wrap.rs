@@ -305,10 +305,15 @@ const NOT_A_FOLDER: &str = "/dev/null";
 
 /// bubblewrap's arguments for one launch, from [`read_host`]'s `host`, in the
 /// order the compiled file names (design §5): the masks of the home and
-/// outside it after the `/` bind, the rest of the compiled arguments, the
-/// unmovable folders, the masks inside the grants, then each folder made
-/// here sealed read-only.
-pub(super) fn arguments(compiled: &CompiledSandbox, host: &Host) -> Vec<OsString> {
+/// outside it after the `/` bind, the rest of the compiled arguments, each
+/// staged file in `reads` read-only at its own path, the unmovable folders,
+/// the masks inside the grants, then each folder made here and each the
+/// compiled file seals, read-only.
+pub(super) fn arguments(
+    compiled: &CompiledSandbox,
+    host: &Host,
+    reads: &[PathBuf],
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = Vec::new();
     let mut made: Vec<PathBuf> = Vec::new();
     let push = |args: &mut Vec<OsString>, words: &[&std::ffi::OsStr]| {
@@ -338,6 +343,14 @@ pub(super) fn arguments(compiled: &CompiledSandbox, host: &Host) -> Vec<OsString
         }
     }
     args.extend(compiled.after_home_mask.iter().map(OsString::from));
+    // The file itself, not its folder: what else is staged there, such as
+    // another import's archive, stays out of sight.
+    for file in reads {
+        push(
+            &mut args,
+            &["--ro-bind".as_ref(), file.as_os_str(), file.as_os_str()],
+        );
+    }
     for folder in &host.unmovable {
         push(
             &mut args,
@@ -365,7 +378,31 @@ pub(super) fn arguments(compiled: &CompiledSandbox, host: &Host) -> Vec<OsString
     for folder in made {
         push(&mut args, &["--remount-ro".as_ref(), folder.as_os_str()]);
     }
+    for folder in &compiled.sealed {
+        push(&mut args, &["--remount-ro".as_ref(), folder.as_ref()]);
+    }
     args
+}
+
+/// Refuses a staged file the sandbox would read that is not one of the
+/// sandbox's `installers/` folder, where the host alone writes: a bind of
+/// anything else would show the sandbox more than enclos staged for it.
+pub(super) fn staged_only(installers: &Path, reads: &[PathBuf]) -> Result<(), WrapError> {
+    for file in reads {
+        let named = file.parent() == Some(installers)
+            && matches!(
+                file.components().next_back(),
+                Some(std::path::Component::Normal(_))
+            );
+        if !named {
+            return Err(WrapError(format!(
+                "{} is not a file enclos stages in {}, so the sandbox is not shown it",
+                file.display(),
+                installers.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// An empty tmpfs on `folder`, with each entry that is neither hidden nor on
@@ -427,9 +464,10 @@ pub(super) fn command(
             hidden.display()
         )));
     }
+    staged_only(&ctx.installers, &launch.reads)?;
     let mut bwrap = Command::new(programs.bwrap);
     bwrap
-        .args(arguments(compiled, host))
+        .args(arguments(compiled, host, &launch.reads))
         .arg(enclos)
         .args(["inside", "--compiled"])
         .arg(compiled_path);

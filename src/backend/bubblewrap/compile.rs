@@ -10,10 +10,12 @@
 //!
 //! The deny list is not mounted. The arguments `wrap` runs are
 //! `before_home_mask`, what it makes of [`HomeMask`]'s `denied` and
-//! `denied_elsewhere`, `after_home_mask`, its binds of `unmovable`, its masks
-//! of `in_sandbox_home` and `in_workspace`, which a later `--bind` would
-//! uncover, then its `--remount-ro` for each folder it made. So a mask comes
-//! after the bind of the folder that holds it, and before anything is sealed.
+//! `denied_elsewhere`, `after_home_mask`, the staged files a launch reads,
+//! its binds of `unmovable`, its masks of
+//! `in_sandbox_home` and `in_workspace`, which a later `--bind` would
+//! uncover, then its `--remount-ro` for each folder it made and each of
+//! `sealed`. So a mask comes after the bind of the folder that holds it,
+//! and before anything is sealed.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -139,6 +141,10 @@ pub struct CompiledSandbox {
     pub before_home_mask: Vec<String>,
     pub home_mask: HomeMask,
     pub after_home_mask: Vec<String>,
+    /// The protected folders outside the user's home, each a tmpfs of its
+    /// own in `after_home_mask`: `wrap` seals them read-only once what it
+    /// binds under them is there.
+    pub sealed: Vec<String>,
     pub landlock: LandlockRules,
     pub seccomp: SeccompFilter,
     pub relay: Relay,
@@ -376,11 +382,6 @@ fn compiled_sandbox(
     after.extend(args(&["--ro-bind", &visible, &visible]));
     after.extend(args(&["--ro-bind", &compiled, &compiled]));
     after.extend(args(&["--ro-bind-try", &secrets, &secrets]));
-    // Writable while bubblewrap made mount points in it; nothing may write
-    // there afterwards.
-    for root in &elsewhere {
-        after.extend(["--remount-ro".to_owned(), text(root)?]);
-    }
     after.extend(args(proposed::NAMESPACES));
     // No `--clearenv`: `wrap` empties bubblewrap's own environment and sets
     // the session's there, so no secret is on its command line.
@@ -404,6 +405,9 @@ fn compiled_sandbox(
             unmovable: texts(&unmovable)?,
         },
         after_home_mask: after,
+        // Writable while bubblewrap makes mount points in them; nothing may
+        // write there afterwards.
+        sealed: texts(&elsewhere)?,
         landlock: LandlockRules {
             read: strings(&["/"]),
             execute,
@@ -591,7 +595,7 @@ mod tests {
                 let at = args.iter().position(|a| a == root).unwrap();
                 assert_eq!(args[at - 1], "--tmpfs", "{root}");
                 assert!(at < first_bind, "{root}: {args:?}");
-                assert!(after(args, "--remount-ro").contains(&root), "{root}");
+                assert!(c.sealed.contains(&root.to_owned()), "{root}");
             }
         }
     }
@@ -687,13 +691,9 @@ mod tests {
             ]
         );
         assert!(after(args, "--tmpfs").contains(&"/srv/enclos"));
-        assert_eq!(after(args, "--remount-ro"), ["/srv/enclos"]);
-        let last_mount = args
-            .iter()
-            .rposition(|a| a.starts_with("--ro-bind") || a == "--bind")
-            .unwrap();
-        let sealed = args.iter().position(|a| a == "--remount-ro").unwrap();
-        assert!(last_mount < sealed);
+        assert_eq!(c.sealed, ["/srv/enclos"]);
+        // `wrap` seals it last, after every bind of its own under it.
+        assert!(after(args, "--remount-ro").is_empty(), "{args:?}");
     }
 
     /// `--ro-bind / /` shows the real folder, so a mask on the spelled path
@@ -718,7 +718,7 @@ mod tests {
                 .contains(&format!("{}/e", user.display()))
         );
         assert!(after(args, "--tmpfs").contains(&real), "{args:?}");
-        assert!(after(args, "--remount-ro").contains(&real), "{args:?}");
+        assert!(c.sealed.contains(&real.to_owned()), "{:?}", c.sealed);
         let hidden = args.iter().position(|a| a == real).unwrap();
         let bound = args.iter().position(|a| a == "--bind").unwrap();
         assert!(hidden < bound, "{args:?}");

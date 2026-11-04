@@ -65,6 +65,7 @@ struct Lists {
     in_workspace: Vec<PathBuf>,
     workspaces: Vec<PathBuf>,
     unmovable: Vec<PathBuf>,
+    sealed: Vec<PathBuf>,
 }
 
 fn compiled(home: &Home, lists: Lists) -> CompiledSandbox {
@@ -92,6 +93,7 @@ fn compiled(home: &Home, lists: Lists) -> CompiledSandbox {
             unmovable: texts(&lists.unmovable),
         },
         after_home_mask: after,
+        sealed: texts(&lists.sealed),
         landlock: serde_json::from_value(serde_json::json!({
             "read": [], "execute": [], "write": [], "devices": [], "proc_write": [], "scoped": []
         }))
@@ -142,7 +144,7 @@ fn a_denied_path_in_the_home_is_left_out_of_its_folders_and_the_rest_bound_back(
         },
     );
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let user = text(&home.user());
     let config = text(&home.at(".config"));
     // Each folder on the way to a denied path becomes a tmpfs.
@@ -168,7 +170,7 @@ fn the_home_is_masked_after_the_root_and_before_the_compiled_rest() {
     let home = Home::new();
     let c = compiled(&home, Lists::default());
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let user = text(&home.user());
     assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
     assert_eq!(&args[3..5], ["--tmpfs", user.as_str()]);
@@ -193,7 +195,7 @@ fn a_deny_entry_elsewhere_is_masked_by_its_kind_after_the_root() {
         },
     );
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let rest = position(&args, &["--bind", &text(&home.sandbox_home())]);
     assert!(position(&args, &["--tmpfs", &text(&folder)]) < rest);
     assert!(position(&args, &["--ro-bind", "/dev/null", &text(&file)]) < rest);
@@ -220,7 +222,7 @@ fn a_deny_entry_in_a_workspace_is_masked_after_its_bind_whether_or_not_it_is_the
         },
     );
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let bound = position(&args, &["--bind-try", &text(&workspace)]);
     let config = text(&home.at("proj/config"));
     let unmovable = position(&args, &["--bind", &config, &config]);
@@ -249,7 +251,7 @@ fn a_deny_entry_in_the_sandbox_home_is_masked_after_its_bind() {
         },
     );
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let bound = position(&args, &["--bind", &text(&home.sandbox_home())]);
     assert!(position(&args, &["--tmpfs", &text(&entry)]) > bound);
 }
@@ -271,7 +273,7 @@ fn a_workspace_not_made_yet_gets_no_mask() {
     );
     let host = read(&home, &c, None).unwrap();
     assert!(host.in_grants.is_empty(), "{host:?}");
-    assert!(!strings(&arguments(&c, &host)).contains(&text(&entry)));
+    assert!(!strings(&arguments(&c, &host, &[])).contains(&text(&entry)));
 }
 
 /// `~/cargo -> ~/.cargo` with `write = ["~/cargo"]`: the bind reaches the
@@ -293,7 +295,7 @@ fn a_workspace_through_a_link_has_the_entry_it_reaches_masked_at_its_own_name() 
         },
     );
     let host = read(&home, &c, None).unwrap();
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     let through = text(&home.at("cargo/credentials.toml"));
     let mask = position(&args, &["--ro-bind", "/dev/null", &through]);
     assert!(mask > position(&args, &["--bind-try", &text(&home.at("cargo"))]));
@@ -366,7 +368,7 @@ fn the_agents_socket_is_masked_wherever_the_host_puts_it() {
 
     let host = read(&home, &c, Some(&in_home)).unwrap();
     assert!(host.hidden.contains(&in_home), "{host:?}");
-    let args = strings(&arguments(&c, &host));
+    let args = strings(&arguments(&c, &host, &[]));
     position(&args, &["--tmpfs", &text(&home.at(".agent"))]);
     assert!(!args.contains(&text(&in_home)), "{args:?}");
 
@@ -417,7 +419,122 @@ fn launch(env: Vec<(String, SecretValue)>) -> Launch {
         in_terminal: false,
         service_port: None,
         limits: LaunchLimits::default(),
+        reads: Vec::new(),
     }
+}
+
+/// The files an install staged in the sandbox's `installers/` folder.
+fn staged(home: &Home) -> Vec<PathBuf> {
+    let installers = ctx(home).installers;
+    vec![
+        installers.join("home-0"),
+        installers.join("hermes-install-0a1b.sh"),
+    ]
+}
+
+/// The data folder is hidden from the sandbox, so what an install reads
+/// there is bound back, each file alone and read-only, after the binds the
+/// compiled file makes and before anything is sealed.
+#[test]
+fn the_files_an_install_staged_are_bound_read_only_and_nothing_else_of_their_folder() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let reads = staged(&home);
+    let args = strings(&arguments(&c, &host, &reads));
+    let sandbox = text(&home.sandbox_home());
+    let bound = position(&args, &["--bind", &sandbox, &sandbox]);
+    let first_seal = args.iter().position(|a| a == "--remount-ro").unwrap();
+    for file in &reads {
+        let at = position(&args, &["--ro-bind", &text(file), &text(file)]);
+        assert!(bound < at && at < first_seal, "{args:?}");
+    }
+    let installers = text(&ctx(&home).installers);
+    let shown: Vec<&String> = args.iter().filter(|a| a.contains(&installers)).collect();
+    assert_eq!(shown.len(), 2 * reads.len(), "{args:?}");
+    assert!(!args.contains(&installers), "{args:?}");
+}
+
+/// A session that reads nothing staged sees none of the folder.
+#[test]
+fn a_session_that_reads_nothing_staged_is_shown_nothing_of_the_installers() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let programs = Programs {
+        bwrap: Path::new("/usr/bin/bwrap"),
+        enclos: Path::new("/usr/bin/enclos"),
+    };
+    let file = Path::new("/c/compiled/x.json");
+    let command = command(&programs, file, &c, &host, &ctx(&home), &launch(Vec::new())).unwrap();
+    let installers = text(&ctx(&home).installers);
+    let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+    assert!(!args.iter().any(|a| a.contains(&installers)), "{args:?}");
+}
+
+/// A data folder outside the user's home is a tmpfs of its own: sealed
+/// before the staged files are bound, bubblewrap could not make their
+/// mount points in it.
+#[test]
+fn a_protected_folder_outside_the_home_is_sealed_after_the_staged_files() {
+    let home = Home::new();
+    let elsewhere = home.folder("srv/enclos");
+    let c = compiled(
+        &home,
+        Lists {
+            sealed: vec![elsewhere.clone()],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let reads = staged(&home);
+    let args = strings(&arguments(&c, &host, &reads));
+    let sealed = position(&args, &["--remount-ro", &text(&elsewhere)]);
+    for file in &reads {
+        assert!(position(&args, &["--ro-bind", &text(file), &text(file)]) < sealed);
+    }
+    assert_eq!(args.len(), sealed + 2, "sealed last: {args:?}");
+}
+
+/// Only a file of the sandbox's own `installers/` folder is bound: not the
+/// folder, nothing below a folder in it, and nothing elsewhere.
+#[test]
+fn only_a_file_of_the_sandboxs_installers_folder_is_shown() {
+    let installers = Path::new("/d/sandboxes/lab/installers");
+    assert!(staged_only(installers, &[installers.join("home-0")]).is_ok());
+    assert!(staged_only(installers, &[]).is_ok());
+    for refused in [
+        installers.to_path_buf(),
+        installers.join("deep/home-0"),
+        installers.join(".."),
+        PathBuf::from("/d/sandboxes/other/installers/home-0"),
+        PathBuf::from("/d/state.db"),
+        PathBuf::from("home-0"),
+    ] {
+        let why = staged_only(installers, &[installers.join("home-0"), refused.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains(&refused.display().to_string()), "{why}");
+    }
+}
+
+/// A launch naming another file starts nothing.
+#[test]
+fn a_launch_reading_a_file_enclos_did_not_stage_is_refused() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let host = read(&home, &c, None).unwrap();
+    let programs = Programs {
+        bwrap: Path::new("/usr/bin/bwrap"),
+        enclos: Path::new("/usr/bin/enclos"),
+    };
+    let mut launch = launch(Vec::new());
+    launch.reads = vec![home.at(".enclos/state.db")];
+    let file = Path::new("/c/compiled/x.json");
+    let why = command(&programs, file, &c, &host, &ctx(&home), &launch)
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("is not a file enclos stages"), "{why}");
 }
 
 /// bubblewrap runs `enclos inside` first, with the compiled file, then the

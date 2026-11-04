@@ -155,7 +155,7 @@ impl Engine {
         audit_name: &str,
         kind: CommandKind,
     ) -> Result<SessionEnd> {
-        let command = command.into_words();
+        let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
@@ -170,7 +170,11 @@ impl Engine {
             unreachable,
             prepared: keep_waiting,
         } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
-            let starting = Starting::Command { kind, group };
+            let starting = Starting::Command {
+                kind,
+                group,
+                reads: &reads,
+            };
             let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
             self.failed_on_error(lock, name, audit_name, started)
         })?;
