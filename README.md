@@ -26,6 +26,37 @@ enclos protects against accidental damage by agents you mostly trust ([threat mo
 
 More in the [glossary](GLOSSARY.md).
 
+## How it works
+
+enclos adds no container and no VM. It uses the sandbox your operating system already has: on macOS, Seatbelt, through `sandbox-exec`. A session starts under its sandbox's compiled policy, and everything that session starts stays under it, whether a helper, an installer or a browser. Linux, with bubblewrap, is [the next milestone](docs/design.md#13-milestones).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/sandbox-dark.svg">
+  <img alt="The sandbox lab, on your Mac, holds Hermes and its agents, its home and any workspaces you grant, all read and write. From inside it, reading the rest of your disk is allowed. Reading the deny list, reaching host services and any direct connection are refused. Connecting to the egress proxy, on the host outside the sandbox, is allowed, and the proxy connects to the public web or your allowlist, and refuses the local network, cloud metadata and the host itself." src="docs/diagrams/sandbox-light.svg">
+</picture>
+
+### Files and network, together
+
+Each limit needs the other. Without the file limits, an agent could read your SSH keys. Without the network limits, it could send what it reads anywhere. Reads are broad, so the two set what a mistake can cost: the deny list decides what an agent cannot read at all, and the network mode decides where the rest could go. That is the public web under the `assistant` template, and only the hosts you list in allowlist mode.
+
+Seatbelt starts from `(deny default)`: a sandbox may do only what its compiled policy allows.
+
+- **Writes are allow-only.** A sandbox writes to its own home and to the workspaces its policy names.
+- **Reads are allowed, then denied.** A sandbox reads broadly, and the deny list overrides that. Protected paths, such as the state database, the audit log and other sandboxes, are denied whatever the policy says.
+- **The network is allow-only.** The compiled policy denies the network, then allows the sandbox's proxy port on localhost, Unix sockets in its home and, for a runtime that listens, its own service's port. Only the proxy leads out of the sandbox.
+- **Host services are refused.** So are Apple Events, launchd jobs, preferences, the pasteboard and signals to processes outside the sandbox.
+
+The proxy runs on the host, one per sandbox, so a sandbox cannot change what it decides. A session's proxy variables point at it, and a program that ignores them reaches nothing. For each new connection it reads the active policy, checks the network mode, resolves the name itself, connects only to an address it has validated and logs the result. That is why `enclos policy allow` works without a restart. It sees where an HTTPS connection goes, not what it carries.
+
+### From a policy to a session
+
+1. **Resolve.** Four layers (built-in defaults, a template, the runtime's endpoints, the sandbox's own `policy.toml`) become an immutable policy snapshot, identified by its hash.
+2. **Compile.** The backend turns the snapshot into its own file, for Seatbelt a `.sb` file.
+3. **Start.** `enclos connect` starts the program under `sandbox-exec`, with an emptied environment plus the sandbox's own variables. Background services are launchd jobs; there is no enclos daemon.
+4. **Record.** Sessions and the network log go to `state.db`, and each command that changes something to a hash-chained `audit.jsonl`.
+
+`enclos policy test` then shows the result instead of assuming it: escape probes try each way out from inside the sandbox, and each counts only if its control, run outside, shows the route works there.
+
 ## Architecture
 
 <picture>
@@ -33,7 +64,27 @@ More in the [glossary](GLOSSARY.md).
   <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="docs/diagrams/architecture-light.svg">
 </picture>
 
-Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defaults, a template, the runtime's endpoints, your overrides). Its only network route is an egress proxy on the host. Background services are plain launchd jobs; there is no enclos daemon. See [architecture](docs/architecture.md) for the components and a session step by step.
+Every client calls the engine. A command that changes anything takes the state lock, opens an audit entry, does the work and closes the entry, also on failure. Each component sits behind one interface, so a new backend or runtime is one new implementation.
+
+```text
+src/
+├── main.rs, cli/       # Commands, arguments and output
+├── engine.rs, engine/  # Where the components meet: lock, audit, then the work
+├── policy/             # Layers, snapshots and validation
+├── backend/seatbelt/   # Compile a policy, wrap a command
+├── runtime/            # Runtime adapters: Hermes
+├── service/            # The host's service manager: launchd
+├── lifecycle/          # A session's members, and a safe stop
+├── probes/             # Escape probes for enclos policy test
+├── proxy/              # The egress proxy
+├── net/                # Allowlist entries and address classes
+├── secrets/            # The secret store: the Keychain
+├── state/              # state.db
+├── audit/              # audit.jsonl
+└── model/              # Typed records the components share
+```
+
+See [architecture](docs/architecture.md) for what runs on your Mac and a session step by step.
 
 ## Quick start
 
