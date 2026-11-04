@@ -264,6 +264,37 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
     assert_eq!(started.session.sandbox, stood.name);
 }
 
+/// `listen = false`, which every template leaves, is not held on
+/// bubblewrap (design §15): each start says so, once.
+#[test]
+fn a_session_whose_policy_does_not_listen_says_at_start_that_it_is_not_held() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let starting = Starting::Command {
+        kind: CommandKind::Exec,
+        group: Group::Own,
+        reads: &[],
+    };
+    let lock = stood.engine.state.lock().unwrap();
+    let (started, said) = crate::notes::heard(|| {
+        stood
+            .engine
+            .start_session(&lock, &stood.name, &["/bin/true".into()], starting, || {
+                Ok(())
+            })
+    });
+    drop(lock);
+    let mut started = started.unwrap();
+    assert!(started.child.wait().unwrap().success());
+    stood.end_proxy();
+    assert_eq!(
+        said,
+        [
+            "sandbox lab: `listen = false` is not held on bubblewrap: nothing refuses bind or listen in a session's own network namespace (enclos doctor)"
+        ]
+    );
+}
+
 /// A folder of the user's home that holds a deny entry and cannot be
 /// listed stops the start before anything runs, and says which.
 #[test]

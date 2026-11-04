@@ -256,7 +256,7 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 
 The errno is a choice for M3-14: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
 
-Review corrections: Only `run/visible/` is mounted; proxy control and authoritative service state stay outside. `listen=false` is **not enforced** by this prototype; production must refuse it until verified (the end of design §15).
+Review corrections: Only `run/visible/` is mounted; proxy control and authoritative service state stay outside. `listen=false` is **not enforced** by this prototype; production was to refuse it until verified, and design §15 has since chosen to declare it unenforced and say so at each start (ADR 0041, proposed), with Landlock's TCP bind right added in M3-16.
 
 ## M3-03: namespaces per session or per sandbox
 
