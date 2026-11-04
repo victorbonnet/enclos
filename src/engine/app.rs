@@ -51,6 +51,34 @@ impl Engine {
         })
     }
 
+    /// Every agent of every sandbox whose active policy grants it an app
+    /// channel token, as `(sandbox, agent, runtime)`.
+    pub fn app_agents(&self) -> Result<Vec<(SandboxName, String, String)>> {
+        let variable = Channel::App.token_variable();
+        let mut agents = Vec::new();
+        for view in self.list_sandboxes()? {
+            let name = view.record.name.clone();
+            let Ok(policy) = self.policy(&name) else {
+                continue;
+            };
+            let runtime = self
+                .runtime_of(&name)
+                .map(|k| k.to_string())
+                .unwrap_or_default();
+            for (agent, grants) in &policy.snapshot.policy.agent_secrets {
+                if grants.contains_key(variable) {
+                    agents.push((name.clone(), agent.clone(), runtime.clone()));
+                }
+            }
+        }
+        Ok(agents)
+    }
+
+    /// The bridge's static key pair's file.
+    pub fn app_key_path(&self) -> PathBuf {
+        self.layout.data().join("app-bridge.key")
+    }
+
     /// The bridge's own database: conversations and their messages.
     pub fn app_store_path(&self) -> PathBuf {
         self.layout.data().join("app.db")
