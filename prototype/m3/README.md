@@ -256,7 +256,7 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 
 The errno is a choice for the backend: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
 
-Only `run/visible/` is mounted, read-only; the proxy's control socket and the service's state stay outside it (design §11). Nothing here refuses `bind` or `listen`, so `listen = false` is not held; design §15 holds that open decision.
+Only `run/visible/` is mounted, read-only; the proxy's control socket and the service's state stay outside it (design §11). Nothing here refuses `bind` or `listen`, so `listen = false` is not held. Design §15 has since chosen to declare it unenforced on bubblewrap and say so at each start ([ADR 0041](../../docs/adr/0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md), proposed), with Landlock's TCP bind right to come with the sandbox's shared namespace ([ADR 0039](../../docs/adr/0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md), proposed).
 
 ## Namespaces per session or per sandbox
 

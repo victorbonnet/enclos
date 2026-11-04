@@ -114,6 +114,9 @@ pub struct Unenforced {
     pub why: String,
 }
 
+/// The field `listen = false` sets, which no bubblewrap host holds.
+pub(super) const LISTEN: &str = "network.listen";
+
 /// The fields of `policy` that are not held, listed in the compiled output
 /// (ADR 0038) for what stores and starts a sandbox to accept or refuse. An
 /// `[exec]` section joins them once a policy can hold one (ADR 0037).
@@ -123,7 +126,7 @@ pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
     // own limits who is reached, not whether the sandbox listens.
     if !policy.net.listen {
         fields.push(Unenforced {
-            field: "network.listen".to_owned(),
+            field: LISTEN.to_owned(),
             when: "every host".to_owned(),
             why: "nothing refuses bind or listen in a session's own network namespace".to_owned(),
         });

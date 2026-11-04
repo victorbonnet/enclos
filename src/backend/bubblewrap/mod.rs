@@ -125,6 +125,20 @@ impl Backend for Bubblewrap {
         wrap::command(&programs, compiled, &parsed, &host, ctx, launch)
     }
 
+    /// `listen = false` is not held (design §15): every start says so.
+    fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String> {
+        proposed::unenforced(policy)
+            .into_iter()
+            .filter(|u| u.field == proposed::LISTEN)
+            .map(|u| {
+                format!(
+                    "sandbox {}: `listen = false` is not held on bubblewrap: {} (enclos doctor)",
+                    ctx.name, u.why
+                )
+            })
+            .collect()
+    }
+
     fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
         Err(
             "cannot be tested yet: the bubblewrap backend's escape probes are not in this build (milestone 3, M3-17)"

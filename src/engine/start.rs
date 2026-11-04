@@ -284,12 +284,17 @@ impl Engine {
             limits: self.launch_limits(&record, &snapshot.policy)?,
             reads: starting.reads(),
         };
-        let wrapped = self
-            .backend_of(name)?
+        let backend = self.backend_of(name)?;
+        let wrapped = backend
             .wrap(&compiled, &ctx, &launch)
             .map_err(|e| Error::Session {
                 what: format!("cannot start {named}: {e}"),
             })?;
+        // What the policy says that this backend does not hold, before the
+        // program prints anything of its own.
+        for line in backend.said_at_start(&snapshot.policy, &ctx) {
+            crate::notes::say(&line);
+        }
         let (mut wrapped, mut scope) = self.in_scope(name, wrapped)?;
         let group = starting.group();
         if group == Group::Own {
