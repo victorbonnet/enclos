@@ -335,7 +335,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| e.to_string())?;
-    let ended = session(hub, &store, &mut link, &device, &person, &outbox);
+    let ended = run_session(hub, &store, &mut link, &device, &person, &outbox);
     hub.devices.lock().expect("not poisoned").remove(&device.id);
     let _ = store.device_seen(&device.id);
     let _ = store.log(
@@ -417,7 +417,7 @@ fn pair(
     Ok(device)
 }
 
-fn session(
+fn run_session(
     hub: &Arc<Hub>,
     store: &Store,
     link: &mut Link,
