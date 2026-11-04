@@ -7,14 +7,20 @@ use std::io::BufRead;
 use clap::{Args, Subcommand};
 
 use super::runtime::ChannelTarget;
-use enclos::bridge::ids::new_id;
+use enclos::bridge::ids::{new_id, random_bytes};
+use enclos::bridge::keys::bridge_keypair;
 use enclos::bridge::plugin::{PluginError, connect};
+use enclos::bridge::server::{self, AgentEndpoint};
+use enclos::bridge::store::now;
 use enclos::bridge::store::{From, Store};
 use enclos::engine::Engine;
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
+use enclos_protocol::pairing::PairLink;
 use enclos_protocol::plugin::{FromPlugin, OutKind};
 use enclos_protocol::{ConversationId, Person};
+use qrcode::QrCode;
+use qrcode::render::unicode::Dense1x2;
 
 #[derive(Args)]
 pub struct AppArgs {
@@ -35,6 +41,34 @@ enum AppVerb {
         #[arg(long)]
         conversation: Option<String>,
     },
+    /// Run the bridge in this terminal: it serves paired devices on the
+    /// host's loopback, for `tailscale serve` to put on your tailnet.
+    Serve {
+        /// The loopback port to listen on.
+        #[arg(long, default_value_t = 47100)]
+        port: u16,
+    },
+    /// Pair a device: prints a QR code for the enclos app to scan, then
+    /// asks you to confirm the device that used it.
+    Pair {
+        /// The bridge's address on your tailnet; read from `tailscale
+        /// status` when left out.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// List the paired devices.
+    Devices,
+    /// Remove a paired device: it can no longer connect.
+    Unpair { device: String },
+    /// Who can reach the agents, from which devices, and when each was
+    /// last seen.
+    Status,
+    /// The bridge's log: connections, disconnections and refusals.
+    Log {
+        /// How many lines, the newest last.
+        #[arg(short = 'n', default_value_t = 50)]
+        lines: i64,
+    },
 }
 
 pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
@@ -43,7 +77,196 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             target,
             conversation,
         } => chat(engine, by, target, conversation),
+        AppVerb::Serve { port } => serve(engine, port),
+        AppVerb::Pair { url } => pair(engine, url),
+        AppVerb::Devices | AppVerb::Status => devices(engine),
+        AppVerb::Unpair { device } => unpair(engine, &device),
+        AppVerb::Log { lines } => log(engine, lines),
     }
+}
+
+fn failed(what: String) -> Error {
+    Error::Session { what }
+}
+
+fn open_store(engine: &Engine) -> Result<Store> {
+    Store::open(&engine.app_store_path())
+        .map_err(|e| failed(format!("cannot open the bridge's database: {e}")))
+}
+
+fn serve(engine: &Engine, port: u16) -> Result<u8> {
+    let key = bridge_keypair(&engine.app_key_path())
+        .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
+    let mut agents = Vec::new();
+    for (sandbox, agent, runtime) in engine.app_agents()? {
+        match engine.app_endpoint(&sandbox, &agent) {
+            Ok(endpoint) => agents.push(AgentEndpoint {
+                name: format!("{sandbox}/{agent}"),
+                runtime,
+                socket: endpoint.socket,
+                token: endpoint.token.expose().to_owned(),
+            }),
+            Err(e) => eprintln!("enclos app: {sandbox}/{agent} left out: {e}"),
+        }
+    }
+    eprintln!(
+        "The bridge serves {} agent(s) on 127.0.0.1:{port}. Put it on your tailnet with:\n  tailscale serve --bg {port}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
+        agents.len()
+    );
+    for agent in &agents {
+        eprintln!("  {}", agent.name);
+    }
+    server::serve(port, engine.app_store_path(), key.private, agents)
+        .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
+    Ok(exit::OK)
+}
+
+/// The host's name on the tailnet, from `tailscale status --json`.
+fn tailnet_url() -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let name = status.get("Self")?.get("DNSName")?.as_str()?;
+    Some(format!("https://{}", name.trim_end_matches('.')))
+}
+
+fn pair(engine: &Engine, url: Option<String>) -> Result<u8> {
+    let url = url.or_else(tailnet_url).ok_or_else(|| {
+        failed("cannot read this host's tailnet name from `tailscale status`: give it with --url https://<host>.<tailnet>.ts.net".to_owned())
+    })?;
+    let key = bridge_keypair(&engine.app_key_path())
+        .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
+    let store = open_store(engine)?;
+    let code = random_bytes(16).map_err(|e| failed(format!("cannot make a code: {e}")))?;
+    let expires = now() + 300;
+    store
+        .add_pairing(&code, expires)
+        .map_err(|e| failed(format!("cannot record the code: {e}")))?;
+    let host = url
+        .trim_start_matches("https://")
+        .split('.')
+        .next()
+        .unwrap_or("host")
+        .to_owned();
+    let link = PairLink {
+        host,
+        url,
+        key: key.public,
+        code: code.clone(),
+        expires: expires as u64,
+    }
+    .to_link()
+    .map_err(|e| failed(e.to_string()))?;
+    let qr = QrCode::new(link.as_bytes())
+        .map_err(|e| failed(format!("cannot draw the QR code: {e}")))?;
+    println!("{}", qr.render::<Dense1x2>().quiet_zone(true).build());
+    println!("Scan it with the enclos app, or enter this link: {link}");
+    println!("It works once, for 5 minutes, while `enclos app serve` runs.");
+    let request = loop {
+        if let Some(request) = store
+            .pairing_request(&code)
+            .map_err(|e| failed(e.to_string()))?
+        {
+            break request;
+        }
+        if now() > expires {
+            return Err(failed(
+                "the code expired: run `enclos app pair` again".to_owned(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    };
+    print!(
+        "{} (tailscale: {}) wants to pair. Accept? [y/N] ",
+        request.name, request.person
+    );
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| failed(e.to_string()))?;
+    let accept = matches!(answer.trim(), "y" | "Y" | "yes");
+    store
+        .decide_pairing(&code, if accept { "accept" } else { "decline" })
+        .map_err(|e| failed(e.to_string()))?;
+    println!(
+        "{}",
+        if accept {
+            "Paired."
+        } else {
+            "Declined: the device is not paired."
+        }
+    );
+    Ok(exit::OK)
+}
+
+fn when(seconds: Option<i64>) -> String {
+    match seconds {
+        None => "never".to_owned(),
+        Some(at) => {
+            let ago = (now() - at).max(0);
+            match ago {
+                0..60 => "just now".to_owned(),
+                60..3600 => format!("{} min ago", ago / 60),
+                3600..86400 => format!("{} h ago", ago / 3600),
+                _ => format!("{} d ago", ago / 86400),
+            }
+        }
+    }
+}
+
+fn devices(engine: &Engine) -> Result<u8> {
+    let store = open_store(engine)?;
+    let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+    if devices.is_empty() {
+        println!("No paired device: pair one with `enclos app pair`.");
+    }
+    for d in devices {
+        println!(
+            "{}  {}  {}  paired {}, seen {}",
+            d.id,
+            d.name,
+            d.person,
+            when(Some(d.paired)),
+            when(d.seen)
+        );
+    }
+    Ok(exit::OK)
+}
+
+fn unpair(engine: &Engine, device: &str) -> Result<u8> {
+    let store = open_store(engine)?;
+    match store
+        .remove_device(device)
+        .map_err(|e| failed(e.to_string()))?
+    {
+        true => {
+            let _ = store.log(Some(device), None, "unpaired", None);
+            println!("Device {device} removed: it can no longer connect.");
+            Ok(exit::OK)
+        }
+        false => Err(failed(format!(
+            "no paired device {device}: `enclos app devices` lists them"
+        ))),
+    }
+}
+
+fn log(engine: &Engine, lines: i64) -> Result<u8> {
+    let store = open_store(engine)?;
+    for line in store.log_lines(lines).map_err(|e| failed(e.to_string()))? {
+        println!(
+            "{}  {}  {}  {}{}",
+            when(Some(line.at)),
+            line.event,
+            line.device.as_deref().unwrap_or("-"),
+            line.person.as_deref().unwrap_or("-"),
+            line.reason.map(|r| format!("  ({r})")).unwrap_or_default()
+        );
+    }
+    Ok(exit::OK)
 }
 
 fn chat(
@@ -52,7 +275,6 @@ fn chat(
     target: ChannelTarget,
     conversation: Option<String>,
 ) -> Result<u8> {
-    let failed = |what: String| Error::Session { what };
     let ChannelTarget { sandbox, agent } = target;
     // Hermes's built-in agent; a runtime with another would name it here.
     let agent = agent.map_or_else(|| "default".to_owned(), |a| a.to_string());
