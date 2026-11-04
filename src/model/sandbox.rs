@@ -79,6 +79,14 @@ impl BackendKind {
         BackendKind::Libkrun,
     ];
 
+    /// Whether the `mktemp` a sandbox of this kind runs ignores `TMPDIR`
+    /// for a call with no template, `-d` or `-t`, as macOS's
+    /// `/usr/bin/mktemp` does (design §5, "System temp"). GNU `mktemp`, a
+    /// Linux sandbox's, follows it.
+    pub fn mktemp_ignores_tmpdir(self) -> bool {
+        matches!(self, BackendKind::Seatbelt)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             BackendKind::Seatbelt => "seatbelt",

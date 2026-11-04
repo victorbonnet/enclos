@@ -15,6 +15,7 @@ pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::BackendKind;
 pub use home::HomePath;
 
 /// An installer enclos downloads on the host and runs inside the sandbox,
@@ -211,7 +212,9 @@ pub trait RuntimeAdapter {
     /// `[network] allow_add` and nothing else (design §7).
     fn endpoints(&self) -> &'static str;
     fn installer(&self) -> Installer;
-    fn home_files(&self) -> Vec<HomeFile>;
+    /// What the install puts in the sandbox's home, for a sandbox of
+    /// `backend`: a fix for a host tool goes only where that tool needs it.
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;
     /// What a person runs in the sandbox to log the runtime in and set it
     /// up, for enclos's messages: `enclos connect <sandbox> -- <this>`.
     /// enclos shows it, never runs it (ADR 0024).

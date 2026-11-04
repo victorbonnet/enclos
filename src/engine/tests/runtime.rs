@@ -133,8 +133,8 @@ impl RuntimeAdapter for TestRuntime {
             args: vec!["--non-interactive".into()],
         }
     }
-    fn home_files(&self) -> Vec<HomeFile> {
-        Hermes.home_files()
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        Hermes.home_files(backend)
     }
     fn login(&self) -> String {
         Hermes.login()
