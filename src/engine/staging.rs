@@ -13,7 +13,7 @@ use crate::layout::LayoutError;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
 use crate::policy::sha256_hex;
-use crate::runtime::{HomeFile, RuntimeAdapter, SandboxCommand};
+use crate::runtime::{HomeFile, HomePath, RuntimeAdapter, SandboxCommand};
 
 /// An installer larger than this is not an install script: refused.
 const INSTALLER_MAX_BYTES: u64 = 20 * 1024 * 1024;
@@ -87,6 +87,38 @@ impl Engine {
         ];
         words.extend(runtime.installer().args.iter().map(Into::into));
         Ok((SandboxCommand::new(words).reading(reads), sha256))
+    }
+
+    /// Stages `files` in the sandbox's `installers/` folder and returns the
+    /// command that copies each into its place in the home, from inside
+    /// the sandbox, under its policy, as an install's own files are.
+    /// `tag` keeps them apart from an install's, and from another agent's.
+    pub(super) fn stage_home_copy(
+        &self,
+        name: &SandboxName,
+        files: &[(HomePath, &str)],
+        tag: &str,
+    ) -> Result<SandboxCommand> {
+        let dir = self.layout.sandbox_installers(name.as_str());
+        std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+        let mut staged = Vec::new();
+        for (i, (_, contents)) in files.iter().enumerate() {
+            let path = dir.join(format!("{tag}-{i}"));
+            std::fs::write(&path, contents).map_err(io(&path))?;
+            staged.push(path);
+        }
+        let places: Vec<String> = files
+            .iter()
+            .map(|(place, _)| place.as_path().display().to_string())
+            .collect();
+        let copies: Vec<(&Path, &str, bool)> = staged
+            .iter()
+            .zip(&places)
+            .map(|(path, place)| (path.as_path(), place.as_str(), false))
+            .collect();
+        let script = copy_into_home_script(&copies);
+        let words: Vec<OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        Ok(SandboxCommand::new(words).reading(staged))
     }
 }
 
@@ -170,10 +202,20 @@ fn download_installer(
 /// the sandbox may write anyway. Whatever is at the target first goes
 /// (a link, a folder), and the copy must leave a plain file.
 pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
+    let files: Vec<(&Path, &str, bool)> = staged
+        .iter()
+        .map(|(path, file)| (path.as_path(), file.path, file.executable))
+        .collect();
+    copy_into_home_script(&files)
+}
+
+/// The `sh` lines that copy each staged file to its place in the home,
+/// given relative to it.
+fn copy_into_home_script(files: &[(&Path, &str, bool)]) -> String {
     let mut script = String::from("set -e\n");
-    for (path, file) in staged {
-        let target = format!("\"$HOME\"/{}", sh_word(file.path));
-        let mode = if file.executable { "700" } else { "600" };
+    for (path, place, executable) in files {
+        let target = format!("\"$HOME\"/{}", sh_word(place));
+        let mode = if *executable { "700" } else { "600" };
         script.push_str(&format!(
             "mkdir -p \"$(dirname {target})\"\n\
              rm -rf -- {target}\n\
@@ -181,8 +223,7 @@ pub(crate) fn home_files_script(staged: &[(PathBuf, &HomeFile)]) -> String {
              chmod {mode} {target}\n",
             sh_word(&path.display().to_string()),
             sh_word(&format!(
-                "enclos: cannot put {} in the sandbox home: something the sandbox may not replace is in the way",
-                file.path
+                "enclos: cannot put {place} in the sandbox home: something the sandbox may not replace is in the way"
             )),
         ));
     }

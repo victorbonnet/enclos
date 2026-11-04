@@ -377,6 +377,16 @@ pub trait RuntimeAdapter {
         None
     }
 
+    /// The mobile app's channel for `agent` (ADR 0042, proposed): the
+    /// plugin the runtime loads, the commands that turn it on once it is in
+    /// place, and the settings that tell it its socket, `socket`, a path in
+    /// the sandbox home that enclos's bridge connects to. The agent's token
+    /// is a secret the policy grants it as `ENCLOS_APP_TOKEN`. `None`: the
+    /// runtime has no such channel.
+    fn app_channel(&self, _agent: &RuntimeAgentName, _socket: &Path) -> Option<AppChannel> {
+        None
+    }
+
     // What `enclos status` shows. Each answer may be "cannot
     // tell", and a runtime that names nothing still gets sizes.
 
@@ -390,6 +400,18 @@ pub trait RuntimeAdapter {
     fn agent_facts(&self, _agent: &RuntimeAgentName) -> AgentFacts {
         AgentFacts::default()
     }
+}
+
+/// What [`RuntimeAdapter::app_channel`] sets up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppChannel {
+    /// The plugin's files, by their place in the home.
+    pub files: Vec<(HomePath, &'static str)>,
+    /// The runtime's own commands, run once the files are in place.
+    pub commands: Vec<SandboxCommand>,
+    /// Settings for [`RuntimeAdapter::set_setting`], in order, the channel
+    /// turned on last.
+    pub settings: Vec<(String, String)>,
 }
 
 /// A name a runtime gives one of its agents, as the runtime writes it.
