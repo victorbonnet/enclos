@@ -432,6 +432,27 @@ fn bound_in(args: &str, folder: &Path) -> Vec<PathBuf> {
     bound
 }
 
+/// The plan names the host the installer is downloaded on.
+#[test]
+fn a_dry_run_of_an_install_names_this_linux_machine() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let runtime = super::runtime::TestRuntime::new(stood.dir.path(), "#!/bin/sh\n");
+    let Planned::DryRun(plan) = stood
+        .engine
+        .install_runtime_with(&alice(), &stood.name, &runtime, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("installed");
+    };
+    let plan = plan.changes.join("\n");
+    assert!(
+        plan.contains(" on this Linux machine, as it is served now (ADR 0029)"),
+        "{plan}"
+    );
+    assert!(!plan.contains("this Mac"), "{plan}");
+}
+
 /// An import's copy of its archive is in the same hidden folder: its
 /// session is shown that one file, read-only, and not the folder.
 #[test]

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::Baseline;
 use crate::layout::Layout;
-use crate::model::sandbox::SandboxName;
+use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::secret::{SecretRef, SecretValue};
 use crate::probes::{
     ClosedBy, Closer, Expect, HostCheck, HostScript, Outcome, OwnProbes, OwnReading, Probe,
@@ -123,7 +123,7 @@ const LISTENING: &str = "Open by the policy: listening on TCP, on any port but e
 
 /// What a report says of Seatbelt's probes.
 pub const NOTES: ReportNotes = ReportNotes {
-    host: "this Mac",
+    host: BackendKind::Seatbelt.host(),
     folder_moves: "renames and clones",
     listening: LISTENING,
     only_apart: ", only by Seatbelt itself or the (deny default) baseline if any",
