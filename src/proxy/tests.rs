@@ -670,42 +670,55 @@ fn both_loopbacks_share_one_connection_limit() {
 /// One try of "a port taken on `squatted` is listened on by neither
 /// loopback": the squatter takes a port there, `listen` must fail on that
 /// address with `AddrInUse`, and must have left the same port free on `other`.
-/// `false` when another test, running at the same moment, took that port on
-/// the other family first: the system gives a port per family, so a port
-/// free on one is not held free on the other.
-fn port_taken_on_one_loopback(squatted: IpAddr, other: IpAddr) -> bool {
+/// `Err` says why the try does not count, when another test, running at the
+/// same moment, took the port on `other` first: `[::1]:P` and `127.0.0.1:P`
+/// are separate bindings, so a port free on one loopback address is not held
+/// free on the other.
+///
+/// `listen` succeeding is no race: the squatter holds the port at `squatted`,
+/// so it can never succeed.
+fn port_taken_on_one_loopback(squatted: IpAddr, other: IpAddr) -> Result<(), String> {
     let squatter = TcpListener::bind((squatted, 0)).unwrap();
     let port = squatter.local_addr().unwrap().port();
-    let e = match listen(port) {
-        Err(e) if e.addr == (squatted, port).into() => e,
-        // `listen` met someone else's listener first, or none was in the way
-        // at the address it tries first.
-        _ => return false,
-    };
-    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
-    TcpListener::bind((other, port)).is_ok()
+    match listen(port) {
+        Ok(_) => panic!("listen({port}) succeeded with {squatted}:{port} taken"),
+        Err(e) if e.addr == (squatted, port).into() => {
+            assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
+        }
+        Err(e) => return Err(format!("listen failed first at {}: {}", e.addr, e.source)),
+    }
+    TcpListener::bind((other, port))
+        .map(drop)
+        .map_err(|e| format!("{other}:{port} was not free afterwards: {e}"))
+}
+
+/// `port_taken_on_one_loopback`, tried again while it is rejected: a proxy
+/// that kept the listener on `other`, or took it, is rejected every time;
+/// only a test taking the same port at that moment passes on a later try.
+fn port_taken_on_one_loopback_in_some_try(squatted: IpAddr, other: IpAddr) {
+    const TRIES: usize = 10;
+    let mut last = String::new();
+    for _ in 0..TRIES {
+        match port_taken_on_one_loopback(squatted, other) {
+            Ok(()) => return,
+            Err(why) => last = why,
+        }
+    }
+    panic!(
+        "a port taken on {squatted} was not left free on {other} in {TRIES} tries; last: {last}"
+    );
 }
 
 #[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
-    // A proxy that kept the other loopback's listener, or took it, fails
-    // every try; only a test taking the same port at that moment passes the
-    // next one.
-    const TRIES: usize = 10;
     let (v6, v4) = (
         IpAddr::V6(Ipv6Addr::LOCALHOST),
         IpAddr::V4(Ipv4Addr::LOCALHOST),
     );
     // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
-    assert!(
-        (0..TRIES).any(|_| port_taken_on_one_loopback(v6, v4)),
-        "a port taken on [::1] was listened on at 127.0.0.1 in {TRIES} tries"
-    );
+    port_taken_on_one_loopback_in_some_try(v6, v4);
     // Taken on 127.0.0.1: the `[::1]` listener it already had is let go.
-    assert!(
-        (0..TRIES).any(|_| port_taken_on_one_loopback(v4, v6)),
-        "a port taken on 127.0.0.1 left [::1] held in {TRIES} tries"
-    );
+    port_taken_on_one_loopback_in_some_try(v4, v6);
 }
 
 #[test]
