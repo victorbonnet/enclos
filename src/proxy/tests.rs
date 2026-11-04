@@ -667,22 +667,45 @@ fn both_loopbacks_share_one_connection_limit() {
     assert!(reply.starts_with("HTTP/1.1 503"), "{reply}");
 }
 
+/// One try of "a port taken on `squatted` is listened on by neither
+/// loopback": the squatter takes a port there, `listen` must fail on that
+/// address with `AddrInUse`, and must have left the same port free on `other`.
+/// `false` when another test, running at the same moment, took that port on
+/// the other family first: the system gives a port per family, so a port
+/// free on one is not held free on the other.
+fn port_taken_on_one_loopback(squatted: IpAddr, other: IpAddr) -> bool {
+    let squatter = TcpListener::bind((squatted, 0)).unwrap();
+    let port = squatter.local_addr().unwrap().port();
+    let e = match listen(port) {
+        Err(e) if e.addr == (squatted, port).into() => e,
+        // `listen` met someone else's listener first, or none was in the way
+        // at the address it tries first.
+        _ => return false,
+    };
+    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
+    TcpListener::bind((other, port)).is_ok()
+}
+
 #[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
+    // A proxy that kept the other loopback's listener, or took it, fails
+    // every try; only a test taking the same port at that moment passes the
+    // next one.
+    const TRIES: usize = 10;
+    let (v6, v4) = (
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    );
     // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
-    let squatter = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-    let port = squatter.local_addr().unwrap().port();
-    let e = listen(port).unwrap_err();
-    assert_eq!(e.addr, (Ipv6Addr::LOCALHOST, port).into());
-    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
-    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+    assert!(
+        (0..TRIES).any(|_| port_taken_on_one_loopback(v6, v4)),
+        "a port taken on [::1] was listened on at 127.0.0.1 in {TRIES} tries"
+    );
     // Taken on 127.0.0.1: the `[::1]` listener it already had is let go.
-    let squatter = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = squatter.local_addr().unwrap().port();
-    let e = listen(port).unwrap_err();
-    assert_eq!(e.addr, (Ipv4Addr::LOCALHOST, port).into());
-    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
-    assert!(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok());
+    assert!(
+        (0..TRIES).any(|_| port_taken_on_one_loopback(v4, v6)),
+        "a port taken on 127.0.0.1 left [::1] held in {TRIES} tries"
+    );
 }
 
 #[test]
