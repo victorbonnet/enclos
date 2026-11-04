@@ -11,7 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::compile::{CompiledSandbox, OWN_TMPFS};
+use super::compile::{CompiledSandbox, OWN_MOUNTS, OWN_TMPFS};
 use crate::backend::{Launch, SandboxContext, WrapError, environment, under_limits};
 use crate::policy::paths::{is_within, real_path};
 
@@ -202,6 +202,42 @@ pub(super) fn read_host(
             in_grants.push(at);
         }
     }
+    // Where an entry leads through a link is masked too, wherever it is, as
+    // Seatbelt denies the resolved path (design §15): hiding the name alone
+    // leaves what it leads to in the broad read (`~/.ssh -> dotfiles/ssh`).
+    let real_home = real_path(&home);
+    let real_sandbox_home = real_path(sandbox_home);
+    let mut resolved_hidden = Vec::new();
+    let mut resolved_elsewhere = Vec::new();
+    for entry in &every_entry {
+        let real = real_path(entry);
+        // One a workspace holds is masked above, at its name for it.
+        if real == *entry || present.iter().any(|(_, w)| is_within(&real, w)) {
+            continue;
+        }
+        if is_within(&real_home, &real) {
+            return Err(WrapError(format!(
+                "deny entry {} leads to {}, which is the home {} or holds it, so it cannot be hidden: point the link elsewhere or take the entry off the deny list",
+                entry.display(),
+                real.display(),
+                home.display()
+            )));
+        } else if let Ok(rest) = real.strip_prefix(&real_sandbox_home) {
+            let at = sandbox_home.join(rest);
+            no_link_between(sandbox_home, &at)?;
+            in_grants.push(at);
+        } else if let Ok(rest) = real.strip_prefix(&real_home) {
+            resolved_hidden.push(home.join(rest));
+        } else if OWN_TMPFS
+            .iter()
+            .chain(OWN_MOUNTS)
+            .any(|own| is_within(&real, Path::new(own)))
+        {
+            // The sandbox has its own there, never the host's.
+        } else {
+            resolved_elsewhere.push(real);
+        }
+    }
     in_grants.sort();
     in_grants.dedup();
 
@@ -224,8 +260,14 @@ pub(super) fn read_host(
     }
     host.unmovable = unmovable;
 
-    let mut hidden: BTreeSet<PathBuf> = paths(&root_masks.denied).collect();
-    let mut elsewhere: Vec<PathBuf> = paths(&root_masks.denied_elsewhere).collect();
+    let mut hidden: BTreeSet<PathBuf> = paths(&root_masks.denied).chain(resolved_hidden).collect();
+    // An entry outside the home that is itself a link is masked where it
+    // leads alone: bubblewrap's mount would follow it there anyway, and the
+    // sandbox cannot change it.
+    let mut elsewhere: Vec<PathBuf> = paths(&root_masks.denied_elsewhere)
+        .filter(|e| !std::fs::symlink_metadata(e).is_ok_and(|m| m.file_type().is_symlink()))
+        .chain(resolved_elsewhere)
+        .collect();
     if let Some(socket) = ssh_auth_sock.filter(|s| s.is_absolute()) {
         let socket = socket.to_path_buf();
         let own = OWN_TMPFS.iter().any(|t| is_within(&socket, Path::new(t)));

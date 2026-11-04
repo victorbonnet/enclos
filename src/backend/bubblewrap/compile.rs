@@ -21,8 +21,8 @@ use crate::backend::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::policy::paths::{PathContext, is_within};
-pub(super) use place::OWN_TMPFS;
 use place::{Around, BoundBack, check_workspace, place_deny_entries, unmovable};
+pub(super) use place::{OWN_MOUNTS, OWN_TMPFS};
 
 /// Programs may run from these where Landlock applies, and from the
 /// sandbox's home, where the runtime installs itself. A workspace may not,

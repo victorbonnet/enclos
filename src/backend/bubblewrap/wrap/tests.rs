@@ -14,9 +14,19 @@ struct Home {
 
 impl Home {
     fn new() -> Home {
-        let home = Home {
-            dir: tempfile::tempdir().unwrap(),
-        };
+        Home::in_folder(tempfile::tempdir().unwrap())
+    }
+
+    /// One outside `/tmp`, which the sandbox has its own of: what lies
+    /// beside the home there is the host's, as in a real home.
+    fn outside_tmp() -> Home {
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        Home::in_folder(tempfile::tempdir_in(target).unwrap())
+    }
+
+    fn in_folder(dir: tempfile::TempDir) -> Home {
+        let home = Home { dir };
         std::fs::create_dir_all(home.sandbox_home()).unwrap();
         home
     }
@@ -308,6 +318,101 @@ fn a_workspace_through_a_link_has_the_entry_it_reaches_masked_at_its_own_name() 
     // The real folder is the workspace's: its bind replaces it, so it is
     // not listed for the home's mask.
     assert!(!host.entries.contains_key(&home.at(".cargo")), "{host:?}");
+}
+
+/// `~/.ssh -> dotfiles/ssh`, as GNU stow sets a home up: the entry as
+/// written and the folder it leads to are both out of sight, as Seatbelt
+/// denies the resolved path (design §15), and so is the folder when a
+/// workspace holds it.
+#[test]
+fn a_deny_entry_that_is_a_link_has_the_folder_it_leads_to_masked_too() {
+    let home = Home::new();
+    home.file("dotfiles/ssh/id_ed25519");
+    home.file("dotfiles/vimrc");
+    symlink("dotfiles/ssh", home.at(".ssh")).unwrap();
+    let ssh = text(&home.at(".ssh"));
+    let target = text(&home.at("dotfiles/ssh"));
+    let key = text(&home.at("dotfiles/ssh/id_ed25519"));
+
+    // Given the home's broad read.
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".ssh")],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host, &[]));
+    assert!(!args.contains(&ssh), "{args:?}");
+    position(&args, &["--tmpfs", &text(&home.at("dotfiles"))]);
+    let kept = text(&home.at("dotfiles/vimrc"));
+    position(&args, &["--ro-bind-try", &kept, &kept]);
+    for hidden in [&target, &key] {
+        assert!(!args.contains(hidden), "{hidden}: {args:?}");
+    }
+
+    // Given a workspace that holds the folder.
+    let dotfiles = home.at("dotfiles");
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".ssh")],
+            workspaces: vec![dotfiles.clone()],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host, &[]));
+    assert!(!args.contains(&ssh), "{args:?}");
+    let bound = position(&args, &["--bind-try", &text(&dotfiles)]);
+    assert!(position(&args, &["--tmpfs", &target]) > bound, "{args:?}");
+}
+
+/// `~/.config -> ../data` with the deny entry `~/.config/google-chrome`:
+/// the link is made again in the home's mask, so the folder it reaches,
+/// outside the home, is masked where it is.
+#[test]
+fn a_deny_entry_reached_through_a_linked_folder_is_masked_where_it_leads() {
+    let home = Home::outside_tmp();
+    let data = home.dir.path().join("data");
+    std::fs::create_dir_all(data.join("google-chrome/Default")).unwrap();
+    std::fs::write(data.join("google-chrome/Default/Cookies"), "x").unwrap();
+    symlink("../data", home.at(".config")).unwrap();
+    let entry = home.at(".config/google-chrome");
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![entry.clone()],
+            ..Lists::default()
+        },
+    );
+    let host = read(&home, &c, None).unwrap();
+    let args = strings(&arguments(&c, &host, &[]));
+    let config = text(&home.at(".config"));
+    position(&args, &["--symlink", "../data", &config]);
+    let resolved = text(&real_path(&data.join("google-chrome")));
+    let rest = position(&args, &["--bind", &text(&home.sandbox_home())]);
+    assert!(position(&args, &["--tmpfs", &resolved]) < rest, "{args:?}");
+    position(&args, &["--remount-ro", &resolved]);
+    assert!(!args.contains(&text(&entry)), "{args:?}");
+}
+
+/// A link that leads to the home, or above it, cannot be masked where it
+/// leads without hiding the home.
+#[test]
+fn a_deny_entry_that_leads_to_the_home_refuses_the_session() {
+    let home = Home::new();
+    symlink(".", home.at(".ssh")).unwrap();
+    let c = compiled(
+        &home,
+        Lists {
+            denied: vec![home.at(".ssh")],
+            ..Lists::default()
+        },
+    );
+    let why = read(&home, &c, None).unwrap_err().to_string();
+    assert!(why.contains("is the home"), "{why}");
 }
 
 #[test]
