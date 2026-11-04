@@ -67,7 +67,7 @@ impl Engine {
                 .unwrap_or_default();
             for (agent, grants) in &policy.snapshot.policy.agent_secrets {
                 if grants.contains_key(variable) {
-                    agents.push((name.clone(), agent.clone(), runtime.clone()));
+                    agents.push((name.clone(), agent.as_str().to_owned(), runtime.clone()));
                 }
             }
         }
