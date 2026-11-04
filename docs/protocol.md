@@ -64,10 +64,12 @@ enclos://pair?v=1&host=<host name>&url=https://<host>.<tailnet>.ts.net&key=<brid
 - `key`: the bridge's static X25519 public key, base64url, which the app pins.
 - `code`: 128 random bits, base64url, single use, valid until `exp` (5 minutes).
 
-The app makes its **device key**, a P-256 key in the phone's hardware (Android Keystore, StrongBox where the phone has it; Secure Enclave on iOS, which holds only P-256), and its own static X25519 key, kept encrypted under a hardware key. It runs the Noise handshake below as a device the bridge does not know yet, then sends:
+The app makes its **device key**, a P-256 key in the phone's hardware (Android Keystore, StrongBox where the phone has it; Secure Enclave on iOS, which holds only P-256), and its own static X25519 key, kept encrypted under a hardware key. It runs the Noise handshake below as a device the bridge does not know yet, then sends, instead of `auth`:
 
 | `type` | From | Fields |
 | --- | --- | --- |
+| `auth` | device | `device`, `sig` (base64url DER signature of the handshake hash) |
+| `authenticated` | bridge | `person` |
 | `pair.request` | device | `name` (the device's model), `device_key` (P-256 public key, SEC1, base64url), `proof` (HMAC-SHA256 of the handshake hash, keyed with `code`), `push` (`{"kind":"fcm","token":…}`)? |
 | `pair.accepted` | bridge | `device` (its id on this host), `push_key` (32 bytes, base64url) |
 | `pair.refused` | bridge | `reason`: `expired`, `used`, `bad_proof`, `declined` |
@@ -76,10 +78,10 @@ The bridge checks `proof`, then shows at the terminal the device's name, its tai
 
 ### Handshake
 
-`Noise_IK_25519_ChaChaPoly_SHA256`, the device as initiator, the bridge's static key known from pairing. The device's first handshake payload is the JSON `{"device":…,"sig":…}`: its id (empty while pairing) and an ECDSA P-256 signature, by the device key, of the handshake hash so far. The bridge then:
+`Noise_IK_25519_ChaChaPoly_SHA256`, the device as initiator, the bridge's static key known from pairing; the handshake messages carry no payload. The device's first message once it is done is `auth` (or `pair.request` while pairing): its id on this host and an ECDSA P-256 signature, by the device key, DER as the phone's keystore gives it, of the **handshake hash**, which binds it to this session's ephemeral keys. The bridge then:
 
 1. knows the device by its static key, or refuses it (unless pairing);
-2. checks `sig` with the device key it stored;
+2. checks `sig` with the device key it stored, and answers `authenticated` with the person the device speaks for;
 3. asks Tailscale who is calling, and refuses a person or a node other than the device's own;
 4. writes each refusal, with its reason, in the bridge's log (`enclos app log`).
 
