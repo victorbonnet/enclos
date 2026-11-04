@@ -45,8 +45,9 @@ enum RuntimeVerb {
         #[arg(long = "set", value_name = "KEY=VALUE")]
         set: Vec<Setting>,
         /// A bot on this messaging channel, its token a secret the policy
-        /// grants the agent.
-        #[arg(long, requires = "allow_user")]
+        /// grants the agent; or `app`, the enclos mobile app's channel,
+        /// which enclos's bridge connects to.
+        #[arg(long)]
         channel: Option<Channel>,
         /// With --channel: the variable the policy grants the bot's token
         /// as; the channel's usual one (TELEGRAM_BOT_TOKEN) when left out.
@@ -195,6 +196,7 @@ fn configure(
                 "answers": bot.answers.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "reachable": bot.reachable,
                 "host": bot.channel.host(),
+                "socket": bot.socket.as_ref().map(|s| s.display().to_string()),
             })),
         }));
         return Ok(exit::OK);
@@ -205,7 +207,16 @@ fn configure(
     if !done.settings.is_empty() {
         println!("Set: {}.", done.settings.join(", "));
     }
-    if let Some(bot) = &done.channel {
+    if let Some(bot) = done.channel.as_ref().filter(|b| b.channel == Channel::App) {
+        println!(
+            "Its app channel is set up: it listens at {}, for enclos's bridge, which presents ${}.",
+            bot.socket
+                .as_ref()
+                .map(|s| s.display().to_string())
+                .unwrap_or_default(),
+            bot.token
+        );
+    } else if let Some(bot) = &done.channel {
         println!(
             "Its {} bot is set up: its token is read from ${}, and it answers {} user(s).",
             bot.channel.display_name(),
@@ -215,7 +226,7 @@ fn configure(
         if !bot.reachable {
             println!(
                 "Its policy does not let it reach {host}: `enclos policy allow {sandbox} {host}`.",
-                host = bot.channel.host(),
+                host = bot.channel.host().unwrap_or_default(),
             );
         }
     }
