@@ -99,6 +99,26 @@ _Avoid_: platform, integration
 The account on a channel through which the sandbox's runtime answers people, such as a Telegram bot.
 _Avoid_: agent (an agent is the runtime's identity, not the account)
 
+**Bridge**:
+The service of an install that the mobile app reaches over the user's tailnet, and that talks to each agent's channel plugin inside its sandbox.
+_Avoid_: daemon, server, gateway (the runtime's word), relay (the proxy's)
+
+**Paired device**:
+A phone or other device that a bridge accepts, because the host's user paired it there and it holds the key it was paired with.
+_Avoid_: client, session (a sandbox's word)
+
+**Person**:
+Someone the bridge knows by their tailnet login, who talks to agents from their paired devices. The host's user is one.
+_Avoid_: user (for anyone but the host's user), member (a process's word), tenant, guest
+
+**Share**:
+What lets a person other than the host's user see and talk to a sandbox or one agent of it through the bridge, with the abilities it names. It isolates nothing.
+_Avoid_: grant (a secret's or policy's word), permission
+
+**Conversation**:
+One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
+_Avoid_: session (a sandbox's word), chat, thread
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
