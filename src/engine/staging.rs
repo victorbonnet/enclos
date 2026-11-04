@@ -72,7 +72,7 @@ impl Engine {
     ) -> Result<(SandboxCommand, String)> {
         let dir = self.layout.sandbox_installers(name.as_str());
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-        let files = runtime.home_files();
+        let files = runtime.home_files(self.recorded_backend(name)?);
         let staged = stage_files(&dir, &files, runtime.kind())?;
         let (installer, sha256) = download_installer(self.downloader.as_ref(), &dir, runtime)?;
         let mut script = home_files_script(&staged);

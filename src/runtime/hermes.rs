@@ -19,6 +19,7 @@ use super::{
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::BackendKind;
 
 pub struct Hermes;
 
@@ -110,7 +111,12 @@ impl RuntimeAdapter for Hermes {
         }
     }
 
-    fn home_files(&self) -> Vec<HomeFile> {
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        // The shim makes up for macOS's `mktemp`; on a Linux sandbox's PATH
+        // it would only stand in front of a `mktemp` that needs no help.
+        if !backend.mktemp_ignores_tmpdir() {
+            return Vec::new();
+        }
         vec![HomeFile {
             path: "bin/mktemp",
             contents: include_str!("hermes/mktemp"),
@@ -890,12 +896,32 @@ mod tests {
                 "main"
             ]))
         );
-        assert!(
-            Hermes
-                .home_files()
-                .iter()
-                .all(HomeFile::path_is_inside_home)
-        );
+        for backend in BackendKind::ALL {
+            assert!(
+                Hermes
+                    .home_files(backend)
+                    .iter()
+                    .all(HomeFile::path_is_inside_home)
+            );
+        }
+    }
+
+    /// The `mktemp` shim makes up for macOS's own, which ignores `TMPDIR`:
+    /// a Seatbelt sandbox gets it, a Linux sandbox, whose GNU `mktemp`
+    /// follows `TMPDIR`, does not.
+    #[test]
+    fn the_mktemp_shim_goes_only_where_mktemp_ignores_tmpdir() {
+        let paths =
+            |backend| -> Vec<&str> { Hermes.home_files(backend).iter().map(|f| f.path).collect() };
+        assert_eq!(paths(BackendKind::Seatbelt), ["bin/mktemp"]);
+        assert!(paths(BackendKind::Bubblewrap).is_empty());
+        for backend in BackendKind::ALL {
+            assert_eq!(
+                paths(backend).contains(&"bin/mktemp"),
+                backend.mktemp_ignores_tmpdir(),
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

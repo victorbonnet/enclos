@@ -354,10 +354,11 @@ fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
 }
 
 /// The bubblewrap sandbox does not see enclos's data folder, where an
-/// install stages its files, beside the home: `wrap` binds back what the
+/// install stages its installer, beside the home: `wrap` binds back what the
 /// install reads, each file alone and read-only, so the installer that runs
 /// is the file whose SHA-256 was recorded. An ordinary session is shown none
-/// of it.
+/// of it. A Linux sandbox's `mktemp` follows `TMPDIR`, so no shim for it is
+/// staged or put on its PATH.
 #[test]
 fn an_install_session_is_shown_its_staged_files_read_only_and_no_other_session_is() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,9 +378,10 @@ fn an_install_session_is_shown_its_staged_files_read_only_and_no_other_session_i
     assert!(end.installed, "{end:?}\n{args}");
     let installers = stood.engine.layout.sandbox_installers("lab");
     let installer = installers.join(format!("hermes-install-{}.sh", runtime.sha256));
-    let staged = [installers.join("home-0"), installer];
+    let staged = [installer];
+    assert!(!installers.join("home-0").exists());
     let home = stood.engine.sandbox_home(&stood.name);
-    assert!(home.join("bin/mktemp").is_file());
+    assert!(!home.join("bin/mktemp").exists());
     assert_eq!(
         std::fs::read_to_string(home.join("installed")).unwrap(),
         "installed --non-interactive\n"
