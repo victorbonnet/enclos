@@ -232,6 +232,9 @@ fn binary(socket: &mut WebSocket<TcpStream>) -> Result<Vec<u8>, String> {
     }
 }
 
+// The handshake callback's error is tungstenite's `ErrorResponse`, a whole
+// HTTP response: its size is set by the `Callback` trait, not by us.
+#[allow(clippy::result_large_err)]
 fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     let store = hub.store()?;
     let mut login: Option<String> = None;
