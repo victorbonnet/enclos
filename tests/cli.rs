@@ -4526,6 +4526,11 @@ fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
 /// Programs run, and TLS goes through, on either baseline: a page the
 /// policy allows answers 200 over HTTP and HTTPS through the proxy. Needs
 /// the network, as CI has.
+///
+/// The last request gives curl a CA bundle with one root no server chains
+/// to, so it always checks the chain against the system's roots, as
+/// `/usr/bin/curl` does whenever its own bundle lacks the root: whether it
+/// does for a given site depends on the site's chain and the host's bundle.
 #[cfg(target_os = "macos")]
 #[test]
 fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
@@ -4537,16 +4542,29 @@ fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
     let _stop = StopOnDrop(&home, "home");
     home.run(&["policy", "allow", "home", "example.com", "--yes"])
         .ok();
-    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' http://example.com/ && /usr/bin/curl -sS -o /dev/null -w '%{http_code}' https://example.com/";
+    let unrelated_root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/unrelated-root.pem"
+    );
+    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' http://example.com/ && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' https://example.com/ && /usr/bin/curl --cacert \"$1\" -sS -o /dev/null -w '%{http_code}' https://example.com/";
     for baseline in ["allow-default", "deny-default"] {
         let out = Run(home
-            .command(&["exec", "home", "--", "/bin/sh", "-c", script])
+            .command(&[
+                "exec",
+                "home",
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "sh",
+                unrelated_root,
+            ])
             .env("ENCLOS_SEATBELT_BASELINE", baseline)
             .output()
             .unwrap());
         assert_eq!(
             out.stdout(),
-            "hi\n2\n200 200",
+            "hi\n2\n200 200 200",
             "{baseline}: stderr: {}",
             out.stderr()
         );

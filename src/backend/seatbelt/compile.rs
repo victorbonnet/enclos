@@ -738,7 +738,8 @@ mod tests {
                 "(global-name \"com.apple.logd\")",
                 "(global-name \"com.apple.bsd.dirhelper\")",
                 "(global-name \"com.apple.SystemConfiguration.configd\")",
-                "(global-name \"com.apple.trustd.agent\"))",
+                "(global-name \"com.apple.trustd.agent\")",
+                "(global-name \"com.apple.TrustEvaluationAgent\"))",
                 "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
             ]
         );
@@ -770,7 +771,7 @@ mod tests {
         );
         let allowed = global_names(DENY_DEFAULT);
         let denied = global_names(HOST_SERVICES);
-        assert_eq!(allowed.len(), 6);
+        assert_eq!(allowed.len(), 7);
         // The probes count what a refused lookup makes `open` and
         // `osascript` say as closed on this baseline: none of the services
         // they are known or thought to look up may be allowed (traced for
@@ -1003,7 +1004,7 @@ mod tests {
         "(allow process-info* (target same-sandbox))",
         "(allow file-ioctl)",
         "(allow pseudo-tty)",
-        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.logd\") (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.trustd.agent\"))",
+        "(allow mach-lookup (global-name \"com.apple.system.opendirectoryd.membership\") (global-name \"com.apple.system.opendirectoryd.libinfo\") (global-name \"com.apple.logd\") (global-name \"com.apple.bsd.dirhelper\") (global-name \"com.apple.SystemConfiguration.configd\") (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.TrustEvaluationAgent\"))",
         "(allow ipc-posix-shm-read-data (ipc-posix-name \"apple.shm.notification_center\"))",
         "(allow file-write* (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home/home\") (subpath \"/nonexistent-enclos-test/alice/work\") (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\") (literal \"/dev/urandom\") (literal \"/dev/tty\") (literal \"/dev/ptmx\") (literal \"/dev/dtracehelper\") (regex #\"^/dev/fd/[0-9]+$\"))",
         "(allow file-read* file-write* (require-all (regex #\"^/dev/ttys[0-9]+$\") (extension \"com.apple.sandbox.pty\")))",
