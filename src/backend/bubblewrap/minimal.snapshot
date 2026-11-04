@@ -180,6 +180,7 @@
       "in_workspace": [],
       "workspaces": []
     },
+    "sealed": [],
     "options": [
       "--unshare-user",
       "--disable-userns",

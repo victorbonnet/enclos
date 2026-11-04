@@ -17,7 +17,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -99,8 +99,13 @@ impl From<CommandKind> for SessionKind {
 pub(super) enum Starting<'a> {
     /// A command run from the CLI: it starts the sandbox's proxy if need be,
     /// reaches the runtime's service, and gets the sandbox's secrets as
-    /// variables.
-    Command { kind: CommandKind, group: Group },
+    /// variables. It reads the files of the sandbox's `installers/` folder
+    /// in `reads`, which enclos staged for it.
+    Command {
+        kind: CommandKind,
+        group: Group,
+        reads: &'a [PathBuf],
+    },
     /// A service of the sandbox's runtime, for the service manager. Its
     /// proxy already runs, and its secrets are as `service_secrets` says.
     Service { service: &'a str },
@@ -112,6 +117,14 @@ impl Starting<'_> {
     /// one.
     fn in_terminal(self) -> bool {
         matches!(self, Starting::Command { .. })
+    }
+
+    /// The staged files the program reads.
+    fn reads(self) -> Vec<PathBuf> {
+        match self {
+            Starting::Command { reads, .. } => reads.to_vec(),
+            Starting::Service { .. } => Vec::new(),
+        }
     }
 
     fn group(self) -> Group {
@@ -269,6 +282,7 @@ impl Engine {
             in_terminal: starting.in_terminal(),
             service_port,
             limits: self.launch_limits(&record, &snapshot.policy)?,
+            reads: starting.reads(),
         };
         let wrapped = self
             .backend_of(name)?
@@ -342,6 +356,7 @@ mod tests {
     const COMMAND: Starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Caller,
+        reads: &[],
     };
     const SERVICE: Starting = Starting::Service { service: "gateway" };
 
@@ -448,6 +463,7 @@ mod tests {
         let interactive = Starting::Command {
             kind: CommandKind::Interactive,
             group: Group::Own,
+            reads: &[],
         };
         assert_eq!(interactive.recorded_as(), (SessionKind::Interactive, None));
         assert_eq!(

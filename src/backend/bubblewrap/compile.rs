@@ -49,8 +49,9 @@ pub struct CompiledSandbox {
     pub unenforced: Vec<Unenforced>,
 }
 
-/// bubblewrap's arguments. `wrap` joins them in field order, then seals each
-/// folder it made with `--remount-ro`: a mask comes after the bind of the
+/// bubblewrap's arguments. `wrap` joins them in field order, with the staged
+/// files a launch reads after `mounts`, then seals each folder it made and
+/// each of `sealed` with `--remount-ro`: a mask comes after the bind of the
 /// folder that holds it, and before anything is sealed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bubblewrap {
@@ -64,6 +65,10 @@ pub struct Bubblewrap {
     /// Masks inside what `mounts` binds writable, which a mask made before
     /// that bind would not survive.
     pub grant_masks: GrantMasks,
+    /// The protected folders outside the user's home, each a tmpfs of its
+    /// own in `mounts`: `wrap` seals them read-only once what it binds
+    /// under them is there.
+    pub sealed: Vec<String>,
     /// The namespaces, `--die-with-parent` and `--chdir`, whose place among
     /// the arguments does not matter. No `--clearenv`: `wrap` empties
     /// bubblewrap's own environment and sets the session's there, so no
@@ -189,6 +194,9 @@ fn compiled_sandbox(
                 in_workspace: texts(&placed.in_workspace)?,
                 workspaces: texts(&workspaces)?,
             },
+            // Writable while bubblewrap makes mount points in them; nothing
+            // may write there afterwards.
+            sealed: texts(&elsewhere)?,
             options: options(&home)?,
         },
         landlock: landlock_rules(&home, &workspaces)?,
@@ -262,11 +270,6 @@ fn mounts(
     mounts.extend(strings(&["--ro-bind", &visible, &visible]));
     mounts.extend(strings(&["--ro-bind", &compiled, &compiled]));
     mounts.extend(strings(&["--ro-bind-try", &secrets, &secrets]));
-    // Writable while bubblewrap made mount points in it; nothing may write
-    // there afterwards.
-    for root in elsewhere {
-        mounts.extend(["--remount-ro".to_owned(), text(root)?]);
-    }
     Ok(mounts)
 }
 

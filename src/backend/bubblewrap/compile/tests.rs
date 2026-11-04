@@ -122,7 +122,7 @@ fn every_protected_root_is_hidden_before_the_first_bind() {
             let at = args.iter().position(|a| a == root).unwrap();
             assert_eq!(args[at - 1], "--tmpfs", "{root}");
             assert!(at < first_bind, "{root}: {args:?}");
-            assert!(after(args, "--remount-ro").contains(&root), "{root}");
+            assert!(c.bubblewrap.sealed.contains(&root.to_owned()), "{root}");
         }
     }
 }
@@ -163,6 +163,7 @@ fn bubblewraps_arguments_are_held_in_the_order_wrap_joins_them() {
         "root_masks",
         "mounts",
         "grant_masks",
+        "sealed",
         "options",
         "landlock",
     ]
@@ -261,13 +262,9 @@ fn protected_folders_outside_the_home_are_hidden_and_sealed() {
         ]
     );
     assert!(after(args, "--tmpfs").contains(&"/srv/enclos"));
-    assert_eq!(after(args, "--remount-ro"), ["/srv/enclos"]);
-    let last_mount = args
-        .iter()
-        .rposition(|a| a.starts_with("--ro-bind") || a == "--bind")
-        .unwrap();
-    let sealed = args.iter().position(|a| a == "--remount-ro").unwrap();
-    assert!(last_mount < sealed);
+    assert_eq!(c.bubblewrap.sealed, ["/srv/enclos"]);
+    // `wrap` seals it last, after every bind of its own under it.
+    assert!(after(args, "--remount-ro").is_empty(), "{args:?}");
 }
 
 /// `--ro-bind / /` shows the real folder, so a mask on the spelled path
@@ -293,7 +290,11 @@ fn a_protected_root_behind_a_link_is_hidden_at_its_real_path_too() {
             .contains(&format!("{}/e", user.display()))
     );
     assert!(after(args, "--tmpfs").contains(&real), "{args:?}");
-    assert!(after(args, "--remount-ro").contains(&real), "{args:?}");
+    assert!(
+        c.bubblewrap.sealed.contains(&real.to_owned()),
+        "{:?}",
+        c.bubblewrap.sealed
+    );
     let hidden = args.iter().position(|a| a == real).unwrap();
     let bound = args.iter().position(|a| a == "--bind").unwrap();
     assert!(hidden < bound, "{args:?}");

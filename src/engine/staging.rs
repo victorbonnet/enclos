@@ -62,19 +62,23 @@ impl Engine {
     /// Stages what an install needs in the sandbox's `installers/` folder,
     /// beside its home. Returns the command that installs: it copies the
     /// adapter's files into the home from inside the sandbox, under its
-    /// policy, then runs the installer, with the installer's SHA-256.
+    /// policy, then runs the installer, with the installer's SHA-256. The
+    /// command reads those files and the installer, and nothing else
+    /// staged.
     pub(super) fn stage_install(
         &self,
         name: &SandboxName,
         runtime: &dyn RuntimeAdapter,
     ) -> Result<(SandboxCommand, String)> {
-        let dir = self.layout.sandbox_dir(name.as_str()).join("installers");
+        let dir = self.layout.sandbox_installers(name.as_str());
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
         let files = runtime.home_files();
         let staged = stage_files(&dir, &files, runtime.kind())?;
         let (installer, sha256) = download_installer(self.downloader.as_ref(), &dir, runtime)?;
         let mut script = home_files_script(&staged);
         script.push_str("exec /bin/bash \"$0\" \"$@\"\n");
+        let mut reads: Vec<PathBuf> = staged.into_iter().map(|(path, _)| path).collect();
+        reads.push(installer.clone());
         let mut words: Vec<OsString> = vec![
             "/bin/sh".into(),
             "-c".into(),
@@ -82,7 +86,7 @@ impl Engine {
             installer.into_os_string(),
         ];
         words.extend(runtime.installer().args.iter().map(Into::into));
-        Ok((SandboxCommand::new(words), sha256))
+        Ok((SandboxCommand::new(words).reading(reads), sha256))
     }
 }
 

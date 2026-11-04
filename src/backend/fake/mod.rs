@@ -193,6 +193,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let envs = |command: &Command| -> HashMap<OsString, Option<OsString>> {
             command

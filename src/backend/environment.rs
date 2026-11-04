@@ -286,6 +286,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let mut command = Command::new("/bin/true");
         apply(&mut command, &ctx(), &launch);

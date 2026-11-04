@@ -99,13 +99,13 @@ fn agents_need_a_runtime_first() {
 /// Hermes's adapter with an installer of the test's own: `url` is a
 /// `file://` URL to it and `sha256` its hash, which the audit entry should
 /// name.
-struct TestRuntime {
+pub(super) struct TestRuntime {
     url: String,
-    sha256: String,
+    pub(super) sha256: String,
 }
 
 impl TestRuntime {
-    fn new(dir: &Path, script: &str) -> TestRuntime {
+    pub(super) fn new(dir: &Path, script: &str) -> TestRuntime {
         let installer = dir.join("install.sh");
         std::fs::write(&installer, script).unwrap();
         let digest = <sha2::Sha256 as sha2::Digest>::digest(script.as_bytes());
@@ -158,7 +158,7 @@ impl RuntimeAdapter for TestRuntime {
 
 /// An installer that puts a `hermes` stub on the sandbox's PATH, which
 /// records its calls in the home and fails while `hermes-fails` exists.
-const INSTALLS: &str = "#!/bin/sh
+pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
@@ -3190,6 +3190,7 @@ fn a_session_starts_in_the_group_it_records_as_what_it_was_started_for() {
     let command = |group| Starting::Command {
         kind: CommandKind::Interactive,
         group,
+        reads: &[],
     };
     let sleep = ["/bin/sleep".into(), "30".into()];
     for (starting, kind, service, ours, recorded_ours) in [
@@ -3288,6 +3289,7 @@ fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
         Starting::Command {
             kind: CommandKind::Interactive,
             group: Group::Own,
+            reads: &[],
         },
         Starting::Service { service: "gateway" },
     ] {
@@ -3385,6 +3387,7 @@ fn a_program_that_cannot_start_is_named_and_leaves_no_marker() {
             Starting::Command {
                 kind: CommandKind::Interactive,
                 group: Group::Own,
+                reads: &[],
             },
             format!("could not start /nonexistent/program in {}:", lab.name),
         ),

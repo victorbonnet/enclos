@@ -187,6 +187,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, None);
         let names: Vec<_> = command
@@ -215,6 +216,7 @@ mod tests {
             in_terminal: false,
             service_port: Some(61374),
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let args = |launch: &Launch| -> Vec<String> {
             wrap_in(Path::new("/x.sb"), &ctx(), launch, None)
@@ -245,6 +247,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let terminal = Path::new("/dev/ttys004");
         let command = wrap_in(Path::new("/x.sb"), &ctx(), &launch, Some(terminal));
@@ -299,6 +302,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let command = wrap(Path::new("/x.sb"), &ctx(), &launch);
         let args: Vec<_> = command

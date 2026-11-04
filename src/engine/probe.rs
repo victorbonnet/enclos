@@ -249,6 +249,7 @@ impl Engine {
                         in_terminal: false,
                         service_port: None,
                         limits: limits.clone(),
+                        reads: Vec::new(),
                     };
                     backend
                         .wrap(&compiled, &ctx, &launch)
