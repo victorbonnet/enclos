@@ -33,7 +33,7 @@ impl RuntimeAdapter for Bare {
             args: Vec::new(),
         }
     }
-    fn home_files(&self) -> Vec<HomeFile> {
+    fn home_files(&self, _: crate::model::sandbox::BackendKind) -> Vec<HomeFile> {
         Vec::new()
     }
     fn login(&self) -> String {
