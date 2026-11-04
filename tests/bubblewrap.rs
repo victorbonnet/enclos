@@ -384,3 +384,109 @@ fn on_a_runner_doctor_reports_the_backend() {
     println!("{said}");
     assert!(said.contains("bubblewrap: runs here"), "{out:?}");
 }
+
+/// The session of an install or an import reads what enclos staged in the
+/// sandbox's `installers/` folder, which the sandbox does not otherwise see
+/// (design §5, "Staged files"). Staged here as the engine stages it, a file
+/// the host writes in that folder, and launched through the backend's
+/// `wrap` with the file named, as the engine launches an install: the
+/// session reads it, cannot write, replace or remove it, and does not see
+/// the file beside it. The control: an ordinary session is shown neither.
+#[test]
+fn on_a_runner_a_staged_file_is_read_only_and_alone_in_its_session() {
+    use enclos::backend::bubblewrap::{BWRAP, Bubblewrap, CompiledSandbox};
+    use enclos::backend::{Backend, Launch, SandboxContext};
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    // Starts the sandbox's proxy, which the session's relay reaches, and
+    // writes the compiled file.
+    let out = lab.connect("true");
+    assert!(out.status.success(), "{out:?}");
+    let sandbox = lab.root.path().join("sandboxes/lab");
+    let installers = sandbox.join("installers");
+    std::fs::create_dir_all(&installers).unwrap();
+    let staged = installers.join("home-0");
+    let beside = installers.join("agent-other.1.tar.gz");
+    std::fs::write(&staged, "staged by the host\n").unwrap();
+    std::fs::write(&beside, "another import\n").unwrap();
+    let compiled: Vec<PathBuf> = std::fs::read_dir(sandbox.join("compiled"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    let [compiled] = compiled.as_slice() else {
+        panic!("one compiled file: {compiled:?}");
+    };
+    let parsed: CompiledSandbox =
+        serde_json::from_str(&std::fs::read_to_string(compiled).unwrap()).unwrap();
+    let layout = enclos::layout::Layout::at(lab.root.path());
+    let ctx = SandboxContext::new(&layout, &"lab".parse().unwrap(), parsed.relay.port);
+    let backend = Bubblewrap::at(
+        std::path::Path::new(BWRAP),
+        std::path::Path::new(enclos::lifecycle::cgroup::SYSTEMD_RUN),
+        Some(PathBuf::from(env!("CARGO_BIN_EXE_enclos"))),
+    );
+    let script = "cat \"$1\" && echo READ
+echo changed >> \"$1\" 2>/dev/null && echo WROTE
+echo new > \"$1.new\" 2>/dev/null && echo MADE
+mv \"$1\" \"$1.moved\" 2>/dev/null && echo MOVED
+rm -f \"$1\" 2>/dev/null; [ -e \"$1\" ] || echo REMOVED
+cat \"$2\" 2>/dev/null && echo BESIDE
+ls \"$(dirname \"$1\")\" 2>/dev/null";
+    let session = |reads: Vec<PathBuf>| {
+        let launch = Launch {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                staged.clone().into(),
+                beside.clone().into(),
+            ],
+            env: Vec::new(),
+            in_terminal: false,
+            service_port: None,
+            limits: Default::default(),
+            reads,
+        };
+        let out = backend
+            .wrap(compiled, &ctx, &launch)
+            .unwrap()
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (text(&out.stdout), out)
+    };
+
+    let (said, out) = session(vec![staged.clone()]);
+    for line in ["staged by the host", "READ"] {
+        assert!(said.contains(line), "{line}: {out:?}");
+    }
+    // `agent-other`: the folder's listing names the staged file alone.
+    for line in [
+        "WROTE",
+        "MADE",
+        "MOVED",
+        "REMOVED",
+        "BESIDE",
+        "another import",
+        "agent-other",
+    ] {
+        assert!(!said.contains(line), "{line}: {out:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&staged).unwrap(),
+        "staged by the host\n"
+    );
+    assert!(!installers.join("home-0.new").exists());
+
+    // The control: the host's own files, which an ordinary session does
+    // not see at all.
+    let (said, out) = session(Vec::new());
+    for line in ["staged by the host", "READ", "BESIDE", "another import"] {
+        assert!(!said.contains(line), "{line}: {out:?}");
+    }
+    std::fs::write(&staged, "the host writes it\n").unwrap();
+}
