@@ -1,6 +1,6 @@
 # The mobile app protocol
 
-Status: **proposed, version 1 draft**, with [ADR 0041](adr/0041-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0042](adr/0042-sharing-an-agent-is-not-hosting-it.md). Nothing here is implemented yet, and no part of it is tested. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
+Status: **proposed, version 1 draft**, with [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md). Nothing here is implemented yet, and no part of it is tested. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
 
 The protocol has two legs, one message format:
 
@@ -31,7 +31,7 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 
 - **An agent** is `<sandbox>/<agent>` on one host, as enclos names it. The app adds the host it reached.
 - **A conversation** is a UUID the app makes. The plugin gives it to the runtime as the chat's id, so a new conversation is a new chat for the runtime, and a cron job created in it remembers it as its origin.
-- **A person** is a tailnet login, as Tailscale's WhoIs gives it (`alice@example.com`). In version 1 the only person is the host's user; the field is there from the start so sharing (ADR 0042) changes no stored history.
+- **A person** is a tailnet login, as Tailscale's WhoIs gives it (`alice@example.com`). In version 1 the only person is the host's user; the field is there from the start so sharing (ADR 0043) changes no stored history.
 
 ## The plugin leg
 
