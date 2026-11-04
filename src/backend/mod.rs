@@ -307,6 +307,12 @@ pub trait Backend {
         ctx: &SandboxContext,
         launch: &Launch,
     ) -> Result<Command, WrapError>;
+    /// What each session's start says of `policy` on this backend, one line
+    /// each: a field it does not hold, which the policy still runs with.
+    /// Nothing by default.
+    fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
+        Vec::new()
+    }
     /// Its own escape probes and how it refuses, for a sandbox compiled to
     /// `compiled`, or on a dry run, which compiles nothing, for none. Says
     /// why not when that text is not what it compiles.
