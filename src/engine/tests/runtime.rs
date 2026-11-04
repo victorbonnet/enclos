@@ -335,6 +335,11 @@ fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
         plan.contains("download the hermes installer from file://"),
         "{plan}"
     );
+    // A Seatbelt sandbox's host: the line a Mac has always shown.
+    assert!(
+        plan.contains(" on this Mac, as it is served now (ADR 0029)"),
+        "{plan}"
+    );
     assert!(plan.contains("start the proxy"), "{plan}");
     assert_eq!(lab.engine.audit(None).unwrap().len(), entries);
     assert_eq!(lab.runtime(), None);

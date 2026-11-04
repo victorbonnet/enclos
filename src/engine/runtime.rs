@@ -55,6 +55,8 @@ struct InstallPlan {
     /// applied yet, or a newer template or built-in defaults.
     also: Vec<String>,
     proxy_runs: bool,
+    /// The host, as the plan names it: where the installer is downloaded.
+    host: &'static str,
 }
 
 impl Engine {
@@ -239,6 +241,7 @@ impl Engine {
             listen_kept_off: asks && !listening,
             also,
             proxy_runs: self.proxy_runs(name)?,
+            host: record.backend.host(),
         })
     }
 
@@ -318,8 +321,9 @@ impl InstallPlan {
         }
         changes.extend(self.also.iter().map(|c| format!("also {c}")));
         changes.push(format!(
-            "download the {kind} installer from {} on this Mac, as it is served now (ADR 0029), and record its SHA-256",
-            runtime.installer().url
+            "download the {kind} installer from {} on {}, as it is served now (ADR 0029), and record its SHA-256",
+            runtime.installer().url,
+            self.host
         ));
         if !self.proxy_runs {
             changes.push(format!("start the proxy of sandbox {name}"));

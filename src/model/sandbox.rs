@@ -79,6 +79,17 @@ impl BackendKind {
         BackendKind::Libkrun,
     ];
 
+    /// The host, as a sentence names it: where enclos runs a sandbox of
+    /// this kind. OpenShell and a microVM are not built yet, and may run on
+    /// either system.
+    pub const fn host(self) -> &'static str {
+        match self {
+            BackendKind::Seatbelt => "this Mac",
+            BackendKind::Bubblewrap => "this Linux machine",
+            BackendKind::OpenShell | BackendKind::Libkrun => "this host",
+        }
+    }
+
     /// Whether the `mktemp` a sandbox of this kind runs ignores `TMPDIR`
     /// for a call with no template, `-d` or `-t`, as macOS's
     /// `/usr/bin/mktemp` does (design §5, "System temp"). GNU `mktemp`, a
