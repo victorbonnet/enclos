@@ -61,6 +61,8 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
+    /// The enclos mobile app's side of this host: talk to an agent through its app channel.
+    App(cli::app::AppArgs),
     /// Show, widen, edit, apply, discard, refresh, diff, roll back or test a sandbox's policy, or list its history.
     Policy(cli::policy::PolicyArgs),
     /// A sandbox's network log and refused destinations.
@@ -320,6 +322,7 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Secret(args) => cli::secret::run(&engine, &current_actor(), confirm, args),
         Command::State(args) => cli::state::run(&engine, &current_actor(), confirm, args),
         Command::Runtime(args) => cli::runtime::run(&engine, &current_actor(), confirm, args),
+        Command::App(args) => cli::app::run(&engine, &current_actor(), args),
         Command::Agent(args) => cli::agent::run(&engine, &current_actor(), confirm, args),
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
@@ -353,6 +356,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         Command::Connect(_)
         | Command::Exec(_)
         | Command::Runtime(_)
+        | Command::App(_)
         | Command::Proxy(_)
         | Command::Relay(_)
         | Command::Inside(_)
