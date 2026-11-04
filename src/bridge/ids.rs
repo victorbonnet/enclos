@@ -3,6 +3,13 @@
 
 use std::io::Read;
 
+/// `n` bytes from the system's random source.
+pub fn random_bytes(n: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![0u8; n];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// 16 random bytes in the 8-4-4-4-12 form of a UUID (version 4).
 pub fn new_id() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
