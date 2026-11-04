@@ -1,0 +1,166 @@
+//! The plugin leg's fixtures in tests/fixtures/plugin/, which the runtimes'
+//! plugins read in their own tests too: each decodes, and encodes back to the
+//! same JSON.
+
+use enclos_protocol::plugin::{
+    Capability, ErrorCode, FromBridge, FromPlugin, OutKind, decode_from_bridge, decode_from_plugin,
+};
+use enclos_protocol::{DecodeError, Envelope, MAX_MESSAGE_BYTES, encode_line};
+
+const FROM_BRIDGE: &[(&str, &str)] = &[
+    (
+        "hello",
+        include_str!("fixtures/plugin/from_bridge_hello.json"),
+    ),
+    (
+        "message_in",
+        include_str!("fixtures/plugin/from_bridge_message_in.json"),
+    ),
+    ("ack", include_str!("fixtures/plugin/from_bridge_ack.json")),
+];
+
+const FROM_PLUGIN: &[(&str, &str)] = &[
+    (
+        "hello",
+        include_str!("fixtures/plugin/from_plugin_hello.json"),
+    ),
+    (
+        "message_out_reply",
+        include_str!("fixtures/plugin/from_plugin_message_out_reply.json"),
+    ),
+    (
+        "message_out_notify",
+        include_str!("fixtures/plugin/from_plugin_message_out_notify.json"),
+    ),
+    (
+        "typing",
+        include_str!("fixtures/plugin/from_plugin_typing.json"),
+    ),
+    (
+        "error",
+        include_str!("fixtures/plugin/from_plugin_error.json"),
+    ),
+];
+
+fn json(bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes).expect("valid JSON")
+}
+
+fn assert_round_trip<B: serde::Serialize>(name: &str, fixture: &str, message: &Envelope<B>) {
+    let line = encode_line(message);
+    assert_eq!(
+        line.last(),
+        Some(&b'\n'),
+        "{name}: a line ends with a line break"
+    );
+    assert!(
+        !line[..line.len() - 1].contains(&b'\n'),
+        "{name}: no line break inside"
+    );
+    assert_eq!(
+        json(&line),
+        json(fixture.as_bytes()),
+        "{name}: encodes back to the fixture"
+    );
+}
+
+#[test]
+fn every_fixture_from_the_bridge_round_trips() {
+    for (name, fixture) in FROM_BRIDGE {
+        let message =
+            decode_from_bridge(fixture.trim().as_bytes()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_round_trip(name, fixture, &message);
+    }
+}
+
+#[test]
+fn every_fixture_from_a_plugin_round_trips() {
+    for (name, fixture) in FROM_PLUGIN {
+        let message =
+            decode_from_plugin(fixture.trim().as_bytes()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_round_trip(name, fixture, &message);
+    }
+}
+
+#[test]
+fn a_message_reads_as_its_fields_say() {
+    let message = decode_from_bridge(FROM_BRIDGE[1].1.as_bytes()).unwrap();
+    let FromBridge::MessageIn {
+        conversation,
+        person,
+        text,
+    } = message.body
+    else {
+        panic!("not a message.in: {:?}", message.body);
+    };
+    assert_eq!(conversation.as_str(), "c-42");
+    assert_eq!(person.as_str(), "alice@example.com");
+    assert_eq!(text, "What's the weather in Paris?");
+
+    let message = decode_from_plugin(FROM_PLUGIN[2].1.as_bytes()).unwrap();
+    let FromPlugin::MessageOut { kind, reply_to, .. } = message.body else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!(kind, OutKind::Notify);
+    assert_eq!(reply_to, None);
+
+    let message = decode_from_plugin(FROM_PLUGIN[4].1.as_bytes()).unwrap();
+    let FromPlugin::Error(error) = message.body else {
+        panic!("not an error: {:?}", message.body);
+    };
+    assert_eq!(error.code, ErrorCode::AgentUnavailable);
+}
+
+#[test]
+fn unknown_fields_and_capabilities_are_ignored() {
+    let line = br#"{"v":1,"id":"m1","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","teleport"],"later":true}"#;
+    let message = decode_from_plugin(line).unwrap();
+    let FromPlugin::Hello { capabilities, .. } = message.body else {
+        panic!("not a hello: {:?}", message.body);
+    };
+    assert_eq!(capabilities, vec![Capability::Notify, Capability::Unknown]);
+}
+
+#[test]
+fn an_unknown_type_is_told_apart_from_a_bad_message() {
+    let unknown = decode_from_plugin(br#"{"v":1,"id":"m1","type":"message.edit","text":"x"}"#);
+    assert_eq!(
+        unknown,
+        Err(DecodeError::UnknownType {
+            id: Some("m1".to_owned()),
+            kind: "message.edit".to_owned()
+        })
+    );
+    let bad =
+        decode_from_plugin(br#"{"v":1,"id":"m2","type":"message.out","text":"no conversation"}"#);
+    assert!(
+        matches!(bad, Err(DecodeError::Bad { id: Some(ref id), .. }) if id == "m2"),
+        "{bad:?}"
+    );
+}
+
+#[test]
+fn other_versions_wrong_ids_and_oversized_messages_are_refused() {
+    assert_eq!(
+        decode_from_bridge(br#"{"v":2,"id":"m1","type":"ack","of":"m0"}"#),
+        Err(DecodeError::Version(2))
+    );
+    assert!(matches!(
+        decode_from_bridge(br#"{"id":"m1","type":"ack","of":"m0"}"#),
+        Err(DecodeError::Bad { .. })
+    ));
+    assert!(matches!(
+        decode_from_bridge(br#"{"v":1,"id":"","type":"ack","of":"m0"}"#),
+        Err(DecodeError::Bad { .. })
+    ));
+    assert!(matches!(
+        decode_from_bridge(br#"{"v":1,"id":"m1","type":"message.in","conversation":"c\u0000","person":"p","text":"t"}"#),
+        Err(DecodeError::Bad { .. })
+    ));
+    assert!(matches!(
+        decode_from_bridge(b"[1,2]"),
+        Err(DecodeError::NotJson(_))
+    ));
+    let big = vec![b' '; MAX_MESSAGE_BYTES + 1];
+    assert_eq!(decode_from_bridge(&big), Err(DecodeError::TooBig));
+}
