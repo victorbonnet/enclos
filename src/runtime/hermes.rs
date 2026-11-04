@@ -11,7 +11,7 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
+    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
     RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
     RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
@@ -29,6 +29,14 @@ pub const INSTALLER_URL: &str = "https://hermes-agent.nousresearch.com/install.s
 
 /// `hermes`, as the installer puts it on the sandbox's PATH.
 const HERMES: &str = "hermes";
+
+// The mobile app's channel plugin (`channels/hermes/enclos/`), carried by
+// the binary so that nothing is downloaded to put it in a sandbox.
+const APP_PLUGIN_YAML: &str = include_str!("../../channels/hermes/enclos/plugin.yaml");
+const APP_PLUGIN_INIT: &str = include_str!("../../channels/hermes/enclos/__init__.py");
+const APP_PLUGIN_ADAPTER: &str = include_str!("../../channels/hermes/enclos/adapter.py");
+const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/protocol.py");
+const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
 
 /// Hermes's built-in profile, the root of its home.
@@ -247,7 +255,44 @@ impl RuntimeAdapter for Hermes {
                 ),
                 ("platforms.telegram.enabled".to_owned(), "true".to_owned()),
             ]),
+            // Set up by `app_channel`: no bot, no people to answer.
+            Channel::App => None,
         }
+    }
+
+    fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path) -> Option<AppChannel> {
+        // A plugin Hermes loads from the agent's own home, `plugins/` under
+        // its `HERMES_HOME`, and only once `plugins enable` lists it in
+        // that agent's settings (read in Hermes's source, main of
+        // 2026-11-03: `plugins/plugin_loader.py`, `user_plugins_dir`, and
+        // `hermes_cli/plugins_discovery.py`, `gate_manifest`; to verify,
+        // design §14). It turns itself on for an agent whose secrets give
+        // it a socket and a token (`channels/hermes/enclos/adapter.py`).
+        let plugins = agent_folder(agent).child("plugins")?.child("enclos")?;
+        let file = |name: &str, contents: &'static str| Some((plugins.child(name)?, contents));
+        Some(AppChannel {
+            files: vec![
+                file("plugin.yaml", APP_PLUGIN_YAML)?,
+                file("__init__.py", APP_PLUGIN_INIT)?,
+                file("adapter.py", APP_PLUGIN_ADAPTER)?,
+                file("protocol.py", APP_PLUGIN_PROTOCOL)?,
+                file("outbox.py", APP_PLUGIN_OUTBOX)?,
+            ],
+            commands: vec![SandboxCommand::from_words(&[
+                HERMES,
+                "-p",
+                agent.as_str(),
+                "plugins",
+                "enable",
+                "enclos",
+            ])],
+            settings: vec![
+                // Not secrets: where to listen, and that the bridge, which
+                // holds the agent's token, decides who talks to the agent.
+                ("ENCLOS_APP_SOCKET".to_owned(), socket.display().to_string()),
+                ("ENCLOS_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+            ],
+        })
     }
 
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
@@ -987,6 +1032,52 @@ mod tests {
                 "{backend:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_app_channel_goes_in_the_agents_own_home_and_is_enabled_there() {
+        let socket = Path::new("/h/.enclos-app/main.sock");
+        let main = RuntimeAgentName::new("main").unwrap();
+        let app = Hermes.app_channel(&main, socket).unwrap();
+        let places: Vec<String> = app
+            .files
+            .iter()
+            .map(|(place, _)| place.as_path().display().to_string())
+            .collect();
+        assert_eq!(
+            places,
+            [
+                ".hermes/profiles/main/plugins/enclos/plugin.yaml",
+                ".hermes/profiles/main/plugins/enclos/__init__.py",
+                ".hermes/profiles/main/plugins/enclos/adapter.py",
+                ".hermes/profiles/main/plugins/enclos/protocol.py",
+                ".hermes/profiles/main/plugins/enclos/outbox.py",
+            ]
+        );
+        assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));
+        assert_eq!(
+            app.commands
+                .iter()
+                .map(SandboxCommand::shown)
+                .collect::<Vec<_>>(),
+            ["hermes -p main plugins enable enclos"]
+        );
+        assert_eq!(
+            app.settings,
+            [
+                (
+                    "ENCLOS_APP_SOCKET".to_owned(),
+                    "/h/.enclos-app/main.sock".to_owned()
+                ),
+                ("ENCLOS_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+            ]
+        );
+        let default = RuntimeAgentName::new("default").unwrap();
+        let app = Hermes.app_channel(&default, socket).unwrap();
+        assert_eq!(
+            app.files[0].0.as_path(),
+            Path::new(".hermes/plugins/enclos/plugin.yaml")
+        );
     }
 
     #[test]
