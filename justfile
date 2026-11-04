@@ -2,10 +2,10 @@ fmt:
     cargo fmt --all -- --check
 
 clippy:
-    cargo clippy --locked --all-targets --all-features -- -D warnings
+    cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 test:
-    cargo test --locked --all-features
+    cargo test --locked --workspace --all-features
 
 deny:
     cargo deny check
