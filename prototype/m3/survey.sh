@@ -1,5 +1,5 @@
 #!/bin/sh
-# Host survey for milestone 3 (design §14, issue #102, M3-01). Read-only:
+# Host survey for milestone 3 (design §14, issue #102). Read-only:
 # it reads /sys, /proc, the kernel's build configuration, package versions
 # and systemd's settings, and prints one `key: value` line per fact. It runs
 # no bubblewrap, creates no namespace, installs no seccomp filter, changes no

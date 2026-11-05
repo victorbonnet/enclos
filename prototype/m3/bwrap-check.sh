@@ -1,6 +1,6 @@
 #!/bin/sh
 # Whether bubblewrap runs as an unprivileged user, and which setting it needs
-# (design §14, M3-01), and the basics of bubblewrap alone. It creates user namespaces and, with sudo, loads an
+# (design §14), and the basics of bubblewrap alone. It creates user namespaces and, with sudo, loads an
 # AppArmor profile and changes a sysctl, so it runs only on a throwaway
 # GitHub-hosted runner, never on a host in use.
 set -u

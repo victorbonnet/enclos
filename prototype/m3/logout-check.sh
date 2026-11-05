@@ -1,6 +1,6 @@
 #!/bin/sh
 # What happens to a `systemd --user` unit when its user's last session ends,
-# with and without lingering (design §14 and §15, M3-01). It logs in over
+# with and without lingering (design §14 and §15). It logs in over
 # ssh to localhost, starts a unit, logs out, and looks again. It installs
 # sshd, changes lingering and ends sessions, so it runs only on a throwaway
 # GitHub-hosted runner, never on a host in use.
