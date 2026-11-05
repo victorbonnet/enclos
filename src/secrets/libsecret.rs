@@ -220,18 +220,13 @@ impl SecretStore for Libsecret {
             .arg("store")
             .arg(format!("--label=enclos secret {secret}"))
             .args(self.attributes(secret));
-        let way_out = |why: String| {
-            format!(
-                "{why}. To keep a secret not yet recorded in the file store instead, run `{BUS_VAR}= enclos secret set {secret}`"
-            )
-        };
         let out = run(&mut command, Some(value.expose().as_bytes()))
-            .map_err(|e| self.fail("store", secret, way_out(e)))?;
+            .map_err(|e| self.fail("store", secret, e))?;
         if !out.status.success() {
             return Err(SecretError {
                 // It refused, as on a locked collection, and wrote nothing.
                 untouched: out.status.code() == Some(1),
-                ..self.fail("store", secret, way_out(stderr(&out.stderr, out.status)))
+                ..self.fail("store", secret, stderr(&out.stderr, out.status))
             });
         }
         // Only reading the value back shows it was stored whole.
@@ -331,6 +326,11 @@ impl Prober for Libsecret {
             Ok(out) => out.status.success() || found_nothing(&out),
             Err(_) => false,
         }
+    }
+
+    /// An empty bus address: then nothing answers, whatever runs.
+    fn not_answering_with(&self) -> String {
+        format!("{BUS_VAR}=")
     }
 }
 
@@ -566,19 +566,33 @@ esac"#,
 
     /// A host that answers but never unlocks has a way forward, and it is
     /// the one that works: no bus named, nothing answers, and a new secret
-    /// goes to the file.
+    /// goes to the file. The host's stores give it once the store failed,
+    /// refused or out of time.
     #[test]
     fn a_failed_store_says_how_a_new_secret_goes_to_the_file() {
-        let stub = Stub::new("exit 1", LOCKED);
-        let err = stub.store.set(&secret(), &v("a")).unwrap_err();
-        assert!(
-            err.what
-                .contains("DBUS_SESSION_BUS_ADDRESS= enclos secret set home/telegram"),
-            "{err}"
-        );
-        let timed_out = Stub::new("exec sleep 60", LOCKED);
-        let err = timed_out.store.set(&secret(), &v("a")).unwrap_err();
-        assert!(err.what.contains("DBUS_SESSION_BUS_ADDRESS="), "{err}");
+        for (secret_tool, why) in [
+            ("exit 1", "exit status: 1"),
+            (
+                r#"case "$1" in lookup) exit 1 ;; *) exec sleep 60 ;; esac"#,
+                "did not answer",
+            ),
+        ] {
+            let Stub { dir, store } = Stub::new(secret_tool, LOCKED);
+            let stores = Picked::new(
+                Box::new(store),
+                Box::new(FileStore::new(dir.path().join("secrets.json"))),
+            );
+            let store = stores.for_new().unwrap();
+            assert_eq!(store.name(), StoreName::Libsecret);
+            let err = store.set(&secret(), &v("a")).unwrap_err();
+            assert!(err.what.contains(why), "{err}");
+            let other = stores.new_secret_alternative(&secret()).unwrap();
+            assert!(
+                other.contains("DBUS_SESSION_BUS_ADDRESS= enclos secret set home/telegram"),
+                "{other}"
+            );
+            assert!(other.contains("the file store"), "{other}");
+        }
     }
 
     /// A store refused, as on a locked collection, wrote nothing; one that

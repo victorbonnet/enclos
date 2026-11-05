@@ -541,6 +541,100 @@ fn a_store_refused_before_it_wrote_leaves_what_was_there() {
     assert_eq!(store.get(&telegram).unwrap(), Some(value(VALUE)));
 }
 
+/// A Secret Service that answers, but refuses every value, as one whose
+/// collection stays locked.
+struct RefusingService(Rc<InMemory>);
+
+impl SecretStore for RefusingService {
+    fn name(&self) -> StoreName {
+        StoreName::Libsecret
+    }
+    fn set(
+        &self,
+        _: &SecretRef,
+        _: &SecretValue,
+    ) -> std::result::Result<(), crate::secrets::SecretError> {
+        Err(crate::secrets::SecretError {
+            what: "the collection is locked".into(),
+            untouched: true,
+        })
+    }
+    fn get(
+        &self,
+        secret: &SecretRef,
+    ) -> std::result::Result<Option<SecretValue>, crate::secrets::SecretError> {
+        self.0.get(secret)
+    }
+    fn remove(&self, secret: &SecretRef) -> std::result::Result<bool, crate::secrets::SecretError> {
+        self.0.remove(secret)
+    }
+    fn whereabouts(&self, secret: &SecretRef) -> String {
+        self.0.whereabouts(secret)
+    }
+    fn removed_before_record(&self) -> bool {
+        true
+    }
+}
+
+impl crate::secrets::Prober for RefusingService {
+    fn answers(&self) -> bool {
+        true
+    }
+    fn not_answering_with(&self) -> String {
+        "DBUS_SESSION_BUS_ADDRESS=".to_owned()
+    }
+}
+
+/// A new secret a Secret Service refuses is told how to go to the file
+/// store instead; a recorded one, which stays in its store, is not, and
+/// neither is one a host with a single store refuses.
+#[test]
+fn a_new_secret_a_service_refuses_is_told_how_to_go_to_the_file() {
+    let (_dir, engine, store, _) = with_store();
+    let telegram = secret("home/telegram");
+    let advice = "DBUS_SESSION_BUS_ADDRESS= enclos secret set home/telegram";
+    let refusing = |engine: Engine| {
+        engine.with_secrets(Box::new(crate::secrets::Picked::new(
+            Box::new(RefusingService(Rc::new(InMemory::named(
+                StoreName::Libsecret,
+            )))),
+            Box::new(Rc::new(InMemory::named(StoreName::File))),
+        )))
+    };
+    let engine = refusing(engine);
+    let err = engine
+        .secret_set(&alice(), &telegram, Some(&value(VALUE)), Confirm::Yes)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("the collection is locked"), "{err}");
+    assert!(err.contains(advice), "{err}");
+    assert!(err.contains("the file store"), "{err}");
+
+    let stores = TwoStores::new();
+    let engine = stores.on(engine, true);
+    set(&engine, &telegram, VALUE);
+    let engine = refusing(engine);
+    let err = engine
+        .secret_set(&alice(), &telegram, Some(&value("new")), Confirm::Yes)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("the collection is locked"), "{err}");
+    assert!(!err.contains("DBUS_SESSION_BUS_ADDRESS"), "{err}");
+
+    let engine = engine.with_secrets(Box::new(RefusesFirst(Rc::clone(&store))));
+    let err = engine
+        .secret_set(
+            &alice(),
+            &secret("home/mail"),
+            Some(&value(VALUE)),
+            Confirm::Yes,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("too long"), "{err}");
+    assert!(!err.contains("DBUS_SESSION_BUS_ADDRESS"), "{err}");
+}
+
 /// What the `secret` commands call, on the store a host with no Secret
 /// Service picks: a real file, in the test's own folder.
 #[test]

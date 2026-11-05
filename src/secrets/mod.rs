@@ -69,6 +69,9 @@ pub fn host(service: String, file: PathBuf) -> Box<dyn Stores> {
 /// A store that can say whether it can be reached at all.
 pub trait Prober: SecretStore {
     fn answers(&self) -> bool;
+    /// What, set before a command, makes this store not answer for it, as
+    /// `VAR=`: the way a user sends a new secret to another store.
+    fn not_answering_with(&self) -> String;
 }
 
 /// The stores of a host, each secret in the one its record names: a value is
@@ -85,6 +88,11 @@ pub trait Stores {
     /// record (`SecretStore::removed_before_record`), whether that store
     /// answers or not; false for a store this host does not have.
     fn value_goes_before_record(&self, name: StoreName) -> bool;
+    /// How to send the new secret `secret` to another store, for when the
+    /// one `for_new` gave refused it; `None` when there is no other.
+    fn new_secret_alternative(&self, _secret: &SecretRef) -> Option<String> {
+        None
+    }
 }
 
 /// A store alone is a host's only one.
@@ -179,6 +187,18 @@ impl Stores for Picked {
             .filter(|store| granted.contains(&store.name()))
             .flat_map(|store| store.env())
             .collect()
+    }
+
+    /// Only while the first store is the one `for_new` gives: a command for
+    /// which it does not answer sends the secret to the second.
+    fn new_secret_alternative(&self, secret: &SecretRef) -> Option<String> {
+        self.answers().then(|| {
+            format!(
+                "To keep it in {} instead, run `{} enclos secret set {secret}`",
+                self.otherwise.name().shown(),
+                self.preferred.not_answering_with()
+            )
+        })
     }
 
     fn value_goes_before_record(&self, name: StoreName) -> bool {
@@ -372,6 +392,10 @@ impl Prober for Stubbed {
         self.looks.set(self.looks.get() + 1);
         self.answers
     }
+
+    fn not_answering_with(&self) -> String {
+        "DBUS_SESSION_BUS_ADDRESS=".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +467,20 @@ mod tests {
             file,
             looks,
         }
+    }
+
+    /// Another store is offered only while the service is the one picked,
+    /// and a store alone has none to offer.
+    #[test]
+    fn the_file_is_offered_only_for_a_new_secret_the_service_took() {
+        let secret = secret();
+        let offered = case(true).picked.new_secret_alternative(&secret).unwrap();
+        assert!(
+            offered.contains("the file store") && offered.contains("DBUS_SESSION_BUS_ADDRESS="),
+            "{offered}"
+        );
+        assert_eq!(case(false).picked.new_secret_alternative(&secret), None);
+        assert_eq!(InMemory::default().new_secret_alternative(&secret), None);
     }
 
     #[test]

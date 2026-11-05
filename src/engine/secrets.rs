@@ -132,7 +132,10 @@ impl Engine {
                     Some(record) => self.store_of(record)?,
                     None => self.secrets.for_new()?,
                 };
-                if let Err(error) = store.set(secret, value) {
+                if let Err(mut error) = store.set(secret, value) {
+                    if !known && let Some(other) = self.secrets.new_secret_alternative(secret) {
+                        error.what = format!("{}. {other}", error.what);
+                    }
                     // A store can fail after it wrote, as when reading the
                     // value back does not answer: a new value it may have
                     // left goes again, as no record would lead to it.
