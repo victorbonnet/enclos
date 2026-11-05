@@ -270,7 +270,7 @@ impl RuntimeAdapter for Hermes {
         // folders, and writes the profile's wrapper unless the name
         // collides with a command. Its export leaves out `auth.json`, `.env`
         // and the browser's data and scrubs secret-shaped strings. Neither
-        // is shown by a prototype yet (design §14).
+        // is shown yet (design §14).
         let mut words: Vec<OsString> = [HERMES, "profile", "import"].map(OsString::from).to_vec();
         words.push(archive.as_os_str().to_owned());
         words.extend(["--name", name.as_str()].map(OsString::from));

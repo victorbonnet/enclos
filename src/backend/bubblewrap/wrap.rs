@@ -96,17 +96,12 @@ pub(super) fn command(
     Ok(command)
 }
 
-/// `bwrap` with Ctrl-C and Ctrl-\ ignored, for a command's session, which
-/// a terminal may run in, or `connect` passes the signals it catches to.
-/// bubblewrap's outer process stays in the session's process group, which a
-/// terminal's Ctrl-C reaches, and
-/// handles only SIGCHLD: ended so, it would take the whole session with it
-/// through `--die-with-parent`, a program that catches SIGINT included,
-/// where `connect` waits for its program through Ctrl-C (design §8). An
-/// ignored signal stays ignored through `exec`, so `enclos inside` hands
-/// both back to the command ([`super::INTERRUPTS_FLAG`]). `/bin/sh` reads no
-/// startup file when it runs a command, and none of the sandbox's
-/// variables can name a function.
+/// Runs `bwrap` under `sh` with SIGINT and SIGQUIT ignored: bubblewrap's
+/// outer process is in the terminal's foreground group, and Ctrl-C ending
+/// it would end the session through `--die-with-parent`. `enclos inside
+/// --restore-interrupts` gives both back to the command (design §5).
+/// `/bin/sh` reads no startup file when it runs a command, and none of the
+/// sandbox's variables can name a function.
 fn out_of_reach_of_interrupts(bwrap: Command) -> Command {
     let mut sh = Command::new("/bin/sh");
     sh.arg("-c")
