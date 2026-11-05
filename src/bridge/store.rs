@@ -25,6 +25,8 @@ pub struct Message {
     pub text: String,
     /// `reply` or `notify` for the agent's; `message` for a person's.
     pub kind: String,
+    /// When the bridge stored it, in seconds since the Unix epoch.
+    pub at: i64,
 }
 
 pub struct Store {
@@ -48,7 +50,64 @@ CREATE TABLE IF NOT EXISTS messages (
     kind TEXT NOT NULL,
     at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    person TEXT NOT NULL,
+    noise_key BLOB NOT NULL UNIQUE,
+    device_key BLOB NOT NULL,
+    push_key BLOB NOT NULL,
+    push_token TEXT,
+    paired INTEGER NOT NULL,
+    seen INTEGER
+);
+CREATE TABLE IF NOT EXISTS pairings (
+    code BLOB PRIMARY KEY,
+    expires INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    request_name TEXT,
+    request_person TEXT,
+    decision TEXT
+);
+CREATE TABLE IF NOT EXISTS log (
+    at INTEGER NOT NULL,
+    device TEXT,
+    person TEXT,
+    event TEXT NOT NULL,
+    reason TEXT
+);
 ";
+
+/// A paired device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub person: String,
+    pub noise_key: Vec<u8>,
+    pub device_key: Vec<u8>,
+    pub push_key: Vec<u8>,
+    pub push_token: Option<String>,
+    pub paired: i64,
+    pub seen: Option<i64>,
+}
+
+/// One line of the bridge's log: a connection, a disconnection, a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogLine {
+    pub at: i64,
+    pub device: Option<String>,
+    pub person: Option<String>,
+    pub event: String,
+    pub reason: Option<String>,
+}
+
+/// A pairing request the terminal is asked to confirm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequest {
+    pub name: String,
+    pub person: String,
+}
 
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
@@ -101,7 +160,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -114,9 +173,21 @@ impl Store {
                 from: person.map_or(From::Agent, From::Person),
                 text: row.get(4)?,
                 kind: row.get(5)?,
+                at: row.get(6)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// A known conversation's sandbox, agent and owner.
+    pub fn conversation_of(&self, id: &str) -> rusqlite::Result<Option<(String, String, String)>> {
+        self.db
+            .query_row(
+                "SELECT sandbox, agent, owner FROM conversations WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
     }
 
     /// The owner of a conversation, if it is known.
@@ -131,7 +202,197 @@ impl Store {
     }
 }
 
-fn now() -> i64 {
+impl Store {
+    fn device_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+        Ok(Device {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            person: row.get(2)?,
+            noise_key: row.get(3)?,
+            device_key: row.get(4)?,
+            push_key: row.get(5)?,
+            push_token: row.get(6)?,
+            paired: row.get(7)?,
+            seen: row.get(8)?,
+        })
+    }
+
+    const DEVICE_COLUMNS: &'static str =
+        "id, name, person, noise_key, device_key, push_key, push_token, paired, seen";
+
+    pub fn add_device(&self, device: &Device) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO devices (id, name, person, noise_key, device_key, push_key, push_token, paired, seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                device.id,
+                device.name,
+                device.person,
+                device.noise_key,
+                device.device_key,
+                device.push_key,
+                device.push_token,
+                device.paired,
+                device.seen
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_by_noise_key(&self, key: &[u8]) -> rusqlite::Result<Option<Device>> {
+        self.db
+            .query_row(
+                &format!(
+                    "SELECT {} FROM devices WHERE noise_key = ?1",
+                    Self::DEVICE_COLUMNS
+                ),
+                params![key],
+                Self::device_from,
+            )
+            .optional()
+    }
+
+    pub fn devices(&self) -> rusqlite::Result<Vec<Device>> {
+        let mut query = self.db.prepare(&format!(
+            "SELECT {} FROM devices ORDER BY person, paired",
+            Self::DEVICE_COLUMNS
+        ))?;
+        let rows = query.query_map([], Self::device_from)?;
+        rows.collect()
+    }
+
+    /// Removes a device; whether there was one.
+    pub fn remove_device(&self, id: &str) -> rusqlite::Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM devices WHERE id = ?1", params![id])?
+            == 1)
+    }
+
+    pub fn device_seen(&self, id: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE devices SET seen = ?2 WHERE id = ?1",
+            params![id, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_push_token(&self, id: &str, token: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE devices SET push_token = ?2 WHERE id = ?1",
+            params![id, token],
+        )?;
+        Ok(())
+    }
+
+    pub fn log(
+        &self,
+        device: Option<&str>,
+        person: Option<&str>,
+        event: &str,
+        reason: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO log (at, device, person, event, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now(), device, person, event, reason],
+        )?;
+        Ok(())
+    }
+
+    /// The last `limit` lines of the log, oldest first.
+    pub fn log_lines(&self, limit: i64) -> rusqlite::Result<Vec<LogLine>> {
+        let mut query = self.db.prepare(
+            "SELECT at, device, person, event, reason FROM (SELECT rowid, * FROM log ORDER BY rowid DESC LIMIT ?1) ORDER BY rowid",
+        )?;
+        let rows = query.query_map(params![limit], |row| {
+            Ok(LogLine {
+                at: row.get(0)?,
+                device: row.get(1)?,
+                person: row.get(2)?,
+                event: row.get(3)?,
+                reason: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Records a one-time pairing code, valid until `expires`.
+    pub fn add_pairing(&self, code: &[u8], expires: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT INTO pairings (code, expires) VALUES (?1, ?2)",
+            params![code, expires],
+        )?;
+        Ok(())
+    }
+
+    /// Takes the code for a request: `false` when it is unknown, used or
+    /// expired. Using it once is all it gets, whatever the answer.
+    pub fn use_pairing(&self, code: &[u8], request: &PairingRequest) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE pairings SET used = 1, request_name = ?2, request_person = ?3 WHERE code = ?1 AND used = 0 AND expires >= ?4",
+            params![code, request.name, request.person, now()],
+        )? == 1)
+    }
+
+    /// The codes still waiting to be used, for the bridge to try a proof
+    /// against.
+    pub fn open_pairings(&self) -> rusqlite::Result<Vec<Vec<u8>>> {
+        let mut query = self
+            .db
+            .prepare("SELECT code FROM pairings WHERE used = 0 AND expires >= ?1")?;
+        let rows = query.query_map(params![now()], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// The request made with `code`, once a device has used it.
+    pub fn pairing_request(&self, code: &[u8]) -> rusqlite::Result<Option<PairingRequest>> {
+        self.db
+            .query_row(
+                "SELECT request_name, request_person FROM pairings WHERE code = ?1 AND used = 1",
+                params![code],
+                |row| {
+                    Ok(PairingRequest {
+                        name: row.get(0)?,
+                        person: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// The first word on a pairing: the terminal's answer (`accept` or
+    /// `decline`), or the bridge's `gone` when the device left before it;
+    /// whether this one was first.
+    pub fn decide_pairing(&self, code: &[u8], decision: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE pairings SET decision = ?2 WHERE code = ?1 AND decision IS NULL",
+            params![code, decision],
+        )? == 1)
+    }
+
+    /// What became of an accepted pairing, for the terminal: `paired` once
+    /// the device has its answer, `gone` when it left before.
+    pub fn settle_pairing(&self, code: &[u8], outcome: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE pairings SET decision = ?2 WHERE code = ?1 AND decision = 'accept'",
+            params![code, outcome],
+        )?;
+        Ok(())
+    }
+
+    pub fn pairing_decision(&self, code: &[u8]) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT decision FROM pairings WHERE code = ?1",
+                params![code],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+}
+
+pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -185,11 +446,36 @@ mod tests {
             ["hi", "hello"]
         );
         assert_eq!(mine[1].from, From::Agent);
+        // The time it was stored, which a sync gives the device.
+        assert!(mine.iter().all(|m| (now() - m.at).abs() < 60));
         assert_eq!(store.since(owner, first).unwrap().len(), 1);
         assert_eq!(
             store.owner("c-2").unwrap().as_deref(),
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    #[test]
+    fn a_pairing_takes_the_first_word_and_then_its_outcome() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let decision = |s: &Store, code: &[u8]| s.pairing_decision(code).unwrap();
+        // Accepted, then the device got its answer.
+        store.add_pairing(b"one", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"one", "accept").unwrap());
+        assert!(!store.decide_pairing(b"one", "decline").unwrap());
+        store.settle_pairing(b"one", "paired").unwrap();
+        assert_eq!(decision(&store, b"one").as_deref(), Some("paired"));
+        // The device left first: the terminal's answer comes too late.
+        store.add_pairing(b"two", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"two", "gone").unwrap());
+        assert!(!store.decide_pairing(b"two", "accept").unwrap());
+        assert_eq!(decision(&store, b"two").as_deref(), Some("gone"));
+        // An outcome settles an accepted pairing only.
+        store.add_pairing(b"three", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"three", "decline").unwrap());
+        store.settle_pairing(b"three", "paired").unwrap();
+        assert_eq!(decision(&store, b"three").as_deref(), Some("decline"));
     }
 }
