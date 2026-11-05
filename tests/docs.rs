@@ -81,3 +81,16 @@ fn the_verdict_on_a_field_not_enforced_is_spelled_out_in_one_document() {
         .collect();
     assert_eq!(spelled_out.len(), 1, "{spelled_out:?}");
 }
+
+#[test]
+fn the_design_cites_no_ci_run() {
+    // A run's evidence lives in the prototype's README, beside its source;
+    // the design states the result once and points there.
+    let design = design();
+    let runs: Vec<&str> = design
+        .lines()
+        .filter(|line| line.contains("/actions/runs/"))
+        .map(|line| line.get(..80).unwrap_or(line))
+        .collect();
+    assert!(runs.is_empty(), "{runs:#?}");
+}
