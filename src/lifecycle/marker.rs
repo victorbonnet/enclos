@@ -8,8 +8,8 @@
 //! no sandboxed process can open it or change its mode, and enclos keeps no
 //! copy open: the processes holding it are the program and what it started,
 //! unless one closed it or passed it on, or a process outside the sandbox
-//! changed its mode and opened it. `lsof` names them on macOS, and
-//! `/proc/<pid>/fd` on Linux (see `descriptors`). There, `O_PATH` takes no
+//! changed its mode and opened it. The host names them (`lsof` on macOS,
+//! `/proc/<pid>/fd` on Linux; see `host`). On Linux, `O_PATH` takes no
 //! permission on the file, so any process that reaches the folder can name a
 //! marker with a descriptor; such a descriptor opens nothing and holds nothing.
 //!
@@ -24,10 +24,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Stdio;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::descriptors;
 use crate::model::session::ProcessRef;
 
 /// Which processes hold the markers could not be told.
@@ -158,181 +157,12 @@ pub fn holders(dir: &Path) -> Result<Held, MarkerError> {
         Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
         Ok(entries) => entries,
     };
-    if !cfg!(target_os = "macos") {
-        return holders_in_proc(Path::new(descriptors::PROC), dir, entries);
-    }
-    // `-w`: a warning about another file system (an unreachable network
-    // mount) is not a failure to look at this folder.
-    let out = super::bounded::output_within(
-        Command::new("/usr/sbin/lsof")
-            .env("LC_ALL", "C")
-            .args(["-nP", "-w", "-Fpn", "+d"])
-            .arg(dir),
-        super::bounded::LIMIT,
-    )
-    .map_err(|e| MarkerError::Lsof(e.to_string()))?;
-    parse(&out)
-}
-
-/// The processes under `proc` holding each named marker in `dir`, whose
-/// `entries` are what the folder shows now: as with `lsof +d`, a file already
-/// removed from it is not listed, and a process working in it holds nothing.
-fn holders_in_proc(
-    proc: &Path,
-    dir: &Path,
-    entries: std::fs::ReadDir,
-) -> Result<Held, MarkerError> {
-    let folder_error = |e: io::Error| MarkerError::Folder(format!("{}: {e}", dir.display()));
-    let mut markers = BTreeSet::new();
-    for entry in entries {
-        if let Some(name) = entry.map_err(folder_error)?.file_name().to_str()
-            && name.starts_with("root-")
-        {
-            markers.insert(name.to_owned());
-        }
-    }
-    let mut held = Held::new();
-    if markers.is_empty() {
-        return Ok(held);
-    }
-    // `/proc` writes real paths, and `dir` may not be one.
-    let real = dir.canonicalize().map_err(folder_error)?;
-    let processes =
-        descriptors::every_process(proc).map_err(|e| MarkerError::Proc(e.to_string()))?;
-    for (pid, open) in processes {
-        for descriptor in open {
-            let target = &descriptor.target;
-            if target.parent() == Some(real.as_path())
-                && let Some(name) = target.file_name().and_then(|n| n.to_str())
-                && markers.contains(name)
-                && descriptor
-                    .opens()
-                    .map_err(|e| MarkerError::Proc(e.to_string()))?
-            {
-                held.entry(name.to_owned()).or_default().insert(pid);
-            }
-        }
-    }
-    Ok(held)
-}
-
-/// What `lsof -Fpn +d` answered: a `p<pid>` line for each process, then an
-/// `n<path>` line for each file of the folder it holds, the folder itself
-/// for a process working in it. With nothing held it prints nothing and
-/// exits 1, as for listeners (`listeners.rs`).
-fn parse(out: &Output) -> Result<Held, MarkerError> {
-    let text = String::from_utf8_lossy(&out.stdout);
-    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
-        (Some(1), true, true) => return Ok(Held::new()),
-        (Some(0), false, _) | (Some(1), false, true) => {}
-        _ => return Err(MarkerError::Lsof(format!("{}: {why}", out.status))),
-    }
-    let mut held = Held::new();
-    let mut pid = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            pid = Some(
-                p.parse::<u32>()
-                    .map_err(|_| MarkerError::Lsof(format!("unexpected process `{p}`")))?,
-            );
-        } else if let Some(name) = line.strip_prefix('n') {
-            let file = Path::new(name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|n| n.starts_with("root-"));
-            if let (Some(file), Some(pid)) = (file, pid) {
-                held.entry(file.to_owned()).or_default().insert(pid);
-            }
-        }
-    }
-    Ok(held)
+    super::host::marker_holders(dir, entries)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
-
-    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
-        Output {
-            status: ExitStatus::from_raw(code << 8),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn lsof_output_gives_each_sessions_holders() {
-        let held = parse(&output(
-            0,
-            "p100\nf3\nn/e/sandboxes/home/members/root-7-a\np200\nfcwd\nn/e/sandboxes/home/members\nf4\nn/e/sandboxes/home/members/root-7-a\nf5\nn/e/sandboxes/home/members/root-9-b\np300\nf3\nn/e/sandboxes/home/members/starting-1-2\n",
-            "",
-        ))
-        .unwrap();
-        assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
-        assert_eq!(held["root-9-b"], BTreeSet::from([200]));
-        assert_eq!(held.len(), 2, "{held:?}");
-    }
-
-    /// The folder's markers held under a `/proc` of the test's own: each
-    /// process's descriptors, whatever they name, sorted out by marker. The
-    /// folder is asked for through a link, as a home may be, and `/proc`
-    /// writes real paths.
-    #[test]
-    fn proc_gives_each_sessions_holders() {
-        let dir = tempfile::tempdir().unwrap();
-        let members = dir.path().canonicalize().unwrap().join("members");
-        std::fs::create_dir(&members).unwrap();
-        for file in ["root-7-a", "root-9-b", "root-8-unheld", "starting-1-2"] {
-            std::fs::write(members.join(file), "").unwrap();
-        }
-        let path = |file: &str| members.join(file).to_str().unwrap().to_owned();
-        let proc = dir.path().join("proc");
-        descriptors::fake_process(&proc, std::process::id(), &[]);
-        descriptors::fake_process(&proc, 100, &[&path("root-7-a"), "socket:[5]"]);
-        descriptors::fake_process(&proc, 200, &[&path("root-7-a"), &path("root-9-b")]);
-        descriptors::fake_process(
-            &proc,
-            300,
-            &[
-                &path("starting-1-2"),
-                &path("root-3-removed (deleted)"),
-                &path("root-3-removed"),
-                members.to_str().unwrap(),
-                "/elsewhere/root-7-a",
-            ],
-        );
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&members, &link).unwrap();
-        let held = holders_in_proc(&proc, &link, std::fs::read_dir(&link).unwrap()).unwrap();
-        assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
-        assert_eq!(held["root-9-b"], BTreeSet::from([200]));
-        assert_eq!(held.len(), 2, "{held:?}");
-    }
-
-    /// `O_PATH` takes no permission on the file, so a process of the user
-    /// passing through the folder must not read as a member; a descriptor
-    /// closed since the folder was read holds nothing.
-    #[test]
-    fn a_descriptor_that_only_names_a_marker_does_not_hold_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let members = dir.path().canonicalize().unwrap().join("members");
-        std::fs::create_dir(&members).unwrap();
-        std::fs::write(members.join("root-7-a"), "").unwrap();
-        let path = members.join("root-7-a");
-        let path = path.to_str().unwrap();
-        let proc = dir.path().join("proc");
-        descriptors::fake_process(&proc, std::process::id(), &[]);
-        descriptors::fake_process(&proc, 100, &[path]);
-        descriptors::fake_process(&proc, 200, &[path]);
-        descriptors::fake_process(&proc, 300, &[path]);
-        descriptors::fake_flags(&proc.join("200/fdinfo/0"), "012000000");
-        std::fs::remove_file(proc.join("300/fdinfo/0")).unwrap();
-        let held = holders_in_proc(&proc, &members, std::fs::read_dir(&members).unwrap()).unwrap();
-        assert_eq!(held["root-7-a"], BTreeSet::from([100]));
-    }
 
     /// The same with the kernel's own `/proc`: the program holds its marker,
     /// and this process, which opened it `O_PATH` as any process of the user
@@ -388,15 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn a_proc_that_cannot_be_read_is_an_error() {
-        let members = tempfile::tempdir().unwrap();
-        std::fs::write(members.path().join("root-7-a"), "").unwrap();
-        let entries = std::fs::read_dir(members.path()).unwrap();
-        let err = holders_in_proc(Path::new("/nonexistent"), members.path(), entries).unwrap_err();
-        assert!(matches!(err, MarkerError::Proc(_)), "{err}");
-    }
-
-    #[test]
     fn a_reused_pid_gets_another_marker() {
         let at = |started: &str| ProcessRef {
             pid: 42,
@@ -415,13 +236,6 @@ mod tests {
         let mut command = Command::new("/nonexistent/program");
         assert!(marker.spawn(&mut command).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn nothing_held_is_no_holder_and_a_failure_is_an_error() {
-        assert!(parse(&output(1, "", "")).unwrap().is_empty());
-        assert!(parse(&output(1, "", "lsof: status error")).is_err());
-        assert!(parse(&output(0, "pnope\n", "")).is_err());
     }
 
     /// The marker's whole life with real processes: no one can open it, a

@@ -4,8 +4,18 @@ pub mod bounded;
 pub mod descriptors;
 pub mod listeners;
 pub mod look;
+pub mod lsof;
 pub mod marker;
 pub mod members;
+pub mod proc;
 pub mod process;
 pub mod programs;
 pub mod stop;
+
+/// How this host looks at processes: `lsof` and `sysctl` on macOS, `/proc`
+/// on Linux. Both are compiled on every system, so the tests of each run on
+/// either; this is the one place that picks between them.
+#[cfg(target_os = "macos")]
+pub use lsof as host;
+#[cfg(not(target_os = "macos"))]
+pub use proc as host;

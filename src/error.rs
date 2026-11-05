@@ -148,7 +148,7 @@ pub enum Error {
     /// proxy of another user's or another enclos install's sandbox, say.
     #[error(
         "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`{names}` names it), or recreate the sandbox to get another port",
-        names = port_holders_command(*.port)
+        names = crate::lifecycle::host::port_holders_command(*.port)
     )]
     ProxyPortTaken {
         sandbox: String,
@@ -405,14 +405,6 @@ impl Error {
             | Error::FailedAfter { error, .. } => error.root(),
             other => other,
         }
-    }
-}
-
-/// What names the program holding `port`, on this host.
-fn port_holders_command(port: u16) -> String {
-    match cfg!(target_os = "macos") {
-        true => format!("lsof -nP -iTCP:{port} -sTCP:LISTEN"),
-        false => format!("ss -ltnp sport = :{port}"),
     }
 }
 
