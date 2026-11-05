@@ -50,3 +50,34 @@ fn a_line_citing_a_proposed_adr_says_it_is_proposed() {
         .collect();
     assert!(unmarked.is_empty(), "{unmarked:#?}");
 }
+
+/// Every Markdown file under `docs/`, its path relative to `docs/`.
+fn docs_markdown() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
+    let mut found = Vec::new();
+    let mut dirs = vec![root.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "md") {
+                let name = path.strip_prefix(&root).unwrap().display().to_string();
+                found.push((name, fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_verdict_on_a_field_not_enforced_is_spelled_out_in_one_document() {
+    // A proposed output format copied into several documents drifts; the
+    // others name the rule and point to the one that gives it.
+    let spelled_out: Vec<String> = docs_markdown()
+        .into_iter()
+        .filter(|(_, text)| text.contains("field not enforced: ") || text.contains("not_enforced"))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(spelled_out.len(), 1, "{spelled_out:?}");
+}
