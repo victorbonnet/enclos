@@ -68,7 +68,7 @@ impl Engine {
     ) -> Result<Look<'static>> {
         match open.is_empty() {
             true => Ok(Look::nothing_open()),
-            false => Ok(Look::now(&self.markers(name))?.in_cgroups(&self.cgroups(), open)?),
+            false => Ok(Look::now(&self.markers(name), &self.cgroups(), open)?),
         }
     }
 
@@ -76,7 +76,7 @@ impl Engine {
     /// included.
     pub(super) fn look_now(&self, name: &SandboxName) -> Result<Look<'static>> {
         let open = self.state.sessions(name, true)?;
-        Ok(Look::now(&self.markers(name))?.in_cgroups(&self.cgroups(), &open)?)
+        Ok(Look::now(&self.markers(name), &self.cgroups(), &open)?)
     }
 
     /// Stops `session`'s members, with what holds its marker or is in its
@@ -92,7 +92,7 @@ impl Engine {
         Ok(look::stop_marked(
             session,
             grace,
-            || Ok(Look::now(&dir)?.in_cgroups(&cgroups, [session])?),
+            || Look::now(&dir, &cgroups, [session]),
             |session, grace| stop(&cgroups, session, grace),
             is_same,
         )?)

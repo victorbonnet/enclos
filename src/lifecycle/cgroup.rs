@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::descriptors::PROC;
-use super::process::PsError;
-use crate::model::session::Cgroup;
+use super::process::{Proc, PsError};
+use crate::model::session::{Cgroup, ProcessRef};
 
 pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -408,6 +408,24 @@ impl Scope {
             None => Ok(()),
         }
     }
+}
+
+/// The listed processes among `pids`, each known by its start time, and the
+/// pids the listing does not show. Those listed are sure members of the
+/// session whose cgroup or marker gave `pids`; one not listed has no start
+/// time to be known by, so it is never signalled, but the session is not over.
+pub fn members_in(procs: &[Proc], pids: &BTreeSet<u32>) -> (Vec<ProcessRef>, BTreeSet<u32>) {
+    let listed: Vec<ProcessRef> = procs
+        .iter()
+        .filter(|p| pids.contains(&p.pid))
+        .map(|p| ProcessRef {
+            pid: p.pid,
+            started: p.started.clone(),
+        })
+        .collect();
+    let shown: BTreeSet<u32> = listed.iter().map(|r| r.pid).collect();
+    let unlisted = pids.difference(&shown).copied().collect();
+    (listed, unlisted)
 }
 
 /// Whether `e`, from reading a cgroup's folder, says the cgroup was removed.
@@ -930,5 +948,21 @@ mod tests {
         scope.end_asking(|| Ok(None), Duration::ZERO).unwrap();
         let failed = || Err(PsError::Cgroup("no systemctl".into()));
         assert!(scope.end_asking(failed, Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn the_listed_pids_are_known_by_their_start_and_the_others_are_kept_apart() {
+        let listed = |pid: u32| Proc {
+            pid,
+            ppid: 1,
+            pgid: pid,
+            started: format!("start {pid}"),
+            command: "sleep".into(),
+        };
+        let procs = [listed(5), listed(7), listed(9)];
+        let (known, unlisted) = members_in(&procs, &BTreeSet::from([7, 9, 11]));
+        let starts: Vec<_> = known.iter().map(|r| (r.pid, r.started.as_str())).collect();
+        assert_eq!(starts, [(7, "start 7"), (9, "start 9")]);
+        assert_eq!(unlisted, BTreeSet::from([11]));
     }
 }

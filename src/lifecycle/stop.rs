@@ -12,9 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use super::cgroup::Hierarchy;
+use super::cgroup::{Hierarchy, members_in};
 use super::members::{Found, find};
-use super::process::{Proc, PsError, Signal, Signalled, processes, signal_group, signal_process};
+use super::process::{PsError, Signal, Signalled, processes, signal_group, signal_process};
 use crate::model::session::{Member, ProcessRef, SessionRecord};
 
 /// How long members have to exit after TERM, and again after KILL.
@@ -162,27 +162,16 @@ fn look(
     let Some(cgroup) = &session.cgroup else {
         return Ok(find(&procs, session, known));
     };
-    let unlisted = |pids: &BTreeSet<u32>, procs: &[Proc]| -> BTreeSet<u32> {
-        let listed: BTreeSet<u32> = procs.iter().map(|p| p.pid).collect();
-        pids.difference(&listed).copied().collect()
-    };
-    let mut inside = cgroups.pids(cgroup)?;
-    if !unlisted(&inside, &procs).is_empty() {
+    let mut inside = members_in(&procs, &cgroups.pids(cgroup)?);
+    if !inside.1.is_empty() {
         procs = processes()?;
-        inside = cgroups.pids(cgroup)?;
+        inside = members_in(&procs, &cgroups.pids(cgroup)?);
     }
+    let (listed, unlisted) = inside;
     let mut known = known.to_vec();
-    known.extend(
-        procs
-            .iter()
-            .filter(|p| inside.contains(&p.pid))
-            .map(|p| ProcessRef {
-                pid: p.pid,
-                started: p.started.clone(),
-            }),
-    );
+    known.extend(listed);
     let mut found = find(&procs, session, &known);
-    found.extend(unlisted(&inside, &procs).into_iter().map(|pid| Found {
+    found.extend(unlisted.into_iter().map(|pid| Found {
         member: Member {
             pid,
             started: String::new(),
