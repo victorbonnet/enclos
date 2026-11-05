@@ -8,14 +8,18 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     Telegram,
+    /// The enclos mobile app, through the host's bridge (ADR 0042,
+    /// proposed): no bot of a messaging service, and no host to reach.
+    App,
 }
 
 impl Channel {
-    pub const ALL: [Channel; 1] = [Channel::Telegram];
+    pub const ALL: [Channel; 2] = [Channel::Telegram, Channel::App];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Channel::Telegram => "telegram",
+            Channel::App => "app",
         }
     }
 
@@ -23,6 +27,7 @@ impl Channel {
     pub fn display_name(self) -> &'static str {
         match self {
             Channel::Telegram => "Telegram",
+            Channel::App => "enclos app",
         }
     }
 
@@ -34,14 +39,18 @@ impl Channel {
     pub fn token_variable(self) -> &'static str {
         match self {
             Channel::Telegram => "TELEGRAM_BOT_TOKEN",
+            // The agent's token, which the bridge presents to its plugin.
+            Channel::App => "MOBILE_APP_TOKEN",
         }
     }
 
     /// The host its bot reaches, which the policy must allow for the bot
-    /// to work.
-    pub fn host(self) -> &'static str {
+    /// to work; `None` for a channel that reaches out to nothing, as the
+    /// app's, which the bridge dials into.
+    pub fn host(self) -> Option<&'static str> {
         match self {
-            Channel::Telegram => "api.telegram.org",
+            Channel::Telegram => Some("api.telegram.org"),
+            Channel::App => None,
         }
     }
 }
@@ -116,7 +125,15 @@ mod tests {
     #[test]
     fn channels_and_users_parse() {
         assert_eq!("telegram".parse::<Channel>(), Ok(Channel::Telegram));
+        assert_eq!("app".parse::<Channel>(), Ok(Channel::App));
+        assert_eq!(Channel::App.host(), None);
         assert!("slack".parse::<Channel>().is_err());
+        // The policy grants each channel's token as a secret, so its name
+        // must be one a policy may grant.
+        for channel in Channel::ALL {
+            let token = channel.token_variable();
+            assert!(!crate::model::secret::reserved_variable(token), "{token}");
+        }
         assert_eq!(
             "123456789".parse::<ChannelUser>().unwrap().as_str(),
             "123456789"

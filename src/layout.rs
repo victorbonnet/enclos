@@ -226,6 +226,14 @@ impl Layout {
             .join(format!("{agent}{AGENT_SECRETS_SUFFIX}"))
     }
 
+    /// The socket an agent's app channel plugin listens on, in the sandbox
+    /// home, and enclos's bridge connects to (ADR 0042, proposed).
+    pub fn agent_app_socket(&self, name: &str, agent: &str) -> PathBuf {
+        self.sandbox_home(name)
+            .join(".enclos-app")
+            .join(format!("{agent}.sock"))
+    }
+
     /// What enclos stages for an install or an import, beside the home:
     /// the host writes it, and the sandbox reads it and never writes it.
     pub fn sandbox_installers(&self, name: &str) -> PathBuf {
