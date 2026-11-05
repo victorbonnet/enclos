@@ -1,4 +1,4 @@
-//! A bubblewrap sandbox for real (M3-15): only in CI's `bubblewrap` job, on
+//! A bubblewrap sandbox for real: only in CI's `bubblewrap` job, on
 //! GitHub's Ubuntu runners, since it runs bubblewrap, makes namespaces,
 //! starts scopes in the runner's user manager and plants files in its home.
 //! Each test makes a sandbox in a throwaway `ENCLOS_HOME` under the

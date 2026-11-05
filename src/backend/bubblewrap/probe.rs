@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(probe(&stand.host()), Probe::Available);
     }
 
-    /// What was found, what is needed and what to do (issue #102, M3-15).
+    /// The refusal says what was found, what is needed and what to do.
     #[test]
     fn systemd_older_than_254_is_refused_with_what_was_found_and_what_to_do() {
         let stand = Stand::new();

@@ -141,7 +141,7 @@ impl Backend for Bubblewrap {
 
     fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
         Err(
-            "cannot be tested yet: the bubblewrap backend's escape probes are not in this build (milestone 3, M3-17)"
+            "cannot be tested yet: the bubblewrap backend's escape probes are not in this build"
                 .to_owned(),
         )
     }

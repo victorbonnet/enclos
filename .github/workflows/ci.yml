@@ -172,7 +172,7 @@ jobs:
           runtime_dir="/run/user/$(id -u)"
           echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
           timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
-      # The least setting M3-01 found (design §5, Linux hosts): none where
+      # The least setting the host survey found (design §5, Linux hosts): none where
       # bubblewrap runs as installed, as on 26.04, whose own rule the
       # profile would break; else the profile docs/getting-started.md gives,
       # which Ubuntu 24.04's restriction on user namespaces needs.

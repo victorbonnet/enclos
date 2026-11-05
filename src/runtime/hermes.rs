@@ -1,9 +1,8 @@
-//! The Hermes Agent adapter (Nous Research), from the milestone 1 prototype
-//! (issue #5): installed per sandbox with Hermes's own installer (ADR 0020),
-//! meant to be logged in with a ChatGPT subscription through Hermes's
-//! device-code flow, each agent a Hermes profile under `~/.hermes/profiles`,
-//! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
-//! the prototype used them (design §14: to verify in this build).
+//! The Hermes Agent adapter (Nous Research): installed per sandbox with
+//! Hermes's own installer (ADR 0020), meant to be logged in with a ChatGPT
+//! subscription through Hermes's device-code flow, each agent a Hermes
+//! profile under `~/.hermes/profiles`, all sharing the sandbox's one Hermes
+//! login (`~/.hermes/auth.json`) (design §14: to verify in this build).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -127,7 +126,7 @@ impl RuntimeAdapter for Hermes {
     fn login(&self) -> String {
         // Hermes's setup wizard: the provider and its login, the model, and
         // optional sections. `hermes model` covers only provider, login and
-        // model, which the prototype used (`setup` in the sandbox: to verify).
+        // model, all a login needs (`setup` in the sandbox: to verify).
         // For the root profile, whose login every agent shares: without `-p`,
         // Hermes uses the profile `hermes profile use` last saved in
         // `~/.hermes/active_profile` (`hermes_cli/main.py`, Hermes 0.22.2).
@@ -290,7 +289,7 @@ impl RuntimeAdapter for Hermes {
             // Not on disk where enclos can rely on it: `pyproject.toml` says
             // 0.0.0 (to verify, design §14).
             version: None,
-            // Agents share the root login (prototype, issue #5).
+            // Agents share the root login.
             login: Some(at(".hermes/auth.json")),
             // Where the installer puts Hermes itself.
             install: Some(at(".hermes/hermes-agent")),
@@ -334,7 +333,7 @@ impl RuntimeAdapter for Hermes {
 
     fn services(&self) -> Vec<RuntimeService> {
         // One gateway per Hermes home serves every agent: cron, housekeeping
-        // and, later, messaging (prototype, issue #5). The backend starts
+        // and, later, messaging. The backend starts
         // programs from an empty environment, which clears the markers
         // Hermes reads to find its supervisor (`XPC_SERVICE_NAME` for
         // launchd, `INVOCATION_ID` for systemd), so the flag says that one

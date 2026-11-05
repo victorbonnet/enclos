@@ -291,9 +291,9 @@ pub trait RuntimeAdapter {
     }
     /// The runtime's own command that creates agent `name` from `archive`,
     /// an export made with the runtime's own command (for Hermes, `hermes
-    /// profile export`), run in the sandbox by `enclos agent add --from`
-    /// (issue #34). `archive` is a host path beside the sandbox home, which
-    /// the sandbox reads and never writes; the runtime extracts it inside
+    /// profile export`), run in the sandbox by `enclos agent add --from`.
+    /// `archive` is a host path beside the sandbox home, which the sandbox
+    /// reads and never writes; the runtime extracts it inside
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
@@ -349,7 +349,7 @@ pub trait RuntimeAdapter {
         None
     }
 
-    // What `enclos status` shows (issue #29). Each answer may be "cannot
+    // What `enclos status` shows. Each answer may be "cannot
     // tell", and a runtime that names nothing still gets sizes.
 
     /// Parts of the home counted on their own.

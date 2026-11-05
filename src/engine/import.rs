@@ -1,8 +1,8 @@
 //! Importing an agent from an export the runtime made on the host:
-//! `enclos agent add <sandbox>/<agent> --from <archive>` (issue #34, design
-//! §9 "Agents imported from the host"). The host copies the archive beside
-//! the sandbox home and the runtime extracts it inside the sandbox; enclos
-//! never looks inside it.
+//! `enclos agent add <sandbox>/<agent> --from <archive>` (design §9
+//! "Agents imported from the host"). The host copies the archive beside the
+//! sandbox home and the runtime extracts it inside the sandbox; enclos never
+//! looks inside it.
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
