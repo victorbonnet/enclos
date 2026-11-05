@@ -40,7 +40,7 @@ impl Channel {
         match self {
             Channel::Telegram => "TELEGRAM_BOT_TOKEN",
             // The agent's token, which the bridge presents to its plugin.
-            Channel::App => "ENCLOS_APP_TOKEN",
+            Channel::App => "MOBILE_APP_TOKEN",
         }
     }
 
@@ -128,6 +128,12 @@ mod tests {
         assert_eq!("app".parse::<Channel>(), Ok(Channel::App));
         assert_eq!(Channel::App.host(), None);
         assert!("slack".parse::<Channel>().is_err());
+        // The policy grants each channel's token as a secret, so its name
+        // must be one a policy may grant.
+        for channel in Channel::ALL {
+            let token = channel.token_variable();
+            assert!(!crate::model::secret::reserved_variable(token), "{token}");
+        }
         assert_eq!(
             "123456789".parse::<ChannelUser>().unwrap().as_str(),
             "123456789"

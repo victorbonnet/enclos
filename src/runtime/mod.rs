@@ -381,7 +381,7 @@ pub trait RuntimeAdapter {
     /// plugin the runtime loads, the commands that turn it on once it is in
     /// place, and the settings that tell it its socket, `socket`, a path in
     /// the sandbox home that enclos's bridge connects to. The agent's token
-    /// is a secret the policy grants it as `ENCLOS_APP_TOKEN`. `None`: the
+    /// is a secret the policy grants it as `MOBILE_APP_TOKEN`. `None`: the
     /// runtime has no such channel.
     fn app_channel(&self, _agent: &RuntimeAgentName, _socket: &Path) -> Option<AppChannel> {
         None
