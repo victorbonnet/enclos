@@ -3,16 +3,16 @@
 //! launch`. What differs between them is [`Starting`] and what they do
 //! once the program runs and before it is recorded.
 //!
-//! The order is load-bearing. On a host whose systemd is too old for a scope
-//! nothing starts, so the check comes first. The program does not start until the policy
-//! compiles and the secrets are read; the proxy a command needs starts
-//! between the two, and stays if a later step fails. The program starts
-//! holding a marker, which is named after it before the session is
-//! recorded, so that a session started here has its marker. A failure
-//! before the session is recorded kills the program, so that no session
-//! stays open for a program that is ended; a kill that fails is reported.
-//! In a scope (design §8) its cgroup is ended too, with what the program
-//! started meanwhile; with none, only the program is killed.
+//! The order is load-bearing. On a host whose systemd is too old for a
+//! scope nothing starts, so the check comes first. The program does not
+//! start until the policy compiles and the secrets are read; the proxy a
+//! command needs starts between the two, and stays if a later step fails.
+//! The program starts holding a marker, which is named after it before the
+//! session is recorded, so that a session started here has its marker. A
+//! failure before the session is recorded kills the program, so that no
+//! session stays open for a program that is ended; a kill that fails is
+//! reported. In a scope (design §8) its cgroup is ended too, with what the
+//! program started meanwhile; with none, only the program is killed.
 
 use std::ffi::OsString;
 use std::io;

@@ -563,8 +563,6 @@ mod tests {
         }
     }
 
-    /// Each capability is a line of its own, its value in one column, and a
-    /// long note wraps within that column, never back to the margin.
     /// Where sessions run in no scope, as on macOS, nothing is said of it.
     #[test]
     fn a_host_with_no_scopes_says_nothing_of_systemd() {
@@ -606,6 +604,8 @@ mod tests {
         assert!(json(&d)["systemd"]["version"].is_null());
     }
 
+    /// Each capability is a line of its own, its value in one column, and a
+    /// long note wraps within that column, never back to the margin.
     #[test]
     fn each_capability_is_a_line_and_a_long_note_keeps_its_column() {
         let mut d = doctor(compiles());

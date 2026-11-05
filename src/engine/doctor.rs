@@ -214,10 +214,11 @@ pub const MAX_LINES: usize = 2000;
 
 impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
-    /// systemd is too old or cannot be read, enclos's records cannot be read, or a sandbox's backend does not
-    /// run, its next session cannot compile its policy, or enclos could not
-    /// look at all of it. A compiled policy that changed, and a secret found
-    /// in a runtime's settings, are reported, not problems.
+    /// systemd is too old or cannot be read, enclos's records cannot be
+    /// read, or a sandbox's backend does not run, its next session cannot
+    /// compile its policy, or enclos could not look at all of it. A compiled
+    /// policy that changed, and a secret found in a runtime's settings, are
+    /// reported, not problems.
     pub fn has_problems(&self) -> bool {
         let sandbox = |s: &SandboxCheck| {
             !s.backend_runs()

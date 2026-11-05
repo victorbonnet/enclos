@@ -1,7 +1,7 @@
-//! A session's cgroup (design §8). The first test reads a stand-in for the
-//! cgroup hierarchy and runs anywhere. Those named `on_a_runner` start real
+//! A session's cgroup (design §8). Tests named `on_a_runner` start real
 //! scopes in the user's systemd manager, so only CI's `cgroups` job runs
-//! them.
+//! them; the others read a stand-in for the cgroup hierarchy or a stub
+//! `systemd-run`, and run anywhere.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
