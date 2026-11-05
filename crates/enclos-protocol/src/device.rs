@@ -61,6 +61,10 @@ pub enum FromDevice {
     Sync { since: i64 },
     #[serde(rename = "push.token")]
     PushTokenUpdate(PushToken),
+    /// The person forgets this host on the device: the bridge unpairs the
+    /// device, acknowledges, and ends the connection.
+    #[serde(rename = "device.forget")]
+    DeviceForget,
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -78,6 +82,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "attachment.get",
     "sync",
     "push.token",
+    "device.forget",
     "ack",
     "error",
 ];
@@ -241,6 +246,7 @@ mod tests {
                 conversation: ConversationId::new("c-1").unwrap(),
                 seq: 7,
             },
+            FromDevice::DeviceForget,
             FromDevice::AttachmentGet {
                 attachment: "a-1".into(),
                 offset: 45_000,

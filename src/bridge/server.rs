@@ -620,6 +620,22 @@ fn run_session(
                     .set_push_token(&device.id, &push.token)
                     .map_err(|e| e.to_string())?;
             }
+            // The person forgot this host on the device: unpaired, as
+            // `enclos app unpair` does, then the connection ends. The
+            // conversations stay, the person's.
+            FromDevice::DeviceForget => {
+                store.remove_device(&device.id).map_err(|e| e.to_string())?;
+                let _ = store.log(
+                    Some(&device.id),
+                    Some(person),
+                    "unpaired",
+                    Some("forgotten on the device"),
+                );
+                link.send(ToDevice::Ack { of: message.id })?;
+                let _ = link.socket.close(None);
+                let _ = link.socket.flush();
+                return Ok(());
+            }
             _ => {}
         }
     }
