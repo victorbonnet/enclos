@@ -926,7 +926,7 @@ fn send(
 }
 
 #[cfg(test)]
-mod tests {
+mod connection_end_tests {
     use super::*;
 
     #[test]

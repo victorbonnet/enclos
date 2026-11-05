@@ -66,6 +66,9 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
         self._title_checks: dict[str, asyncio.Task] = {}
+        # By conversation: the person's last message, and when it came, so a
+        # file Hermes delivers after a reply (with no reply_to) answers it too.
+        self._last_in: dict[str, tuple[str, float]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -160,6 +163,7 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
+        self._last_in[message["conversation"]] = (message["id"], asyncio.get_running_loop().time())
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
@@ -175,6 +179,8 @@ class EnclosAdapter(BasePlatformAdapter):
     # message may wait in the outbox longer).
 
     MAX_FILE_BYTES = 25 * 1024 * 1024
+    # How long after the person's message a file without reply_to still answers it.
+    FILES_ANSWER_SECONDS = 600
 
     def _stage(self, path: str, name: Optional[str] = None) -> Optional[dict[str, Any]]:
         """A copy of the file in the media folder, as an attachment; None if it cannot be sent."""
@@ -202,6 +208,13 @@ class EnclosAdapter(BasePlatformAdapter):
         files = [a for a in (self._stage(p, n) for p, n in paths) if a]
         if not files and not text:
             return SendResult(success=False, error="the file could not be sent")
+        # Hermes delivers a reply's files apart from its text, without saying
+        # what they answer: within minutes of the person's message, they answer
+        # it; otherwise (a cron job's) they come on their own.
+        if reply_to is None and chat_id in self._last_in:
+            last, at = self._last_in[chat_id]
+            if asyncio.get_running_loop().time() - at < self.FILES_ANSWER_SECONDS:
+                reply_to = last
         message = protocol.message_out(chat_id, text, reply_to, files)
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
