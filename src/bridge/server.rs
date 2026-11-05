@@ -178,15 +178,42 @@ pub fn serve(
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
             match connection(&hub, stream) {
-                // The device hung up: the app closed or replaced its
-                // connection. `enclos app log` has who and when.
-                Err(e) if e == "closed" => eprintln!("enclos app: a device disconnected"),
+                // The device hung up, or went away (a phone that locks, sleeps
+                // or changes network rarely says goodbye): how connections
+                // end, not an error. `enclos app log` has who, when and how.
+                Err(e) if e == CLOSED || e == GONE => {}
                 Err(e) => eprintln!("enclos app: a connection ended: {e}"),
                 Ok(()) => {}
             }
         });
     }
     Ok(())
+}
+
+/// The device closed the connection.
+const CLOSED: &str = "closed";
+/// The device went away without closing it: reset, or just gone.
+const GONE: &str = "went away without closing the connection";
+
+/// Why reading or writing a device's connection failed: [`GONE`] when the
+/// device is simply no longer there, else the error itself.
+fn ended(e: tungstenite::Error) -> String {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset, UnexpectedEof};
+    use tungstenite::error::ProtocolError::ResetWithoutClosingHandshake;
+    match e {
+        tungstenite::Error::Protocol(ResetWithoutClosingHandshake)
+        | tungstenite::Error::ConnectionClosed
+        | tungstenite::Error::AlreadyClosed => GONE.to_owned(),
+        tungstenite::Error::Io(io)
+            if matches!(
+                io.kind(),
+                ConnectionReset | BrokenPipe | ConnectionAborted | UnexpectedEof
+            ) =>
+        {
+            GONE.to_owned()
+        }
+        e => e.to_string(),
+    }
 }
 
 /// What a device's connection is once the handshake is done.
@@ -202,7 +229,7 @@ impl Link {
         let sealed = self.session.encrypt(&plain).map_err(|e| e.to_string())?;
         self.socket
             .send(Message::Binary(sealed.into()))
-            .map_err(|e| e.to_string())
+            .map_err(ended)
     }
 
     /// The next message, `None` while nothing came in time.
@@ -214,7 +241,7 @@ impl Link {
                     .map(Some)
                     .map_err(|e| e.to_string())
             }
-            Ok(Message::Close(_)) => Err("closed".to_owned()),
+            Ok(Message::Close(_)) => Err(CLOSED.to_owned()),
             Ok(_) => Ok(None),
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -224,16 +251,16 @@ impl Link {
             {
                 Ok(None)
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(ended(e)),
         }
     }
 }
 
 fn binary(socket: &mut WebSocket<TcpStream>) -> Result<Vec<u8>, String> {
     loop {
-        match socket.read().map_err(|e| e.to_string())? {
+        match socket.read().map_err(ended)? {
             Message::Binary(bytes) => return Ok(bytes.to_vec()),
-            Message::Close(_) => return Err("closed".to_owned()),
+            Message::Close(_) => return Err(CLOSED.to_owned()),
             _ => {}
         }
     }
@@ -270,9 +297,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         .read_hello(&hello)
         .map_err(|e| refuse(None, Some(&person), &format!("handshake: {e}")))?;
     let (answer, session) = responder.answer().map_err(|e| e.to_string())?;
-    socket
-        .send(Message::Binary(answer.into()))
-        .map_err(|e| e.to_string())?;
+    socket.send(Message::Binary(answer.into())).map_err(ended)?;
     let mut link = Link { socket, session };
     let known = store
         .device_by_noise_key(&noise_key)
@@ -570,4 +595,30 @@ fn send(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_that_goes_away_is_a_disconnection_not_an_error() {
+        use std::io::{Error, ErrorKind};
+        use tungstenite::error::ProtocolError::ResetWithoutClosingHandshake;
+        let gone = [
+            tungstenite::Error::Protocol(ResetWithoutClosingHandshake),
+            tungstenite::Error::ConnectionClosed,
+            tungstenite::Error::Io(Error::from(ErrorKind::ConnectionReset)),
+            tungstenite::Error::Io(Error::from(ErrorKind::BrokenPipe)),
+            tungstenite::Error::Io(Error::from(ErrorKind::UnexpectedEof)),
+        ];
+        for e in gone {
+            assert_eq!(ended(e), GONE);
+        }
+        let other = ended(tungstenite::Error::Io(Error::from(
+            ErrorKind::PermissionDenied,
+        )));
+        assert_ne!(other, GONE);
+        assert_ne!(other, CLOSED);
+    }
 }
