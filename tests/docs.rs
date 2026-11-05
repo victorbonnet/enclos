@@ -373,30 +373,37 @@ const SHARED_DENIES: &[&str] = &[
 fn masks_in_a_writable_folder_come_after_the_arguments_that_bind_it() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
-    for (doc, anchor) in [
-        (design(), "**The order `wrap` keeps:**"),
-        (
-            read("docs/policy-compilation.md"),
-            "`wrap` runs `before_home_mask`",
-        ),
-        (
-            read("src/backend/bubblewrap/compile.rs"),
-            "The arguments `wrap` runs are",
-        ),
-    ] {
+    let in_order = |doc: &str, anchor: &str, words: &[&str]| {
         let text = &doc[doc.find(anchor).expect(anchor)..];
-        let order: Vec<usize> = [
-            "before_home_mask",
-            "after_home_mask",
-            "`unmovable`",
-            "`in_sandbox_home` and `in_workspace`",
-            "`--remount-ro`",
-        ]
-        .iter()
-        .map(|word| text.find(word).expect(word))
-        .collect();
+        let order: Vec<usize> = words
+            .iter()
+            .map(|word| text.find(word).expect(word))
+            .collect();
         assert!(order.is_sorted(), "{anchor}: {order:?}");
-    }
+    };
+    in_order(
+        &design(),
+        "**The order `wrap` keeps:**",
+        &[
+            "the host's files, read-only",
+            "the masks over them",
+            "the writable binds",
+            "each bound on itself",
+            "the masks inside the writable binds",
+            "`--remount-ro`",
+        ],
+    );
+    in_order(
+        &read("docs/policy-compilation.md"),
+        "| `bubblewrap.root` |",
+        &[
+            "`bubblewrap.root`",
+            "`bubblewrap.root_masks`",
+            "`bubblewrap.mounts`",
+            "`bubblewrap.grant_masks`",
+            "`bubblewrap.options`",
+        ],
+    );
 }
 
 /// What compiling leaves open stays written down for the work that picks it up.

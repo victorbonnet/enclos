@@ -1,19 +1,11 @@
 //! Compiling a policy for bubblewrap: its arguments, the Landlock rules and
-//! the seccomp filter, as one JSON file (M3-13, `prototype/m3/compile.py`).
+//! the seccomp filter, as one JSON file.
 //!
 //! Pure: this reads no file, lists no folder and asks nothing of the host,
 //! so paths are expanded and tidied as written, never resolved through a
 //! link, and the output is the same on any system. What depends on the host
-//! is left to `wrap`, at each launch (M3-15): which entries the user's home
-//! holds, each folder of [`HomeMask`] then rebuilt from them, and a session's
-//! variables, which `environment` reads from the host.
-//!
-//! The deny list is not mounted. The arguments `wrap` runs are
-//! `before_home_mask`, what it makes of [`HomeMask`]'s `denied` and
-//! `denied_elsewhere`, `after_home_mask`, its binds of `unmovable`, its masks
-//! of `in_sandbox_home` and `in_workspace`, which a later `--bind` would
-//! uncover, then its `--remount-ro` for each folder it made. So a mask comes
-//! after the bind of the folder that holds it, and before anything is sealed.
+//! is left to `wrap`, at each launch: the masks of the user's home, rebuilt
+//! from what it holds then, and a session's variables.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -132,48 +124,76 @@ const SOCKET_FAMILIES: &[(&str, u64)] = &[
 /// What the file in `compiled/` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledSandbox {
-    pub before_home_mask: Vec<String>,
-    pub home_mask: HomeMask,
-    pub after_home_mask: Vec<String>,
+    pub bubblewrap: Bubblewrap,
     pub landlock: LandlockRules,
     pub seccomp: SeccompFilter,
     pub relay: Relay,
     pub unenforced: Vec<Unenforced>,
 }
 
-/// The masks `wrap` makes at each launch from what the home holds then.
+/// bubblewrap's arguments. `wrap` joins them in field order, then seals each
+/// folder it made with `--remount-ro`: a mask comes after the bind of the
+/// folder that holds it, and before anything is sealed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HomeMask {
-    /// The user's home. Each folder from here down that holds a path of
-    /// `denied` becomes an empty tmpfs with its other entries bound back
-    /// read-only, so a denied path does not exist in the sandbox.
-    pub home: String,
-    pub denied: Vec<String>,
-    /// Deny entries outside the user's home that nothing the sandbox mounts
-    /// covers. `wrap` masks each after the `/` bind: a tmpfs on a folder,
-    /// `/dev/null` on a file, nothing if it is missing, since this area is
-    /// read-only to the sandbox and it cannot be made there.
-    pub denied_elsewhere: Vec<String>,
-    /// Deny entries inside the sandbox's home, which is bound writable:
-    /// masked one by one after that bind.
-    pub in_sandbox_home: Vec<String>,
-    /// Deny entries inside a workspace, masked the same way after its bind.
-    pub in_workspace: Vec<String>,
-    /// The folders inside the sandbox's home or a workspace that hold a mask.
-    /// A mask names a path and the sandbox writes every folder above it, so
-    /// `wrap` binds each on itself, after the grant's bind and before its
-    /// masks: renaming or removing one then gets `EBUSY`.
-    pub unmovable: Vec<String>,
+pub struct Bubblewrap {
+    /// `--ro-bind / /`: the host's files, read-only.
+    pub root: Vec<String>,
+    /// Masks over `root`, which `wrap` makes at each launch.
+    pub root_masks: RootMasks,
+    /// The sandbox's own places, the protected roots outside the user's
+    /// home, the writable binds and what is bound read-only.
+    pub mounts: Vec<String>,
+    /// Masks inside what `mounts` binds writable, which a mask made before
+    /// that bind would not survive.
+    pub grant_masks: GrantMasks,
+    /// The namespaces, `--die-with-parent`, `--clearenv` and `--chdir`,
+    /// whose place among the arguments does not matter.
+    pub options: Vec<String>,
 }
 
-/// What each kind of access is granted beneath; all else is refused.
+/// The masks over the host's files, made by `wrap` from what the host holds
+/// at each launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootMasks {
+    /// The user's home, where `denied` lies.
+    pub home: String,
+    /// Deny entries in the user's home: each folder from `home` down that
+    /// holds one becomes an empty tmpfs with its other entries bound back.
+    pub denied: Vec<String>,
+    /// Deny entries outside the user's home that nothing mounted covers: a
+    /// tmpfs on a folder, `/dev/null` on a file, nothing on a missing path.
+    pub denied_elsewhere: Vec<String>,
+}
+
+/// The masks inside the sandbox's home and the workspaces, each made
+/// whether or not its path exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantMasks {
+    /// Folders that hold a mask, each bound on itself before the masks, so
+    /// renaming or removing one gets `EBUSY`.
+    pub unmovable: Vec<String>,
+    /// Deny entries inside the sandbox's home.
+    pub in_sandbox_home: Vec<String>,
+    /// Deny entries inside a workspace.
+    pub in_workspace: Vec<String>,
+}
+
+/// Where each set of rights is granted, beneath each path. The rights of
+/// rules over one path add up; all else is refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandlockRules {
+    /// Reading files and listing folders.
     pub read: Vec<String>,
+    /// Reading, and running programs.
     pub execute: Vec<String>,
+    /// Reading, and making, writing, renaming and removing files and folders.
     pub write: Vec<String>,
+    /// Reading, writing and truncating files, and `ioctl` on devices.
     pub devices: Vec<String>,
+    /// Reading and writing files, as a process does to set its own values.
     pub proc_write: Vec<String>,
+    /// Landlock's scopes by name, not paths: what a session may not reach
+    /// outside its own Landlock domain.
     pub scoped: Vec<String>,
 }
 
@@ -349,32 +369,32 @@ fn compiled_sandbox(
     .filter(|folder| *folder != home && !workspaces.contains(folder))
     .collect();
 
-    let mut after = args(&["--dev", "/dev", "--proc", "/proc"]);
+    let mut mounts = args(&["--dev", "/dev", "--proc", "/proc"]);
     for place in OWN_TMPFS {
-        after.extend(args(&["--tmpfs", place]));
+        mounts.extend(args(&["--tmpfs", place]));
     }
     for root in &elsewhere {
-        after.extend(["--tmpfs".to_owned(), text(root)?]);
+        mounts.extend(["--tmpfs".to_owned(), text(root)?]);
     }
-    after.extend(["--bind".to_owned(), text(&home)?, text(&home)?]);
+    mounts.extend(["--bind".to_owned(), text(&home)?, text(&home)?]);
     // `-try`: a workspace not made yet does not stop the session, as on
     // Seatbelt, where `policy test` reports it as not run (design §5).
     for workspace in &workspaces {
-        after.extend(["--bind-try".to_owned(), text(workspace)?, text(workspace)?]);
+        mounts.extend(["--bind-try".to_owned(), text(workspace)?, text(workspace)?]);
     }
     let [visible, compiled, secrets] = bound_back.map(text);
     let (visible, compiled, secrets) = (visible?, compiled?, secrets?);
-    after.extend(args(&["--ro-bind", &visible, &visible]));
-    after.extend(args(&["--ro-bind", &compiled, &compiled]));
-    after.extend(args(&["--ro-bind-try", &secrets, &secrets]));
+    mounts.extend(args(&["--ro-bind", &visible, &visible]));
+    mounts.extend(args(&["--ro-bind", &compiled, &compiled]));
+    mounts.extend(args(&["--ro-bind-try", &secrets, &secrets]));
     // Writable while bubblewrap made mount points in it; nothing may write
     // there afterwards.
     for root in &elsewhere {
-        after.extend(["--remount-ro".to_owned(), text(root)?]);
+        mounts.extend(["--remount-ro".to_owned(), text(root)?]);
     }
-    after.extend(args(proposed::NAMESPACES));
-    after.extend(args(&["--die-with-parent", "--clearenv"]));
-    after.extend(["--chdir".to_owned(), text(&home)?]);
+    let mut options = args(proposed::NAMESPACES);
+    options.extend(args(&["--die-with-parent", "--clearenv"]));
+    options.extend(["--chdir".to_owned(), text(&home)?]);
 
     let mut execute = strings(EXEC_SYSTEM);
     execute.push(text(&home)?);
@@ -382,16 +402,21 @@ fn compiled_sandbox(
     write.extend(strings(OWN_TEMPORARY));
 
     Ok(CompiledSandbox {
-        before_home_mask: args(&["--ro-bind", "/", "/"]),
-        home_mask: HomeMask {
-            home: text(&user_home)?,
-            denied: texts(&denied)?,
-            denied_elsewhere: texts(&denied_elsewhere)?,
-            in_sandbox_home: texts(&in_sandbox_home)?,
-            in_workspace: texts(&in_workspace)?,
-            unmovable: texts(&unmovable)?,
+        bubblewrap: Bubblewrap {
+            root: args(&["--ro-bind", "/", "/"]),
+            root_masks: RootMasks {
+                home: text(&user_home)?,
+                denied: texts(&denied)?,
+                denied_elsewhere: texts(&denied_elsewhere)?,
+            },
+            mounts,
+            grant_masks: GrantMasks {
+                unmovable: texts(&unmovable)?,
+                in_sandbox_home: texts(&in_sandbox_home)?,
+                in_workspace: texts(&in_workspace)?,
+            },
+            options,
         },
-        after_home_mask: after,
         landlock: LandlockRules {
             read: strings(&["/"]),
             execute,
@@ -509,6 +534,12 @@ mod tests {
         compiled_sandbox(p, &ctx()).unwrap()
     }
 
+    /// The arguments compiled as they are, not made by `wrap` from a list.
+    fn fixed_arguments(c: &CompiledSandbox) -> impl Iterator<Item = &String> {
+        let b = &c.bubblewrap;
+        b.root.iter().chain(&b.mounts).chain(&b.options)
+    }
+
     /// The value after each `option` in `words`.
     fn after<'a>(words: &'a [String], option: &str) -> Vec<&'a str> {
         words
@@ -568,12 +599,12 @@ mod tests {
         let (p, ctx) = resolved_linux_case();
         assert_eq!(ctx.protected.len(), 4, "{:?}", ctx.protected);
         let c = compiled_sandbox(&p, &ctx).unwrap();
-        let args = &c.after_home_mask;
+        let args = &c.bubblewrap.mounts;
         let first_bind = args.iter().position(|a| a.starts_with("--bind")).unwrap();
         for root in &ctx.protected {
             let root = root.to_str().unwrap();
             if root.starts_with(USER) {
-                assert!(c.home_mask.denied.contains(&root.to_owned()), "{root}");
+                assert!(c.bubblewrap.root_masks.denied.contains(&root.to_owned()), "{root}");
             } else {
                 let at = args.iter().position(|a| a == root).unwrap();
                 assert_eq!(args[at - 1], "--tmpfs", "{root}");
@@ -606,16 +637,44 @@ mod tests {
         }
     }
 
+    /// `wrap` joins bubblewrap's arguments in the order the file holds them,
+    /// so the masks over what a mount binds must come after that mount.
+    #[test]
+    fn bubblewraps_arguments_are_held_in_the_order_wrap_joins_them() {
+        let text = compile(&policy(&["{home}", "~/proj"], &["~/proj/.env"]), &ctx())
+            .unwrap()
+            .text;
+        let at: Vec<usize> = ["bubblewrap", "root", "root_masks", "mounts", "grant_masks", "options", "landlock"]
+            .iter()
+            .map(|field| text.find(&format!("\"{field}\": ")).expect(field))
+            .collect();
+        assert!(at.is_sorted(), "{at:?}");
+        let c = compiled(&policy(&["{home}", "~/proj"], &["~/proj/.env"]));
+        let b = &c.bubblewrap;
+        for option in proposed::NAMESPACES
+            .iter()
+            .chain(&["--die-with-parent", "--clearenv", "--chdir"])
+        {
+            assert!(b.options.iter().any(|a| a == option), "{option}");
+            assert!(!b.mounts.iter().any(|a| a == option), "{option}");
+        }
+        for mount in ["--dev", "--proc", "--tmpfs", "--bind", "--bind-try", "--ro-bind"] {
+            assert!(b.mounts.iter().any(|a| a == mount), "{mount}");
+            assert!(!b.options.iter().any(|a| a == mount), "{mount}");
+        }
+        assert_eq!(b.grant_masks.in_workspace, [format!("{USER}/proj/.env")]);
+    }
+
     #[test]
     fn a_denied_path_is_named_for_the_mask_and_never_bound() {
         let c = compiled(&policy(&["{home}"], &["~/.ssh", "~/.config/google-chrome"]));
-        assert_eq!(c.home_mask.home, USER);
+        assert_eq!(c.bubblewrap.root_masks.home, USER);
         assert_eq!(
-            c.home_mask.denied,
+            c.bubblewrap.root_masks.denied,
             protected_and(&[".config/google-chrome", ".ssh"])
         );
-        assert_eq!(c.before_home_mask, ["--ro-bind", "/", "/"]);
-        assert!(!c.after_home_mask.iter().any(|a| a.contains("/.ssh")));
+        assert_eq!(c.bubblewrap.root, ["--ro-bind", "/", "/"]);
+        assert!(!fixed_arguments(&c).any(|a| a.contains("/.ssh")));
     }
 
     /// A session starts without a workspace not made yet, as on Seatbelt,
@@ -624,7 +683,7 @@ mod tests {
     #[test]
     fn a_workspace_not_made_yet_does_not_stop_the_session() {
         let c = compiled(&policy(&["{home}", "~/proj"], &[]));
-        let args = &c.after_home_mask;
+        let args = &c.bubblewrap.mounts;
         assert_eq!(
             after(args, "--bind"),
             [format!("{USER}/.enclos/sandboxes/home/home")]
@@ -636,18 +695,18 @@ mod tests {
     #[test]
     fn a_deny_entry_under_the_sandboxs_own_tmpfs_needs_no_mask() {
         let c = compiled(&policy(&["{home}"], &["/run/user", "/tmp/x"]));
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
-        assert!(c.home_mask.denied_elsewhere.is_empty());
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
+        assert!(c.bubblewrap.root_masks.denied_elsewhere.is_empty());
     }
 
     #[test]
     fn the_masked_host_paths_come_after_the_devices_whatever_the_policy() {
         let c = compiled(&Policy::default());
         assert_eq!(
-            after(&c.after_home_mask, "--tmpfs"),
+            after(&c.bubblewrap.mounts, "--tmpfs"),
             ["/tmp", "/var/tmp", "/run", "/dev/shm"]
         );
-        let at = |word: &str| c.after_home_mask.iter().position(|a| a == word).unwrap();
+        let at = |word: &str| c.bubblewrap.mounts.iter().position(|a| a == word).unwrap();
         assert!(at("--dev") < at("--tmpfs"));
         assert!(at("--tmpfs") < at("--bind"));
     }
@@ -655,7 +714,7 @@ mod tests {
     #[test]
     fn the_protected_paths_are_masked_whatever_the_policy_says() {
         let c = compiled(&policy(&[], &[]));
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
     }
 
     /// Outside the home no mask reaches them, so each gets its own tmpfs,
@@ -665,9 +724,9 @@ mod tests {
         let layout = Layout::at("/srv/enclos").with_user_home(USER);
         let ctx = on_linux(&layout);
         let c = compiled_sandbox(&policy(&["{home}"], &[]), &ctx).unwrap();
-        let args = &c.after_home_mask;
+        let args = &c.bubblewrap.mounts;
         assert_eq!(
-            c.home_mask.denied,
+            c.bubblewrap.root_masks.denied,
             [
                 format!("{USER}/.config/systemd/user"),
                 format!("{USER}/.local/share/systemd/user")
@@ -698,9 +757,10 @@ mod tests {
         let ctx = on_linux(&layout);
         let real = real.to_str().unwrap();
         let c = compiled_sandbox(&policy(&["{home}"], &[]), &ctx).unwrap();
-        let args = &c.after_home_mask;
+        let args = &c.bubblewrap.mounts;
         assert!(
-            c.home_mask
+            c.bubblewrap
+                .root_masks
                 .denied
                 .contains(&format!("{}/e", user.display()))
         );
@@ -730,7 +790,7 @@ mod tests {
     #[test]
     fn the_sandbox_gets_its_own_folders_and_only_those() {
         let c = compiled(&policy(&["{home}", "~/proj"], &[]));
-        let args = &c.after_home_mask;
+        let args = &c.bubblewrap.mounts;
         let sandbox = format!("{USER}/.enclos/sandboxes/home");
         assert_eq!(after(args, "--bind"), [format!("{sandbox}/home")]);
         assert_eq!(after(args, "--bind-try"), [format!("{USER}/proj")]);
@@ -791,7 +851,7 @@ mod tests {
             "--clearenv",
             "--die-with-parent",
         ] {
-            assert!(c.after_home_mask.iter().any(|a| a == option), "{option}");
+            assert!(c.bubblewrap.options.iter().any(|a| a == option), "{option}");
         }
     }
 
@@ -830,10 +890,10 @@ mod tests {
             &["/opt/secrets", "/var/snap/lxd", "/var/run/docker.sock"],
         ));
         assert_eq!(
-            c.home_mask.denied_elsewhere,
+            c.bubblewrap.root_masks.denied_elsewhere,
             ["/opt/secrets", "/var/run/docker.sock", "/var/snap/lxd"]
         );
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
     }
 
     #[test]
@@ -842,7 +902,7 @@ mod tests {
         let snap = resolve(&initial_overrides("home", &name), None).unwrap();
         let c = compiled(&snap.policy);
         assert_eq!(
-            c.home_mask.denied_elsewhere,
+            c.bubblewrap.root_masks.denied_elsewhere,
             ["/var/lib/incus", "/var/lib/lxd", "/var/snap/lxd"]
         );
     }
@@ -879,9 +939,9 @@ mod tests {
             &["~/Pictures"],
             &["~/Pictures/Photos Library.photoslibrary"],
         ));
-        assert_eq!(c.home_mask.in_workspace, std::slice::from_ref(&entry));
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
-        assert!(!c.after_home_mask.contains(&entry));
+        assert_eq!(c.bubblewrap.grant_masks.in_workspace, std::slice::from_ref(&entry));
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
+        assert!(!fixed_arguments(&c).any(|a| *a == entry));
     }
 
     /// Before the arms for what is hidden already: the workspace's bind
@@ -889,7 +949,7 @@ mod tests {
     #[test]
     fn a_deny_entry_inside_a_workspace_under_the_sandboxs_own_tmpfs_is_masked() {
         let c = compiled(&policy(&["/tmp/proj"], &["/tmp/proj/.env"]));
-        assert_eq!(c.home_mask.in_workspace, ["/tmp/proj/.env"]);
+        assert_eq!(c.bubblewrap.grant_masks.in_workspace, ["/tmp/proj/.env"]);
     }
 
     /// `~/.cargo` granted: the login the host trusts must not be writable,
@@ -904,7 +964,7 @@ mod tests {
             ],
         ));
         assert_eq!(
-            c.home_mask.in_workspace,
+            c.bubblewrap.grant_masks.in_workspace,
             [
                 "/nonexistent-enclos-test/alice/.cargo/credentials.toml",
                 "/nonexistent-enclos-test/proj/.env"
@@ -960,7 +1020,7 @@ mod tests {
     fn a_deny_entry_in_the_sandbox_home_is_kept_for_its_own_mask() {
         let c = compiled(&policy(&["{home}"], &["{home}/private"]));
         assert_eq!(
-            c.home_mask.in_sandbox_home,
+            c.bubblewrap.grant_masks.in_sandbox_home,
             [format!("{USER}/.enclos/sandboxes/home/home/private")]
         );
     }
@@ -968,8 +1028,8 @@ mod tests {
     #[test]
     fn an_entry_that_holds_the_home_leaves_it_bound() {
         let c = compiled(&policy(&["{home}"], &["~/.enclos/sandboxes"]));
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
-        assert!(after(&c.after_home_mask, "--bind")[0].ends_with("/sandboxes/home/home"));
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
+        assert!(after(&c.bubblewrap.mounts, "--bind")[0].ends_with("/sandboxes/home/home"));
     }
 
     /// These folders are bound back after a protected root is hidden, so
@@ -997,7 +1057,7 @@ mod tests {
             &["~/proj/config/deep/.env", "{home}/a/key"],
         ));
         assert_eq!(
-            c.home_mask.unmovable,
+            c.bubblewrap.grant_masks.unmovable,
             [
                 format!("{USER}/.enclos/sandboxes/home/home/a"),
                 format!("{USER}/proj/config"),
@@ -1011,9 +1071,9 @@ mod tests {
     fn a_folder_with_no_mask_below_it_is_not_listed() {
         let c = compiled(&policy(&["{home}", "~/proj"], &["~/proj/.env", "{home}/x"]));
         assert!(
-            c.home_mask.unmovable.is_empty(),
+            c.bubblewrap.grant_masks.unmovable.is_empty(),
             "{:?}",
-            c.home_mask.unmovable
+            c.bubblewrap.grant_masks.unmovable
         );
     }
 
@@ -1021,7 +1081,7 @@ mod tests {
     #[test]
     fn a_deny_entry_under_a_protected_root_and_not_bound_back_stays_hidden() {
         let c = compiled(&policy(&["{home}"], &["~/.enclos/sandboxes/other/secrets"]));
-        assert_eq!(c.home_mask.denied, protected_and(&[]));
+        assert_eq!(c.bubblewrap.root_masks.denied, protected_and(&[]));
     }
 
     /// Nothing of the host reaches the output: a link stays as written, and
