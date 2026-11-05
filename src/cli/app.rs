@@ -217,18 +217,38 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
         .read_line(&mut answer)
         .map_err(|e| failed(e.to_string()))?;
     let accept = matches!(answer.trim(), "y" | "Y" | "yes");
-    store
+    let left =
+        || failed("the device left before it was paired: run `enclos app pair` again".to_owned());
+    if !store
         .decide_pairing(&code, if accept { "accept" } else { "decline" })
-        .map_err(|e| failed(e.to_string()))?;
-    println!(
-        "{}",
-        if accept {
-            "Paired."
-        } else {
-            "Declined: the device is not paired."
+        .map_err(|e| failed(e.to_string()))?
+    {
+        // The bridge had its word first: the device left.
+        return Err(left());
+    }
+    if !accept {
+        println!("Declined: the device is not paired.");
+        return Ok(exit::OK);
+    }
+    // Paired once the device has its answer, which the bridge says.
+    for _ in 0..20 {
+        match store
+            .pairing_decision(&code)
+            .map_err(|e| failed(e.to_string()))?
+            .as_deref()
+        {
+            Some("paired") => {
+                println!("Paired.");
+                return Ok(exit::OK);
+            }
+            Some("gone") => return Err(left()),
+            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
         }
-    );
-    Ok(exit::OK)
+    }
+    Err(failed(
+        "accepted, but the bridge did not answer the device: is `enclos app serve` running?"
+            .to_owned(),
+    ))
 }
 
 fn when(seconds: Option<i64>) -> String {

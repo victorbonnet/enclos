@@ -416,6 +416,14 @@ fn pair(
     {
         return Err(refused(link, "used"));
     }
+    // While the person decides in the terminal, the device's connection is
+    // read: that answers its pings (an app drops a connection that does not
+    // answer them within its interval, 30 s for the enclos app), and shows
+    // when it left, which the terminal is then told.
+    link.socket
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|e| e.to_string())?;
     let waited = std::time::Instant::now();
     let decision = loop {
         if let Some(decision) = store.pairing_decision(&code).map_err(|e| e.to_string())? {
@@ -424,7 +432,30 @@ fn pair(
         if waited.elapsed() > PAIRING_WAIT {
             return Err(refused(link, "expired"));
         }
-        std::thread::sleep(Duration::from_millis(500));
+        let left = match link.socket.read() {
+            Ok(Message::Close(_)) => true,
+            Ok(_) => false,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(_) => true,
+        };
+        // The pong a ping asked for goes out now, not with the next message.
+        if left || link.socket.flush().is_err() {
+            let _ = store.decide_pairing(&code, "gone");
+            let _ = store.log(
+                None,
+                Some(person),
+                "refused",
+                Some("the device left before the answer"),
+            );
+            return Err("the device left before the answer".to_owned());
+        }
     };
     if decision != "accept" {
         return Err(refused(link, "declined"));
@@ -441,10 +472,23 @@ fn pair(
         seen: None,
     };
     store.add_device(&device).map_err(|e| e.to_string())?;
-    link.send(ToDevice::PairAccepted {
+    // A device that does not get its answer has no id to come back with:
+    // it is not kept, and the terminal is told.
+    if let Err(e) = link.send(ToDevice::PairAccepted {
         device: device.id.clone(),
         push_key: encode(&device.push_key),
-    })?;
+    }) {
+        let _ = store.remove_device(&device.id);
+        let _ = store.settle_pairing(&code, "gone");
+        let _ = store.log(
+            None,
+            Some(person),
+            "refused",
+            Some("the device left before the answer"),
+        );
+        return Err(e);
+    }
+    let _ = store.settle_pairing(&code, "paired");
     Ok(device)
 }
 
