@@ -18,7 +18,7 @@ Decision (proposed), on the bubblewrap backend:
 - **`status` names the command, with no URL.** It says to run `enclos dashboard <sandbox>`, and over ssh with `-L` on a remote host. On macOS it shows the dashboard as before.
 - **Listening.** `policy show` and `policy test` say that the sandbox may listen, and that its listeners are reachable from its own sessions and, through `enclos dashboard`, by the user running it. No rule needs to keep the sandbox off enclos's proxy ports: those ports are on the host's loopback, which a sandbox's namespace does not share. `status` naming listeners beyond loopback stays as 0028 has it, since none of them serve the host's network on Linux.
 
-Reason: the network namespace that keeps the sandbox off the host's loopback and network (0004) also keeps the host off the sandbox's listeners, and on this path nothing else looks at who connects, so the check on the owner is what keeps the token from another local user. Milestone 4.1's host-service forward is a different thing, which gives a sandbox a port of the host. The prototype measured the path with Hermes's real dashboard: the page, its assets and WebSockets served to this user, also through `ssh -L`, and a second user refused with no byte and no token, itself and through its own tunnel.
+Reason: the network namespace that keeps the sandbox off the host's loopback and network (0004) also keeps the host off the sandbox's listeners, and on this path nothing else looks at who connects, so the check on the owner is what keeps the token from another local user. Milestone 4.1's host-service forward is a different thing, which gives a sandbox a port of the host. On GitHub's runners the path was measured with Hermes's real dashboard (`prototype/m3/README.md`): the page, its assets and WebSockets served to this user, also through `ssh -L`, and a second user refused with no byte and no token, itself and through its own tunnel.
 
 ## Considered options
 
@@ -30,6 +30,6 @@ Reason: the network namespace that keeps the sandbox off the host's loopback and
 
 - 0028's consequence that a listener bound to every address serves the host's network does not hold on Linux, and the host's browser reaches the dashboard only while `enclos dashboard` runs.
 - The listener runs inside the command, so nothing but the command opens it, and the service's port it serves comes from the host's reading, never from a file the sandbox writes.
-- The Chat tab's terminal is not shown working. On a session's compiled environment it cannot reach its backend until its session has `NO_PROXY` for loopback, and an answer is not shown even then (§14; M3-20).
+- The Chat tab's terminal is not shown working. On a session's compiled environment it cannot reach its backend until its session has `NO_PROXY` for loopback, and an answer is not shown even then (§14).
 - `listen = false` is not held in a sandbox's own network namespace; how that is reported is open (§15).
 - macOS behaves as 0028 says; this ADR changes nothing there.

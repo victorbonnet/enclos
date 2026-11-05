@@ -6,7 +6,7 @@ status: proposed
 
 Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for the bubblewrap backend: a session reaches what any session of its sandbox listens on, not only its service's port.
 
-A session with a network namespace of its own cannot reach the port its runtime's service listens on, which 0028 gives every session of the sandbox: Hermes's chat in another session than its gateway fails with `Gateway connection failed; no local fallback`. bubblewrap can make a network namespace but has no option to join one. The M3-03 prototype (`prototype/m3/README.md`) shows that a session can join one all the same, on GitHub's Ubuntu 24.04 runners, x86_64 and arm64, and Ubuntu 26.04 runner, x86_64. Its first two runs were refused with EPERM only because the namespace holder was started with `--dev /dev`, which nests a second user namespace: the namespace holder handed out the inner one, while its network namespace belonged to the outer.
+A session with a network namespace of its own cannot reach the port its runtime's service listens on, which 0028 gives every session of the sandbox: Hermes's chat in another session than its gateway fails with `Gateway connection failed; no local fallback`. bubblewrap can make a network namespace but has no option to join one. A session can join one all the same, as shown on GitHub's Ubuntu 24.04 runners, x86_64 and arm64, and Ubuntu 26.04 runner, x86_64 (`prototype/m3/README.md`). A namespace holder started with `--dev /dev` cannot be joined (EPERM): that option nests a second user namespace, and the namespace holder hands out the inner one while its network namespace belongs to the outer.
 
 Decision (proposed, not accepted):
 
@@ -15,12 +15,12 @@ Decision (proposed, not accepted):
 - **What a session sees.** It mounts `run/<sandbox>/visible/` read-only, which holds the proxy's socket. The namespace holder's sockets, which hand out the sandbox's namespace descriptors and are the host's way to the service, and the records of the service's port stay in the host-only `run/<sandbox>/`, which no session mounts.
 - **The service's port is not relayed.** A session reaches the service on 127.0.0.1, as on macOS, and a runtime's client finds it as it does there.
 - **enclos reads that port from the host**, by 0028's rule and from the process holding the socket: in a shared namespace another session can listen in the ephemeral range too, so it is the port the service's own program holds, read from the namespace holder's `/proc/<pid>/net/tcp` and the program's socket descriptors, not from `lsof`.
-- **The namespace holder is a service of its own**, `enclos.<install>.<sandbox>.holder`. `connect` installs it when it is not installed, also for a runtime with no service, and it stays until `sandbox stop`. A runtime that declares a service named `holder` is refused. The code for that is M3-16's.
+- **The namespace holder is a service of its own**, `enclos.<install>.<sandbox>.holder`. `connect` installs it when it is not installed, also for a runtime with no service, and it stays until `sandbox stop`. A runtime that declares a service named `holder` is refused.
 
 Reason:
 
 - Sessions reach their service as on macOS, and a service restart costs them nothing: with a gateway restarted, an open session reached the new port with no help. With a namespace per session and the port relayed, which also worked, it would keep a relay at the old port until opened again.
-- Processes stay apart. In the prototype another session of the sandbox could not find the service's process, so its signals, ptrace and start-up environment were out of reach.
+- Processes stay apart. On GitHub's runners another session of the sandbox could not find the service's process, so its signals, ptrace and start-up environment were out of reach.
 - A joined session kept the rest: seccomp, `--disable-userns` (ENOSPC with seccomp off), no capability over the namespace and no namespace descriptor left open, with Landlock and without.
 
 ## Considered options
@@ -38,4 +38,4 @@ Reason:
 - A session cannot signal the relay, which is outside its PID namespace, and the relay reaches nothing but the proxy's socket.
 - enclos needs `nsenter`, from util-linux, on the host; `doctor` names it when it is missing.
 - A chat started in a session while the service is down starts a gateway of its own there, as 0028 says, outside the service and in that session's PID namespace.
-- Shown in CI only, with a stand-in service and with Hermes's chat stopped at the model for want of a login. A logged-in chat, the service's own children reaching it, and a kernel without Landlock are left to M3-16 and M3-20.
+- Shown in CI only, with a stand-in service and with Hermes's chat stopped at the model for want of a login. A logged-in chat, the service's own children reaching it, and a kernel without Landlock are still to show (design §14).

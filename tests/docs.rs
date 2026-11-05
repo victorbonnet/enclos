@@ -161,7 +161,11 @@ fn the_chat_tabs_control_pair_is_recorded_as_measured() {
         .lines()
         .find(|line| line.starts_with("- `enclos dashboard`"))
         .expect("§14's item");
-    for part in ["M3-20", "`NO_PROXY` for loopback is needed", "not shown"] {
+    for part in [
+        "which sessions get it",
+        "`NO_PROXY` for loopback is needed",
+        "not shown",
+    ] {
         assert!(item.contains(part), "{part}");
     }
 }
@@ -267,7 +271,10 @@ fn the_relay_has_one_runner_and_the_holders_part_is_proposed() {
     };
     let networking = find("**Linux networking.**");
     assert!(networking.contains("adr/0039-"), "{networking}");
-    assert!(networking.contains("kill or replace its relay"), "{networking}");
+    assert!(
+        networking.contains("kill or replace its relay"),
+        "{networking}"
+    );
     let backend = find("   - the bubblewrap backend");
     assert!(!backend.contains("relay"), "{backend}");
     let proxy = find("   - the proxy listening on a Unix socket");
