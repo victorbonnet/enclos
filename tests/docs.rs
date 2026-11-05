@@ -154,7 +154,10 @@ fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
                 .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
                 .collect();
             if !sub.is_empty() {
-                assert!(layout.contains(&format!("{sub}/")), "{marker}{sub} not in §11");
+                assert!(
+                    layout.contains(&format!("{sub}/")),
+                    "{marker}{sub} not in §11"
+                );
             }
         }
     }
