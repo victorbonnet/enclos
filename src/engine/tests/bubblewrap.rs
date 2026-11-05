@@ -42,14 +42,21 @@ impl Stood {
         Stood::with_proxy_socket(true)
     }
 
-    /// With a proxy that opens its socket, or holds its port alone.
+    /// With a stand-in proxy that serves its socket alone, as a bubblewrap
+    /// sandbox's proxy does, or, without `opens`, with something listening
+    /// on the sandbox's port and no socket.
     fn with_proxy_socket(opens: bool) -> Stood {
         let dir = tempfile::tempdir().unwrap();
         let at = |name: &str| dir.path().join(name);
         script(
             &at("bwrap"),
             &format!(
-                "[ \"$*\" = '--ro-bind / / true' ] && exit 0\nprintf '%s\\n' \"$@\" > '{args}'\n{{ printf '%s\\n' \"$@\"; echo ===; }} >> '{calls}'\nenv > '{env}'\nwhile [ $# -gt 0 ]; do a=$1; shift; [ \"$a\" = -- ] && exec \"$@\"; done\nexit 99",
+                r#"[ "$*" = '--ro-bind / / true' ] && exit 0
+printf '%s\n' "$@" > '{args}'
+{{ printf '%s\n' "$@"; echo ===; }} >> '{calls}'
+env > '{env}'
+while [ $# -gt 0 ]; do a=$1; shift; [ "$a" = -- ] && exec "$@"; done
+exit 99"#,
                 args = at("args").display(),
                 calls = at("calls").display(),
                 env = at("env").display()
@@ -138,10 +145,10 @@ impl Stood {
     }
 }
 
-/// A process that holds `port` without listening on it, so that the engine
-/// finds it free, and, once the stand-in proxy writes to the pipe at `go`,
-/// listens on it and then, if `opens`, on `socket`, as `proxy run` does.
-/// What it does, and any error, it writes to `log`. It holds no session's
+/// What the stand-in proxy listens through: once the proxy writes to the
+/// pipe at `go`, it listens on `socket` alone if `opens`, as `proxy run`
+/// does for a bubblewrap sandbox, else on `port` alone, which it holds from
+/// the start. What it does, and any error, it writes to `log`. It holds no session's
 /// marker, so another test ending its session never ends it. Returns once
 /// it holds the port, waiting at most 30 seconds.
 fn hold_port(port: u16, socket: &Path, go: &Path, log: &Path, opens: bool) -> std::process::Child {
@@ -164,19 +171,21 @@ def drain(listener):
 
 
 port, path, go, opens = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == 'opens'
-t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(('127.0.0.1', port))
+if not opens:
+    t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(('127.0.0.1', port))
 os.mkfifo(go)
 print('holding', flush=True)
 heard = open(go).read()
 print('heard', repr(heard), file=sys.stderr, flush=True)
-t.listen()
-threading.Thread(target=drain, args=(t,), daemon=True).start()
-print('listening on', port, file=sys.stderr, flush=True)
 if opens:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     u = socket.socket(socket.AF_UNIX); u.bind(path); u.listen()
     threading.Thread(target=drain, args=(u,), daemon=True).start()
     print('listening on', path, file=sys.stderr, flush=True)
+else:
+    t.listen()
+    threading.Thread(target=drain, args=(t,), daemon=True).start()
+    print('listening on', port, file=sys.stderr, flush=True)
 sys.stdin.read()",
         ])
         .arg(port.to_string())
@@ -198,7 +207,7 @@ sys.stdin.read()",
         Ok(line) if line == "holding\n" => holder,
         other => {
             let _ = holder.kill();
-            panic!("the stand-in proxy did not hold port {port}: {other:?}");
+            panic!("the stand-in proxy's listener did not start: {other:?}");
         }
     }
 }
@@ -342,9 +351,9 @@ fn a_session_the_host_refuses_at_launch_starts_nothing() {
     assert!(open.is_empty(), "{open:?}");
 }
 
-/// The #119 review: the proxy's port answering says nothing of its socket,
-/// which `run_proxy` opens after it, and a bubblewrap session has no other
-/// way out. A proxy that never opens it fails the start, which says so.
+/// A bubblewrap session reaches its proxy through the socket alone, so
+/// something answering on the sandbox's port says nothing of the proxy: a
+/// proxy that never opens its socket fails the start, which names it.
 #[test]
 fn a_session_waits_for_its_proxys_socket_and_fails_without_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());

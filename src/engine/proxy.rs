@@ -267,8 +267,8 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::net::UnixListener;
 
-    /// The #119 review: a proxy that holds its port and has not opened its
-    /// socket yet is not one a bubblewrap session can reach.
+    /// Where sessions reach the proxy over its socket, the proxy is seen
+    /// started once the socket answers, whatever answers on the port.
     #[test]
     fn a_proxy_answers_once_its_socket_does_too_where_sessions_use_it() {
         let port = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
