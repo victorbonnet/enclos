@@ -359,11 +359,22 @@ impl Store {
             .optional()
     }
 
-    /// The terminal's answer: `accept` or `decline`.
-    pub fn decide_pairing(&self, code: &[u8], decision: &str) -> rusqlite::Result<()> {
-        self.db.execute(
-            "UPDATE pairings SET decision = ?2 WHERE code = ?1",
+    /// The first word on a pairing: the terminal's answer (`accept` or
+    /// `decline`), or the bridge's `gone` when the device left before it;
+    /// whether this one was first.
+    pub fn decide_pairing(&self, code: &[u8], decision: &str) -> rusqlite::Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE pairings SET decision = ?2 WHERE code = ?1 AND decision IS NULL",
             params![code, decision],
+        )? == 1)
+    }
+
+    /// What became of an accepted pairing, for the terminal: `paired` once
+    /// the device has its answer, `gone` when it left before.
+    pub fn settle_pairing(&self, code: &[u8], outcome: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "UPDATE pairings SET decision = ?2 WHERE code = ?1 AND decision = 'accept'",
+            params![code, outcome],
         )?;
         Ok(())
     }
@@ -443,5 +454,28 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    #[test]
+    fn a_pairing_takes_the_first_word_and_then_its_outcome() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let decision = |s: &Store, code: &[u8]| s.pairing_decision(code).unwrap();
+        // Accepted, then the device got its answer.
+        store.add_pairing(b"one", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"one", "accept").unwrap());
+        assert!(!store.decide_pairing(b"one", "decline").unwrap());
+        store.settle_pairing(b"one", "paired").unwrap();
+        assert_eq!(decision(&store, b"one").as_deref(), Some("paired"));
+        // The device left first: the terminal's answer comes too late.
+        store.add_pairing(b"two", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"two", "gone").unwrap());
+        assert!(!store.decide_pairing(b"two", "accept").unwrap());
+        assert_eq!(decision(&store, b"two").as_deref(), Some("gone"));
+        // An outcome settles an accepted pairing only.
+        store.add_pairing(b"three", now() + 300).unwrap();
+        assert!(store.decide_pairing(b"three", "decline").unwrap());
+        store.settle_pairing(b"three", "paired").unwrap();
+        assert_eq!(decision(&store, b"three").as_deref(), Some("decline"));
     }
 }
