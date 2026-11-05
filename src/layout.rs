@@ -290,14 +290,19 @@ impl Layout {
     /// name starts with it too, such as `state.db-journal` or
     /// `audit.jsonl.torn-12`.
     pub fn hidden_files(&self) -> Vec<PathBuf> {
+        self.hidden_files_on(Os::current())
+    }
+
+    fn hidden_files_on(&self, os: Os) -> Vec<PathBuf> {
         let mut files = vec![
             self.state_db(),
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
         ];
-        // Only Linux has the file store; macOS's rules stay as they are.
-        if cfg!(target_os = "linux") {
+        // Only Linux has the file store, as `secrets::host` picks the
+        // stores: the two change together.
+        if os == Os::Linux {
             files.push(self.secrets_file());
         }
         files
@@ -480,6 +485,28 @@ mod tests {
         let layout = Layout::at("/data/enclos");
         assert!(layout.hidden_files().contains(&layout.secrets_file()));
         assert!(layout.secrets_file().starts_with(layout.data()));
+    }
+
+    /// The file store is hidden on Linux, the only system with one, and
+    /// macOS's list stays without it.
+    #[test]
+    fn the_hidden_files_are_each_systems_own() {
+        let layout = Layout::at("/data/enclos");
+        assert!(
+            layout
+                .hidden_files_on(Os::Linux)
+                .contains(&layout.secrets_file())
+        );
+        assert_eq!(
+            layout.hidden_files_on(Os::MacOs),
+            [
+                layout.state_db(),
+                layout.state_lock(),
+                layout.audit_log(),
+                layout.config_file()
+            ]
+        );
+        assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
     }
 
     #[test]
