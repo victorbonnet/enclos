@@ -346,11 +346,12 @@ fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction()
     let relay = Relay::start();
     let mut client = relay.client();
     let upstream = relay.accepted();
+    // Before anything closes: macOS refuses a timeout once the peer has.
+    upstream.set_read_timeout(Some(PATIENCE)).unwrap();
     client.write_all(b"last").unwrap();
     drop(client);
     thread::sleep(Duration::from_millis(200));
     upstream.shutdown(Shutdown::Write).unwrap();
-    upstream.set_read_timeout(Some(PATIENCE)).unwrap();
     assert_eq!(all_of(&upstream), b"last");
 }
 
