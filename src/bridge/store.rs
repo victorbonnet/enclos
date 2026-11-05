@@ -38,6 +38,19 @@ pub struct Conversation {
     pub title: Option<String>,
     /// [`BY_AGENT`] or [`BY_PERSON`], when it has a name.
     pub titled_by: Option<String>,
+    /// The `seq` of the last message its owner read, on any device.
+    pub read: Option<i64>,
+}
+
+fn conversation_row(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        id: row.get(0)?,
+        sandbox: row.get(1)?,
+        agent: row.get(2)?,
+        title: row.get(3)?,
+        titled_by: row.get(4)?,
+        read: row.get(5)?,
+    })
 }
 
 /// A file of a message; its bytes are in the bridge's media folder, under its id.
@@ -76,7 +89,11 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     let columns = query
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (column, kind) in [("title", "TEXT"), ("titled_by", "TEXT")] {
+    for (column, kind) in [
+        ("title", "TEXT"),
+        ("titled_by", "TEXT"),
+        ("read", "INTEGER"),
+    ] {
         if !columns.iter().any(|c| c == column) {
             db.execute_batch(&format!(
                 "ALTER TABLE conversations ADD COLUMN {column} {kind}"
@@ -94,7 +111,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     owner TEXT NOT NULL,
     created INTEGER NOT NULL,
     title TEXT,
-    titled_by TEXT
+    titled_by TEXT,
+    read INTEGER
 );
 CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,18 +201,23 @@ impl Store {
     /// The person's conversations, the oldest first.
     pub fn conversations(&self, owner: &str) -> rusqlite::Result<Vec<Conversation>> {
         let mut query = self.db.prepare(
-            "SELECT id, sandbox, agent, title, titled_by FROM conversations WHERE owner = ?1 ORDER BY created, id",
+            "SELECT id, sandbox, agent, title, titled_by, read FROM conversations WHERE owner = ?1 ORDER BY created, id",
         )?;
-        let rows = query.query_map(params![owner], |row| {
-            Ok(Conversation {
-                id: row.get(0)?,
-                sandbox: row.get(1)?,
-                agent: row.get(2)?,
-                title: row.get(3)?,
-                titled_by: row.get(4)?,
-            })
-        })?;
+        let rows = query.query_map(params![owner], conversation_row)?;
         rows.collect()
+    }
+
+    /// Its owner read conversation `id` up to message `seq`; whether that
+    /// moved how far it was read. It only moves forward, and never past the
+    /// conversation's newest message.
+    pub fn mark_read(&self, id: &str, seq: i64) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversations SET read = ?2 WHERE id = ?1
+             AND (read IS NULL OR read < ?2)
+             AND ?2 <= (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation = ?1)",
+            params![id, seq],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Names a conversation, saying who named it ([`BY_AGENT`] or
@@ -256,17 +279,9 @@ impl Store {
     pub fn conversation_info(&self, id: &str) -> rusqlite::Result<Option<Conversation>> {
         self.db
             .query_row(
-                "SELECT id, sandbox, agent, title, titled_by FROM conversations WHERE id = ?1",
+                "SELECT id, sandbox, agent, title, titled_by, read FROM conversations WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(Conversation {
-                        id: row.get(0)?,
-                        sandbox: row.get(1)?,
-                        agent: row.get(2)?,
-                        title: row.get(3)?,
-                        titled_by: row.get(4)?,
-                    })
-                },
+                conversation_row,
             )
             .optional()
     }
@@ -577,6 +592,41 @@ mod tests {
     }
 
     #[test]
+    fn how_far_a_conversation_was_read_only_moves_forward_to_its_messages() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store.conversation("c-2", "lab", "main", owner).unwrap();
+        let read = |s: &Store| s.conversation_info("c-1").unwrap().unwrap().read;
+        // Nothing to read yet.
+        assert!(!store.mark_read("c-1", 1).unwrap());
+        assert_eq!(read(&store), None);
+        let hi = store
+            .add("m-1", "c-1", &From::Person(owner.into()), "hi", "message")
+            .unwrap()
+            .unwrap();
+        let other = store
+            .add("m-2", "c-2", &From::Agent, "elsewhere", "reply")
+            .unwrap()
+            .unwrap();
+        let answer = store
+            .add("m-3", "c-1", &From::Agent, "hello", "reply")
+            .unwrap()
+            .unwrap();
+        assert!(store.mark_read("c-1", hi).unwrap());
+        assert_eq!(read(&store), Some(hi));
+        // Not past its newest message, even to another conversation's seq beyond it.
+        assert!(!store.mark_read("c-1", answer + 1).unwrap());
+        assert!(other < answer);
+        assert!(store.mark_read("c-1", answer).unwrap());
+        // Not backwards, and once only.
+        assert!(!store.mark_read("c-1", hi).unwrap());
+        assert!(!store.mark_read("c-1", answer).unwrap());
+        assert_eq!(store.conversations(owner).unwrap()[0].read, Some(answer));
+    }
+
+    #[test]
     fn a_database_from_an_earlier_bridge_gains_the_name_columns() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("app.db");
@@ -591,6 +641,7 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert!(store.name("c-1", "Weather", BY_AGENT).unwrap());
+        assert_eq!(store.conversation_info("c-1").unwrap().unwrap().read, None);
         // Opening it again changes nothing.
         drop(store);
         let store = Store::open(&path).unwrap();
