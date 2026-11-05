@@ -381,7 +381,7 @@ fn a_session_has_its_own_namespaces_and_no_user_namespace() {
     ] {
         assert!(c.bubblewrap.options.iter().any(|a| a == option), "{option}");
     }
-    // `wrap` empties the environment (`wrap::tests`), on the process,
+    // `wrap` empties the environment (`wrap::tests::command`), on the process,
     // where a secret is not on a command line.
     assert!(!c.bubblewrap.options.iter().any(|a| a == "--clearenv"));
 }
