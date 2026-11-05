@@ -26,8 +26,8 @@ pub const UNCOMPILABLE: &str = "uncompilable";
 pub struct FakeProbes;
 
 impl OwnProbes for FakeProbes {
-    /// As a backend refuses that leaves paths out of the sandbox and mounts
-    /// the rest read-only.
+    /// The refusals of a backend that leaves paths out of the sandbox and
+    /// mounts the rest read-only.
     fn refusal(&self) -> Refusal {
         Refusal::any_of(&[
             "No such file or directory",

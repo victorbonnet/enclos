@@ -1,7 +1,6 @@
-//! The Seatbelt probe list as it was before the probes were split per
-//! backend (M3-06), so that the split is seen to change none of it. Every
-//! probe, in order, on each baseline; regenerate only for a change meant to
-//! show in `policy test`.
+//! The Seatbelt probe list, compared with a snapshot: every probe, in order,
+//! on each baseline. Regenerate it only for a change meant to show in
+//! `policy test`.
 
 use std::path::Path;
 
@@ -166,7 +165,7 @@ fn snapshot() -> String {
 }
 
 #[test]
-fn the_seatbelt_probe_list_is_as_it_was() {
+fn the_seatbelt_probe_list_matches_its_snapshot() {
     let got = snapshot();
     if std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some() {
         let file =

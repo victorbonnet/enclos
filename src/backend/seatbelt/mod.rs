@@ -1,7 +1,6 @@
 //! The Seatbelt backend: macOS's sandbox, through `sandbox-exec` (ADR 0005).
 //! Policies compile on the `(deny default)` baseline (ADR 0006); the
-//! `(allow default)` one milestone 1 used is kept only so tests can compare
-//! the two baselines.
+//! `(allow default)` one is kept only so tests can compare the two.
 
 mod compile;
 pub mod probes;

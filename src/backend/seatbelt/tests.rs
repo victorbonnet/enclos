@@ -1179,7 +1179,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
     std::fs::write(&open, without).unwrap();
     assert!(run(&open), "the route is gone: nothing to test");
     assert!(!run(&w.compiled));
-    // The rule alone closes it on the earlier baseline, and the baseline
+    // The rule alone closes it on `(allow default)`, and the baseline
     // alone closes it without the rule.
     let with_rule = on_allow_default(&text);
     let file = w.base.join("allow-default-with-the-rule.sb");

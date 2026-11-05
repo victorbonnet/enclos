@@ -292,10 +292,10 @@ mod tests {
         assert_eq!(test_json(&lab, &none)["baseline"], Value::Null);
     }
 
-    /// The report of each kind of test on Seatbelt, as it was before the
-    /// probes were split per backend (M3-06): text, verdict and JSON.
+    /// The report of each kind of test on Seatbelt, compared with a
+    /// snapshot: text, verdict and JSON.
     #[test]
-    fn the_seatbelt_report_is_as_it_was() {
+    fn the_seatbelt_report_matches_its_snapshot() {
         let row = |route, name: &str, outcome, closed_by| ProbeResult {
             route,
             name: name.to_owned(),

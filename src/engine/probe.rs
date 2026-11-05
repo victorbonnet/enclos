@@ -51,9 +51,8 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// The closed probes that show something other than their route's
-    /// rule, as the report says them: ` (1 by Seatbelt itself, 2 by the
-    /// (deny default) baseline)`, or nothing.
+    /// The closed probes that show something other than their route's rule,
+    /// counted by what closed them (` (1 by ..., 2 by ...)`), or nothing.
     pub fn closed_apart(&self) -> String {
         let said: Vec<String> = [Closer::Backend, Closer::Baseline]
             .into_iter()
@@ -341,10 +340,9 @@ impl Engine {
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
         let limits = self.launch_limits(&record, &self.policy(name)?.snapshot.policy)?;
-        // Not `backend_of`: a dry run asks nothing of the host, so it counts
-        // the probes of a backend this host cannot run too. No compiled file
-        // is read: the baseline only changes what closes a probe, not how
-        // many run.
+        // Not `backend_of`: a dry run asks nothing of the host, so it also
+        // counts for a backend this host cannot run. It reads no compiled
+        // file, which changes what closes a probe, not how many run.
         let backend = match self.backends.iter().find(|b| b.kind() == record.backend) {
             Some(backend) => backend.as_ref(),
             None => self.backend_of(name)?,
@@ -604,7 +602,7 @@ mod tests {
     }
 
     /// Either wording of a missing domain reads absent, whatever the macOS
-    /// here says; any other failure cannot tell (#136).
+    /// here says; any other failure cannot tell.
     #[test]
     fn a_preferences_domain_is_absent_by_either_message_of_defaults() {
         let saying = |message: &str| {

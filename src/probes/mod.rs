@@ -30,9 +30,7 @@ use crate::layout::Layout;
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::is_within;
 
-/// What a program says when a backend refuses it: any one of these texts,
-/// each the backend's own: one backend may refuse in one way, another by
-/// what it leaves out of the sandbox, in several.
+/// The texts a program prints when the backend refuses it; any one counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal(Vec<String>);
 
@@ -267,13 +265,13 @@ impl ProbeResult {
 pub struct ReportNotes {
     /// The host, as a sentence says it.
     pub host: &'static str,
-    /// What moves a folder that cannot move, as the probes try it, or nothing
-    /// for a backend with no such probes.
+    /// How the count of folders that cannot move names the backend's probes
+    /// of them (`renames and clones`); empty for a backend with none.
     pub folder_moves: &'static str,
     /// What listening opens, for a policy that allows it (ADR 0028).
     pub listening: &'static str,
-    /// Who else can close a probe, for a test where nothing else did: `,
-    /// only by ... if any`, or nothing.
+    /// What the verdict adds when no probe was closed by its rule, naming
+    /// what else closes probes: `, only by ... if any`; empty if nothing does.
     pub only_apart: &'static str,
     /// The routes of [`OwnProbes::host_services`].
     pub host_service_routes: &'static [&'static str],
@@ -297,12 +295,12 @@ pub trait OwnProbes {
     fn refusal(&self) -> Refusal;
     /// What a report says of its probes.
     fn notes(&self) -> ReportNotes;
-    /// Sets up on the host what its probes need, once they will run; what
-    /// it returns is held until the test ends, and undoes that when dropped.
+    /// Sets up on the host what its probes need. The engine holds what it
+    /// returns until the test ends; dropping it undoes the set-up.
     fn set_up(&mut self, _layout: &Layout, _name: &SandboxName) -> Box<dyn std::any::Any> {
         Box::new(())
     }
-    /// Stands in for [`OwnProbes::set_up`] on a dry run, only to count the
+    /// Replaces [`OwnProbes::set_up`] on a dry run, which only counts the
     /// probes.
     fn count_only(&mut self, _name: &SandboxName) {}
     /// Probes of a folder that cannot move, in the order of

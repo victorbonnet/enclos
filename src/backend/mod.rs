@@ -261,9 +261,9 @@ pub trait Backend {
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
     /// The command that runs `launch` inside the sandbox under `compiled`.
     fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
-    /// Its own escape probes and how it refuses, for a sandbox compiled to
-    /// `compiled`, or on a dry run, which compiles nothing, for none. Says
-    /// why not when that text is not what it compiles.
+    /// Its escape probes and refusals for a sandbox whose compiled policy
+    /// has the text `compiled`; `None` on a dry run, which compiles nothing.
+    /// Fails, saying why, on a text this backend did not compile.
     fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;
 }
 
