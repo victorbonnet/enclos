@@ -26,10 +26,6 @@ pub const UNCOMPILABLE: &str = "uncompilable";
 pub struct FakeProbes;
 
 impl OwnProbes for FakeProbes {
-    fn name(&self) -> &'static str {
-        "the fake"
-    }
-
     /// As a backend refuses that leaves paths out of the sandbox and mounts
     /// the rest read-only.
     fn refusal(&self) -> Refusal {

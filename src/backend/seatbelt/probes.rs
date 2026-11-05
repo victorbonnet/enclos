@@ -190,11 +190,13 @@ fn apple_event(refusal: &str, succeeded: bool, output: &str) -> Outcome {
 const EVENT_REFUSED: OwnReading = OwnReading {
     label: "apple event blocked: (-600)",
     read: |succeeded, output| apple_event(AE_REFUSED, succeeded, output),
+    when_control_fails: None,
 };
 
 const EVENT_LOOKUP_REFUSED: OwnReading = OwnReading {
     label: "apple event blocked: application \"Finder\". (-1728)",
     read: |succeeded, output| apple_event(AE_LOOKUP_REFUSED, succeeded, output),
+    when_control_fails: None,
 };
 
 /// A loopback address a bind probe tries.
@@ -386,28 +388,60 @@ fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
 /// Renames `folder` into itself, with rename(2) through perl: the filesystem
 /// refuses that whatever the policy, so the folder never moves, and the
 /// same call on the host is the control.
-fn rename_probe(folder: &Path, tag: u32, own: &dyn OwnProbes) -> Probe {
+fn rename_probe(folder: &Path, tag: u32) -> Probe {
     into_itself(
         "renames",
         "rename",
         "rename($ARGV[0], $ARGV[1])",
         folder,
         tag,
-        own,
     )
 }
 
+/// A folder renamed or cloned into itself, which the filesystem refuses
+/// (`Invalid argument`; a volume that cannot clone refuses a clone with
+/// another error), so nothing moves or is copied even when the rule does not
+/// hold. Seatbelt refuses before the filesystem does: closed on its refusal,
+/// alone on the last line, where the script prints `$!`; a text inside a
+/// longer line came from something else, such as the shell or the loader
+/// failing to start perl. The filesystem's refusal means the call got past
+/// Seatbelt: open. Any other failure is inconclusive.
+const INTO_ITSELF: OwnReading = OwnReading {
+    label: "into itself",
+    read: into_itself_read,
+    when_control_fails: Some(
+        "outside the sandbox, the filesystem did not refuse it with Invalid argument",
+    ),
+};
+
+fn into_itself_read(succeeded: bool, output: &str) -> Outcome {
+    let line = last_line(output);
+    if succeeded {
+        // Its script says what the call may have left.
+        return Outcome::Open(match line.is_empty() {
+            true => "it succeeded".to_owned(),
+            false => line,
+        });
+    }
+    if line == NOT_PERMITTED {
+        return Outcome::Closed;
+    }
+    if output.contains("Invalid argument") {
+        return Outcome::Open(
+            "the filesystem refused it (Invalid argument), so Seatbelt let the call through".into(),
+        );
+    }
+    Outcome::Inconclusive(format!(
+        "it failed, but not with the policy's refusal ({NOT_PERMITTED}): {line}"
+    ))
+}
+
 /// A probe whose perl `call` acts on `folder` and a path inside it
-/// (`$ARGV[0]`, `$ARGV[1]`): see [`Expect::IntoItself`]. Both the probe and
-/// its control print why they failed, and say what a success may have left.
-fn into_itself(
-    route: &'static str,
-    verb: &str,
-    call: &str,
-    folder: &Path,
-    tag: u32,
-    own: &dyn OwnProbes,
-) -> Probe {
+/// (`$ARGV[0]`, `$ARGV[1]`), read by [`INTO_ITSELF`]. Both the probe and its
+/// control print why they failed, and say what a success may have left. The
+/// control is the same call on the host, which works when the filesystem
+/// refuses it there.
+fn into_itself(route: &'static str, verb: &str, call: &str, folder: &Path, tag: u32) -> Probe {
     let script = |on_success: &str, on_failure: &str| {
         format!(
             "/usr/bin/perl -e 'if ({call}) {{ print \"it succeeded, so $ARGV[1] may now exist\\n\"; {on_success} }} {on_failure}' {} {}",
@@ -419,10 +453,7 @@ fn into_itself(
         route,
         format!("{verb} {}", folder.display()),
         script("exit 0", "die \"$!\\n\""),
-        Expect::IntoItself {
-            refusal: own.refusal(),
-            backend: own.name(),
-        },
+        Expect::Own(INTO_ITSELF),
         // The filesystem's refusal is the control working.
         script("exit 1", "exit 0 if $!{EINVAL}; die \"$!\\n\""),
     )
@@ -431,14 +462,13 @@ fn into_itself(
 /// Clones `folder` into itself, with clonefileat(2) (syscall 462, with
 /// `AT_FDCWD`) through perl, which has no call of its own for it: refused by
 /// the filesystem whatever the policy, so nothing is copied.
-fn clone_probe(folder: &Path, tag: u32, own: &dyn OwnProbes) -> Probe {
+fn clone_probe(folder: &Path, tag: u32) -> Probe {
     into_itself(
         "clones",
         "clone",
         "syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0",
         folder,
         tag,
-        own,
     )
 }
 
@@ -547,10 +577,6 @@ impl SeatbeltProbes {
 }
 
 impl OwnProbes for SeatbeltProbes {
-    fn name(&self) -> &'static str {
-        "Seatbelt"
-    }
-
     fn refusal(&self) -> Refusal {
         Refusal::any_of(&[NOT_PERMITTED])
     }
@@ -584,10 +610,7 @@ impl OwnProbes for SeatbeltProbes {
     }
 
     fn of_folder(&self, folder: &Path, i: &ProbeInputs) -> Vec<Probe> {
-        vec![
-            rename_probe(folder, i.tag, self),
-            clone_probe(folder, i.tag, self),
-        ]
+        vec![rename_probe(folder, i.tag), clone_probe(folder, i.tag)]
     }
 
     fn folders(&self, i: &ProbeInputs) -> Vec<Probe> {
@@ -1346,6 +1369,36 @@ mod tests {
                     Outcome::Inconclusive(format!(
                         "outside the sandbox, the filesystem did not refuse it with Invalid argument: {host}"
                     ))
+                );
+            }
+        }
+    }
+
+    /// The call into itself prints a bare `$!`, so the refusal must be all of
+    /// its last line: with anything around it, the text came from something
+    /// else, such as the shell or the loader failing to start perl, and the
+    /// call was never tried.
+    #[test]
+    fn a_call_into_itself_is_closed_only_by_the_refusal_alone_on_the_last_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = all(dir.path());
+        for route in ["renames", "clones"] {
+            let p = find(&list, route);
+            for refusal in [
+                "Operation not permitted",
+                "Operation not permitted\n",
+                "a warning first\nOperation not permitted",
+            ] {
+                assert_eq!(proven(p, ran(false, refusal)), Outcome::Closed, "{refusal}");
+            }
+            for never_tried in [
+                "/bin/sh: 1: /usr/bin/perl: Operation not permitted",
+                "dyld: Library not loaded: libperl.dylib: Operation not permitted",
+                "Operation not permitted\nand then something else",
+            ] {
+                assert!(
+                    matches!(proven(p, ran(false, never_tried)), Outcome::Inconclusive(_)),
+                    "{never_tried}"
                 );
             }
         }

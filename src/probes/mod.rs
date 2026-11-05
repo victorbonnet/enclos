@@ -46,13 +46,6 @@ impl Refusal {
         self.0.iter().any(|text| output.contains(text.as_str()))
     }
 
-    /// Strict, for a script that prints the error alone: a text inside a
-    /// longer line came from something else, such as the shell or the loader
-    /// failing to start the program.
-    fn is_the_last_line_of(&self, output: &str) -> bool {
-        self.0.contains(&last_line(output))
-    }
-
     /// As the report says it.
     pub fn shown(&self) -> String {
         self.0.join(" or ")
@@ -73,6 +66,9 @@ pub struct OwnReading {
     /// From whether the script succeeded and what it printed. Closed here
     /// is not yet proof: [`outcome`] adds the host check and the control.
     pub read: fn(bool, &str) -> Outcome,
+    /// What an inconclusive result says when the control failed, if not
+    /// "it fails outside the sandbox too".
+    pub when_control_fails: Option<&'static str>,
 }
 
 impl PartialEq for OwnReading {
@@ -93,18 +89,6 @@ pub enum Expect {
     FailsWith(Refusal),
     /// Closed when the output does not contain this text.
     OutputLacks(&'static str),
-    /// A folder renamed or cloned into itself, which the filesystem refuses
-    /// (`Invalid argument`; a volume that cannot clone refuses a clone with
-    /// another error), so nothing moves or is copied even when the rule does
-    /// not hold. Fits a backend that refuses before the filesystem does: closed
-    /// on its refusal, alone on the last line as the script prints it; the
-    /// filesystem's means the call got past `backend`: open. Any other failure
-    /// is inconclusive. The control is the same call on the host, which works
-    /// when the filesystem refuses it there.
-    IntoItself {
-        refusal: Refusal,
-        backend: &'static str,
-    },
     /// Read by the backend.
     Own(OwnReading),
 }
@@ -304,8 +288,6 @@ pub struct ReportNotes {
 /// Each method places its probes in the list, so that a report reads route
 /// by route.
 pub trait OwnProbes {
-    /// The backend's name, as a sentence says it.
-    fn name(&self) -> &'static str;
     /// What its refusals look like.
     fn refusal(&self) -> Refusal;
     /// What a report says of its probes.
@@ -806,9 +788,10 @@ pub fn outcome(
             (Proof::Control { .. }, Some((true, _))) => Outcome::Closed,
             (Proof::Control { expect, .. }, Some((false, output))) => {
                 let why = match expect {
-                    Expect::IntoItself { .. } => {
-                        "outside the sandbox, the filesystem did not refuse it with Invalid argument"
-                    }
+                    Expect::Own(OwnReading {
+                        when_control_fails: Some(why),
+                        ..
+                    }) => why,
                     _ => "it fails outside the sandbox too",
                 };
                 Outcome::Inconclusive(match last_line(output) {
@@ -864,24 +847,6 @@ fn judge(probe: &Probe, succeeded: bool, output: &str) -> Outcome {
             Outcome::Open(format!("output has `{text}`"))
         }
         Expect::OutputLacks(_) => Outcome::Closed,
-        // Its script says what the call may have left.
-        Expect::IntoItself { .. } if succeeded => Outcome::Open(match last_line(output) {
-            line if line.is_empty() => "it succeeded".to_owned(),
-            line => line,
-        }),
-        Expect::IntoItself { refusal, .. } if refusal.is_the_last_line_of(output) => {
-            Outcome::Closed
-        }
-        Expect::IntoItself { backend, .. } if output.contains("Invalid argument") => {
-            Outcome::Open(format!(
-                "the filesystem refused it (Invalid argument), so {backend} let the call through"
-            ))
-        }
-        Expect::IntoItself { refusal, .. } => Outcome::Inconclusive(format!(
-            "it failed, but not with the policy's refusal ({}): {}",
-            refusal.shown(),
-            last_line(output)
-        )),
         Expect::Own(reading) => (reading.read)(succeeded, output),
     }
 }
@@ -1328,41 +1293,32 @@ mod tests {
         assert_eq!(proven(dns, ran(true, "")), Outcome::Closed);
     }
 
-    /// The call into itself prints a bare `$!`, so the refusal must be all of
-    /// its last line: with anything around it, the text came from something
-    /// else, such as the shell or the loader failing to start perl, and the
-    /// call was never tried.
+    /// A backend's own reading says why a failed control proves nothing,
+    /// and the shared outcome uses it as it is.
     #[test]
-    fn a_call_into_itself_is_closed_only_by_the_refusal_alone_on_the_last_line() {
-        let expect = Expect::IntoItself {
-            refusal: Plain.refusal(),
-            backend: Plain.name(),
+    fn a_backend_s_own_reading_says_why_its_control_failing_proves_nothing() {
+        let read = |own: OwnReading| {
+            let p = probe("renames", "rename", "true", Expect::Own(own), "true");
+            outcome(&p, ran(false, ""), Ok(None), Some((false, "on the host")))
         };
-        let p = probe("renames", "rename", "true", expect, "true");
-        for refusal in [
-            "No such file or directory",
-            "Read-only file system\n",
-            "a warning first\nNo such file or directory",
-        ] {
-            assert_eq!(
-                proven(&p, ran(false, refusal)),
-                Outcome::Closed,
-                "{refusal}"
-            );
-        }
-        for never_tried in [
-            "/bin/sh: 1: /usr/bin/perl: No such file or directory",
-            "/usr/bin/perl: error while loading shared libraries: libperl.so: cannot open shared object file: No such file or directory",
-            "No such file or directory\nand then something else",
-        ] {
-            assert!(
-                matches!(
-                    proven(&p, ran(false, never_tried)),
-                    Outcome::Inconclusive(_)
-                ),
-                "{never_tried}"
-            );
-        }
+        let closed = |_: bool, _: &str| Outcome::Closed;
+        let own = OwnReading {
+            label: "stand-in",
+            read: closed,
+            when_control_fails: Some("the host gave another answer"),
+        };
+        assert_eq!(
+            read(own),
+            Outcome::Inconclusive("the host gave another answer: on the host".into())
+        );
+        let plain = OwnReading {
+            when_control_fails: None,
+            ..own
+        };
+        assert_eq!(
+            read(plain),
+            Outcome::Inconclusive("it fails outside the sandbox too: on the host".into())
+        );
     }
 
     /// A backend with no probes of its own, refusing as one that leaves
@@ -1370,10 +1326,6 @@ mod tests {
     struct Plain;
 
     impl OwnProbes for Plain {
-        fn name(&self) -> &'static str {
-            "Plain"
-        }
-
         fn refusal(&self) -> Refusal {
             Refusal::any_of(&["No such file or directory", "Read-only file system"])
         }

@@ -88,7 +88,6 @@ fn expect(expect: &Expect) -> String {
         Expect::Fails => "fails".to_owned(),
         Expect::FailsWith(refusal) => format!("fails with {}", refusal.shown()),
         Expect::OutputLacks(text) => format!("output lacks {text}"),
-        Expect::IntoItself { .. } => "into itself".to_owned(),
         Expect::Own(reading) => reading.label.to_owned(),
     }
 }
