@@ -177,7 +177,7 @@ pub enum Error {
     /// The relay cannot hold its port in the session's network.
     #[error("the relay cannot listen on 127.0.0.1:{port}: {source}")]
     RelayListen { port: u16, source: std::io::Error },
-    /// The path the relay forwards to can never be a Unix socket's.
+    /// The path the relay passes connections to can never be a Unix socket's.
     #[error("the relay cannot use {path} as a Unix socket: {source}")]
     RelaySocket {
         path: PathBuf,

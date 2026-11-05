@@ -1802,7 +1802,8 @@ print(answer.status, answer.read().decode())
     }
 
     /// The proxy refuses and closes with the body unread, so the upload
-    /// fails while the refusal is on its way. Many times: it was a race.
+    /// fails while the refusal is on its way. Repeated, as the refusal and the
+    /// failed upload race.
     #[test]
     fn a_large_post_gets_the_refusal_of_a_destination_the_policy_denies() {
         let (_proxy, port, server, _asked) = started();
