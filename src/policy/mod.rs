@@ -411,6 +411,11 @@ mod tests {
             "~/Library/Calendars",
             "~/Library/Group Containers/group.com.apple.calendar",
             "~/Pictures/Photos Library.photoslibrary",
+            // Messaging apps' data on macOS
+            "~/Library/Application Support/Signal",
+            "~/Library/Application Support/Slack",
+            "~/Library/Application Support/discord",
+            "~/Library/Application Support/Telegram Desktop",
             // The same kinds of data where Linux keeps them
             "~/.local/share/com.vercel.cli",
             "~/.local/share/keyrings",
@@ -439,10 +444,6 @@ mod tests {
             "~/.config/Slack",
             "~/.config/discord",
             "~/.local/share/TelegramDesktop",
-            "~/Library/Application Support/Signal",
-            "~/Library/Application Support/Slack",
-            "~/Library/Application Support/discord",
-            "~/Library/Application Support/Telegram Desktop",
             "~/.config/1Password",
             "~/.config/Bitwarden",
             "~/.config/Bitwarden CLI",

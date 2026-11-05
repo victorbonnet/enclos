@@ -106,6 +106,7 @@ read_deny = [
     "~/Library/Calendars",
     "~/Library/Group Containers/group.com.apple.calendar",
     "~/Pictures/Photos Library.photoslibrary",
+    # Mail on Linux: Thunderbird's and Evolution's
     "~/.thunderbird",
     "~/.config/evolution",
     "~/.local/share/evolution",
@@ -137,9 +138,10 @@ read_deny = [
     "~/.1password",
     "~/.bitwarden-ssh-agent.sock",
     # Launch agents: Hermes finds the real home through the user database, not
-    # $HOME, and read the host's own gateway job here (prototype, issue #5).
+    # $HOME, so it reads the host's own gateway job here.
     "~/Library/LaunchAgents",
-    # Linux's counterparts: what the user's manager and desktop start
+    # Linux's counterparts: what systemd's user manager and the desktop start
+    # at login
     "~/.config/systemd/user",
     "~/.local/share/systemd/user",
     "~/.config/autostart",
