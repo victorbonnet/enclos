@@ -4,9 +4,9 @@
 //! and any process of the user can read it, as with the Keychain (ADR 0014).
 //!
 //! Its mode and owner are checked on every read, through the open file: a
-//! wider mode or another owner is refused, naming the file, for a value that
-//! may have been read is no longer the user's alone. Every write holds the state lock, and replaces the file
-//! whole by a rename, so a read sees one state or the other.
+//! wider mode or another owner is refused, naming the file. Every write
+//! holds the state lock, and replaces the file whole by a rename, so a read
+//! sees one state or the other.
 
 use std::collections::BTreeMap;
 use std::fs::{File, Metadata, OpenOptions};
@@ -142,22 +142,25 @@ impl FileStore {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(cannot(&new, e)),
         }
-        let written = (|| {
-            let mut out = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(MODE)
-                .open(&new)?;
-            out.write_all(text.as_bytes())?;
-            out.sync_all()?;
-            std::fs::rename(&new, &self.file)
-        })();
-        written.map_err(|e| {
+        write_new(&new, text.as_bytes(), &self.file).map_err(|e| {
             // Whatever part of the values it holds does not stay behind.
             let _ = std::fs::remove_file(&new);
             cannot(&self.file, e)
         })
     }
+}
+
+/// Writes `text` to `new`, a file it creates with the store's mode, and
+/// renames it to `file`.
+fn write_new(new: &Path, text: &[u8], file: &Path) -> std::io::Result<()> {
+    let mut out = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(MODE)
+        .open(new)?;
+    out.write_all(text)?;
+    out.sync_all()?;
+    std::fs::rename(new, file)
 }
 
 impl SecretStore for FileStore {

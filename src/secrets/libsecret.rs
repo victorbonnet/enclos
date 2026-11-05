@@ -464,7 +464,7 @@ esac"#,
     }
 
     /// As libsecret 0.21.4's `secret-tool`: `clear` exits 1 with no words
-    /// when it removed nothing, on an empty keyring as on CI's first run.
+    /// when it removed nothing, as on an empty keyring.
     #[test]
     fn clearing_nothing_is_no_removal_and_no_failure() {
         let stub = Stub::new("exit 1", UNLOCKED);

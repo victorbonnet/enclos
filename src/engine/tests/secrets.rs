@@ -1,5 +1,4 @@
-//! Secrets granted per sandbox (design §12, ADR 0022), with a secret store
-//! in memory in place of the Keychain.
+//! Secrets granted per sandbox (design §12, ADR 0022), with stand-in stores.
 
 use std::rc::Rc;
 

@@ -63,7 +63,7 @@ pub(super) fn run_for(
         Err(_) => Err(format!("lost what {program} answered")),
     };
     let (stdout, stderr) = (joined(stdout), joined(stderr));
-    // Why it failed, as `security` said it, when it said anything.
+    // Why it failed, as the tool said it, when it said anything.
     let status = status.map_err(|e| match &stderr {
         Ok(said) if !said.is_empty() => {
             format!("{e} ({})", scrub(String::from_utf8_lossy(said).trim(), ""))

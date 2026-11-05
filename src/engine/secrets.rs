@@ -16,7 +16,6 @@ use crate::model::secret::{SecretRecord, SecretRef, SecretValue, StoreName};
 use crate::runtime::adapter;
 use crate::secrets::{SecretError, SecretStore};
 
-/// What `secret set` did.
 /// One way a policy gives a secret: as `variable`, to the whole sandbox,
 /// or to `agent` alone (ADR 0036).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +34,7 @@ impl std::fmt::Display for Grant {
     }
 }
 
+/// What `secret set` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSet {
     /// False when it replaced the value of a secret already set.
