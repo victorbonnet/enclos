@@ -25,6 +25,8 @@ pub struct Message {
     pub text: String,
     /// `reply` or `notify` for the agent's; `message` for a person's.
     pub kind: String,
+    /// When the bridge stored it, in seconds since the Unix epoch.
+    pub at: i64,
 }
 
 pub struct Store {
@@ -158,7 +160,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -171,6 +173,7 @@ impl Store {
                 from: person.map_or(From::Agent, From::Person),
                 text: row.get(4)?,
                 kind: row.get(5)?,
+                at: row.get(6)?,
             })
         })?;
         rows.collect()
@@ -432,6 +435,8 @@ mod tests {
             ["hi", "hello"]
         );
         assert_eq!(mine[1].from, From::Agent);
+        // The time it was stored, which a sync gives the device.
+        assert!(mine.iter().all(|m| (now() - m.at).abs() < 60));
         assert_eq!(store.since(owner, first).unwrap().len(), 1);
         assert_eq!(
             store.owner("c-2").unwrap().as_deref(),
