@@ -368,7 +368,7 @@ impl Engine {
     /// proposed): the runtime's plugin copied into the sandbox home from
     /// `installers/`, the runtime's commands that turn it on, and the
     /// settings that give it its socket. Refused first: a runtime with no
-    /// such channel, the agent's token, `ENCLOS_APP_TOKEN`, not granted to
+    /// such channel, the agent's token, `MOBILE_APP_TOKEN`, not granted to
     /// the agent alone, and a socket path too long for a Unix socket.
     fn app_channel(
         &self,
