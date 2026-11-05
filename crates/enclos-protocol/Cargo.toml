@@ -8,8 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+hmac = "0.13.0"
+p256 = { version = "0.14.0", features = ["ecdsa"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
+# Without snow's `std` feature: in 0.10.0 it also turns on `ring`, whose C
+# build needs a C compiler for each target (an Android NDK). The RustCrypto
+# primitives are all the Noise_IK_25519_ChaChaPoly_SHA256 handshake uses.
+snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
 thiserror = "2.0.21"
 
 [lints]
