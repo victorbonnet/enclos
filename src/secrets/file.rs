@@ -201,6 +201,10 @@ impl SecretStore for FileStore {
         )
     }
 
+    fn removed_before_record(&self) -> bool {
+        true
+    }
+
     /// A file of a mode it would refuse is found before a service starts.
     fn readable(&self) -> Result<(), SecretError> {
         self.load().map(|_| ())

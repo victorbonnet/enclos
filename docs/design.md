@@ -384,12 +384,14 @@ pub trait SecretStore {
     fn whereabouts(&self, r: &SecretRef) -> String;   // where it is, for one left behind
     fn env(&self) -> Vec<(String, String)>;   // how a service reaches the same store
     fn readable(&self) -> Result<()>;   // readable now without a dialog (not a locked keychain)
+    fn removed_before_record(&self) -> bool;   // a value it cannot remove keeps its sandbox (§12)
 }
 
 pub trait Stores {                                 // a host's stores
     fn for_new(&self) -> Result<&dyn SecretStore>;   // where a new secret goes
     fn recorded(&self, name: StoreName) -> Result<&dyn SecretStore>;   // that store, or refused: never another
     fn service_env(&self) -> Vec<(String, String)>;
+    fn value_goes_before_record(&self, name: StoreName) -> bool;   // that store's own, answering or not
 }
 ```
 

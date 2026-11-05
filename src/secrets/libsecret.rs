@@ -291,6 +291,10 @@ impl SecretStore for Libsecret {
         )
     }
 
+    fn removed_before_record(&self) -> bool {
+        true
+    }
+
     /// Only systemd's own bus, whose address never changes: a unit outlives
     /// a login, and a bus that came with one would stay named in it, dead,
     /// over the manager's own. A service then takes the manager's.

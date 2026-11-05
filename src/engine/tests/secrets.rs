@@ -469,6 +469,9 @@ impl SecretStore for WritesThenFails {
     fn whereabouts(&self, secret: &SecretRef) -> String {
         self.0.whereabouts(secret)
     }
+    fn removed_before_record(&self) -> bool {
+        self.0.removed_before_record()
+    }
 }
 
 #[test]
@@ -517,6 +520,9 @@ impl SecretStore for RefusesFirst {
     }
     fn whereabouts(&self, secret: &SecretRef) -> String {
         self.0.whereabouts(secret)
+    }
+    fn removed_before_record(&self) -> bool {
+        self.0.removed_before_record()
     }
 }
 
@@ -580,6 +586,47 @@ fn with_no_secret_service_the_secret_commands_keep_values_in_the_file() {
     done(engine.secret_rm(&alice(), &token, Confirm::Yes).unwrap());
     assert!(!std::fs::read_to_string(&file).unwrap().contains("other"));
     assert!(engine.secret_list(&name).unwrap().is_empty());
+}
+
+/// A file store that refuses its own mode keeps the sandbox, saying why, and
+/// a `sandbox rm` run once the mode is fixed finishes.
+#[test]
+fn a_sandbox_stays_while_the_file_store_refuses_its_mode() {
+    use crate::secrets::file::FileStore;
+    use crate::secrets::{Picked, Stubbed};
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, engine, _, name) = with_store();
+    let file = dir.path().join("secrets.json");
+    let engine = engine.with_secrets(Box::new(Picked::new(
+        Box::new(Stubbed {
+            answers: false,
+            looks: Rc::default(),
+            store: Rc::new(InMemory::named(StoreName::Libsecret)),
+        }),
+        Box::new(FileStore::new(file.clone())),
+    )));
+    let token = secret("home/telegram");
+    set(&engine, &token, VALUE);
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = engine
+        .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("was not removed"), "{err}");
+    assert!(err.contains(&file.display().to_string()), "{err}");
+    assert!(err.contains("again once they can be removed"), "{err}");
+    assert!(!err.contains("where their store answers"), "{err}");
+    assert_eq!(engine.secret_list(&name).unwrap().len(), 1);
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let left = done(
+        engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!std::fs::read_to_string(&file).unwrap().contains(VALUE));
 }
 
 /// An engine on a Linux host's two stores, its Secret Service answering or

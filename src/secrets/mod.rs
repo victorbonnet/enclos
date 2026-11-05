@@ -25,6 +25,12 @@ pub trait SecretStore {
     /// Where the store keeps `secret`, and how to remove it without enclos:
     /// for a secret enclos could not remove.
     fn whereabouts(&self, secret: &SecretRef) -> String;
+    /// Whether a value this store cannot remove keeps its sandbox: then
+    /// `sandbox rm` removes the value before the sandbox's record, which is
+    /// all that leads to it, and refuses while one stays. Otherwise the
+    /// record goes first, and a value left behind is named with its
+    /// whereabouts.
+    fn removed_before_record(&self) -> bool;
     /// The variables with which another enclos process, such as a service,
     /// reaches this same store.
     fn env(&self) -> Vec<(String, String)> {
@@ -75,6 +81,10 @@ pub trait Stores {
     /// The variables with which a service reaches `granted`, the stores
     /// holding what its policy grants.
     fn service_env(&self, granted: &[StoreName]) -> Vec<(String, String)>;
+    /// Whether a value in the store `name` is removed before its sandbox's
+    /// record (`SecretStore::removed_before_record`), whether that store
+    /// answers or not; false for a store this host does not have.
+    fn value_goes_before_record(&self, name: StoreName) -> bool;
 }
 
 /// A store alone is a host's only one.
@@ -95,6 +105,10 @@ impl<T: SecretStore> Stores for T {
     /// needs from the moment a policy grants a secret.
     fn service_env(&self, _granted: &[StoreName]) -> Vec<(String, String)> {
         self.env()
+    }
+
+    fn value_goes_before_record(&self, name: StoreName) -> bool {
+        name == self.name() && self.removed_before_record()
     }
 }
 
@@ -166,6 +180,13 @@ impl Stores for Picked {
             .flat_map(|store| store.env())
             .collect()
     }
+
+    fn value_goes_before_record(&self, name: StoreName) -> bool {
+        let stores: [&dyn SecretStore; 2] = [&*self.preferred, &*self.otherwise];
+        stores
+            .into_iter()
+            .any(|store| store.name() == name && store.removed_before_record())
+    }
 }
 
 /// No store: every call fails, saying why.
@@ -184,6 +205,10 @@ impl Stores for Unavailable {
 
     fn service_env(&self, _: &[StoreName]) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    fn value_goes_before_record(&self, _: StoreName) -> bool {
+        false
     }
 }
 
@@ -246,6 +271,11 @@ impl SecretStore for InMemory {
         format!("{secret} in memory")
     }
 
+    /// As the store it stands for does.
+    fn removed_before_record(&self) -> bool {
+        self.name() != StoreName::Keychain
+    }
+
     fn readable(&self) -> Result<(), SecretError> {
         match self.1.get() {
             true => Err(SecretError {
@@ -277,6 +307,10 @@ impl<T: SecretStore> SecretStore for std::rc::Rc<T> {
 
     fn whereabouts(&self, secret: &SecretRef) -> String {
         (**self).whereabouts(secret)
+    }
+
+    fn removed_before_record(&self) -> bool {
+        (**self).removed_before_record()
     }
 
     fn env(&self) -> Vec<(String, String)> {
@@ -319,6 +353,10 @@ impl SecretStore for Stubbed {
         self.store.whereabouts(secret)
     }
 
+    fn removed_before_record(&self) -> bool {
+        self.store.removed_before_record()
+    }
+
     fn env(&self) -> Vec<(String, String)> {
         self.store.env()
     }
@@ -348,6 +386,36 @@ mod tests {
 
     fn value() -> SecretValue {
         SecretValue::new("tok".to_owned()).unwrap()
+    }
+
+    /// The libsecret and file stores keep a sandbox while one of its values
+    /// stays, the Keychain does not; a host's stores answer for each, the
+    /// Secret Service answering or not, and for a store it lacks, no.
+    #[test]
+    fn which_values_go_before_their_sandboxs_record_is_each_stores_own() {
+        let service = || "enclos.test".to_owned();
+        let file = || file::FileStore::new(PathBuf::from("/nonexistent/secrets.json"));
+        assert!(!keychain::Keychain::from_env(service()).removed_before_record());
+        assert!(libsecret::Libsecret::from_env(service()).removed_before_record());
+        assert!(file().removed_before_record());
+
+        let picked = Picked::new(
+            Box::new(libsecret::Libsecret::from_env(service())),
+            Box::new(file()),
+        );
+        assert!(picked.value_goes_before_record(StoreName::Libsecret));
+        assert!(picked.value_goes_before_record(StoreName::File));
+        assert!(!picked.value_goes_before_record(StoreName::Keychain));
+        assert!(picked.answered.get().is_none(), "it looked for a service");
+
+        let alone = keychain::Keychain::from_env(service());
+        assert!(!alone.value_goes_before_record(StoreName::Keychain));
+        assert!(!file().value_goes_before_record(StoreName::Libsecret));
+        assert!(file().value_goes_before_record(StoreName::File));
+        let none = Unavailable {
+            why: "none".to_owned(),
+        };
+        assert!(!none.value_goes_before_record(StoreName::File));
     }
 
     struct Case {

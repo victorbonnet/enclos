@@ -321,6 +321,12 @@ impl SecretStore for Keychain {
         )
     }
 
+    /// `sandbox rm` finishes whatever the Keychain answers: an item it
+    /// leaves is named, with the `security` command that removes it.
+    fn removed_before_record(&self) -> bool {
+        false
+    }
+
     fn env(&self) -> Vec<(String, String)> {
         self.file
             .iter()
