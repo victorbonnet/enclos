@@ -673,7 +673,6 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         target: None,
         tag: 7,
         limits: Default::default(),
-        reads: Vec::new(),
     };
     let output = |mut command: Command| {
         let out = command.stdin(Stdio::null()).output().unwrap();
@@ -834,7 +833,6 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         target: None,
         tag: 7,
         limits: Default::default(),
-        reads: Vec::new(),
     };
     let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
