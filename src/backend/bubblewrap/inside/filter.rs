@@ -97,8 +97,8 @@ fn errno(name: &str) -> Result<u32, InsideError> {
 /// Ends a process that makes an x32 call. x32 shares x86_64's audit
 /// architecture and numbers its calls from `0x4000_0000`, so seccompiler's
 /// check of the architecture passes it and no listed number matches: without
-/// this, `keyctl` plus that bit gets past a filter of named calls. libseccomp
-/// treats it as another architecture, which ends the process; so does this.
+/// this, `keyctl` plus that bit gets past a filter of named calls. This ends
+/// the process, as seccompiler does for a call of another architecture.
 /// Numbers above the range, such as `-1`, stay the kernel's to refuse.
 fn no_x32() -> BpfProgram {
     const LOAD_NUMBER: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS, at offset 0

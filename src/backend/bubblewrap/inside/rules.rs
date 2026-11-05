@@ -40,8 +40,8 @@ fn write() -> BitFlags<AccessFs> {
         | AccessFs::Truncate
 }
 
-/// Each compiled list with its rights, as `inside.py --proc-truncate` gives
-/// them.
+/// Each compiled list with its rights. `/proc` has `TRUNCATE`, so a write
+/// there that opens with `O_TRUNC` is not refused (design §5).
 pub(super) fn grants(rules: &LandlockRules) -> Vec<Grant> {
     let lists = [
         (&rules.read, read()),
@@ -99,8 +99,9 @@ fn kernel_abi(status: LandlockStatus) -> Option<u32> {
     }
 }
 
-/// What was held, from what the kernel answered. A kernel with every right
-/// that held less is refused: it is no case ADR 0037 runs without.
+/// What was held, from what the kernel answered. Refuses a kernel with ABI
+/// 6 or newer whose rules did not all hold: ADR 0037 runs with less only on
+/// an older or missing Landlock.
 pub(super) fn outcome(
     kernel: LandlockStatus,
     ruleset: RulesetStatus,
@@ -166,7 +167,8 @@ mod tests {
             .collect()
     }
 
-    /// `inside.py --proc-truncate`'s numbers, shown on Landlock's ABI 8.
+    /// Each list's rights as Landlock's bits, the same as
+    /// `prototype/m3/inside.py --proc-truncate` applied on ABI 8.
     #[test]
     fn each_list_has_the_prototypes_rights() {
         assert_eq!(access_of("/")[0].bits(), 0b1100);

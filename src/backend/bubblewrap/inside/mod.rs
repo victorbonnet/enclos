@@ -85,19 +85,21 @@ trait Confine {
     fn say(&mut self, line: &str);
 }
 
-/// What a session does besides, each step returning what stops it.
+/// The steps only a session takes, after [`Confine`]'s, each returning what
+/// stops it.
 trait SessionSteps: Confine {
     fn start_relay(&mut self) -> Result<(), InsideError>;
     fn run_command(&mut self) -> InsideError;
 }
 
-/// What the relay does besides.
+/// The steps only a relay takes.
 trait RelaySteps: Confine {
     fn say_ready(&mut self) -> Result<(), InsideError>;
     fn serve(&mut self) -> InsideError;
 }
 
-/// Landlock, then seccomp, as the prototype applied them.
+/// Landlock, then seccomp: the rules are made while no filter applies to
+/// the calls that make them.
 fn confine(steps: &mut impl Confine) -> Result<(), InsideError> {
     let landlock = steps.apply_landlock()?;
     if let Some(line) = landlock.notice() {
@@ -181,7 +183,8 @@ impl Prepared {
             .spawn()
             .map_err(InsideError::RelayStart)?;
         let mut said = String::new();
-        // Read here, as the log goes with the session's own `/tmp`.
+        // Read now: the log is in the session's `/tmp`, which goes when the
+        // session ends.
         let not_ready = || InsideError::RelayNotReady {
             why: last_line(Path::new(&relay.log)),
         };
