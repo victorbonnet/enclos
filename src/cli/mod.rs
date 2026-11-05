@@ -2,6 +2,7 @@
 //! the one engine call each verb makes, and how its result prints.
 
 pub mod agent;
+pub mod app;
 pub mod connect;
 pub mod doctor;
 pub mod inside;

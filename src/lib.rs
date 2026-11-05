@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod backend;
+pub mod bridge;
 pub mod config;
 pub mod engine;
 pub mod error;

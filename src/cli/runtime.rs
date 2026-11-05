@@ -144,9 +144,9 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: RuntimeArgs) -> 
 /// What `runtime configure` sets up: the bot of the sandbox's built-in
 /// agent, or of the agent named (ADR 0036).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChannelTarget {
-    sandbox: SandboxName,
-    agent: Option<AgentName>,
+pub(super) struct ChannelTarget {
+    pub(super) sandbox: SandboxName,
+    pub(super) agent: Option<AgentName>,
 }
 
 impl FromStr for ChannelTarget {

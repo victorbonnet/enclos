@@ -350,7 +350,7 @@ impl Engine {
     }
 
     /// The values of `grants`, by variable, read from the secret store now.
-    fn granted_values(
+    pub(super) fn granted_values(
         &self,
         grants: &crate::model::policy::SecretGrants,
     ) -> Result<Vec<(String, SecretValue)>> {
