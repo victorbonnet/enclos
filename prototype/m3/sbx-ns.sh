@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs a command in the prototype sandbox as one session of it, joined to the
-# sandbox's namespaces in one of nsjoin.py's ways (M3-03):
+# sandbox's namespaces in one of nsjoin.py's ways:
 #
 #   SBX_JOIN=<one of nsjoin.py's ways> [SBX_HOLDER=<holder socket>] \
 #   [SBX_LANDLOCK=auto|off] [SBX_SECCOMP=on|off] [SBX_RELAY=1] \
@@ -11,7 +11,7 @@
 # through ns-fds.py, then runs nsenter and bubblewrap as nsjoin.py says, then
 # inside.py.
 #
-# For the `relay` way (option 2): SBX_SERVICE_FORWARD=1 marks the service's
+# For the `relay` way: SBX_SERVICE_FORWARD=1 marks the service's
 # session: ns-listen.py makes run/service.sock on the host and inside.py
 # forwards it to 127.0.0.1 at the port the host writes in run/service.port.
 # SBX_SERVICE_PORT=<port> marks any other session: inside.py listens on

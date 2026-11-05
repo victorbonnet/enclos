@@ -1,6 +1,6 @@
 """Gets a sandbox's namespaces from its holder (ns-holder.py) and runs a
 command with them open as file descriptors 10 (user), 11 (PID) and 12
-(network), for nsenter or bubblewrap to join (M3-03).
+(network), for nsenter or bubblewrap to join.
 
     python3 -I ns-fds.py HOLDER_SOCKET -- command...
 """

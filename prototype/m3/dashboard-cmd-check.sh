@@ -1,6 +1,6 @@
 #!/bin/bash
 # The stand-in for `enclos dashboard <sandbox>` (dashboard-cmd.py), end to end
-# (M3-03): Hermes's real dashboard from the host, through the listener, for the
+#: Hermes's real dashboard from the host, through the listener, for the
 # user running it and for no other. In order:
 #
 #   a. page, assets, WebSockets, the terminal (/api/pty) and the chat as far as

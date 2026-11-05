@@ -1,4 +1,4 @@
-"""The host's side of the path to a sandbox's service (M3-03): it listens on
+"""The host's side of the path to a sandbox's service: it listens on
 the host's 127.0.0.1 at the sandbox's reserved port and passes each connection
 to a Unix socket in the host-only folder, which the holder relays into the
 sandbox's network namespace (ns-holder.py --host-relay). Only the user running

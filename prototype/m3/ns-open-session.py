@@ -1,4 +1,4 @@
-"""A session left open (M3-03): what a user's terminal is while the service,
+"""A session left open: what a user's terminal is while the service,
 the proxy or the holder restarts. Run as a session's command, it waits for
 commands the check drops in a folder of the sandbox's home, runs each inside
 this one session and leaves its output there (lib.sh's `ask`), so the check

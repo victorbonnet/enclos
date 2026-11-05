@@ -1,5 +1,5 @@
 #!/bin/bash
-# Namespaces per session or per sandbox (M3-03, design §15 and §14): can
+# Namespaces per session or per sandbox (design §5 and §14): can
 # bubblewrap start inside a network namespace enclos entered first, so every
 # session of a sandbox shares one and reaches its service's port (ADR 0028)?
 # And what does sharing, or not, change for PIDs, signals, start-up
@@ -12,16 +12,16 @@
 # does), then the same probes from a second session of A, from a session of
 # B, and from the host. Then it ends A's holder and looks whether the service
 # outlived it. Sandboxes A and B share one compiled policy, home and run/
-# folder: only their namespaces differ. In the `relay` way (option 2), the
+# folder: only their namespaces differ. In the `relay` way, the
 # service's session forwards run/service.sock to its port, which the host
 # reads from the service's namespace and writes to run/service.port, and the
 # other session of A relays that port; B is given no relay, as a sandbox
 # without the service, but reaches the socket only because it shares run/.
 #
-# Then, for the `nsenter` way, the one decided on: what still holds in a joined
-# session with each layer off in turn (--disable-userns, the seccomp filter,
-# capabilities), and what a service, proxy or holder restart does to a session
-# left open (ns-open-session.py), and to a new one.
+# Then, for the `nsenter` way, the one ADR 0039 proposes: what still holds in
+# a joined session with each layer off in turn (--disable-userns, the seccomp
+# filter, capabilities), and what a service, proxy or holder restart does to a
+# session left open (ns-open-session.py), and to a new one.
 #
 # Acts on the host (runs bubblewrap, makes namespaces): CI only.
 set -u
@@ -29,7 +29,7 @@ source "$(dirname "$0")/lib.sh"
 out="$RESULTS_DIR/50-namespaces.md"
 tmp="$RESULTS_DIR/namespaces"
 mkdir -p "$tmp"
-# The rejected ways stay in nsjoin.py; the third run measured them (README.md).
+# The other ways stay in nsjoin.py, measured and rejected (README.md).
 WAYS=(own nsenter relay)
 HOST_PORT=18999
 
@@ -322,7 +322,7 @@ sed -i -e "s/ $old\t/ <old port>\t/; s/ $port\t/ <service>\t/" "$log"
     echo "| --- | --- | --- | --- | --- | --- | --- |"
     printf '%s\n' "${summary[@]}"
     section "What still holds in a joined session"
-    echo "\`status\` is the probe's own \`/proc/self/status\`. With seccomp off, \`unshare user\` shows \`--disable-userns\` alone (ENOSPC from it, as in M3-02); \`setns-net\` and \`net-admin\` show the session has no capability over the sandbox's network namespace."
+    echo "\`status\` is the probe's own \`/proc/self/status\`. With seccomp off, \`unshare user\` shows \`--disable-userns\` alone (ENOSPC from it, as in \`own\`); \`setns-net\` and \`net-admin\` show the session has no capability over the sandbox's network namespace."
     echo
     python3 -I "$M3/table.py" "${holds_cols[@]}"
     echo

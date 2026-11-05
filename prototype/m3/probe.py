@@ -281,7 +281,7 @@ def p_dns(name):
         return "EAI", str(e)
 
 
-# M3-03: what a session sees of its sandbox's other sessions.
+# What a session sees of its sandbox's other sessions.
 
 def p_netns():
     return "ok", " ".join(os.readlink(f"/proc/self/ns/{n}") for n in ("user", "pid", "net"))

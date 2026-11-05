@@ -1,6 +1,7 @@
 #!/bin/bash
-# What refused the first run's joins (M3-03): `nsenter` entering the holder's
-# network namespace and bubblewrap's `--pidns`, both EPERM on the runners.
+# What refuses a join of a holder started with `--dev /dev`: `nsenter`
+# entering its network namespace and bubblewrap's `--pidns`, both EPERM on
+# the runners.
 # With AppArmor's restriction on unprivileged user namespaces on (as the
 # runners are, with setup-runner.sh's profile for /usr/bin/bwrap), then off,
 # then on again, it records:

@@ -1,4 +1,4 @@
-"""Makes the Unix socket the service's port is relayed through (M3-03, option
+"""Makes the Unix socket the service's port is relayed through (option
 2) and runs a command with it listening as file descriptor 13. The host makes
 it, in the sandbox's run/ folder, which the sandbox reads but cannot write,
 so the service's session needs no write access there.

@@ -1,4 +1,4 @@
-"""What Hermes's own client code does to find its gateway (M3-03), run with
+"""What Hermes's own client code does to find its gateway, run with
 Hermes's interpreter in a session of the sandbox: it lists the functions of
 `hermes_cli.gateway_client`, then calls those whose names say they look for
 a gateway and that need no argument, and prints what each returned. Names

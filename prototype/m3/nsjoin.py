@@ -1,5 +1,5 @@
-"""How a session joins its sandbox's namespaces (M3-03, design §15's row on
-network and PID namespaces). Pure: it rewrites the compiled bubblewrap
+"""How a session joins its sandbox's namespaces (design §5, A
+session's namespaces). Pure: it rewrites the compiled bubblewrap
 arguments for one way of joining and prints the command, NUL-separated, for
 sbx-ns.sh; test_nsjoin.py tests it anywhere.
 
@@ -26,12 +26,12 @@ that owns it. So the ways tried are:
                   drops every capability, then Landlock and seccomp
     userns-subpid the same, with a PID namespace of the session's own made
                   under the holder's (--unshare-pid with --pidns)
-    userns-net    the second run's option 1a: bubblewrap joins the holder's
+    userns-net    rejected: bubblewrap joins the holder's
                   user namespace alone (--userns, no --pidns), makes a PID
                   namespace of the session's own, and keeps CAP_SYS_ADMIN, so
                   inside.py can enter the network namespace, then drop every
                   capability, then apply Landlock and seccomp
-    relay         the second run's option 2: every session its own
+    relay         not chosen: every session its own
                   namespaces, as `own`; the service's port is relayed
                   through a Unix socket in the sandbox's run/ folder
                   (sbx-ns.sh's SBX_SERVICE_FORWARD and SBX_SERVICE_PORT)

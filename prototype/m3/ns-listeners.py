@@ -1,5 +1,5 @@
 """The TCP ports listening on 127.0.0.1 in the network namespace of a host
-process, and which processes hold each (M3-03), read from the host as ADR
+process, and which processes hold each, read from the host as ADR
 0028 has enclos read its service's port: from /proc/<pid>/net/tcp, matched to
 the holders' socket descriptors in /proc/*/fd.
 

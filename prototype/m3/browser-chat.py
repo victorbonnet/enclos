@@ -1,5 +1,5 @@
-"""Hermes's Chat tab in a real Chromium on the host, through the host's listener
-(M3-03): the page's own JavaScript opens /api/pty, this types a prompt into its
+"""Hermes's Chat tab in a real Chromium on the host, through the host's
+listener: the page's own JavaScript opens /api/pty, this types a prompt into its
 terminal as a user would, and keeps every frame the page received, read over
 the DevTools protocol, with a screenshot.
 

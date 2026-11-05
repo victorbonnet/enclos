@@ -8,13 +8,13 @@ then starts the relay, confined like the rest, and runs the command.
         [--service-forward FD PORT_FILE] [--service-relay PORT SOCKET]
         -- command...
 
-For M3-03, --setns-net-fd enters the sandbox's network namespace from a
+--setns-net-fd enters the sandbox's network namespace from a
 descriptor its holder gave (nsjoin.py's `userns` ways, where bubblewrap kept
 CAP_SYS_ADMIN in the holder's user namespace), then drops every capability,
 before Landlock and seccomp, which refuses setns. --close-fd closes the
 holder's descriptors so the command never holds them.
 
-For M3-03's option 2 (nsjoin.py's `relay` way), where every session has its
+For nsjoin.py's `relay` way, where every session has its
 own network namespace: in the service's session, --service-forward accepts
 on a Unix socket the host made and passed in as FD (in the sandbox's run/
 folder, which the sandbox cannot write) and forwards each connection to

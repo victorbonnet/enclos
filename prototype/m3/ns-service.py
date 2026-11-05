@@ -1,4 +1,4 @@
-"""A stand-in for a runtime's service in a session (M3-03): it listens as
+"""A stand-in for a runtime's service in a session: it listens as
 Hermes's gateway does, on 127.0.0.1 at a port the kernel picks, and also on
 every address and on an abstract Unix socket, then writes where it listens to
 a file in the sandbox's home and waits. Its marker is in its command line and

@@ -1,14 +1,13 @@
-"""Host-side process lookups for the M3-03 checks, read from /proc only.
+"""Host-side process lookups for the namespaces checks, read from /proc only.
 
     python3 -I ns-procs.py descendants PID   # PID's descendants, deepest first
     python3 -I ns-procs.py match WORD...     # pid, comm and command line of every
                                              # process whose command line holds
                                              # every word, launchers left out
 
-The first run counted Hermes's gateways by "gateway run" in `ps`, which
-matched the relay inside.py forks (it keeps inside.py's command line) and not
-Hermes's own gateway; `match` leaves out the launchers and prints `comm`, so
-the output says which process it found.
+Counting "gateway run" in `ps` matches the relay inside.py forks (it keeps
+inside.py's command line) and not Hermes's own gateway, so `match` leaves out
+the launchers and prints `comm`, which says which process it found.
 """
 
 import os

@@ -1,12 +1,12 @@
-"""The holder of a sandbox's namespaces (M3-03): what enclos would run for a
+"""The holder of a sandbox's namespaces: what enclos would run for a
 sandbox, in its proxy service for instance, so that every session joins one
 network and PID namespace. bubblewrap starts it in a new user, PID and network
 namespace; it opens its own namespaces and hands them, as file descriptors,
 to whoever connects to its Unix socket (ns-fds.py), so the host needs no
 access to /proc/<pid>/ns. With --relay, it also serves the sandbox's one
 relay on 127.0.0.1 in that network namespace, so sessions need none of
-their own. With --host-relay, it serves the other direction (decision 2): each
-connection to a Unix socket in the host-only folder is passed to 127.0.0.1 in
+their own. With --host-relay, it serves the other direction, the host's way
+in: each connection to a Unix socket in the host-only folder is passed to 127.0.0.1 in
 that namespace, at the port in PORT_FILE. The host writes that file after
 reading the port from the service's side; it is read per connection, so a
 restarted service needs nothing from the holder, and no session can reach it.

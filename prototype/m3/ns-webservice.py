@@ -1,4 +1,4 @@
-"""A stand-in for a runtime's dashboard in a session (M3-03): a page, an asset
+"""A stand-in for a runtime's dashboard in a session: a page, an asset
 and a WebSocket that echoes, on 127.0.0.1 at a port the kernel picks. It says
 which Host header it saw, and writes its port to a file in the sandbox's home
 that the check only compares with what it read from the host.

@@ -1,9 +1,10 @@
 #!/bin/bash
-# Whether the dashboard's Chat tab reaches its backend (M3-03), as a control
-# pair in one run. The fifth run's proxy refused `GET http://127.0.0.1:<port>`
-# while the terminal was open: the terminal's program, in a session with
-# NODE_USE_ENV_PROXY=1 and NO_PROXY empty, seems to send its own backend
-# connection to the proxy. So the same round runs twice through the stand-in:
+# Whether the dashboard's Chat tab reaches its backend, as a control
+# pair in one run. With the session as it is, the proxy refuses
+# `GET http://127.0.0.1:<port>` while the terminal is open: the terminal's
+# program, in a session with NODE_USE_ENV_PROXY=1 and NO_PROXY empty, sends
+# its own backend connection to the proxy. So the same round runs twice
+# through the stand-in:
 #
 #   as-is   the dashboard's session as it is
 #   fixed   that session alone with NO_PROXY=127.0.0.1,localhost,::1 and no_proxy

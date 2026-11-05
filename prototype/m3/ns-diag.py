@@ -1,4 +1,4 @@
-"""What refuses joining a holder's namespaces (M3-03): run with the holder's
+"""What refuses joining a holder's namespaces: run with the holder's
 descriptors at 10 (user), 11 (PID) and 12 (network), from ns-fds.py, it
 enters them one at a time as nsenter does, user first, and prints after each
 step its AppArmor label, its capabilities and the error, if any.

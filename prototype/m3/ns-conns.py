@@ -1,4 +1,4 @@
-"""Who is connected to a port in a process's network namespace (M3-03), read
+"""Who is connected to a port in a process's network namespace, read
 from the host: the established client ends to 127.0.0.1:PORT in
 /proc/<pid>/net/tcp, each with the processes holding it. This shows whether the
 dashboard's terminal holds its backend connection, rather than inferring it.

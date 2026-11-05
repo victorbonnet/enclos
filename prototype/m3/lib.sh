@@ -66,7 +66,7 @@ section() { printf '\n## %s\n\n' "$1"; }
 # The text in a fence, ending in a newline even when the input does not.
 fence() { printf '```\n'; sed -e '$a\'; printf '```\n'; }
 
-# M3-03's holder of a sandbox's namespaces (ns-holder.py), with the
+# The holder of a sandbox's namespaces (ns-holder.py), with the
 # sandbox's relay to $PROXY_SOCK and the host's way in: <folder>/host-relay.sock
 # to the port the host writes in <folder>/service.port.
 #
@@ -93,8 +93,9 @@ start_holder() {
 }
 
 # join_cmd HOLDER_DIR: sets JOINED to the start of a command that runs as a
-# session joined to that holder the decided way. An array, not a function, so
-# `"${JOINED[@]}" command &` leaves $! at timeout, which passes a TERM on.
+# session joined to that holder the `nsenter` way (ADR 0039, proposed). An
+# array, not a function, so `"${JOINED[@]}" command &` leaves $! at timeout,
+# which passes a TERM on.
 join_cmd() {
     JOINED=(env SBX_JOIN=nsenter SBX_HOLDER="$1/holder.sock" timeout 1200 "$M3/sbx-ns.sh" --)
 }

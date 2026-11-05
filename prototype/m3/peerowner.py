@@ -1,4 +1,4 @@
-"""Who owns the client end of a connection to the host's listener (M3-03): read
+"""Who owns the client end of a connection to the host's listener: read
 from the kernel's socket tables, /proc/net/tcp and /proc/net/tcp6, where each
 socket's row names its owner's uid. Pure but for read_tables: test_peerowner.py
 tests it on fixture text. A dual-stack client's IPv4 connection is in tcp6, as

@@ -1,5 +1,5 @@
 #!/bin/bash
-# The host's path to a sandbox's service (M3-03, decision 2), so that Hermes's
+# The host's path to a sandbox's service, so that Hermes's
 # dashboard opens in the host's browser: a listener on the host's 127.0.0.1 at
 # the sandbox's reserved port (host-listen.py) -> a Unix socket in the host-only
 # folder -> the holder's relay (ns-holder.py --host-relay) -> 127.0.0.1:<service

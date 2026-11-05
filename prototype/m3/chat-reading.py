@@ -1,4 +1,4 @@
-"""What dashboard-chat-check.sh's control pair reads as (M3-03). The sentence on
+"""What dashboard-chat-check.sh's control pair reads as. The sentence on
 the cause comes from the backend rows alone; a missing answer is said apart,
 since counting words on a terminal in a window shows no cause.
 

@@ -1,4 +1,4 @@
-"""What a browser on the host does at a sandbox's service (M3-03, decision 2):
+"""What a browser on the host does at a sandbox's service:
 the page, its assets and its WebSocket, with the Host and Origin a browser
 would send for BASE's own port. Prints probe.py's lines (spec, result, detail)
 for table.py, with the URL's port written <url port>, so a column read through

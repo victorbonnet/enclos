@@ -1,4 +1,4 @@
-"""The little of RFC 6455 the M3-03 host-path checks need, on the standard
+"""The little of RFC 6455 the host-path checks need, on the standard
 library alone: the handshake's accept key and one frame at a time. Pure:
 test_host_path.py tests it anywhere.
 """

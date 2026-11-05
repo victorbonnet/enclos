@@ -1,6 +1,6 @@
 #!/bin/bash
 # Whether Hermes's clients find a gateway that runs in another session of the
-# sandbox (M3-03, design §15 and §14): in a network namespace of the
+# sandbox (design §5 and §14): in a network namespace of the
 # sandbox's, held by ns-holder.py, and in the same PID namespace or another.
 #
 # It installs Hermes in the sandbox's home (as hermes-check.sh, through the
@@ -20,11 +20,12 @@
 #
 #   own          each session its own network and PID namespaces (control)
 #   nsenter      one network namespace, the holder's, entered with nsenter
-#                before bubblewrap; each session its own PIDs (the decided way)
+#                before bubblewrap; each session its own PIDs (ADR 0039,
+#                proposed)
 #   relay        each session its own namespaces; the gateway's port, read
-#                from the host, relayed through run/service.sock (option 2)
+#                from the host, relayed through run/service.sock
 #
-# The third run measured the shared ways and rejected the others (README.md).
+# The other ways stay in nsjoin.py, measured and rejected (README.md).
 #
 # Acts on the host (runs bubblewrap, makes namespaces, installs Hermes in the
 # home): CI only.
@@ -74,8 +75,8 @@ py=$(head -1 "$SBX_HOME/.local/bin/hermes" 2>/dev/null | sed -n 's/^#!\([^ ]*pyt
 # Hermes's gateway, found two ways from the host: the processes holding a
 # port on 127.0.0.1 in the ephemeral range in its network namespace (as ADR
 # 0028 has enclos find it), and the processes whose command line names
-# Hermes and its gateway (ns-procs.py leaves the launchers out, which the
-# first run's count did not). gateway-starts.log, in the home, is Hermes's
+# Hermes and its gateway (ns-procs.py leaves out the launchers, whose command
+# lines name them too). gateway-starts.log, in the home, is Hermes's
 # own record of each gateway start.
 starts() { wc -l <"$SBX_HOME/.hermes/gateway-starts.log" 2>/dev/null || echo 0; }
 by_name() { python3 -I "$M3/ns-procs.py" match hermes gateway | sed "s#$SBX_HOME#~#g" | cut -c1-200; }

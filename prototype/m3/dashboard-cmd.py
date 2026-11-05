@@ -1,4 +1,4 @@
-"""A stand-in for `enclos dashboard <sandbox>` (M3-03): the way to Hermes's
+"""A stand-in for `enclos dashboard <sandbox>`: the way to Hermes's
 dashboard from the host's browser. It starts a dashboard server of its own as a
 recorded session under the sandbox's policy, on a port the kernel picks and
 never attached to one another session left open (a plain `hermes dashboard`
