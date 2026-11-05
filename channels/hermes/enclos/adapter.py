@@ -56,6 +56,9 @@ class EnclosAdapter(BasePlatformAdapter):
         self._server: Optional[asyncio.base_events.Server] = None
         self._bridge: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
+        # By conversation: the title last sent to the bridge, and the pending look.
+        self._titles: dict[str, str] = {}
+        self._title_checks: dict[str, asyncio.Task] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -139,6 +142,8 @@ class EnclosAdapter(BasePlatformAdapter):
             self._outbox.acknowledge(message["of"])
         elif kind == "message.in":
             await self._on_message(message)
+        elif kind == "conversation.rename":
+            await self._rename(message["conversation"], message["title"])
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
         else:
@@ -161,7 +166,89 @@ class EnclosAdapter(BasePlatformAdapter):
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
         await self._write(message)  # if it is not connected, it gets the message on its next hello
+        self._check_title_soon(chat_id)
         return SendResult(success=True, message_id=message["id"])
+
+    # Conversation titles. Hermes names each session (a title cut from the
+    # first message at once, then a model's summary about a second later) but
+    # tells only its Telegram and Discord adapters when it does: the adapter
+    # looks after each reply, and again a little later. What it reads goes
+    # through the gateway's session store and database, which are not a
+    # plugin API: when they are not there, the conversation has no title.
+
+    # Seconds after a reply to look at the title: at once, and after the
+    # model's summary usually lands.
+    TITLE_LOOKS = (0, 5, 20)
+
+    def _check_title_soon(self, chat_id: str) -> None:
+        pending = self._title_checks.get(chat_id)
+        if pending is not None and not pending.done():
+            pending.cancel()
+        self._title_checks[chat_id] = asyncio.ensure_future(self._look_for_title(chat_id))
+
+    async def _look_for_title(self, chat_id: str) -> None:
+        waited = 0
+        for at in self.TITLE_LOOKS:
+            await asyncio.sleep(at - waited)
+            waited = at
+            found = await self._session_title(chat_id)
+            # The model's summary, or a name the person set in Hermes; not the
+            # cut of the first message, which the summary replaces a second later.
+            if found is None or found[1] not in ("llm", "user"):
+                continue
+            title = protocol.runtime_title(found[0])
+            if title and title != self._titles.get(chat_id):
+                if await self._write(protocol.title(chat_id, title)):
+                    self._titles[chat_id] = title
+
+    def _session_id(self, chat_id: str) -> Optional[str]:
+        """The Hermes session behind a conversation now: it changes when Hermes
+        compresses or resets one, so it is looked up each time."""
+        try:
+            from gateway.session import build_session_key
+            source = self.build_source(chat_id=chat_id, chat_name=chat_id, chat_type="dm")
+            self._canonicalize(source)
+            key = build_session_key(source, profile=self._session_key_profile(source))
+            store = getattr(self, "_session_store", None)
+            return store.peek_session_id(key) if store is not None else None
+        except Exception:
+            logger.debug("[%s] No session for %s", self.name, chat_id, exc_info=True)
+            return None
+
+    async def _session_db_call(self, method: str, *args: Any) -> Any:
+        db = getattr(getattr(self, "gateway_runner", None), "_session_db", None)
+        call = getattr(db, method, None) if db is not None else None
+        if call is None:
+            raise LookupError("no session database")
+        result = call(*args)
+        return await result if asyncio.iscoroutine(result) else result
+
+    async def _session_title(self, chat_id: str) -> Optional[tuple[str, str]]:
+        session_id = self._session_id(chat_id)
+        if not session_id:
+            return None
+        try:
+            title = await self._session_db_call("get_session_title", session_id)
+            source = await self._session_db_call("get_session_title_source", session_id)
+        except Exception:
+            logger.debug("[%s] Cannot read the title of %s", self.name, chat_id, exc_info=True)
+            return None
+        return (title, source or "") if title else None
+
+    async def _rename(self, chat_id: str, title: str) -> None:
+        """The person named the conversation in the app (or cleared its name): the
+        session takes it with the person's authority, so Hermes names it no more."""
+        self._titles[chat_id] = title
+        session_id = self._session_id(chat_id)
+        if not session_id:
+            return
+        try:
+            from hermes_state import SessionDB
+            await self._session_db_call("set_session_title", session_id, SessionDB.sanitize_title(title) or "")
+        except Exception as e:
+            # Another session holds that title (Hermes keeps them unique), or no
+            # database: the app shows the bridge's name all the same.
+            logger.info("[%s] The session keeps its title: %s", self.name, e)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         await self._write(protocol.typing(chat_id, True))
