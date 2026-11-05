@@ -38,14 +38,10 @@ const OWN_DESCRIPTORS: u64 = 24;
 /// connections and lookups also hold threads, which nothing else bounds.
 const MOST_DESCRIPTORS: u64 = 1024;
 
-/// The most client connections a proxy serves at once, and the most name
-/// lookups that run at once, for a process limited to `descriptors` (none:
-/// no limit). A connection holds a thread, two while it relays, and two
-/// descriptors. A lookup, which counts until the host's resolver returns
-/// even if the proxy stopped waiting for it, holds a thread, and possibly a
-/// descriptor while the resolver waits. Connections and lookups share what
-/// is left after [`OWN_DESCRIPTORS`] at the rate of 100 to 32, which fills
-/// the 256 launchd gives a service, and neither is ever none.
+/// The connections and lookups a proxy runs at once under a soft limit of
+/// `descriptors` (None: unlimited), each at least 1. A connection takes two
+/// descriptors, a lookup up to one; they share what is left after
+/// [`OWN_DESCRIPTORS`] at the rate of 100 to 32, which fills launchd's 256.
 fn limits_for(descriptors: Option<u64>) -> (usize, usize) {
     const SHARE: u64 = 2 * 100 + 32;
     let left = descriptors

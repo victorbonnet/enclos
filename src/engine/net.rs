@@ -32,16 +32,12 @@ impl Engine {
     }
 
     /// Runs the sandbox's egress proxy until the process ends: on its Unix
-    /// socket, and, when the sandbox's sessions reach it over TCP, on `port`
-    /// on both loopbacks (127.0.0.1 alone where `[::1]` is not configured).
-    /// A proxy whose sessions reach it over the socket alone leaves the port
-    /// free (ADR 0040). With `record`, it records itself as the sandbox's
-    /// proxy once it holds the port, or the lock only one proxy holds, and
-    /// its socket is open or given up on, as `proxy_socket` says, never
-    /// before. When the sandbox's reserved port is taken, it says whether by
-    /// the sandbox's own proxy or by another program, and on which loopback.
-    /// It reads the active policy for each new connection, so policy changes
-    /// apply without a restart.
+    /// socket, and on `port` on both loopbacks unless its sessions reach it
+    /// over the socket alone (ADR 0040). With `record`, it records itself
+    /// once it holds the port, or the lock only one proxy holds, and its
+    /// socket is open or given up on, as `proxy_socket` says. It reads the
+    /// active policy for each new connection, so policy changes apply
+    /// without a restart.
     pub fn run_proxy(&self, name: &SandboxName, port: u16, record: Option<&Actor>) -> Result<()> {
         let sandbox = self.record(name)?;
         self.policy(name)?;
@@ -76,7 +72,10 @@ impl Engine {
         })
     }
 
-    /// The proxy's listeners at `port` on both loopbacks.
+    /// The proxy's listeners at `port` on both loopbacks, or on 127.0.0.1
+    /// alone where `[::1]` is not configured. When the sandbox's reserved
+    /// port is taken, the error says whether by the sandbox's own proxy or
+    /// by another program, and on which loopback.
     fn listen_on_port(
         &self,
         name: &SandboxName,

@@ -233,7 +233,7 @@ impl Layout {
 
     /// The socket a session with a network of its own reaches the sandbox's
     /// proxy on, in the one folder of [`Layout::sandbox_run_dir`] that is for
-    /// the sandbox's sessions (design §15, Linux runtime boundary).
+    /// the sandbox's sessions (design §5, Linux networking).
     pub fn proxy_socket(&self, name: &str) -> PathBuf {
         self.sandbox_run_dir(name).join("visible/proxy.sock")
     }
