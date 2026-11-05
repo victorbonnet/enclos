@@ -41,7 +41,7 @@ pub struct HostSystem {
     shells: &'static [&'static str],
     /// What makes the shell ready for a person. A login shell on macOS. Not
     /// on Linux: Debian's `/etc/profile` sets `PATH`, which would drop the
-    /// sandbox's own `bin` folders; Ubuntu's does not.
+    /// sandbox's own `bin` folders.
     shell_args: &'static [&'static str],
     /// Its folders of programs, in `PATH` order.
     folders: &'static [&'static str],

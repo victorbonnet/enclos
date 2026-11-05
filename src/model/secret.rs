@@ -229,9 +229,9 @@ pub fn reserved_variable(name: &str) -> bool {
         || name.starts_with("LC_")
         || name.starts_with("ENCLOS_")
         || name.starts_with("DYLD_")
-        // Read by Linux's dynamic linker in every host process that carries
-        // a session's variables, before any sandbox and whatever `bash -p`
-        // ignores.
+        // Linux's dynamic linker reads these as soon as a host process with
+        // a session's variables starts (the `bash -p` that sets limits
+        // included), before any sandbox.
         || name.starts_with("LD_")
         || name.starts_with("XDG_")
         || name.starts_with("BASH_FUNC_")
