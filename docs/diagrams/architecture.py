@@ -19,7 +19,7 @@ THEMES = {
 }
 
 TITLE = "Every client goes through one core; each sandbox runs as its own services"
-SUBTITLE = "No daemon: the CLI writes state and audit, and launchd keeps each sandbox's proxy and gateway running"
+SUBTITLE = "No daemon: the CLI writes state and audit, and the service manager keeps each sandbox's proxy and gateway running"
 
 CLIENTS = [  # x, title, lines, kind
     (40, "enclos (CLI)", ["every operation", "milestone 1"], "accent"),
@@ -93,7 +93,7 @@ def draw(t: dict) -> str:
     text(195, 455, "runs the runtime inside the sandbox", 13.5, t["sub"], anchor="start")
 
     out.append(f'<rect x="40" y="476" width="1060" height="140" rx="11" fill="{t["panel"]}" stroke="{t["line"]}" stroke-width="1.5"/>')
-    text(1080, 500, "Services: launchd on macOS (systemd on Linux, later)", 15, t["text"], "600", "end")
+    text(1080, 500, "Services: launchd on macOS, systemd on Linux", 15, t["text"], "600", "end")
     for i, (x, title, lines) in enumerate(SERVICES):
         box(x, 520, 300, 76, title, lines)
         if i:
