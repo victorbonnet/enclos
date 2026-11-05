@@ -117,6 +117,9 @@ pub trait ServiceManager {
     /// The labels installed and not removed yet that start with `prefix`,
     /// whether or not they run.
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError>;
+    /// The command a user runs to remove `var` from this manager's own
+    /// environment.
+    fn unset_env_command(&self, var: &str) -> String;
 }
 
 /// This host's service manager: launchd on macOS, systemd on Linux. Other
@@ -172,6 +175,10 @@ impl ServiceManager for Unsupported {
 
     fn installed(&self, _prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         Ok(Vec::new())
+    }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("unset {var} where the service runs")
     }
 }
 

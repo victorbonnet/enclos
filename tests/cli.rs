@@ -3566,6 +3566,27 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
 /// A baseline value that is neither makes Seatbelt unusable, which doctor
 /// says with why, in text and JSON; on the comparison baseline it says what
 /// it compares against.
+/// `launch` refuses the comparison baseline before anything runs, and names
+/// the command that removes it from the host's own service manager.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn launch_on_the_comparison_baseline_names_the_hosts_manager() {
+    let home = Home::new();
+    home.init(1);
+    let out = Run(home
+        .command(&["launch", "home", "gateway"])
+        .env("ENCLOS_SEATBELT_BASELINE", "allow-default")
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    let unset = if cfg!(target_os = "macos") {
+        "`launchctl unsetenv ENCLOS_SEATBELT_BASELINE`"
+    } else {
+        "`systemctl --user unset-environment ENCLOS_SEATBELT_BASELINE`"
+    };
+    assert!(out.stderr().contains(unset), "{}", out.stderr());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_says_what_a_baseline_value_does() {

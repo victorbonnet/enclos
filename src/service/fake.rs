@@ -136,6 +136,10 @@ impl ServiceManager for FakeServices {
             .filter(|l| l.as_str().starts_with(prefix))
             .collect())
     }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("fake-manager unset {var}")
+    }
 }
 
 /// Shared, so a test keeps a handle on what the engine asked.
@@ -162,5 +166,9 @@ impl ServiceManager for std::rc::Rc<FakeServices> {
 
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         self.as_ref().installed(prefix)
+    }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        self.as_ref().unset_env_command(var)
     }
 }

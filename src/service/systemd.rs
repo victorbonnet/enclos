@@ -363,6 +363,10 @@ impl ServiceManager for Systemd {
         labels.sort();
         Ok(labels)
     }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("systemctl --user unset-environment {var}")
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +377,15 @@ mod tests {
 
     fn label(text: &str) -> ServiceLabel {
         ServiceLabel::parse(text).unwrap()
+    }
+
+    #[test]
+    fn a_variable_is_unset_in_the_users_manager() {
+        let systemd = Systemd::for_user(Path::new("/home/alice/.config/systemd/user"));
+        assert_eq!(
+            systemd.unset_env_command("ENCLOS_SEATBELT_BASELINE"),
+            "systemctl --user unset-environment ENCLOS_SEATBELT_BASELINE"
+        );
     }
 
     fn proxy() -> ServiceUnit {
