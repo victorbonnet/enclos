@@ -238,6 +238,11 @@ impl Layout {
         self.sandbox_run_dir(name).join("visible/proxy.sock")
     }
 
+    /// The lock a sandbox's proxy holds while it runs, when it holds no port.
+    pub fn proxy_lock(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("proxy.lock")
+    }
+
     /// Creates the folder of the sandbox's proxy socket.
     pub fn create_proxy_socket_dir(&self, name: &str) -> std::io::Result<()> {
         users_alone(&self.sandbox_run_dir(name).join("visible"))

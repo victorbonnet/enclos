@@ -41,11 +41,11 @@ fn runs_a_proxy_when_asked() {
     panic!("the proxy stopped: {err}");
 }
 
-/// The sandbox's proxy on its reserved port, in a child running this test
-/// program's [`runs_a_proxy_when_asked`], as `enclos proxy run` runs it. A
-/// proxy has no way to stop but its process ending: on a thread of this
-/// program, it would keep its port, which the next sandbox of another test
-/// is given, for every test after. Killed when dropped; [`ProxyChild::end`]
+/// The sandbox's proxy, in a child running this test program's
+/// [`runs_a_proxy_when_asked`], as `enclos proxy run` runs it. A proxy has
+/// no way to stop but its process ending: on a thread of this program, it
+/// would keep its port, which the next sandbox of another test is given,
+/// for every test after. Killed when dropped; [`ProxyChild::end`]
 /// also checks the port is free again. Take the [`HOST_PORTS`] turn first
 /// and keep it until then.
 struct ProxyChild {
@@ -83,6 +83,18 @@ impl ProxyChild {
         self.child.try_wait().unwrap().is_some()
     }
 
+    /// A connection to the proxy's socket at `path`, once it answers there.
+    fn connect(&mut self, path: &std::path::Path) -> UnixStream {
+        let started = std::time::Instant::now();
+        loop {
+            match UnixStream::connect(path) {
+                Ok(conn) => return conn,
+                Err(e) if started.elapsed().as_secs() > 30 || self.exited() => panic!("{e}"),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     /// Kills the proxy and checks that nothing answers on its port any
     /// more, on either loopback.
     fn end(mut self) {
@@ -107,15 +119,7 @@ fn a_running_proxy_decides_and_logs_on_its_socket() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let (_dir, engine, name) = with_sandbox();
     let mut proxy = ProxyChild::start(&engine, &name, false);
-    let path = engine.layout.proxy_socket(name.as_str());
-    let started = std::time::Instant::now();
-    let mut conn = loop {
-        match UnixStream::connect(&path) {
-            Ok(conn) => break conn,
-            Err(e) if started.elapsed().as_secs() > 30 || proxy.exited() => panic!("{e}"),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    };
+    let mut conn = proxy.connect(&engine.layout.proxy_socket(name.as_str()));
     // Not a web port, so public mode does not allow it either.
     conn.write_all(b"CONNECT evil.example.com:9 HTTP/1.1\r\n\r\n")
         .unwrap();
@@ -278,7 +282,7 @@ fn a_proxy_goes_by_its_sandboxs_backend_when_its_socket_cannot_be_opened() {
     let err = run_proxy_of(&engine, &name).join().unwrap().unwrap_err();
     assert!(matches!(err, Error::ProxySocket { .. }), "{err}");
     assert!(!engine.proxy_runs(&name).unwrap());
-    // It let its port go as it stopped.
+    // Nothing holds its port.
     let refused = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap_err();
     assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
 
@@ -305,5 +309,92 @@ fn removing_a_sandbox_removes_its_run_folder_even_keeping_its_data() {
             .remove_sandbox(&alice(), &name, keep_data, Confirm::Yes)
             .unwrap();
         assert!(!run.exists(), "keep_data: {keep_data}");
+    }
+}
+
+#[test]
+fn a_proxy_whose_sessions_reach_it_over_its_socket_leaves_its_port_free() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for backend in [BackendKind::Bubblewrap, BackendKind::Seatbelt] {
+        let (_dir, engine, name) = on_backend(backend);
+        let mut proxy = ProxyChild::start(&engine, &name, false);
+        // The socket opens last, so every listener is up once it answers.
+        proxy.connect(&engine.layout.proxy_socket(name.as_str()));
+        let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port));
+        match backend.reaches_proxy_over_socket() {
+            true => {
+                let refused = tcp.unwrap_err();
+                assert_eq!(refused.kind(), ErrorKind::ConnectionRefused, "{refused}");
+                // `[::1]` may not be configured: any error says nothing answers.
+                assert!(TcpStream::connect((Ipv6Addr::LOCALHOST, proxy.port)).is_err());
+            }
+            false => {
+                tcp.unwrap();
+            }
+        }
+        proxy.end();
+    }
+}
+
+#[test]
+fn a_second_proxy_leaves_the_running_one_its_socket_when_neither_holds_a_port() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, engine, name) = on_backend(BackendKind::Bubblewrap);
+    let mut running = ProxyChild::start(&engine, &name, false);
+    let path = engine.layout.proxy_socket(name.as_str());
+    running.connect(&path);
+    let err = run_proxy_of(&engine, &name).join().unwrap().unwrap_err();
+    assert!(
+        matches!(&err, Error::ProxyRuns { on, .. } if on == "its socket"),
+        "{err}"
+    );
+    UnixStream::connect(&path).unwrap();
+    assert!(!running.exited());
+    running.end();
+}
+
+#[test]
+fn a_proxy_whose_sessions_reach_it_over_its_socket_starts_whatever_holds_its_port() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for backend in [BackendKind::Bubblewrap, BackendKind::Seatbelt] {
+        let (dir, engine, name) = on_backend(backend);
+        // No program there: what goes as far as starting the proxy fails then.
+        let engine = engine.with_exe(dir.path().join("no-such-program"));
+        let record = engine.state.get(&name).unwrap().unwrap();
+        // Another program on the port, which accepts connections.
+        let _taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, record.proxy_port)).unwrap();
+        let lock = engine.state.lock().unwrap();
+        let err = engine.ensure_proxy(&lock, &record).unwrap_err();
+        match backend.reaches_proxy_over_socket() {
+            true => assert!(
+                err.to_string().contains("could not start the proxy"),
+                "{err}"
+            ),
+            false => assert!(matches!(err, Error::ProxyPortTaken { .. }), "{err}"),
+        }
+    }
+}
+
+#[test]
+fn a_started_proxy_is_waited_for_where_its_sessions_reach_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for backend in [BackendKind::Bubblewrap, BackendKind::Seatbelt] {
+        let (dir, engine, name) = on_backend(backend);
+        let record = engine.state.get(&name).unwrap().unwrap();
+        let mut proxy = ProxyChild::start(&engine, &name, false);
+        let reached = engine.proxy_reached_at(&record);
+        let lock = engine.state.lock().unwrap();
+        engine
+            .record_started_proxy(
+                &lock,
+                &record,
+                &mut proxy.child,
+                &reached,
+                &dir.path().join("proxy.log"),
+            )
+            .unwrap();
+        drop(lock);
+        assert!(engine.proxy_runs(&name).unwrap(), "{backend}");
+        proxy.end();
     }
 }

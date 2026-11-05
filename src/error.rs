@@ -106,9 +106,11 @@ pub enum Error {
     },
     #[error(transparent)]
     Compile(#[from] crate::backend::CompileError),
-    /// Its own proxy holds the port: there is nothing to stop or recreate.
-    #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
-    ProxyRuns { sandbox: String, port: u16 },
+    /// Its own proxy holds the port, or the lock of a proxy without one:
+    /// there is nothing to stop or recreate. `on` says which: "port 41000",
+    /// or "its socket".
+    #[error("the proxy of sandbox `{sandbox}` already runs on {on}")]
+    ProxyRuns { sandbox: String, on: String },
     /// The sandbox's home is not a real folder (a link, a file, or missing),
     /// so its policy is not compiled: Seatbelt resolves the path when the
     /// policy is compiled, and a link would carry the grant elsewhere.

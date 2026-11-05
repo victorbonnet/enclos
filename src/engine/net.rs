@@ -1,12 +1,16 @@
 //! The engine's network calls: the network log, denied destinations, and
 //! running a sandbox's egress proxy (design §6).
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
+use std::net::TcpListener;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 use super::Engine;
 use crate::error::{Error, Result};
+use crate::layout::LayoutError;
 use crate::model::Timestamp;
 use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
@@ -27,19 +31,19 @@ impl Engine {
         Ok(self.state.denied(name)?)
     }
 
-    /// Runs the sandbox's egress proxy on `port`, on both loopbacks, and on
-    /// its Unix socket, until the process ends. With `record`, it records
-    /// itself as the sandbox's proxy once `listen` holds the port (on both
-    /// loopbacks, or on 127.0.0.1 alone where `[::1]` is not configured)
-    /// and the socket is open or given up on, as `proxy_socket`
-    /// says, never before: a recorded proxy owns its port.
-    /// When the sandbox's reserved port is taken, it says whether by the
-    /// sandbox's own proxy or by another program, and on which loopback.
-    /// It reads the active policy for each new connection, so policy
-    /// changes apply without a restart.
+    /// Runs the sandbox's egress proxy until the process ends: on its Unix
+    /// socket, and, when the sandbox's sessions reach it over TCP, on `port`
+    /// on both loopbacks (127.0.0.1 alone where `[::1]` is not configured).
+    /// A proxy whose sessions reach it over the socket alone leaves the port
+    /// free (ADR 0040). With `record`, it records itself as the sandbox's
+    /// proxy once it holds the port, or the lock only one proxy holds, and
+    /// its socket is open or given up on, as `proxy_socket` says, never
+    /// before. When the sandbox's reserved port is taken, it says whether by
+    /// the sandbox's own proxy or by another program, and on which loopback.
+    /// It reads the active policy for each new connection, so policy changes
+    /// apply without a restart.
     pub fn run_proxy(&self, name: &SandboxName, port: u16, record: Option<&Actor>) -> Result<()> {
         let sandbox = self.record(name)?;
-        let reserved = sandbox.proxy_port;
         self.policy(name)?;
         let store = || SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
         let policy = ActivePolicy {
@@ -47,24 +51,13 @@ impl Engine {
             sandbox: name.clone(),
         };
         let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(store()));
-        let listeners = listen(port).map_err(|e| match e.source.kind() {
-            // Only the sandbox's reserved port is its to recreate.
-            ErrorKind::AddrInUse if port == reserved => match self.proxy_runs(name) {
-                Ok(true) => Error::ProxyRuns {
-                    sandbox: name.to_string(),
-                    port,
-                },
-                Ok(false) => Error::proxy_port_taken(name.as_str(), e.addr),
-                Err(error) => error,
-            },
-            _ => Error::ProxyListen {
-                sandbox: name.to_string(),
-                addr: e.addr.to_string(),
-                source: e.source,
-            },
-        })?;
-        // After the port, which only one proxy holds: so a socket found
-        // here is not the running proxy's.
+        // Held until the process ends, as the port is.
+        let (_lock, listeners) = match sandbox.backend.reaches_proxy_over_socket() {
+            true => (Some(self.hold_proxy_lock(name)?), Vec::new()),
+            false => (None, self.listen_on_port(name, port, sandbox.proxy_port)?),
+        };
+        // After the port or the lock, which only one proxy holds: so a socket
+        // found here is not the running proxy's.
         let socket = self.proxy_socket(name, sandbox.backend)?;
         if let Some(by) = record {
             self.record_proxy(by, name)?;
@@ -81,6 +74,60 @@ impl Engine {
                     .collect(),
             ),
         })
+    }
+
+    /// The proxy's listeners at `port` on both loopbacks.
+    fn listen_on_port(
+        &self,
+        name: &SandboxName,
+        port: u16,
+        reserved: u16,
+    ) -> Result<Vec<TcpListener>> {
+        listen(port).map_err(|e| match e.source.kind() {
+            // Only the sandbox's reserved port is its to recreate.
+            ErrorKind::AddrInUse if port == reserved => match self.proxy_runs(name) {
+                Ok(true) => Error::ProxyRuns {
+                    sandbox: name.to_string(),
+                    on: format!("port {port}"),
+                },
+                Ok(false) => Error::proxy_port_taken(name.as_str(), e.addr),
+                Err(error) => error,
+            },
+            _ => Error::ProxyListen {
+                sandbox: name.to_string(),
+                addr: e.addr.to_string(),
+                source: e.source,
+            },
+        })
+    }
+
+    /// The lock only the sandbox's running proxy holds, for a proxy that
+    /// holds no port: it keeps a second proxy off the first one's socket, as
+    /// the port does for a proxy that holds one.
+    fn hold_proxy_lock(&self, name: &SandboxName) -> Result<File> {
+        let path = self.layout.proxy_lock(name.as_str());
+        let io = |source| LayoutError::Io {
+            path: path.clone(),
+            source,
+        };
+        self.layout
+            .create_proxy_socket_dir(name.as_str())
+            .map_err(io)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(io)?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => Err(Error::ProxyRuns {
+                sandbox: name.to_string(),
+                on: "its socket".to_owned(),
+            }),
+            Err(TryLockError::Error(e)) => Err(io(e).into()),
+        }
     }
 
     /// The proxy's listener on the sandbox's Unix socket, in a folder made
