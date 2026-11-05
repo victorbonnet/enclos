@@ -174,6 +174,16 @@ impl Hub {
                             hub.deliver_conversation(&store, &owner, id);
                         }
                     }
+                    // A tool the agent runs, for one of its own agent's
+                    // conversations: passed on live, not kept.
+                    FromPlugin::Tool(step) => {
+                        if let Ok(Some(c)) = store.conversation_info(step.conversation.as_str())
+                            && format!("{}/{}", c.sandbox, c.agent) == agent
+                            && let Ok(Some(owner)) = store.owner(step.conversation.as_str())
+                        {
+                            hub.deliver(&owner, ToDevice::Tool(step));
+                        }
+                    }
                     _ => {}
                 }
             }
