@@ -493,7 +493,8 @@ fn run_session(
                         },
                         text: m.text,
                         kind: m.kind,
-                        time: now(),
+                        // When it was said, not when it is synced.
+                        time: m.at,
                         seq: m.seq,
                     }))?;
                 }

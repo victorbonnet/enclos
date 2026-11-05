@@ -2847,7 +2847,11 @@ fn app_devices_status_and_log_print_a_document_when_piped() {
     );
     let out = home.run(&["app", "unpair", "nope"]);
     assert_eq!(out.code(), 1);
-    assert!(out.stderr().contains("no paired device nope"), "{}", out.stderr());
+    assert!(
+        out.stderr().contains("no paired device nope"),
+        "{}",
+        out.stderr()
+    );
 }
 
 #[test]
