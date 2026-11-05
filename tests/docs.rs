@@ -353,8 +353,8 @@ fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     }
 }
 
-/// Paths on the deny list since before Linux's were added, checked or listed
-/// on their own: the rest of `~/.config` and `~/.local` is Linux's.
+/// Entries under `~/.config` and `~/.local` that tools keep there on macOS
+/// too, checked or listed on their own: the rest of those folders is Linux's.
 const SHARED_DENIES: &[&str] = &[
     "~/.config/gcloud",
     "~/.config/gh",
