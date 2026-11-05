@@ -328,15 +328,16 @@ fn holder_means_the_namespace_holder_alone() {
     }
 }
 
-/// The prototype's default leaves it out, so what `enclos inside` does is
-/// written down, and that it has not been shown to help Chromium.
+/// `enclos inside` grants `TRUNCATE` on `/proc`, which `inside.py` does only
+/// with `--proc-truncate`: the design and the prototype's README both say so,
+/// and neither leaves the grant an open question.
 #[test]
 fn the_grant_of_truncate_on_proc_is_recorded() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
     let readme = fs::read_to_string(path).unwrap();
     assert!(readme.contains("`enclos inside` grants it"));
     assert!(design().contains("`enclos inside` grants `TRUNCATE` on `/proc`"));
-    assert!(!readme.contains("whether M3-13 should allow these writes is open"));
+    assert!(!readme.contains("should allow these writes is open"));
 }
 
 /// The code cites §5 for it.
