@@ -9,8 +9,9 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use super::SandboxContext;
+use super::{Launch, SandboxContext};
 
 /// Host variables a sandbox keeps: how to draw, which language to speak,
 /// the time zone and the user's name.
@@ -104,8 +105,25 @@ fn shell_command_on(system: &HostSystem, present: &dyn Fn(&str) -> bool) -> Vec<
         .collect()
 }
 
+/// Clears `command`'s environment and sets a session's variables: the
+/// secrets `launch` grants, then the host's kept variables, then enclos's
+/// own. Set in that order, a secret never replaces a variable enclos sets
+/// or passes on, whatever the validation of a policy let through.
+pub fn apply(command: &mut Command, ctx: &SandboxContext, launch: &Launch) {
+    command.env_clear();
+    for (name, value) in &launch.env {
+        command.env(name, value.expose());
+    }
+    for (name, value) in from_host() {
+        command.env(name, value);
+    }
+    for (name, value) in variables(ctx) {
+        command.env(name, value);
+    }
+}
+
 /// The host's variables a sandbox keeps.
-pub fn from_host() -> Vec<(OsString, OsString)> {
+fn from_host() -> Vec<(OsString, OsString)> {
     kept_from(HostSystem::current(), std::env::vars_os())
 }
 
@@ -227,7 +245,6 @@ mod tests {
     use super::*;
     use crate::layout::Layout;
     use std::collections::HashMap;
-    use std::process::Command;
 
     const HOME: &str = "/Users/alice/.enclos/sandboxes/home/home";
 
@@ -247,6 +264,32 @@ mod tests {
     fn kept(system: &HostSystem, vars: &[(&str, &str)]) -> HashMap<OsString, OsString> {
         let vars = vars.iter().map(|(k, v)| ((*k).into(), (*v).into()));
         kept_from(system, vars).into_iter().collect()
+    }
+
+    /// Set before what enclos sets, a secret never replaces one of its
+    /// variables, whatever the validation of a policy let through.
+    #[test]
+    fn a_secret_never_replaces_a_variable_enclos_sets() {
+        let value = |v: &str| crate::model::secret::SecretValue::new(v.to_owned()).unwrap();
+        let launch = Launch {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: vec![
+                ("HOME".to_owned(), value("/elsewhere")),
+                ("TOKEN".to_owned(), value("t")),
+            ],
+            in_terminal: false,
+            service_port: None,
+            limits: Default::default(),
+        };
+        let mut command = Command::new("/bin/true");
+        apply(&mut command, &ctx(), &launch);
+        let env: HashMap<_, _> = command
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+            .collect();
+        assert_eq!(env["HOME"], "/Users/alice/.enclos/sandboxes/home/home");
+        assert_eq!(env["TOKEN"], "t");
     }
 
     #[test]

@@ -135,19 +135,7 @@ pub(super) fn wrap_in(
         .arg(&launch.program)
         .args(&launch.args);
     let mut command = super::super::under_limits(command, &launch.limits);
-    command.env_clear();
-    // The secrets the policy grants first: what enclos sets or passes on
-    // comes after them and so is never one of theirs, whatever the
-    // validation of the policy let through.
-    for (name, value) in &launch.env {
-        command.env(name, value.expose());
-    }
-    for (name, value) in environment::from_host() {
-        command.env(name, value);
-    }
-    for (name, value) in environment::variables(ctx) {
-        command.env(name, value);
-    }
+    environment::apply(&mut command, ctx, launch);
     command.current_dir(&ctx.home);
     command
 }
@@ -188,31 +176,6 @@ mod tests {
     fn ctx() -> SandboxContext {
         let layout = Layout::at(PathBuf::from("/Users/alice/.enclos"));
         SandboxContext::new(&layout, &"home".parse().unwrap(), 41001)
-    }
-
-    /// Set before what enclos sets, a secret never replaces one of its
-    /// variables, whatever the validation of a policy let through.
-    #[test]
-    fn a_secret_never_replaces_a_variable_enclos_sets() {
-        let value = |v: &str| crate::model::secret::SecretValue::new(v.to_owned()).unwrap();
-        let launch = Launch {
-            program: "/bin/true".into(),
-            args: Vec::new(),
-            env: vec![
-                ("HOME".to_owned(), value("/elsewhere")),
-                ("TOKEN".to_owned(), value("t")),
-            ],
-            in_terminal: false,
-            service_port: None,
-            limits: Default::default(),
-        };
-        let command = wrap_in(Path::new("/c.sb"), &ctx(), &launch, None);
-        let env: std::collections::HashMap<_, _> = command
-            .get_envs()
-            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
-            .collect();
-        assert_eq!(env["HOME"], "/Users/alice/.enclos/sandboxes/home/home");
-        assert_eq!(env["TOKEN"], "t");
     }
 
     #[test]
