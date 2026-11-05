@@ -150,8 +150,9 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
         inputs.workspaces,
         [user.join("a"), user.join("b"), user.join("later")]
     );
-    let own =
-        crate::backend::seatbelt::probes::SeatbeltProbes::on(crate::backend::Baseline::DenyDefault);
+    let own = crate::backend::seatbelt::probes::SeatbeltProbes::on(
+        crate::backend::seatbelt::Baseline::DenyDefault,
+    );
     let names: Vec<String> = crate::probes::probes(&inputs, &own)
         .into_iter()
         .filter(|p| p.route == "writable folders")
@@ -220,7 +221,8 @@ fn a_fake_backend_s_probes_run_through_the_shared_set() {
     let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
     let backend = engine.backend_of(&name).unwrap();
     let own = backend.own_probes(Some("fake policy for home\n")).unwrap();
-    assert_eq!(own.baseline(), None);
+    assert_eq!(own.notes().baseline_key, None);
+    assert_eq!(own.notes().comparison, None);
     // This test's own child, the signal probe's target.
     let mut target = std::process::Command::new("/bin/sleep")
         .arg("60")

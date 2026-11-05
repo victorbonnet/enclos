@@ -22,8 +22,7 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::probes::OwnProbes;
 
-pub use super::Baseline;
-pub use compile::{BASELINE_VAR, tag};
+pub use compile::{BASELINE_VAR, Baseline, tag};
 
 /// Seatbelt, compiling on one baseline for the whole process.
 pub struct Seatbelt {

@@ -77,8 +77,9 @@ enum PolicyVerb {
     /// Try each way out of the sandbox from inside it; every probe must fail.
     Test {
         sandbox: SandboxName,
-        /// Also probe routes that could act on this host if a rule did not
-        /// hold (open, Apple Events, launchd, preferences). For CI and VMs.
+        /// Also probe the backend's host-service routes (`policy test` lists
+        /// them), which could act on this host if a rule did not hold. For
+        /// CI and VMs.
         #[arg(long)]
         host_services: bool,
     },

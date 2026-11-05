@@ -26,7 +26,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::Baseline;
 use crate::layout::Layout;
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::is_within;
@@ -282,6 +281,12 @@ pub struct ReportNotes {
     /// test` names them, so that a test that passed is not read as covering
     /// them.
     pub not_probed: &'static [&'static str],
+    /// The baseline the probes ran on, as a JSON report names it, for a
+    /// backend that has baselines.
+    pub baseline_key: Option<&'static str>,
+    /// The baseline the probes ran on, as a sentence names it, when it is a
+    /// comparison baseline, which only a debug build compiles (ADR 0006).
+    pub comparison: Option<&'static str>,
 }
 
 /// What a backend adds to the probes every backend runs, and how it refuses.
@@ -292,10 +297,6 @@ pub trait OwnProbes {
     fn refusal(&self) -> Refusal;
     /// What a report says of its probes.
     fn notes(&self) -> ReportNotes;
-    /// The baseline the probes run under, for a backend that has one.
-    fn baseline(&self) -> Option<Baseline> {
-        None
-    }
     /// Sets up on the host what its probes need, once they will run; what
     /// it returns is held until the test ends, and undoes that when dropped.
     fn set_up(&mut self, _layout: &Layout, _name: &SandboxName) -> Box<dyn std::any::Any> {
@@ -892,7 +893,7 @@ mod tests {
 
     /// The list of a real backend, whose refusal the texts below use.
     fn seatbelt() -> SeatbeltProbes {
-        SeatbeltProbes::on(crate::backend::Baseline::DenyDefault)
+        SeatbeltProbes::on(crate::backend::seatbelt::Baseline::DenyDefault)
     }
 
     fn probes(i: &ProbeInputs) -> Vec<Probe> {
@@ -1338,6 +1339,8 @@ mod tests {
                 only_apart: "",
                 host_service_routes: &[],
                 not_probed: &[],
+                baseline_key: None,
+                comparison: None,
             }
         }
     }

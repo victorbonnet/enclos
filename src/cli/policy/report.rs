@@ -2,7 +2,6 @@
 
 use serde_json::{Value, json};
 
-use enclos::backend::Baseline;
 use enclos::engine::TestReport;
 use enclos::error::exit;
 use enclos::model::sandbox::SandboxName;
@@ -39,11 +38,7 @@ pub(super) fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "not_here": report.not_here,
         "not_probed": report.notes.not_probed,
         "listens": report.listens,
-        "baseline": match report.baseline {
-            Some(Baseline::AllowDefault) => Some("allow_default"),
-            Some(Baseline::DenyDefault) => Some("deny_default"),
-            None => None,
-        },
+        "baseline": report.notes.baseline_key,
     })
 }
 
@@ -138,12 +133,11 @@ pub(super) fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) ->
                 listed("inconclusive", "inconclusive")
             ),
         };
-        let baseline = match report.baseline {
-            Some(Baseline::AllowDefault) => {
-                " On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
-            }
-            Some(Baseline::DenyDefault) | None => "",
-        };
+        let baseline = report
+            .notes
+            .comparison
+            .map(|c| format!(" On {c}, which only a debug build compiles and no service runs on."))
+            .unwrap_or_default();
         return format!("READY: no probe got out of sandbox {sandbox}: {shown}.{baseline}");
     }
     let mut why = Vec::new();
@@ -177,7 +171,8 @@ pub(super) fn verdict(sandbox: &SandboxName, report: &TestReport, json: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enclos::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, NOTES};
+    use enclos::backend::seatbelt::Baseline;
+    use enclos::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, notes_on};
     use enclos::probes::ProbeResult;
 
     fn report(outcome: Outcome) -> TestReport {
@@ -198,8 +193,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            baseline: Some(Baseline::DenyDefault),
-            notes: NOTES,
+            notes: notes_on(Baseline::DenyDefault),
         }
     }
 
@@ -275,6 +269,29 @@ mod tests {
         assert!(!text.contains("bind probes"), "{text}");
     }
 
+    /// The baseline a report names, in its verdict and its JSON, is the
+    /// backend's to say; a backend that names none says nothing of it.
+    #[test]
+    fn the_baseline_a_report_names_is_the_backend_s() {
+        let lab: SandboxName = "lab".parse().unwrap();
+        let mut other = report(Outcome::Closed);
+        other.notes.baseline_key = Some("another_baseline");
+        other.notes.comparison = Some("another backend's comparison baseline");
+        assert_eq!(
+            verdict(&lab, &other, false),
+            "READY: no probe got out of sandbox lab: all 1 shown closed. On another backend's comparison baseline, which only a debug build compiles and no service runs on."
+        );
+        assert_eq!(test_json(&lab, &other)["baseline"], "another_baseline");
+        let mut none = report(Outcome::Closed);
+        none.notes.baseline_key = None;
+        none.notes.comparison = None;
+        assert_eq!(
+            verdict(&lab, &none, false),
+            "READY: no probe got out of sandbox lab: all 1 shown closed."
+        );
+        assert_eq!(test_json(&lab, &none)["baseline"], Value::Null);
+    }
+
     /// The report of each kind of test on Seatbelt, as it was before the
     /// probes were split per backend (M3-06): text, verdict and JSON.
     #[test]
@@ -335,8 +352,7 @@ mod tests {
                 host_services,
                 not_here,
                 listens,
-                baseline: Some(baseline),
-                notes: NOTES,
+                notes: notes_on(baseline),
             };
             got.push_str(&test_text(&lab, &report));
             got.push_str(&verdict(&lab, &report, false));

@@ -18,17 +18,6 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::probes::OwnProbes;
 
-/// What a compiled policy does with an operation none of its rules names
-/// (ADR 0006).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Baseline {
-    /// `(deny default)`, then the reviewed allowances of `deny-default.sb`.
-    #[default]
-    DenyDefault,
-    /// `(allow default)`, as before ADR 0006: only for comparing the two.
-    AllowDefault,
-}
-
 /// Whether a backend can run on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {

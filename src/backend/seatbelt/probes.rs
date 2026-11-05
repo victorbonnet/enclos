@@ -25,7 +25,7 @@
 use std::any::Any;
 use std::path::{Path, PathBuf};
 
-use crate::backend::Baseline;
+use super::Baseline;
 use crate::layout::Layout;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::{SecretRef, SecretValue};
@@ -121,15 +121,26 @@ const KEYCHAIN_PROBE_HEX: &str = "656e636c6f732d70726f6265";
 /// What listening opens, for a policy that allows it.
 const LISTENING: &str = "Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.";
 
-/// What a report says of Seatbelt's probes.
-pub const NOTES: ReportNotes = ReportNotes {
-    host: "this Mac",
-    folder_moves: "renames and clones",
-    listening: LISTENING,
-    only_apart: ", only by Seatbelt itself or the (deny default) baseline if any",
-    host_service_routes: HOST_SERVICE_ROUTES,
-    not_probed: NOT_PROBED,
-};
+/// What a report says of Seatbelt's probes on `baseline`.
+pub const fn notes_on(baseline: Baseline) -> ReportNotes {
+    let (baseline_key, comparison) = match baseline {
+        Baseline::DenyDefault => ("deny_default", None),
+        Baseline::AllowDefault => (
+            "allow_default",
+            Some("the (allow default) comparison baseline"),
+        ),
+    };
+    ReportNotes {
+        host: "this Mac",
+        folder_moves: "renames and clones",
+        listening: LISTENING,
+        only_apart: ", only by Seatbelt itself or the (deny default) baseline if any",
+        host_service_routes: HOST_SERVICE_ROUTES,
+        not_probed: NOT_PROBED,
+        baseline_key: Some(baseline_key),
+        comparison,
+    }
+}
 
 /// A launchd job a probe tries to leave.
 pub(crate) fn launchd_job(label: &str) -> ToolCheck {
@@ -582,11 +593,7 @@ impl OwnProbes for SeatbeltProbes {
     }
 
     fn notes(&self) -> ReportNotes {
-        NOTES
-    }
-
-    fn baseline(&self) -> Option<Baseline> {
-        Some(self.baseline)
+        notes_on(self.baseline)
     }
 
     fn set_up(&mut self, layout: &Layout, name: &SandboxName) -> Box<dyn Any> {

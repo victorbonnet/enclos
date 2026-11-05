@@ -44,6 +44,8 @@ impl OwnProbes for FakeProbes {
             only_apart: "",
             host_service_routes: &[],
             not_probed: &[],
+            baseline_key: None,
+            comparison: None,
         }
     }
 }

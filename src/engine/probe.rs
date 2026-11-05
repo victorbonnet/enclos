@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 
-use crate::backend::{Baseline, LaunchLimits};
+use crate::backend::LaunchLimits;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -37,11 +37,8 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
-    /// The baseline the probes ran on: `(allow default)` only when a
-    /// comparison asks for it (ADR 0006), which the report says. None for a
-    /// backend that has no baseline.
-    pub baseline: Option<Baseline>,
-    /// What the report says of the backend's probes.
+    /// What the report says of the backend's probes, the baseline they ran
+    /// on included.
     pub notes: ReportNotes,
 }
 
@@ -184,10 +181,11 @@ impl Engine {
         }
         let summary = |r: &TestReport| {
             let platform = r.closed_apart();
-            let baseline = match r.baseline {
-                Some(Baseline::AllowDefault) => ", on the (allow default) comparison baseline",
-                Some(Baseline::DenyDefault) | None => "",
-            };
+            let baseline = r
+                .notes
+                .comparison
+                .map(|c| format!(", on {c}"))
+                .unwrap_or_default();
             format!(
                 "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run{baseline}",
                 r.results.len(),
@@ -204,9 +202,8 @@ impl Engine {
             })?;
             let compiled = self.compile_policy(name, record.proxy_port)?;
             let backend = self.backend_of(name)?;
-            // On Seatbelt, the baseline's refused lookups count as closed
-            // only on `(deny default)`, as the file compiled for these probes
-            // says. Read before anything is started for the probes.
+            // Read before anything starts: the backend's probes depend on
+            // what was compiled.
             let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
                 path: compiled.clone(),
                 source,
@@ -268,7 +265,6 @@ impl Engine {
                 host_services,
                 not_here: not_here(&inputs, own.as_ref()),
                 listens: inputs.listen,
-                baseline: own.baseline(),
                 notes: own.notes(),
             })
         })
@@ -574,7 +570,8 @@ fn host_sockets(user_home: &std::path::Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, NOTES, SeatbeltProbes};
+    use crate::backend::seatbelt::Baseline;
+    use crate::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, SeatbeltProbes, notes_on};
     use std::process::{ExitStatus, Output};
 
     fn report(outcomes: Vec<Outcome>) -> TestReport {
@@ -591,8 +588,7 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            baseline: Some(Baseline::DenyDefault),
-            notes: NOTES,
+            notes: notes_on(Baseline::DenyDefault),
         }
     }
 
