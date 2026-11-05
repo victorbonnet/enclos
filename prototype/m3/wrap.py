@@ -1,4 +1,4 @@
-"""The prototype's wrap step (a draft of what M3-13 builds): at each session's
+"""The prototype's wrap step, a draft of the bubblewrap backend's: at each session's
 start, turns the compiled policy, which is pure and cached, into bubblewrap's
 arguments, from what the host holds at that moment. read_host() reads the
 host; arguments() only uses what it is given.

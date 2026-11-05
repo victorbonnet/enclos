@@ -1,7 +1,6 @@
 """Loads one page in Chromium through the DevTools protocol over a pipe, as
 browser tools such as Playwright drive it, rather than with `--dump-dom`,
-which on the runners never returned, on the host as in the sandbox (the
-second bwrap-prototype run, PR #113). Prints the stage it reached and the
+which on the runners never returns, on the host as in the sandbox. Prints the stage it reached and the
 page's title; exits 0 once the page's load event fired and its title was
 read, 1 otherwise.
 

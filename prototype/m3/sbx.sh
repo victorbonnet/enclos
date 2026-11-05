@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs a command in the prototype's bubblewrap sandbox (M3-02):
+# Runs a command in the prototype's bubblewrap sandbox:
 #
 #   [SBX_LANDLOCK=auto|off] [SBX_SECCOMP=on|off] [SBX_RELAY=1] [SBX_NEW_SESSION=1] \
 #       [SBX_PROC_TRUNCATE=1] \

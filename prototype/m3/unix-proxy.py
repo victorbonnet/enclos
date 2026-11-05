@@ -1,6 +1,6 @@
 """The milestone 1 prototype's proxy (prototype/m1/proxy.py) served on a Unix
 socket instead of a TCP port, as the bubblewrap sandbox reaches it (design
-§5, Linux networking; M3-08 builds the real listener). Same allowlist,
+§5, Linux networking; a draft, not enclos's listener). Same allowlist,
 --learn mode and JSON log.
 
     python3 -I unix-proxy.py --socket PATH (--allow FILE | --learn) --log FILE

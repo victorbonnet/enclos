@@ -1,6 +1,6 @@
 #!/bin/bash
-# The prototype sandbox's files, programs and system calls (design §14,
-# M3-02): broad reads with the deny list not mounted, denied paths inside the
+# The prototype sandbox's files, programs and system calls (design §14):
+# broad reads with the deny list not mounted, denied paths inside the
 # workspace masked (planted, or missing and so a folder) with the rest of it
 # as granted, deny entries that are links with their targets hidden, writes to the home and the workspace only, the home and
 # workspace unmovable, programs run from the
@@ -37,7 +37,7 @@ for d in "${DENY[@]}"; do
     planted+=("$d/enclos-proto-planted")
 done
 echo planted >"$WORK/denied-file"
-rm -rf "$WORK/denied-missing"  # the first run leaves the mask's mount point there
+rm -rf "$WORK/denied-missing"  # its mask leaves an empty folder on the host; start without it
 echo kept >"$WORK/kept-file"
 # Deny entries that are links, as GNU stow sets a home up: their targets, here
 # or out of the workspace, must not read through a folder bound back.

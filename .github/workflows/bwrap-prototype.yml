@@ -1,6 +1,6 @@
 name: bwrap-prototype
 
-# Milestone 3's bubblewrap prototype (prototype/m3/, design §14, M3-02) on
+# Milestone 3's bubblewrap prototype (prototype/m3/, design §14) on
 # GitHub's Ubuntu runners: the sandbox's mounts, Landlock and seccomp, the
 # host's Unix sockets, the relay, Hermes's installer and Chromium. Every
 # check acts on the host, so they run only on these throwaway runners. Each

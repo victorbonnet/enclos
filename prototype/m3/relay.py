@@ -1,11 +1,11 @@
-"""The relay (design §5, Linux networking; M3-09 builds the real one): accepts
+"""The relay (design §5, Linux networking; a draft, not enclos's relay): accepts
 TCP connections on a listening socket inside the sandbox and forwards each to
 the proxy's Unix socket, and nothing else. inside.py makes the listening
 socket on 127.0.0.1 and calls serve() in a process of its own.
 
 One thread per direction, so a direction blocked on a slow reader never holds
 up the other, and the kernel's socket buffers are the only buffering. An EOF
-ends one direction only. README.md says what M3-09 may take from this."""
+ends one direction only. README.md says what enclos's relay may take from this."""
 
 import socket
 import threading

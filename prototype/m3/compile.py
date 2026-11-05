@@ -1,4 +1,4 @@
-"""The prototype's compile step (M3-02, a draft of what M3-13 builds).
+"""The prototype's compile step, a draft of the bubblewrap backend's.
 
 Turns the prototype's policy into what the bubblewrap backend applies:
 bubblewrap's arguments, the Landlock rules and the seccomp filter, written as

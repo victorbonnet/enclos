@@ -1,4 +1,4 @@
-# Sourced by the M3-02 bubblewrap prototype's scripts (design §14, issue #102).
+# Sourced by the bubblewrap prototype's scripts (design §14, issue #102).
 # Everything they run acts on the host (user namespaces, bubblewrap, sudo,
 # packages, planted files in the home), so they refuse to run anywhere but a
 # throwaway GitHub-hosted runner, or a disposable VM for the manual steps in
@@ -34,7 +34,7 @@ mkdir -p "$SBX_HOME" "$SBX_RUN" "$SBX_COMPILED" "$WORK"
 mkdir -p "$SBX_HOME/tmp"                   # TMPDIR (ADR 0015)
 
 # The deny list the checks plant files under: a few of the default list's
-# Linux entries (M3-07) and enclos's own folder, which is protected.
+# Linux entries and enclos's own folder, which is protected.
 DENY=(
     "$H/.ssh"
     "$H/.aws"

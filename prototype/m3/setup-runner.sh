@@ -1,5 +1,5 @@
 #!/bin/bash
-# Prepares a GitHub-hosted Ubuntu runner for the M3-02 checks: installs
+# Prepares a GitHub-hosted Ubuntu runner for the bubblewrap checks: installs
 # bubblewrap and what the checks use, then finds the least setting that lets
 # bubblewrap make its user namespace under AppArmor (design §14): none, a
 # profile that lets /usr/bin/bwrap alone make user namespaces, or the

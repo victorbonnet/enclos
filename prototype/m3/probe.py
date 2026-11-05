@@ -1,4 +1,4 @@
-"""Probes for the M3-02 bubblewrap prototype. Each argument is one probe, its
+"""Probes for the bubblewrap prototype. Each argument is one probe, its
 words separated by spaces; each prints one tab-separated line: the probe,
 then `ok` or the error's name (ENOENT, EROFS, EACCES, EPERM, …), then a
 detail. The same probes run on the host as their control and in the sandbox

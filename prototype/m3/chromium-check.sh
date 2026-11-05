@@ -34,10 +34,9 @@ if [ -z "$chrome" ]; then
     chrome=$(find_chrome)
 fi
 
-# Two ways to load the page. `--dump-dom` is what the first two runs used;
-# in the second (PR #113) it never returned within 120 s on the host either,
-# so it says nothing about the sandbox, and it is kept only on the host and
-# in full mode, for comparison. cdp-load.py drives Chromium over the
+# Two ways to load the page. `--dump-dom` never returns within 120 s on the
+# runners, on the host either, so it says nothing about the sandbox; it runs
+# only on the host and in full mode, for comparison. cdp-load.py drives Chromium over the
 # DevTools protocol on a pipe, as Hermes's browser tool and Playwright do,
 # and waits for the page's load event: that runs in every mode. Each run:
 # key, label, the sandbox mode's prefix, Chromium's own sandbox on or off.

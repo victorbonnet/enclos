@@ -1,5 +1,5 @@
-"""The small program bubblewrap runs first inside the prototype sandbox
-(M3-02; what M3-14's hidden enclos command will do). It applies the Landlock
+"""The small program bubblewrap runs first inside the prototype sandbox,
+a draft of what enclos itself will run there. It applies the Landlock
 rules where the kernel has Landlock (ADR 0037), then the seccomp filter,
 then starts the relay, confined like the rest, and runs the command.
 
