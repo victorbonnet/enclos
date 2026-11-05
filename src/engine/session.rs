@@ -379,8 +379,9 @@ impl Engine {
                 let mut members = session.clone();
                 members.tracked = known.clone();
                 let stop_members = self.stop_members;
+                let cgroups = self.cgroups().into_owned();
                 stopping = Some(std::thread::spawn(move || {
-                    stop_members(&members, STOP_GRACE)
+                    stop_members(&cgroups, &members, STOP_GRACE)
                 }));
             }
             if stopping

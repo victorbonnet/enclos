@@ -69,7 +69,8 @@ use crate::audit::jsonl::JsonlAuditLog;
 use crate::backend::{self, Backend, Probe};
 use crate::config;
 use crate::error::{Error, Result};
-use crate::layout::Layout;
+use crate::layout::{Layout, Os};
+use crate::lifecycle::cgroup::{Hierarchy, Scopes};
 use crate::lifecycle::process::PsError;
 use crate::lifecycle::stop::Stopped;
 use crate::model::audit::{Actor, AuditEntry, AuditFilter, Intent, Outcome, Since, VerifyReport};
@@ -98,19 +99,16 @@ pub struct Engine {
     /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
     /// leaves them running.
     stop_members: StopMembers,
-    /// Whether a session's program runs in a scope of its own, with a cgroup
-    /// (design §8): on Linux, and in an engine built without it not, so
-    /// tests never reach the host's systemd.
-    scopes: bool,
-    /// Where a session's cgroup is read.
-    cgroups: crate::lifecycle::cgroup::Hierarchy,
-    /// The `systemd-run` asked for the host's systemd version.
-    systemd_run: PathBuf,
+    /// How a session's program runs in a scope of its own, with a cgroup
+    /// (design §8): set on Linux; none on macOS and in tests, so they never
+    /// reach the host's systemd.
+    scopes: Option<Scopes>,
 }
 
-/// Stops a session's members within a grace period, as
-/// `lifecycle::stop::stop` does.
-type StopMembers = fn(&SessionRecord, Duration) -> std::result::Result<Stopped, PsError>;
+/// Stops a session's members within a grace period, reading its cgroup in
+/// the hierarchy given, as `lifecycle::stop::stop` does.
+type StopMembers =
+    fn(&Hierarchy, &SessionRecord, Duration) -> std::result::Result<Stopped, PsError>;
 
 /// What `enclos init` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +190,7 @@ impl Engine {
         )
         .with_services(services)
         .with_secrets(secrets)
-        .with_scopes(cfg!(target_os = "linux"))
+        .with_scopes((Os::current() == Os::Linux).then(Scopes::host))
     }
 
     pub fn new(
@@ -212,19 +210,27 @@ impl Engine {
             }),
             stop_members: crate::lifecycle::stop::stop,
             downloader: Box::new(Curl),
-            scopes: false,
-            cgroups: crate::lifecycle::cgroup::Hierarchy::host(),
-            systemd_run: crate::lifecycle::cgroup::SYSTEMD_RUN.into(),
+            scopes: None,
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),
         }
     }
 
-    /// The same engine, running each session's program in a scope or not.
-    pub fn with_scopes(mut self, scopes: bool) -> Engine {
+    /// The same engine, running each session's program in a scope as
+    /// `scopes` says, or in none.
+    pub fn with_scopes(mut self, scopes: Option<Scopes>) -> Engine {
         self.scopes = scopes;
         self
+    }
+
+    /// Where a session's cgroup is read: the scopes' hierarchy, or the
+    /// host's for an engine with no scopes, whose sessions record none.
+    fn cgroups(&self) -> std::borrow::Cow<'_, Hierarchy> {
+        match &self.scopes {
+            Some(scopes) => std::borrow::Cow::Borrowed(scopes.hierarchy()),
+            None => std::borrow::Cow::Owned(Hierarchy::host()),
+        }
     }
 
     /// The same engine with another secret store.

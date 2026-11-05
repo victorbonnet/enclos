@@ -251,16 +251,67 @@ impl Systemd {
     }
 }
 
-/// The scope a session's program runs in.
+/// How this host runs a session's program in a scope: the `systemd-run`
+/// that starts the scope and tells the host's systemd version, and the
+/// hierarchy where a session's cgroup is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scopes {
+    systemd_run: PathBuf,
+    hierarchy: Hierarchy,
+}
+
+impl Scopes {
+    /// The host's `systemd-run` and cgroup hierarchy.
+    pub fn host() -> Scopes {
+        Scopes::at(Path::new(SYSTEMD_RUN), Hierarchy::host())
+    }
+
+    pub fn at(systemd_run: &Path, hierarchy: Hierarchy) -> Scopes {
+        Scopes {
+            systemd_run: systemd_run.to_owned(),
+            hierarchy,
+        }
+    }
+
+    /// The host's systemd, as `systemd-run --version` says.
+    pub fn systemd(&self) -> Systemd {
+        Systemd::at(&self.systemd_run)
+    }
+
+    /// Why no session can start on this host, with what to do.
+    pub fn refusal(&self) -> Option<String> {
+        self.systemd().refusal()
+    }
+
+    pub fn hierarchy(&self) -> &Hierarchy {
+        &self.hierarchy
+    }
+
+    /// `command` as the program of a new scope for a session of `sandbox`,
+    /// reaching the manager this process reaches, and that scope.
+    pub fn wrap(&self, install: &str, sandbox: &str, command: &Command) -> (Command, Scope) {
+        let scope = Scope::new(self, install, sandbox);
+        let manager: Vec<_> = MANAGER_VARIABLES
+            .iter()
+            .filter_map(|name| Some((name.into(), std::env::var_os(name)?)))
+            .collect();
+        (scope.around(command, &manager), scope)
+    }
+}
+
+/// The scope a session's program runs in, and its cgroup once read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {
     slice: String,
     unit: String,
+    systemd_run: PathBuf,
+    hierarchy: Hierarchy,
+    cgroup: Option<Cgroup>,
 }
 
 impl Scope {
-    /// A new scope for a session of `sandbox`.
-    pub fn new(install: &str, sandbox: &str) -> Scope {
+    /// A new scope of `scopes` for a session of `sandbox`.
+    fn new(scopes: &Scopes, install: &str, sandbox: &str) -> Scope {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -268,20 +319,21 @@ impl Scope {
         Scope {
             slice: slice_name(install, sandbox),
             unit: scope_name(install, sandbox, &session),
+            systemd_run: scopes.systemd_run.clone(),
+            hierarchy: scopes.hierarchy.clone(),
+            cgroup: None,
         }
     }
 
-    /// `command` as a program of this scope: `systemd-run` joins the scope,
-    /// then becomes the program, so the pid and the group stay the same, and
-    /// the terminal and the inherited descriptors are expected to (design
-    /// §14). `manager` holds the variables
-    /// that reach the user's manager, which `/usr/bin/env` removes again.
-    /// Nothing may expand the program's arguments on the way: they reach it
-    /// as they are.
-    /// `command` gave the whole environment the program runs with, as a
-    /// backend's `wrap` does for a Linux host, and no standard stream yet.
+    /// The `systemd-run` this scope's program runs through.
+    pub fn systemd_run(&self) -> &Path {
+        &self.systemd_run
+    }
+
+    /// `command` run through `systemd-run` in this scope, with `manager`'s
+    /// variables for `systemd-run` alone; arguments are passed unexpanded.
     fn around(&self, command: &Command, manager: &[(OsString, OsString)]) -> Command {
-        let mut scoped = Command::new(SYSTEMD_RUN);
+        let mut scoped = Command::new(&self.systemd_run);
         scoped
             .args(["--user", "--scope", "--quiet", "--collect"])
             .arg("--expand-environment=no")
@@ -306,28 +358,20 @@ impl Scope {
         scoped
     }
 
-    /// `command` as a program of this scope, reaching the manager this
-    /// process reaches.
-    pub fn wrap(&self, command: &Command) -> Command {
-        let manager: Vec<_> = MANAGER_VARIABLES
-            .iter()
-            .filter_map(|name| Some((name.into(), std::env::var_os(name)?)))
-            .collect();
-        self.around(command, &manager)
-    }
-
-    /// The cgroup of the scope `pid` was started in. A scope that never
-    /// started is an error, and so is a cgroup `cgroups` does not show.
-    pub fn cgroup_of(&self, pid: u32, cgroups: &Hierarchy) -> Result<Cgroup, PsError> {
+    /// The cgroup of this scope, where `pid` was started, kept for
+    /// [`Scope::end`]. A scope that never started is an error, and so is a
+    /// cgroup the hierarchy does not show.
+    pub fn cgroup_of(&mut self, pid: u32) -> Result<Cgroup, PsError> {
         let proc = Path::new(PROC);
         let cgroup = cgroup_from(proc, pid, &self.unit, SCOPE_WAIT, &|| self.control_group())?;
-        in_hierarchy(cgroups, proc, pid, &cgroup)?;
+        self.cgroup = Some(cgroup.clone());
+        in_hierarchy(&self.hierarchy, proc, pid, &cgroup)?;
         Ok(cgroup)
     }
 
     /// What systemd says of the scope's cgroup: none once nothing is left
     /// in it. It takes no pid, so it holds for a program already reaped.
-    pub fn control_group(&self) -> Result<Option<Cgroup>, PsError> {
+    fn control_group(&self) -> Result<Option<Cgroup>, PsError> {
         let out = Command::new(SYSTEMCTL)
             .args(["--user", "show", "--property=ControlGroup", &self.unit])
             .stdin(Stdio::null())
@@ -341,6 +385,28 @@ impl Scope {
             )));
         }
         parse_control_group(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    /// Ends what is left in this scope's cgroup within `wait`: the cgroup
+    /// read by [`Scope::cgroup_of`], or else the one systemd names, if any.
+    pub fn end(&self, wait: Duration) -> Result<(), PsError> {
+        self.end_asking(|| self.control_group(), wait)
+    }
+
+    /// `end`, with `ask` saying what systemd would.
+    fn end_asking(
+        &self,
+        ask: impl FnOnce() -> Result<Option<Cgroup>, PsError>,
+        wait: Duration,
+    ) -> Result<(), PsError> {
+        let cgroup = match &self.cgroup {
+            Some(cgroup) => Some(cgroup.clone()),
+            None => ask()?,
+        };
+        match cgroup {
+            Some(cgroup) => self.hierarchy.end(&cgroup, wait),
+            None => Ok(()),
+        }
     }
 }
 
@@ -461,7 +527,7 @@ mod tests {
     #[test]
     fn the_longest_sandbox_name_of_hyphens_stays_a_valid_unit_name() {
         let name = format!("a{}", "-".repeat(40));
-        let scope = Scope::new("1f2e3d4c", &name);
+        let scope = Scope::new(&Scopes::host(), "1f2e3d4c", &name);
         for unit in [&scope.slice, &scope.unit] {
             assert!(unit.len() <= 255, "{unit}");
             assert!(
@@ -474,9 +540,9 @@ mod tests {
 
     #[test]
     fn two_scopes_of_a_sandbox_have_two_names_in_its_slice() {
-        let first = Scope::new("1f2e3d4c", "home");
+        let first = Scope::new(&Scopes::host(), "1f2e3d4c", "home");
         std::thread::sleep(Duration::from_millis(1));
-        let second = Scope::new("1f2e3d4c", "home");
+        let second = Scope::new(&Scopes::host(), "1f2e3d4c", "home");
         assert_eq!(first.slice, second.slice);
         assert_ne!(first.unit, second.unit);
         assert!(first.unit.starts_with("enclos.1f2e3d4c.home.session-"));
@@ -494,7 +560,21 @@ mod tests {
         Scope {
             slice: "enclos.1f2e3d4c.home.slice".into(),
             unit: "enclos.1f2e3d4c.home.session-1.scope".into(),
+            systemd_run: SYSTEMD_RUN.into(),
+            hierarchy: Hierarchy::host(),
+            cgroup: None,
         }
+    }
+
+    /// The program spawned is the `systemd-run` whose version was checked.
+    #[test]
+    fn a_scope_runs_through_the_systemd_run_its_scopes_were_given() {
+        let systemd_run = Path::new("/opt/systemd/bin/systemd-run");
+        let scopes = Scopes::at(systemd_run, Hierarchy::host());
+        let (command, scope) = scopes.wrap("1f2e3d4c", "home", &Command::new("/bin/prog"));
+        assert_eq!(command.get_program(), systemd_run);
+        assert_eq!(scope.systemd_run(), systemd_run);
+        assert_eq!(Scopes::host().systemd_run, Path::new(SYSTEMD_RUN));
     }
 
     /// `systemd-run` would read such a secret on the host, and `env` would
@@ -813,5 +893,42 @@ mod tests {
         let left = cgroups.end(&at("/s.scope"), Duration::ZERO).unwrap_err();
         assert!(left.to_string().contains("/s.scope"), "{left}");
         assert!(cgroups.end(&at("/bad.scope"), Duration::ZERO).is_err());
+    }
+
+    /// A scope in `cgroups`, with its cgroup read as `cgroup`, if any.
+    fn scope_in(cgroups: &Hierarchy, cgroup: Option<&str>) -> Scope {
+        Scope {
+            hierarchy: cgroups.clone(),
+            cgroup: cgroup.map(at),
+            ..scope()
+        }
+    }
+
+    #[test]
+    fn ending_a_scope_kills_the_cgroup_it_read_without_asking_systemd() {
+        let (dir, cgroups) = hierarchy(&[("s.scope", "")]);
+        let scope = scope_in(&cgroups, Some("/s.scope"));
+        scope.end_asking(never_asked, Duration::ZERO).unwrap();
+        let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
+        assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn ending_a_scope_whose_cgroup_was_not_read_kills_the_one_systemd_names() {
+        let (dir, cgroups) = hierarchy(&[("s.scope", "")]);
+        let scope = scope_in(&cgroups, None);
+        let named = || Ok(Some(at("/s.scope")));
+        scope.end_asking(named, Duration::ZERO).unwrap();
+        let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
+        assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn a_scope_with_nothing_left_has_nothing_to_end_and_a_failed_ask_is_an_error() {
+        let (_dir, cgroups) = hierarchy(&[]);
+        let scope = scope_in(&cgroups, None);
+        scope.end_asking(|| Ok(None), Duration::ZERO).unwrap();
+        let failed = || Err(PsError::Cgroup("no systemctl".into()));
+        assert!(scope.end_asking(failed, Duration::ZERO).is_err());
     }
 }

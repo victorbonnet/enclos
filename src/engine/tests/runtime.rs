@@ -3445,7 +3445,7 @@ fn a_runtime_that_outlives_being_told_to_end_is_audited_and_its_session_stays_op
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     // Nothing survives KILL on demand: this stop sends no signal and
     // reports the program as having survived both.
-    let lab = Lab::stopping_with(|session, _| {
+    let lab = Lab::stopping_with(|_, session, _| {
         Ok(Stopped::Survivors(vec![Survivor {
             member: Member {
                 pid: session.root.pid,
@@ -3498,7 +3498,7 @@ fn a_runtime_enclos_cannot_stop_is_audited_and_its_session_stays_open() {
 
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     // `ps` failing whenever the members are stopped: nothing is signalled.
-    let lab = Lab::stopping_with(|_, _| Err(PsError::new("ps failed")));
+    let lab = Lab::stopping_with(|_, _, _| Err(PsError::new("ps failed")));
     assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
     let ended = Arc::new(AtomicBool::new(false));
     let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
@@ -3538,9 +3538,9 @@ fn a_launch_refuses_to_start_beside_an_earlier_session_that_does_not_stop() {
     // without signalling it; every other session it stops for real.
     static STUBBORN: AtomicU32 = AtomicU32::new(0);
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let lab = Lab::stopping_with(|session, grace| {
+    let lab = Lab::stopping_with(|cgroups, session, grace| {
         if session.root.pid != STUBBORN.load(Ordering::Relaxed) {
-            return crate::lifecycle::stop::stop(session, grace);
+            return crate::lifecycle::stop::stop(cgroups, session, grace);
         }
         Ok(Stopped::Survivors(vec![Survivor {
             member: Member {

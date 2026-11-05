@@ -21,7 +21,7 @@ use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
 use crate::layout::LayoutError;
-use crate::lifecycle::cgroup::Systemd;
+use crate::lifecycle::cgroup::{Scopes, Systemd};
 use crate::lifecycle::look::Look;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
@@ -283,7 +283,7 @@ impl Engine {
         };
         Doctor {
             backends,
-            systemd: self.scopes.then(|| Systemd::at(&self.systemd_run)),
+            systemd: self.scopes.as_ref().map(Scopes::systemd),
             sandboxes,
         }
     }
@@ -346,7 +346,7 @@ impl Engine {
                 Ok(procs) => Look::in_listing(procs, &self.markers(name))
                     .map_err(|e| e.to_string())
                     .and_then(|look| {
-                        look.in_cgroups(&self.cgroups, open.iter().copied())
+                        look.in_cgroups(&self.cgroups(), open.iter().copied())
                             .map_err(|e| e.to_string())
                     }),
                 Err(e) => Err(e.to_string()),

@@ -94,12 +94,9 @@ pub fn describe_survivors(left: &[Survivor]) -> String {
         .join("; ")
 }
 
-pub fn stop(session: &SessionRecord, grace: Duration) -> Result<Stopped, PsError> {
-    stop_in(&Hierarchy::host(), session, grace)
-}
-
-/// `stop`, reading a session's cgroup in `cgroups`.
-fn stop_in(
+/// Stops `session`'s members within `grace`, reading its cgroup, if it has
+/// one, in `cgroups`.
+pub fn stop(
     cgroups: &Hierarchy,
     session: &SessionRecord,
     grace: Duration,
@@ -398,7 +395,7 @@ mod tests {
                     std::thread::sleep(POLL);
                 }
             });
-            let stopped = stop_in(&cgroups, &session, GRACE).unwrap();
+            let stopped = stop(&cgroups, &session, GRACE).unwrap();
             done.store(true, std::sync::atomic::Ordering::Relaxed);
             stopped
         });
@@ -416,7 +413,7 @@ mod tests {
         let mut root = shell_until_input_closes("");
         let mut session = session_of(&root);
         let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), unlisted]);
-        let stopped = stop_in(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
         let _ = root.wait();
         let Stopped::Survivors(left) = stopped else {
             panic!("{stopped:?}");
@@ -434,7 +431,7 @@ mod tests {
         let mut session = session_of(&root);
         let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), unlisted]);
         std::fs::create_dir(dir.path().join("s.scope/cgroup.kill")).unwrap();
-        let stopped = stop_in(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
         let _ = root.wait();
         let Stopped::Survivors(left) = stopped else {
             panic!("{stopped:?}");
@@ -456,7 +453,7 @@ mod tests {
         drop(root.stdin.take());
         root.wait().unwrap();
         let (dir, cgroups) = in_cgroup(&mut session, &[unlisted]);
-        let stopped = stop_in(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
         let Stopped::Survivors(left) = stopped else {
             panic!("{stopped:?}");
         };
@@ -485,7 +482,7 @@ mod tests {
                 }
                 write_cgroup(dir.path(), &[]);
             });
-            stop_in(&cgroups, &session, GRACE).unwrap()
+            stop(&cgroups, &session, GRACE).unwrap()
         });
         assert_eq!(stopped, Stopped::Clean);
         assert!(!is_same(&session.root).unwrap());
@@ -500,9 +497,9 @@ mod tests {
         drop(root.stdin.take());
         root.wait().unwrap();
         let (dir, cgroups) = in_cgroup(&mut session, &[]);
-        assert_eq!(stop_in(&cgroups, &session, GRACE).unwrap(), Stopped::Gone);
+        assert_eq!(stop(&cgroups, &session, GRACE).unwrap(), Stopped::Gone);
         std::fs::write(dir.path().join("s.scope/cgroup.procs"), "x\n").unwrap();
-        assert!(stop_in(&cgroups, &session, GRACE).is_err());
+        assert!(stop(&cgroups, &session, GRACE).is_err());
     }
 
     #[test]
@@ -511,7 +508,10 @@ mod tests {
         let session = session_of(&child);
         drop(child.stdin.take());
         child.wait().unwrap();
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Gone);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Gone
+        );
     }
 
     #[test]
@@ -524,7 +524,10 @@ mod tests {
             .unwrap();
         let session = session_of(&child);
         member_besides_root(&session, |_| true);
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         let _ = child.wait();
     }
 
@@ -539,7 +542,10 @@ mod tests {
             .unwrap();
         let session = session_of(&child);
         let job = member_besides_root(&session, |m| group_of(m.pid).unwrap() == Some(m.pid));
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         let _ = child.wait();
         assert!(!is_same(&reference_to(&job)).unwrap());
     }
@@ -555,7 +561,7 @@ mod tests {
         member_besides_root(&session, |_| true);
         let started = Instant::now();
         assert_eq!(
-            stop(&session, Duration::from_millis(500)).unwrap(),
+            stop(&Hierarchy::host(), &session, Duration::from_millis(500)).unwrap(),
             Stopped::Clean
         );
         // The shell ignored TERM: only KILL, after the grace, ended it.
@@ -573,7 +579,10 @@ mod tests {
         let session = session_of(&child);
         member_besides_root(&session, |_| true);
         let started = Instant::now();
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(child.wait().unwrap().code(), Some(7));
     }
@@ -595,7 +604,7 @@ mod tests {
         session.tracked = vec![reference_to(&job)];
         assert_eq!(members(&session).unwrap(), std::slice::from_ref(&job));
         assert_eq!(
-            stop(&session, Duration::from_millis(500)).unwrap(),
+            stop(&Hierarchy::host(), &session, Duration::from_millis(500)).unwrap(),
             Stopped::Clean
         );
         assert!(!is_same(&reference_to(&job)).unwrap());
@@ -610,7 +619,7 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"\n").unwrap();
         child.wait().unwrap();
 
-        let stopped = stop(&session, Duration::from_millis(200)).unwrap();
+        let stopped = stop(&Hierarchy::host(), &session, Duration::from_millis(200)).unwrap();
         assert_eq!(
             stopped,
             Stopped::Survivors(vec![Survivor {

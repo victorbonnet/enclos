@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::lifecycle::cgroup::{Hierarchy, Systemd};
+use crate::lifecycle::cgroup::{Hierarchy, SYSTEMD_RUN, Scopes, Systemd};
 use crate::lifecycle::process::{Signal, is_same, reference, signal_process};
 use crate::model::sandbox::SandboxState;
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
@@ -27,7 +27,7 @@ fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
     let scope = hierarchy.path().join("s.scope");
     std::fs::create_dir(&scope).unwrap();
     std::fs::write(scope.join("cgroup.procs"), format!("{}\n", member.id())).unwrap();
-    lab.engine.cgroups = Hierarchy::at(hierarchy.path());
+    lab.engine.scopes = Some(in_stand_in(hierarchy.path()));
     let session = SessionRecord {
         id: crate::model::session::SessionId(0),
         sandbox: lab.name.clone(),
@@ -65,6 +65,61 @@ fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
     member.wait().unwrap();
 }
 
+/// Scopes whose cgroups are read in the stand-in hierarchy at `root`; no
+/// test using them starts a session, so `systemd-run` never runs.
+fn in_stand_in(root: &Path) -> Scopes {
+    Scopes::at(Path::new(SYSTEMD_RUN), Hierarchy::at(root))
+}
+
+/// A stop reads the cgroup where the engine's look does: a pid there that
+/// `ps` does not list is reported, and the kill reaches that cgroup.
+#[test]
+fn a_stop_reads_and_kills_the_cgroup_the_engine_looks_at() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let mut ended = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
+    let root = crate::lifecycle::process::reference_of_child(&ended).unwrap();
+    ended.wait().unwrap();
+    // A pid `ps` cannot list: the stand-in holds it for ever.
+    let unlisted = u32::MAX - 1;
+    let hierarchy = tempfile::tempdir().unwrap();
+    let scope = hierarchy.path().join("s.scope");
+    std::fs::create_dir(&scope).unwrap();
+    std::fs::write(scope.join("cgroup.procs"), format!("{unlisted}\n")).unwrap();
+    lab.engine.scopes = Some(in_stand_in(hierarchy.path()));
+    let session = SessionRecord {
+        id: crate::model::session::SessionId(0),
+        sandbox: lab.name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: lab.engine.active_policy(&lab.name).unwrap().1.id,
+        compiled: None,
+        root,
+        pgid: None,
+        cgroup: Some("/s.scope".parse().unwrap()),
+        tracked: Vec::new(),
+        started_at: crate::model::now(),
+        ended_at: None,
+    };
+
+    let stopped = lab
+        .engine
+        .stop_marked(
+            &session,
+            Duration::from_millis(100),
+            crate::lifecycle::stop::stop,
+        )
+        .unwrap();
+    let crate::lifecycle::stop::Stopped::Survivors(left) = stopped else {
+        panic!("{stopped:?}");
+    };
+    assert_eq!(left[0].member.pid, unlisted);
+    assert_eq!(left[0].why, crate::lifecycle::stop::Why::NotListed);
+    let asked = std::fs::read_to_string(scope.join("cgroup.kill"));
+    assert_eq!(asked.unwrap(), "1");
+}
+
 /// A `systemd-run` that prints `first line` for `--version`, and that nothing
 /// reaches a manager through.
 fn systemd_run_printing(first_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -82,8 +137,7 @@ fn refused_exec(first_line: &str) -> String {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut lab = Lab::new();
     let (_dir, stub) = systemd_run_printing(first_line);
-    lab.engine.scopes = true;
-    lab.engine.systemd_run = stub;
+    lab.engine.scopes = Some(Scopes::at(&stub, Hierarchy::host()));
     let ran = lab.home.join("ran");
     let script = format!("/usr/bin/touch {}", ran.display());
     let err = lab
@@ -128,9 +182,8 @@ fn doctor_fails_on_a_systemd_too_old_and_only_where_sessions_run_in_scopes() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut lab = Lab::new();
     let (_dir, stub) = systemd_run_printing("systemd 252 (252.39-1~deb12u2)");
-    lab.engine.systemd_run = stub;
     assert_eq!(lab.engine.doctor().systemd, None);
-    lab.engine.scopes = true;
+    lab.engine.scopes = Some(Scopes::at(&stub, Hierarchy::host()));
     let doctor = lab.engine.doctor();
     assert_eq!(doctor.systemd, Some(Systemd::TooOld(252)));
     assert!(doctor.has_problems());
@@ -154,7 +207,7 @@ fn on_a_runner() -> bool {
 
 fn lab_with_scopes() -> Lab {
     let mut lab = Lab::new();
-    lab.engine.scopes = true;
+    lab.engine.scopes = Some(Scopes::host());
     lab
 }
 
