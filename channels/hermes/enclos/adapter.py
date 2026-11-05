@@ -1,8 +1,8 @@
 """The Hermes side of enclos's channel: a gateway platform adapter.
 
-It listens on ENCLOS_APP_SOCKET, a Unix socket in the sandbox home, for
+It listens on MOBILE_APP_SOCKET, a Unix socket in the sandbox home, for
 enclos's bridge, which must open with a `hello` holding the agent's token
-(ENCLOS_APP_TOKEN, granted to this agent alone). Each conversation is a
+(MOBILE_APP_TOKEN, granted to this agent alone). Each conversation is a
 Hermes chat, so a cron job created in one delivers back to it. What the
 agent says is kept on disk until the bridge acknowledges it.
 
@@ -37,18 +37,18 @@ def _setting(config: Optional[PlatformConfig], key: str, env: str) -> str:
 
 
 def check_requirements() -> bool:
-    return bool(_setting(None, "socket", "ENCLOS_APP_SOCKET") and _setting(None, "token", "ENCLOS_APP_TOKEN"))
+    return bool(_setting(None, "socket", "MOBILE_APP_SOCKET") and _setting(None, "token", "MOBILE_APP_TOKEN"))
 
 
 def validate_config(config) -> bool:
-    return bool(_setting(config, "socket", "ENCLOS_APP_SOCKET") and _setting(config, "token", "ENCLOS_APP_TOKEN"))
+    return bool(_setting(config, "socket", "MOBILE_APP_SOCKET") and _setting(config, "token", "MOBILE_APP_TOKEN"))
 
 
 class EnclosAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform(PLATFORM))
-        self._path = _setting(config, "socket", "ENCLOS_APP_SOCKET")
-        self._token = _setting(config, "token", "ENCLOS_APP_TOKEN")
+        self._path = _setting(config, "socket", "MOBILE_APP_SOCKET")
+        self._token = _setting(config, "token", "MOBILE_APP_TOKEN")
         # enclos names each agent's socket `<agent>.sock`; the process's own
         # environment would name the gateway's first agent for every one
         self._agent = os.path.basename(self._path).removesuffix(".sock") or "default"
@@ -59,7 +59,7 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
-            logger.warning("[%s] ENCLOS_APP_SOCKET or ENCLOS_APP_TOKEN not set", self.name)
+            logger.warning("[%s] MOBILE_APP_SOCKET or MOBILE_APP_TOKEN not set", self.name)
             return False
         try:
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
@@ -175,12 +175,12 @@ class EnclosAdapter(BasePlatformAdapter):
 
 def _env_enablement() -> dict | None:
     """On for an agent whose secrets give it a socket and a token."""
-    socket_path = _setting(None, "socket", "ENCLOS_APP_SOCKET")
-    token = _setting(None, "token", "ENCLOS_APP_TOKEN")
+    socket_path = _setting(None, "socket", "MOBILE_APP_SOCKET")
+    token = _setting(None, "token", "MOBILE_APP_TOKEN")
     if not (socket_path and token):
         return None
     seed: dict[str, Any] = {"socket": socket_path, "token": token}
-    home = _setting(None, "home", "ENCLOS_APP_HOME_CHANNEL")
+    home = _setting(None, "home", "MOBILE_APP_HOME_CHANNEL")
     if home:
         seed["home_channel"] = {"chat_id": home, "name": "Home"}
     return seed
@@ -190,10 +190,10 @@ def register(ctx) -> None:
     ctx.register_platform(
         name=PLATFORM, label="enclos app", adapter_factory=lambda cfg: EnclosAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config,
-        required_env=["ENCLOS_APP_SOCKET", "ENCLOS_APP_TOKEN"],
+        required_env=["MOBILE_APP_SOCKET", "MOBILE_APP_TOKEN"],
         install_hint="Set up with `enclos runtime configure <sandbox>/<agent> --channel app` on the host",
         env_enablement_fn=_env_enablement,
-        cron_deliver_env_var="ENCLOS_APP_HOME_CHANNEL",
-        allow_all_env="ENCLOS_APP_ALLOW_ALL",
+        cron_deliver_env_var="MOBILE_APP_HOME_CHANNEL",
+        allow_all_env="MOBILE_APP_ALLOW_ALL",
         emoji="📱",
         platform_hint="You are talking with the user through the enclos mobile app, on their phone.")
