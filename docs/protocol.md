@@ -79,6 +79,8 @@ enclos://pair?v=1&host=<host name>&url=https://<host>.<tailnet>.ts.net&key=<brid
 - `key`: the bridge's static X25519 public key, base64url, which the app pins.
 - `code`: 128 random bits, base64url, single use, valid until `exp` (5 minutes).
 
+It also prints that link, and an https link to open on the phone: `https://<host>.<tailnet>.ts.net/pair#v=1&host=…` (the same parameters, after `#`). A chat or a note opens an https link, not an app's own scheme. The bridge answers `GET /pair` with one static page, the same for everyone, which reads the parameters in the browser, shows the host and the time left, and opens the `enclos://pair` link in the app on a tap. A browser never sends what follows `#`: the code does not reach the bridge, its transport or a log. Every other request is a device's WebSocket.
+
 The app makes its **device key**, a P-256 key in the phone's hardware (Android Keystore, StrongBox where the phone has it; Secure Enclave on iOS, which holds only P-256), and its own static X25519 key, kept encrypted under a hardware key. It runs the Noise handshake below as a device the bridge does not know yet, then sends, instead of `auth`:
 
 | `type` | From | Fields |
