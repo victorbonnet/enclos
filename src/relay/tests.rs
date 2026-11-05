@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{OWN_DESCRIPTORS, connections_for, pass_on, say_lost, serve_up_to};
+use super::{OWN_DESCRIPTORS, connections_for, copy_through, say_lost, serve_up_to};
 use crate::proxy::IDLE_TIMEOUT;
 
 /// Far beyond the sockets' buffers.
@@ -338,18 +338,29 @@ fn a_failed_upload_leaves_the_answer_on_its_way_to_the_client() {
     assert_eq!(all_of(&client), b"refused");
 }
 
-/// macOS answers ENOTCONN to telling a peer that has closed, and Linux does
-/// not: the other direction may still be carrying that peer's last bytes.
+/// A client that sent its last bytes and closed both ways: macOS answers
+/// ENOTCONN when the relay tells it the download ended, and Linux does not.
+/// Either way the upload still carries those bytes to the proxy.
 #[test]
 fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction() {
+    let relay = Relay::start();
+    let mut client = relay.client();
+    let upstream = relay.accepted();
+    client.write_all(b"last").unwrap();
+    drop(client);
+    thread::sleep(Duration::from_millis(200));
+    upstream.shutdown(Shutdown::Write).unwrap();
+    upstream.set_read_timeout(Some(PATIENCE)).unwrap();
+    assert_eq!(all_of(&upstream), b"last");
+}
+
+#[test]
+fn a_copy_says_whether_it_reached_the_end_of_its_input() {
     let mut sent = Vec::new();
-    pass_on(
-        &b"last"[..],
-        &mut sent,
-        || Err(ErrorKind::NotConnected.into()),
-        || panic!("the other direction was ended"),
-    );
+    assert!(copy_through(&b"last"[..], &mut sent));
     assert_eq!(sent, b"last");
+    let mut full = [0u8; 2];
+    assert!(!copy_through(&b"last"[..], &mut full[..]));
 }
 
 #[test]

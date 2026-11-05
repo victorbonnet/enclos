@@ -114,63 +114,43 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
 fn carry(client: &TcpStream, upstream: &UnixStream, limit: Duration) {
     let _ = client.set_write_timeout(Some(limit));
     let _ = upstream.set_write_timeout(Some(limit));
-    // Wakes the other direction, which may be blocked.
-    let end_both = || {
-        let _ = client.shutdown(Shutdown::Both);
-        let _ = upstream.shutdown(Shutdown::Both);
-    };
     let (up_ended, wait_up) = mpsc::channel::<()>();
     thread::scope(|s| {
-        // A failed upload ends the upload alone: the proxy may be answering,
-        // as when it refuses a request and closes with the body unread.
         let up = thread::Builder::new().spawn_scoped(s, move || {
             let _ended = up_ended;
-            pass_on(
-                client,
-                upstream,
-                || upstream.shutdown(Shutdown::Write),
-                || {
-                    let _ = upstream.shutdown(Shutdown::Write);
-                },
-            )
+            copy_through(client, upstream);
+            // Ended or failed, the upload ends alone: the proxy may still be
+            // answering, as when it refuses a request with the body unread.
+            let _ = upstream.shutdown(Shutdown::Write);
         });
         if let Err(e) = up {
             say(format_args!("cannot start a thread for a connection: {e}"));
             return;
         }
-        pass_on(
-            upstream,
-            client,
-            || {
-                let told = client.shutdown(Shutdown::Write);
-                // A read on the client cannot see that the proxy left, so a
-                // client that sends nothing more would hold its place.
-                let _ = wait_up.recv_timeout(limit);
-                let _ = client.shutdown(Shutdown::Both);
-                told
-            },
-            end_both,
-        );
+        if copy_through(upstream, client) {
+            // macOS answers ENOTCONN when the client has closed already,
+            // while the upload may still carry its last bytes: ignored.
+            let _ = client.shutdown(Shutdown::Write);
+            // A read on the client cannot see that the proxy left, so a
+            // client that sends nothing more would hold its place.
+            let _ = wait_up.recv_timeout(limit);
+            let _ = client.shutdown(Shutdown::Both);
+        } else {
+            // A failed download ends both, waking the upload if it is blocked.
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = upstream.shutdown(Shutdown::Both);
+        }
     });
 }
 
-/// Copies one direction to its end of input, then tells the other side with
-/// `done`; `failed` runs when the copy goes wrong. A `done` that fails ends
-/// nothing: macOS answers ENOTCONN when that side has closed already, while
-/// the other direction may still carry the last of what it sent.
-fn pass_on(
-    mut from: impl Read,
-    mut to: impl Write,
-    done: impl FnOnce() -> io::Result<()>,
-    failed: impl FnOnce(),
-) {
+/// Copies `from` to `to` up to its end of input, and says why it failed
+/// unless a peer left. Whether it reached the end.
+fn copy_through(mut from: impl Read, mut to: impl Write) -> bool {
     match io::copy(&mut from, &mut to) {
-        Ok(_) => {
-            let _ = done();
-        }
+        Ok(_) => true,
         Err(e) => {
             say_lost(&e, &mut io::stderr());
-            failed();
+            false
         }
     }
 }
