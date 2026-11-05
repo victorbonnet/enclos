@@ -21,6 +21,13 @@ pub enum FromBridge {
         person: Person,
         text: String,
     },
+    /// The person named the conversation, or, with an empty `title`,
+    /// cleared its name.
+    #[serde(rename = "conversation.rename")]
+    Rename {
+        conversation: ConversationId,
+        title: String,
+    },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -28,7 +35,8 @@ pub enum FromBridge {
 }
 
 /// The `type`s of [`FromBridge`].
-pub const FROM_BRIDGE_TYPES: &[&str] = &["hello", "message.in", "ack", "error"];
+pub const FROM_BRIDGE_TYPES: &[&str] =
+    &["hello", "message.in", "conversation.rename", "ack", "error"];
 
 /// What a plugin sends to the bridge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +64,14 @@ pub enum FromPlugin {
         conversation: ConversationId,
         on: bool,
     },
+    /// A short name for the conversation, from what was said in it: the
+    /// runtime's own (Hermes: its session title). The bridge keeps a name
+    /// the person gave over it.
+    #[serde(rename = "conversation.title")]
+    Title {
+        conversation: ConversationId,
+        title: String,
+    },
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -63,7 +79,14 @@ pub enum FromPlugin {
 }
 
 /// The `type`s of [`FromPlugin`].
-pub const FROM_PLUGIN_TYPES: &[&str] = &["hello", "message.out", "typing", "ack", "error"];
+pub const FROM_PLUGIN_TYPES: &[&str] = &[
+    "hello",
+    "message.out",
+    "typing",
+    "conversation.title",
+    "ack",
+    "error",
+];
 
 /// Whether an agent's message answers one, or comes on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +108,8 @@ pub enum Capability {
     Attachments,
     Approval,
     Abort,
+    /// It names conversations (`conversation.title`).
+    Titles,
     #[serde(other)]
     Unknown,
 }

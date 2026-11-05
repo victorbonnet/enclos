@@ -23,7 +23,7 @@ def fixture(name: str) -> bytes:
 class FromTheBridge(unittest.TestCase):
     def test_every_fixture_the_bridge_sends_decodes(self):
         names = sorted(n for n in os.listdir(FIXTURES) if n.startswith("from_bridge_"))
-        self.assertEqual(len(names), 3)
+        self.assertEqual(len(names), 4)
         for name in names:
             with self.subTest(name):
                 self.assertEqual(protocol.decode_from_bridge(fixture(name)), json.loads(fixture(name)))
@@ -66,6 +66,19 @@ class ToTheBridge(unittest.TestCase):
         self.assert_like_fixture(
             protocol.message_out("c-42", "Good morning: 9 °C in Paris."), "from_plugin_message_out_notify.json")
         self.assert_like_fixture(protocol.typing("c-42", True), "from_plugin_typing.json")
+        self.assert_like_fixture(
+            protocol.title("c-42", "Paris weather this week"), "from_plugin_conversation_title.json")
+
+    def test_hermes_uniqueness_suffix_is_dropped(self):
+        self.assertEqual(protocol.runtime_title("Paris weather #2"), "Paris weather")
+        self.assertEqual(protocol.runtime_title("  Paris   weather "), "Paris weather")
+        self.assertEqual(protocol.runtime_title("Issue #42 triage"), "Issue #42 triage")
+
+    def test_a_title_is_one_short_line(self):
+        message = protocol.title("c-1", "  Paris\nweather   " + "x" * 200)
+        self.assertNotIn("\n", message["title"])
+        self.assertTrue(message["title"].startswith("Paris weather x"))
+        self.assertEqual(len(message["title"]), protocol.MAX_TITLE_CHARS)
 
     def test_a_line_has_no_line_break_inside(self):
         line = protocol.encode_line(protocol.message_out("c-1", "two\nlines"))
