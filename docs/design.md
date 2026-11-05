@@ -391,7 +391,7 @@ pub trait Backend {
 }
 ```
 
-The escape probes come in two parts, and the engine runs each through the backend's `wrap`. `probes/` builds those every backend runs: reads of the deny list, writes outside the home, other sandboxes, enclos's files, the proxy, a direct connection and DNS on port 53, host sockets, signals, terminals and limits. Each backend adds its own through `own_probes`, and says there what its refusals look like, which is what those probes are judged by: Seatbelt's are the folders that cannot move (a rename or clone into itself, the removal of the home), the host services, the Keychain, the pasteboard, mDNSResponder, `at` and `crontab`, and the bind and `[::1]` probes that test its loopback rule. No bubblewrap backend exists yet, so nothing has run the shared set on Linux, and its commands are still written for macOS's paths where the two differ.
+The escape probes come in two parts, and the engine runs each through the backend's `wrap`. `probes/` builds those every backend runs: reads of the deny list, writes outside the home, other sandboxes, enclos's files, the proxy, a direct connection and DNS on port 53, host sockets, signals, terminals and limits. Each backend adds its own through `own_probes`, and says there what its refusals look like, which is what those probes are judged by: Seatbelt's are the folders that cannot move (a rename or clone into itself, the removal of the home), the host services, the Keychain, the pasteboard, mDNSResponder, `at` and `crontab`, and the bind and `[::1]` probes that test its loopback rule. The bubblewrap backend has no probes of its own yet, so `policy test` refuses a bubblewrap sandbox, and nothing has run the shared set on Linux.
 
 **Egress proxy**
 
