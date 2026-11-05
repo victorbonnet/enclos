@@ -94,3 +94,46 @@ fn the_design_cites_no_ci_run() {
         .collect();
     assert!(runs.is_empty(), "{runs:#?}");
 }
+
+/// The lines of the design from the first line starting with `start` up to,
+/// not including, the next line starting with `end`.
+fn section<'a>(design: &'a str, start: &str, end: &str) -> Vec<&'a str> {
+    design
+        .lines()
+        .skip_while(|line| !line.starts_with(start))
+        .take_while(|line| !line.starts_with(end))
+        .collect()
+}
+
+/// Whether `line` names a CI run by its number: "run" followed by digits.
+fn names_a_run_number(line: &str) -> bool {
+    line.split("run ")
+        .skip(1)
+        .any(|rest| rest.chars().take_while(char::is_ascii_digit).count() >= 6)
+}
+
+#[test]
+fn milestone_3_awaiting_verification_holds_only_what_is_still_to_show() {
+    // A result a prototype showed moves into the section it describes; §14
+    // keeps what is still to show, and points to the README for the runs.
+    let design = design();
+    let milestone_3 = section(&design, "**Milestone 3**", "## 15.");
+    assert!(!milestone_3.is_empty(), "§14's milestone 3 list");
+    assert!(
+        milestone_3[0].contains("Results are in `prototype/m3/README.md`"),
+        "{}",
+        milestone_3[0]
+    );
+    let with_results: Vec<&str> = milestone_3
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.contains("PR #")
+                || line.contains("M3-")
+                || line.contains("Shown by")
+                || names_a_run_number(line)
+        })
+        .map(|line| line.get(..100).unwrap_or(line))
+        .collect();
+    assert!(with_results.is_empty(), "{with_results:#?}");
+}
