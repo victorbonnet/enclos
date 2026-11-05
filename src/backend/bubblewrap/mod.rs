@@ -4,6 +4,7 @@
 
 pub mod compile;
 pub mod proposed;
+pub mod seccomp;
 
 pub use compile::{CompiledSandbox, compile};
 pub use proposed::{Host, capabilities};
