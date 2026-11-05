@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
 use crate::ids::{ConversationId, MessageId};
-use crate::plugin::{Capability, ErrorBody};
+use crate::plugin::{Capability, ErrorBody, ToolStep};
 
 /// What a device sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +93,10 @@ pub enum ToDevice {
         conversation: ConversationId,
         on: bool,
     },
+    /// A tool the agent starts or ends while it works: as on the plugin
+    /// leg, live, not kept.
+    #[serde(rename = "tool")]
+    Tool(ToolStep),
     #[serde(rename = "synced")]
     Synced { seq: i64 },
     #[serde(rename = "ack")]
@@ -109,6 +113,7 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "conversation",
     "message",
     "typing",
+    "tool",
     "synced",
     "ack",
     "error",
