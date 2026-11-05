@@ -1,5 +1,5 @@
 //! What each process holds open, from `/proc/<pid>/fd`, with no `unsafe`
-//! code (ADR 0012): where `lsof` is not at `/usr/sbin/lsof`, on Linux.
+//! code (ADR 0012): how enclos looks on Linux, where macOS uses `lsof`.
 //!
 //! Each look is a `readlink`, which `/proc` answers without reaching the file
 //! system the descriptor is on, so unlike `lsof` it needs no time limit.

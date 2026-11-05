@@ -280,8 +280,8 @@ pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled,
     Ok(kill(signal, i64::from(process.pid)))
 }
 
-/// Sends `signal` to `process` alone, only if it is still the recorded
-/// process.
+/// As above, through a pidfd taken before the check, so a reused pid is
+/// never signalled.
 #[cfg(target_os = "linux")]
 pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
     through_pidfd(process, signal, || is_same(process))
