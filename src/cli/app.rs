@@ -13,6 +13,7 @@ use enclos::bridge::plugin::{PluginError, connect};
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
 use enclos::bridge::store::{From, Store};
+use enclos::bridge::transport::Transport;
 use enclos::engine::Engine;
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
@@ -42,19 +43,26 @@ enum AppVerb {
         conversation: Option<String>,
     },
     /// Run the bridge in this terminal: it serves paired devices on the
-    /// host's loopback, for `tailscale serve` to put on your tailnet.
+    /// host's loopback, for its transport to put on your network.
     Serve {
         /// The loopback port to listen on.
         #[arg(long, default_value_t = 47100)]
         port: u16,
+        /// How devices reach the bridge, and who it says each caller is;
+        /// `tailscale`, through `tailscale serve`, is the only one for now.
+        #[arg(long, default_value = "tailscale")]
+        transport: Transport,
     },
     /// Pair a device: prints a QR code for the enclos app to scan, then
     /// asks you to confirm the device that used it.
     Pair {
-        /// The bridge's address on your tailnet; read from `tailscale
-        /// status` when left out.
+        /// The bridge's address on your network; asked of the transport
+        /// (`tailscale status`) when left out.
         #[arg(long)]
         url: Option<String>,
+        /// How devices reach the bridge: as `app serve --transport`.
+        #[arg(long, default_value = "tailscale")]
+        transport: Transport,
     },
     /// List the paired devices.
     Devices,
@@ -77,8 +85,8 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             target,
             conversation,
         } => chat(engine, by, target, conversation),
-        AppVerb::Serve { port } => serve(engine, port),
-        AppVerb::Pair { url } => pair(engine, url),
+        AppVerb::Serve { port, transport } => serve(engine, port, transport),
+        AppVerb::Pair { url, transport } => pair(engine, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
         AppVerb::Unpair { device } => unpair(engine, &device),
         AppVerb::Log { lines } => log(engine, lines),
@@ -94,7 +102,7 @@ fn open_store(engine: &Engine) -> Result<Store> {
         .map_err(|e| failed(format!("cannot open the bridge's database: {e}")))
 }
 
-fn serve(engine: &Engine, port: u16) -> Result<u8> {
+fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
     let mut agents = Vec::new();
@@ -110,31 +118,30 @@ fn serve(engine: &Engine, port: u16) -> Result<u8> {
         }
     }
     eprintln!(
-        "The bridge serves {} agent(s) on 127.0.0.1:{port}. Put it on your tailnet with:\n  tailscale serve --bg {port}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
-        agents.len()
+        "The bridge serves {} agent(s) on 127.0.0.1:{port}, through {transport}. Put it on your network with:\n  {}\nthen pair a device with `enclos app pair`. Ctrl-C to stop.",
+        agents.len(),
+        transport.expose_hint(port)
     );
     for agent in &agents {
         eprintln!("  {}", agent.name);
     }
-    server::serve(port, engine.app_store_path(), key.private, agents)
-        .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
+    server::serve(
+        transport,
+        port,
+        engine.app_store_path(),
+        key.private,
+        agents,
+    )
+    .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
     Ok(exit::OK)
 }
 
-/// The host's name on the tailnet, from `tailscale status --json`.
-fn tailnet_url() -> Option<String> {
-    let out = std::process::Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-        .ok()?;
-    let status: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let name = status.get("Self")?.get("DNSName")?.as_str()?;
-    Some(format!("https://{}", name.trim_end_matches('.')))
-}
-
-fn pair(engine: &Engine, url: Option<String>) -> Result<u8> {
-    let url = url.or_else(tailnet_url).ok_or_else(|| {
-        failed("cannot read this host's tailnet name from `tailscale status`: give it with --url https://<host>.<tailnet>.ts.net".to_owned())
+fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8> {
+    let url = url.or_else(|| transport.address()).ok_or_else(|| {
+        failed(format!(
+            "cannot read the bridge's address from {transport}: give it with --url {}",
+            transport.address_form()
+        ))
     })?;
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
@@ -179,7 +186,7 @@ fn pair(engine: &Engine, url: Option<String>) -> Result<u8> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
     print!(
-        "{} (tailscale: {}) wants to pair. Accept? [y/N] ",
+        "{} ({transport} login: {}) wants to pair. Accept? [y/N] ",
         request.name, request.person
     );
     use std::io::Write as _;
