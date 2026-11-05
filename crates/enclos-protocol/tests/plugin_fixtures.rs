@@ -57,6 +57,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         "tool_end",
         include_str!("fixtures/plugin/from_plugin_tool_end.json"),
     ),
+    (
+        "message_out_image",
+        include_str!("fixtures/plugin/from_plugin_message_out_image.json"),
+    ),
 ];
 
 fn json(bytes: &[u8]) -> serde_json::Value {
@@ -161,6 +165,20 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(
         (end.call, end.phase, end.ok, end.duration_ms),
         (start.call, ToolPhase::End, Some(true), Some(1840))
+    );
+
+    let message = decode_from_plugin(FROM_PLUGIN[8].1.as_bytes()).unwrap();
+    let FromPlugin::MessageOut { attachments, .. } = message.body else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(
+        (
+            attachments[0].mime.as_str(),
+            attachments[0].name.as_str(),
+            attachments[0].size
+        ),
+        ("image/png", "unicorn.png", 1_962_976)
     );
 }
 

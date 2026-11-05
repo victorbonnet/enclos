@@ -32,7 +32,9 @@ PLATFORM_HINT = (
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
     "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
     "on a phone screen, and keep tables narrow. A single newline is a line break. "
-    "Images are not shown (an image link shows as its alt text) and HTML shows as literal text."
+    "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
+    "shows in the conversation, another file as an attachment, and the person can share either. "
+    "A remote image in markdown is not loaded, and HTML shows as literal text."
 )
 
 
@@ -126,13 +128,34 @@ def hello(runtime: str, agent: str) -> dict[str, Any]:
     return _message("hello", runtime=runtime, agent=agent, capabilities=list(CAPABILITIES))
 
 
-def message_out(conversation: str, text: str, reply_to: str | None = None) -> dict[str, Any]:
-    """A reply when it answers a message, `notify` otherwise (a cron job, background work)."""
+def message_out(conversation: str, text: str, reply_to: str | None = None,
+                attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A reply when it answers a message, `notify` otherwise (a cron job, background work);
+    with the files it carries, each already in the channel's media folder (`attachment`)."""
     fields: dict[str, Any] = {"conversation": conversation, "text": text,
                               "kind": "reply" if reply_to else "notify"}
     if reply_to:
         fields["reply_to"] = reply_to
+    if attachments:
+        fields["attachments"] = attachments
     return _message("message.out", **fields)
+
+
+def attachment(file: str, mime: str, name: str, size: int) -> dict[str, Any]:
+    """A file of the media folder, by its name there, for message_out."""
+    return {"file": file, "mime": mime, "name": name, "size": size}
+
+
+# A markdown image whose source is not a web address: a file the agent made,
+# by its path (`![Unicorn](cache/generated/images/x.png)`).
+LOCAL_IMAGE = re.compile(r"!\[([^\]]*)\]\((?!https?://)([^)\s]+)\)")
+
+
+def local_images(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """The text without its local markdown images, and each one's (alt, path)."""
+    found = [(m.group(1), m.group(2)) for m in LOCAL_IMAGE.finditer(text)]
+    rest = LOCAL_IMAGE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", rest).strip(), found
 
 
 def typing(conversation: str, on: bool) -> dict[str, Any]:
