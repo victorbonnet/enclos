@@ -177,8 +177,12 @@ pub fn serve(
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
-            if let Err(e) = connection(&hub, stream) {
-                eprintln!("enclos app: a connection ended: {e}");
+            match connection(&hub, stream) {
+                // The device hung up: the app closed or replaced its
+                // connection. `enclos app log` has who and when.
+                Err(e) if e == "closed" => eprintln!("enclos app: a device disconnected"),
+                Err(e) => eprintln!("enclos app: a connection ended: {e}"),
+                Ok(()) => {}
             }
         });
     }
