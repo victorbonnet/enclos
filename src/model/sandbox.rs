@@ -98,6 +98,17 @@ impl BackendKind {
             BackendKind::Bubblewrap | BackendKind::OpenShell | BackendKind::Libkrun => true,
         }
     }
+
+    /// Whether a session sees the host's files through one bind of `/`, as
+    /// under bubblewrap's `--ro-bind / /`: a protected file behind a link is
+    /// then there at its real path too, and is probed there. Seatbelt's
+    /// rules name the real path already.
+    pub fn binds_the_hosts_root(self) -> bool {
+        match self {
+            BackendKind::Bubblewrap => true,
+            BackendKind::Seatbelt | BackendKind::OpenShell | BackendKind::Libkrun => false,
+        }
+    }
 }
 
 /// A backend name enclos does not know.

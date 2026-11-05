@@ -364,3 +364,57 @@ fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
         "{err}"
     );
 }
+
+/// An engine whose data folder is reached through a link, with one sandbox
+/// on `kind`.
+fn behind_a_link_on(kind: BackendKind) -> (TempDir, Engine, SandboxName, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("e")).unwrap();
+    let layout = Layout::at(base.join("e"));
+    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let audit = JsonlAuditLog::new(layout.audit_log());
+    let backend = FakeBackend::available(kind);
+    let engine = Engine::new(
+        layout,
+        Box::new(state),
+        Box::new(audit),
+        vec![Box::new(backend)],
+    );
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "home".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: kind,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    (dir, engine, name, base.join("real"))
+}
+
+/// The backend kind decides, not the host's system: under one bind of `/`
+/// the real folder shows, so a bubblewrap sandbox's probes read it too.
+#[test]
+fn a_protected_file_behind_a_link_is_probed_at_its_real_path_for_bubblewrap_alone() {
+    for (kind, probed) in [
+        (BackendKind::Bubblewrap, true),
+        (BackendKind::Seatbelt, false),
+    ] {
+        let (_dir, engine, name, real) = behind_a_link_on(kind);
+        let ctx = engine.sandbox_context(&name, 41001);
+        let inputs = engine
+            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .unwrap();
+        let hidden = engine.layout.hidden_files();
+        assert_eq!(&inputs.hidden_files[..hidden.len()], hidden, "{kind:?}");
+        assert!(
+            inputs.hidden_files.contains(&real.join("state.db")) == probed,
+            "{kind:?}"
+        );
+        assert!(
+            inputs.hidden_files.contains(&real.join("run")) == probed,
+            "{kind:?}"
+        );
+    }
+}

@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::layout::{Layout, Os};
+use crate::layout::Layout;
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{is_within, real_path};
 
@@ -287,27 +287,25 @@ pub struct ReportNotes {
     pub comparison: Option<&'static str>,
 }
 
-/// What a backend adds to the probes every backend runs, and how it refuses.
-/// Each method places its probes in the list, so that a report reads route
-/// by route.
-/// `files`, and on Linux where a link takes one of them or `run`, its real
-/// path too: `--ro-bind / /` shows the real folder, while a read of the
-/// spelled path can fail for its mask alone. Seatbelt compiles the real path
-/// (`seatbelt/compile.rs`), so macOS keeps the list it has.
-pub fn with_real_paths(files: &[PathBuf], run: &Path, os: Os) -> Vec<PathBuf> {
+/// `files`, and where a link takes one of them or `run`, its real path too,
+/// for a backend whose sessions see the host's files through one bind of
+/// `/`: there the real folder shows, while a read of the spelled path can
+/// fail for its mask alone.
+pub fn with_real_paths(files: &[PathBuf], run: &Path) -> Vec<PathBuf> {
     let mut paths = files.to_vec();
-    if os == Os::Linux {
-        paths.extend(
-            files
-                .iter()
-                .map(PathBuf::as_path)
-                .chain([run])
-                .filter_map(|p| Some(real_path(p)).filter(|real| real != p)),
-        );
-    }
+    paths.extend(
+        files
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([run])
+            .filter_map(|p| Some(real_path(p)).filter(|real| real != p)),
+    );
     paths
 }
 
+/// What a backend adds to the probes every backend runs, and how it refuses.
+/// Each method places its probes in the list, so that a report reads route
+/// by route.
 pub trait OwnProbes {
     /// What its refusals look like.
     fn refusal(&self) -> Refusal;
@@ -923,14 +921,13 @@ mod tests {
         let files = vec![base.join("e/state.db")];
         let run = base.join("e/run");
         assert_eq!(
-            with_real_paths(&files, &run, Os::Linux),
+            with_real_paths(&files, &run),
             [
                 base.join("e/state.db"),
                 base.join("real/state.db"),
                 base.join("real/run")
             ]
         );
-        assert_eq!(with_real_paths(&files, &run, Os::MacOs), files);
     }
 
     #[test]
@@ -938,7 +935,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let files = vec![base.join("state.db")];
-        assert_eq!(with_real_paths(&files, &base.join("run"), Os::Linux), files);
+        assert_eq!(with_real_paths(&files, &base.join("run")), files);
     }
 
     /// A protected file gets a probe by being on the list, whichever it is:

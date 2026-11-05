@@ -16,7 +16,7 @@ use signal_hook::consts::SIGTERM;
 use super::Engine;
 use crate::backend::{Launch, SandboxContext};
 use crate::error::{Error, Result};
-use crate::layout::{LayoutError, Os};
+use crate::layout::LayoutError;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
@@ -303,15 +303,18 @@ impl Engine {
         }
         let mut writes = fs.writes.clone();
         writes.push(home.clone());
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let mut hidden_files = self.layout.hidden_files();
+        if record.backend.binds_the_hosts_root() {
+            hidden_files = with_real_paths(&hidden_files, &self.layout.run_dir());
+        }
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
-            hidden_files: with_real_paths(
-                &self.layout.hidden_files(),
-                &self.layout.data().join("run"),
-                Os::current(),
-            ),
+            hidden_files,
             sandbox_dir: self.layout.sandbox_dir(name.as_str()),
             writes,
             other_sandboxes: self
