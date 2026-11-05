@@ -11,8 +11,8 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
-    RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
+    AgentFacts, AppChannel, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead,
+    ProviderAt, RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
     RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
@@ -289,8 +289,8 @@ impl RuntimeAdapter for Hermes {
             settings: vec![
                 // Not secrets: where to listen, and that the bridge, which
                 // holds the agent's token, decides who talks to the agent.
-                ("ENCLOS_APP_SOCKET".to_owned(), socket.display().to_string()),
-                ("ENCLOS_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                ("MOBILE_APP_SOCKET".to_owned(), socket.display().to_string()),
+                ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
             ],
         })
     }
@@ -1066,10 +1066,10 @@ mod tests {
             app.settings,
             [
                 (
-                    "ENCLOS_APP_SOCKET".to_owned(),
+                    "MOBILE_APP_SOCKET".to_owned(),
                     "/h/.enclos-app/main.sock".to_owned()
                 ),
-                ("ENCLOS_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
             ]
         );
         let default = RuntimeAgentName::new("default").unwrap();
