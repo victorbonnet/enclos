@@ -1,12 +1,13 @@
 //! The bridge's service (ADR 0042, proposed; `docs/protocol.md`, The
-//! device leg): a WebSocket listener on the host's loopback, which
-//! `tailscale serve` puts on the tailnet. Each connection is a Noise
-//! session with a paired device, or one that is pairing; each agent's app
-//! channel is a plugin connection the bridge keeps open.
+//! device leg): a WebSocket listener on the host's loopback, which its
+//! transport puts on the person's network (`tailscale serve`, the only one
+//! for now). Each connection is a Noise session with a paired device, or
+//! one that is pairing; each agent's app channel is a plugin connection the
+//! bridge keeps open.
 //!
-//! Who calls is what `tailscale serve` says, in its `Tailscale-User-Login`
-//! header: the bridge listens on loopback only, where nothing else of the
-//! tailnet reaches it. A connection without that header is refused.
+//! Who calls is what the transport says, in its login header: the bridge
+//! listens on loopback only, where nothing else of the network reaches it.
+//! A connection without that header is refused.
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -27,9 +28,8 @@ use tungstenite::{Message, WebSocket};
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
 use super::store::{Device, From, PairingRequest, Store, now};
+use super::transport::Transport;
 
-/// The header `tailscale serve` adds with the caller's tailnet login.
-const LOGIN_HEADER: &str = "Tailscale-User-Login";
 /// How long a pairing waits for the terminal's answer.
 const PAIRING_WAIT: Duration = Duration::from_secs(120);
 
@@ -45,6 +45,7 @@ pub struct AgentEndpoint {
 
 /// What every connection shares.
 struct Hub {
+    transport: Transport,
     store_path: std::path::PathBuf,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
@@ -157,6 +158,7 @@ impl Hub {
 
 /// Serves on `127.0.0.1:port` until the process ends.
 pub fn serve(
+    transport: Transport,
     port: u16,
     store_path: std::path::PathBuf,
     bridge_private: Vec<u8>,
@@ -164,6 +166,7 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let hub = Arc::new(Hub {
+        transport,
         store_path,
         bridge_private,
         agents,
@@ -244,7 +247,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     let mut socket = tungstenite::accept_hdr(stream, |request: &Request, response: Response| {
         login = request
             .headers()
-            .get(LOGIN_HEADER)
+            .get(hub.transport.login_header())
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         Ok(response)
@@ -255,11 +258,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         why.to_owned()
     };
     let Some(person) = login else {
-        return Err(refuse(
-            None,
-            None,
-            "no Tailscale login: reach the bridge through `tailscale serve`",
-        ));
+        return Err(refuse(None, None, hub.transport.no_login()));
     };
     let mut responder = Responder::new(&hub.bridge_private).map_err(|e| e.to_string())?;
     let hello = binary(&mut socket)?;
