@@ -110,8 +110,8 @@ pub struct LandlockRules {
     pub scoped: Vec<String>,
 }
 
-/// The relay to the sandbox's proxy, in a session's own network namespace
-/// until M3-16, when the holder serves one for the sandbox (ADR 0039).
+/// The relay to the sandbox's proxy, in a session's own network namespace.
+/// Under ADR 0039 the namespace holder serves one for the whole sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relay {
     pub port: u16,

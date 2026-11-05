@@ -1,21 +1,19 @@
-//! What the backend rests on that is still proposed: each dependence on
-//! ADRs 0037 to 0040 that compiling has is here. Accepting ADR 0039 reaches
-//! further than [`NAMESPACES`]: see its note.
+//! What the backend rests on that is still proposed or open: the
+//! dependences compiling has on ADRs 0037 to 0039 and on design §15. Under
+//! ADR 0039 the relay changes too: see [`NAMESPACES`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Capabilities, Enforcement};
 use crate::model::policy::Policy;
 
-/// ADR 0039: every session its own namespaces for now, a service's included,
-/// until M3-16 has them join the holder's network namespace. That takes more
-/// than `--unshare-net` out of this list: the holder serves the one relay, so
-/// `relay` in the compiled file and M3-14's per-session relay change too. No
-/// user namespace is made inside (`--disable-userns`). `--as-pid-1`: without
-/// it bubblewrap's own reaper is PID 1, with no filter and no Landlock, and a
-/// member on a host with neither Landlock nor Yama could attach to it and run
-/// what the filter refuses. So what bubblewrap runs must confine itself, then
-/// stay as PID 1, fork the command and reap (M3-14).
+/// Every session its own namespaces, a service's included. Under ADR 0039
+/// a session joins the namespace holder's network namespace instead, and the
+/// holder serves the one relay, so `relay` in the compiled file changes too.
+/// No user namespace is made inside (`--disable-userns`). `--as-pid-1`:
+/// without it bubblewrap's own reaper is PID 1, with no filter and no
+/// Landlock, which a member on a host with neither Landlock nor Yama could
+/// attach to; so what bubblewrap runs confines itself, stays PID 1 and reaps.
 pub(super) const NAMESPACES: &[&str] = &[
     "--unshare-user",
     "--disable-userns",
@@ -39,23 +37,23 @@ pub struct Host {
 }
 
 /// What the backend is built to enforce on `host` (design §5's table): a
-/// declaration, which the escape probes have yet to show, so nothing reads
-/// as enforced before M3-17 passes. Landlock missing or too old weakens the
-/// file and program rows (ADR 0037): M3-14 applies what an older ABI has.
-/// `listen = false` is not held (ADR 0040). Limits are M3-18's, the memory
-/// controller included (ADR 0038).
+/// declaration the escape probes have yet to show, so nothing reads as
+/// enforced. Landlock missing or too old weakens the file and program rows
+/// (ADR 0037); an older ABI's rights still apply. `listen = false` is not
+/// held (design §15). No limit is set yet, a memory limit included (ADR
+/// 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
     let (fs, exec) = match host.landlock_abi {
         Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
-            "the mounts and Landlock, unproven until M3-17",
+            "the mounts and Landlock, not yet shown by the escape probes",
             "programs that are mounted, and Landlock's execute rules",
         ),
         Some(_) => (
-            "the mounts, and what this ABI has of Landlock, unproven until M3-17",
+            "the mounts, and what this ABI has of Landlock, not yet shown by the escape probes",
             "programs that are mounted; execute rules on an older ABI are open",
         ),
         None => (
-            "writes held by the mounts alone, with no second layer, unproven until M3-17",
+            "writes held by the mounts alone, with no second layer, not yet shown by the escape probes",
             "any program that is mounted: no Landlock execute rules",
         ),
     };
@@ -67,7 +65,7 @@ pub fn capabilities(host: &Host) -> Capabilities {
         network: partial("through the proxy; `listen = false` is not held"),
         exec: partial(exec),
         resources: Enforcement::Unsupported,
-        members: partial("a session's cgroup, unproven until M3-17"),
+        members: partial("a session's cgroup, not yet shown by the escape probes"),
     }
 }
 
@@ -84,7 +82,7 @@ pub struct Unenforced {
 /// `[exec]` section joins them once a policy can hold one (ADR 0037).
 pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
     let mut fields = Vec::new();
-    // ADR 0040: bind and listen stay open, and a network namespace of its
+    // Whether to refuse it is open (design §15): a network namespace of its
     // own limits who is reached, not whether the sandbox listens.
     if !policy.net.listen {
         fields.push(Unenforced {
@@ -126,11 +124,11 @@ mod tests {
         ] {
             let declared = capabilities(&Host { landlock_abi });
             assert!(
-                partial_note(&declared.fs).contains("M3-17"),
+                partial_note(&declared.fs).contains("not yet shown by the escape probes"),
                 "{landlock_abi:?}"
             );
             assert!(
-                partial_note(&declared.members).contains("M3-17"),
+                partial_note(&declared.members).contains("not yet shown by the escape probes"),
                 "{landlock_abi:?}"
             );
         }
@@ -148,7 +146,7 @@ mod tests {
         assert!(partial_note(&none.exec).contains("no Landlock"));
     }
 
-    /// M3-14 applies what an older ABI has, so "no second layer" would be
+    /// What an older ABI has still applies, so "no second layer" would be
     /// false there; whether that takes in execute rules is open (design §15).
     #[test]
     fn an_older_landlock_abi_is_not_declared_as_no_landlock() {
