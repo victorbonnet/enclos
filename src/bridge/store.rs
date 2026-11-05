@@ -40,6 +40,16 @@ pub struct Conversation {
     pub titled_by: Option<String>,
 }
 
+/// A file of a message; its bytes are in the bridge's media folder, under its id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    pub id: String,
+    pub conversation: String,
+    pub mime: String,
+    pub name: String,
+    pub size: i64,
+}
+
 /// A conversation named by its runtime.
 pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
@@ -47,6 +57,16 @@ pub const BY_PERSON: &str = "person";
 
 pub struct Store {
     db: Connection,
+}
+
+fn attachment_row(row: &rusqlite::Row) -> rusqlite::Result<StoredAttachment> {
+    Ok(StoredAttachment {
+        id: row.get(0)?,
+        conversation: row.get(1)?,
+        mime: row.get(2)?,
+        name: row.get(3)?,
+        size: row.get(4)?,
+    })
 }
 
 /// Brings a database made by an earlier bridge up to [`SCHEMA`]: columns
@@ -84,6 +104,14 @@ CREATE TABLE IF NOT EXISTS messages (
     text TEXT NOT NULL,
     kind TEXT NOT NULL,
     at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    message TEXT NOT NULL,
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    mime TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS devices (
     id TEXT PRIMARY KEY,
@@ -193,6 +221,35 @@ impl Store {
             )?,
         };
         Ok(changed == 1)
+    }
+
+    /// Records a file of message `message` (by the message's id).
+    pub fn add_attachment(&self, a: &StoredAttachment, message: &str) -> rusqlite::Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO attachments (id, message, conversation, mime, name, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![a.id, message, a.conversation, a.mime, a.name, a.size],
+        )?;
+        Ok(())
+    }
+
+    /// The files of a message, by the message's id, in the order they came.
+    pub fn attachments_of(&self, message: &str) -> rusqlite::Result<Vec<StoredAttachment>> {
+        let mut query = self.db.prepare(
+            "SELECT id, conversation, mime, name, size FROM attachments WHERE message = ?1 ORDER BY rowid",
+        )?;
+        let rows = query.query_map(params![message], attachment_row)?;
+        rows.collect()
+    }
+
+    /// A file, by its id.
+    pub fn attachment(&self, id: &str) -> rusqlite::Result<Option<StoredAttachment>> {
+        self.db
+            .query_row(
+                "SELECT id, conversation, mime, name, size FROM attachments WHERE id = ?1",
+                params![id],
+                attachment_row,
+            )
+            .optional()
     }
 
     /// A known conversation, with its name.

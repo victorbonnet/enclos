@@ -217,6 +217,7 @@ mod tests {
                             text: format!("echo: {text}"),
                             kind: OutKind::Reply,
                             reply_to: Some(message.id),
+                            attachments: Vec::new(),
                         },
                     );
                 }
@@ -248,6 +249,7 @@ mod tests {
             text,
             kind,
             reply_to,
+            ..
         } = reply.body
         else {
             panic!("not a reply: {:?}", reply.body);
