@@ -136,6 +136,21 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     Ok(exit::OK)
 }
 
+/// The QR code drawn black on bright white when it goes to a terminal: a
+/// dark theme would otherwise draw its modules light on dark, which most
+/// scanners do not read.
+fn terminal_qr(drawn: &str) -> String {
+    use std::io::IsTerminal as _;
+    if !std::io::stdout().is_terminal() {
+        return drawn.to_owned();
+    }
+    drawn
+        .lines()
+        .map(|line| format!("\x1b[30;107m{line}\x1b[0m"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8> {
     let url = url.or_else(|| transport.address()).ok_or_else(|| {
         failed(format!(
@@ -168,7 +183,10 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
     .map_err(|e| failed(e.to_string()))?;
     let qr = QrCode::new(link.as_bytes())
         .map_err(|e| failed(format!("cannot draw the QR code: {e}")))?;
-    println!("{}", qr.render::<Dense1x2>().quiet_zone(true).build());
+    println!(
+        "{}",
+        terminal_qr(&qr.render::<Dense1x2>().quiet_zone(true).build())
+    );
     println!("Scan it with the enclos app, or enter this link: {link}");
     println!("It works once, for 5 minutes, while `enclos app serve` runs.");
     let request = loop {
