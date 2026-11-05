@@ -5,7 +5,10 @@
 use std::io::BufRead;
 
 use clap::{Args, Subcommand};
+use jiff::Timestamp;
+use serde_json::{Value, json};
 
+use super::output;
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
 use enclos::bridge::keys::bridge_keypair;
@@ -243,9 +246,30 @@ fn when(seconds: Option<i64>) -> String {
     }
 }
 
+/// A time of the bridge's database, seconds since the Unix epoch, as the
+/// other documents give one.
+fn instant(seconds: i64) -> Value {
+    match Timestamp::from_second(seconds) {
+        Ok(at) => json!(at.to_string()),
+        Err(_) => json!(seconds),
+    }
+}
+
 fn devices(engine: &Engine) -> Result<u8> {
     let store = open_store(engine)?;
     let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+    if output::json() {
+        output::emit(&json!({
+            "devices": devices.iter().map(|d| json!({
+                "device": d.id,
+                "name": d.name,
+                "person": d.person,
+                "paired_at": instant(d.paired),
+                "seen_at": d.seen.map(instant),
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(exit::OK);
+    }
     if devices.is_empty() {
         println!("No paired device: pair one with `enclos app pair`.");
     }
@@ -270,7 +294,10 @@ fn unpair(engine: &Engine, device: &str) -> Result<u8> {
     {
         true => {
             let _ = store.log(Some(device), None, "unpaired", None);
-            println!("Device {device} removed: it can no longer connect.");
+            match output::json() {
+                true => output::emit(&json!({"device": device, "removed": true})),
+                false => println!("Device {device} removed: it can no longer connect."),
+            }
             Ok(exit::OK)
         }
         false => Err(failed(format!(
@@ -281,7 +308,20 @@ fn unpair(engine: &Engine, device: &str) -> Result<u8> {
 
 fn log(engine: &Engine, lines: i64) -> Result<u8> {
     let store = open_store(engine)?;
-    for line in store.log_lines(lines).map_err(|e| failed(e.to_string()))? {
+    let lines = store.log_lines(lines).map_err(|e| failed(e.to_string()))?;
+    if output::json() {
+        output::emit(&json!({
+            "log": lines.iter().map(|l| json!({
+                "at": instant(l.at),
+                "event": l.event,
+                "device": l.device,
+                "person": l.person,
+                "reason": l.reason,
+            })).collect::<Vec<_>>(),
+        }));
+        return Ok(exit::OK);
+    }
+    for line in lines {
         println!(
             "{}  {}  {}  {}{}",
             when(Some(line.at)),
