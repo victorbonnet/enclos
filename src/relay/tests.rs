@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{connections_for, pass_on, say_lost, serve_up_to};
+use super::{OWN_DESCRIPTORS, connections_for, pass_on, say_lost, serve_up_to};
 use crate::proxy::IDLE_TIMEOUT;
 
 /// Far beyond the sockets' buffers.
@@ -410,6 +410,8 @@ fn a_connection_that_never_comes_fails_the_test_rather_than_hanging_it() {
 
 #[test]
 fn the_connection_limit_follows_the_descriptors_and_is_never_none() {
+    let connections_for =
+        |descriptors| connections_for(crate::net::budget::left_after(descriptors, OWN_DESCRIPTORS));
     assert_eq!(connections_for(Some(256)), 124);
     assert_eq!(connections_for(None), connections_for(Some(1 << 20)));
     assert_eq!(connections_for(None), 508);

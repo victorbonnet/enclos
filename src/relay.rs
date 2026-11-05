@@ -24,15 +24,11 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use crate::proxy::Slot;
+use crate::net::budget::{self, Slot};
 
 /// The descriptors a relay keeps for itself: the standard streams, its
 /// listener, what the session's launcher left open.
 const OWN_DESCRIPTORS: u64 = 8;
-
-/// The most descriptors a relay plans for, as the proxy does: its
-/// connections also hold threads, which nothing else bounds.
-const MOST_DESCRIPTORS: u64 = 1024;
 
 /// How long to wait before accepting again after accepting failed, such as
 /// when the process is out of file descriptors.
@@ -44,13 +40,9 @@ fn say(what: std::fmt::Arguments) {
     let _ = writeln!(io::stderr(), "enclos relay: {what}");
 }
 
-/// The most connections a relay carries at once in a process limited to
-/// `descriptors` (none: no limit). Each holds two; never none.
-fn connections_for(descriptors: Option<u64>) -> usize {
-    let left = descriptors
-        .unwrap_or(MOST_DESCRIPTORS)
-        .min(MOST_DESCRIPTORS)
-        .saturating_sub(OWN_DESCRIPTORS);
+/// The most connections a relay carries at once with `left` descriptors to
+/// share. Each holds two; never none.
+fn connections_for(left: u64) -> usize {
     ((left / 2) as usize).max(1)
 }
 
@@ -58,12 +50,10 @@ fn connections_for(descriptors: Option<u64>) -> usize {
 /// until the process ends. A socket nobody answers on closes the connection
 /// and is tried again for the next, so the proxy can restart under a relay.
 pub fn serve(listener: TcpListener, socket: &Path) -> ! {
-    // The soft limit is the one a descriptor hits: the session's.
-    let descriptors = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
     serve_up_to(
         listener,
         socket,
-        connections_for(descriptors),
+        connections_for(budget::descriptors_to_share(OWN_DESCRIPTORS)),
         crate::proxy::IDLE_TIMEOUT,
     )
 }

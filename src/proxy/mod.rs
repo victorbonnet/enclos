@@ -26,29 +26,21 @@ use std::time::Duration;
 use crate::model::policy::Policy;
 use crate::model::sandbox::SandboxName;
 use crate::net::addr::{AddrClass, classify};
+use crate::net::budget;
 use crate::state::{NetLogStore, StateStore};
 
-pub(crate) use server::Slot;
 pub use stream::Listener;
 
 /// The descriptors a proxy keeps for itself: the standard streams, its
 /// listeners, the state database.
 const OWN_DESCRIPTORS: u64 = 24;
 
-/// The most descriptors a proxy plans for, however many it was given: its
-/// connections and lookups also hold threads, which nothing else bounds.
-const MOST_DESCRIPTORS: u64 = 1024;
-
-/// The connections and lookups a proxy runs at once under a soft limit of
-/// `descriptors` (None: unlimited), each at least 1. A connection takes two
-/// descriptors, a lookup up to one; they share what is left after
-/// [`OWN_DESCRIPTORS`] at the rate of 100 to 32, which fills launchd's 256.
-fn limits_for(descriptors: Option<u64>) -> (usize, usize) {
+/// The connections and lookups a proxy runs at once with `left` descriptors
+/// to share, each at least 1. A connection takes two descriptors, a lookup
+/// up to one; they share `left` at the rate of 100 to 32, which fills
+/// launchd's 256 once [`OWN_DESCRIPTORS`] are kept.
+fn limits_for(left: u64) -> (usize, usize) {
     const SHARE: u64 = 2 * 100 + 32;
-    let left = descriptors
-        .unwrap_or(MOST_DESCRIPTORS)
-        .min(MOST_DESCRIPTORS)
-        .saturating_sub(OWN_DESCRIPTORS);
     let share = |rate: u64| ((left * rate / SHARE) as usize).max(1);
     (share(100), share(32))
 }
@@ -126,11 +118,10 @@ impl Proxy {
         policy: Box<dyn PolicySource>,
         log: Box<dyn NetLogStore + Send + Sync>,
     ) -> Proxy {
-        // The soft limit is the one a descriptor hits: what the service
-        // manager gave, or the shell of the `connect` that started the
-        // proxy, as the proxy never raises it.
-        let descriptors = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
-        let (max_connections, max_lookups) = limits_for(descriptors);
+        // The soft limit: what the service manager gave, or the shell of the
+        // `connect` that started the proxy, as the proxy never raises it.
+        let (max_connections, max_lookups) =
+            limits_for(budget::descriptors_to_share(OWN_DESCRIPTORS));
         Proxy {
             sandbox,
             policy,

@@ -324,6 +324,8 @@ const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 #[test]
 fn the_limits_are_sized_from_the_descriptors_the_proxy_was_given() {
+    let limits_for =
+        |descriptors| limits_for(crate::net::budget::left_after(descriptors, OWN_DESCRIPTORS));
     // launchd's limit gives 100 and 32.
     assert_eq!(limits_for(Some(256)), (100, 32));
     // systemd's usual soft limit.

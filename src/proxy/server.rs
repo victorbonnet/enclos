@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use super::stream::{Listener, Stream};
 use super::tunnel::{NameCheck, relay};
 use crate::model::net::{NetEvent, Reason, Verdict, destination};
 use crate::model::now;
+use crate::net::budget::Slot;
 
 /// How long a client has to send its whole request head.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -366,26 +367,6 @@ enum LookupFailed {
     TimedOut,
     /// Its thread ended without an answer.
     Lost,
-}
-
-/// A place among the connections, or the lookups, the proxy runs at once;
-/// it frees when dropped, as the connection or lookup ends.
-pub(crate) struct Slot(Arc<AtomicUsize>);
-
-impl Slot {
-    pub(crate) fn take(open: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
-        open.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n < max).then_some(n + 1)
-        })
-        .ok()?;
-        Some(Slot(Arc::clone(open)))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 /// Reads from a client until a deadline, however slowly it sends.
