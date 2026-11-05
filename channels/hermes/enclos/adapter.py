@@ -13,7 +13,10 @@ this channel's own variable, which `enclos runtime configure` turns on.
 
 import asyncio
 import logging
+import mimetypes
 import os
+import shutil
+import uuid
 from datetime import UTC, datetime
 from typing import Any, Optional
 
@@ -63,6 +66,9 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the title last sent to the bridge, and the pending look.
         self._titles: dict[str, str] = {}
         self._title_checks: dict[str, asyncio.Task] = {}
+        # By conversation: the person's last message, and when it came, so a
+        # file Hermes delivers after a reply (with no reply_to) answers it too.
+        self._last_in: dict[str, tuple[str, float]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -157,6 +163,7 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
+        self._last_in[message["conversation"]] = (message["id"], asyncio.get_running_loop().time())
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
@@ -165,10 +172,100 @@ class EnclosAdapter(BasePlatformAdapter):
             raw_message=message, timestamp=datetime.now(tz=UTC)))
         await self._write(protocol.ack(message["id"]))
 
+    # Files the agent sends. Hermes finds them in a reply (MEDIA:/path tags,
+    # bare absolute paths) and calls the method for their kind; each is copied
+    # at once into the channel's media folder, beside the socket, where the
+    # bridge takes it (Hermes sweeps some of its caches after a day, and the
+    # message may wait in the outbox longer).
+
+    MAX_FILE_BYTES = 25 * 1024 * 1024
+    # How long after the person's message a file without reply_to still answers it.
+    FILES_ANSWER_SECONDS = 600
+
+    def _stage(self, path: str, name: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """A copy of the file in the media folder, as an attachment; None if it cannot be sent."""
+        try:
+            size = os.path.getsize(path)
+            if not os.path.isfile(path) or size > self.MAX_FILE_BYTES:
+                logger.info("[%s] Not sent: %s is not a file of at most 25 MiB", self.name, path)
+                return None
+            media = os.path.join(os.path.dirname(self._path), "media")
+            os.makedirs(media, mode=0o700, exist_ok=True)
+            extension = os.path.splitext(path)[1].lower()[:10]
+            file = f"{uuid.uuid4()}{extension}"
+            # A new file of the folder, never through a link left there.
+            fd = os.open(os.path.join(media, file), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with open(path, "rb") as source, os.fdopen(fd, "wb") as target:
+                shutil.copyfileobj(source, target)
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            return protocol.attachment(file, mime, name or os.path.basename(path), size)
+        except OSError as e:
+            logger.info("[%s] Not sent: %s: %s", self.name, path, e)
+            return None
+
+    async def _send_files(self, chat_id: str, paths: list[tuple[str, Optional[str]]], text: str,
+                          reply_to: Optional[str]) -> SendResult:
+        files = [a for a in (self._stage(p, n) for p, n in paths) if a]
+        if not files and not text:
+            return SendResult(success=False, error="the file could not be sent")
+        # Hermes delivers a reply's files apart from its text, without saying
+        # what they answer: within minutes of the person's message, they answer
+        # it; otherwise (a cron job's) they come on their own.
+        if reply_to is None and chat_id in self._last_in:
+            last, at = self._last_in[chat_id]
+            if asyncio.get_running_loop().time() - at < self.FILES_ANSWER_SECONDS:
+                reply_to = last
+        message = protocol.message_out(chat_id, text, reply_to, files)
+        if not self._outbox.put(message):
+            return SendResult(success=False, error="too many messages waiting for the bridge")
+        await self._write(message)
+        self._check_title_soon(chat_id)
+        return SendResult(success=True, message_id=message["id"])
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                              **kwargs) -> SendResult:
+        return await self._send_files(chat_id, [(image_path, None)], caption or "", reply_to)
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_files(chat_id, [(file_path, file_name)], caption or "", reply_to)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        return await self._send_files(chat_id, [(video_path, None)], caption or "", reply_to)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+                         **kwargs) -> SendResult:
+        return await self._send_files(chat_id, [(audio_path, None)], caption or "", reply_to)
+
+    def _local_image(self, path: str) -> Optional[str]:
+        """A markdown image's file, when it is one Hermes may send: by its path,
+        absolute or relative to the agent's Hermes home (where its tools save)."""
+        try:
+            from hermes_constants import get_hermes_home
+            home = str(get_hermes_home())
+        except Exception:
+            home = os.environ.get("HERMES_HOME", "")
+        candidate = path if os.path.isabs(path) else os.path.join(home, path) if home else ""
+        if not candidate or os.path.splitext(candidate)[1].lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+            return None
+        safe = self.validate_media_delivery_path(candidate)
+        return str(safe) if safe and os.path.isfile(str(safe)) else None
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
+        # A local markdown image (`![x](cache/generated/images/y.png)`), which
+        # Hermes does not take for a file: sent as one, out of the text.
+        rest, images = protocol.local_images(content)
+        files = [(found, None) for found in (self._local_image(p) for _, p in images) if found]
+        if files:
+            return await self._send_files(chat_id, files, rest, reply_to)
         message = protocol.message_out(chat_id, content, reply_to)
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
