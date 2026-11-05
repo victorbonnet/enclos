@@ -492,6 +492,27 @@ fn the_agents_socket_is_masked_wherever_the_host_puts_it() {
     assert!(host.elsewhere.is_empty(), "{host:?}");
 }
 
+/// The agent's socket is placed as the place a linked deny entry leads to
+/// is: in a grant, the folders that hold it cannot be moved; under the
+/// sandbox's own `/dev`, nothing is masked, as a mask there would not last;
+/// the home itself cannot be hidden, so the session is refused.
+#[test]
+fn the_agents_socket_is_placed_as_where_a_deny_entry_leads() {
+    let home = Home::new();
+    let c = compiled(&home, Lists::default());
+    let in_sandbox_home = home.file(".enclos/sandboxes/lab/home/.agent/agent.sock");
+
+    let host = read(&home, &c, Some(&in_sandbox_home)).unwrap();
+    assert_eq!(host.in_grants, [(in_sandbox_home.clone(), Kind::Other)]);
+    assert_eq!(host.unmovable, [home.sandbox_home().join(".agent")]);
+
+    let host = read(&home, &c, Some(Path::new("/dev/enclos-test/agent.sock"))).unwrap();
+    assert!(host.elsewhere.is_empty(), "{host:?}");
+
+    let why = read(&home, &c, Some(&home.user())).unwrap_err().to_string();
+    assert!(why.contains("SSH_AUTH_SOCK"), "{why}");
+}
+
 #[test]
 fn a_folder_that_cannot_be_listed_refuses_the_session() {
     let home = Home::new();

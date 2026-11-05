@@ -129,69 +129,191 @@ fn holders(grant: &Path, entry: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// What this launch's masks depend on. `ssh_auth_sock` is the socket the
-/// host's `SSH_AUTH_SOCK` names, masked wherever it is.
-pub(super) fn read_host(
-    compiled: &CompiledSandbox,
-    sandbox_home: &Path,
-    ssh_auth_sock: Option<&Path>,
-) -> Result<Host, WrapError> {
+/// The places a mask can go, as this launch finds them: the home and the
+/// sandbox home as written and as they really are, and each workspace.
+struct Grants<'a> {
+    home: PathBuf,
+    real_home: PathBuf,
+    sandbox_home: &'a Path,
+    real_sandbox_home: PathBuf,
+    /// Every workspace, as written.
+    workspaces: Vec<PathBuf>,
+    /// Each workspace that is there, as written and where it really is: one
+    /// reached through a link the user made is bound where it leads.
+    present: Vec<(PathBuf, PathBuf)>,
+}
+
+impl<'a> Grants<'a> {
+    fn read(compiled: &CompiledSandbox, sandbox_home: &'a Path) -> Grants<'a> {
+        let home = PathBuf::from(&compiled.bubblewrap.root_masks.home);
+        let workspaces: Vec<PathBuf> = paths(&compiled.bubblewrap.grant_masks.workspaces).collect();
+        let present = workspaces
+            .iter()
+            .filter(|w| w.is_dir())
+            .map(|w| (w.clone(), real_path(w)))
+            .collect();
+        Grants {
+            real_home: real_path(&home),
+            home,
+            sandbox_home,
+            real_sandbox_home: real_path(sandbox_home),
+            workspaces,
+            present,
+        }
+    }
+}
+
+/// Where a mask for a path, as it really is, goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Place {
+    /// At the home or above it, which no mask can hide.
+    HoldsTheHome,
+    /// Inside `grant`, at `at`, after the grant's bind.
+    InGrant { grant: PathBuf, at: PathBuf },
+    /// Under the home, left out of the home's mask.
+    InHome(PathBuf),
+    /// Under a place the sandbox has its own of, never the host's.
+    SandboxOwn,
+    /// Anywhere else, masked after the `/` bind.
+    Elsewhere(PathBuf),
+}
+
+/// Where the mask for `real` goes. A grant comes before the home that may
+/// hold it, and each is named as the sandbox reaches it.
+fn place(real: &Path, grants: &Grants<'_>) -> Place {
+    let under =
+        |root: &Path, written: &Path| real.strip_prefix(root).ok().map(|rest| written.join(rest));
+    if is_within(&grants.real_home, real) {
+        return Place::HoldsTheHome;
+    }
+    for (written, real_workspace) in &grants.present {
+        if let Some(at) = under(real_workspace, written) {
+            return Place::InGrant {
+                grant: written.clone(),
+                at,
+            };
+        }
+    }
+    if let Some(at) = under(&grants.real_sandbox_home, grants.sandbox_home) {
+        return Place::InGrant {
+            grant: grants.sandbox_home.to_path_buf(),
+            at,
+        };
+    }
+    if let Some(at) = under(&grants.real_home, &grants.home) {
+        return Place::InHome(at);
+    }
+    match sandbox_own(real) {
+        true => Place::SandboxOwn,
+        false => Place::Elsewhere(real.to_path_buf()),
+    }
+}
+
+/// Whether `path` lies under a place the sandbox has its own of.
+fn sandbox_own(path: &Path) -> bool {
+    OWN_TMPFS
+        .iter()
+        .chain(OWN_MOUNTS)
+        .any(|own| is_within(path, Path::new(own)))
+}
+
+/// The masks of one launch, before the host says what each path is.
+#[derive(Default)]
+struct Masks {
+    in_grants: Vec<PathBuf>,
+    hidden: BTreeSet<PathBuf>,
+    elsewhere: Vec<PathBuf>,
+}
+
+impl Masks {
+    /// Adds the mask `place` names, or refuses it as `refused` says.
+    fn put(&mut self, place: Place, refused: impl FnOnce() -> WrapError) -> Result<(), WrapError> {
+        match place {
+            Place::HoldsTheHome => return Err(refused()),
+            Place::InGrant { grant, at } => {
+                no_link_between(&grant, &at)?;
+                self.in_grants.push(at);
+            }
+            Place::InHome(at) => {
+                self.hidden.insert(at);
+            }
+            Place::SandboxOwn => {}
+            Place::Elsewhere(at) => self.elsewhere.push(at),
+        }
+        Ok(())
+    }
+}
+
+/// Every deny entry the compiled file lists, as written and where it really
+/// is now.
+fn resolved_entries(compiled: &CompiledSandbox) -> Vec<(PathBuf, PathBuf)> {
     let root_masks = &compiled.bubblewrap.root_masks;
     let grant_masks = &compiled.bubblewrap.grant_masks;
-    let home = PathBuf::from(&root_masks.home);
-    let workspaces: Vec<PathBuf> = paths(&grant_masks.workspaces).collect();
-    // Each workspace as written, and where it really is now: one reached
-    // through a link the user made is bound where it leads.
-    let present: Vec<(PathBuf, PathBuf)> = workspaces
-        .iter()
-        .filter(|w| w.is_dir())
-        .map(|w| (w.clone(), real_path(w)))
-        .collect();
-    let every_entry: Vec<PathBuf> = paths(&root_masks.denied)
+    paths(&root_masks.denied)
         .chain(paths(&root_masks.denied_elsewhere))
         .chain(paths(&grant_masks.in_workspace))
         .chain(paths(&grant_masks.in_sandbox_home))
-        .collect();
-    let mut host = Host::default();
+        .map(|entry| {
+            let real = real_path(&entry);
+            (entry, real)
+        })
+        .collect()
+}
 
-    for entry in &every_entry {
-        let real = real_path(entry);
-        for (written, real_workspace) in &present {
-            if is_within(real_workspace, &real) {
-                return Err(WrapError(format!(
-                    "workspace {} is at or inside {}, which the deny list hides, through a link: write the folder it means, outside the deny list",
-                    written.display(),
-                    entry.display()
-                )));
-            }
+/// Refuses a workspace whose real path is a deny entry's or lies inside one.
+fn refuse_workspace_reaching_an_entry(
+    entries: &[(PathBuf, PathBuf)],
+    grants: &Grants<'_>,
+) -> Result<(), WrapError> {
+    for (entry, real) in entries {
+        if let Some((written, _)) = grants.present.iter().find(|(_, w)| is_within(w, real)) {
+            return Err(WrapError(format!(
+                "workspace {} is at or inside {}, which the deny list hides, through a link: write the folder it means, outside the deny list",
+                written.display(),
+                entry.display()
+            )));
         }
     }
+    Ok(())
+}
 
-    // Inside a grant: the sandbox home, then each workspace that is there,
-    // its entries as written first.
-    let mut in_grants: Vec<PathBuf> = Vec::new();
+/// The entries compile placed inside a grant, as written: the sandbox
+/// home's, then each of a workspace that is there. A workspace that is
+/// missing gets no mask: bubblewrap binds none.
+fn in_grants_as_written(
+    compiled: &CompiledSandbox,
+    grants: &Grants<'_>,
+    masks: &mut Masks,
+) -> Result<(), WrapError> {
+    let grant_masks = &compiled.bubblewrap.grant_masks;
     for entry in paths(&grant_masks.in_sandbox_home) {
-        no_link_between(sandbox_home, &entry)?;
-        in_grants.push(entry);
+        no_link_between(grants.sandbox_home, &entry)?;
+        masks.in_grants.push(entry);
     }
     for entry in paths(&grant_masks.in_workspace) {
-        let Some(workspace) = workspaces.iter().find(|w| is_within(&entry, w)) else {
+        let Some(workspace) = grants.workspaces.iter().find(|w| is_within(&entry, w)) else {
             continue;
         };
-        // No mask for a workspace that is missing: bubblewrap binds none.
-        if !present.iter().any(|(w, _)| w == workspace) {
+        if !grants.present.iter().any(|(w, _)| w == workspace) {
             continue;
         }
         no_link_between(workspace, &entry)?;
-        in_grants.push(entry);
+        masks.in_grants.push(entry);
     }
-    // An entry whose real path a workspace holds, through a link the user
-    // made, is masked at the workspace's own name for it (`~/cargo` ->
-    // `~/.cargo`).
-    for entry in &every_entry {
-        let real = real_path(entry);
-        for (written, real_workspace) in &present {
-            if is_within(entry, written) || !is_within(&real, real_workspace) {
+    Ok(())
+}
+
+/// An entry whose real path a workspace holds, through a link the user
+/// made, is masked at the workspace's own name for it (`~/cargo` ->
+/// `~/.cargo`).
+fn at_a_workspaces_name(
+    entries: &[(PathBuf, PathBuf)],
+    grants: &Grants<'_>,
+    masks: &mut Masks,
+) -> Result<(), WrapError> {
+    for (entry, real) in entries {
+        for (written, real_workspace) in &grants.present {
+            if is_within(entry, written) {
                 continue;
             }
             let Ok(rest) = real.strip_prefix(real_workspace) else {
@@ -199,54 +321,61 @@ pub(super) fn read_host(
             };
             let at = written.join(rest);
             no_link_between(written, &at)?;
-            in_grants.push(at);
+            masks.in_grants.push(at);
         }
     }
-    // Where an entry leads through a link is masked too, wherever it is, as
-    // Seatbelt denies the resolved path (design §15): hiding the name alone
-    // leaves what it leads to in the broad read (`~/.ssh -> dotfiles/ssh`).
-    let real_home = real_path(&home);
-    let real_sandbox_home = real_path(sandbox_home);
-    let mut resolved_hidden = Vec::new();
-    let mut resolved_elsewhere = Vec::new();
-    for entry in &every_entry {
-        let real = real_path(entry);
-        // One a workspace holds is masked above, at its name for it.
-        if real == *entry || present.iter().any(|(_, w)| is_within(&real, w)) {
+    Ok(())
+}
+
+/// Where an entry leads through a link is masked too, wherever it is, as
+/// Seatbelt denies the resolved path (design §15): hiding the name alone
+/// leaves what it leads to in the broad read (`~/.ssh -> dotfiles/ssh`).
+/// One a workspace holds was masked at the workspace's name for it.
+fn where_links_lead(
+    entries: &[(PathBuf, PathBuf)],
+    grants: &Grants<'_>,
+    masks: &mut Masks,
+) -> Result<(), WrapError> {
+    for (entry, real) in entries {
+        if real == entry || grants.present.iter().any(|(_, w)| is_within(real, w)) {
             continue;
         }
-        if is_within(&real_home, &real) {
-            return Err(WrapError(format!(
+        masks.put(place(real, grants), || {
+            WrapError(format!(
                 "deny entry {} leads to {}, which is the home {} or holds it, so it cannot be hidden: point the link elsewhere or take the entry off the deny list",
                 entry.display(),
                 real.display(),
-                home.display()
-            )));
-        } else if let Ok(rest) = real.strip_prefix(&real_sandbox_home) {
-            let at = sandbox_home.join(rest);
-            no_link_between(sandbox_home, &at)?;
-            in_grants.push(at);
-        } else if let Ok(rest) = real.strip_prefix(&real_home) {
-            resolved_hidden.push(home.join(rest));
-        } else if OWN_TMPFS
-            .iter()
-            .chain(OWN_MOUNTS)
-            .any(|own| is_within(&real, Path::new(own)))
-        {
-            // The sandbox has its own there, never the host's.
-        } else {
-            resolved_elsewhere.push(real);
-        }
+                grants.home.display()
+            ))
+        })?;
     }
-    in_grants.sort();
-    in_grants.dedup();
+    Ok(())
+}
 
-    let mut unmovable: Vec<PathBuf> = paths(&grant_masks.unmovable)
-        .filter(|f| f.is_dir())
-        .collect();
-    for at in &in_grants {
-        let grant = std::iter::once(sandbox_home)
-            .chain(workspaces.iter().map(PathBuf::as_path))
+/// The socket the host's `SSH_AUTH_SOCK` names, masked wherever it really
+/// is. One named under the sandbox's own places is hidden there already,
+/// whatever link leads elsewhere on the host (`/tmp` on macOS).
+fn agents_socket(socket: &Path, grants: &Grants<'_>, masks: &mut Masks) -> Result<(), WrapError> {
+    let place = match place(&real_path(socket), grants) {
+        Place::Elsewhere(_) if sandbox_own(socket) => Place::SandboxOwn,
+        place => place,
+    };
+    masks.put(place, || {
+        WrapError(format!(
+            "SSH_AUTH_SOCK names {}, which is the home {} or holds it, so it cannot be hidden: unset it, or name the agent's socket",
+            socket.display(),
+            grants.home.display()
+        ))
+    })
+}
+
+/// The folders bound on themselves so the sandbox cannot move them: those
+/// compile listed that are there, and each between a grant and a mask in it.
+fn unmovable(listed: &[String], in_grants: &[PathBuf], grants: &Grants<'_>) -> Vec<PathBuf> {
+    let mut unmovable: Vec<PathBuf> = paths(listed).filter(|f| f.is_dir()).collect();
+    for at in in_grants {
+        let grant = std::iter::once(grants.sandbox_home)
+            .chain(grants.workspaces.iter().map(PathBuf::as_path))
             .find(|g| is_within(at, g) && at != g);
         if let Some(grant) = grant {
             unmovable.extend(holders(grant, at));
@@ -254,44 +383,64 @@ pub(super) fn read_host(
     }
     unmovable.sort();
     unmovable.dedup();
-    for at in in_grants {
-        let kind = Kind::of(&at)?;
-        host.in_grants.push((at, kind));
-    }
-    host.unmovable = unmovable;
+    unmovable
+}
 
-    let mut hidden: BTreeSet<PathBuf> = paths(&root_masks.denied).chain(resolved_hidden).collect();
+/// Each path with what the host holds there now.
+fn with_kinds(mut found: Vec<PathBuf>) -> Result<Vec<(PathBuf, Kind)>, WrapError> {
+    found.sort();
+    found.dedup();
+    found
+        .into_iter()
+        .map(|path| Kind::of(&path).map(|kind| (path, kind)))
+        .collect()
+}
+
+/// What this launch's masks depend on, in the order design §5 gives:
+/// workspaces that reach a deny entry refused, the masks inside the grants,
+/// where links lead, the agent's socket, the folders that cannot move, then
+/// the home's folders listed. `ssh_auth_sock` is the socket the host's
+/// `SSH_AUTH_SOCK` names.
+pub(super) fn read_host(
+    compiled: &CompiledSandbox,
+    sandbox_home: &Path,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<Host, WrapError> {
+    let root_masks = &compiled.bubblewrap.root_masks;
+    let grants = Grants::read(compiled, sandbox_home);
+    let entries = resolved_entries(compiled);
+    refuse_workspace_reaching_an_entry(&entries, &grants)?;
+
     // An entry outside the home that is itself a link is masked where it
     // leads alone: bubblewrap's mount would follow it there anyway, and the
     // sandbox cannot change it.
-    let mut elsewhere: Vec<PathBuf> = paths(&root_masks.denied_elsewhere)
-        .filter(|e| !std::fs::symlink_metadata(e).is_ok_and(|m| m.file_type().is_symlink()))
-        .chain(resolved_elsewhere)
-        .collect();
+    let mut masks = Masks {
+        in_grants: Vec::new(),
+        hidden: paths(&root_masks.denied).collect(),
+        elsewhere: paths(&root_masks.denied_elsewhere)
+            .filter(|e| !std::fs::symlink_metadata(e).is_ok_and(|m| m.file_type().is_symlink()))
+            .collect(),
+    };
+    in_grants_as_written(compiled, &grants, &mut masks)?;
+    at_a_workspaces_name(&entries, &grants, &mut masks)?;
+    where_links_lead(&entries, &grants, &mut masks)?;
     if let Some(socket) = ssh_auth_sock.filter(|s| s.is_absolute()) {
-        let socket = socket.to_path_buf();
-        let own = OWN_TMPFS.iter().any(|t| is_within(&socket, Path::new(t)));
-        let in_grant =
-            is_within(&socket, sandbox_home) || workspaces.iter().any(|w| is_within(&socket, w));
-        if in_grant {
-            let kind = Kind::of(&socket)?;
-            host.in_grants.push((socket, kind));
-        } else if is_within(&socket, &home) && socket != home {
-            hidden.insert(socket);
-        } else if !own {
-            elsewhere.push(socket);
-        }
-    }
-    elsewhere.sort();
-    elsewhere.dedup();
-    for path in elsewhere {
-        let kind = Kind::of(&path)?;
-        host.elsewhere.push((path, kind));
+        agents_socket(socket, &grants, &mut masks)?;
     }
 
-    let roots: Vec<PathBuf> = present.iter().map(|(_, real)| real.clone()).collect();
-    walk(&home, &hidden, &roots, &mut host.entries)?;
-    host.hidden = hidden;
+    let mut host = Host {
+        unmovable: unmovable(
+            &compiled.bubblewrap.grant_masks.unmovable,
+            &masks.in_grants,
+            &grants,
+        ),
+        in_grants: with_kinds(masks.in_grants)?,
+        elsewhere: with_kinds(masks.elsewhere)?,
+        ..Host::default()
+    };
+    let roots: Vec<PathBuf> = grants.present.into_iter().map(|(_, real)| real).collect();
+    walk(&grants.home, &masks.hidden, &roots, &mut host.entries)?;
+    host.hidden = masks.hidden;
     Ok(host)
 }
 
