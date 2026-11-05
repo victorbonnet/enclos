@@ -246,6 +246,18 @@ pub fn serve(
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
         std::thread::spawn(move || {
+            // The pairing page, for a browser; anything else is a device's
+            // WebSocket. A caller that sends nothing gives up the thread.
+            if stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .is_err()
+            {
+                return;
+            }
+            if super::page::requested(&stream) {
+                let _ = super::page::serve(stream);
+                return;
+            }
             match connection(&hub, stream) {
                 // The device hung up: the app closed or replaced its
                 // connection. `enclos app log` has who and when.
