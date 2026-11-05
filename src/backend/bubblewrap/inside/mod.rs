@@ -11,35 +11,28 @@
 //! refuses it, that applies the same rules to itself before it serves. A
 //! session's command runs only once its relay said so.
 
+mod command;
 mod filter;
+mod relay;
 mod rules;
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::net::TcpListener;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::{CommandExt, parent_id};
+use std::os::fd::AsFd;
+use std::os::unix::process::parent_id;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
 
 use seccompiler::{BpfProgram, TargetArch};
 
 use super::compile::CompiledSandbox;
 use super::proposed::Landlock;
-
-/// What the relay says once it is confined and serving is all that is left.
-const READY: &str = "ready";
-
-/// This program, wherever it was installed and whatever the mounts show of
-/// that path.
-const THIS_PROGRAM: &str = "/proc/self/exe";
-
-/// How often a relay looks whether its session is still there.
-const PARENT_LOOK: Duration = Duration::from_secs(1);
+use command::Session;
+#[cfg(test)]
+use command::{Ended, reap_until};
+use relay::Serving;
+#[cfg(test)]
+use relay::{last_line, wait_for_new_parent};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InsideError {
@@ -159,123 +152,6 @@ impl Prepared {
             compiled,
         })
     }
-
-    /// The port is held before the relay starts, so the command never races
-    /// it, and passed as the relay's stdin, the one descriptor `Command`
-    /// hands on without `unsafe`.
-    fn start_relay(&self) -> Result<(), InsideError> {
-        let relay = &self.compiled.relay;
-        let listener = crate::relay::listen(relay.port, Path::new(&relay.socket))
-            .map_err(|e| InsideError::RelayListen(Box::new(e)))?;
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&relay.log)
-            .map_err(|source| InsideError::RelayLog {
-                path: relay.log.clone(),
-                source,
-            })?;
-        // In a group of its own: in a terminal the session's is the foreground
-        // one, whose Ctrl-C is the program's to hear, and would end the relay.
-        let child = Command::new(THIS_PROGRAM)
-            .args(["inside", "--relay", "--compiled"])
-            .arg(&self.path)
-            .process_group(0)
-            .stdin(Stdio::from(OwnedFd::from(listener)))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(log))
-            .spawn()
-            .map_err(InsideError::RelayStart)?;
-        let mut said = String::new();
-        // Read now: the log is in the session's `/tmp`, which goes when the
-        // session ends.
-        let not_ready = || InsideError::RelayNotReady {
-            why: last_line(Path::new(&relay.log)),
-        };
-        let stdout = child.stdout.ok_or_else(not_ready)?;
-        BufReader::new(stdout)
-            .read_line(&mut said)
-            .map_err(|_| not_ready())?;
-        match said.trim() == READY {
-            true => Ok(()),
-            false => Err(not_ready()),
-        }
-    }
-}
-
-/// What a relay's log ends with, which is what stopped it.
-fn last_line(log: &Path) -> String {
-    let text = std::fs::read(log).unwrap_or_default();
-    let text = String::from_utf8_lossy(&text);
-    match text.lines().rfind(|line| !line.trim().is_empty()) {
-        Some(line) => line.trim_start_matches("error: ").to_owned(),
-        None => "it left no word in its log".to_owned(),
-    }
-}
-
-/// The signals bubblewrap's outer process ignores in a terminal's session
-/// (`wrap`): ignored here too, as an ignored signal stays so through
-/// `exec`, until this hands them back.
-const INTERRUPTS: [i32; 2] = [signal_hook::consts::SIGINT, signal_hook::consts::SIGQUIT];
-
-/// Catches [`INTERRUPTS`], with nothing done when they come: a caught
-/// signal is reset to its default by `exec`, so the command gets them as a
-/// program run from a terminal does, while this process, which only reaps,
-/// goes on.
-fn hand_back_interrupts() -> Result<(), InsideError> {
-    let heard = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in INTERRUPTS {
-        signal_hook::flag::register(signal, heard.clone()).map_err(InsideError::Interrupts)?;
-    }
-    Ok(())
-}
-
-/// How a child ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ended {
-    Exited(i32),
-    Killed(i32),
-    /// Stopped or continued, which `wait` does not report unless asked.
-    Neither,
-}
-
-impl Ended {
-    fn of(status: rustix::process::WaitStatus) -> Ended {
-        match (status.exit_status(), status.terminating_signal()) {
-            (Some(code), _) => Ended::Exited(code),
-            (None, Some(signal)) => Ended::Killed(signal),
-            (None, None) => Ended::Neither,
-        }
-    }
-}
-
-/// Reaps what `next` finds ended, every orphan of the session included, until
-/// `command` ends, then gives its exit code as a shell does: 128 and the
-/// signal for one a signal ended. A call a signal cut short is made again.
-fn reap_until(
-    command: u32,
-    mut next: impl FnMut() -> io::Result<Option<(u32, Ended)>>,
-) -> Result<u8, InsideError> {
-    loop {
-        match next() {
-            Ok(Some((pid, ended))) if pid == command => match ended {
-                Ended::Exited(code) => return Ok(code.clamp(0, 255) as u8),
-                Ended::Killed(signal) => return Ok((128 + signal).clamp(0, 255) as u8),
-                Ended::Neither => {}
-            },
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(InsideError::Reap(e)),
-        }
-    }
-}
-
-/// Returns once `now` gives another parent than `parent`.
-fn wait_for_new_parent(parent: u32, now: impl Fn() -> u32, every: Duration) {
-    while now() == parent {
-        thread::sleep(every);
-    }
 }
 
 /// The compiled file, and the session's command or the relay's port.
@@ -299,83 +175,6 @@ impl<T> Confine for Running<T> {
     /// The session's stderr, and the relay's log for the relay.
     fn say(&mut self, line: &str) {
         let _ = writeln!(io::stderr(), "{line}");
-    }
-}
-
-/// The session's command, and whether to hand Ctrl-C and Ctrl-\ back to it.
-struct Session<'a> {
-    command: &'a [OsString],
-    restore_interrupts: bool,
-}
-
-impl SessionSteps for Running<Session<'_>> {
-    fn start_relay(&mut self) -> Result<(), InsideError> {
-        self.prepared.start_relay()
-    }
-
-    /// Not dumpable, so no process of the session attaches to this one or
-    /// writes its memory, then the command as a child of its own, which a
-    /// terminal's Ctrl-C reaches with its own handlers: as PID 1 the kernel
-    /// would drop every signal it does not catch. Every orphan of the
-    /// session is reaped here, until the command ends.
-    fn run_command(&mut self) -> Result<u8, InsideError> {
-        let Some((program, args)) = self.then.command.split_first() else {
-            return Err(InsideError::NoCommand);
-        };
-        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
-            .map_err(|e| InsideError::NotDumpable(e.into()))?;
-        if self.then.restore_interrupts {
-            hand_back_interrupts()?;
-        }
-        let child =
-            Command::new(program)
-                .args(args)
-                .spawn()
-                .map_err(|source| InsideError::Command {
-                    command: program.to_string_lossy().into_owned(),
-                    source,
-                })?;
-        reap_until(child.id(), || {
-            rustix::process::wait(rustix::process::WaitOptions::empty())
-                .map(|found| {
-                    found.map(|(pid, status)| {
-                        (pid.as_raw_nonzero().get().unsigned_abs(), Ended::of(status))
-                    })
-                })
-                .map_err(io::Error::from)
-        })
-    }
-}
-
-/// The port a relay serves, and the session that started it.
-struct Serving {
-    listener: TcpListener,
-    session: u32,
-}
-
-impl RelaySteps for Running<Serving> {
-    fn say_ready(&mut self) -> Result<(), InsideError> {
-        writeln!(io::stdout(), "{READY}").map_err(InsideError::RelayStart)
-    }
-
-    /// Looks after its session from here: a parent-death signal is checked
-    /// as one the dying session sends, so where Landlock's scopes apply the
-    /// relay's own domain refuses it, and a PID namespace is not relied on.
-    fn serve(&mut self) -> InsideError {
-        let session = self.then.session;
-        let watching = thread::Builder::new().spawn(move || {
-            wait_for_new_parent(session, parent_id, PARENT_LOOK);
-            std::process::exit(0);
-        });
-        if let Err(e) = watching {
-            return InsideError::RelayStart(e);
-        }
-        match self.then.listener.try_clone() {
-            Ok(listener) => {
-                crate::relay::serve(listener, Path::new(&self.prepared.compiled.relay.socket))
-            }
-            Err(e) => InsideError::RelayPort(e),
-        }
     }
 }
 
@@ -405,9 +204,9 @@ pub fn landlock_abi() -> Option<u32> {
 
 /// Serves as the session's relay. Returns only what stopped it.
 pub fn relay(path: &Path) -> InsideError {
-    // The session it serves is the process that started it, and the command
-    // that process became. Read first: a session gone before this line leaves
-    // nobody to read `ready`, and saying it fails.
+    // The session it serves is the `enclos inside` that started it. Read
+    // first: a session gone before this line leaves nobody to read `ready`,
+    // and saying it fails.
     let session = parent_id();
     let listener = io::stdin()
         .as_fd()

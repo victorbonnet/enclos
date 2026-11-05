@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 /// Records what is called and fails where it is told to: nothing here is
 /// applied to any process.
@@ -190,12 +191,12 @@ fn what_compile_writes_is_what_is_read() {
 #[test]
 fn the_session_reaps_its_orphans_until_its_command_ends() {
     let mut found = vec![
-        Ok(Some((9, Ended::Exited(0)))),
+        Ok(Some((9, Some(Ended::Exited(0))))),
         Err(io::Error::from(io::ErrorKind::Interrupted)),
-        Ok(Some((7, Ended::Neither))),
-        Ok(Some((8, Ended::Killed(9)))),
-        Ok(Some((7, Ended::Exited(3)))),
-        Ok(Some((7, Ended::Exited(4)))),
+        Ok(Some((7, None))),
+        Ok(Some((8, Some(Ended::Killed(9))))),
+        Ok(Some((7, Some(Ended::Exited(3))))),
+        Ok(Some((7, Some(Ended::Exited(4))))),
     ]
     .into_iter();
     let code = reap_until(7, || found.next().unwrap()).unwrap();
@@ -206,7 +207,7 @@ fn the_session_reaps_its_orphans_until_its_command_ends() {
 /// As a shell gives it, so `connect` reports the same either way.
 #[test]
 fn a_command_a_signal_ended_gives_128_and_the_signal() {
-    let mut found = [Ok(Some((7, Ended::Killed(2))))].into_iter();
+    let mut found = [Ok(Some((7, Some(Ended::Killed(2)))))].into_iter();
     assert_eq!(reap_until(7, || found.next().unwrap()).unwrap(), 130);
 }
 
@@ -214,4 +215,36 @@ fn a_command_a_signal_ended_gives_128_and_the_signal() {
 fn a_session_that_lost_its_children_says_so() {
     let e = reap_until(7, || Err(io::Error::from_raw_os_error(10))).unwrap_err();
     assert!(e.to_string().contains("lost the session's command"), "{e}");
+}
+
+/// What `wait` reports of a child this test started: its exit code, the
+/// signal that ended it, and nothing for one that was only stopped. Each
+/// child is reaped by `waitpid`, which clippy's lint does not see.
+#[test]
+#[allow(clippy::zombie_processes)]
+fn a_child_that_stopped_has_not_ended() {
+    use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+    let wait = |child: &std::process::Child, options| {
+        let pid = Pid::from_child(child);
+        let (_, status) = waitpid(Some(pid), options).unwrap().unwrap();
+        Ended::of(status)
+    };
+    let exits = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 3"])
+        .spawn()
+        .unwrap();
+    assert_eq!(wait(&exits, WaitOptions::empty()), Some(Ended::Exited(3)));
+
+    let sleeps = std::process::Command::new("/usr/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_child(&sleeps);
+    kill_process(pid, Signal::STOP).unwrap();
+    assert_eq!(wait(&sleeps, WaitOptions::UNTRACED), None);
+    kill_process(pid, Signal::KILL).unwrap();
+    assert_eq!(
+        wait(&sleeps, WaitOptions::empty()),
+        Some(Ended::Killed(Signal::KILL.as_raw()))
+    );
 }
