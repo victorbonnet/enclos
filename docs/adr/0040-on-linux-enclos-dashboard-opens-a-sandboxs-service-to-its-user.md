@@ -11,6 +11,7 @@ Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for 
 Decision (proposed), on the bubblewrap backend:
 
 - **`enclos dashboard <sandbox>` is the way in.** It starts `hermes dashboard --no-open --isolated --port 0` as a recorded session under the sandbox's policy, reads the port that session holds from the host, opens a listener on the host's 127.0.0.1 at the sandbox's reserved port, and prints the URL. Each connection goes through a Unix socket in the host-only `run/<sandbox>/` to a relay in the sandbox's network namespace, then to that port.
+- **A bubblewrap sandbox's proxy serves its Unix socket alone, with no TCP listener.** Its sessions reach it through that socket and the relay, and none of them can reach the host's loopback, so a TCP listener there would serve no sandbox, only any local program, as an egress proxy logged as the sandbox's. So the sandbox's reserved port stays free for `enclos dashboard`.
 - **It serves only the user running it.** The listener reads the owner of each connection's socket and closes any other's before a byte reaches the service. Loopback and the owner check are hard-coded, with no setting. On a remote host the user runs it over ssh with `-L`.
 - **It lives as long as the command.** Ctrl-C ends the session and the listener and records the end. Start and end are audited, and a second run on the same sandbox is refused, naming the first.
 - **Its server is its own.** A plain `hermes dashboard` reports one another session left open and exits 0, so `--isolated` and `--port 0` keep that session, and any session holding Hermes's default port, from stopping the command.
@@ -23,6 +24,7 @@ Reason: the network namespace that keeps the sandbox off the host's loopback and
 
 - **The dashboard from inside the sandbox alone:** no path from the host to open, but no browser on the host, which is where the user has one.
 - **The gateway's port behind the same listener:** the page loads and does not work.
+- **A port of its own for the dashboard** (a second reservation, or port 0 with the URL printed): it leaves the proxy's TCP listener on the host's loopback, which serves no bubblewrap sandbox and lets any local program use the sandbox's proxy.
 
 ## Consequences
 

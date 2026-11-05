@@ -159,7 +159,7 @@ fn the_chat_tabs_control_pair_is_recorded_as_measured() {
     let design = design();
     let item = design
         .lines()
-        .find(|line| line.starts_with("- The dashboard's terminal"))
+        .find(|line| line.starts_with("- `enclos dashboard`"))
         .expect("§14's item");
     for part in ["M3-20", "`NO_PROXY` for loopback is needed", "not shown"] {
         assert!(item.contains(part), "{part}");
@@ -199,6 +199,29 @@ fn a_session_sees_run_visible_and_never_the_host_only_folder() {
         assert!(text.contains("`run/<sandbox>/visible/`"));
         assert!(text.contains("host-only `run/<sandbox>/`, which no session mounts"));
     }
+}
+
+#[test]
+fn a_bubblewrap_sandboxs_proxy_leaves_its_reserved_port_to_enclos_dashboard() {
+    // `enclos dashboard` listens on the host's 127.0.0.1 at the sandbox's
+    // reserved port, so the proxy of a bubblewrap sandbox must not hold it.
+    let design = design();
+    let adr_0040 = adr("0040-on-linux-enclos-dashboard-opens-a-sandboxs-service-to-its-user.md");
+    let find = |start: &str| {
+        design
+            .lines()
+            .find(|line| line.starts_with(start))
+            .unwrap_or_else(|| panic!("no line starting with {start}"))
+            .to_string()
+    };
+    let milestone_bullet = find("   - the proxy listening on a Unix socket");
+    let network_section = find("**The runtime's own service on Linux**");
+    let awaiting_item = find("- `enclos dashboard`");
+    for text in [&adr_0040, &milestone_bullet, &network_section] {
+        assert!(text.contains("no TCP listener"), "{text}");
+    }
+    assert!(!milestone_bullet.contains("beside its TCP listener"));
+    assert!(awaiting_item.contains("reserved port"), "{awaiting_item}");
 }
 
 #[test]
