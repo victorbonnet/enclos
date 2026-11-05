@@ -158,8 +158,6 @@ fn connect_waits_for_installed_services_and_starts_nothing() {
     assert_eq!(fake.stopped.borrow().len(), stopped);
 }
 
-/// A limit no program could start under refuses the start before any
-/// service is removed or installed.
 /// A manager that reads another folder than this shell lists nothing here,
 /// and its units keep running: `stop` says so rather than saying it stopped.
 #[test]
@@ -183,6 +181,8 @@ fn a_stopped_sandbox_with_nothing_installed_does_not_ask_the_manager() {
     assert!(engine.installed_labels(&name).unwrap().is_empty());
 }
 
+/// A limit no program could start under refuses the start before any
+/// service is removed or installed.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_start_under_a_limit_no_program_could_run_under_installs_nothing() {

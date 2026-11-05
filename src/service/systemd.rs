@@ -192,16 +192,13 @@ fn exec_word(text: &str) -> String {
     quoted(text).replace('$', "$$")
 }
 
-/// The unit file: started now and at each login, restarted after a non-zero
-/// exit or a signal (systemd counts SIGHUP, SIGINT, SIGPIPE and SIGTERM as
-/// clean unless told otherwise) but never after exit 0, however often, with
-/// its output in the unit's log. systemd sleeps `RestartSec` before every
-/// restart, where launchd's throttle only spaces two starts, so the first
-/// waits a second and a crash loop grows to the 10 launchd takes; a systemd
-/// older than 254 ignores the two keys that grow it. `stop` sends TERM to the program alone,
-/// which may be stopping what it runs, and KILL to what is left when it
-/// exits or after the unit's stop timeout. An error when the log's path
-/// cannot be written in a unit file, where `append:` takes no quoting.
+/// The unit file, a pure function of `unit`: started now and at each login,
+/// with its output in the unit's log; restarted after a non-zero exit or a
+/// signal (systemd counts SIGHUP, SIGINT, SIGPIPE and SIGTERM as clean
+/// unless told otherwise), never after exit 0, the delay growing from 1
+/// second to 10. `stop` sends TERM to the program alone and KILL to what is
+/// left when it exits or after the unit's stop timeout. An error when the
+/// log's path holds a control character, which `append:` cannot quote.
 pub fn unit_file(unit: &ServiceUnit) -> Result<String, ServiceError> {
     let log = unit.log.display().to_string();
     if log.chars().any(|c| c.is_control()) {
