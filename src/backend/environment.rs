@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{Launch, SandboxContext};
+use crate::layout::Os;
 
 /// Host variables a sandbox keeps: how to draw, which language to speak,
 /// the time zone and the user's name.
@@ -73,9 +74,13 @@ const LINUX: HostSystem = HostSystem {
 impl HostSystem {
     /// The system this process runs on.
     fn current() -> &'static HostSystem {
-        match cfg!(target_os = "macos") {
-            true => &MACOS,
-            false => &LINUX,
+        HostSystem::on(Os::current())
+    }
+
+    fn on(os: Os) -> &'static HostSystem {
+        match os {
+            Os::MacOs => &MACOS,
+            Os::Linux => &LINUX,
         }
     }
 
@@ -471,6 +476,13 @@ mod tests {
             None,
             &system
         ));
+    }
+
+    #[test]
+    fn each_host_system_has_its_own_table() {
+        assert_eq!(HostSystem::on(Os::MacOs), &MACOS);
+        assert_eq!(HostSystem::on(Os::Linux), &LINUX);
+        assert_eq!(HostSystem::current(), HostSystem::on(Os::current()));
     }
 
     /// On the host itself, where every system has the usual terminal.
