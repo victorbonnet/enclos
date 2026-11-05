@@ -1,5 +1,6 @@
 //! What the backend rests on that is still proposed or open: the
-//! dependences compiling has on ADRs 0037 to 0039 and on design §15. Under
+//! dependences compiling has on ADRs 0037 to 0039 and 0041, and on design
+//! §15. Under
 //! ADR 0039 the relay changes too: see [`NAMESPACES`].
 
 use serde::{Deserialize, Serialize};
@@ -77,7 +78,7 @@ pub struct Host {
 /// declaration the escape probes have yet to show, so nothing reads as
 /// enforced. Landlock missing or too old weakens the file and program rows
 /// (ADR 0037); an older ABI's rights still apply. `listen = false` is not
-/// held (design §15). No limit is set yet, a memory limit included (ADR
+/// held (ADR 0041). No limit is set yet, a memory limit included (ADR
 /// 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
     let (fs, exec) = match host.landlock_abi {
@@ -122,8 +123,8 @@ pub(super) const LISTEN: &str = "network.listen";
 /// `[exec]` section joins them once a policy can hold one (ADR 0037).
 pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
     let mut fields = Vec::new();
-    // Whether to refuse it is open (design §15): a network namespace of its
-    // own limits who is reached, not whether the sandbox listens.
+    // Declared, not refused (ADR 0041): a network namespace of its own
+    // limits who is reached, not whether the sandbox listens.
     if !policy.net.listen {
         fields.push(Unenforced {
             field: LISTEN.to_owned(),

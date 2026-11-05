@@ -185,10 +185,10 @@ impl LaunchLimits {
 /// in the sandbox without root can raise them, then becomes the program;
 /// one it cannot set stops it with exit 125 and the field named, so no
 /// program runs without its limits. Only `open_files` is set: Seatbelt
-/// refuses the others (ADR 0033), and no other backend is built. In
-/// privileged mode (`-p`), as it runs on the host with the sandbox's
-/// variables: it then reads no `BASH_ENV` or `ENV` file, no `SHELLOPTS` and
-/// no function from them. Only `command`'s program and arguments are kept:
+/// refuses the others (ADR 0033), and bubblewrap enforces no limit yet,
+/// so every one is refused there. In privileged mode (`-p`), as it runs on
+/// the host with the sandbox's variables: it then reads no `BASH_ENV` or
+/// `ENV` file, no `SHELLOPTS` and no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`
 /// unchanged when no limit is set.
 pub fn under_limits(command: Command, limits: &LaunchLimits) -> Command {
