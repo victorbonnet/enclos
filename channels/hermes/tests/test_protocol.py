@@ -82,5 +82,22 @@ class Token(unittest.TestCase):
         self.assertFalse(protocol.token_matches("", ""))
 
 
+class Hint(unittest.TestCase):
+    """The hint promises what the app draws, and nothing it does not."""
+
+    def test_it_names_what_the_app_draws(self):
+        for element in ("bold", "italic", "strikethrough", "inline code", "headings", "lists",
+                        "quotes", "code blocks", "tables", "links", "newline"):
+            with self.subTest(element):
+                self.assertIn(element, protocol.PLATFORM_HINT)
+
+    def test_it_says_images_and_html_are_not_drawn(self):
+        self.assertIn("Images are not shown", protocol.PLATFORM_HINT)
+        self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
+
+    def test_it_stays_short_for_every_prompt(self):
+        self.assertLess(len(protocol.PLATFORM_HINT), 600)
+
+
 if __name__ == "__main__":
     unittest.main()
