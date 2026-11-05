@@ -165,6 +165,21 @@ fn a_path_too_long_for_a_socket_stops_a_proxy_that_needs_it() {
     assert!(err.to_string().contains("shorter sandbox name"), "{err}");
 }
 
+#[test]
+fn a_socket_failure_stops_the_proxy_of_every_backend_whose_sessions_need_it() {
+    let (_dir, engine) = engine_with_a_long_path();
+    for backend in BackendKind::ALL {
+        let socket = engine.proxy_socket(&"home".parse().unwrap(), backend);
+        match backend.reaches_proxy_over_socket() {
+            true => assert!(
+                matches!(socket, Err(Error::ProxySocket { .. })),
+                "{backend}"
+            ),
+            false => assert!(matches!(socket, Ok(None)), "{backend}"),
+        }
+    }
+}
+
 /// A file where the sandbox's proxy's socket goes.
 fn block_the_socket(engine: &Engine, name: &SandboxName) {
     let path = engine.layout.proxy_socket(name.as_str());

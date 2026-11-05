@@ -87,6 +87,17 @@ impl BackendKind {
             BackendKind::Libkrun => "libkrun",
         }
     }
+
+    /// Whether the sandbox's sessions reach its proxy over its Unix socket
+    /// alone. A Seatbelt session shares the host's network and reaches the
+    /// proxy over TCP on loopback (design §5); a session of every other kind
+    /// has a network of its own, out of the host's loopback.
+    pub fn reaches_proxy_over_socket(self) -> bool {
+        match self {
+            BackendKind::Seatbelt => false,
+            BackendKind::Bubblewrap | BackendKind::OpenShell | BackendKind::Libkrun => true,
+        }
+    }
 }
 
 /// A backend name enclos does not know.
@@ -178,6 +189,17 @@ mod tests {
             assert_eq!(kind.as_str().parse::<BackendKind>(), Ok(kind));
         }
         assert!("docker".parse::<BackendKind>().is_err());
+    }
+
+    #[test]
+    fn only_seatbelt_sessions_reach_the_proxy_over_tcp() {
+        for kind in BackendKind::ALL {
+            assert_eq!(
+                kind.reaches_proxy_over_socket(),
+                kind != BackendKind::Seatbelt,
+                "{kind}"
+            );
+        }
     }
 
     #[test]
