@@ -253,6 +253,28 @@ fn an_adrs_consequences_section_holds_only_its_list() {
 }
 
 #[test]
+fn the_relay_has_one_runner_and_the_holders_part_is_proposed() {
+    // ADR 0039, proposed, gives the relay to the namespace holder; until it
+    // is accepted, the design cites it where it says so and keeps the case
+    // where a session runs its relay.
+    let design = design();
+    let find = |start: &str| {
+        design
+            .lines()
+            .find(|line| line.starts_with(start))
+            .unwrap_or_else(|| panic!("no line starting with {start}"))
+            .to_string()
+    };
+    let networking = find("**Linux networking.**");
+    assert!(networking.contains("adr/0039-"), "{networking}");
+    assert!(networking.contains("kill or replace its relay"), "{networking}");
+    let backend = find("   - the bubblewrap backend");
+    assert!(!backend.contains("relay"), "{backend}");
+    let proxy = find("   - the proxy listening on a Unix socket");
+    assert!(proxy.contains("holder, which runs the relay"), "{proxy}");
+}
+
+#[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder
     // under `run/<sandbox>/` the design names is in §11's layout.
