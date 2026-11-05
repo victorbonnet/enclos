@@ -16,7 +16,9 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
 FROM_BRIDGE_TYPES = ("hello", "message.in", "conversation.rename", "ack", "error")
-CAPABILITIES = ("notify", "typing", "titles")
+CAPABILITIES = ("notify", "typing", "titles", "tools")
+# The longest label of a tool step: a line on a phone.
+MAX_TOOL_LABEL_CHARS = 120
 # The longest conversation title sent (Hermes' own limit is 100 characters).
 MAX_TITLE_CHARS = 100
 
@@ -141,6 +143,20 @@ def title(conversation: str, text: str) -> dict[str, Any]:
     """The runtime's name for a conversation, on one line, at most MAX_TITLE_CHARS."""
     one_line = " ".join(text.split())[:MAX_TITLE_CHARS]
     return _message("conversation.title", conversation=conversation, title=one_line)
+
+
+def tool(conversation: str, call: str, name: str, phase: str, label: str | None = None,
+         ok: bool | None = None, duration_ms: int | None = None) -> dict[str, Any]:
+    """A tool the agent starts (`phase` "start", with what it does as `label`)
+    or ends ("end", with whether it worked and how long it took)."""
+    fields: dict[str, Any] = {"conversation": conversation, "call": call, "name": name, "phase": phase}
+    if label:
+        fields["label"] = " ".join(label.split())[:MAX_TOOL_LABEL_CHARS]
+    if ok is not None:
+        fields["ok"] = ok
+    if duration_ms is not None:
+        fields["duration_ms"] = max(0, int(duration_ms))
+    return _message("tool", **fields)
 
 
 def runtime_title(text: str) -> str:

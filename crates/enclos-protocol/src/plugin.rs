@@ -72,6 +72,9 @@ pub enum FromPlugin {
         conversation: ConversationId,
         title: String,
     },
+    /// A step of the agent's work on an answer: a tool it starts, or ends.
+    #[serde(rename = "tool")]
+    Tool(ToolStep),
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -84,9 +87,39 @@ pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "message.out",
     "typing",
     "conversation.title",
+    "tool",
     "ack",
     "error",
 ];
+
+/// One tool the agent runs while it works on an answer, as the plugin
+/// reports it and the bridge passes it on: shown live, not stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolStep {
+    pub conversation: ConversationId,
+    /// The runtime's id of this call, the same at its start and its end.
+    pub call: String,
+    /// The tool, as the runtime names it (`terminal`, `web_search`).
+    pub name: String,
+    /// A short line about what it does (`ls -la`, `weather Lyon`), at its start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub phase: ToolPhase,
+    /// At its end: whether it worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    /// At its end: how long it took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// Whether a [`ToolStep`] starts or ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPhase {
+    Start,
+    End,
+}
 
 /// Whether an agent's message answers one, or comes on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +143,8 @@ pub enum Capability {
     Abort,
     /// It names conversations (`conversation.title`).
     Titles,
+    /// It reports the tools it runs while it works (`tool`).
+    Tools,
     #[serde(other)]
     Unknown,
 }

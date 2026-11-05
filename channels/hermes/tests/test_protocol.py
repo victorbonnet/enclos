@@ -68,6 +68,12 @@ class ToTheBridge(unittest.TestCase):
         self.assert_like_fixture(protocol.typing("c-42", True), "from_plugin_typing.json")
         self.assert_like_fixture(
             protocol.title("c-42", "Paris weather this week"), "from_plugin_conversation_title.json")
+        self.assert_like_fixture(
+            protocol.tool("c-42", "call_7Hq2", "web_search", "start", label="weather Paris this week"),
+            "from_plugin_tool_start.json")
+        self.assert_like_fixture(
+            protocol.tool("c-42", "call_7Hq2", "web_search", "end", ok=True, duration_ms=1840),
+            "from_plugin_tool_end.json")
 
     def test_hermes_uniqueness_suffix_is_dropped(self):
         self.assertEqual(protocol.runtime_title("Paris weather #2"), "Paris weather")
