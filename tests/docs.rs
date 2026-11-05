@@ -137,3 +137,25 @@ fn milestone_3_awaiting_verification_holds_only_what_is_still_to_show() {
         .collect();
     assert!(with_results.is_empty(), "{with_results:#?}");
 }
+
+#[test]
+fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
+    // Nothing after §15's table makes decisions outside it, and every folder
+    // under `run/<sandbox>/` the design names is in §11's layout.
+    let design = design();
+    let last = design.lines().rev().find(|line| !line.trim().is_empty());
+    assert!(last.is_some_and(|line| line.starts_with('|')), "{last:?}");
+    let layout = section(&design, "## 11.", "## 12.").join("\n");
+    let marker = "run/<sandbox>/";
+    for line in design.lines() {
+        for rest in line.split(marker).skip(1) {
+            let sub: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                .collect();
+            if !sub.is_empty() {
+                assert!(layout.contains(&format!("{sub}/")), "{marker}{sub} not in §11");
+            }
+        }
+    }
+}
