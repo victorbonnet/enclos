@@ -225,6 +225,34 @@ fn a_bubblewrap_sandboxs_proxy_leaves_its_reserved_port_to_enclos_dashboard() {
 }
 
 #[test]
+fn an_adrs_consequences_section_holds_only_its_list() {
+    // A paragraph after an ADR's consequences sits outside its structure and
+    // can decide what its Decision section does not.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/adr");
+    let mut stray = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let text = fs::read_to_string(&path).unwrap();
+        let after = text
+            .lines()
+            .skip_while(|line| *line != "## Consequences")
+            .skip(1)
+            .take_while(|line| !line.starts_with("## "));
+        for line in after {
+            let in_list = line.trim().is_empty()
+                || line.starts_with("- ")
+                || line.starts_with("  ")
+                || line.ends_with(':');
+            if !in_list {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                stray.push(format!("{name}: {}", line.get(..60).unwrap_or(line)));
+            }
+        }
+    }
+    assert!(stray.is_empty(), "{stray:#?}");
+}
+
+#[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder
     // under `run/<sandbox>/` the design names is in §11's layout.

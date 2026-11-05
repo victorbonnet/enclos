@@ -31,6 +31,5 @@ Reason: the network namespace that keeps the sandbox off the host's loopback and
 - 0028's consequence that a listener bound to every address serves the host's network does not hold on Linux, and the host's browser reaches the dashboard only while `enclos dashboard` runs.
 - The listener runs inside the command, so nothing but the command opens it, and the service's port it serves comes from the host's reading, never from a file the sandbox writes.
 - The Chat tab's terminal is not shown working. On a session's compiled environment it cannot reach its backend until its session has `NO_PROXY` for loopback, and an answer is not shown even then (§14; M3-20).
+- `listen = false` is not held in a sandbox's own network namespace; how that is reported is open (§15).
 - macOS behaves as 0028 says; this ADR changes nothing there.
-
-Enforcement limitation: the prototype does not enforce `listen=false` against `bind` or `listen`; its seccomp filter permits both. A private network namespace limits reachability but is not enforcement of that field. Production must report it unenforced and refuse it unless explicitly accepted under ADR 0009, until a tested restriction exists. Only sandbox-visible data-plane sockets under `run/<sandbox>/visible/` may be mounted; proxy control and authoritative port records remain host-only.
