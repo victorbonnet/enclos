@@ -92,14 +92,14 @@ The account on a channel through which the sandbox's runtime answers people, suc
 _Avoid_: agent (an agent is the runtime's identity, not the account)
 
 **Service**:
-A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
+A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
 
 **Relay**:
 On Linux, the part of enclos that passes connections between 127.0.0.1 in a sandbox's network namespace and a Unix socket outside it: to the sandbox's proxy, or from the host to its runtime's listening service.
 _Avoid_: forwarder, port forward, tunnel (the proxy's word for a connection it carries)
 
-**Holder**:
+**Namespace holder**:
 On Linux, the process that keeps a sandbox's network namespace in being, so that every session of the sandbox can join it.
 
 **Member**:

@@ -274,6 +274,53 @@ fn the_relay_has_one_runner_and_the_holders_part_is_proposed() {
     assert!(proxy.contains("holder, which runs the relay"), "{proxy}");
 }
 
+/// The places in `text` where "holder" is not part of "namespace holder".
+fn bare_holders(text: &str) -> Vec<String> {
+    let mut bare = Vec::new();
+    for line in text.lines().map(str::to_lowercase) {
+        for (at, _) in line.match_indices("holder") {
+            // A service's name, such as `enclos.<install>.<sandbox>.holder`.
+            let named = line[..at].ends_with(['.', '`']);
+            if !named && !line[..at].ends_with("namespace ") {
+                let start = (0..=at.saturating_sub(40))
+                    .rev()
+                    .find(|i| line.is_char_boundary(*i))
+                    .unwrap_or(0);
+                bare.push(line[start..].chars().take(60).collect());
+            }
+        }
+    }
+    bare
+}
+
+#[test]
+fn holder_means_the_namespace_holder_alone() {
+    // §8 and ADR 0030 say a process holds a marker; the process that keeps a
+    // sandbox's network namespace is the "namespace holder", so the two
+    // never read as one.
+    let glossary_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("GLOSSARY.md");
+    let glossary = fs::read_to_string(glossary_path).unwrap();
+    assert!(glossary.contains("**Namespace holder**:"));
+    assert!(!glossary.contains("**Holder**:"));
+    let service = glossary
+        .lines()
+        .skip_while(|line| *line != "**Service**:")
+        .nth(1)
+        .expect("the Service entry");
+    assert!(service.contains("namespace holder"), "{service}");
+    let design = design();
+    let outside_section_8: String = design
+        .lines()
+        .filter(|line| !section(&design, "## 8.", "## 9.").contains(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let adr_0039 = adr("0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md");
+    for text in [&outside_section_8, &adr_0039, &glossary] {
+        let bare = bare_holders(text);
+        assert!(bare.is_empty(), "{bare:#?}");
+    }
+}
+
 #[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder
