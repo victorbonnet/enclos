@@ -7,33 +7,10 @@
 //! [`perl_listener`] or [`python_listener`], each with the same rule. A port
 //! rejected stays held while the next is asked for, so the system gives
 //! another; it is let go at the end.
-//!
-//! Inside the range, [`proxy_ports`] spreads the tests' sandboxes over it.
 
 use std::net::{IpAddr, TcpListener};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::model::sandbox::{PORT_FIRST, PORT_LAST};
-
-/// The proxy range, from the port after the one the previous call started
-/// from, round to the port before it: the order in which a test's engine
-/// looks for a new sandbox's proxy port.
-///
-/// Every test's sandbox would otherwise get the range's first port, and the
-/// engine connects to it again and again (is it free, is the proxy up). On
-/// Linux, connections to one port take their own ports one after another
-/// from the ephemeral range, which holds the proxy range: one of them, made
-/// while nothing listened, was given the port it connected to, connected to
-/// itself, and left that port in `TIME-WAIT` for a minute. No proxy could
-/// listen there, and every test that started one in that minute failed.
-/// Spread over the range, each port is connected to a few times only.
-pub(crate) fn proxy_ports() -> impl Iterator<Item = u16> {
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-    let size = usize::from(PORT_LAST - PORT_FIRST + 1);
-    let offset = CALLS.fetch_add(1, Ordering::Relaxed) % size;
-    let first = PORT_FIRST + u16::try_from(offset).unwrap();
-    (first..=PORT_LAST).chain(PORT_FIRST..first)
-}
 
 /// How many ports are tried before giving up.
 const TRIES: usize = 64;
@@ -146,15 +123,6 @@ mod tests {
         assert_eq!(asked, 4);
         assert_eq!(*dropped.borrow(), 3);
         drop(held);
-    }
-
-    #[test]
-    fn each_search_for_a_proxy_port_starts_elsewhere_and_goes_round_the_range() {
-        let ports: Vec<u16> = proxy_ports().collect();
-        let mut sorted = ports.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, (PORT_FIRST..=PORT_LAST).collect::<Vec<_>>());
-        assert_ne!(proxy_ports().next(), proxy_ports().next());
     }
 
     #[test]
