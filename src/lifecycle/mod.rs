@@ -11,11 +11,12 @@ pub mod members;
 pub mod proc;
 pub mod process;
 pub mod programs;
+pub mod ps;
 pub mod stop;
 
-/// How this host looks at processes: `lsof` and `sysctl` on macOS, `/proc`
-/// on Linux. Both are compiled on every system, so the tests of each run on
-/// either; this is the one place that picks between them.
+/// How this host looks at processes: `ps`, `lsof` and `sysctl` on macOS,
+/// `/proc` on Linux. Both are compiled on every system, so the tests of each
+/// run on either; this is the one place that picks between them.
 #[cfg(target_os = "macos")]
 pub use lsof as host;
 #[cfg(not(target_os = "macos"))]

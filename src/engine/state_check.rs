@@ -13,10 +13,10 @@ use super::Engine;
 use super::printable_line;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::host::{program_files, program_name};
 use crate::lifecycle::look::Look;
 use crate::lifecycle::marker::{MarkerError, holders, is_held};
 use crate::lifecycle::process::{Proc, processes};
-use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionId;
@@ -124,15 +124,15 @@ impl fmt::Display for Repair {
 /// What the host runs, listed once and shared by every sandbox looked at.
 struct Host {
     procs: Vec<Proc>,
-    /// As `lsof` writes their names: see [`lsof_name`].
+    /// As the host writes their names: see [`program_name`].
     programs: BTreeMap<u32, Vec<String>>,
 }
 
 impl Host {
-    /// Program files first: a process listed there and not by `ps` after is
-    /// one that ended between the two, not one that left its session, which
-    /// ran before either. With no sandbox, nothing is listed: no process can
-    /// be one's.
+    /// Program files first: a process listed there and not in the listing
+    /// of processes after is one that ended between the two, not one that
+    /// left its session, which ran before either. With no sandbox, nothing
+    /// is listed: no process can be one's.
     fn list(sandboxes: usize) -> Result<Host> {
         if sandboxes == 0 {
             return Ok(Host {
@@ -506,7 +506,7 @@ impl Engine {
                 path: dir.clone(),
                 source,
             })?;
-            let inside = format!("{}/", lsof_name(&real));
+            let inside = format!("{}/", program_name(&real));
             for (pid, files) in &host.programs {
                 let Some(file) = files.iter().find(|f| f.starts_with(&inside)) else {
                     continue;
