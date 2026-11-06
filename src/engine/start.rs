@@ -36,8 +36,9 @@ use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
 
-/// How long what a failed start left in its cgroup has to die of the kill.
-const SCOPE_END_WAIT: Duration = Duration::from_secs(5);
+/// How long what a failed start, or a probe, left in its cgroup has to die
+/// of the kill.
+pub(super) const SCOPE_END_WAIT: Duration = Duration::from_secs(5);
 
 /// Which process group a session's program starts in (design §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +248,7 @@ impl Engine {
     /// refused. `Scopes::wrap` keeps only the program, its arguments,
     /// environment and folder, so anything else is set on what this
     /// returns.
-    fn in_scope(
+    pub(super) fn in_scope(
         &self,
         name: &SandboxName,
         wrapped: Command,

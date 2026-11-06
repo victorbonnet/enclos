@@ -44,6 +44,14 @@ enum HolderVerb {
     },
 }
 
+impl HolderArgs {
+    /// Whether this is a session's `holder join`, which passes on to the
+    /// session's bubblewrap what it inherited, the session's marker among it.
+    pub fn joins(&self) -> bool {
+        matches!(self.verb, HolderVerb::Join { .. })
+    }
+}
+
 /// Runs `args`, opening enclos's state only for `holder run`: `join` must
 /// start no thread before it enters a user namespace, and `serve` sees none
 /// of enclos's files.

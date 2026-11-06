@@ -10,8 +10,10 @@ pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod inside;
 mod probe;
+pub mod probes;
 pub mod proposed;
 pub mod seccomp;
+mod sockets;
 mod wrap;
 
 use std::path::{Path, PathBuf};
@@ -136,7 +138,8 @@ impl Backend for Bubblewrap {
             WrapError("cannot find the enclos program, which bubblewrap runs first".to_owned())
         })?;
         let ssh_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
-        let host = wrap::read_host(&parsed, &ctx.home, ssh_auth_sock.as_deref())?;
+        let sockets = sockets::host_paths();
+        let host = wrap::read_host(&parsed, &ctx.home, ssh_auth_sock.as_deref(), &sockets)?;
         let programs = wrap::Programs {
             bwrap: &self.bwrap,
             enclos,
@@ -168,11 +171,14 @@ impl Backend for Bubblewrap {
         proposed::not_enforced_here(policy, &host())
     }
 
-    fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
-        Err(
-            "cannot be tested yet: the bubblewrap backend's escape probes are not in this build"
-                .to_owned(),
-        )
+    /// The same probes for every compiled file, which must be one this
+    /// backend wrote.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
+        if let Some(text) = compiled {
+            serde_json::from_str::<CompiledSandbox>(text)
+                .map_err(|e| format!("is not a policy compiled for bubblewrap: {e}"))?;
+        }
+        Ok(Box::new(probes::BubblewrapProbes::default()))
     }
 
     /// Every session joins it (ADR 0039).

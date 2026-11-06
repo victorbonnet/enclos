@@ -491,7 +491,7 @@ enclos policy test scout
 ```
 
 - [ ] `show` lists the `exec` session and its process; the session runs in a scope `enclos.<8 hex>.lab.<session>.scope` in the sandbox's slice, and Ctrl-C in the second terminal ends it and its scope.
-- [ ] `policy test` runs the probes every backend shares; bubblewrap's own escape probes are still to come (design §13, milestone 3). A probe that reads open is a finding; one it cannot run says why. A refusal on bubblewrap reads as a path that is not there or is empty, `Read-only file system` or `Permission denied`, not as Seatbelt's `Operation not permitted`.
+- [ ] `policy test` runs the probes every backend shares and bubblewrap's own (design §5, bubblewrap's escape probes): the buses, the `systemd --user` manager, every Unix socket on the host that answers you, abstract sockets, `ptrace`, the other sandbox's processes and `secrets/` folder, TIOCSTI, a setgid program, namespaces, mounting and the session's cgroup. It is READY, or each probe that reads open is a finding to report; one it cannot run says why. On a kernel without Landlock, the report says so once. A socket in your home that no deny entry names, such as one of another enclos install, reads open.
 
 ### 8: the secret store
 
@@ -567,4 +567,4 @@ These are stated in the design and the release notes, so a test that shows them 
 - Hermes's browser tools do not start in a sandbox.
 - CPU time, memory and file size limits are refused: Seatbelt cannot hold them.
 - Agents of one sandbox share its files: an agent's secrets reach it alone, but another agent of the same sandbox can read its secrets file (ADR 0036). Isolation is per sandbox.
-- Linux is milestone 3, in progress: Hermes does not run there yet, and bubblewrap's limits and its own escape probes are still to come (design §13).
+- Linux is milestone 3, in progress: Hermes does not run there yet, and bubblewrap's limits are still to come (design §13).
