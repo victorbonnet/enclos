@@ -33,7 +33,8 @@ use tungstenite::{Message, WebSocket};
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
 use super::store::{
-    BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, StoredAttachment, now,
+    BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, StoredAttachment,
+    home_id, is_home, now,
 };
 use super::transport::Transport;
 
@@ -56,6 +57,9 @@ struct Hub {
     store_path: std::path::PathBuf,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
+    /// The person the host belongs to, on the transport: whose the agents'
+    /// Home conversations are. Unknown, the first person who connects.
+    host: Option<String>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, (PluginWriter, Vec<Capability>)>>,
     /// Connected devices: who they speak for, and where to send.
@@ -107,7 +111,8 @@ impl Hub {
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
         let (hello, mut reader, writer) =
-            connect(&endpoint.socket, &endpoint.token).map_err(|e| e.to_string())?;
+            connect(&endpoint.socket, &endpoint.token, &home_id(agent))
+                .map_err(|e| e.to_string())?;
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
@@ -139,6 +144,23 @@ impl Hub {
                         let kind = match kind {
                             OutKind::Reply => "reply",
                             OutKind::Notify => "notify",
+                            OutKind::Status => "status",
+                        };
+                        // A conversation the bridge does not know, or another
+                        // agent's: the runtime's home channel as it was, or a
+                        // chat gone. It goes to this agent's Home, not nowhere.
+                        let own = matches!(
+                            store.conversation_of(conversation.as_str()),
+                            Ok(Some((sandbox, name, _))) if format!("{sandbox}/{name}") == agent
+                        );
+                        let conversation = if own {
+                            conversation
+                        } else {
+                            let _ = store.ensure_home(&agent, hub.host.as_deref().unwrap_or(""));
+                            match ConversationId::new(home_id(&agent)) {
+                                Ok(home) => home,
+                                Err(_) => continue,
+                            }
                         };
                         let stored = store.add(
                             message.id.as_str(),
@@ -234,14 +256,22 @@ pub fn serve(
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let host = transport.host_person();
     let hub = Arc::new(Hub {
         transport,
         store_path,
         bridge_private,
         agents,
+        host,
         plugins: Mutex::new(HashMap::new()),
         devices: Mutex::new(HashMap::new()),
     });
+    // Each agent's Home, the host's person's, before anything is sent to it.
+    if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
+        for agent in &hub.agents {
+            let _ = store.ensure_home(&agent.name, host);
+        }
+    }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let hub = Arc::clone(&hub);
@@ -438,6 +468,11 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     })?;
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
+    // The agents' Homes, made at start when the transport names the host's
+    // person; else this person's, the first to connect.
+    for agent in &hub.agents {
+        let _ = store.ensure_home(&agent.name, hub.host.as_deref().unwrap_or(&person));
+    }
     let (sender, outbox) = channel();
     hub.devices
         .lock()
@@ -614,7 +649,8 @@ fn run_session(
                 let Some((sandbox, name)) = agent.split_once('/') else {
                     continue;
                 };
-                if !hub.agents.iter().any(|a| a.name == agent) {
+                // A Home is the bridge's to make, for the host's person.
+                if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
                     continue;
                 }
                 store
@@ -853,6 +889,7 @@ fn attachment_info(a: StoredAttachment) -> Attachment {
 /// A conversation for a device: `None` for an id the protocol refuses.
 fn conversation_info(c: Conversation) -> Option<ConversationInfo> {
     Some(ConversationInfo {
+        home: is_home(&c.id),
         conversation: ConversationId::new(c.id).ok()?,
         agent: format!("{}/{}", c.sandbox, c.agent),
         title: c.title,

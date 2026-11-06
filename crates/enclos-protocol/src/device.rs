@@ -185,6 +185,10 @@ pub struct ConversationInfo {
     /// devices; none before they read any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read: Option<i64>,
+    /// The agent's Home: where what has no conversation of its own goes
+    /// (cron jobs, the runtime's notices). Shown first, never empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -278,15 +282,33 @@ mod tests {
             title: Some("Weather in Lyon".into()),
             titled_by: Some("agent".into()),
             read: Some(7),
+            home: false,
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
-        // A conversation never read carries no `read`.
+        // Only Home says so.
+        assert!(!String::from_utf8_lossy(&line).contains("home"));
+        let home = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("home.lab.main").unwrap(),
+            agent: "lab/main".into(),
+            title: Some("Home".into()),
+            titled_by: Some("person".into()),
+            read: None,
+            home: true,
+        });
+        let line = encode_line(&Envelope::new(id(), home.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""home":true"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, home);
+        // A conversation never read carries no `read`, and is no Home.
         let unread =
             br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main"}"#;
         assert!(matches!(
             decode_to_device(unread).unwrap().body,
-            ToDevice::Conversation(ConversationInfo { read: None, .. })
+            ToDevice::Conversation(ConversationInfo {
+                read: None,
+                home: false,
+                ..
+            })
         ));
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
     }

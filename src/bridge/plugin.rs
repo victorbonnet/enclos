@@ -55,10 +55,12 @@ pub struct PluginReader {
 }
 
 /// Connects to the plugin at `socket` and opens the connection with
-/// `token`; the plugin answers with its own `hello`.
+/// `token` and the agent's `home` conversation; the plugin answers with its
+/// own `hello`.
 pub fn connect(
     socket: &Path,
     token: &str,
+    home: &str,
 ) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
     let stream = UnixStream::connect(socket).map_err(|source| PluginError::Connect {
         path: socket.display().to_string(),
@@ -69,6 +71,7 @@ pub fn connect(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
+        home: ConversationId::new(home).ok(),
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut reader = PluginReader {
@@ -175,7 +178,8 @@ mod tests {
             let mut lines = BufReader::new(stream);
             let mut line = Vec::new();
             lines.read_until(b'\n', &mut line).unwrap();
-            let FromBridge::Hello { token: given } = decode_from_bridge(&line).unwrap().body else {
+            let FromBridge::Hello { token: given, .. } = decode_from_bridge(&line).unwrap().body
+            else {
                 panic!("not a hello first");
             };
             if given != token {
@@ -230,7 +234,7 @@ mod tests {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
-        let (hello, mut reader, mut writer) = connect(&socket, "t0ken").unwrap();
+        let (hello, mut reader, mut writer) = connect(&socket, "t0ken", "home.lab.main").unwrap();
         assert_eq!(hello.agent, "main");
         assert_eq!(hello.capabilities, [Capability::Notify]);
         let conversation = ConversationId::new("c-1").unwrap();
@@ -270,7 +274,7 @@ mod tests {
         let socket = folder.path().join("main.sock");
         let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
         assert!(matches!(
-            connect(&socket, "other"),
+            connect(&socket, "other", "home.lab.main"),
             Err(PluginError::Refused)
         ));
         plugin.join().unwrap();
@@ -280,7 +284,8 @@ mod tests {
     fn no_plugin_says_where_it_looked() {
         let folder = tempfile::tempdir().unwrap();
         let socket = folder.path().join("main.sock");
-        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken") else {
+        let Err(PluginError::Connect { path, .. }) = connect(&socket, "t0ken", "home.lab.main")
+        else {
             panic!("connected to nothing");
         };
         assert!(path.ends_with("main.sock"));
