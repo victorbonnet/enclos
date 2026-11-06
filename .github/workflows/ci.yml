@@ -202,12 +202,16 @@ jobs:
           python3 -c "import ctypes; print('Landlock ABI', ctypes.CDLL(None).syscall(444, None, 0, 1))"
           echo "apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
       # A test renamed away would leave the filter matching nothing, and
-      # cargo test passing all the same, so the count is checked too.
+      # cargo test passing all the same, so the count is checked too. One of
+      # them runs `policy test` and fails if any probe reads open.
       - name: Sandboxes and sessions under bubblewrap
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 14 passed' bubblewrap.log
+          grep -q 'test result: ok\. 15 passed' bubblewrap.log
+      - name: The escape probes' report
+        if: always()
+        run: cat target/tmp/policy-test-lab.txt || echo "no report: policy test did not run"
 
   libsecret:
     strategy:
