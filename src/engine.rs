@@ -33,6 +33,7 @@ mod state_check;
 mod status;
 #[cfg(test)]
 mod tests;
+mod unenforced;
 
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
@@ -104,6 +105,9 @@ pub struct Engine {
     /// (design §8): set on Linux; none on macOS and in tests, so they never
     /// reach the host's systemd.
     scopes: Option<Scopes>,
+    /// The fields this command accepts running not enforced where the host
+    /// does not enforce them (`--accept-unenforced`, ADR 0038).
+    accepting: Vec<crate::model::unenforced::UnenforcedField>,
 }
 
 /// Stops a session's members within a grace period, reading its cgroup in
@@ -212,6 +216,7 @@ impl Engine {
             stop_members: crate::lifecycle::stop::stop,
             downloader: Box::new(Curl),
             scopes: None,
+            accepting: Vec::new(),
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),

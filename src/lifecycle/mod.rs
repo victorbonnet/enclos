@@ -2,6 +2,7 @@
 
 pub mod bounded;
 pub mod cgroup;
+pub mod controllers;
 pub mod descriptors;
 pub mod listeners;
 pub mod look;

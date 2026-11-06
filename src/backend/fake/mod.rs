@@ -10,6 +10,7 @@ use super::{
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
+use crate::model::unenforced::{NotEnforcedHere, UnenforcedField};
 use crate::probes::{OwnProbes, Refusal, ReportNotes};
 
 /// The variable that tells a program the fake runs whether it was launched
@@ -56,6 +57,8 @@ pub struct FakeBackend {
     probe: Probe,
     /// What `try_run` answers.
     runs: Probe,
+    /// Why the host it stands on does not hold `memory`, if it does not.
+    memory_not_held: Option<String>,
 }
 
 impl FakeBackend {
@@ -65,7 +68,15 @@ impl FakeBackend {
             kind,
             probe: Probe::Available,
             runs: Probe::Available,
+            memory_not_held: None,
         }
+    }
+
+    /// The same fake, on a host that does not hold `memory`, for `why`
+    /// (ADR 0038).
+    pub fn without_memory_controller(mut self, why: &str) -> Self {
+        self.memory_not_held = Some(why.to_owned());
+        self
     }
 
     /// A fake that stands in for `kind`, is there, and refuses to run a
@@ -78,6 +89,7 @@ impl FakeBackend {
             runs: Probe::Unavailable {
                 reason: reason.to_owned(),
             },
+            memory_not_held: None,
         }
     }
 
@@ -91,6 +103,7 @@ impl FakeBackend {
             runs: Probe::Unavailable {
                 reason: reason.to_owned(),
             },
+            memory_not_held: None,
         }
     }
 }
@@ -106,6 +119,17 @@ impl Backend for FakeBackend {
 
     fn try_run(&self) -> Probe {
         self.runs.clone()
+    }
+
+    fn not_enforced_here(&self, policy: &Policy) -> Vec<NotEnforcedHere> {
+        match (&policy.resources.memory, &self.memory_not_held) {
+            (Some(value), Some(why)) => vec![NotEnforcedHere {
+                field: UnenforcedField::Memory,
+                value: value.clone(),
+                why: why.clone(),
+            }],
+            _ => Vec::new(),
+        }
     }
 
     fn capabilities(&self) -> Capabilities {

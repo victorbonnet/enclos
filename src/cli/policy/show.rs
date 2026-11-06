@@ -183,7 +183,9 @@ fn print_rules(policy: &Policy) {
         cpu: _,
     } = r;
     if !r.is_unset() {
-        println!("\nLimits (each process, from its start; memory and CPU share for the sandbox)");
+        println!(
+            "\nLimits (each process, from its start; memory and CPU share for each session as a whole)"
+        );
         if let Some(files) = r.open_files {
             println!("  open files: {files}");
         }
@@ -197,7 +199,7 @@ fn print_rules(policy: &Policy) {
             println!("  memory:     {memory}");
         }
         if let Some(cpu) = &r.cpu {
-            println!("  CPU share:  {cpu}");
+            println!("  CPU share:  {cpu} cores");
         }
     }
     if !policy.secrets.is_empty() || !policy.agent_secrets.is_empty() {

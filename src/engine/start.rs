@@ -23,11 +23,12 @@ use std::time::Duration;
 
 use super::Engine;
 use super::proxy::abandon;
-use crate::backend::Launch;
+use crate::backend::{Launch, LaunchLimits};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::cgroup::{Scope, Scopes, no_systemd_run};
+use crate::lifecycle::cgroup::{Scope, ScopeLimits, Scopes, no_systemd_run};
 use crate::lifecycle::process::{PsError, reference_of_child};
+use crate::model::limits::CpuShare;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
@@ -211,15 +212,31 @@ fn failed_spawn(named: &str, systemd_run: Option<&Path>, e: &io::Error) -> Strin
 
 impl Engine {
     /// `wrapped` as the program of a new scope in sandbox `name`'s slice,
-    /// and that scope, when this engine runs programs in scopes (design §8).
-    /// `Scopes::wrap` keeps only the program, its arguments, environment and
-    /// folder, so anything else is set on what this returns.
-    fn in_scope(&self, name: &SandboxName, wrapped: Command) -> Result<(Command, Option<Scope>)> {
+    /// held to the limits of `limits` a scope holds, and that scope, when
+    /// this engine runs programs in scopes (design §8). With no scope, such
+    /// a limit is refused, so no program runs without it. `Scopes::wrap`
+    /// keeps only the program, its arguments, environment and folder, so
+    /// anything else is set on what this returns.
+    fn in_scope(
+        &self,
+        name: &SandboxName,
+        wrapped: Command,
+        limits: &LaunchLimits,
+    ) -> Result<(Command, Option<Scope>)> {
+        let held = ScopeLimits {
+            memory: limits.memory(),
+            cpu_percent: limits.cpu().map(CpuShare::percent),
+        };
         let Some(scopes) = &self.scopes else {
+            if !held.is_unset() {
+                return Err(Error::Session {
+                    what: "resources.memory and resources.cpu hold a session's scope, and enclos runs none here".into(),
+                });
+            }
             return Ok((wrapped, None));
         };
         let install = self.layout.install_id()?;
-        let (scoped, scope) = scopes.wrap(&install, name.as_str(), &wrapped);
+        let (scoped, scope) = scopes.wrap(&install, name.as_str(), &wrapped, &held);
         Ok((scoped, Some(scope)))
     }
 
@@ -297,7 +314,7 @@ impl Engine {
         for line in backend.said_at_start(&snapshot.policy, &ctx) {
             crate::notes::say(&line);
         }
-        let (mut wrapped, mut scope) = self.in_scope(name, wrapped)?;
+        let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;
         let group = starting.group();
         if group == Group::Own {
             wrapped.process_group(0);

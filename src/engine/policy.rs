@@ -15,6 +15,7 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::model::unenforced::UnenforcedField;
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
@@ -327,6 +328,7 @@ impl Engine {
         validate(policy, &self.validation_context(name))?;
         validate_secrets(policy, name)?;
         validate_resources(policy, backend, crate::backend::max_files_per_process())?;
+        self.accepted_gaps(name, backend, policy, None)?;
         self.check_agent_secrets_delivered(name, policy)?;
         self.check_secrets_set(name, policy)
     }
@@ -361,7 +363,9 @@ impl Engine {
     /// The limits `policy`'s programs run under in sandbox `record`: checked
     /// again against its backend, though stored checked, and against the
     /// hard limits enclos itself runs under, so a session is refused before
-    /// anything runs, naming the limit and how to raise the hard one.
+    /// anything runs, naming the limit and how to raise the hard one. One
+    /// this host does not enforce is left out once accepted, and refused
+    /// before then (ADR 0038).
     pub(super) fn launch_limits(
         &self,
         record: &crate::model::sandbox::SandboxRecord,
@@ -372,10 +376,16 @@ impl Engine {
             record.backend,
             crate::backend::max_files_per_process(),
         )?;
-        let limits =
+        let mut limits =
             LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
         if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });
+        }
+        let start = format!("enclos sandbox start {}", record.name);
+        for gap in self.accepted_gaps(&record.name, record.backend, policy, Some(&start))? {
+            match gap.field {
+                UnenforcedField::Memory => limits = limits.without_memory(),
+            }
         }
         Ok(limits)
     }
@@ -616,12 +626,12 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             now.cpu_seconds.map(|s| format!("{s} s")),
         ),
         (
-            "the sandbox's memory",
+            "the memory of each session",
             was.memory.clone(),
             now.memory.clone(),
         ),
         (
-            "the sandbox's share of the CPU",
+            "the share of the CPU of each session",
             was.cpu.clone(),
             now.cpu.clone(),
         ),

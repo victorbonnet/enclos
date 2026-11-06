@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Capabilities, Enforcement};
 use crate::model::policy::Policy;
+use crate::model::unenforced::{NotEnforcedHere, UnenforcedField};
 
 /// The namespaces bubblewrap makes for each session, a service's included,
 /// inside the namespace holder's user and network namespaces, which the
@@ -67,19 +68,22 @@ impl Landlock {
     }
 }
 
-/// What the backend's capabilities depend on, found on the host (ADR 0037).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the backend's capabilities depend on, found on the host (ADR 0037,
+/// ADR 0038).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     /// The kernel's Landlock ABI, if it has Landlock.
     pub landlock_abi: Option<u32>,
+    /// Why the host's cgroups do not hold a `memory` limit, if they do not.
+    pub memory_not_held: Option<String>,
 }
 
 /// What the backend is built to enforce on `host` (design §5's table): a
 /// declaration the escape probes have yet to show, so nothing reads as
 /// enforced. Landlock missing or too old weakens the file and program rows
 /// (ADR 0037); an older ABI's rights still apply. `listen = false` is not
-/// held (ADR 0041). No limit is set yet, a memory limit included (ADR
-/// 0038).
+/// held (ADR 0041). `memory` is not applied on a host whose cgroups do not
+/// hold it (ADR 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
     let (fs, exec) = match host.landlock_abi {
         Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
@@ -102,8 +106,26 @@ pub fn capabilities(host: &Host) -> Capabilities {
         fs: partial(fs),
         network: partial("through the proxy; `listen = false` is not held"),
         exec: partial(exec),
-        resources: Enforcement::Unsupported,
+        resources: partial(&match &host.memory_not_held {
+            None => "open_files on each process; memory and cpu on each session's cgroup; cpu_seconds and file_size refused; not yet shown by the escape probes".to_owned(),
+            Some(why) => format!(
+                "open_files on each process; cpu on each session's cgroup; memory not applied on this host, as {why}; cpu_seconds and file_size refused; not yet shown by the escape probes"
+            ),
+        }),
         members: partial("a session's cgroup, not yet shown by the escape probes"),
+    }
+}
+
+/// The fields of `policy` that `host` does not enforce, which a sandbox runs
+/// with only once accepted (ADR 0038).
+pub fn not_enforced_here(policy: &Policy, host: &Host) -> Vec<NotEnforcedHere> {
+    match (&policy.resources.memory, &host.memory_not_held) {
+        (Some(value), Some(why)) => vec![NotEnforcedHere {
+            field: UnenforcedField::Memory,
+            value: value.clone(),
+            why: why.clone(),
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -147,6 +169,14 @@ pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
 mod tests {
     use super::*;
 
+    /// A host with this Landlock ABI, whose cgroups hold `memory`.
+    fn host(landlock_abi: Option<u32>) -> Host {
+        Host {
+            landlock_abi,
+            memory_not_held: None,
+        }
+    }
+
     fn partial_note(area: &Enforcement) -> &str {
         match area {
             Enforcement::Partial { note } => note,
@@ -163,7 +193,7 @@ mod tests {
             Some(LANDLOCK_ABI_NEEDED - 1),
             Some(LANDLOCK_ABI_NEEDED),
         ] {
-            let declared = capabilities(&Host { landlock_abi });
+            let declared = capabilities(&host(landlock_abi));
             assert!(
                 partial_note(&declared.fs).contains("not yet shown by the escape probes"),
                 "{landlock_abi:?}"
@@ -192,11 +222,9 @@ mod tests {
 
     #[test]
     fn landlock_missing_or_too_old_declares_the_weaker_controls() {
-        let full = capabilities(&Host {
-            landlock_abi: Some(LANDLOCK_ABI_NEEDED),
-        });
+        let full = capabilities(&host(Some(LANDLOCK_ABI_NEEDED)));
         assert!(partial_note(&full.exec).contains("Landlock's execute rules"));
-        let none = capabilities(&Host { landlock_abi: None });
+        let none = capabilities(&host(None));
         assert!(partial_note(&none.fs).contains("mounts alone"));
         assert!(partial_note(&none.fs).contains("no second layer"));
         assert!(partial_note(&none.exec).contains("no Landlock"));
@@ -207,7 +235,7 @@ mod tests {
     #[test]
     fn an_older_landlock_abi_is_not_declared_as_no_landlock() {
         for landlock_abi in [Some(1), Some(LANDLOCK_ABI_NEEDED - 1)] {
-            let older = capabilities(&Host { landlock_abi });
+            let older = capabilities(&host(landlock_abi));
             assert!(partial_note(&older.fs).contains("what this ABI has"));
             assert!(!partial_note(&older.fs).contains("no second layer"));
             assert!(partial_note(&older.exec).contains("older ABI"));
@@ -216,9 +244,42 @@ mod tests {
     }
 
     #[test]
-    fn no_limit_is_declared_before_the_backend_sets_one() {
-        let declared = capabilities(&Host { landlock_abi: None });
-        assert_eq!(declared.resources, Enforcement::Unsupported);
+    fn the_limits_are_declared_with_memory_where_the_host_holds_it() {
+        let held = capabilities(&host(None));
+        let note = partial_note(&held.resources);
+        assert!(
+            note.contains("memory and cpu on each session's cgroup"),
+            "{note}"
+        );
+        assert!(
+            note.contains("not yet shown by the escape probes"),
+            "{note}"
+        );
+        let pi = Host {
+            memory_not_held: Some("this host's kernel has no memory controller".to_owned()),
+            ..host(None)
+        };
+        let declared = capabilities(&pi);
+        let note = partial_note(&declared.resources);
+        assert!(note.contains("memory not applied on this host"), "{note}");
+        assert!(note.contains("no memory controller"), "{note}");
+    }
+
+    #[test]
+    fn memory_is_not_enforced_only_where_set_and_the_host_does_not_hold_it() {
+        let pi = Host {
+            memory_not_held: Some("no memory controller".to_owned()),
+            ..host(None)
+        };
+        let mut policy = Policy::default();
+        assert!(not_enforced_here(&policy, &pi).is_empty());
+        policy.resources.memory = Some("1G".to_owned());
+        assert!(not_enforced_here(&policy, &host(None)).is_empty());
+        let gaps = not_enforced_here(&policy, &pi);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].field, UnenforcedField::Memory);
+        assert_eq!(gaps[0].value, "1G");
+        assert_eq!(gaps[0].why, "no memory controller");
     }
 
     #[test]

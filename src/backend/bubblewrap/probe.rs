@@ -114,6 +114,15 @@ pub(super) fn landlock_abi() -> Option<u32> {
     None
 }
 
+/// Why this host's cgroups do not hold a `memory` limit for this user, or
+/// none when they do (ADR 0038).
+pub(super) fn memory_not_held() -> Option<String> {
+    crate::lifecycle::controllers::memory_not_held(
+        crate::lifecycle::cgroup::Hierarchy::host().root(),
+        rustix::process::getuid().as_raw(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

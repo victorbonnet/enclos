@@ -144,13 +144,17 @@ pub struct Launch {
     pub reads: Vec<PathBuf>,
 }
 
-/// The limits a program runs under, as a backend sets them: only those a
-/// backend enforces as written, `open_files` for now (design §7, ADR 0033).
-/// The engine makes them from a policy's `[resources]` once checked for the
-/// sandbox's backend, so a limit nothing enforces never reaches a program.
+/// The limits a program runs under: only those a backend enforces as
+/// written (design §7, ADR 0033). `open_files` holds each process, and the
+/// backend sets it; `memory` and `cpu` hold the session's cgroup, and the
+/// engine sets them on the session's scope. The engine makes them from a
+/// policy's `[resources]` once checked for the sandbox's backend, so a limit
+/// nothing enforces never reaches a program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchLimits {
     open_files: Option<u64>,
+    memory: Option<u64>,
+    cpu: Option<crate::model::limits::CpuShare>,
 }
 
 impl LaunchLimits {
@@ -169,19 +173,45 @@ impl LaunchLimits {
             memory,
             cpu,
         } = resources;
-        if file_size.is_some() || cpu_seconds.is_some() || memory.is_some() || cpu.is_some() {
+        if file_size.is_some() || cpu_seconds.is_some() {
             return Err(format!(
                 "a limit no backend enforces reached a launch: {resources:?}"
             ));
         }
         Ok(LaunchLimits {
             open_files: *open_files,
+            memory: match memory {
+                Some(written) => Some(crate::model::limits::memory(written)?.0),
+                None => None,
+            },
+            cpu: cpu.as_deref().map(str::parse).transpose()?,
         })
+    }
+
+    /// These limits with `memory` left out, for a host that does not hold
+    /// it, where the user accepted that it is not applied (ADR 0038).
+    pub(crate) fn without_memory(self) -> LaunchLimits {
+        LaunchLimits {
+            memory: None,
+            ..self
+        }
     }
 
     /// The file descriptors a process may hold, if limited.
     pub fn open_files(&self) -> Option<u64> {
         self.open_files
+    }
+
+    /// The bytes of memory the session's processes may use together, with
+    /// no swap beyond it, if limited.
+    pub fn memory(&self) -> Option<u64> {
+        self.memory
+    }
+
+    /// The share of the CPU the session's processes may use together, if
+    /// limited.
+    pub fn cpu(&self) -> Option<crate::model::limits::CpuShare> {
+        self.cpu
     }
 }
 
@@ -189,9 +219,9 @@ impl LaunchLimits {
 /// `/bin/bash` sets them with `ulimit`, hard and soft alike, so no process
 /// in the sandbox without root can raise them, then becomes the program;
 /// one it cannot set stops it with exit 125 and the field named, so no
-/// program runs without its limits. Only `open_files` is set: Seatbelt
-/// refuses the others (ADR 0033), and bubblewrap enforces no limit yet,
-/// so every one is refused there. In privileged mode (`-p`), as it runs on
+/// program runs without its limits. Only `open_files` is set here: Seatbelt
+/// refuses the others (ADR 0033), and on bubblewrap `memory` and `cpu` hold
+/// the session's scope, not each process. In privileged mode (`-p`), as it runs on
 /// the host with the sandbox's variables: it then reads no `BASH_ENV` or
 /// `ENV` file, no `SHELLOPTS` and no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`
@@ -305,6 +335,16 @@ pub trait Backend {
     /// each: a field it does not hold, which the policy still runs with.
     /// Nothing by default.
     fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
+        Vec::new()
+    }
+    /// The fields of `policy` this host does not enforce, though the
+    /// backend holds them where the host has what they need (ADR 0038): a
+    /// sandbox runs with one only once the user accepted it. None by
+    /// default.
+    fn not_enforced_here(
+        &self,
+        _policy: &Policy,
+    ) -> Vec<crate::model::unenforced::NotEnforcedHere> {
         Vec::new()
     }
     /// Its escape probes and refusals for a sandbox whose compiled policy
