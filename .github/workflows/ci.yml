@@ -54,6 +54,29 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked --all-features
+      - name: LOOP (to drop) the loopback port test on a crowded 127.0.0.1, then the library tests
+        if: runner.os == 'Linux'
+        run: |
+          python3 -I ci-loop/v6_port_held_on_v4.py 1000 10000
+          bin=$(cargo test --locked --all-features --lib --no-run 2>&1 | sed -n 's/.*(\(target\/debug\/deps\/enclos-[0-9a-f]*\)).*/\1/p' | head -1)
+          python3 -I ci-loop/crowd.py 3000 &
+          crowd=$!
+          sleep 3
+          for t in a_port_taken_on_either_loopback_unfixed a_port_taken_on_either_loopback_is_listened_on_by_neither; do
+            fails=0
+            for i in $(seq 1 300); do
+              if ! "$bin" --exact "proxy::tests::$t" -q > loop-out.txt 2>&1; then
+                fails=$((fails + 1))
+                grep -m1 -A1 panicked loop-out.txt | cut -c1-300 || true
+              fi
+            done
+            echo "== $t: $fails of 300 runs failed, 3000 listeners held on 127.0.0.1"
+          done
+          kill "$crowd"
+          for i in $(seq 1 8); do
+            echo "== round $i"
+            cargo test --locked --all-features --lib 2>&1 | grep -E -A1 "FAILED|panicked|test result" | cut -c1-400 || true
+          done
       # A release build refuses the comparison baseline (ADR 0006): checked
       # on every change, not only when a tag is pushed.
       - name: A release refuses the comparison baseline
