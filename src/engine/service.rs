@@ -119,6 +119,15 @@ impl Engine {
         self.logs_dir(name).join(format!("{}.log", unit.as_str()))
     }
 
+    /// Makes the folder of the sandbox's logs, which a service's unit
+    /// appends to: the service manager makes no folder, and does not start
+    /// a unit whose log it cannot open.
+    pub(super) fn create_logs_dir(&self, name: &SandboxName) -> Result<()> {
+        let logs = self.logs_dir(name);
+        std::fs::create_dir_all(&logs).map_err(|source| LayoutError::Io { path: logs, source })?;
+        Ok(())
+    }
+
     /// The proxy's log, whether the service manager or a session started
     /// it, so that `enclos logs` shows it either way.
     pub(super) fn proxy_log(&self, name: &SandboxName) -> PathBuf {
@@ -265,9 +274,7 @@ impl Engine {
                         .map(|unit| self.service_unit(&record, unit, &store_env))
                         .filter(|unit| !matches!(unit, Ok(u) if Some(&u.label) == kept))
                         .collect::<Result<Vec<ServiceUnit>>>()?;
-                    let logs = self.logs_dir(name);
-                    std::fs::create_dir_all(&logs)
-                        .map_err(|source| LayoutError::Io { path: logs, source })?;
+                    self.create_logs_dir(name)?;
                     // A proxy `connect` started would hold the port the
                     // service needs, and what a runtime service left running
                     // would run beside the new one.
