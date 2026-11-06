@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+mod limits;
+
 /// One sandbox at a time: each `ENCLOS_HOME` would give its first sandbox
 /// the same proxy port.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
