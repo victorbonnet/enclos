@@ -196,4 +196,4 @@ def register(ctx) -> None:
         cron_deliver_env_var="MOBILE_APP_HOME_CHANNEL",
         allow_all_env="MOBILE_APP_ALLOW_ALL",
         emoji="📱",
-        platform_hint="You are talking with the user through the enclos mobile app, on their phone.")
+        platform_hint=protocol.PLATFORM_HINT)
