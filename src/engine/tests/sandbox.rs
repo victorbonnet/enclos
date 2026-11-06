@@ -2,6 +2,7 @@
 
 use super::policy::with_sandbox_on;
 use super::*;
+use crate::backend::Backend;
 use crate::engine::SandboxSpec;
 use crate::lifecycle::process::reference;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
@@ -276,6 +277,17 @@ fn rm_records_the_end_of_sessions_gone_after_a_crash_and_removes_the_sandbox() {
 /// Another engine on `engine`'s folder, on which the sandboxes' backend
 /// no longer runs: whatever starts a session fails half-way.
 pub(super) fn without_backend(engine: &Engine) -> Engine {
+    with_backends(
+        engine,
+        vec![Box::new(FakeBackend::unavailable(
+            BackendKind::Seatbelt,
+            "taken away by the test",
+        ))],
+    )
+}
+
+/// Another engine on `engine`'s folder, with these backends.
+pub(super) fn with_backends(engine: &Engine, backends: Vec<Box<dyn Backend>>) -> Engine {
     let layout = engine.layout.clone();
     Engine::new(
         layout.clone(),
@@ -284,10 +296,7 @@ pub(super) fn without_backend(engine: &Engine) -> Engine {
             layout.state_lock(),
         )),
         Box::new(JsonlAuditLog::new(layout.audit_log())),
-        vec![Box::new(FakeBackend::unavailable(
-            BackendKind::Seatbelt,
-            "taken away by the test",
-        ))],
+        backends,
     )
 }
 

@@ -1,9 +1,11 @@
 //! The Seatbelt backend: macOS's sandbox, through `sandbox-exec` (ADR 0005).
 //! Policies compile on the `(deny default)` baseline (ADR 0006); the
-//! `(allow default)` one milestone 1 used is kept only so tests can compare
-//! the two baselines.
+//! `(allow default)` one is kept only so tests can compare the two.
 
 mod compile;
+pub mod probes;
+#[cfg(test)]
+mod probes_snapshot;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 mod wrap;
@@ -11,11 +13,13 @@ mod wrap;
 use std::path::Path;
 use std::process::Command;
 
+use self::probes::SeatbeltProbes;
 use super::{
     Backend, Capabilities, CompileError, Compiled, Enforcement, Launch, Probe, SandboxContext,
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
+use crate::probes::OwnProbes;
 
 pub use compile::{BASELINE_VAR, Baseline, tag};
 
@@ -126,5 +130,17 @@ impl Backend for Seatbelt {
             say_allow_default(ctx);
         }
         wrap::wrap(compiled, ctx, launch)
+    }
+
+    /// On the baseline `compiled` says, and on a dry run, where it changes
+    /// only what closes a probe, the default.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
+        let baseline = match compiled {
+            Some(text) => Baseline::of_compiled(text).ok_or(
+                "names no baseline enclos writes, though enclos just wrote it: a bug of enclos, or the file was edited meanwhile",
+            )?,
+            None => Baseline::default(),
+        };
+        Ok(Box::new(SeatbeltProbes::on(baseline)))
     }
 }

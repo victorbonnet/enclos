@@ -1,7 +1,9 @@
 //! Compiling a sandbox's active policy into the sandbox's folder.
 
 use super::policy::with_sandbox_on;
+use super::sandbox::{with_backends, without_backend};
 use super::*;
+use crate::probes::OwnProbes as _;
 
 #[test]
 fn the_active_policy_compiles_once_into_the_sandbox_folder() {
@@ -140,14 +142,7 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
     grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
     let ctx = engine.sandbox_context(&name, 41001);
     let inputs = engine
-        .probe_inputs(
-            &name,
-            &ctx,
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-        )
+        .probe_inputs(&name, &ctx, None, None, Default::default())
         .unwrap();
     let home = ctx.home.canonicalize().unwrap();
     assert_eq!(inputs.home, home);
@@ -155,7 +150,10 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
         inputs.workspaces,
         [user.join("a"), user.join("b"), user.join("later")]
     );
-    let names: Vec<String> = crate::probes::probes(&inputs)
+    let own = crate::backend::seatbelt::probes::SeatbeltProbes::on(
+        crate::backend::seatbelt::Baseline::DenyDefault,
+    );
+    let names: Vec<String> = crate::probes::probes(&inputs, &own)
         .into_iter()
         .filter(|p| p.route == "writable folders")
         .map(|p| p.name)
@@ -170,12 +168,102 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
             rename(&user.join("b")),
         ]
     );
-    let missing = crate::probes::missing_workspaces(&inputs);
+    let missing = own.folders_not_run(&inputs);
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].name, rename(&user.join("later")));
     assert!(
         matches!(&missing[0].outcome, crate::probes::Outcome::NotRun(why) if why.contains("create it on the host"))
     );
+    // A backend with no such probe has none to call not run, which would
+    // fail its test.
+    let fake = FakeBackend::available(BackendKind::Seatbelt)
+        .own_probes(None)
+        .unwrap();
+    assert!(fake.folders_not_run(&inputs).is_empty());
+}
+
+/// A dry run asks nothing of the host, so a backend this host cannot run
+/// still counts its probes; one not in this build has none to count.
+#[test]
+fn a_policy_test_dry_run_counts_on_an_unavailable_backend_and_needs_it_in_the_build() {
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let unavailable = without_backend(&engine);
+    let Planned::DryRun(plan) = unavailable
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.starts_with("run ") && c.contains(" escape probes in sandbox home ")),
+        "{:?}",
+        plan.changes
+    );
+    let not_in_this_build = with_backends(&engine, Vec::new());
+    let err = not_in_this_build
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::BackendUnavailable { reason, .. } if reason.contains("does not include it")),
+        "{err}"
+    );
+}
+
+/// A backend with no probes of its own runs the shared set through its
+/// `wrap`: the fake holds nothing back, so a write and a signal get out
+/// and read open, on what the host sees.
+#[test]
+fn a_fake_backend_s_probes_run_through_the_shared_set() {
+    use crate::backend::{Launch, LaunchLimits};
+    use crate::probes::{Outcome, probes};
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let backend = engine.backend_of(&name).unwrap();
+    let own = backend.own_probes(Some("fake policy for home\n")).unwrap();
+    assert_eq!(own.notes().baseline_key, None);
+    assert_eq!(own.notes().comparison, None);
+    // This test's own child, the signal probe's target.
+    let mut target = std::process::Command::new("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let ctx = engine.sandbox_context(&name, 41001);
+    let inputs = engine
+        .probe_inputs(
+            &name,
+            &ctx,
+            Some(target.id()),
+            None,
+            LaunchLimits::default(),
+        )
+        .unwrap();
+    let list = probes(&inputs, own.as_ref());
+    assert!(own.host_services(&inputs).is_empty());
+    for route in ["writes", "signals"] {
+        let probe = list.iter().find(|p| p.route == route).unwrap();
+        let got = crate::engine::probe::run_probe(
+            probe,
+            |script| {
+                let launch = Launch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    env: Vec::new(),
+                    in_terminal: false,
+                    service_port: None,
+                    limits: LaunchLimits::default(),
+                };
+                backend
+                    .wrap(std::path::Path::new("unused"), &ctx, &launch)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+            },
+            &mut target,
+        );
+        assert!(matches!(got, Outcome::Open(_)), "{route}: {got:?}");
+    }
+    let _ = target.kill();
+    let _ = target.wait();
 }
 
 #[test]

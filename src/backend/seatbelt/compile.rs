@@ -112,8 +112,8 @@ impl Baseline {
     }
 }
 
-/// Device files every runtime writes to (shown by the prototype: shells,
-/// Python, Node and Hermes). `/dev/tty` is the terminal a session runs in,
+/// Device files every runtime writes to (shells, Python, Node and Hermes
+/// each do). `/dev/tty` is the terminal a session runs in,
 /// whatever its name; terminal devices by name are in [`TERMINALS`].
 const DEVICES: &[&str] = &[
     "(literal \"/dev/null\")",

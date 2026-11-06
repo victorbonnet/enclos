@@ -16,6 +16,7 @@ use std::process::Command;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::probes::OwnProbes;
 
 /// Whether a backend can run on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +261,10 @@ pub trait Backend {
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
     /// The command that runs `launch` inside the sandbox under `compiled`.
     fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
+    /// Its escape probes and refusals for a sandbox whose compiled policy
+    /// has the text `compiled`; `None` on a dry run, which compiles nothing.
+    /// Fails, saying why, on a text this backend did not compile.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;
 }
 
 /// Every backend this build of enclos ships, in order of preference.

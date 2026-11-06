@@ -1,0 +1,427 @@
+## deny default
+sensitive files | read <dir>/user/.ssh
+  script: /bin/ls '<dir>/user/.ssh' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.ssh' >/dev/null
+sensitive files | read <dir>/user/work/.secrets
+  script: /bin/ls '<dir>/user/work/.secrets' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/work/.secrets' >/dev/null
+sensitive files | read <dir>/user/work/.env
+  script: /usr/bin/head -c 1 '<dir>/user/work/.env' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/work/.env' >/dev/null
+sensitive files | write <dir>/user/work/.secrets, under a write grant
+  script: echo x > '<dir>/user/work/.secrets/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/work/.secrets'
+  host: the file <dir>/user/work/.secrets/enclos-probe-7
+sensitive files | write <dir>/user/work/.env, under a write grant
+  script: true >> '<dir>/user/work/.env'
+  proof: fails
+  control: test -f '<dir>/user/work/.env' && true >> '<dir>/user/work/.env'
+renames | rename <dir>/user/.enclos/sandboxes/home/home
+  script: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+clones | clone <dir>/user/.enclos/sandboxes/home/home
+  script: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+renames | rename <dir>/user/work
+  script: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+clones | clone <dir>/user/work
+  script: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+enclos files | read <dir>/user/.enclos/state.db
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/state.db' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/state.db' >/dev/null
+enclos files | read <dir>/user/.enclos/state.lock
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/state.lock' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/state.lock' >/dev/null
+enclos files | read <dir>/user/.enclos/audit.jsonl
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/audit.jsonl' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/audit.jsonl' >/dev/null
+enclos files | read <dir>/user/.enclos/config.toml
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/config.toml' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/config.toml' >/dev/null
+enclos files | read <dir>/user/.enclos/run
+  script: /bin/ls '<dir>/user/.enclos/run' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.enclos/run' >/dev/null
+other sandboxes | read <dir>/user/.enclos/sandboxes/lab
+  script: /bin/ls '<dir>/user/.enclos/sandboxes/lab' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.enclos/sandboxes/lab' >/dev/null
+other sandboxes | write in <dir>/user/.enclos/sandboxes/lab/home
+  script: echo x > '<dir>/user/.enclos/sandboxes/lab/home/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos/sandboxes/lab/home'
+  host: the file <dir>/user/.enclos/sandboxes/lab/home/enclos-probe-7
+enclos files | write in the enclos folder
+  script: echo x > '<dir>/user/.enclos/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos'
+  host: the file <dir>/user/.enclos/enclos-probe-7
+enclos files | create the sandbox's own policy.toml
+  script: echo x > '<dir>/user/.enclos/sandboxes/home/policy.toml'
+  proof: fails
+  control: test -w '<dir>/user/.enclos/sandboxes/home'
+  host: the file <dir>/user/.enclos/sandboxes/home/policy.toml
+enclos files | write in the sandbox's own compiled folder
+  script: echo x > '<dir>/user/.enclos/sandboxes/home/compiled/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos/sandboxes/home/compiled'
+  host: the file <dir>/user/.enclos/sandboxes/home/compiled/enclos-probe-7
+writes | write outside the home
+  script: echo x > '<dir>/user/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user'
+  host: the file <dir>/user/enclos-probe-7
+writable folders | remove the sandbox home
+  script: /bin/mkdir -p '<dir>/user/.enclos/sandboxes/home/home/tmp' 2>/dev/null || { echo 'could not prepare the probe'; exit 2; }; out=$(/bin/rmdir '<dir>/user/.enclos/sandboxes/home/home' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: /bin/mkdir -p '<dir>/user/.enclos/sandboxes/home/home/tmp' 2>/dev/null || { echo 'could not prepare the probe'; exit 2; }; out=$(/bin/rmdir '<dir>/user/.enclos/sandboxes/home/home' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+writable folders | rename <dir>/user/.enclos/sandboxes/home/home
+  script: out=$(/bin/mv '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: out=$(/bin/mv '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+writable folders | rename <dir>/user/work
+  script: out=$(/bin/mv '<dir>/user/work' '<dir>/user/work/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: out=$(/bin/mv '<dir>/user/work' '<dir>/user/work/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+network | an unlisted port through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://probe.enclos.invalid:8443/
+  proof: the proxy refuses
+network | loopback through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://127.0.0.1/
+  proof: the proxy refuses
+network | the cloud metadata address through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://169.254.169.254/
+  proof: the proxy refuses
+network | a private address through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://10.0.0.1/
+  proof: the proxy refuses
+network | a direct connection, around the proxy
+  script: /usr/bin/nc -z -w 3 1.1.1.1 443
+  proof: fails
+  control: /usr/bin/nc -z -w 3 1.1.1.1 443
+network | the proxy port on IPv6 loopback reaches only the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' --proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/; echo " $?"
+  proof: only the proxy
+  control: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' --proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/; echo " $?"
+network | bind a TCP port on 127.0.0.1
+  script: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, sockaddr_in(0, inet_aton("127.0.0.1"))) or die "bind: $!\n"'
+  proof: fails with bind: Operation not permitted
+  control: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, sockaddr_in(0, inet_aton("127.0.0.1"))) or die "bind: $!\n"'
+network | bind a TCP port on [::1]
+  script: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET6, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, pack_sockaddr_in6(0, inet_pton(AF_INET6, "::1"))) or die "bind: $!\n"'
+  proof: fails with bind: Operation not permitted
+  control: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET6, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, pack_sockaddr_in6(0, inet_pton(AF_INET6, "::1"))) or die "bind: $!\n"'
+dns | DNS on port 53
+  script: /usr/bin/nc -z -w 3 1.1.1.1 53
+  proof: fails
+  control: /usr/bin/nc -z -w 3 1.1.1.1 53
+dns | a name lookup through mDNSResponder
+  script: /usr/bin/dscacheutil -q host -a name example.com
+  proof: output lacks address
+  control: /usr/bin/dscacheutil -q host -a name example.com | /usr/bin/grep -q address
+host sockets | connect to <dir>/user/agent.sock
+  script: /usr/bin/nc -U -w 2 '<dir>/user/agent.sock' </dev/null
+  proof: fails
+  control: /usr/bin/nc -U -w 2 '<dir>/user/agent.sock' </dev/null
+signals | signal a process outside the sandbox
+  script: kill -TERM 4242
+  proof: fails
+  control: kill -0 4242
+  host: the signal probe's target
+terminals | open a terminal that is not the session's, to read
+  script: : < '/dev/ttys042'
+  proof: fails with Operation not permitted
+  control: : < '/dev/ttys042'
+terminals | open a terminal that is not the session's, to write
+  script: : >> '/dev/ttys042'
+  proof: fails with Operation not permitted
+  control: : >> '/dev/ttys042'
+keychain | read the login keychain's settings
+  script: /usr/bin/security show-keychain-info '<dir>/user/Library/Keychains/login.keychain-db' >/dev/null 2>&1
+  proof: fails
+  control: /usr/bin/security show-keychain-info '<dir>/user/Library/Keychains/login.keychain-db' >/dev/null 2>&1
+resources | have a hard limit above 256 open files
+  script: v=$(ulimit -Hn); case "$v" in unlimited) exit 0 ;; ''|*[!0-9]*) echo "unreadable limit: $v"; exit 0 ;; esac; test "$v" -gt 256
+  proof: fails
+  control: v=$(ulimit -Hn); case "$v" in unlimited) exit 0 ;; ''|*[!0-9]*) echo "unreadable limit: $v"; exit 0 ;; esac; test "$v" -gt 256
+keychain | read a keychain item
+  script: /usr/bin/security find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w '<dir>/user/probe.keychain-db' 2>/dev/null
+  proof: output lacks 656e636c6f732d70726f6265
+  control: /usr/bin/security find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w '<dir>/user/probe.keychain-db' 2>/dev/null | /usr/bin/grep -q 656e636c6f732d70726f6265
+pasteboard | read the pasteboard
+  script: /usr/bin/pbpaste >/dev/null
+  proof: fails
+  control: /usr/bin/pbpaste >/dev/null
+crontab | read the crontab
+  script: /usr/bin/crontab -l >/dev/null
+  proof: fails with /usr/bin/crontab: Operation not permitted
+  control: /usr/bin/crontab -l >/dev/null
+  closed by: seatbelt: Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested
+at | list the `at` queue
+  script: /usr/bin/atq >/dev/null
+  proof: fails with /usr/bin/atq: Operation not permitted
+  control: /usr/bin/atq >/dev/null
+  closed by: seatbelt: Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested
+### host services
+launchservices | open a folder through LaunchServices
+  script: /usr/bin/open -g /System
+  proof: fails with Code=-10661
+  control: /usr/bin/pgrep -x Finder >/dev/null
+  closed by: baseline: on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes
+apple events | send an Apple Event to Finder
+  script: /usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application "Finder" to count windows' -e 'end timeout'
+  proof: apple event blocked: application "Finder". (-1728)
+  control: /usr/bin/pgrep -x Finder >/dev/null
+  closed by: baseline: on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes
+launchd | submit a launchd job
+  script: /bin/launchctl submit -l org.enclos.probe.7 -- /usr/bin/true
+  proof: fails
+  control: /bin/launchctl print gui/$(/usr/bin/id -u) >/dev/null 2>&1
+  host: the launchd job org.enclos.probe.7
+preferences | write preferences through cfprefsd
+  script: /usr/bin/defaults write org.enclos.probe.7 probe -string written
+  proof: fails
+  control: /usr/bin/defaults domains >/dev/null 2>&1
+  host: the preferences domain org.enclos.probe.7
+launch agents | write in ~/Library/LaunchAgents
+  script: echo x > '<dir>/user/Library/LaunchAgents/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/Library/LaunchAgents'
+  host: the file <dir>/user/Library/LaunchAgents/enclos-probe-7
+### not here
+1 of the 5 denied sensitive paths (they do not exist here)
+denied paths that are neither a file nor a folder, which a probe could wait on: <dir>/user/work/pipe
+renames and clones of 1 of the 3 folders that cannot move (they are not folders here)
+## allow default, listening
+sensitive files | read <dir>/user/.ssh
+  script: /bin/ls '<dir>/user/.ssh' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.ssh' >/dev/null
+sensitive files | read <dir>/user/work/.secrets
+  script: /bin/ls '<dir>/user/work/.secrets' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/work/.secrets' >/dev/null
+sensitive files | read <dir>/user/work/.env
+  script: /usr/bin/head -c 1 '<dir>/user/work/.env' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/work/.env' >/dev/null
+sensitive files | write <dir>/user/work/.secrets, under a write grant
+  script: echo x > '<dir>/user/work/.secrets/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/work/.secrets'
+  host: the file <dir>/user/work/.secrets/enclos-probe-7
+sensitive files | write <dir>/user/work/.env, under a write grant
+  script: true >> '<dir>/user/work/.env'
+  proof: fails
+  control: test -f '<dir>/user/work/.env' && true >> '<dir>/user/work/.env'
+renames | rename <dir>/user/.enclos/sandboxes/home/home
+  script: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+clones | clone <dir>/user/.enclos/sandboxes/home/home
+  script: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-7'
+renames | rename <dir>/user/work
+  script: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (rename($ARGV[0], $ARGV[1])) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+clones | clone <dir>/user/work
+  script: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 0 } die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+  proof: into itself
+  control: /usr/bin/perl -e 'if (syscall(462, -2, $ARGV[0], -2, $ARGV[1], 0) == 0) { print "it succeeded, so $ARGV[1] may now exist\n"; exit 1 } exit 0 if $!{EINVAL}; die "$!\n"' '<dir>/user/work' '<dir>/user/work/enclos-probe-7'
+enclos files | read <dir>/user/.enclos/state.db
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/state.db' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/state.db' >/dev/null
+enclos files | read <dir>/user/.enclos/state.lock
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/state.lock' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/state.lock' >/dev/null
+enclos files | read <dir>/user/.enclos/audit.jsonl
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/audit.jsonl' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/audit.jsonl' >/dev/null
+enclos files | read <dir>/user/.enclos/config.toml
+  script: /usr/bin/head -c 1 '<dir>/user/.enclos/config.toml' >/dev/null
+  proof: fails
+  control: /usr/bin/head -c 1 '<dir>/user/.enclos/config.toml' >/dev/null
+enclos files | read <dir>/user/.enclos/run
+  script: /bin/ls '<dir>/user/.enclos/run' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.enclos/run' >/dev/null
+other sandboxes | read <dir>/user/.enclos/sandboxes/lab
+  script: /bin/ls '<dir>/user/.enclos/sandboxes/lab' >/dev/null
+  proof: fails
+  control: /bin/ls '<dir>/user/.enclos/sandboxes/lab' >/dev/null
+other sandboxes | write in <dir>/user/.enclos/sandboxes/lab/home
+  script: echo x > '<dir>/user/.enclos/sandboxes/lab/home/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos/sandboxes/lab/home'
+  host: the file <dir>/user/.enclos/sandboxes/lab/home/enclos-probe-7
+enclos files | write in the enclos folder
+  script: echo x > '<dir>/user/.enclos/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos'
+  host: the file <dir>/user/.enclos/enclos-probe-7
+enclos files | write the sandbox's own policy.toml
+  script: true >> '<dir>/user/.enclos/sandboxes/home/policy.toml'
+  proof: fails
+  control: test -f '<dir>/user/.enclos/sandboxes/home/policy.toml' && true >> '<dir>/user/.enclos/sandboxes/home/policy.toml'
+enclos files | write in the sandbox's own compiled folder
+  script: echo x > '<dir>/user/.enclos/sandboxes/home/compiled/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/.enclos/sandboxes/home/compiled'
+  host: the file <dir>/user/.enclos/sandboxes/home/compiled/enclos-probe-7
+writes | write outside the home
+  script: echo x > '<dir>/user/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user'
+  host: the file <dir>/user/enclos-probe-7
+writable folders | remove the sandbox home
+  script: /bin/mkdir -p '<dir>/user/.enclos/sandboxes/home/home/tmp' 2>/dev/null || { echo 'could not prepare the probe'; exit 2; }; out=$(/bin/rmdir '<dir>/user/.enclos/sandboxes/home/home' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: /bin/mkdir -p '<dir>/user/.enclos/sandboxes/home/home/tmp' 2>/dev/null || { echo 'could not prepare the probe'; exit 2; }; out=$(/bin/rmdir '<dir>/user/.enclos/sandboxes/home/home' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+writable folders | rename <dir>/user/.enclos/sandboxes/home/home
+  script: out=$(/bin/mv '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: out=$(/bin/mv '<dir>/user/.enclos/sandboxes/home/home' '<dir>/user/.enclos/sandboxes/home/home/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+writable folders | rename <dir>/user/work
+  script: out=$(/bin/mv '<dir>/user/work' '<dir>/user/work/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac; echo "the policy let it through: $out"
+  proof: fails with Operation not permitted
+  control: out=$(/bin/mv '<dir>/user/work' '<dir>/user/work/enclos-probe-moved' 2>&1); case "$out" in *'Operation not permitted'*) echo "$out"; exit 1;; esac
+network | an unlisted port through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://probe.enclos.invalid:8443/
+  proof: the proxy refuses
+network | loopback through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://127.0.0.1/
+  proof: the proxy refuses
+network | the cloud metadata address through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://169.254.169.254/
+  proof: the proxy refuses
+network | a private address through the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' https://10.0.0.1/
+  proof: the proxy refuses
+network | a direct connection, around the proxy
+  script: /usr/bin/nc -z -w 3 1.1.1.1 443
+  proof: fails
+  control: /usr/bin/nc -z -w 3 1.1.1.1 443
+network | the proxy port on IPv6 loopback reaches only the proxy
+  script: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' --proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/; echo " $?"
+  proof: only the proxy
+  control: /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 15 --noproxy '' --proxy 'http://[::1]:41001' https://probe.enclos.invalid:8443/; echo " $?"
+network | bind the sandbox's proxy port, 41001, on 127.0.0.1
+  script: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, sockaddr_in(41001, inet_aton("127.0.0.1"))) or die "bind: $!\n"'
+  proof: fails with bind: Operation not permitted
+  control: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, sockaddr_in(0, inet_aton("127.0.0.1"))) or die "bind: $!\n"'
+network | bind the sandbox's proxy port, 41001, on [::1]
+  script: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET6, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, pack_sockaddr_in6(41001, inet_pton(AF_INET6, "::1"))) or die "bind: $!\n"'
+  proof: fails with bind: Operation not permitted
+  control: /usr/bin/perl -MSocket=:all -e 'socket(my $s, AF_INET6, SOCK_STREAM, 0) or die "socket: $!\n"; bind($s, pack_sockaddr_in6(0, inet_pton(AF_INET6, "::1"))) or die "bind: $!\n"'
+dns | DNS on port 53
+  script: /usr/bin/nc -z -w 3 1.1.1.1 53
+  proof: fails
+  control: /usr/bin/nc -z -w 3 1.1.1.1 53
+dns | a name lookup through mDNSResponder
+  script: /usr/bin/dscacheutil -q host -a name example.com
+  proof: output lacks address
+  control: /usr/bin/dscacheutil -q host -a name example.com | /usr/bin/grep -q address
+host sockets | connect to <dir>/user/agent.sock
+  script: /usr/bin/nc -U -w 2 '<dir>/user/agent.sock' </dev/null
+  proof: fails
+  control: /usr/bin/nc -U -w 2 '<dir>/user/agent.sock' </dev/null
+signals | signal a process outside the sandbox
+  script: kill -TERM 4242
+  proof: fails
+  control: kill -0 4242
+  host: the signal probe's target
+terminals | open a terminal that is not the session's, to read
+  script: : < '/dev/ttys042'
+  proof: fails with Operation not permitted
+  control: : < '/dev/ttys042'
+terminals | open a terminal that is not the session's, to write
+  script: : >> '/dev/ttys042'
+  proof: fails with Operation not permitted
+  control: : >> '/dev/ttys042'
+keychain | read the login keychain's settings
+  script: /usr/bin/security show-keychain-info '<dir>/user/Library/Keychains/login.keychain-db' >/dev/null 2>&1
+  proof: fails
+  control: /usr/bin/security show-keychain-info '<dir>/user/Library/Keychains/login.keychain-db' >/dev/null 2>&1
+resources | have a hard limit above 256 open files
+  script: v=$(ulimit -Hn); case "$v" in unlimited) exit 0 ;; ''|*[!0-9]*) echo "unreadable limit: $v"; exit 0 ;; esac; test "$v" -gt 256
+  proof: fails
+  control: v=$(ulimit -Hn); case "$v" in unlimited) exit 0 ;; ''|*[!0-9]*) echo "unreadable limit: $v"; exit 0 ;; esac; test "$v" -gt 256
+keychain | read a keychain item
+  script: /usr/bin/security find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w '<dir>/user/probe.keychain-db' 2>/dev/null
+  proof: output lacks 656e636c6f732d70726f6265
+  control: /usr/bin/security find-generic-password -s 'enclos.abc.probe' -a 'home/probe' -w '<dir>/user/probe.keychain-db' 2>/dev/null | /usr/bin/grep -q 656e636c6f732d70726f6265
+pasteboard | read the pasteboard
+  script: /usr/bin/pbpaste >/dev/null
+  proof: fails
+  control: /usr/bin/pbpaste >/dev/null
+crontab | read the crontab
+  script: /usr/bin/crontab -l >/dev/null
+  proof: fails with /usr/bin/crontab: Operation not permitted
+  control: /usr/bin/crontab -l >/dev/null
+  closed by: seatbelt: Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested
+at | list the `at` queue
+  script: /usr/bin/atq >/dev/null
+  proof: fails with /usr/bin/atq: Operation not permitted
+  control: /usr/bin/atq >/dev/null
+  closed by: seatbelt: Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested
+### host services
+launchservices | open a folder through LaunchServices
+  script: /usr/bin/open -g /System
+  proof: fails with error -54 
+  control: /usr/bin/pgrep -x Finder >/dev/null
+apple events | send an Apple Event to Finder
+  script: /usr/bin/osascript -e 'with timeout of 8 seconds' -e 'tell application "Finder" to count windows' -e 'end timeout'
+  proof: apple event blocked: (-600)
+  control: /usr/bin/pgrep -x Finder >/dev/null
+launchd | submit a launchd job
+  script: /bin/launchctl submit -l org.enclos.probe.7 -- /usr/bin/true
+  proof: fails
+  control: /bin/launchctl print gui/$(/usr/bin/id -u) >/dev/null 2>&1
+  host: the launchd job org.enclos.probe.7
+preferences | write preferences through cfprefsd
+  script: /usr/bin/defaults write org.enclos.probe.7 probe -string written
+  proof: fails
+  control: /usr/bin/defaults domains >/dev/null 2>&1
+  host: the preferences domain org.enclos.probe.7
+launch agents | write in ~/Library/LaunchAgents
+  script: echo x > '<dir>/user/Library/LaunchAgents/enclos-probe-7'
+  proof: fails
+  control: test -w '<dir>/user/Library/LaunchAgents'
+  host: the file <dir>/user/Library/LaunchAgents/enclos-probe-7
+### not here
+1 of the 5 denied sensitive paths (they do not exist here)
+denied paths that are neither a file nor a folder, which a probe could wait on: <dir>/user/work/pipe
+renames and clones of 1 of the 3 folders that cannot move (they are not folders here)
+## host-service routes
+launchservices
+apple events
+launchd
+preferences
+launch agents
+## not probed
+bootstrapping or loading a launchd job
+installing a crontab
+submitting an `at` job
+registering a login item
+posting synthetic input events
+writing the pasteboard
+typing into the terminal (TIOCSTI)

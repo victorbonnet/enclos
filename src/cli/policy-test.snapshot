@@ -1,0 +1,221 @@
+Escape probes in sandbox lab: each tries one way out and must fail.
+  closed        writes           write outside the home
+  closed        at               list the `at` queue  (Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested)
+  closed        launchservices   open a folder through LaunchServices  (on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes)
+No probe tries these routes yet: bootstrapping or loading a launchd job, installing a crontab, submitting an `at` job, registering a login item, posting synthetic input events, writing the pasteboard, typing into the terminal (TIOCSTI).
+Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.
+READY: no probe got out of sandbox lab: all 3 shown closed (1 by Seatbelt itself, 1 by the (deny default) baseline).
+{
+  "baseline": "deny_default",
+  "host_services_probed": true,
+  "listens": false,
+  "not_here": [],
+  "not_probed": [
+    "bootstrapping or loading a launchd job",
+    "installing a crontab",
+    "submitting an `at` job",
+    "registering a login item",
+    "posting synthetic input events",
+    "writing the pasteboard",
+    "typing into the terminal (TIOCSTI)"
+  ],
+  "probes": [
+    {
+      "closed_by": null,
+      "name": "write outside the home",
+      "outcome": "closed",
+      "route": "writes",
+      "why": null
+    },
+    {
+      "closed_by": "seatbelt",
+      "name": "list the `at` queue",
+      "outcome": "closed",
+      "route": "at",
+      "why": "Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested"
+    },
+    {
+      "closed_by": "baseline",
+      "name": "open a folder through LaunchServices",
+      "outcome": "closed",
+      "route": "launchservices",
+      "why": "on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes"
+    }
+  ],
+  "ready": true,
+  "sandbox": "lab",
+  "verdict": "READY: no probe got out of sandbox lab: all 3 shown closed (1 by Seatbelt itself, 1 by the (deny default) baseline)."
+}
+
+Escape probes in sandbox lab: each tries one way out and must fail.
+  closed        writes           write outside the home
+  closed        at               list the `at` queue  (Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested)
+  closed        launchservices   open a folder through LaunchServices  (on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes)
+  inconclusive  crontab          read the crontab  (it fails outside the sandbox too)
+Host-service routes (launchservices, apple events, launchd, preferences, launch agents) were not probed; CI probes them with --host-services.
+Not probed, as it is not on this host: keychain (no login keychain here).
+No probe tries these routes yet: bootstrapping or loading a launchd job, installing a crontab, submitting an `at` job, registering a login item, posting synthetic input events, writing the pasteboard, typing into the terminal (TIOCSTI).
+Open by the policy: listening on TCP, on any port but enclos's proxy ports, on every address (ADR 0028); the bind probes show only that the proxy ports stay closed. What listens in this sandbox can serve the network.
+Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.
+1 probes were inconclusive: they failed for a reason other than the policy, so they show nothing about it.
+READY: no probe got out of sandbox lab: 3 of 4 shown closed (1 by Seatbelt itself, 1 by the (deny default) baseline), 1 could not be checked on this Mac (inconclusive above), none open. On the (allow default) comparison baseline, which only a debug build compiles and no service runs on.
+{
+  "baseline": "allow_default",
+  "host_services_probed": false,
+  "listens": true,
+  "not_here": [
+    "keychain (no login keychain here)"
+  ],
+  "not_probed": [
+    "bootstrapping or loading a launchd job",
+    "installing a crontab",
+    "submitting an `at` job",
+    "registering a login item",
+    "posting synthetic input events",
+    "writing the pasteboard",
+    "typing into the terminal (TIOCSTI)"
+  ],
+  "probes": [
+    {
+      "closed_by": null,
+      "name": "write outside the home",
+      "outcome": "closed",
+      "route": "writes",
+      "why": null
+    },
+    {
+      "closed_by": "seatbelt",
+      "name": "list the `at` queue",
+      "outcome": "closed",
+      "route": "at",
+      "why": "Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested"
+    },
+    {
+      "closed_by": "baseline",
+      "name": "open a folder through LaunchServices",
+      "outcome": "closed",
+      "route": "launchservices",
+      "why": "on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes"
+    },
+    {
+      "closed_by": null,
+      "name": "read the crontab",
+      "outcome": "inconclusive",
+      "route": "crontab",
+      "why": "it fails outside the sandbox too"
+    }
+  ],
+  "ready": true,
+  "sandbox": "lab",
+  "verdict": "READY: no probe got out of sandbox lab: 3 of 4 shown closed (1 by Seatbelt itself, 1 by the (deny default) baseline), 1 could not be checked on this Mac (\"inconclusive\" in probes), none open. On the (allow default) comparison baseline, which only a debug build compiles and no service runs on."
+}
+
+Escape probes in sandbox lab: each tries one way out and must fail.
+  closed        writes           write outside the home
+  closed        at               list the `at` queue  (Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested)
+  closed        launchservices   open a folder through LaunchServices  (on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes)
+  inconclusive  crontab          read the crontab  (it fails outside the sandbox too)
+  OPEN          network          a direct connection, around the proxy  <- it succeeded: 
+  NOT RUN       dns              DNS on port 53  <- could not run it
+Host-service routes (launchservices, apple events, launchd, preferences, launch agents) were not probed; CI probes them with --host-services.
+No probe tries these routes yet: bootstrapping or loading a launchd job, installing a crontab, submitting an `at` job, registering a login item, posting synthetic input events, writing the pasteboard, typing into the terminal (TIOCSTI).
+Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.
+1 probes were inconclusive: they failed for a reason other than the policy, so they show nothing about it.
+NOT READY: sandbox lab: 1 of 6 probes got out (OPEN above); 1 could not run or be checked, so their routes were not tested (NOT RUN above). Do not use it until this is fixed.
+{
+  "baseline": "deny_default",
+  "host_services_probed": false,
+  "listens": false,
+  "not_here": [],
+  "not_probed": [
+    "bootstrapping or loading a launchd job",
+    "installing a crontab",
+    "submitting an `at` job",
+    "registering a login item",
+    "posting synthetic input events",
+    "writing the pasteboard",
+    "typing into the terminal (TIOCSTI)"
+  ],
+  "probes": [
+    {
+      "closed_by": null,
+      "name": "write outside the home",
+      "outcome": "closed",
+      "route": "writes",
+      "why": null
+    },
+    {
+      "closed_by": "seatbelt",
+      "name": "list the `at` queue",
+      "outcome": "closed",
+      "route": "at",
+      "why": "Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested"
+    },
+    {
+      "closed_by": "baseline",
+      "name": "open a folder through LaunchServices",
+      "outcome": "closed",
+      "route": "launchservices",
+      "why": "on (deny default) the baseline refuses something the tool needs (likely a lookup; not traced) before the route's rule is reached; the rule itself is shown only by a run on (allow default), as enclos's CI makes"
+    },
+    {
+      "closed_by": null,
+      "name": "read the crontab",
+      "outcome": "inconclusive",
+      "route": "crontab",
+      "why": "it fails outside the sandbox too"
+    },
+    {
+      "closed_by": null,
+      "name": "a direct connection, around the proxy",
+      "outcome": "open",
+      "route": "network",
+      "why": "it succeeded: "
+    },
+    {
+      "closed_by": null,
+      "name": "DNS on port 53",
+      "outcome": "not_run",
+      "route": "dns",
+      "why": "could not run it"
+    }
+  ],
+  "ready": false,
+  "sandbox": "lab",
+  "verdict": "NOT READY: sandbox lab: 1 of 6 probes got out (\"open\" in probes); 1 could not run or be checked, so their routes were not tested (\"not_run\" in probes). Do not use it until this is fixed."
+}
+
+Escape probes in sandbox lab: each tries one way out and must fail.
+  closed        at               list the `at` queue  (Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested)
+Host-service routes (launchservices, apple events, launchd, preferences, launch agents) were not probed; CI probes them with --host-services.
+No probe tries these routes yet: bootstrapping or loading a launchd job, installing a crontab, submitting an `at` job, registering a login item, posting synthetic input events, writing the pasteboard, typing into the terminal (TIOCSTI).
+Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.
+NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules.
+{
+  "baseline": "deny_default",
+  "host_services_probed": false,
+  "listens": false,
+  "not_here": [],
+  "not_probed": [
+    "bootstrapping or loading a launchd job",
+    "installing a crontab",
+    "submitting an `at` job",
+    "registering a login item",
+    "posting synthetic input events",
+    "writing the pasteboard",
+    "typing into the terminal (TIOCSTI)"
+  ],
+  "probes": [
+    {
+      "closed_by": "seatbelt",
+      "name": "list the `at` queue",
+      "outcome": "closed",
+      "route": "at",
+      "why": "Seatbelt itself refuses to run setuid programs, whatever the policy; no enclos rule is tested"
+    }
+  ],
+  "ready": false,
+  "sandbox": "lab",
+  "verdict": "NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by Seatbelt itself or the (deny default) baseline if any, so the test showed nothing about the policy's rules."
+}
+
