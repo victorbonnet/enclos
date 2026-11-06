@@ -261,7 +261,12 @@ impl RuntimeAdapter for Hermes {
         }
     }
 
-    fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path) -> Option<AppChannel> {
+    fn app_channel(
+        &self,
+        agent: &RuntimeAgentName,
+        socket: &Path,
+        home: &str,
+    ) -> Option<AppChannel> {
         // A plugin Hermes loads from the agent's own home, `plugins/` under
         // its `HERMES_HOME`, and only once `plugins enable` lists it in
         // that agent's settings (read in Hermes's source, main of
@@ -292,6 +297,11 @@ impl RuntimeAdapter for Hermes {
                 // holds the agent's token, decides who talks to the agent.
                 ("MOBILE_APP_SOCKET".to_owned(), socket.display().to_string()),
                 ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                // Hermes's home channel for the app is the agent's Home
+                // conversation (ADR 0044): what `/sethome` would set, from
+                // the start, so Hermes never asks for one. Overwrites what
+                // a `/sethome` left.
+                ("MOBILE_APP_HOME_CHANNEL".to_owned(), home.to_owned()),
             ],
         })
     }
@@ -973,7 +983,7 @@ mod tests {
     fn the_app_channel_goes_in_the_agents_own_home_and_is_enabled_there() {
         let socket = Path::new("/h/.enclos-app/main.sock");
         let main = RuntimeAgentName::new("main").unwrap();
-        let app = Hermes.app_channel(&main, socket).unwrap();
+        let app = Hermes.app_channel(&main, socket, "home.lab.main").unwrap();
         let places: Vec<String> = app
             .files
             .iter()
@@ -1005,10 +1015,16 @@ mod tests {
                     "/h/.enclos-app/main.sock".to_owned()
                 ),
                 ("MOBILE_APP_ALLOW_ALL".to_owned(), "true".to_owned()),
+                (
+                    "MOBILE_APP_HOME_CHANNEL".to_owned(),
+                    "home.lab.main".to_owned()
+                ),
             ]
         );
         let default = RuntimeAgentName::new("default").unwrap();
-        let app = Hermes.app_channel(&default, socket).unwrap();
+        let app = Hermes
+            .app_channel(&default, socket, "home.lab.default")
+            .unwrap();
         assert_eq!(
             app.files[0].0.as_path(),
             Path::new(".hermes/plugins/enclos/plugin.yaml")

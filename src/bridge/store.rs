@@ -68,6 +68,19 @@ pub const BY_AGENT: &str = "agent";
 /// A conversation named by its owner.
 pub const BY_PERSON: &str = "person";
 
+/// The id of agent `<sandbox>/<agent>`'s Home conversation, where what has
+/// no conversation of its own goes (ADR 0044). Fixed, so the bridge and the
+/// runtime, which `runtime configure` tells, agree on it without asking;
+/// without `:` or `/`, which runtimes put in their own keys.
+pub fn home_id(agent: &str) -> String {
+    format!("home.{}", agent.replace('/', "."))
+}
+
+/// Whether conversation `id` is an agent's Home: a device's own ids are UUIDs.
+pub fn is_home(id: &str) -> bool {
+    id.starts_with("home.")
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -304,6 +317,30 @@ impl Store {
             params![id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+    }
+
+    /// Makes the Home conversation of `agent` (`<sandbox>/<agent>`), owned
+    /// by `owner` and named Home by them, so the runtime's names do not
+    /// replace it; one already there keeps its owner, unless it had none
+    /// (made before anyone was known), which `owner` then takes. Whether it
+    /// was made.
+    pub fn ensure_home(&self, agent: &str, owner: &str) -> rusqlite::Result<bool> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Ok(false);
+        };
+        let id = home_id(agent);
+        if self.conversation_of(&id)?.is_some() {
+            if !owner.is_empty() {
+                self.db.execute(
+                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner = ''",
+                    params![id, owner],
+                )?;
+            }
+            return Ok(false);
+        }
+        self.conversation(&id, sandbox, name, owner)?;
+        self.name(&id, "Home", BY_PERSON)?;
+        Ok(true)
     }
 
     /// Stores a message once: a second with the same id is a duplicate
@@ -708,5 +745,47 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    #[test]
+    fn an_agents_home_is_made_once_named_home_for_its_owner() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        assert_eq!(home_id("lab/main"), "home.lab.main");
+        assert!(is_home("home.lab.main") && !is_home("a47e17c0-eaad-4d1d-8853-56aa0b69e1e2"));
+        assert!(store.ensure_home("lab/main", "victor@example.com").unwrap());
+        // Once: a second person does not take it.
+        assert!(!store.ensure_home("lab/main", "alice@example.com").unwrap());
+        assert_eq!(
+            store.owner("home.lab.main").unwrap().as_deref(),
+            Some("victor@example.com")
+        );
+        let home = store.conversation_info("home.lab.main").unwrap().unwrap();
+        assert_eq!(
+            (home.sandbox.as_str(), home.agent.as_str()),
+            ("lab", "main")
+        );
+        assert_eq!(
+            (home.title.as_deref(), home.titled_by.as_deref()),
+            (Some("Home"), Some(BY_PERSON))
+        );
+        // The runtime's name for its session does not replace Home.
+        assert!(
+            !store
+                .name("home.lab.main", "Gateway notices", BY_AGENT)
+                .unwrap()
+        );
+        assert!(!store.ensure_home("no-slash", "victor@example.com").unwrap());
+        // Made before anyone was known: the first person takes it, once.
+        assert!(store.ensure_home("lab/scout", "").unwrap());
+        assert_eq!(store.owner("home.lab.scout").unwrap().as_deref(), Some(""));
+        store.ensure_home("lab/scout", "alice@example.com").unwrap();
+        store
+            .ensure_home("lab/scout", "victor@example.com")
+            .unwrap();
+        assert_eq!(
+            store.owner("home.lab.scout").unwrap().as_deref(),
+            Some("alice@example.com")
+        );
     }
 }
