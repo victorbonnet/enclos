@@ -12,8 +12,8 @@ use rustix::fs::{Dir, FileType};
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
     AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService, SandboxCommand, ServiceName,
-    Signal, Unreadable, ValueAt,
+    RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener, RuntimeService,
+    SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -421,6 +421,26 @@ impl RuntimeAdapter for Hermes {
         })
     }
 
+    fn dashboard(&self) -> Option<RuntimeDashboard> {
+        // `hermes dashboard` puts its session token in its page, which the
+        // gateway's own port withholds, so the page works there alone.
+        // `--isolated` and `--port 0` make its server its own: a plain one
+        // reports a dashboard another session left open, or one on Hermes's
+        // default port, and exits 0 (`_attach_to_host_backend`, read in
+        // Hermes 0.22.5's source; ADR 0040).
+        Some(RuntimeDashboard {
+            command: SandboxCommand::from_words(&[
+                HERMES,
+                "dashboard",
+                "--no-open",
+                "--isolated",
+                "--port",
+                "0",
+            ]),
+            page: "/",
+        })
+    }
+
     fn agents_in(&self, home: &Path) -> Result<Vec<RuntimeAgentName>, Unreadable> {
         // Hermes lists a named profile when its folder under
         // `~/.hermes/profiles/` has a valid id, is not `default` (the Hermes
@@ -678,6 +698,16 @@ mod tests {
         let listener = Hermes.listener().unwrap();
         assert_eq!(listener.service.as_str(), "gateway");
         assert!(Hermes.services().iter().any(|s| s.name == listener.service));
+    }
+
+    #[test]
+    fn the_dashboard_is_a_server_of_its_own_on_a_port_the_kernel_picks() {
+        let dashboard = Hermes.dashboard().unwrap();
+        assert_eq!(
+            dashboard.command.shown(),
+            "hermes dashboard --no-open --isolated --port 0"
+        );
+        assert_eq!(dashboard.page, "/");
     }
 
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {
