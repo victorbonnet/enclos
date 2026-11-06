@@ -54,6 +54,13 @@ fn parse_stat(text: &str) -> Option<Stat> {
     })
 }
 
+/// Whether the task is dead (`X`): exited and being removed, it shows `-1`
+/// for its group and session, and is as gone as one already removed.
+fn is_dead(text: &str) -> bool {
+    let state = text.rsplit_once(')').map(|(_, rest)| rest.trim_start());
+    state.is_some_and(|rest| rest.starts_with('X'))
+}
+
 /// The `stat` of `pid` under `proc`, or `None` when it is gone. Its name may
 /// be any bytes, so it is read lossily.
 fn read_stat(proc: &Path, pid: u32) -> io::Result<Option<Stat>> {
@@ -63,6 +70,9 @@ fn read_stat(proc: &Path, pid: u32) -> io::Result<Option<Stat>> {
         bytes => bytes?,
     };
     let text = String::from_utf8_lossy(&bytes);
+    if is_dead(&text) {
+        return Ok(None);
+    }
     parse_stat(&text).map(Some).ok_or_else(|| {
         io::Error::other(format!(
             "{} does not read: `{}`",
@@ -261,6 +271,30 @@ mod tests {
         std::fs::remove_dir_all(proc.join(me.to_string())).unwrap();
         let err = processes_under(proc, 100).unwrap_err().to_string();
         assert!(err.contains("does not show pid"), "{err}");
+    }
+
+    /// A dead task, as main's CI saw one (`-1` for its group and session),
+    /// is gone: left out of the listing, with no group and nothing seen.
+    #[test]
+    fn a_dead_process_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        fake_boot(proc, 1_791_451_860);
+        let me = std::process::id();
+        fake(proc, me, &line(me, "enclos", 'S', 1, 1, 100));
+        fake(
+            proc,
+            5150,
+            "5150 (sleep) X 0 -1 -1 0 -1 4228108 73 0 0 0 0 0 0 0 20 0 0 0 41386 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 1 0 0 0 0 0 0 0 0 0 0 0 0 9",
+        );
+        let pids: Vec<u32> = processes_under(proc, 100)
+            .unwrap()
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, [me]);
+        assert_eq!(group_under(proc, 5150).unwrap(), None);
+        assert_eq!(seen_under(proc, 5150, 100).unwrap(), None);
     }
 
     #[test]
