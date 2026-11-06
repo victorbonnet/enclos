@@ -30,7 +30,7 @@ More in the [glossary](GLOSSARY.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.svg">
-  <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="docs/diagrams/architecture-light.svg">
+  <img alt="Clients (the enclos CLI, which host assistants such as Claude Code and Codex also run, through the enclos plugin; a web UI later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="docs/diagrams/architecture-light.svg">
 </picture>
 
 Each sandbox runs under macOS Seatbelt with a policy compiled from layers (defaults, a template, the runtime's endpoints, your overrides). Its only network route is an egress proxy on the host. Background services are plain launchd jobs; there is no enclos daemon. See [architecture](docs/architecture.md) for the components and a session step by step.
