@@ -44,7 +44,7 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? | A person's message to the agent |
-| `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work); `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
+| `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work), which every runtime may send; `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
 | `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
 | `conversation.rename` | bridge | `conversation`, `title` (empty: no name) | The person named the conversation, or cleared its name |
@@ -150,11 +150,10 @@ When a `message` arrives for a conversation whose owner has no device connected,
 
 ## Capabilities
 
-A plugin's `hello` and each agent of `agents.list` name what the runtime does, and the app shows only that:
+A plugin's `hello` and each agent of `agents.list` name what the runtime does, and the app shows only that. Sending on its own (`kind: notify`) is not a capability: every runtime may, and a device shows such a message whichever runtime sent it. Version 1 first listed it as `notify`; a plugin that still announces it is read as announcing nothing more.
 
 | Capability | Meaning |
 | --- | --- |
-| `notify` | The runtime may send on its own (`kind: notify`): cron output, background work. Without it, the agent only answers |
 | `typing` | It reports working on an answer |
 | `stream` | It sends a reply in parts, batched (never one message per word); version 1 defines no parts message yet |
 | `attachments` | It takes and sends files; version 1 defines none yet |
@@ -164,7 +163,7 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `tools` | It reports the tools it runs while it works (`tool`) |
 | `commands` | It lists the commands a person may type to it (`commands`) |
 
-Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
+Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 
 ## Errors
 

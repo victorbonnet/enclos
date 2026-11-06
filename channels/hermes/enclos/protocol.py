@@ -16,7 +16,7 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
 FROM_BRIDGE_TYPES = ("hello", "message.in", "conversation.rename", "ack", "error")
-CAPABILITIES = ("notify", "typing", "titles", "tools")
+CAPABILITIES = ("typing", "titles", "tools")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
 # The longest conversation title sent (Hermes' own limit is 100 characters).
