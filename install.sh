@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install the latest enclos release on an Apple silicon Mac:
+# Install the latest enclos release on an Apple silicon Mac, or on Linux on
+# x86_64 or arm64:
 #
 #   curl -fsSL https://enclos.dev/install.sh | bash
 #
@@ -7,14 +8,22 @@
 set -euo pipefail
 
 readonly repository="https://github.com/victorbonnet/enclos"
-readonly asset="enclos-aarch64-apple-darwin.tar.gz"
+# Below this, enclos refuses to start a session (`enclos doctor` says why).
+readonly systemd_needed=254
 
+# Set by main for this host: the release archive, what to call the host, and
+# the command that prints a file's SHA-256 as `shasum -a 256` does.
+asset=""
+host_name=""
+sha256=()
 temp_dir=""
 staging_dir=""
 
 usage() {
   cat <<'HELP'
-Install the latest enclos release on an Apple silicon Mac running macOS 15 or later.
+Install the latest enclos release on an Apple silicon Mac running macOS 15 or
+later, or on Linux on x86_64 or arm64 (aarch64). Linux needs systemd 254 or
+later to run sandboxes; the installer warns on an older one.
 
 Usage: install.sh [--prefix PATH]
 
@@ -23,8 +32,9 @@ Usage: install.sh [--prefix PATH]
 
 Through a pipe: curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix PATH
 
-The installer needs curl, tar and shasum. It never uses sudo, edits shell
-startup files or creates sandboxes. To build from source instead, see
+The installer needs curl, tar, and shasum on macOS or sha256sum on Linux. It
+never uses sudo, edits shell startup files or creates sandboxes. To build from
+source instead, see
 https://github.com/victorbonnet/enclos/blob/main/docs/getting-started.md
 HELP
 }
@@ -32,6 +42,10 @@ HELP
 fail() {
   printf 'enclos installer: %s\n' "$*" >&2
   exit 1
+}
+
+warn() {
+  printf '\nWarning: %s\n' "$*" >&2
 }
 
 # Removes what the installer created; one failure does not stop the other.
@@ -42,6 +56,23 @@ cleanup() {
 
 need() {
   command -v "$1" >/dev/null 2>&1 || fail "$1 is required."
+}
+
+# What to tell the user of this host's systemd, if anything: enclos runs each
+# session in a systemd scope and refuses to start one below systemd 254. The
+# version is read as enclos reads it, from the first line of
+# `systemd-run --version`, such as `systemd 255 (255.4-1ubuntu8)`.
+systemd_warning() {
+  local said first name="" version="" major
+  said=$(systemd-run --version 2>/dev/null) || said=""
+  first=${said%%$'\n'*}
+  read -r name version _ <<< "$first" || true
+  major=${version%%[!0-9]*}
+  if [ "$name" != systemd ] || [ -z "$major" ]; then
+    printf 'Cannot tell the systemd version here (systemd-run --version). enclos needs systemd %s or later to start a session; enclos doctor says what it finds.\n' "$systemd_needed"
+  elif [ "$major" -lt "$systemd_needed" ]; then
+    printf 'enclos needs systemd %s or later; this host has %s, so enclos installs but refuses to start a session here. Debian 12 ships 252: Debian 13 or Ubuntu 24.04 work.\n' "$systemd_needed" "$major"
+  fi
 }
 
 # HTTPS only, including redirects, with bounded connection and transfer times.
@@ -73,12 +104,12 @@ install_latest() {
 
   need curl
   need tar
-  need shasum
+  need "${sha256[0]}"
   temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/enclos-install.XXXXXX")
 
   printf 'Finding the latest enclos release…\n'
   tag=$(latest_tag)
-  printf 'Downloading enclos %s for Apple silicon…\n' "$tag"
+  printf 'Downloading enclos %s for %s…\n' "$tag" "$host_name"
   fetch --output "$temp_dir/$asset" "$repository/releases/download/$tag/$asset" \
     || fail "Could not download $asset for $tag; nothing was installed."
   fetch --output "$temp_dir/$asset.sha256" "$repository/releases/download/$tag/$asset.sha256" \
@@ -93,7 +124,7 @@ install_latest() {
     "$asset" | "*$asset") ;;
     *) fail "The release checksum names another file; nothing was installed." ;;
   esac
-  actual=$(shasum -a 256 "$temp_dir/$asset")
+  actual=$("${sha256[@]}" "$temp_dir/$asset")
   [ "${actual%% *}" = "$digest" ] \
     || fail "The release checksum does not match; nothing was installed."
 
@@ -124,7 +155,7 @@ install_latest() {
 }
 
 main() {
-  local prefix="${HOME:?HOME must be set}/.local" macos found
+  local prefix="${HOME:?HOME must be set}/.local" system macos machine systemd="" found
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -143,13 +174,39 @@ main() {
   esac
   [ -n "$prefix" ] || fail "Do not install into the filesystem root."
 
-  [ "$(uname -s)" = Darwin ] || fail "enclos supports only macOS for now."
-  # `uname -m` says x86_64 when this shell runs under Rosetta; the Mac decides.
-  [ "$(uname -m)" = arm64 ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] \
-    || fail "enclos needs an Apple silicon Mac."
-  macos=$(sw_vers -productVersion)
-  case "${macos%%.*}" in '' | *[!0-9]*) fail "Cannot tell the macOS version." ;; esac
-  [ "${macos%%.*}" -ge 15 ] || fail "macOS 15 or later is required (found $macos)."
+  system=$(uname -s)
+  case "$system" in
+    Darwin)
+      # `uname -m` says x86_64 when this shell runs under Rosetta; the Mac decides.
+      [ "$(uname -m)" = arm64 ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] \
+        || fail "enclos needs an Apple silicon Mac."
+      macos=$(sw_vers -productVersion)
+      case "${macos%%.*}" in '' | *[!0-9]*) fail "Cannot tell the macOS version." ;; esac
+      [ "${macos%%.*}" -ge 15 ] || fail "macOS 15 or later is required (found $macos)."
+      asset="enclos-aarch64-apple-darwin.tar.gz"
+      host_name="Apple silicon"
+      sha256=(shasum -a 256)
+      ;;
+    Linux)
+      # The kernel's architecture decides: the binary is static, so it needs
+      # nothing of the distribution, whose userland may be 32-bit.
+      machine=$(uname -m)
+      case "$machine" in
+        x86_64 | amd64)
+          asset="enclos-x86_64-unknown-linux-musl.tar.gz"
+          host_name="Linux on x86_64"
+          ;;
+        aarch64 | arm64)
+          asset="enclos-aarch64-unknown-linux-musl.tar.gz"
+          host_name="Linux on arm64"
+          ;;
+        *) fail "enclos on Linux needs a 64-bit x86_64 or arm64 (aarch64) kernel (found $machine)." ;;
+      esac
+      sha256=(sha256sum)
+      systemd=$(systemd_warning)
+      ;;
+    *) fail "enclos supports only macOS and Linux (found $system)." ;;
+  esac
   [ "$(id -u)" != 0 ] || fail "Run the installer as yourself, without sudo."
 
   trap cleanup EXIT
@@ -168,7 +225,13 @@ main() {
     printf '\nAnother enclos comes first on your PATH: %s\n' "$found"
     printf 'Remove it (for one built with cargo: cargo uninstall enclos), or put %s first.\n' "$prefix/bin"
   fi
-  printf '\nNext:\n  enclos init\n  enclos sandbox create lab --template assistant\n  enclos runtime install hermes --sandbox lab\n'
+  if [ "$system" = Linux ]; then
+    if [ -n "$systemd" ]; then warn "$systemd"; fi
+    printf '\nNext, with the bubblewrap package installed:\n  enclos init\n  enclos doctor\n  enclos sandbox create lab --backend bubblewrap --template assistant\n'
+    printf 'What Linux needs: %s/blob/main/docs/getting-started.md#linux-requirements\n' "$repository"
+  else
+    printf '\nNext:\n  enclos init\n  enclos sandbox create lab --template assistant\n  enclos runtime install hermes --sandbox lab\n'
+  fi
 }
 
 main "$@"
