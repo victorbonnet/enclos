@@ -59,20 +59,29 @@ mod tests {
 
         use super::*;
 
-        /// A connection from `addr` to `addr`: what the system makes when
-        /// it gives a connection the port it connects to.
-        fn to_itself(addr: SocketAddr) -> TcpStream {
-            let socket =
-                rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
-            rustix::net::bind(&socket, &addr).unwrap();
-            rustix::net::connect(&socket, &addr).unwrap();
-            TcpStream::from(socket)
+        /// A connection from a port on 127.0.0.1 to that same port: what the
+        /// system makes when it gives a connection the port it connects to.
+        /// The port is held from its bind on, so no other test takes it.
+        fn to_itself() -> (TcpStream, SocketAddr) {
+            let socket = crate::test_ports::clear_of_proxies(|| {
+                let socket =
+                    rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).unwrap();
+                rustix::net::bind(&socket, &SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+                let port = TcpStream::from(socket.try_clone().unwrap())
+                    .local_addr()
+                    .unwrap()
+                    .port();
+                (socket, port)
+            });
+            let stream = TcpStream::from(socket);
+            let addr = stream.local_addr().unwrap();
+            rustix::net::connect(&stream, &addr).unwrap();
+            (stream, addr)
         }
 
         #[test]
         fn a_connection_to_itself_is_no_listener_and_leaves_its_port_free() {
-            let addr = free();
-            let stream = to_itself(addr);
+            let (stream, addr) = to_itself();
             assert_eq!(stream.peer_addr().unwrap(), addr);
             assert!(!reached_another(stream));
             TcpListener::bind(addr).unwrap();
@@ -82,8 +91,8 @@ mod tests {
         /// from a listener for as long as `TIME-WAIT` lasts.
         #[test]
         fn a_connection_to_itself_closed_as_usual_keeps_its_port_from_a_listener() {
-            let addr = free();
-            drop(to_itself(addr));
+            let (stream, addr) = to_itself();
+            drop(stream);
             let err = TcpListener::bind(addr).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
         }
