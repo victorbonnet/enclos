@@ -321,7 +321,7 @@ fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
     };
     let plan = plan.changes.join("\n");
     assert!(
-        plan.contains("allow the 13 destinations hermes needs"),
+        plan.contains("allow the 14 destinations hermes needs"),
         "{plan}"
     );
     // Listening is what the adapter brings, like its destinations: named,

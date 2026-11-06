@@ -1,4 +1,5 @@
-//! The files each process has mapped, as `lsof` names them (`txt`): its
+//! How macOS says which files each process has mapped, through `lsof`
+//! (`proc::program_files` says it on Linux), as `lsof` names them (`txt`): its
 //! executable (shown on macOS 26.5.2), and, as `lsof` documents it, the
 //! libraries it loaded and other files it maps (not shown yet). The
 //! command `ps` lists (`comm`) is the process's argv[0] on macOS, which it
@@ -9,14 +10,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use std::process::Stdio;
 use std::process::{Command, ExitStatus, Output};
 
-/// `lsof` could not say which program files the processes run.
+/// The host could not say which program files the processes run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("cannot look at the programs processes run with /usr/sbin/lsof: {0}")]
-pub struct ProgramsError(String);
+#[error("cannot look at the programs processes run with {with}: {why}")]
+pub struct ProgramsError {
+    /// What enclos looked with: `/usr/sbin/lsof` or `/proc`.
+    with: &'static str,
+    why: String,
+}
+
+impl ProgramsError {
+    /// `lsof`, or the `ps` that checks it, could not answer.
+    fn lsof(why: String) -> ProgramsError {
+        ProgramsError {
+            with: "/usr/sbin/lsof",
+            why,
+        }
+    }
+
+    /// `/proc` could not be read.
+    pub(super) fn proc(why: String) -> ProgramsError {
+        ProgramsError { with: "/proc", why }
+    }
+}
 
 /// The program files of each process `lsof` can see (the user's; root's
 /// are not listed), by pid, each named as `lsof` writes it: compare one with
@@ -41,7 +61,7 @@ fn whole(
     // With `-w` a failure to read some processes can pass unsaid: a listing
     // without enclos itself, whose program is mapped, is not complete.
     if !files.contains_key(&std::process::id()) {
-        return Err(ProgramsError(format!(
+        return Err(ProgramsError::lsof(format!(
             "{status}, and its listing left out this process"
         )));
     }
@@ -53,17 +73,17 @@ fn whole(
         return Ok(files);
     }
     let again = list(Some(&left)).map_err(|e| {
-        ProgramsError(format!(
+        ProgramsError::lsof(format!(
             "{status}, and its listing left out processes of this user it could read: {}; looking at them again: {}",
             joined(&left, ", "),
-            e.0
+            e.why
         ))
     })?;
     files.extend(again.files);
     let still = readable(Some(&left))?;
     left.retain(|p| still.contains(p) && !files.contains_key(p));
     if !left.is_empty() {
-        return Err(ProgramsError(format!(
+        return Err(ProgramsError::lsof(format!(
             "{status}, then {} looked at again, and its listings left out processes of this user it could read: {}",
             again.status,
             joined(&left, ", ")
@@ -96,7 +116,7 @@ fn list(only: Option<&[u32]>) -> Result<Listing, ProgramsError> {
     }
     let out =
         super::bounded::output_within(lsof.args(["-d", "txt", "-Fpn"]), super::bounded::LIMIT)
-            .map_err(|e| ProgramsError(e.to_string()))?;
+            .map_err(|e| ProgramsError::lsof(e.to_string()))?;
     Ok(Listing {
         status: out.status,
         files: parse(&out, only.is_some())?,
@@ -123,7 +143,7 @@ fn readable_own(only: Option<&[u32]>) -> Result<BTreeSet<u32>, ProgramsError> {
     };
     let out =
         super::bounded::output_within(ps.args(["-o", "pid=,flags=,stat="]), super::bounded::LIMIT)
-            .map_err(|e| ProgramsError(format!("/bin/ps: {e}")))?;
+            .map_err(|e| ProgramsError::lsof(format!("/bin/ps: {e}")))?;
     answered(&out, only.is_some())
 }
 
@@ -138,11 +158,14 @@ fn answered(out: &Output, some: bool) -> Result<BTreeSet<u32>, ProgramsError> {
     match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
         (Some(0), false, _) => parse_readable(&text),
         (Some(1), true, true) if some => Ok(BTreeSet::new()),
-        (_, true, true) => Err(ProgramsError(format!(
+        (_, true, true) => Err(ProgramsError::lsof(format!(
             "/bin/ps {}, with no output",
             out.status
         ))),
-        _ => Err(ProgramsError(format!("/bin/ps {}: {why}", out.status))),
+        _ => Err(ProgramsError::lsof(format!(
+            "/bin/ps {}: {why}",
+            out.status
+        ))),
     }
 }
 
@@ -155,13 +178,13 @@ fn parse_readable(text: &str) -> Result<BTreeSet<u32>, ProgramsError> {
         let mut words = line.split_whitespace();
         let fields = (words.next(), words.next(), words.next());
         let (Some(pid), Some(flags), Some(stat)) = fields else {
-            return Err(ProgramsError(format!("unexpected ps line `{line}`")));
+            return Err(ProgramsError::lsof(format!("unexpected ps line `{line}`")));
         };
         let pid: u32 = pid
             .parse()
-            .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
+            .map_err(|_| ProgramsError::lsof(format!("unexpected ps line `{line}`")))?;
         let flags = u32::from_str_radix(flags, 16)
-            .map_err(|_| ProgramsError(format!("unexpected ps line `{line}`")))?;
+            .map_err(|_| ProgramsError::lsof(format!("unexpected ps line `{line}`")))?;
         if flags & P_SUGID == 0 && !stat.starts_with('Z') && !stat.contains('E') {
             pids.insert(pid);
         }
@@ -223,9 +246,12 @@ fn parse(out: &Output, some: bool) -> Result<BTreeMap<u32, Vec<String>>, Program
         (Some(0 | 1), true, true) if some => return Ok(BTreeMap::new()),
         (Some(0), false, _) | (Some(1), false, true) => {}
         _ if why.is_empty() => {
-            return Err(ProgramsError(format!("{}, with no output", out.status)));
+            return Err(ProgramsError::lsof(format!(
+                "{}, with no output",
+                out.status
+            )));
         }
-        _ => return Err(ProgramsError(format!("{}: {why}", out.status))),
+        _ => return Err(ProgramsError::lsof(format!("{}: {why}", out.status))),
     }
     let mut files: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut pid = None;
@@ -233,7 +259,7 @@ fn parse(out: &Output, some: bool) -> Result<BTreeMap<u32, Vec<String>>, Program
         if let Some(p) = line.strip_prefix('p') {
             let p = p
                 .parse::<u32>()
-                .map_err(|_| ProgramsError(format!("unexpected process `{p}`")))?;
+                .map_err(|_| ProgramsError::lsof(format!("unexpected process `{p}`")))?;
             files.entry(p).or_default();
             pid = Some(p);
         } else if let (Some(name), Some(pid)) = (line.strip_prefix('n'), pid) {
@@ -243,7 +269,7 @@ fn parse(out: &Output, some: bool) -> Result<BTreeMap<u32, Vec<String>>, Program
     Ok(files)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -363,6 +389,7 @@ pub(crate) mod tests {
     }
 
     /// On this host, the whole listing leaves out no process it can read.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_listing_of_this_host_is_whole() {
         program_files().unwrap();
@@ -448,7 +475,7 @@ pub(crate) mod tests {
             |_| Ok(around.clone()),
             |only| match only {
                 None => Ok(listing(&[me])),
-                Some(_) => Err(ProgramsError("did not answer within 5 s".to_owned())),
+                Some(_) => Err(ProgramsError::lsof("did not answer within 5 s".to_owned())),
             },
         )
         .unwrap_err()
@@ -499,6 +526,7 @@ pub(crate) mod tests {
     /// Asked for processes that have all gone, `lsof` lists none and `ps`
     /// shows none, and neither is an error. Asked about this process too,
     /// `lsof` lists its program and `ps` shows it alone.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_look_at_gone_processes_lists_none() {
         let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
@@ -516,6 +544,7 @@ pub(crate) mod tests {
 
     /// A program in a folder whose name holds what `lsof` escapes is listed
     /// as `lsof_name` writes its path.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_program_file_is_named_as_lsof_name_writes_it() {
         let dir = tempfile::tempdir().unwrap();

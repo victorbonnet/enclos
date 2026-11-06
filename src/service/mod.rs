@@ -81,6 +81,35 @@ pub enum ServiceStatus {
     NotLoaded,
 }
 
+/// How `state check` names an installed unit that does not run and will
+/// not on its own until later, as after a person stopped it by hand, in its
+/// manager's words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandStop {
+    /// What one unit is called: `launchd job`.
+    pub unit: &'static str,
+    /// What such a unit is: `not loaded`.
+    pub state: &'static str,
+    /// What a person did to it: `unloaded by hand`.
+    pub how: &'static str,
+    /// When it runs again on its own: `the next login`.
+    pub until: &'static str,
+    /// What `sandbox start` does to every service: `loads`.
+    pub again: &'static str,
+}
+
+impl HandStop {
+    /// A unit the manager no longer has loaded, as after `launchctl
+    /// bootout`, which launchd loads again at the next login.
+    pub const UNLOADED: HandStop = HandStop {
+        unit: "launchd job",
+        state: "not loaded",
+        how: "unloaded by hand",
+        until: "the next login",
+        again: "loads",
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{what}")]
 pub struct ServiceError {
@@ -118,6 +147,16 @@ pub trait ServiceManager {
     /// The labels installed and not removed yet that start with `prefix`,
     /// whether or not they run.
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError>;
+    /// Whether `label`, installed, does not run and will not on its own
+    /// until what [`ServiceManager::hand_stop`] names, as after a person
+    /// stopped it. By default, when the manager does not have it loaded.
+    fn stopped_by_hand(&self, label: &ServiceLabel) -> Result<bool, ServiceError> {
+        Ok(self.status(label)? == ServiceStatus::NotLoaded)
+    }
+    /// The words for a unit [`ServiceManager::stopped_by_hand`] finds.
+    fn hand_stop(&self) -> HandStop {
+        HandStop::UNLOADED
+    }
     /// The command a user runs to remove `var` from this manager's own
     /// environment.
     fn unset_env_command(&self, var: &str) -> String;

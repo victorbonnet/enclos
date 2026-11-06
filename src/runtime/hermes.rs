@@ -542,6 +542,7 @@ mod tests {
                 "files.pythonhosted.org",
                 "github.com",
                 "nodejs.org",
+                "playwright.download.prss.microsoft.com",
                 "pypi.org",
                 "registry.npmjs.org",
                 "release-assets.githubusercontent.com",
