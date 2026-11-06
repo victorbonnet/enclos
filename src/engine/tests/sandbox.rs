@@ -703,7 +703,7 @@ fn dry_runs_of_stop_and_connect_change_nothing() {
     assert!(
         plan.changes
             .last()
-            .is_some_and(|c| c.starts_with("run `/bin/zsh -l` in sandbox home")),
+            .is_some_and(|c| c.starts_with(&format!("run `{}` in sandbox home", default_shell()))),
         "{plan:?}"
     );
     assert_eq!(

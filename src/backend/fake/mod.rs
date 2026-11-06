@@ -112,21 +112,15 @@ impl Backend for FakeBackend {
     }
 
     /// Runs the program as it is, outside any sandbox, but with the
-    /// sandbox's environment (its home, PATH and TMPDIR), so that a test's
-    /// program never touches the developer's own home. It also gets
+    /// variables every backend gives (its home, PATH and TMPDIR among them),
+    /// so that a test's program never touches the developer's own home. It also gets
     /// [`IN_TERMINAL`], so a test sees whether the program was to run in
     /// enclos's terminal, and [`SERVICE_PORT`], the service port it was given.
     fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
         let mut command = super::under_limits(command, &launch.limits);
-        command.env_clear();
-        for (name, value) in &launch.env {
-            command.env(name, value.expose());
-        }
-        for (name, value) in super::seatbelt::environment(ctx) {
-            command.env(name, value);
-        }
+        super::environment::apply(&mut command, ctx, launch);
         command.env(IN_TERMINAL, launch.in_terminal.to_string());
         command.env(
             SERVICE_PORT,
@@ -142,6 +136,38 @@ impl Backend for FakeBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    /// The host's kept variables included, so engine tests run a program
+    /// with what a real session gets.
+    #[test]
+    fn a_program_gets_the_variables_every_backend_gives() {
+        let layout = Layout::at(PathBuf::from("/home/alice/.enclos"));
+        let ctx = SandboxContext::new(&layout, &"home".parse().unwrap(), 41001);
+        let launch = Launch {
+            program: "/usr/bin/true".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            in_terminal: false,
+            service_port: None,
+            limits: Default::default(),
+        };
+        let envs = |command: &Command| -> HashMap<OsString, Option<OsString>> {
+            command
+                .get_envs()
+                .map(|(k, v)| (k.to_owned(), v.map(ToOwned::to_owned)))
+                .filter(|(k, _)| k != IN_TERMINAL && k != SERVICE_PORT)
+                .collect()
+        };
+        let fake = FakeBackend::available(BackendKind::Seatbelt);
+        let wrapped = fake.wrap(Path::new("/c.fake"), &ctx, &launch);
+        let mut expected = Command::new("/usr/bin/true");
+        crate::backend::environment::apply(&mut expected, &ctx, &launch);
+        assert_eq!(envs(&wrapped), envs(&expected));
+    }
 
     #[test]
     fn reports_what_it_was_given() {

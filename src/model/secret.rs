@@ -183,8 +183,8 @@ impl fmt::Debug for SecretValue {
 }
 
 /// Environment variables a session may not be given as a secret: the ones
-/// enclos sets itself or passes on from the host (a test of the Seatbelt
-/// backend holds this list to its environment), or that would change how
+/// enclos sets itself or passes on from the host (a test of the session
+/// environment holds this list to it), or that would change how
 /// the sandbox runs.
 pub fn reserved_variable(name: &str) -> bool {
     const RESERVED: &[&str] = &[
@@ -229,6 +229,10 @@ pub fn reserved_variable(name: &str) -> bool {
         || name.starts_with("LC_")
         || name.starts_with("ENCLOS_")
         || name.starts_with("DYLD_")
+        // Linux's dynamic linker reads these as soon as a host process with
+        // a session's variables starts (the `bash -p` that sets limits
+        // included), before any sandbox.
+        || name.starts_with("LD_")
         || name.starts_with("XDG_")
         || name.starts_with("BASH_FUNC_")
 }
@@ -319,6 +323,10 @@ mod tests {
             "LC_ALL",
             "ENCLOS_HOME",
             "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_SDK_KEY",
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
             "BROWSER",
