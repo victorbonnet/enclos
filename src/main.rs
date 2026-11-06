@@ -67,6 +67,8 @@ enum Command {
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
+    /// Open the runtime's dashboard of a sandbox the host cannot reach, as on Linux, to you alone, until Ctrl-C.
+    Dashboard(cli::dashboard::DashboardArgs),
     /// What is on this host, what it costs on disk, and what you could do.
     ///
     /// In JSON, sizes are in bytes, times in RFC 3339, and each fact read
@@ -333,6 +335,7 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
+        Command::Dashboard(args) => cli::dashboard::run(&engine, &current_actor(), args),
         Command::Status(args) => cli::status::run(&engine, args),
     }
 }
@@ -342,7 +345,7 @@ fn run(cli: Cli) -> Result<u8> {
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
 /// `exec`, `inside`, `runtime`, and the `agent` verbs but `list`), keep running
-/// (`proxy`, `relay`, `holder`, `launch`), or handle a closed output themselves (`logs`). No
+/// (`proxy`, `relay`, `holder`, `launch`, `dashboard`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
 fn ends_on_closed_output(command: &Command) -> bool {
     match command {
@@ -364,6 +367,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Inside(_)
         | Command::Holder(_)
         | Command::Launch(_)
+        | Command::Dashboard(_)
         | Command::Logs(_) => false,
     }
 }

@@ -125,6 +125,12 @@ impl Engine {
         self.log_file(name, Unit::Proxy)
     }
 
+    /// The log of `enclos dashboard`'s program, beside the services' so
+    /// that `enclos logs` shows it.
+    pub(super) fn dashboard_log(&self, name: &SandboxName) -> PathBuf {
+        self.logs_dir(name).join("dashboard.log")
+    }
+
     pub(super) fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
         self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
             name: name.to_string(),

@@ -259,11 +259,24 @@ impl Engine {
         session: &SessionRecord,
         waited: Waited,
     ) -> Result<SessionEnd> {
+        self.finish_session_saying(by, audit_name, session, waited, None)
+    }
+
+    /// `finish_session`, with `why` it ended in its audit entry.
+    pub(super) fn finish_session_saying(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        waited: Waited,
+        why: Option<&str>,
+    ) -> Result<SessionEnd> {
         let signal = waited.status.signal();
-        let exit = waited
-            .status
-            .code()
-            .unwrap_or_else(|| 128 + signal.unwrap_or(0));
+        let code = exit_code(waited.status);
+        let exit = match why {
+            Some(why) => format!("{code}, {why}"),
+            None => code.to_string(),
+        };
         let summary = |_: &()| match &waited.left {
             Ok(left) if left.is_empty() => format!("exit {exit}"),
             Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
@@ -279,7 +292,7 @@ impl Engine {
         };
         Ok(SessionEnd {
             session: session.id,
-            exit,
+            exit: code,
             signal,
             left,
             notes: waited.notes,
@@ -629,6 +642,14 @@ impl Engine {
             ..Plan::default()
         })
     }
+}
+
+/// A program's exit status as a shell reports it: its code, or 128 plus
+/// the signal that ended it.
+pub(super) fn exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 pub(super) fn note(notes: &mut Vec<String>, note: String) {

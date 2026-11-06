@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod connect;
+pub mod dashboard;
 pub mod doctor;
 pub mod holder;
 pub mod inside;
