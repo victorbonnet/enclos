@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use super::super::sockets::Address;
 use super::calls::{self, Numbers};
-use super::sockets::Address;
 use super::{BubblewrapProbes, ITSELF};
 use crate::backend::environment::SANDBOX_VARIABLE;
 use crate::probes::{

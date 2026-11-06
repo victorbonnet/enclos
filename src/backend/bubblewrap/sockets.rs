@@ -1,8 +1,32 @@
 //! The Unix sockets a network namespace listens on, as its `/proc/net/unix`
-//! table lists them, and whether one answers this process.
+//! table lists them, and whether one answers this process: `wrap` masks the
+//! host's under the user's home at each launch, and the escape probes try
+//! each one.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+/// The table of this process's network namespace: the host's, for enclos.
+pub const HOST_TABLE: &str = "/proc/net/unix";
+
+/// The files the host's sockets that take clients are bound to, as
+/// [`HOST_TABLE`] lists them now; none where it cannot be read, as on macOS.
+pub fn host_paths() -> Vec<PathBuf> {
+    std::fs::read_to_string(HOST_TABLE)
+        .map(|table| paths_in(&table))
+        .unwrap_or_default()
+}
+
+/// The files the sockets of `table` that take clients are bound to.
+pub fn paths_in(table: &str) -> Vec<PathBuf> {
+    listening(table)
+        .into_iter()
+        .filter_map(|socket| match socket.address {
+            Address::Path(path) => Some(path),
+            Address::Abstract(_) => None,
+        })
+        .collect()
+}
 
 /// `SOCK_STREAM`, `SOCK_DGRAM` and `SOCK_SEQPACKET`, as the table writes a
 /// socket's type: the same numbers on x86_64 and arm64.

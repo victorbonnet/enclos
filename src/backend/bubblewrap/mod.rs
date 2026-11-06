@@ -13,6 +13,7 @@ mod probe;
 pub mod probes;
 pub mod proposed;
 pub mod seccomp;
+mod sockets;
 mod wrap;
 
 use std::path::{Path, PathBuf};
@@ -136,7 +137,8 @@ impl Backend for Bubblewrap {
             WrapError("cannot find the enclos program, which bubblewrap runs first".to_owned())
         })?;
         let ssh_auth_sock = std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from);
-        let host = wrap::read_host(&parsed, &ctx.home, ssh_auth_sock.as_deref())?;
+        let sockets = sockets::host_paths();
+        let host = wrap::read_host(&parsed, &ctx.home, ssh_auth_sock.as_deref(), &sockets)?;
         let programs = wrap::Programs {
             bwrap: &self.bwrap,
             enclos,

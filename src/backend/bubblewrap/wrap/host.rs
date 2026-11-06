@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::masks::{
-    Grants, Masks, agents_socket, at_a_workspaces_name, in_grants_as_written,
+    Grants, Masks, agents_socket, at_a_workspaces_name, home_sockets, in_grants_as_written,
     refuse_workspace_reaching_an_entry, resolved_entries, unmovable, where_links_lead,
 };
 use super::paths;
@@ -62,6 +62,9 @@ pub(in crate::backend::bubblewrap) struct Host {
     /// The masks inside a grant, after its bind, at the path the grant is
     /// written by.
     pub in_grants: Vec<(PathBuf, Kind)>,
+    /// The host's listening sockets under the user's home that the home's
+    /// mask would show, each masked after it.
+    pub sockets: Vec<PathBuf>,
 }
 
 fn gone(e: &io::Error) -> bool {
@@ -139,13 +142,15 @@ fn with_kinds(mut found: Vec<PathBuf>) -> Result<Vec<(PathBuf, Kind)>, WrapError
 
 /// What this launch's masks depend on, in the order design §5 gives:
 /// workspaces that reach a deny entry refused, the masks inside the grants,
-/// where links lead, the agent's socket, the folders that cannot move, then
-/// the home's folders listed. `ssh_auth_sock` is the socket the host's
-/// `SSH_AUTH_SOCK` names.
+/// where links lead, the agent's socket, the home's listening sockets, the
+/// folders that cannot move, then the home's folders listed.
+/// `ssh_auth_sock` is the socket the host's `SSH_AUTH_SOCK` names, and
+/// `sockets` the files the host's listening sockets are bound to now.
 pub(in crate::backend::bubblewrap) fn read_host(
     compiled: &CompiledSandbox,
     sandbox_home: &Path,
     ssh_auth_sock: Option<&Path>,
+    sockets: &[PathBuf],
 ) -> Result<Host, WrapError> {
     let root_masks = &compiled.bubblewrap.root_masks;
     let grants = Grants::read(compiled, sandbox_home);
@@ -169,6 +174,13 @@ pub(in crate::backend::bubblewrap) fn read_host(
         agents_socket(socket, &grants, &mut masks)?;
     }
 
+    // One that went away since the table was read gets no mask, which
+    // bubblewrap would otherwise make as a file.
+    let home_sockets = with_kinds(home_sockets(sockets, &grants, &masks.hidden))?
+        .into_iter()
+        .filter(|(_, kind)| *kind == Kind::Other)
+        .map(|(socket, _)| socket)
+        .collect();
     let mut host = Host {
         unmovable: unmovable(
             &compiled.bubblewrap.grant_masks.unmovable,
@@ -177,6 +189,7 @@ pub(in crate::backend::bubblewrap) fn read_host(
         ),
         in_grants: with_kinds(masks.in_grants)?,
         elsewhere: with_kinds(masks.elsewhere)?,
+        sockets: home_sockets,
         ..Host::default()
     };
     let roots: Vec<PathBuf> = grants.present.into_iter().map(|(_, real)| real).collect();

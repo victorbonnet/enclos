@@ -996,9 +996,10 @@ fn report_lines(report: &serde_json::Value) -> String {
 /// probe open and every route of milestone 3's step 5 shown closed (design
 /// §13): with a denied folder in the user's home, a workspace holding a
 /// denied folder and a denied file, and another sandbox running a session
-/// that listens on an abstract socket, its `secrets/` folder there. Each
-/// probe's control runs on the host. The report goes to the test's target
-/// folder, which the job prints.
+/// that listens on an abstract socket, its `secrets/` folder there, and a
+/// socket listening in the user's home that no deny entry names, which
+/// `wrap` masks at each launch. Each probe's control runs on the host. The
+/// report goes to the test's target folder, which the job prints.
 #[test]
 fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
     if !on_a_runner() {
@@ -1053,6 +1054,10 @@ fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
     let secrets = lab.root.path().join("sandboxes/other/secrets");
     std::fs::create_dir_all(&secrets).unwrap();
     std::fs::write(secrets.join(".env"), "TOKEN=other\n").unwrap();
+    // This test's own, listening until it ends.
+    let listening = home().join("enclos-ci-listening.sock");
+    let _ = std::fs::remove_file(&listening);
+    let listener = std::os::unix::net::UnixListener::bind(&listening).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_enclos"))
         .args(["--json", "policy", "test", "lab"])
@@ -1060,6 +1065,8 @@ fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
+    drop(listener);
+    let _ = std::fs::remove_file(&listening);
     let _ = std::fs::remove_file(&planted);
     let _ = std::fs::remove_dir_all(&work);
     let _ = lab.command(&["sandbox", "stop", "other"]).output();
@@ -1108,6 +1115,7 @@ fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
         ("vsock", "AF_VSOCK"),
         ("dns", "resolver"),
         ("host sockets", "connect to /"),
+        ("host sockets", "/enclos-ci-listening.sock"),
         ("abstract sockets", "where enclos listens on the host"),
         ("abstract sockets", "@enclos-ci-other, of sandbox other"),
         ("session bus", "session bus"),

@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::super::sockets::{Address, Socket};
 use super::host::{HostFacts, OtherProcess, OtherSocket};
 use super::routes::CRONTAB;
 #[cfg(target_os = "linux")]
 use super::routes::environment_probe;
-use super::sockets::{Address, Socket};
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::probes::TARGET_VARIABLE;

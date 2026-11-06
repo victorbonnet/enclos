@@ -20,7 +20,6 @@
 mod calls;
 mod host;
 mod routes;
-mod sockets;
 #[cfg(test)]
 mod tests;
 

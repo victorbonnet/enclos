@@ -8,7 +8,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::sockets::{self, Address, Socket};
+use super::super::sockets::{self, Address, Socket};
 use crate::backend::environment::SANDBOX_VARIABLE;
 use crate::layout::Layout;
 use crate::model::sandbox::SandboxName;
@@ -138,7 +138,7 @@ fn host_sockets(
     target: Option<&str>,
     keep: impl Fn(&Socket) -> bool,
 ) -> Vec<Socket> {
-    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+    let Ok(table) = std::fs::read_to_string(sockets::HOST_TABLE) else {
         return Vec::new();
     };
     let own_proxy = layout.proxy_socket(name.as_str());
