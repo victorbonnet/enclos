@@ -122,7 +122,7 @@ jobs:
       - name: Scopes in the runner's user manager
         run: |
           cargo test --locked --all-features --lib engine::tests::runtime::cgroups::on_a_runner | tee cgroups.log
-          grep -q 'test result: ok\. 12 passed' cgroups.log
+          grep -q 'test result: ok\. 13 passed' cgroups.log
 
   confinement:
     strategy:

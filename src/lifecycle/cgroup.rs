@@ -308,6 +308,11 @@ impl Scopes {
     ) -> Result<(), PsError> {
         super::slice::hold(&slice_name(install, sandbox), limits)
     }
+
+    /// Stops `sandbox`'s slice and drops its limits, once it is removed.
+    pub fn release_slice(&self, install: &str, sandbox: &str) -> Result<(), PsError> {
+        super::slice::release(&slice_name(install, sandbox))
+    }
 }
 
 /// The scope a session's program runs in, and its cgroup once read.

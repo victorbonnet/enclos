@@ -637,3 +637,51 @@ fn on_a_runner_nothing_stays_in_a_slice_after_its_session() {
     let listed = String::from_utf8_lossy(&units.stdout);
     assert!(listed.trim().is_empty(), "{listed}");
 }
+
+/// A sandbox removed leaves no slice: systemd keeps one active once a scope
+/// ran in it, with the limits its sessions set on it for this boot, until
+/// `sandbox rm` stops it and drops them.
+#[test]
+fn on_a_runner_a_sandbox_removed_leaves_no_slice() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    done(
+        lab.engine
+            .exec(&alice(), &lab.name, vec!["/bin/true".into()], Confirm::Yes)
+            .unwrap(),
+    );
+    let install = lab.engine.layout.install_id().unwrap();
+    let slice = crate::lifecycle::cgroup::slice_name(&install, lab.name.as_str());
+    let show = || {
+        let out = Command::new("/usr/bin/systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--property=DropInPaths",
+            ])
+            .arg(&slice)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // The control: the session left it active, with its limits.
+    let before = show();
+    assert!(before.contains("ActiveState=active"), "{before}");
+    assert!(!before.contains("DropInPaths=\n"), "{before}");
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+    done(
+        lab.engine
+            .remove_sandbox(&alice(), &lab.name, false, Confirm::Yes)
+            .unwrap(),
+    );
+    let after = show();
+    assert!(after.contains("ActiveState=inactive"), "{after}");
+    assert!(after.contains("DropInPaths=\n"), "{after}");
+}
