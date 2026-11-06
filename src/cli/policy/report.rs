@@ -15,7 +15,7 @@ pub(super) fn test_code(report: &TestReport) -> u8 {
 }
 
 pub(super) fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
-    json!({
+    let mut document = json!({
         "sandbox": sandbox.to_string(),
         "ready": report.passed(),
         "verdict": verdict(sandbox, report, true),
@@ -39,7 +39,12 @@ pub(super) fn test_json(sandbox: &SandboxName, report: &TestReport) -> Value {
         "not_probed": report.notes.not_probed,
         "listens": report.listens,
         "baseline": report.notes.baseline_key,
-    })
+    });
+    // Only where a session said something of enclos's own.
+    if !report.notices.is_empty() {
+        document["notices"] = json!(report.notices);
+    }
+    document
 }
 
 pub(super) fn print_test(sandbox: &SandboxName, report: &TestReport) -> u8 {
@@ -100,6 +105,9 @@ fn test_text(sandbox: &SandboxName, report: &TestReport) -> String {
     }
     if report.listens {
         line(report.notes.listening.to_owned());
+    }
+    for notice in &report.notices {
+        line(format!("The probes' sessions said: {notice}"));
     }
     line("Closed means the probe was refused in the sandbox while its control, a harmless check, worked on this host (for the probes through the proxy: the proxy answered 403). It does not mean no other way out exists.".to_owned());
     if report.inconclusive() > 0 {
@@ -194,6 +202,7 @@ mod tests {
             not_here: Vec::new(),
             listens: false,
             notes: notes_on(Baseline::DenyDefault),
+            notices: Vec::new(),
         }
     }
 
@@ -267,6 +276,21 @@ mod tests {
         let text = test_text(&name, &listens);
         assert!(text.contains(listens.notes.listening), "{text}");
         assert!(!text.contains("bind probes"), "{text}");
+    }
+
+    /// What enclos said on the probes' sessions is said once, in text and in
+    /// JSON, and a report with nothing of it keeps its JSON as it was.
+    #[test]
+    fn what_the_sessions_said_of_the_host_is_said_once() {
+        let name = "lab".parse().unwrap();
+        let quiet = report(Outcome::Closed);
+        assert!(test_json(&name, &quiet).get("notices").is_none());
+        let mut said = report(Outcome::Closed);
+        let notice = "enclos: this kernel has no Landlock";
+        said.notices = vec![notice.to_owned()];
+        let text = test_text(&name, &said);
+        assert_eq!(text.matches(notice).count(), 1, "{text}");
+        assert_eq!(test_json(&name, &said)["notices"][0], notice);
     }
 
     /// The baseline a report names, in its verdict and its JSON, is the
@@ -353,6 +377,7 @@ mod tests {
                 not_here,
                 listens,
                 notes: notes_on(baseline),
+                notices: Vec::new(),
             };
             got.push_str(&test_text(&lab, &report));
             got.push_str(&verdict(&lab, &report, false));

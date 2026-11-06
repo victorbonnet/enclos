@@ -126,7 +126,7 @@ fn compiled(home: &Home, lists: Lists) -> CompiledSandbox {
 }
 
 fn read(home: &Home, c: &CompiledSandbox, ssh: Option<&Path>) -> Result<Host, WrapError> {
-    read_host(c, &home.sandbox_home(), ssh)
+    read_host(c, &home.sandbox_home(), ssh, &[])
 }
 
 fn strings(args: &[OsString]) -> Vec<String> {
@@ -173,4 +173,5 @@ fn staged(home: &Home) -> Vec<PathBuf> {
 mod command;
 mod links;
 mod masks;
+mod sockets;
 mod staged;

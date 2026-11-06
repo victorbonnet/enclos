@@ -560,6 +560,14 @@ impl Engine {
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
                 let left = self.forget_secrets(&after_record);
+                // Its slice, which held its scopes and stays active once
+                // one ran, holds nothing now: it goes, with its limits.
+                if let Some(scopes) = &self.scopes {
+                    let install = self.layout.install_id()?;
+                    if let Err(e) = scopes.release_slice(&install, name.as_str()) {
+                        crate::notes::say(&format!("the slice of sandbox {name} stays: {e}"));
+                    }
+                }
                 // Nothing in it outlives the sandbox's proxy, whatever
                 // `keep_data` keeps; left behind, the next proxy of the name
                 // takes its socket over.

@@ -947,3 +947,193 @@ while time.time() < deadline:
     assert_eq!(second[1], port.to_string(), "{said}");
     assert_eq!(second[3], token, "{said}");
 }
+
+/// A session of another sandbox, in Python: listens on the abstract socket
+/// named first, says so with a file in its home, and waits.
+const ABSTRACT_LISTENER: &str = r#"
+import os, socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.bind("\0" + sys.argv[1])
+s.listen()
+open(os.path.join(os.environ["HOME"], "abstract.ready"), "w").close()
+time.sleep(600)
+"#;
+
+/// The text of a `policy test --json` report, a line per probe, for the
+/// job's log.
+fn report_lines(report: &serde_json::Value) -> String {
+    let mut lines = vec![
+        report["verdict"]
+            .as_str()
+            .unwrap_or("no verdict")
+            .to_owned(),
+    ];
+    for probe in report["probes"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{:<12}  {:<16}  {}{}",
+            probe["outcome"].as_str().unwrap_or("?"),
+            probe["route"].as_str().unwrap_or("?"),
+            probe["name"].as_str().unwrap_or("?"),
+            probe["why"]
+                .as_str()
+                .map(|why| format!("  ({why})"))
+                .unwrap_or_default()
+        ));
+    }
+    for (what, key) in [
+        ("Not here", "not_here"),
+        ("Not probed", "not_probed"),
+        ("Said", "notices"),
+    ] {
+        for item in report[key].as_array().into_iter().flatten() {
+            lines.push(format!("{what}: {}", item.as_str().unwrap_or("?")));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
+/// `policy test` runs bubblewrap's own escape probes and is READY, with no
+/// probe open and every route of milestone 3's step 5 shown closed (design
+/// §13): with a denied folder in the user's home, a workspace holding a
+/// denied folder and a denied file, and another sandbox running a session
+/// that listens on an abstract socket, its `secrets/` folder there, and a
+/// socket listening in the user's home that no deny entry names, which
+/// `wrap` masks at each launch. Each probe's control runs on the host. The
+/// report goes to the test's target folder, which the job prints.
+#[test]
+fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let ssh = home().join(".ssh");
+    std::fs::create_dir_all(&ssh).unwrap();
+    let planted = ssh.join("enclos-ci-probe");
+    std::fs::write(&planted, "secret\n").unwrap();
+    let work = home().join("enclos-ci-work");
+    std::fs::create_dir_all(work.join(".secrets")).unwrap();
+    std::fs::create_dir_all(work.join("config")).unwrap();
+    std::fs::write(work.join(".secrets/token"), "secret\n").unwrap();
+    std::fs::write(work.join("config/.env"), "TOKEN=secret\n").unwrap();
+    let policy_file = lab.root.path().join("sandboxes/lab/policy.toml");
+    let original = std::fs::read_to_string(&policy_file).unwrap();
+    let policy = original.replace(
+        "write_add = []\nread_deny_add = []",
+        "write_add = [\"~/enclos-ci-work\"]\nread_deny_add = [\"~/enclos-ci-work/.secrets\", \"~/enclos-ci-work/config/.env\"]",
+    );
+    assert_ne!(policy, original, "the grant was not added:\n{original}");
+    std::fs::write(&policy_file, policy).unwrap();
+    // `policy allow` applies the file's other changes with `--yes`.
+    lab.ok(&["policy", "allow", "lab", "example.com", "--yes"]);
+
+    lab.ok(&[
+        "sandbox",
+        "create",
+        "other",
+        "--backend",
+        "bubblewrap",
+        "--template",
+        "assistant",
+    ]);
+    let mut other = lab
+        .command(&[
+            "connect",
+            "other",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            ABSTRACT_LISTENER,
+            "enclos-ci-other",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    once_there(&lab.home_of("other").join("abstract.ready"));
+    // As `launch` writes it for a service (ADR 0034).
+    let secrets = lab.root.path().join("sandboxes/other/secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join(".env"), "TOKEN=other\n").unwrap();
+    // This test's own, listening until it ends.
+    let listening = home().join("enclos-ci-listening.sock");
+    let _ = std::fs::remove_file(&listening);
+    let listener = std::os::unix::net::UnixListener::bind(&listening).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_enclos"))
+        .args(["--json", "policy", "test", "lab"])
+        .env("ENCLOS_HOME", lab.root.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    drop(listener);
+    let _ = std::fs::remove_file(&listening);
+    let _ = std::fs::remove_file(&planted);
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = lab.command(&["sandbox", "stop", "other"]).output();
+    let _ = other.kill();
+    let _ = other.wait();
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {out:?}"));
+    let lines = report_lines(&report);
+    let file = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("policy-test-lab.txt");
+    std::fs::write(&file, &lines).unwrap();
+    let probes = report["probes"].as_array().cloned().unwrap_or_default();
+    let with = |outcome: &str| -> Vec<String> {
+        probes
+            .iter()
+            .filter(|p| p["outcome"] == outcome)
+            .map(|p| format!("{}: {}", p["route"], p["name"]))
+            .collect()
+    };
+    assert!(with("open").is_empty(), "open: {:?}\n{lines}", with("open"));
+    assert!(
+        with("not_run").is_empty(),
+        "not run: {:?}\n{lines}",
+        with("not_run")
+    );
+    assert_eq!(report["ready"], true, "{lines}");
+    assert_eq!(out.status.code(), Some(0), "{lines}");
+    let closed = |route: &str, name: &str| {
+        probes.iter().any(|p| {
+            p["outcome"] == "closed"
+                && p["route"] == route
+                && p["name"].as_str().is_some_and(|n| n.contains(name))
+        })
+    };
+    let other_secrets = format!("read {}", secrets.display());
+    for (route, name) in [
+        ("sensitive files", "read "),
+        ("sensitive files", "under a write grant"),
+        ("enclos files", "read "),
+        ("other sandboxes", other_secrets.as_str()),
+        ("writes", "write outside the home"),
+        ("writable folders", "remove the sandbox home"),
+        ("writable folders", "rename "),
+        ("renames", "/enclos-ci-work/config"),
+        ("network", "where a program listens on the host"),
+        ("vsock", "AF_VSOCK"),
+        ("dns", "resolver"),
+        ("host sockets", "connect to /"),
+        ("host sockets", "/enclos-ci-listening.sock"),
+        ("abstract sockets", "where enclos listens on the host"),
+        ("abstract sockets", "@enclos-ci-other, of sandbox other"),
+        ("session bus", "session bus"),
+        ("system bus", "system bus"),
+        ("systemd --user", "manager"),
+        ("signals", "signal a process outside"),
+        ("ptrace", "attach"),
+        ("environment", "a process outside the sandbox"),
+        ("environment", "of sandbox other"),
+        ("terminals", "TIOCSTI"),
+        ("setuid", "chage"),
+        ("user namespace", "user namespace"),
+        ("mounts", "mount"),
+        ("cgroup", "cgroup"),
+    ] {
+        assert!(
+            closed(route, name),
+            "no closed {route} probe `{name}`:\n{lines}"
+        );
+    }
+}
