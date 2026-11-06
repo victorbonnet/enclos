@@ -385,6 +385,57 @@ fn a_rollback_checks_the_paths_again_as_they_are_now() {
     assert_eq!(engine.layout.read_policy("home").unwrap(), file);
 }
 
+/// Takes `entry` out of version `version`'s stored policy, as a snapshot made
+/// before the entry joined the built-in defaults.
+fn from_before_the_default(engine: &Engine, name: &SandboxName, version: u32, entry: &str) {
+    let id = engine
+        .state
+        .policy_version(name, version)
+        .unwrap()
+        .unwrap()
+        .1
+        .id;
+    let conn = rusqlite::Connection::open(engine.layout.state_db()).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE policy_snapshots SET policy = replace(policy, ?1, '') WHERE id = ?2",
+            [format!("\"{entry}\","), id.0],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+#[test]
+fn a_rollback_to_a_version_older_than_a_default_is_refused_and_says_what_to_do() {
+    let (_dir, engine, name) = with_three_versions();
+    from_before_the_default(&engine, &name, 1, "~/.pki");
+    let file = engine.layout.read_policy("home").unwrap();
+    let err = engine
+        .policy_rollback(&alice(), &name, 1, Confirm::Yes)
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let said = err.to_string();
+    assert!(
+        said.contains("cannot be restored") && said.contains("~/.pki"),
+        "{said}"
+    );
+    assert!(said.contains("`policy edit`"), "{said}");
+    assert_eq!(engine.policy(&name).unwrap().version.version, 3);
+    assert_eq!(engine.layout.read_policy("home").unwrap(), file);
+}
+
+#[test]
+fn the_first_allow_after_a_new_default_asks_and_lists_it() {
+    let (_dir, engine, name) = with_three_versions();
+    from_before_the_default(&engine, &name, 3, "~/.pki");
+    let err = engine
+        .policy_allow(&alice(), &name, "c.example.com", Confirm::Ask)
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 3, "{err}");
+    assert!(err.to_string().contains("~/.pki"), "{err}");
+    assert_eq!(engine.policy(&name).unwrap().version.version, 3);
+}
+
 #[test]
 fn a_rollback_of_a_sandbox_that_does_not_exist_says_so() {
     let (_dir, engine, _name) = with_sandbox();
