@@ -626,12 +626,12 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
             now.cpu_seconds.map(|s| format!("{s} s")),
         ),
         (
-            "the memory of each session",
+            "the sandbox's memory",
             was.memory.clone(),
             now.memory.clone(),
         ),
         (
-            "the share of the CPU of each session",
+            "the sandbox's share of the CPU",
             was.cpu.clone(),
             now.cpu.clone(),
         ),

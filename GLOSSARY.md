@@ -124,7 +124,7 @@ On Linux, the unit of the user's systemd manager that holds one session's proces
 On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
 
 **Limit**:
-A bound a policy sets on what a sandbox's processes use: open files on each process, or memory and a share of the CPU on each session as a whole.
+A bound a policy sets on what a sandbox's processes use: open files on each process, or memory and a share of the CPU on the sandbox as a whole, its sessions and services together.
 _Avoid_: quota, resource cap
 
 **Acceptance**:

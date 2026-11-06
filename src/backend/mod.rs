@@ -146,8 +146,8 @@ pub struct Launch {
 
 /// The limits a program runs under: only those a backend enforces as
 /// written (design §7, ADR 0033). `open_files` holds each process, and the
-/// backend sets it; `memory` and `cpu` hold the session's cgroup, and the
-/// engine sets them on the session's scope. The engine makes them from a
+/// backend sets it; `memory` and `cpu` hold the sandbox as a whole, and the
+/// engine sets them on the sandbox's slice. The engine makes them from a
 /// policy's `[resources]` once checked for the sandbox's backend, so a limit
 /// nothing enforces never reaches a program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -202,13 +202,13 @@ impl LaunchLimits {
         self.open_files
     }
 
-    /// The bytes of memory the session's processes may use together, with
+    /// The bytes of memory the sandbox's processes may use together, with
     /// no swap beyond it, if limited.
     pub fn memory(&self) -> Option<u64> {
         self.memory
     }
 
-    /// The share of the CPU the session's processes may use together, if
+    /// The share of the CPU the sandbox's processes may use together, if
     /// limited.
     pub fn cpu(&self) -> Option<crate::model::limits::CpuShare> {
         self.cpu
@@ -221,7 +221,7 @@ impl LaunchLimits {
 /// one it cannot set stops it with exit 125 and the field named, so no
 /// program runs without its limits. Only `open_files` is set here: Seatbelt
 /// refuses the others (ADR 0033), and on bubblewrap `memory` and `cpu` hold
-/// the session's scope, not each process. In privileged mode (`-p`), as it runs on
+/// the sandbox's slice, not each process. In privileged mode (`-p`), as it runs on
 /// the host with the sandbox's variables: it then reads no `BASH_ENV` or
 /// `ENV` file, no `SHELLOPTS` and no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`

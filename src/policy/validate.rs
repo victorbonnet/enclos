@@ -115,7 +115,7 @@ fn check_grants(
 /// and run past its CPU time, macOS refuses a memory limit, does not hold
 /// appends to a file size limit, and enclos has no means for a CPU share.
 /// bubblewrap holds `open_files` as Seatbelt does, and `memory` and `cpu` on
-/// each session's cgroup; whether this host's cgroups hold `memory` is
+/// the sandbox's slice; whether this host's cgroups hold `memory` is
 /// checked apart, as it depends on the host (ADR 0038).
 ///
 /// `most_open_files` is the host's own ceiling on the files one process
@@ -181,7 +181,7 @@ pub fn validate_resources(
             )));
         }
     }
-    // The limits a session's cgroup holds, kept as written for a backend
+    // The limits a sandbox's slice holds, kept as written for a backend
     // that refuses them, read here for one that holds them.
     if let Some(memory) = &r.memory
         && accepted("memory")
@@ -254,7 +254,7 @@ fn refusals(
             }
         }
         // `open_files` as on Seatbelt, and `memory` and `cpu` on each
-        // session's cgroup; the per-process limits it does not set yet.
+        // sandbox's slice; the per-process limits it does not set yet.
         BackendKind::Bubblewrap => {
             if let Some(size) = r.file_size {
                 refused.push(("file_size", format!(
@@ -621,7 +621,7 @@ mod tests {
         }
     }
 
-    /// `open_files` as on Seatbelt, and the limits of a session's cgroup.
+    /// `open_files` as on Seatbelt, and the limits of a sandbox's slice.
     #[test]
     fn bubblewrap_accepts_open_files_memory_and_cpu() {
         let mut policy = Policy::default();

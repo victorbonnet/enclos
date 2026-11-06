@@ -251,37 +251,6 @@ impl Systemd {
     }
 }
 
-/// What a scope's cgroup holds its processes to together (design §7), set
-/// as the scope's properties as `systemd-run` starts it, so the program
-/// never runs without them.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScopeLimits {
-    /// The bytes of memory, with no swap beyond them: past it the kernel
-    /// stops a process of the scope, and systemd then the scope.
-    pub memory: Option<u64>,
-    /// A share of the CPU, as a percentage of one core: 50 is half of one.
-    pub cpu_percent: Option<u32>,
-}
-
-impl ScopeLimits {
-    /// `systemd-run`'s `--property` arguments that set them.
-    fn properties(&self) -> Vec<String> {
-        let mut set = Vec::new();
-        if let Some(bytes) = self.memory {
-            set.push(format!("--property=MemoryMax={bytes}"));
-            set.push("--property=MemorySwapMax=0".to_owned());
-        }
-        if let Some(percent) = self.cpu_percent {
-            set.push(format!("--property=CPUQuota={percent}%"));
-        }
-        set
-    }
-
-    pub fn is_unset(&self) -> bool {
-        *self == ScopeLimits::default()
-    }
-}
-
 /// How this host runs a session's program in a scope: the `systemd-run`
 /// that starts the scope and tells the host's systemd version, and the
 /// hierarchy where a session's cgroup is read.
@@ -319,21 +288,25 @@ impl Scopes {
     }
 
     /// `command` as the program of a new scope for a session of `sandbox`,
-    /// held to `limits`, reaching the manager this process reaches, and
-    /// that scope.
-    pub fn wrap(
-        &self,
-        install: &str,
-        sandbox: &str,
-        command: &Command,
-        limits: &ScopeLimits,
-    ) -> (Command, Scope) {
+    /// reaching the manager this process reaches, and that scope.
+    pub fn wrap(&self, install: &str, sandbox: &str, command: &Command) -> (Command, Scope) {
         let scope = Scope::new(self, install, sandbox);
         let manager: Vec<_> = MANAGER_VARIABLES
             .iter()
             .filter_map(|name| Some((name.into(), std::env::var_os(name)?)))
             .collect();
-        (scope.around(command, limits, &manager), scope)
+        (scope.around(command, &manager), scope)
+    }
+
+    /// Holds `sandbox`'s slice, which each of its scopes sits in, to
+    /// `limits` (design §7).
+    pub fn limit_slice(
+        &self,
+        install: &str,
+        sandbox: &str,
+        limits: &super::slice::SliceLimits,
+    ) -> Result<(), PsError> {
+        super::slice::hold(&slice_name(install, sandbox), limits)
     }
 }
 
@@ -368,15 +341,9 @@ impl Scope {
         &self.systemd_run
     }
 
-    /// `command` run through `systemd-run` in this scope, held to
-    /// `limits`, with `manager`'s variables for `systemd-run` alone;
-    /// arguments are passed unexpanded.
-    fn around(
-        &self,
-        command: &Command,
-        limits: &ScopeLimits,
-        manager: &[(OsString, OsString)],
-    ) -> Command {
+    /// `command` run through `systemd-run` in this scope, with `manager`'s
+    /// variables for `systemd-run` alone; arguments are passed unexpanded.
+    fn around(&self, command: &Command, manager: &[(OsString, OsString)]) -> Command {
         let mut scoped = Command::new(&self.systemd_run);
         scoped
             .args(["--user", "--scope", "--quiet", "--collect"])
@@ -384,7 +351,6 @@ impl Scope {
             .arg(format!("--description={DESCRIPTION}"))
             .arg(format!("--slice={}", self.slice))
             .arg(format!("--unit={}", self.unit))
-            .args(limits.properties())
             .args(["--", ENV]);
         for name in MANAGER_VARIABLES.iter().chain(&SCOPE_VARIABLES) {
             scoped.args(["-u", name]);
@@ -634,12 +600,7 @@ mod tests {
     fn a_scope_runs_through_the_systemd_run_its_scopes_were_given() {
         let systemd_run = Path::new("/opt/systemd/bin/systemd-run");
         let scopes = Scopes::at(systemd_run, Hierarchy::host());
-        let (command, scope) = scopes.wrap(
-            "1f2e3d4c",
-            "home",
-            &Command::new("/bin/prog"),
-            &ScopeLimits::default(),
-        );
+        let (command, scope) = scopes.wrap("1f2e3d4c", "home", &Command::new("/bin/prog"));
         assert_eq!(command.get_program(), systemd_run);
         assert_eq!(scope.systemd_run(), systemd_run);
         assert_eq!(Scopes::host().systemd_run, Path::new(SYSTEMD_RUN));
@@ -658,7 +619,7 @@ mod tests {
     fn a_program_runs_through_systemd_run_with_no_way_to_the_manager() {
         let mut program = Command::new("/bin/prog");
         program.arg("--flag");
-        let command = scope().around(&program, &ScopeLimits::default(), &[]);
+        let command = scope().around(&program, &[]);
         assert_eq!(command.get_program(), SYSTEMD_RUN);
         assert_eq!(
             words(&command),
@@ -685,42 +646,12 @@ mod tests {
         );
     }
 
-    /// Set as `systemd-run` starts the scope, before the program runs; no
-    /// swap beyond the memory limit, so a process past it is stopped.
-    #[test]
-    fn a_scopes_limits_are_its_properties() {
-        let limits = ScopeLimits {
-            memory: Some(512 << 20),
-            cpu_percent: Some(50),
-        };
-        let command = scope().around(&Command::new("/bin/prog"), &limits, &[]);
-        let args = words(&command);
-        let end = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(
-            args[..end]
-                .iter()
-                .filter(|a| a.starts_with("--property="))
-                .collect::<Vec<_>>(),
-            [
-                "--property=MemoryMax=536870912",
-                "--property=MemorySwapMax=0",
-                "--property=CPUQuota=50%",
-            ]
-        );
-        let cpu_only = ScopeLimits {
-            cpu_percent: Some(200),
-            ..ScopeLimits::default()
-        };
-        assert_eq!(cpu_only.properties(), ["--property=CPUQuota=200%"]);
-        assert!(ScopeLimits::default().properties().is_empty());
-    }
-
     #[test]
     fn systemd_run_gets_the_programs_environment_and_folder_and_the_managers_variables() {
         let mut program = Command::new("/bin/prog");
         program.env_clear().env("HOME", "/h").current_dir("/h");
         let manager = [("XDG_RUNTIME_DIR".into(), "/run/user/1000".into())];
-        let command = scope().around(&program, &ScopeLimits::default(), &manager);
+        let command = scope().around(&program, &manager);
         let env: Vec<_> = command
             .get_envs()
             .map(|(n, v)| (n.to_owned(), v.map(ToOwned::to_owned)))

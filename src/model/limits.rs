@@ -1,4 +1,4 @@
-//! The limits a session's cgroup holds (design §7): `memory` and `cpu`, as a
+//! The limits a sandbox's slice holds (design §7): `memory` and `cpu`, as a
 //! policy writes them and as a backend reads them. The policy keeps both as
 //! written, so a backend that refuses them says only that, whatever the
 //! value; one that holds them reads them here.

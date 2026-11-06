@@ -1,6 +1,7 @@
 //! A bubblewrap sandbox's `[resources]` (design §7): `memory` and `cpu` on
-//! the session's scope, `open_files` on each process. Each with a control:
-//! the same program under a limit it does not reach, or none.
+//! the sandbox's slice, which its sessions share, `open_files` on each
+//! process. Each with a control: the same programs under a limit they do
+//! not reach, or none.
 
 use super::{Lab, on_a_runner, text};
 
@@ -12,6 +13,23 @@ for i in range(16):
     chunks.append(b"x" * (16 << 20))
     print("allocated", (i + 1) * 16, flush=True)
 print("done", flush=True)
+"#;
+
+/// Allocates 160M, 16M at a time, every byte written, then says it is
+/// ready in `~/ready-<argv[1]>` and waits up to 30 s for the other session
+/// named by `argv[2]` to be ready too: `done` once both held theirs at once.
+const ALLOCATE_BESIDE: &str = r#"
+import os, sys, time
+chunks = [b"x" * (16 << 20) for _ in range(10)]
+home = os.environ["HOME"]
+open(os.path.join(home, "ready-" + sys.argv[1]), "w").close()
+other = os.path.join(home, "ready-" + sys.argv[2])
+start = time.monotonic()
+while not os.path.exists(other) and time.monotonic() - start < 30:
+    time.sleep(0.1)
+if os.path.exists(other):
+    time.sleep(1)
+    print("done", flush=True)
 "#;
 
 /// Spins for 4 s of wall time, then prints the CPU time it got per second.
@@ -54,10 +72,40 @@ impl Lab {
 
     /// `connect lab -- python3 -c program`.
     fn python(&self, program: &str) -> std::process::Output {
-        self.command(&["connect", "lab", "--", "/usr/bin/python3", "-c", program])
-            .output()
-            .unwrap()
+        self.python_with(program, &[]).output().unwrap()
     }
+
+    /// The command that runs `program` with `args` in a session of `lab`.
+    fn python_with(&self, program: &str, args: &[&str]) -> std::process::Command {
+        let mut command =
+            self.command(&["connect", "lab", "--", "/usr/bin/python3", "-c", program]);
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    }
+
+    /// Two sessions of `lab` at once, each running `program` with its own
+    /// arguments, and what each did.
+    fn two_sessions(&self, program: &str, args: [&[&str]; 2]) -> [std::process::Output; 2] {
+        // The namespace holder started first, by a session alone.
+        assert!(self.connect(":").status.success());
+        let children = args.map(|args| self.python_with(program, args).spawn().unwrap());
+        children.map(|child| child.wait_with_output().unwrap())
+    }
+
+    /// Two sessions allocating 160M each, together, from a clean home.
+    fn allocating_together(&self) -> [std::process::Output; 2] {
+        for name in ["ready-a", "ready-b"] {
+            let _ = std::fs::remove_file(self.sandbox_home().join(name));
+        }
+        self.two_sessions(ALLOCATE_BESIDE, [&["a", "b"], &["b", "a"]])
+    }
+}
+
+fn finished(out: &std::process::Output) -> bool {
+    out.status.success() && text(&out.stdout) == "done"
 }
 
 #[test]
@@ -79,24 +127,47 @@ fn on_a_runner_a_process_allocating_past_memory_is_stopped() {
     assert!(!said.contains("allocated 128"), "{out:?}");
 }
 
+/// The sandbox's sessions share one cap: each stays within it alone, and
+/// together they do not.
 #[test]
-fn on_a_runner_a_share_of_the_cpu_holds() {
+fn on_a_runner_two_sessions_together_past_memory_are_stopped() {
     if !on_a_runner() {
         return;
     }
     let lab = Lab::new();
-    let share = |out: std::process::Output| -> f64 {
-        assert!(out.status.success(), "{out:?}");
-        text(&out.stdout).parse().unwrap()
+    // The control: under a cap they do not reach together, both finish.
+    lab.set_resources("memory = \"1G\"");
+    let [a, b] = lab.allocating_together();
+    assert!(finished(&a) && finished(&b), "{a:?}\n{b:?}");
+    lab.set_resources("memory = \"256M\"");
+    let [a, b] = lab.allocating_together();
+    assert!(!(finished(&a) && finished(&b)), "{a:?}\n{b:?}");
+    assert!(!a.status.success() || !b.status.success(), "{a:?}\n{b:?}");
+}
+
+/// Two sessions spinning at once share the sandbox's 0.25 of a core.
+#[test]
+fn on_a_runner_a_share_of_the_cpu_holds_the_sessions_together() {
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let shares = |outs: [std::process::Output; 2]| -> [f64; 2] {
+        outs.map(|out| {
+            assert!(out.status.success(), "{out:?}");
+            text(&out.stdout).parse().unwrap()
+        })
     };
-    // The control: with no share set, a spinning process gets a core.
-    let free = share(lab.python(SPIN));
-    assert!(free > 0.7, "{free}");
+    let spin_together = || shares(lab.two_sessions(SPIN, [&[], &[]]));
+    // The control: with no share set, each spinning process gets a core.
+    let free = spin_together();
+    assert!(free.iter().all(|s| *s > 0.7), "{free:?}");
     lab.set_resources("cpu = \"0.25\"");
-    let held = share(lab.python(SPIN));
+    let held = spin_together();
+    let together: f64 = held.iter().sum();
     assert!(
-        held < 0.4,
-        "{held} of a core under cpu = 0.25, {free} without"
+        together < 0.4,
+        "{held:?} of a core together under cpu = 0.25, {free:?} without"
     );
 }
 

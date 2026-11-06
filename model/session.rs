@@ -1,0 +1,169 @@
+//! Sessions and their members (design §8, ADR 0019): a single use of a
+//! sandbox from start to end, with every process it started, and the policy
+//! it started under.
+
+use std::fmt;
+use std::str::FromStr;
+
+use super::Timestamp;
+use super::policy::SnapshotId;
+use super::sandbox::SandboxName;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub i64);
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// `enclos connect`, and the installers and agent commands enclos runs,
+    /// in the user's terminal.
+    Interactive,
+    /// `enclos exec`: one command, for a script or another program.
+    Exec,
+    /// One of the runtime's background services, run by `enclos launch`
+    /// for the service manager.
+    Service,
+    /// The sandbox's egress proxy, outside the sandbox.
+    Proxy,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Interactive => "interactive",
+            SessionKind::Exec => "exec",
+            SessionKind::Service => "service",
+            SessionKind::Proxy => "proxy",
+        }
+    }
+}
+
+impl FromStr for SessionKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        [
+            SessionKind::Interactive,
+            SessionKind::Exec,
+            SessionKind::Service,
+            SessionKind::Proxy,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
+        .ok_or_else(|| format!("unknown session kind `{s}`"))
+    }
+}
+
+/// A process enclos started, as it can be recognized later: its pid alone
+/// could have been reused, so its start time is kept too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRef {
+    pub pid: u32,
+    /// The start time `ps` reports for it, in UTC, its five words one space
+    /// apart. Compared as text.
+    pub started: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub id: SessionId,
+    pub sandbox: SandboxName,
+    pub kind: SessionKind,
+    /// The runtime service a service session runs, by the name its runtime
+    /// declares (`enclos launch <sandbox> <service>`); none for other kinds.
+    pub service: Option<String>,
+    /// The policy version and snapshot the session started under.
+    pub version: u32,
+    pub snapshot: SnapshotId,
+    /// The compiled policy file it runs under (none for the proxy).
+    pub compiled: Option<String>,
+    /// The program the session started.
+    pub root: ProcessRef,
+    /// The process group the program started in: one made for it, or the
+    /// terminal's job, which the `enclos` holding the terminal leads; none
+    /// when neither (design §8).
+    pub pgid: Option<u32>,
+    /// The cgroup of the scope the program runs in, as the host gave it:
+    /// the session's members are the processes in it. None on macOS and for
+    /// the proxy (design §8).
+    pub cgroup: Option<Cgroup>,
+    /// Members recorded while the session ran, so that one whose parent
+    /// exited is still found.
+    pub tracked: Vec<ProcessRef>,
+    pub started_at: Timestamp,
+    pub ended_at: Option<Timestamp>,
+}
+
+/// The path of a session's scope in the cgroup hierarchy. Every way to one
+/// goes through [`Cgroup::from_str`], also for a path read back from the
+/// state database, so what is read and killed is always a scope below the
+/// root, never the root or a slice holding other sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cgroup(String);
+
+impl Cgroup {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The scope's unit name.
+    pub fn unit(&self) -> &str {
+        self.0.rsplit('/').next().unwrap_or_default()
+    }
+}
+
+impl std::str::FromStr for Cgroup {
+    type Err = String;
+
+    fn from_str(path: &str) -> Result<Cgroup, String> {
+        let parts = path.strip_prefix('/').map(|p| p.split('/'));
+        let below_root = parts.is_some_and(|mut p| p.all(|p| !p.is_empty() && p != ".."));
+        match below_root && path.ends_with(".scope") {
+            true => Ok(Cgroup(path.to_owned())),
+            false => Err(format!("`{path}` is not the path of a scope")),
+        }
+    }
+}
+
+impl std::fmt::Display for Cgroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A process found running as a member of a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub pid: u32,
+    pub started: String,
+    pub command: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cgroup_is_a_scope_below_the_hierarchys_root() {
+        let scope: Cgroup = "/user.slice/a.slice/s.scope".parse().unwrap();
+        assert_eq!(scope.as_str(), "/user.slice/a.slice/s.scope");
+        assert_eq!(scope.unit(), "s.scope");
+        for path in [
+            "",
+            "/",
+            "/user.slice",
+            "s.scope",
+            "/a//s.scope",
+            "/a/../s.scope",
+            "/../s.scope",
+            "/s.scope/",
+        ] {
+            assert!(path.parse::<Cgroup>().is_err(), "{path}");
+        }
+    }
+}

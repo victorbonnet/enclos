@@ -110,7 +110,7 @@ fn an_acceptance_holds_until_the_value_changes() {
     assert!(err.to_string().contains("resources.memory = 2G"), "{err}");
 }
 
-/// Not applied, so the session's scope is not given it; the rest are.
+/// Not applied, so the sandbox's slice is not given it; the rest are.
 #[test]
 fn an_accepted_memory_limit_is_left_out_of_what_a_session_runs_under() {
     let (_dir, engine, name) = on_a_host_without_the_memory_controller();

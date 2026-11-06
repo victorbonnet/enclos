@@ -12,7 +12,7 @@ use super::Timestamp;
 /// one (ADR 0037).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UnenforcedField {
-    /// `resources.memory`, held by a session's cgroup where the host's
+    /// `resources.memory`, held by the sandbox's slice where the host's
     /// memory controller is there and delegated to the user's manager.
     Memory,
 }

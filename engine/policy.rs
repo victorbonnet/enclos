@@ -1,0 +1,835 @@
+//! The engine's policy calls: show the active and pending policies and
+//! allow a destination (design §7, ADR 0018). Changes that may need a
+//! restart go through `pending.rs`.
+
+use std::path::PathBuf;
+
+use toml_edit::{Array, DocumentMut, Item, Table};
+
+use super::Engine;
+use super::pending::{Change, Recorded, Restarted};
+use crate::backend::LaunchLimits;
+use crate::error::{Error, Result};
+use crate::model::audit::Actor;
+use crate::model::plan::{Confirm, Plan, Planned};
+use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
+use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::model::unenforced::UnenforcedField;
+use crate::net::host::AllowEntry;
+use crate::policy::paths::PathContext;
+use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
+use crate::policy::{self, AdapterLayer, PolicyError, Problem};
+use crate::state::StateLock;
+
+/// A sandbox's active policy, and its pending one, as `enclos policy show`
+/// prints them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyView {
+    pub sandbox: SandboxName,
+    pub version: PolicyVersion,
+    pub snapshot: PolicySnapshot,
+    /// A change saved while sessions ran under rules it changes, waiting
+    /// for `policy apply`.
+    pub pending: Option<(PendingPolicy, PolicySnapshot)>,
+    /// The sandbox's `policy.toml`.
+    pub file: PathBuf,
+}
+
+impl PolicyView {
+    /// The policy the next change normally starts from: the pending one if
+    /// there is one, since `policy.toml` holds it, else the active one.
+    pub fn latest(&self) -> &PolicySnapshot {
+        self.pending.as_ref().map_or(&self.snapshot, |(_, s)| s)
+    }
+}
+
+/// What a policy change did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyApplied {
+    /// The active version after the change.
+    pub version: PolicyVersion,
+    /// Whether the active policy changed: a new version is in force.
+    pub changed: bool,
+    /// What the change does besides the entry asked for, one sentence each:
+    /// edits to `policy.toml` not applied yet, or a newer template or
+    /// built-in defaults. For `policy edit`, `rollback` and `refresh`,
+    /// everything it changes from the active policy.
+    pub also: Vec<String>,
+    pub outcome: ChangeOutcome,
+}
+
+/// Where a change ended up (design §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeOutcome {
+    /// In force for new sessions, and live for the network; `pending` is
+    /// what became of the pending policy, if one waited.
+    InForce { pending: Option<PendingEnd> },
+    /// A change waits as the pending policy: this one, or one saved before
+    /// it that this change left waiting.
+    Pending(PendingPolicy),
+    /// With `--yes`, the sandbox restarted into it.
+    Restarted(Restarted),
+}
+
+/// What became of a pending policy when a change went in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEnd {
+    /// Dropped: the change put the policy in force back.
+    Dropped(PendingPolicy),
+    /// In force with the change, which was resolved from the file that held
+    /// it, now that no session runs under rules it changes.
+    Applied(PendingPolicy),
+}
+
+/// What `policy allow` would do, worked out without changing anything.
+struct AllowPlan {
+    view: PolicyView,
+    /// The file to write and what it resolves to; `None` when the policy
+    /// already allows the entry.
+    change: Option<(String, PolicySnapshot)>,
+    also: Vec<String>,
+}
+
+impl Engine {
+    /// The sandbox's active policy, and its pending one.
+    pub fn policy(&self, name: &SandboxName) -> Result<PolicyView> {
+        let (version, snapshot) = self.active_policy(name)?;
+        Ok(PolicyView {
+            sandbox: name.clone(),
+            version,
+            snapshot,
+            pending: self.state.pending_policy(name)?,
+            file: self.layout.policy_file(name.as_str()),
+        })
+    }
+
+    /// Whether the policy in force allows `destination`, written as
+    /// `policy allow` writes it.
+    pub fn allows(&self, name: &SandboxName, destination: &str) -> Result<bool> {
+        let Ok(entry) = AllowEntry::parse(destination) else {
+            return Ok(false);
+        };
+        let entry = entry.to_string();
+        let view = self.policy(name)?;
+        Ok(view.snapshot.policy.net.allow.contains(&entry))
+    }
+
+    /// Allows the sandbox to reach `destination` (`host`, `host:port` or
+    /// `*.domain`). A network change applies at once when it can be
+    /// separated from a pending change (design §7): the proxy enforces it,
+    /// so nothing restarts, and the pending change gets it too. The new
+    /// version is what `policy.toml` resolves to, so when it changes more
+    /// than this entry (edits not applied yet, a newer template or built-in
+    /// defaults), it asks first; with `--yes`, a part that needs a restart
+    /// restarts the sandbox (design §7).
+    pub fn policy_allow(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        destination: &str,
+        confirm: Confirm,
+    ) -> Result<Planned<PolicyApplied>> {
+        let entry = AllowEntry::parse(destination)
+            .map_err(|e| PolicyError::Invalid {
+                problems: vec![Problem::entry(format!("`{destination}`"), e)],
+            })?
+            .to_string();
+        let plan = self.plan_allow(name, &entry)?;
+        match confirm {
+            Confirm::DryRun => {
+                let changes = match plan.change {
+                    None => vec![format!(
+                        "change nothing: sandbox {name} already allows {entry}"
+                    )],
+                    Some((_, ref snapshot)) => {
+                        let mut changes: Vec<String> = std::iter::once(format!(
+                            "allow {entry} in sandbox {name}; applies at once, unless it waits with a pending change it cannot be separated from"
+                        ))
+                        .chain(plan.also.iter().map(|c| format!("also {c}")))
+                        .collect();
+                        let latest = &plan.view.latest().policy;
+                        if !snapshot.policy.same_at_launch(&plan.view.snapshot.policy)
+                            && !self.sessions_under_rules(name)?.is_empty()
+                        {
+                            changes.push(match snapshot.policy.same_at_launch(latest) {
+                                true => format!(
+                                    "keep the rest of the change pending in sandbox {name} until `enclos policy apply {name}`"
+                                ),
+                                false => format!(
+                                    "save the rest as the pending policy of sandbox {name}, since sessions run under rules it changes; with --yes, restart the sandbox to apply it"
+                                ),
+                            });
+                        }
+                        changes
+                    }
+                };
+                return Ok(Planned::DryRun(Plan {
+                    changes,
+                    ..Plan::default()
+                }));
+            }
+            Confirm::Ask if !plan.also.is_empty() => {
+                return Err(needs_confirmation(&entry, &plan.also));
+            }
+            _ => {}
+        }
+        let recorded = self.write(
+            by,
+            "policy allow",
+            Some(format!("{name} {entry}")),
+            |r: &Recorded| allow_summary(&r.applied),
+            |lock| {
+                // Again under the lock: the policy may have changed since.
+                let plan = self.plan_allow(name, &entry)?;
+                let Some((overrides, snapshot)) = plan.change else {
+                    return Ok(Recorded {
+                        applied: PolicyApplied {
+                            version: plan.view.version,
+                            changed: false,
+                            also: Vec::new(),
+                            outcome: match plan.view.pending {
+                                Some((p, _)) => ChangeOutcome::Pending(p),
+                                None => ChangeOutcome::InForce { pending: None },
+                            },
+                        },
+                        restarts: false,
+                    });
+                };
+                if confirm == Confirm::Ask && !plan.also.is_empty() {
+                    return Err(needs_confirmation(&entry, &plan.also));
+                }
+                let mut recorded = self.propose(
+                    lock,
+                    by,
+                    name,
+                    Change {
+                        entry: Some(&entry),
+                        ..Change::edit(&overrides, &snapshot)
+                    },
+                )?;
+                recorded.applied.also = plan.also;
+                Ok(recorded)
+            },
+        )?;
+        Ok(Planned::Done(
+            self.restart_if_asked(by, name, confirm, recorded)?,
+        ))
+    }
+
+    fn plan_allow(&self, name: &SandboxName, entry: &str) -> Result<AllowPlan> {
+        let view = self.policy(name)?;
+        let allows = |s: &PolicySnapshot| s.policy.net.allow.iter().any(|a| a == entry);
+        if allows(&view.snapshot) && allows(view.latest()) {
+            return Ok(AllowPlan {
+                view,
+                change: None,
+                also: Vec::new(),
+            });
+        }
+        // The file may already list the entry, edited by hand but not applied
+        // yet: only the active snapshot says what the proxy enforces.
+        let current = self.layout.read_policy(name.as_str())?;
+        let overrides = with_allowed(&current, entry)?.unwrap_or(current);
+        let snapshot = self.checked_policy(name, &overrides)?;
+        // What else goes in force with it is told against the active
+        // policy; while sessions keep a change waiting, against that change,
+        // which stays pending with this one.
+        // The same test `propose` makes.
+        let waits = !snapshot.policy.same_at_launch(&view.snapshot.policy)
+            && !self.sessions_under_rules(name)?.is_empty();
+        let base = match waits {
+            true => view.latest(),
+            false => &view.snapshot,
+        };
+        let also = differences(&base.policy, &snapshot.policy, &[entry]);
+        Ok(AllowPlan {
+            view,
+            change: Some((overrides, snapshot)),
+            also,
+        })
+    }
+
+    /// Resolves and checks `overrides` with `runtime`'s endpoints instead of
+    /// the installed runtime's, writes them to `policy.toml`, then records
+    /// the snapshot as the active version: while a runtime installs, before
+    /// it is recorded.
+    pub(super) fn save_policy_for_runtime(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        overrides: &str,
+        runtime: Option<RuntimeKind>,
+    ) -> Result<PolicyVersion> {
+        let backend = self.recorded_backend(name)?;
+        let snapshot =
+            self.checked_policy_with(name, overrides, runtime.map(adapter_layer), backend)?;
+        self.store_policy(lock, by, name, overrides, &snapshot, None)
+    }
+
+    /// `overrides` resolved and validated for this sandbox.
+    pub(super) fn checked_policy(
+        &self,
+        name: &SandboxName,
+        overrides: &str,
+    ) -> Result<PolicySnapshot> {
+        let backend = self.recorded_backend(name)?;
+        self.checked_policy_with(name, overrides, self.adapter_layer(name)?, backend)
+    }
+
+    /// A `policy.toml` that names no template, said with the one the active
+    /// policy is built on: picking another template could open what the
+    /// sandbox's own template closed.
+    fn with_active_template(&self, name: &SandboxName, error: Error) -> Error {
+        if !matches!(error, Error::Policy(PolicyError::NoTemplate)) {
+            return error;
+        }
+        match self.state.active_policy(name) {
+            Ok(Some((_, active))) => {
+                let template = &active.inputs.template;
+                Error::WithContext {
+                    what: format!(
+                        "{error}; its active policy is built on `{template}`, which `extends = \"{template}\"` keeps"
+                    ),
+                    error: Box::new(error),
+                }
+            }
+            _ => error,
+        }
+    }
+
+    pub(super) fn checked_policy_with(
+        &self,
+        name: &SandboxName,
+        overrides: &str,
+        adapter: Option<AdapterLayer>,
+        backend: BackendKind,
+    ) -> Result<PolicySnapshot> {
+        // Every path that resolves a policy.toml says which template the
+        // sandbox has when the file names none (`runtime install` too).
+        let snapshot = policy::resolve(overrides, adapter.as_ref())
+            .map_err(|e| self.with_active_template(name, e.into()))?;
+        self.check_policy(name, &snapshot.policy, backend)?;
+        Ok(snapshot)
+    }
+
+    /// Every check a policy passes before it is stored, whichever command
+    /// stores it: its paths as they are now, the secrets it grants, that
+    /// each of those is set, and its limits against `backend`, which the
+    /// caller names: the recorded one, or for `sandbox create`, before the
+    /// sandbox has a record, the one it is given. Never skipped.
+    pub(super) fn check_policy(
+        &self,
+        name: &SandboxName,
+        policy: &Policy,
+        backend: BackendKind,
+    ) -> Result<()> {
+        validate(policy, &self.validation_context(name))?;
+        validate_secrets(policy, name)?;
+        validate_resources(policy, backend, crate::backend::max_files_per_process())?;
+        self.accepted_gaps(name, backend, policy, None)?;
+        self.check_agent_secrets_delivered(name, policy)?;
+        self.check_secrets_set(name, policy)
+    }
+
+    /// Refuses secrets granted to one agent where the sandbox's runtime has
+    /// no file to give them through (ADR 0036): they would reach no one.
+    /// Before a runtime is installed, they wait for one.
+    fn check_agent_secrets_delivered(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+        if policy.agent_secrets.is_empty() {
+            return Ok(());
+        }
+        let Some(kind) = self.record(name)?.runtime else {
+            return Ok(());
+        };
+        match crate::runtime::adapter(kind).secrets_folder_var() {
+            Some(_) => Ok(()),
+            None => Err(Error::Policy(crate::policy::PolicyError::Invalid {
+                problems: vec![crate::policy::Problem::Refused(format!(
+                    "secrets.agents: {} gives no agent secrets of its own; grant them under [secrets] instead",
+                    kind.display_name()
+                ))],
+            })),
+        }
+    }
+
+    /// The backend of sandbox `name`, as recorded, whose limits its policy
+    /// is checked against.
+    pub(super) fn recorded_backend(&self, name: &SandboxName) -> Result<BackendKind> {
+        Ok(self.record(name)?.backend)
+    }
+
+    /// The limits `policy`'s programs run under in sandbox `record`: checked
+    /// again against its backend, though stored checked, and against the
+    /// hard limits enclos itself runs under, so a session is refused before
+    /// anything runs, naming the limit and how to raise the hard one. One
+    /// this host does not enforce is left out once accepted, and refused
+    /// before then (ADR 0038).
+    pub(super) fn launch_limits(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+        policy: &Policy,
+    ) -> Result<LaunchLimits> {
+        validate_resources(
+            policy,
+            record.backend,
+            crate::backend::max_files_per_process(),
+        )?;
+        let mut limits =
+            LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
+        if let Some(why) = crate::backend::unsettable(&limits) {
+            return Err(Error::Session { what: why });
+        }
+        let start = format!("enclos sandbox start {}", record.name);
+        for gap in self.accepted_gaps(&record.name, record.backend, policy, Some(&start))? {
+            match gap.field {
+                UnenforcedField::Memory => limits = limits.without_memory(),
+            }
+        }
+        Ok(limits)
+    }
+
+    /// Whether the sandbox's active policy could start a session or service
+    /// now, under its limits: for a command that stops the sandbox before
+    /// it starts it again, such as `sandbox restart`, to ask before
+    /// anything stops.
+    pub fn check_start_limits(&self, name: &SandboxName) -> Result<()> {
+        let record = self.record(name)?;
+        self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+        Ok(())
+    }
+
+    /// Writes the file first, so the active version never runs ahead of it:
+    /// if recording the version fails, the file goes back to what it was,
+    /// and an error says so if that fails too.
+    pub(super) fn store_policy(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        overrides: &str,
+        snapshot: &PolicySnapshot,
+        restores: Option<u32>,
+    ) -> Result<PolicyVersion> {
+        // A sandbox being created has no file yet: nothing to put back.
+        let previous = match self.layout.read_policy(name.as_str()) {
+            Ok(text) => Some(text),
+            Err(crate::layout::LayoutError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The same policy as the active one is not a new version. Read
+        // before the file is written, so a failure leaves it as it was.
+        let active = self.state.active_policy(name)?;
+        self.layout.write_policy(name.as_str(), overrides)?;
+        if let Some((active, current)) = active
+            && current.id == snapshot.id
+        {
+            return Ok(active);
+        }
+        match self.state.save_policy(lock, name, snapshot, by, restores) {
+            Ok(version) => Ok(version),
+            Err(e) => Err(match previous {
+                Some(previous) => self.restore_policy(name, &previous, e.into()),
+                None => e.into(),
+            }),
+        }
+    }
+
+    pub(super) fn validation_context(&self, name: &SandboxName) -> ValidationContext {
+        ValidationContext {
+            paths: PathContext {
+                user_home: self.layout.user_home().to_owned(),
+                sandbox_home: self.layout.sandbox_home(name.as_str()),
+            },
+            protected: self.layout.protected(),
+        }
+    }
+
+    /// The installed runtime's endpoints, as a policy layer (design §7). A
+    /// state that cannot be read is an error: resolving without the layer
+    /// would record a policy that lacks them.
+    fn adapter_layer(&self, name: &SandboxName) -> Result<Option<AdapterLayer>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        Ok(record.runtime.map(adapter_layer))
+    }
+}
+
+/// `kind`'s endpoints as a policy layer.
+pub(super) fn adapter_layer(kind: RuntimeKind) -> AdapterLayer {
+    let runtime = crate::runtime::adapter(kind);
+    AdapterLayer {
+        runtime: kind.to_string(),
+        version: runtime.version().to_owned(),
+        text: runtime.endpoints().to_owned(),
+    }
+}
+
+fn allow_summary(applied: &PolicyApplied) -> String {
+    let version = applied.version.version;
+    let others = match applied.also.len() {
+        0 => String::new(),
+        n => format!(", with {n} other changes: {}", applied.also.join("; ")),
+    };
+    match (&applied.outcome, applied.changed) {
+        (ChangeOutcome::Pending(p), true) => format!(
+            "policy v{version} in force; pending snapshot {}{others}",
+            p.snapshot.short()
+        ),
+        (ChangeOutcome::Pending(p), false) => format!(
+            "waits with pending snapshot {}; policy v{version} stays in force{others}",
+            p.snapshot.short()
+        ),
+        (
+            ChangeOutcome::InForce {
+                pending: Some(PendingEnd::Dropped(p)),
+            },
+            false,
+        ) => format!(
+            "already allowed in policy v{version}; dropped pending snapshot {}",
+            p.snapshot.short()
+        ),
+        (_, false) => "already allowed; nothing changed".to_owned(),
+        (_, true) => format!("policy v{version}{others}"),
+    }
+}
+
+fn needs_confirmation(entry: &str, also: &[String]) -> Error {
+    Error::NeedsConfirmation {
+        what: format!(
+            "allowing {entry} together with {} other changes to the policy ({})",
+            also.len(),
+            also.join("; ")
+        ),
+    }
+}
+
+/// What `new` grants differently from `old`, one sentence each.
+pub fn policy_differences(old: &Policy, new: &Policy) -> Vec<String> {
+    differences(old, new, &[])
+}
+
+/// What `new` grants differently from `old`, besides allowing `expected`.
+pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut compare = |old: &[String], new: &[String], added: &str, removed: &str| {
+        for e in new
+            .iter()
+            .filter(|e| !old.contains(e) && !expected.contains(&e.as_str()))
+        {
+            found.push(added.replace("{}", e));
+        }
+        for e in old.iter().filter(|e| !new.contains(e)) {
+            found.push(removed.replace("{}", e));
+        }
+    };
+    compare(
+        &old.fs.write,
+        &new.fs.write,
+        "let it write {} (sessions started from now on)",
+        "stop it writing {} (sessions started from now on)",
+    );
+    compare(
+        &old.fs.read_deny,
+        &new.fs.read_deny,
+        "hide {} from it (sessions started from now on)",
+        "let it read {} (sessions started from now on)",
+    );
+    compare(
+        &old.net.allow,
+        &new.net.allow,
+        "allow {}",
+        "stop allowing {}",
+    );
+    compare(
+        &old.net.private,
+        &new.net.private,
+        "let {} reach private addresses",
+        "stop {} reaching private addresses",
+    );
+    if old.net.mode != new.net.mode {
+        found.push(match new.net.mode {
+            NetMode::Public => {
+                "open the public web to it: any public address on ports 80 and 443".to_owned()
+            }
+            NetMode::Allowlist => "limit its network to the allowlist".to_owned(),
+        });
+    }
+    if old.net.listen != new.net.listen {
+        found.push(listen_change(new.net.listen));
+    }
+    for (variable, grant) in &new.secrets {
+        if old.secrets.get(variable) != Some(grant) {
+            found.push(format!(
+                "give it secret {} as ${variable} (sessions started from now on)",
+                grant.0
+            ));
+        }
+    }
+    for variable in old.secrets.keys().filter(|v| !new.secrets.contains_key(*v)) {
+        found.push(format!(
+            "stop giving it ${variable} (sessions started from now on)"
+        ));
+    }
+    let none = crate::model::policy::SecretGrants::new();
+    let agents: std::collections::BTreeSet<&crate::model::agent::AgentName> = old
+        .agent_secrets
+        .keys()
+        .chain(new.agent_secrets.keys())
+        .collect();
+    for agent in agents {
+        let was = old.agent_secrets.get(agent).unwrap_or(&none);
+        let now = new.agent_secrets.get(agent).unwrap_or(&none);
+        for (variable, grant) in now {
+            if was.get(variable) != Some(grant) {
+                found.push(format!(
+                    "give agent {agent} secret {} as ${variable} (its services started from now on)",
+                    grant.0
+                ));
+            }
+        }
+        for variable in was.keys().filter(|v| !now.contains_key(*v)) {
+            found.push(format!(
+                "stop giving agent {agent} ${variable} (its services started from now on)"
+            ));
+        }
+    }
+    // Every field named, so one added is decided on here.
+    let crate::model::policy::Resources {
+        open_files: _,
+        file_size: _,
+        cpu_seconds: _,
+        memory: _,
+        cpu: _,
+    } = &new.resources;
+    let (was, now) = (&old.resources, &new.resources);
+    for (what, before, after) in [
+        (
+            "the files a process holds open",
+            was.open_files.map(|n| n.to_string()),
+            now.open_files.map(|n| n.to_string()),
+        ),
+        (
+            "the size of a file a process writes",
+            was.file_size.map(|s| s.to_string()),
+            now.file_size.map(|s| s.to_string()),
+        ),
+        (
+            "a process's CPU time",
+            was.cpu_seconds.map(|s| format!("{s} s")),
+            now.cpu_seconds.map(|s| format!("{s} s")),
+        ),
+        (
+            "the sandbox's memory",
+            was.memory.clone(),
+            now.memory.clone(),
+        ),
+        (
+            "the sandbox's share of the CPU",
+            was.cpu.clone(),
+            now.cpu.clone(),
+        ),
+    ] {
+        if before != after {
+            found.push(match after {
+                Some(limit) => format!("limit {what} to {limit} (sessions started from now on)"),
+                None => format!("stop limiting {what} (sessions started from now on)"),
+            });
+        }
+    }
+    found
+}
+
+/// How a change of [`NetPolicy::listen`](crate::model::policy::NetPolicy)
+/// to `listen` is worded (ADR 0028).
+pub(super) fn listen_change(listen: bool) -> String {
+    match listen {
+        true => "let it listen on TCP, on any port but enclos's proxy ports, on every address (sessions started from now on)".to_owned(),
+        false => "stop it listening on TCP (sessions started from now on)".to_owned(),
+    }
+}
+
+/// `policy.toml` with `entry` added to `[network] allow_add`, keeping the
+/// user's comments and layout; `None` when the file already allows it.
+pub(super) fn with_allowed(text: &str, entry: &str) -> Result<Option<String>> {
+    let mut doc: DocumentMut =
+        text.parse()
+            .map_err(|e: toml_edit::TomlError| PolicyError::Parse {
+                layer: "policy.toml".to_owned(),
+                reason: e.to_string().trim().to_owned(),
+            })?;
+    let listed = |key: &str| {
+        doc.get("network")
+            .and_then(|n| n.get(key))
+            .and_then(Item::as_array)
+            .is_some_and(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str())
+                    .any(|v| AllowEntry::parse(v).is_ok_and(|e| e.to_string() == entry))
+            })
+    };
+    if listed("allow") || listed("allow_add") {
+        return Ok(None);
+    }
+    let not_a_table = || PolicyError::Parse {
+        layer: "policy.toml".to_owned(),
+        reason: "`network` must be a table and `network.allow_add` a list".to_owned(),
+    };
+    let network = doc
+        .entry("network")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_like_mut()
+        .ok_or_else(not_a_table)?;
+    let list = network
+        .entry("allow_add")
+        .or_insert(toml_edit::value(Array::new()))
+        .as_array_mut()
+        .ok_or_else(not_a_table)?;
+    list.push(entry);
+    Ok(Some(doc.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowing_keeps_comments_and_skips_what_is_already_allowed() {
+        let text = "# mine\nextends = \"assistant\"\n\n[network]\n# trusted APIs\nallow_add = [\"api.example.com\"]\n";
+        let updated = with_allowed(text, "weather.example.com").unwrap().unwrap();
+        assert!(
+            updated.contains("# mine") && updated.contains("# trusted APIs"),
+            "{updated}"
+        );
+        assert!(updated.contains("\"weather.example.com\""), "{updated}");
+        assert_eq!(with_allowed(text, "api.example.com").unwrap(), None);
+        // An inline or dotted network table is edited where it is.
+        for text in [
+            "extends = \"assistant\"\nnetwork = { allow_add = [\"a.example.com\"] }\n",
+            "extends = \"assistant\"\nnetwork.allow_add = [\"a.example.com\"]\n",
+        ] {
+            let updated = with_allowed(text, "b.example.com").unwrap().unwrap();
+            let parsed = policy::resolve(&updated, None).unwrap();
+            assert_eq!(
+                parsed.policy.net.allow,
+                ["a.example.com", "b.example.com"],
+                "{updated}"
+            );
+        }
+        // A file without a [network] table gets one.
+        let bare = with_allowed("extends = \"assistant\"\n", "a.example.com")
+            .unwrap()
+            .unwrap();
+        assert!(
+            bare.contains("[network]") && bare.contains("allow_add = [\"a.example.com\"]"),
+            "{bare}"
+        );
+    }
+
+    /// What an agent is given, as it changes (ADR 0036): a new or other
+    /// secret says what it is given, a dropped one what it stops being.
+    #[test]
+    fn a_change_of_an_agents_secrets_says_what_it_is_given() {
+        let none = Policy::default();
+        let grant = |p: &mut Policy, secret: &str| {
+            p.agent_secrets
+                .entry("main".parse().unwrap())
+                .or_default()
+                .insert("T".into(), secret.parse().unwrap());
+        };
+        let mut given = none.clone();
+        grant(&mut given, "secret:home/bot");
+        assert_eq!(
+            differences(&none, &given, &[]),
+            ["give agent main secret home/bot as $T (its services started from now on)"]
+        );
+        let mut other = none.clone();
+        grant(&mut other, "secret:home/bot-two");
+        assert_eq!(
+            differences(&given, &other, &[]),
+            ["give agent main secret home/bot-two as $T (its services started from now on)"]
+        );
+        assert_eq!(
+            differences(&given, &none, &[]),
+            ["stop giving agent main $T (its services started from now on)"]
+        );
+    }
+
+    #[test]
+    fn a_change_of_limits_says_what_each_becomes() {
+        let none = Policy::default();
+        let mut set = none.clone();
+        set.resources.open_files = Some(64);
+        set.resources.file_size = Some("1M".parse().unwrap());
+        set.resources.cpu_seconds = Some(600);
+        assert_eq!(
+            differences(&none, &set, &[]),
+            [
+                "limit the files a process holds open to 64 (sessions started from now on)",
+                "limit the size of a file a process writes to 1M (sessions started from now on)",
+                "limit a process's CPU time to 600 s (sessions started from now on)",
+            ]
+        );
+        let mut changed = set.clone();
+        changed.resources.open_files = Some(128);
+        assert_eq!(
+            differences(&set, &changed, &[]),
+            ["limit the files a process holds open to 128 (sessions started from now on)"]
+        );
+        assert_eq!(
+            differences(&set, &none, &[]),
+            [
+                "stop limiting the files a process holds open (sessions started from now on)",
+                "stop limiting the size of a file a process writes (sessions started from now on)",
+                "stop limiting a process's CPU time (sessions started from now on)",
+            ]
+        );
+    }
+
+    #[test]
+    fn differences_leave_out_the_entry_asked_for() {
+        let mut old = Policy::default();
+        old.fs.read_deny = vec!["~/.ssh".into(), "~/dev/work".into()];
+        let mut new = old.clone();
+        new.net.allow = vec!["a.example.com".into(), "b.example.com".into()];
+        new.fs.write = vec!["~/work".into()];
+        new.fs.read_deny.pop();
+        assert_eq!(
+            differences(&old, &new, &["a.example.com"]),
+            [
+                "let it write ~/work (sessions started from now on)",
+                "let it read ~/dev/work (sessions started from now on)",
+                "allow b.example.com",
+            ]
+        );
+        assert!(differences(&old, &old, &["a.example.com"]).is_empty());
+        let mut public = old.clone();
+        public.net.mode = NetMode::Public;
+        assert_eq!(
+            differences(&old, &public, &["a.example.com"]),
+            ["open the public web to it: any public address on ports 80 and 443"]
+        );
+        assert_eq!(
+            differences(&public, &old, &["a.example.com"]),
+            ["limit its network to the allowlist"]
+        );
+        let mut listens = old.clone();
+        listens.net.listen = true;
+        assert_eq!(
+            differences(&old, &listens, &[]),
+            [
+                "let it listen on TCP, on any port but enclos's proxy ports, on every address (sessions started from now on)"
+            ]
+        );
+        assert_eq!(
+            differences(&listens, &old, &[]),
+            ["stop it listening on TCP (sessions started from now on)"]
+        );
+    }
+}

@@ -26,8 +26,9 @@ use super::proxy::abandon;
 use crate::backend::{Launch, LaunchLimits};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::cgroup::{Scope, ScopeLimits, Scopes, no_systemd_run};
+use crate::lifecycle::cgroup::{Scope, Scopes, no_systemd_run};
 use crate::lifecycle::process::{PsError, reference_of_child};
+use crate::lifecycle::slice::SliceLimits;
 use crate::model::limits::CpuShare;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
@@ -212,31 +213,37 @@ fn failed_spawn(named: &str, systemd_run: Option<&Path>, e: &io::Error) -> Strin
 
 impl Engine {
     /// `wrapped` as the program of a new scope in sandbox `name`'s slice,
-    /// held to the limits of `limits` a scope holds, and that scope, when
-    /// this engine runs programs in scopes (design §8). With no scope, such
-    /// a limit is refused, so no program runs without it. `Scopes::wrap`
-    /// keeps only the program, its arguments, environment and folder, so
-    /// anything else is set on what this returns.
+    /// and that scope, when this engine runs programs in scopes (design §8).
+    /// The slice is held to the limits of `limits` a slice holds first, so
+    /// the program never runs outside them; with no scope, such a limit is
+    /// refused. `Scopes::wrap` keeps only the program, its arguments,
+    /// environment and folder, so anything else is set on what this
+    /// returns.
     fn in_scope(
         &self,
         name: &SandboxName,
         wrapped: Command,
         limits: &LaunchLimits,
     ) -> Result<(Command, Option<Scope>)> {
-        let held = ScopeLimits {
+        let held = SliceLimits {
             memory: limits.memory(),
             cpu_percent: limits.cpu().map(CpuShare::percent),
         };
         let Some(scopes) = &self.scopes else {
             if !held.is_unset() {
                 return Err(Error::Session {
-                    what: "resources.memory and resources.cpu hold a session's scope, and enclos runs none here".into(),
+                    what: "resources.memory and resources.cpu hold the sandbox's slice, and enclos runs no session in one here".into(),
                 });
             }
             return Ok((wrapped, None));
         };
         let install = self.layout.install_id()?;
-        let (scoped, scope) = scopes.wrap(&install, name.as_str(), &wrapped, &held);
+        scopes
+            .limit_slice(&install, name.as_str(), &held)
+            .map_err(|e| Error::Session {
+                what: format!("cannot hold sandbox {name} to its limits: {e}"),
+            })?;
+        let (scoped, scope) = scopes.wrap(&install, name.as_str(), &wrapped);
         Ok((scoped, Some(scope)))
     }
 

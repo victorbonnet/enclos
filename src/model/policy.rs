@@ -28,7 +28,7 @@ pub struct Policy {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub agent_secrets: std::collections::BTreeMap<super::agent::AgentName, SecretGrants>,
     /// Limits on the sandbox's processes, each fixed when it starts (and,
-    /// for `memory` and `cpu`, on each session as a whole). Left
+    /// for `memory` and `cpu`, on the sandbox as a whole). Left
     /// out of the snapshot when none is set, as secrets are.
     #[serde(default, skip_serializing_if = "Resources::is_unset")]
     pub resources: Resources,
@@ -39,8 +39,8 @@ pub struct Policy {
 pub type SecretGrants = std::collections::BTreeMap<String, super::secret::SecretGrant>;
 
 /// Limits on a sandbox (design §7): `open_files`, `file_size` and
-/// `cpu_seconds` on each of its processes, `memory` and `cpu` on each of
-/// its sessions as a whole, every process it started. The Seatbelt backend
+/// `cpu_seconds` on each of its processes, `memory` and `cpu` on the
+/// sandbox as a whole, its sessions and services together. The Seatbelt backend
 /// enforces `open_files`, through the process limits macOS keeps, and
 /// refuses the others (ADR 0033), so a policy it stores holds none of them;
 /// bubblewrap enforces `open_files`, `memory` and `cpu`. `memory` and `cpu`

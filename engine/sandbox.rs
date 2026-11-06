@@ -1,0 +1,704 @@
+//! The engine's sandbox calls: create, list, show, remove and stop
+//! (design §8, §10).
+
+use super::Engine;
+use super::secrets::SecretLeft;
+use super::service::IfUnrecorded;
+use crate::error::{Error, Result};
+use crate::layout::LayoutError;
+use crate::lifecycle::stop::{GRACE, Stopped, Survivor, stop};
+use crate::model::audit::Actor;
+use crate::model::now;
+use crate::model::plan::{Confirm, Plan, Planned};
+use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
+use crate::model::sandbox::{
+    BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
+};
+use crate::model::secret::SecretRecord;
+use crate::model::session::{Member, SessionId, SessionRecord};
+use crate::policy;
+use crate::secrets::SecretError;
+use crate::service::ServiceLabel;
+use std::path::{Path, PathBuf};
+
+/// What `enclos sandbox create` takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxSpec {
+    pub name: SandboxName,
+    pub backend: BackendKind,
+    pub template: TemplateName,
+}
+
+/// A sandbox as `list` and `show` print it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxView {
+    pub record: SandboxRecord,
+    /// The template the active policy is built on. `policy.toml` may name
+    /// another than [`SandboxRecord::created_from`], the one the sandbox
+    /// was created from, which is used when it has no active policy.
+    pub template: TemplateName,
+    pub policy: Option<PolicyVersion>,
+    /// The change waiting for a restart, if any (design §7).
+    pub pending: Option<PendingPolicy>,
+    /// Why enclos now refuses to compile the active policy, if it does: see
+    /// [`compile_refused`].
+    pub policy_refused: Option<String>,
+    /// Sessions not ended yet, and the sandbox's proxy, which is recorded
+    /// beside them.
+    pub sessions: Vec<SessionView>,
+}
+
+/// A session not ended yet, as `show` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub session: SessionRecord,
+    /// The members found now.
+    pub members: Vec<Member>,
+    /// Whether its file and program rules differ from the active
+    /// snapshot's, so that only a restart applies them (design §8).
+    pub needs_restart: bool,
+}
+
+impl StopReport {
+    /// The sessions whose end the stop records.
+    fn ended(&self) -> Vec<SessionId> {
+        self.stopped.iter().chain(&self.gone).copied().collect()
+    }
+}
+
+impl SessionView {
+    /// Nothing of the session runs any more, as after a crash or a restart
+    /// of the Mac, but its end is not recorded: `show` reads and changes
+    /// nothing, and `sandbox stop` or `sandbox rm` records it.
+    pub fn gone(&self) -> bool {
+        self.members.is_empty()
+    }
+}
+
+/// What stopping a sandbox did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReport {
+    /// The services removed, so they do not start again.
+    pub services: Vec<ServiceLabel>,
+    /// Sessions whose members it stopped.
+    pub stopped: Vec<SessionId>,
+    /// Sessions of which nothing ran any more, whose end it recorded.
+    pub gone: Vec<SessionId>,
+    pub survivors: Vec<(SessionId, Vec<Survivor>)>,
+}
+
+/// What a sandbox's folder held before `sandbox create` wrote to it, so
+/// that a failed create can put it back.
+enum Before {
+    /// No folder: the create makes it.
+    Nothing,
+    /// A folder without `policy.toml`, such as one left by a create that
+    /// stopped before writing it.
+    Folder,
+    /// A folder and the `policy.toml` it held, such as one kept by
+    /// `sandbox rm --keep-data`.
+    Kept(String),
+}
+
+impl Engine {
+    /// Creates a sandbox: its folder and home, its `policy.toml` from the
+    /// template, then its record, with a proxy port, and version 1 of its
+    /// policy in one transaction.
+    pub fn create_sandbox(
+        &self,
+        by: &Actor,
+        spec: SandboxSpec,
+        confirm: Confirm,
+    ) -> Result<Planned<SandboxRecord>> {
+        if self.state.get(&spec.name)?.is_some() {
+            return Err(Error::SandboxExists {
+                name: spec.name.to_string(),
+            });
+        }
+        if confirm == Confirm::DryRun {
+            // The checks a create makes before it writes anything, a dry run
+            // makes too: the backend, the template as it resolves and is
+            // checked, a free proxy port, and what the sandbox's folder
+            // already holds.
+            let name = spec.name.as_str();
+            self.backend_for(&spec.name, spec.backend)?;
+            let overrides = policy::initial_overrides(name, &spec.template);
+            self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
+            self.free_port()?;
+            let mut changes = vec![format!(
+                "create sandbox {} ({}, template {})",
+                spec.name, spec.backend, spec.template
+            )];
+            match self.before_create(name)? {
+                Before::Kept(_) => changes.push(format!(
+                    "write its policy.toml again from the `{}` template, in place of the one its folder kept, and keep its home",
+                    spec.template
+                )),
+                Before::Folder => changes.push("reuse the folder left for it, and its home".into()),
+                Before::Nothing => {}
+            }
+            return Ok(Planned::DryRun(Plan {
+                create: vec![self.layout.sandbox_home(name)],
+                changes,
+            }));
+        }
+        let summary = |r: &SandboxRecord| format!("{} on port {}", r.backend, r.proxy_port);
+        let record = self.write(
+            by,
+            "sandbox create",
+            Some(spec.name.to_string()),
+            summary,
+            |lock| {
+                // Checked again under the lock: another create may have
+                // taken the name while this one waited for it.
+                if self.state.get(&spec.name)?.is_some() {
+                    return Err(Error::SandboxExists {
+                        name: spec.name.to_string(),
+                    });
+                }
+                // The backend must run here (ADR 0009), and the template
+                // must resolve, before any file or record is written. A new
+                // sandbox has no runtime, so no adapter layer.
+                let name = spec.name.as_str();
+                self.backend_for(&spec.name, spec.backend)?;
+                let overrides = policy::initial_overrides(name, &spec.template);
+                let snapshot =
+                    self.checked_policy_with(&spec.name, &overrides, None, spec.backend)?;
+                let record = SandboxRecord {
+                    name: spec.name.clone(),
+                    backend: spec.backend,
+                    created_from: spec.template.clone(),
+                    state: SandboxState::Created,
+                    proxy_port: self.free_port()?,
+                    runtime: None,
+                    created_at: now(),
+                };
+                // The folder first, then the record and version 1 of its
+                // policy in one transaction. A crash in between leaves only
+                // the folder, which the next create of this name reuses as it
+                // does one kept by `sandbox rm --keep-data`: its home is kept
+                // and its `policy.toml` written again from the template
+                // (design §11).
+                let before = self.before_create(name)?;
+                let made = (|| -> Result<()> {
+                    self.layout.create_sandbox_dirs(name)?;
+                    self.layout.write_policy(name, &overrides)?;
+                    self.state.create_sandbox(lock, &record, &snapshot, by)?;
+                    Ok(())
+                })();
+                if let Err(error) = made {
+                    return Err(match self.undo_create(name, before) {
+                        Ok(()) => error,
+                        Err(left) => Error::CleanupFailed {
+                            error: Box::new(error),
+                            left,
+                        },
+                    });
+                }
+                Ok(record)
+            },
+        )?;
+        Ok(Planned::Done(record))
+    }
+
+    /// What the sandbox's folder holds before `sandbox create` writes to
+    /// it. Only a missing `policy.toml` counts as none: one that cannot be
+    /// read stops the create before anything is written, since its undo
+    /// could not put it back.
+    fn before_create(&self, name: &str) -> Result<Before> {
+        match self.layout.read_policy(name) {
+            Ok(policy) => Ok(Before::Kept(policy)),
+            Err(LayoutError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let dir = self.layout.sandbox_dir(name);
+                match dir.try_exists() {
+                    Ok(true) => Ok(Before::Folder),
+                    Ok(false) => Ok(Before::Nothing),
+                    Err(source) => Err(LayoutError::Io { path: dir, source }.into()),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Takes back what a failed create wrote: the folder it made, or the
+    /// `policy.toml` it wrote into a folder that was there before. A kept
+    /// home stays as it is, with any `home/tmp` the create added. Returns
+    /// what it could not take back.
+    fn undo_create(&self, name: &str, before: Before) -> std::result::Result<(), String> {
+        let gone = |path: &Path, removed: std::io::Result<()>| match removed {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("{} ({e})", path.display()))
+            }
+            _ => Ok(()),
+        };
+        match before {
+            Before::Nothing => {
+                let dir = self.layout.sandbox_dir(name);
+                gone(&dir, std::fs::remove_dir_all(&dir))
+            }
+            Before::Folder => {
+                let file = self.layout.policy_file(name);
+                gone(&file, std::fs::remove_file(&file))
+            }
+            Before::Kept(policy) => self.layout.write_policy(name, &policy).map_err(|e| {
+                format!(
+                    "{} with the template's policy in place of the kept one ({e})",
+                    self.layout.policy_file(name).display()
+                )
+            }),
+        }
+    }
+
+    /// The first port no sandbox here uses and nothing on this host listens
+    /// on (other enclos installs or users included).
+    fn free_port(&self) -> Result<u16> {
+        let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
+        let listening = |port: u16| {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
+                .is_ok()
+        };
+        (PORT_FIRST..=PORT_LAST)
+            .find(|port| !used.contains(port) && !listening(*port))
+            .ok_or(Error::NoFreePorts)
+    }
+
+    pub fn list_sandboxes(&self) -> Result<Vec<SandboxView>> {
+        self.state
+            .list()?
+            .into_iter()
+            .map(|r| self.view(r))
+            .collect()
+    }
+
+    pub fn show_sandbox(&self, name: &SandboxName) -> Result<SandboxView> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        self.view(record)
+    }
+
+    /// The file the active policy compiles to: a session started under
+    /// another one runs file and program rules the active policy no longer
+    /// has. A sandbox this host cannot compile for runs nothing. Compiled in
+    /// memory only: nothing is written.
+    pub(super) fn active_compiled(&self, record: &SandboxRecord) -> Result<PathBuf> {
+        self.compiled_file(&record.name, record.proxy_port)
+            .map(|(file, _)| file)
+    }
+
+    fn view(&self, record: SandboxRecord) -> Result<SandboxView> {
+        let active = self.state.active_policy(&record.name)?;
+        let template = active.as_ref().map_or_else(
+            || record.created_from.clone(),
+            |(_, snapshot)| snapshot.inputs.template.clone(),
+        );
+        let policy = active.map(|(v, _)| v);
+        let pending = self.state.pending_policy(&record.name)?.map(|(p, _)| p);
+        let compiled = self.active_compiled(&record);
+        let active = compiled.as_ref().ok().map(PathBuf::as_path);
+        let open = self.state.sessions(&record.name, true)?;
+        let look = self.look_open(&record.name, &open)?;
+        let sessions = open
+            .into_iter()
+            .map(|session| {
+                let members = look
+                    .members(&session)
+                    .into_iter()
+                    .map(|found| found.member)
+                    .collect();
+                let needs_restart = needs_restart(&session, active);
+                SessionView {
+                    session,
+                    members,
+                    needs_restart,
+                }
+            })
+            .collect();
+        Ok(SandboxView {
+            record,
+            template,
+            policy,
+            pending,
+            policy_refused: compile_refused(&compiled),
+            sessions,
+        })
+    }
+
+    /// Stops every session of the sandbox. Members that survive are
+    /// reported, and the sandbox is marked failed rather than stopped.
+    pub fn stop_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+    ) -> Result<Planned<StopReport>> {
+        if confirm == Confirm::DryRun {
+            let view = self.show_sandbox(name)?;
+            let mut changes: Vec<String> = view
+                .sessions
+                .iter()
+                .map(|v| match v.gone() {
+                    true => format!(
+                        "record the end of session {} ({}), whose processes are gone",
+                        v.session.id,
+                        v.session.kind.as_str()
+                    ),
+                    false => format!(
+                        "stop session {} ({}, {} processes)",
+                        v.session.id,
+                        v.session.kind.as_str(),
+                        v.members.len()
+                    ),
+                })
+                .collect();
+            changes.splice(
+                0..0,
+                self.service_status(name)?
+                    .into_iter()
+                    .map(|(label, _)| format!("stop service {label}")),
+            );
+            changes.push(format!("mark sandbox {name} stopped"));
+            return Ok(Planned::DryRun(Plan {
+                changes,
+                ..Plan::default()
+            }));
+        }
+        let summary = |r: &StopReport| {
+            let done = match r.survivors.is_empty() {
+                true => format!(
+                    "removed {} services, stopped {} sessions",
+                    r.services.len(),
+                    r.stopped.len()
+                ),
+                false => format!(
+                    "removed {} services; {} sessions left members running",
+                    r.services.len(),
+                    r.survivors.len()
+                ),
+            };
+            format!("{done}{}", ended_gone(&r.gone))
+        };
+        // Which sessions still run, looked at before the services are
+        // removed: a session a service ran (the proxy service's always)
+        // ends with its service, and is stopped, not found gone. A look
+        // that fails tells none apart, so none is said to be gone; the stop
+        // below looks again, and fails on its own if it still cannot.
+        let open = self.state.sessions(name, true)?;
+        let ran: Vec<SessionId> = match self.look_open(name, &open) {
+            Ok(look) => open
+                .iter()
+                .filter(|s| !look.is_gone(s))
+                .map(|s| s.id)
+                .collect(),
+            Err(_) => open.iter().map(|s| s.id).collect(),
+        };
+        // The services first, so the service manager does not restart what
+        // is stopped; outside the lock, which a service told to end needs to
+        // record its end, and audited on its own. A damaged audit log would
+        // refuse the audited stop after the removal, so it is checked before.
+        self.audit.check()?;
+        let services = self
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, None)?
+            .into_result()?;
+        self.write(
+            by,
+            "sandbox stop",
+            Some(name.to_string()),
+            summary,
+            |lock| {
+                let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+                    name: name.to_string(),
+                })?;
+                let mut report = StopReport {
+                    services: services.clone(),
+                    stopped: Vec::new(),
+                    gone: Vec::new(),
+                    survivors: Vec::new(),
+                };
+                let mut cannot_look: Option<Error> = None;
+                let sessions = self.state.sessions(name, true)?;
+                for session in &sessions {
+                    // Its marker looked at here, after the services are
+                    // removed, and again once it stopped.
+                    match self.stop_marked(session, GRACE, stop) {
+                        // Nothing of it ran before this stop either: it ended
+                        // with nothing to record its end (a crash, a restart
+                        // of the Mac, `enclos` killed), which the audit entry
+                        // tells apart.
+                        Ok(Stopped::Gone) if !ran.contains(&session.id) => {
+                            report.gone.push(session.id)
+                        }
+                        Ok(Stopped::Gone | Stopped::Clean) => report.stopped.push(session.id),
+                        Ok(Stopped::Survivors(left)) => report.survivors.push((session.id, left)),
+                        // Without a listing, nothing shows the members are
+                        // gone: this session and those after it stay open.
+                        Err(e) => {
+                            cannot_look = Some(e);
+                            break;
+                        }
+                    }
+                }
+                record.state = match (&cannot_look, report.survivors.is_empty()) {
+                    (Some(e), _) => SandboxState::Failed {
+                        reason: format!("stop could not look at processes: {e}"),
+                    },
+                    (None, true) => SandboxState::Stopped,
+                    (None, false) => SandboxState::Failed {
+                        reason: "members survived stop".to_owned(),
+                    },
+                };
+                // The ends and the state in one transaction, so that a crash
+                // or a failed write never leaves every session ended and the
+                // sandbox still running.
+                let saved = self.state.end_sessions(lock, &report.ended(), &record);
+                match (cannot_look, saved) {
+                    (None, saved) => {
+                        saved?;
+                        let ended = report.ended();
+                        for session in sessions.iter().filter(|s| ended.contains(&s.id)) {
+                            self.forget_marker(session);
+                        }
+                        // What its services read their secrets from, once
+                        // its services are removed, however its sessions
+                        // ended (ADR 0034).
+                        self.remove_secrets_file(name)?;
+                        Ok(report)
+                    }
+                    (Some(e), Ok(())) => Err(e),
+                    (Some(e), Err(saved)) => Err(Error::CleanupFailed {
+                        error: Box::new(e),
+                        left: format!(
+                            "sandbox {name} not marked failed, and the end of sessions {} not recorded ({saved})",
+                            join_ids(&report.ended())
+                        ),
+                    }),
+                }
+            },
+        )
+        .map(Planned::Done)
+    }
+
+    /// Removes a stopped sandbox: its record and history, its secrets, and
+    /// its folder unless `keep_data`. Deleting data or secrets asks for
+    /// confirmation first. Returns the secrets it could not remove.
+    pub fn remove_sandbox(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        keep_data: bool,
+        confirm: Confirm,
+    ) -> Result<Planned<Vec<SecretLeft>>> {
+        let gone = self.require_stopped(name)?;
+        let dir = self.layout.sandbox_dir(name.as_str());
+        let what = if keep_data {
+            "remove its record"
+        } else {
+            "delete its folder and home"
+        };
+        // Its secrets go with it, kept data or not: their record goes with
+        // the sandbox's, and their values are kept nowhere else.
+        let secrets = self.state.secrets(name)?.len();
+        match confirm {
+            Confirm::DryRun => {
+                let mut changes: Vec<String> = gone
+                    .iter()
+                    .map(|id| format!("record the end of session {id}, whose processes are gone"))
+                    .collect();
+                changes.push(format!("remove sandbox {name}: {what} ({})", dir.display()));
+                if secrets > 0 {
+                    changes.push(format!(
+                        "remove its {secrets} secret(s) from the secret store"
+                    ));
+                }
+                return Ok(Planned::DryRun(Plan {
+                    changes,
+                    ..Plan::default()
+                }));
+            }
+            Confirm::Ask if !keep_data || secrets > 0 => {
+                return Err(Error::NeedsConfirmation {
+                    what: match (keep_data, secrets) {
+                        (false, 0) => format!("deleting sandbox {name} and its home"),
+                        (false, n) => format!(
+                            "deleting sandbox {name}, its home and its {n} secret(s), whose values are kept nowhere else"
+                        ),
+                        (true, n) => format!(
+                            "removing sandbox {name} and its {n} secret(s), whose values are kept nowhere else"
+                        ),
+                    },
+                });
+            }
+            _ => {}
+        }
+        let (_, secrets_left) = self.write(
+            by,
+            "sandbox rm",
+            Some(name.to_string()),
+            |(gone, left): &(Vec<SessionId>, Vec<SecretLeft>)| {
+                let left = match left.as_slice() {
+                    [] => String::new(),
+                    left => format!(
+                        "; could not remove from the secret store: {}",
+                        left.iter()
+                            .map(|l| l.secret.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                format!("{what}{}{left}", ended_gone(gone))
+            },
+            |lock| {
+                // Checked again under the lock: a `connect` may have started
+                // while this command waited for it.
+                let gone = self.require_stopped(name)?;
+                let secrets = self.state.secrets(name)?;
+                let after_record = self.remove_sandbox_secrets(name, &secrets)?;
+                // The sessions' rows go with the record: only the audit
+                // entry keeps their ends.
+                self.state.remove(lock, name)?;
+                let left = self.forget_secrets(&after_record);
+                // Nothing in it outlives the sandbox's proxy, whatever
+                // `keep_data` keeps; left behind, the next proxy of the name
+                // takes its socket over.
+                let run = self.layout.sandbox_run_dir(name.as_str());
+                if let Err(e) = std::fs::remove_dir_all(&run)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::notes::say(&format!("cannot remove {}: {e}", run.display()));
+                }
+                if !keep_data
+                    && dir.exists()
+                    && let Err(source) = std::fs::remove_dir_all(&dir)
+                {
+                    let error = Error::from(LayoutError::Io {
+                        path: dir.clone(),
+                        source,
+                    });
+                    let removed = secrets.len() - left.len();
+                    let not = match left.as_slice() {
+                        [] => String::new(),
+                        left => format!(
+                            ", though not these: {}",
+                            left.iter()
+                                .map(|l| l.why.as_str())
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ),
+                    };
+                    return Err(Error::FailedAfter {
+                        error: Box::new(error),
+                        done: format!(
+                            "removing the record of sandbox {name} and {removed} of its secret(s){not}{}",
+                            ended_gone(&gone)
+                        ),
+                    });
+                }
+                Ok((gone, left))
+            },
+        )?;
+        Ok(Planned::Done(secrets_left))
+    }
+
+    /// Removes what of `name`'s secrets goes before its record: the file its
+    /// services read them from (ADR 0034), then each value whose store keeps
+    /// the sandbox while it cannot be removed, refusing while one stays.
+    /// Returns the secrets whose values go after the record.
+    fn remove_sandbox_secrets(
+        &self,
+        name: &SandboxName,
+        secrets: &[SecretRecord],
+    ) -> Result<Vec<SecretRecord>> {
+        self.remove_secrets_file(name)?;
+        let (before_record, after_record): (Vec<_>, Vec<_>) = secrets
+            .iter()
+            .cloned()
+            .partition(|r| self.secrets.value_goes_before_record(r.store));
+        let stay = self.forget_secrets(&before_record);
+        if !stay.is_empty() {
+            return Err(Error::Secret(SecretError {
+                what: format!(
+                    "sandbox {name} was not removed, as these secrets could not be: {}. Run `enclos sandbox rm {name}` again once they can be removed",
+                    stay.iter()
+                        .map(|l| l.why.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                untouched: false,
+            }));
+        }
+        Ok(after_record)
+    }
+
+    /// Refuses a sandbox with services installed or sessions running, saying
+    /// how to end them. Returns the open sessions of which nothing runs any
+    /// more, whose end is left to record.
+    fn require_stopped(&self, name: &SandboxName) -> Result<Vec<SessionId>> {
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        // Installed, a service comes back on its own, even with no session
+        // recorded: one whose proxy could not take its port has none. A
+        // namespace holder alone counts too.
+        if !self.installed_labels(name)?.is_empty() {
+            return Err(Error::SandboxHasServices {
+                name: name.to_string(),
+            });
+        }
+        let open = self.state.sessions(name, true)?;
+        let look = self.look_open(name, &open)?;
+        if open.iter().all(|s| look.is_gone(s)) {
+            return Ok(open.iter().map(|s| s.id).collect());
+        }
+        let name = name.to_string();
+        Err(match record.state {
+            SandboxState::Failed { reason } => Error::SandboxNotStopped { name, reason },
+            _ => Error::SandboxRunning { name },
+        })
+    }
+}
+
+/// What an audit summary adds for the sessions of which nothing ran any
+/// more, whose end the command recorded.
+fn ended_gone(gone: &[SessionId]) -> String {
+    match gone {
+        [] => String::new(),
+        ids => format!(
+            "; recorded the end of sessions {}, whose processes were gone",
+            join_ids(ids)
+        ),
+    }
+}
+
+fn join_ids(ids: &[SessionId]) -> String {
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Why enclos refuses to compile the active policy because a path changed
+/// since it was stored (design §5): nothing new starts in the sandbox until
+/// the user fixes it, while what already runs keeps the policy it started
+/// with. Other failures, such as a backend this host cannot run, are told
+/// where the sandbox is started.
+pub(super) fn compile_refused(compiled: &Result<PathBuf>) -> Option<String> {
+    match compiled {
+        Err(e @ (Error::HomeNotAFolder { .. } | Error::ActivePolicyInvalid { .. })) => {
+            Some(e.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a running session needs a restart to run under the active
+/// policy: it started under another compiled file. The proxy has none and
+/// applies network rules live, so it never does.
+pub(super) fn needs_restart(session: &SessionRecord, active: Option<&Path>) -> bool {
+    match (&session.compiled, active) {
+        (Some(at_launch), Some(active)) => Path::new(at_launch) != active,
+        _ => false,
+    }
+}

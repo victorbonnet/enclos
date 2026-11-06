@@ -207,7 +207,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 17 passed' bubblewrap.log
+          grep -q 'test result: ok\. 18 passed' bubblewrap.log
 
   libsecret:
     strategy:

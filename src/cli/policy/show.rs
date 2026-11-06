@@ -184,7 +184,7 @@ fn print_rules(policy: &Policy) {
     } = r;
     if !r.is_unset() {
         println!(
-            "\nLimits (each process, from its start; memory and CPU share for each session as a whole)"
+            "\nLimits (each process, from its start; memory and CPU share for the sandbox as a whole)"
         );
         if let Some(files) = r.open_files {
             println!("  open files: {files}");

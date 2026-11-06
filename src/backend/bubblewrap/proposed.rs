@@ -107,9 +107,9 @@ pub fn capabilities(host: &Host) -> Capabilities {
         network: partial("through the proxy; `listen = false` is not held"),
         exec: partial(exec),
         resources: partial(&match &host.memory_not_held {
-            None => "open_files on each process; memory and cpu on each session's cgroup; cpu_seconds and file_size refused; not yet shown by the escape probes".to_owned(),
+            None => "open_files on each process; memory and cpu on the sandbox's slice, its sessions and services together; cpu_seconds and file_size refused; not yet shown by the escape probes".to_owned(),
             Some(why) => format!(
-                "open_files on each process; cpu on each session's cgroup; memory not applied on this host, as {why}; cpu_seconds and file_size refused; not yet shown by the escape probes"
+                "open_files on each process; cpu on the sandbox's slice, its sessions and services together; memory not applied on this host, as {why}; cpu_seconds and file_size refused; not yet shown by the escape probes"
             ),
         }),
         members: partial("a session's cgroup, not yet shown by the escape probes"),
@@ -159,7 +159,7 @@ pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
         fields.push(Unenforced {
             field: "resources.memory".to_owned(),
             when: "a host whose memory controller is missing or not delegated".to_owned(),
-            why: "a session's cgroup holds this limit, and needs that controller".to_owned(),
+            why: "the sandbox's slice holds this limit, and needs that controller".to_owned(),
         });
     }
     fields
@@ -248,7 +248,7 @@ mod tests {
         let held = capabilities(&host(None));
         let note = partial_note(&held.resources);
         assert!(
-            note.contains("memory and cpu on each session's cgroup"),
+            note.contains("memory and cpu on the sandbox's slice"),
             "{note}"
         );
         assert!(
