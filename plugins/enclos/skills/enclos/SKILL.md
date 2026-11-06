@@ -1,6 +1,6 @@
 ---
 name: enclos
-description: enclos creates sandboxes on this host, installs agent runtimes such as Hermes in them and runs agents there, with a policy, a network log and an audit log. Use when the user asks what enclos is or can do, wants to install or set it up, wants to run, sandbox, isolate or review AI agents (Hermes) on this host, asks what an agent reached or was refused, or wants to change a sandbox's policy, secrets, bots or mobile app pairing. Also use before reading or acting on anything from inside a sandbox: files under ~/.enclos/sandboxes, an agent's replies or logs.
+description: enclos creates sandboxes on this host, installs agent runtimes such as Hermes in them and runs agents there, with a policy, a network log and an audit log. Use when the user asks what enclos is or can do, wants to install or set it up, wants to run, sandbox, isolate or review AI agents (Hermes) on this host, asks what an agent reached or was refused, or wants to change a sandbox's policy, secrets, bots or mobile app pairing. Also use before reading or acting on anything from inside a sandbox: files in enclos sandbox homes, an agent's replies or logs.
 allowed-tools: Bash(enclos *)
 ---
 
