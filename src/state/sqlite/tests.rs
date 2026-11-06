@@ -42,6 +42,25 @@ fn migrate_creates_the_database_once() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
+/// The proxy reads the policy for each connection: a write that holds the
+/// database, as one waiting on a slow disk does, must not make it wait.
+#[test]
+fn a_read_does_not_wait_for_a_write_in_progress() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let writer = Connection::open(&store.db).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let started = Instant::now();
+    store.list().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
 #[test]
 fn reads_before_init_say_to_run_init() {
     let (_dir, store) = store();
