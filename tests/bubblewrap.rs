@@ -19,6 +19,10 @@ use tempfile::TempDir;
 #[path = "bubblewrap/limits.rs"]
 mod limits;
 
+#[path = "support/inherited.rs"]
+mod inherited;
+use inherited::{HOLDS_NINE, holding_open};
+
 /// One sandbox at a time: each `ENCLOS_HOME` would give its first sandbox
 /// the same proxy port.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
@@ -855,6 +859,58 @@ print("held", held)
     let own = namespace_descriptors(holder);
     assert!(own.iter().any(|t| t.starts_with("user:[")), "{own:?}");
     assert!(own.iter().any(|t| t.starts_with("net:[")), "{own:?}");
+}
+
+/// What `pid` holds open, as the host reads it.
+fn open_files(pid: u32) -> Vec<PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .collect()
+}
+
+/// A descriptor `connect`'s caller passed on reaches neither the session's
+/// program nor the proxy `connect` started, which runs on after it. The
+/// controls: a program the same shell starts on the host holds it, and
+/// `/proc` shows it held.
+#[test]
+fn on_a_runner_what_connect_starts_holds_none_of_its_callers_descriptors() {
+    if !on_a_runner() {
+        return;
+    }
+    let lab = Lab::new();
+    let lock = lab.root.path().join("caller.lock");
+    std::fs::write(&lock, "").unwrap();
+    let lock = lock.canonicalize().unwrap();
+
+    let out = holding_open(&lock, Command::new("/bin/sh").args(["-c", HOLDS_NINE]))
+        .output()
+        .unwrap();
+    assert_eq!(text(&out.stdout), "held", "{out:?}");
+    let mut sleeping = holding_open(&lock, Command::new("/bin/sleep").arg("4323"))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !open_files(sleeping.id()).contains(&lock) {
+        assert!(
+            Instant::now() < deadline,
+            "/proc never showed the lock held"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = sleeping.kill();
+    let _ = sleeping.wait();
+
+    let connect = lab.command(&["connect", "lab", "--", "/bin/sh", "-c", HOLDS_NINE]);
+    let out = holding_open(&lock, &connect).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(text(&out.stdout), "none", "{out:?}");
+    let port = lab.proxy_port("lab").to_string();
+    let proxy = host_pid_of(&["enclos", "proxy", "run", "lab", "--port", &port])
+        .expect("the proxy connect started runs on");
+    let held = open_files(proxy);
+    assert!(!held.contains(&lock), "{held:?}");
 }
 
 /// With the runtime's service listening, `connect` starts its session at
