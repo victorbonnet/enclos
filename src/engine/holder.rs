@@ -76,7 +76,7 @@ impl Engine {
 
     /// Waits up to `wait` for the namespace holder to answer, then says why
     /// it did not, as a session's start that cannot go on.
-    pub(super) fn holder_answers(
+    fn holder_answers(
         &self,
         name: &SandboxName,
         holder: &dyn NamespaceHolder,

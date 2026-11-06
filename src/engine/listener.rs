@@ -403,7 +403,12 @@ impl Engine {
         let started = match step {
             ConnectStep::Nothing => return Ok(None),
             ConnectStep::Unreadable(why) => return done(false, Some(why)),
-            ConnectStep::Wait => false,
+            // A service whose namespace holder is missing never listens, as
+            // its session cannot join: one missing is installed first.
+            ConnectStep::Wait => {
+                self.ensure_holder(&record)?;
+                false
+            }
             ConnectStep::Start => {
                 // A running proxy, one an earlier `connect` started or the
                 // proxy service, gives way to the proxy service installed
