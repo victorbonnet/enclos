@@ -37,14 +37,14 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 
 The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
 
-1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
+1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation.
 2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`.
 3. Then, in either direction:
 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? | A person's message to the agent |
-| `message.out` | plugin | `conversation`, `text`, `kind` (`reply` or `notify`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work) |
+| `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work); `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
 | `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
 | `conversation.rename` | bridge | `conversation`, `title` (empty: no name) | The person named the conversation, or cleared its name |
@@ -53,6 +53,8 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | `error` | either | `of`?, `code`, `message` | See [Errors](#errors) |
 
 **A conversation's name.** The bridge keeps one name per conversation and who gave it. The runtime's (`conversation.title`, for one of its own agent's conversations) replaces the runtime's; the person's (`conversation.rename` from a device) replaces any, and the runtime's no longer replaces it until the person clears it. The bridge passes the person's name on to the plugin, so the runtime can keep it too (Hermes: the session's title, with the user's authority). Hermes names every session on its own and tells no plugin, so its plugin reads the title after each reply, and a little later, and sends it when it changed.
+
+**Home.** Each agent has one Home conversation ([ADR 0044](adr/0044-each-agent-has-a-home-conversation.md), proposed): id `home.<sandbox>.<agent>`, made by the bridge, owned by the host's person (as the transport names the host's own user; else the first person who connects), named Home by them. It is the runtime's home channel: `runtime configure` gives it to the runtime (Hermes: `MOBILE_APP_HOME_CHANNEL`), and the bridge's `hello` names it. A `message.out` for a conversation the bridge does not know, or for another agent's, is stored in this agent's Home. A device may not start a conversation with a Home's id. Hermes's plugin makes Home its gateway's home channel when the bridge says so, answers `/sethome` itself, and sends the gateway's notices about itself as `kind: status`.
 
 **What the agent does while it works.** A `tool` step is passed on live to the devices of the conversation's owner, for a conversation of the plugin's own agent, and not kept: a device that was away does not get it at the next `sync`. Hermes reports its tools to plugin hooks (`pre_tool_call`, `post_tool_call`) with the call's id, its arguments and its outcome; its plugin finds the conversation in the turn's session context, labels the step as Hermes does (`build_tool_preview`), and returns at once, as `pre_tool_call` may also block a tool. A label shows a command or a search as the agent wrote it, to the conversation's owner only.
 
@@ -114,7 +116,7 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
 | `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
 | `conversation.read` | device | `conversation`, `seq` | The person read it up to that message, on this device |
-| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name changes or it was read further |
+| `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read), `home`? (`true` for the agent's [Home](#home)) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name changes or it was read further |
 | `message` | bridge | `conversation`, `agent`, `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq`, `attachments`? (`[{id, mime, name, size}]`) | A message of a conversation, sent and received alike, in order |
 | `attachment.get` | device | `attachment` (its id), `offset` | The bytes of a file of one of the person's messages, from `offset` |
 | `attachment.data` | bridge | `attachment`, `offset`, `size` (the file's), `data` (base64url, at most 45,000 bytes) | One part of it: a Noise message holds 64 KiB. A device asks for the next `offset` until it has `size` |

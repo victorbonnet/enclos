@@ -352,10 +352,16 @@ pub trait RuntimeAdapter {
     /// The mobile app's channel for `agent` (ADR 0042, proposed): the
     /// plugin the runtime loads, the commands that turn it on once it is in
     /// place, and the settings that tell it its socket, `socket`, a path in
-    /// the sandbox home that enclos's bridge connects to. The agent's token
-    /// is a secret the policy grants it as `MOBILE_APP_TOKEN`. `None`: the
-    /// runtime has no such channel.
-    fn app_channel(&self, _agent: &RuntimeAgentName, _socket: &Path) -> Option<AppChannel> {
+    /// the sandbox home that enclos's bridge connects to, and its `home`
+    /// conversation, the runtime's home channel (ADR 0044, proposed). The
+    /// agent's token is a secret the policy grants it as `MOBILE_APP_TOKEN`.
+    /// `None`: the runtime has no such channel.
+    fn app_channel(
+        &self,
+        _agent: &RuntimeAgentName,
+        _socket: &Path,
+        _home: &str,
+    ) -> Option<AppChannel> {
         None
     }
 

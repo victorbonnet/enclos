@@ -22,6 +22,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "conversation_rename",
         include_str!("fixtures/plugin/from_bridge_conversation_rename.json"),
     ),
+    (
+        "hello_home",
+        include_str!("fixtures/plugin/from_bridge_hello_home.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -60,6 +64,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "message_out_image",
         include_str!("fixtures/plugin/from_plugin_message_out_image.json"),
+    ),
+    (
+        "message_out_status",
+        include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
     ),
 ];
 
@@ -124,6 +132,33 @@ fn a_message_reads_as_its_fields_say() {
     };
     assert_eq!(kind, OutKind::Notify);
     assert_eq!(reply_to, None);
+
+    // The runtime about itself: a status, to the agent's Home.
+    let message = decode_from_plugin(FROM_PLUGIN.last().unwrap().1.as_bytes()).unwrap();
+    let FromPlugin::MessageOut {
+        kind, conversation, ..
+    } = message.body
+    else {
+        panic!("not a message.out: {:?}", message.body);
+    };
+    assert_eq!(
+        (kind, conversation.as_str()),
+        (OutKind::Status, "home.lab.main")
+    );
+
+    // The bridge's hello names the agent's Home; an older one, without it, still reads.
+    let message = decode_from_bridge(FROM_BRIDGE.last().unwrap().1.as_bytes()).unwrap();
+    let FromBridge::Hello { home, .. } = message.body else {
+        panic!("not a hello: {:?}", message.body);
+    };
+    assert_eq!(home.as_ref().map(|h| h.as_str()), Some("home.lab.main"));
+    let FromBridge::Hello { home, .. } = decode_from_bridge(FROM_BRIDGE[0].1.as_bytes())
+        .unwrap()
+        .body
+    else {
+        panic!("not a hello");
+    };
+    assert_eq!(home, None);
 
     let message = decode_from_plugin(FROM_PLUGIN[4].1.as_bytes()).unwrap();
     let FromPlugin::Error(error) = message.body else {
