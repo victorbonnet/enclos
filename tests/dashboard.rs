@@ -186,7 +186,12 @@ impl Lab {
             Ok(line) if !line.is_empty() => line.trim().to_owned(),
             other => {
                 let _ = child.kill();
-                panic!("no address: {other:?}; {}", said.lock().unwrap());
+                let logs = self.command(&["logs", "lab"]).output().unwrap();
+                panic!(
+                    "no address: {other:?}; {}\nenclos logs lab:\n{}",
+                    said.lock().unwrap(),
+                    String::from_utf8_lossy(&logs.stdout)
+                );
             }
         };
         Dashboard { child, url, said }
