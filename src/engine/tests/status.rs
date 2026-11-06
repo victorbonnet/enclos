@@ -661,6 +661,8 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
     // The gateway is not running, and nothing in the sandbox listens.
     assert_eq!(s["dashboard"], "absent");
+    // The host reaches a Seatbelt sandbox's listeners: no command to name.
+    assert_eq!(s["dashboard_command"], serde_json::Value::Null);
     assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
     assert_eq!(json["complete"], true);
     assert_eq!(json["idle_days"], 30);

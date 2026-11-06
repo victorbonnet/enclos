@@ -220,12 +220,19 @@ fn a_bubblewrap_sandboxs_proxy_leaves_its_reserved_port_to_enclos_dashboard() {
     };
     let milestone_bullet = find("   - the proxy listening on a Unix socket");
     let network_section = find("**The runtime's own service on Linux**");
-    let awaiting_item = find("- `enclos dashboard`");
     for text in [&adr_0040, &milestone_bullet, &network_section] {
         assert!(text.contains("no TCP listener"), "{text}");
     }
     assert!(!milestone_bullet.contains("beside its TCP listener"));
-    assert!(awaiting_item.contains("reserved port"), "{awaiting_item}");
+    assert!(
+        network_section.contains("reserved port"),
+        "{network_section}"
+    );
+    // Shown beside the sandbox's own proxy, no longer a stand-in's.
+    let shown = find(
+        "Shown on GitHub's Ubuntu 24.04 runners, x86_64 and arm64, and Ubuntu 26.04 runner, x86_64 (CI's `bubblewrap` job, `tests/dashboard.rs`)",
+    );
+    assert!(shown.contains("beside the sandbox's own proxy"), "{shown}");
 }
 
 #[test]

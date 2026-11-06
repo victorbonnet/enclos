@@ -159,6 +159,8 @@ enclos policy allow lab api.example.com:8443
 
 The agent cannot allow anything itself.
 
+On Linux the host cannot reach a sandbox's listeners, so Hermes's dashboard opens with `enclos dashboard lab`: it prints the page's address and serves it to you alone until Ctrl-C. On a host you reach over ssh, such as a Raspberry Pi, forward that port from your own machine with `ssh -L <port>:127.0.0.1:<port> <host>` and open the address there; the host's sshd must allow TCP forwarding (`AllowTcpForwarding`), which some installs turn off.
+
 ## Look around
 
 ```bash

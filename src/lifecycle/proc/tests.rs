@@ -299,3 +299,20 @@ fn two_processes_share_a_network_when_their_namespace_links_match() {
     assert!(!same_network_under(proc, 7, 9).unwrap());
     assert!(same_network_under(proc, 7, 10).is_err());
 }
+
+/// A connection this process makes to itself is this user's, read from the
+/// host's own tables, and a closed one is no one's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_loopback_connections_client_is_this_users() {
+    use std::net::{Ipv4Addr, TcpStream};
+    let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, peer) = listener.accept().unwrap();
+    let server = accepted.local_addr().unwrap();
+    let me = rustix::process::getuid().as_raw();
+    assert_eq!(tcp_client_owner(peer, server).unwrap(), Some(me));
+    drop(client);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(tcp_client_owner(peer, server).unwrap(), None);
+}
