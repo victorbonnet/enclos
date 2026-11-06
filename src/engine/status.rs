@@ -369,6 +369,7 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     /// A running session of `kind` whose root is `root`.
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
@@ -402,11 +403,12 @@ mod tests {
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
-        let mut child = std::process::Command::new("/usr/bin/perl")
-            .args(["-e", &listens()])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_unmarked(
+            std::process::Command::new("/usr/bin/perl")
+                .args(["-e", &listens()])
+                .stdout(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
         let mut port = || lines.next().unwrap().unwrap();
         let (wide, narrow) = (port(), port());
