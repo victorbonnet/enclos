@@ -1215,6 +1215,10 @@ mod host_ports;
 #[path = "../src/test_scripts.rs"]
 mod test_scripts;
 
+#[cfg(target_os = "macos")]
+#[path = "support/inherited.rs"]
+mod inherited;
+
 /// Tests that start proxies take turns: proxy ports are the host's, shared
 /// by every test's enclos folder and every other test run of this user.
 #[cfg(target_os = "macos")]
@@ -1890,6 +1894,59 @@ fn a_proxy_that_died_is_replaced_and_stop_works_from_another_time_zone() {
         stop.stdout()
     );
     assert!(eventually(|| long.0.try_wait().unwrap().is_some()));
+}
+
+/// The processes holding `file` open, as `lsof` lists them.
+#[cfg(target_os = "macos")]
+fn holders_of(file: &Path) -> Vec<u32> {
+    let out = Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg(file)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// A descriptor `connect`'s caller passed on reaches neither the session's
+/// program nor the proxy `connect` started, which runs on after it. The
+/// controls: a program the same shell starts on the host holds it, and
+/// `lsof` shows it held.
+#[cfg(target_os = "macos")]
+#[test]
+fn what_connect_starts_holds_none_of_its_callers_descriptors() {
+    use inherited::{HOLDS_NINE, holding_open};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _stop = StopOnDrop(&home, "home");
+    let lock = home._dir.path().join("caller.lock");
+    std::fs::write(&lock, "").unwrap();
+
+    let out = holding_open(&lock, Command::new("/bin/sh").args(["-c", HOLDS_NINE]))
+        .output()
+        .unwrap();
+    assert_eq!(Run(out).stdout().trim(), "held");
+    let sleeping = KillOnDrop(
+        holding_open(&lock, Command::new("/bin/sleep").arg("30"))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(eventually(|| holders_of(&lock) == [sleeping.0.id()]));
+    drop(sleeping);
+
+    let connect = home.command(&["connect", "home", "--", "/bin/sh", "-c", HOLDS_NINE]);
+    let out = Run(holding_open(&lock, &connect).output().unwrap());
+    assert_eq!(out.ok().stdout().trim(), "none", "{}", out.stderr());
+    let proxy = proxy_pid(&home).expect("the proxy connect started runs on");
+    let held = holders_of(&lock);
+    assert!(!held.contains(&proxy), "{held:?}");
+    assert!(held.is_empty(), "{held:?}");
 }
 
 #[cfg(target_os = "macos")]
