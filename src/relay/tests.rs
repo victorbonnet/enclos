@@ -68,8 +68,13 @@ fn an_upstream_done_sending_still_gets_the_clients_bytes() {
     let mut client = relay.client();
     let upstream = relay.accepted();
     (&upstream).write_all(b"go ahead").unwrap();
+    let mut got = [0; 8];
+    client.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"go ahead");
+    // Only once the relay has passed them on: on macOS its read could miss a
+    // shutdown right behind them (see `harness::Upstream`).
     upstream.shutdown(Shutdown::Write).unwrap();
-    assert_eq!(all_of(&client), b"go ahead");
+    assert_eq!(all_of(&client), b"");
     client.write_all(b"still here").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     assert_eq!(all_of(&upstream), b"still here");
@@ -222,8 +227,6 @@ fn a_peer_that_cannot_be_told_the_input_ended_does_not_end_the_other_direction()
     let relay = Relay::start();
     let mut client = relay.client();
     let upstream = relay.accepted();
-    // Before anything closes: macOS refuses a timeout once the peer has.
-    upstream.set_read_timeout(Some(PATIENCE)).unwrap();
     client.write_all(b"last").unwrap();
     drop(client);
     thread::sleep(Duration::from_millis(200));

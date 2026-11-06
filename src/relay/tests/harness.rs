@@ -1,13 +1,14 @@
 //! What the relay's tests share: a relay serving a loopback port, the
 //! Unix socket it passes connections to, and the ends a test holds.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, TcpStream};
+use std::ops::Deref;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::serve_up_to;
 use crate::proxy::IDLE_TIMEOUT;
@@ -18,6 +19,9 @@ pub(super) const LARGE: usize = 64 * 1024 * 1024;
 /// How long a test waits for what must happen: long, since a test that
 /// passes waits only as long as it takes, and a hang is a failure.
 pub(super) const PATIENCE: Duration = Duration::from_secs(60);
+
+/// How long a read of an [`Upstream`] waits before it looks again.
+const TICK: Duration = Duration::from_millis(100);
 
 pub(super) struct Relay {
     pub(super) port: u16,
@@ -86,12 +90,53 @@ impl Relay {
         wait.recv_timeout(PATIENCE).unwrap();
     }
 
-    /// The upstream end of the connection the relay opens next.
-    pub(super) fn accepted(&self) -> UnixStream {
+    /// The upstream end of the connection the relay opens next. Its
+    /// timeouts are set at once: macOS refuses one once the peer has closed.
+    pub(super) fn accepted(&self) -> Upstream {
         let conn = accepted_within(&self.upstream, PATIENCE);
-        conn.set_read_timeout(Some(PATIENCE)).unwrap();
+        conn.set_read_timeout(Some(TICK)).unwrap();
         conn.set_write_timeout(Some(PATIENCE)).unwrap();
-        conn
+        Upstream(conn)
+    }
+}
+
+/// The proxy's end of a connection the relay opened, as a test holds it.
+///
+/// A read looks again every [`TICK`] until it gets something or
+/// [`PATIENCE`] has passed. On macOS, a reader asleep in `recv` on a Unix
+/// socket can miss the wakeup of its peer's shutdown when that shutdown
+/// follows the peer's last bytes at once, as the relay's does when the
+/// client's input ends: the end of input is there, and the reader sleeps on
+/// until its timeout. Looking again, it sees the end at once.
+pub(super) struct Upstream(UnixStream);
+
+impl Read for &Upstream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            match (&self.0).read(buf) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {}
+                read => return read,
+            }
+        }
+    }
+}
+
+impl Write for &Upstream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&self.0).flush()
+    }
+}
+
+impl Deref for Upstream {
+    type Target = UnixStream;
+
+    fn deref(&self) -> &UnixStream {
+        &self.0
     }
 }
 
