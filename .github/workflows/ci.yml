@@ -211,7 +211,8 @@ jobs:
           grep -q 'test result: ok\. 15 passed' bubblewrap.log
       - name: The escape probes' report
         if: always()
-        run: cat target/tmp/policy-test-lab.txt || echo "no report: policy test did not run"
+        run: |
+          cat target/tmp/policy-test-lab.txt || echo "no report: policy test did not run"
 
   libsecret:
     strategy:
