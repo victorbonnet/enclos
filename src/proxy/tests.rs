@@ -15,7 +15,7 @@ use super::*;
 use crate::model::Timestamp;
 use crate::model::net::{DeniedDestination, NameSeen, NetEvent, Reason, Verdict};
 use crate::state::Result as StateResult;
-use crate::test_ports::tcp_listener;
+use crate::test_ports::{tcp_listener, tcp_listener_free_at};
 
 struct FixedPolicy(Arc<Mutex<Policy>>);
 
@@ -888,15 +888,16 @@ fn a_link_in_a_sockets_place_is_kept_and_not_followed() {
 
 #[test]
 fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
-    // Taken on `[::1]`: the proxy stops there, before 127.0.0.1.
-    let squatter = tcp_listener(Ipv6Addr::LOCALHOST);
+    // Taken on `[::1]`: the proxy stops there, before 127.0.0.1. On a port
+    // 127.0.0.1 leaves free, so that what holds it after is the proxy's.
+    let squatter = tcp_listener_free_at(Ipv6Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
     let port = squatter.local_addr().unwrap().port();
     let e = listen(port).unwrap_err();
     assert_eq!(e.addr, (Ipv6Addr::LOCALHOST, port).into());
     assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
     assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
     // Taken on 127.0.0.1: the `[::1]` listener it already had is let go.
-    let squatter = tcp_listener(Ipv4Addr::LOCALHOST);
+    let squatter = tcp_listener_free_at(Ipv4Addr::LOCALHOST, Ipv6Addr::LOCALHOST);
     let port = squatter.local_addr().unwrap().port();
     let e = listen(port).unwrap_err();
     assert_eq!(e.addr, (Ipv4Addr::LOCALHOST, port).into());
