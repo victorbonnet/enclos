@@ -106,6 +106,22 @@ fn every_link_inside_the_plugin_leads_somewhere() {
     assert!(broken.is_empty(), "links that lead nowhere: {broken:#?}");
 }
 
+/// A running gateway does not show that the provider and the model work
+/// (#171): setup sends one message through `exec`, in the step that starts
+/// the sandbox, and its summary reports the answer.
+#[test]
+fn setup_checks_the_agent_answers_through_exec() {
+    let setup = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/enclos/skills/setup/SKILL.md"),
+    )
+    .unwrap();
+    let run = &setup[setup.find("## 9. Run it").unwrap()..setup.find("## 10.").unwrap()];
+    assert!(run.contains("**Check that the agent answers.**"));
+    assert!(run.contains("enclos exec <sandbox> -- hermes chat --help"));
+    assert!(run.contains("`-p <agent>`"));
+    assert!(setup.contains("whether the agent answered through `exec`"));
+}
+
 #[test]
 fn the_codex_manifest_names_its_skills() {
     // Codex finds a plugin's skills only through this field.
