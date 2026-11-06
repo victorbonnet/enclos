@@ -94,3 +94,71 @@ fn the_design_cites_no_ci_run() {
         .collect();
     assert!(runs.is_empty(), "{runs:#?}");
 }
+
+/// The lines of the design from the first line starting with `start` up to,
+/// not including, the next line starting with `end`.
+fn section<'a>(design: &'a str, start: &str, end: &str) -> Vec<&'a str> {
+    design
+        .lines()
+        .skip_while(|line| !line.starts_with(start))
+        .take_while(|line| !line.starts_with(end))
+        .collect()
+}
+
+/// Whether `line` names a CI run by its number: "run" followed by digits.
+fn names_a_run_number(line: &str) -> bool {
+    line.split("run ")
+        .skip(1)
+        .any(|rest| rest.chars().take_while(char::is_ascii_digit).count() >= 6)
+}
+
+#[test]
+fn milestone_3_awaiting_verification_holds_only_what_is_still_to_show() {
+    // A result a prototype showed moves into the section it describes; §14
+    // keeps what is still to show, and points to the README for the runs.
+    let design = design();
+    let milestone_3 = section(&design, "**Milestone 3**", "## 15.");
+    assert!(!milestone_3.is_empty(), "§14's milestone 3 list");
+    assert!(
+        milestone_3[0].contains("Results are in `prototype/m3/README.md`"),
+        "{}",
+        milestone_3[0]
+    );
+    let with_results: Vec<&str> = milestone_3
+        .iter()
+        .copied()
+        .filter(|line| {
+            line.contains("PR #")
+                || line.contains("M3-")
+                || line.contains("Shown by")
+                || names_a_run_number(line)
+        })
+        .map(|line| line.get(..100).unwrap_or(line))
+        .collect();
+    assert!(with_results.is_empty(), "{with_results:#?}");
+}
+
+#[test]
+fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
+    // Nothing after §15's table makes decisions outside it, and every folder
+    // under `run/<sandbox>/` the design names is in §11's layout.
+    let design = design();
+    let last = design.lines().rev().find(|line| !line.trim().is_empty());
+    assert!(last.is_some_and(|line| line.starts_with('|')), "{last:?}");
+    let layout = section(&design, "## 11.", "## 12.").join("\n");
+    let marker = "run/<sandbox>/";
+    for line in design.lines() {
+        for rest in line.split(marker).skip(1) {
+            let sub: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                .collect();
+            if !sub.is_empty() {
+                assert!(
+                    layout.contains(&format!("{sub}/")),
+                    "{marker}{sub} not in §11"
+                );
+            }
+        }
+    }
+}

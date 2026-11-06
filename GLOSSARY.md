@@ -106,6 +106,10 @@ A file enclos gives a program as a session starts, which the program and everyth
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume
 
+**Mask**:
+An empty, read-only stand-in over a denied path that a grant holds, so the path exists but shows nothing and the rest of the grant stays as granted.
+_Avoid_: stub, overlay
+
 **Protected path**:
 A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
 _Avoid_: system path, reserved path
