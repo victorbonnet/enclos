@@ -11,7 +11,9 @@ use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
-use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord, SandboxState};
+use crate::model::sandbox::{
+    BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
+};
 use crate::model::secret::SecretRecord;
 use crate::model::session::{Member, SessionId, SessionRecord};
 use crate::policy;
@@ -249,16 +251,15 @@ impl Engine {
         }
     }
 
-    /// The first port of [`proxy_ports`] no sandbox here uses and nothing on
-    /// this host listens on (other enclos installs or users included).
+    /// The first port no sandbox here uses and nothing on this host listens
+    /// on (other enclos installs or users included).
     fn free_port(&self) -> Result<u16> {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let listening = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-                .is_ok()
+            super::loopback::listens(addr, std::time::Duration::from_millis(100))
         };
-        proxy_ports()
+        (PORT_FIRST..=PORT_LAST)
             .find(|port| !used.contains(port) && !listening(*port))
             .ok_or(Error::NoFreePorts)
     }
@@ -707,19 +708,4 @@ pub(super) fn needs_restart(session: &SessionRecord, active: Option<&Path>) -> b
         (Some(at_launch), Some(active)) => Path::new(at_launch) != active,
         _ => false,
     }
-}
-
-/// The proxy range in the order a new sandbox's port is looked for: from
-/// its first port.
-#[cfg(not(test))]
-fn proxy_ports() -> impl Iterator<Item = u16> {
-    use crate::model::sandbox::{PORT_FIRST, PORT_LAST};
-    PORT_FIRST..=PORT_LAST
-}
-
-/// In tests, from a port no other test of the run started from, so that
-/// their sandboxes, all named `home`, do not all want the same port.
-#[cfg(test)]
-fn proxy_ports() -> impl Iterator<Item = u16> {
-    crate::test_ports::proxy_ports()
 }
