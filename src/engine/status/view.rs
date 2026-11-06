@@ -123,6 +123,11 @@ pub struct SandboxStatus {
     /// while it holds no such port or one that cannot be trusted, not
     /// provided for a runtime with no such page.
     pub dashboard: Fact<String>,
+    /// The command that opens the runtime's dashboard to the user who runs
+    /// it, for a sandbox whose listeners the host cannot reach, where
+    /// `dashboard` gives no address (ADR 0040); none elsewhere, and for a
+    /// runtime with no dashboard.
+    pub dashboard_command: Option<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback
     /// (ADR 0028).

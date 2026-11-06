@@ -132,7 +132,7 @@ fn on_host(service: &str, root: &ProcessRef) -> std::result::Result<u16, NoPort>
 /// range too, and the host's range is not the namespace's. enclos's proxy
 /// ports are on the host's loopback, which the namespace does not share, so
 /// one is no proxy's there.
-fn in_namespace(
+pub(super) fn in_namespace(
     service: &str,
     root: &ProcessRef,
     held: &HeldNamespace,

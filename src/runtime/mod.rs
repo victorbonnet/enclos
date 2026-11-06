@@ -243,6 +243,13 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
+    /// The runtime's dashboard, a page for a browser on the host, served by
+    /// a command of its own: what `enclos dashboard` runs where the host
+    /// cannot reach the sandbox's listeners (ADR 0040). `None` (the
+    /// default): the runtime has none.
+    fn dashboard(&self) -> Option<RuntimeDashboard> {
+        None
+    }
     /// The variable naming a folder whose `.env` the runtime's services
     /// read into their own process: their secrets go there, not into their
     /// environment, which any process of the user can read (ADR 0034).
@@ -470,6 +477,19 @@ pub struct RuntimeListener {
     /// status` shows it at the port sessions are given, while the service
     /// has one.
     pub page: Option<&'static str>,
+}
+
+/// A runtime's dashboard, served by a command run in its sandbox as a
+/// session of its own (ADR 0040).
+#[derive(Debug, Clone)]
+pub struct RuntimeDashboard {
+    /// Serves the dashboard on 127.0.0.1, at a port the kernel picks, in a
+    /// server of its own whatever else runs in the sandbox, and runs until
+    /// it is stopped: the port is read from the host, never from what the
+    /// command says.
+    pub command: SandboxCommand,
+    /// The path of its page, such as `/`.
+    pub page: &'static str,
 }
 
 /// A runtime's name for one of its services, stable across versions, as it

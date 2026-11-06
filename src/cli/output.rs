@@ -2,8 +2,9 @@
 //! its output is piped or with `--json`, errors and refusals included. A
 //! command whose stdout is a program's or the services' ([`RUNS_A_PROGRAM`])
 //! is never JSON because it is piped. With `--json`, its dry run's plan is
-//! JSON on stdout, `logs` writes its lines as JSON Lines there, and enclos's
-//! own words, its failure and its notes, are JSON on stderr.
+//! JSON on stdout, `logs` writes its lines as JSON Lines there, `dashboard`
+//! its address as one JSON line, and enclos's own words, its failure and its
+//! notes, are JSON on stderr.
 
 use std::fs::File;
 use std::io::{IsTerminal, Write};
@@ -34,9 +35,17 @@ pub enum Output {
 /// document: the program's they run (`connect`, `exec`, the hidden
 /// `launch` and `inside`, and the hidden `holder`, whose `join` becomes a
 /// session's bubblewrap), the services' logs (`logs`), or a long-running
-/// command's own log (the hidden `proxy` and `relay`).
-pub const RUNS_A_PROGRAM: [&str; 8] = [
-    "connect", "exec", "logs", "launch", "inside", "holder", "proxy", "relay",
+/// command's own output (`dashboard`, and the hidden `proxy` and `relay`).
+pub const RUNS_A_PROGRAM: [&str; 9] = [
+    "connect",
+    "exec",
+    "logs",
+    "launch",
+    "inside",
+    "holder",
+    "proxy",
+    "relay",
+    "dashboard",
 ];
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();

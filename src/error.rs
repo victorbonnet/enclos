@@ -45,6 +45,9 @@ pub enum Error {
     NoFreePorts,
     #[error("{what}")]
     Session { what: String },
+    /// `enclos dashboard` cannot serve, or ended on its own (ADR 0040).
+    #[error("{what}")]
+    Dashboard { what: String },
     /// A value enclos could not write as JSON.
     #[error("cannot write {what} as JSON: {source}")]
     Json {
@@ -416,6 +419,7 @@ impl Error {
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
+            | Error::Dashboard { .. }
             | Error::Json { .. }
             | Error::Service(_)
             | Error::Processes(_)

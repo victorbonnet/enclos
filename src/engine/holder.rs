@@ -68,6 +68,8 @@ impl Engine {
             crate::notes::say(&format!(
                 "starting the namespace holder of sandbox {name}, whose network namespace its sessions join; it runs until `enclos sandbox stop {name}`"
             ));
+            // Made by no one else yet when nothing of the sandbox ran before.
+            self.create_logs_dir(name)?;
             self.services
                 .start(&self.service_unit(record, Unit::Holder, &[])?)?;
         }

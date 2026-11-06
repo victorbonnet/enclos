@@ -39,13 +39,13 @@ fn replaced_earlier(service: &str, ids: &[SessionId]) -> Option<String> {
 }
 
 /// Sets `ended` on TERM, INT and HUP while it lives, instead of ending this
-/// process: `launch` outlives them to stop the runtime, which runs in a
-/// group of its own that the service manager does not signal, and to
-/// record its end.
-struct EndOn(Vec<signal_hook::SigId>);
+/// process: `launch` and `dashboard` outlive them to stop their program,
+/// which runs in a group of its own that neither the service manager nor
+/// the terminal signals, and to record its end.
+pub(super) struct EndOn(Vec<signal_hook::SigId>);
 
 impl EndOn {
-    fn new(ended: &Arc<AtomicBool>) -> Result<Self> {
+    pub(super) fn new(ended: &Arc<AtomicBool>) -> Result<Self> {
         // The guard first, so what is registered is unregistered even when a
         // later registration fails.
         let mut guard = EndOn(Vec::new());

@@ -1,6 +1,6 @@
 //! The TCP tables and the ephemeral port range, as `/proc` writes them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
@@ -54,6 +54,40 @@ fn parse_table(text: &str) -> Result<BTreeMap<u64, SocketAddr>, ListenersError> 
     Ok(sockets)
 }
 
+/// `TCP_ESTABLISHED`, as `/proc/net/tcp` writes a socket's state.
+const ESTABLISHED: &str = "01";
+
+/// The owner of the socket at `client` connected to `server`, from
+/// `tables`, the texts of `/proc/net/tcp` and `tcp6`: the uid its line
+/// gives, when its lines give exactly one. Only an established connection's
+/// line counts: one in another state may name no owner, as a `TIME_WAIT`
+/// line gives uid 0. A line that cannot be read names no one.
+pub(super) fn client_owner(
+    tables: &[String],
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Option<u32> {
+    let mut owners = BTreeSet::new();
+    for line in tables.iter().flat_map(|table| table.lines().skip(1)) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [_, local, remote, state, _, _, _, uid, ..] = words.as_slice() else {
+            continue;
+        };
+        if *state == ESTABLISHED
+            && table_address(local) == Some(client)
+            && table_address(remote) == Some(server)
+            && let Ok(uid) = uid.parse::<u32>()
+        {
+            owners.insert(uid);
+        }
+    }
+    let mut owners = owners.into_iter();
+    match (owners.next(), owners.next()) {
+        (Some(owner), None) => Some(owner),
+        _ => None,
+    }
+}
+
 /// `0100007F:1F90`, or 32 hexadecimal digits before the colon for IPv6: each
 /// group of 8 is a 32-bit word of the address as this host's `%08X` prints
 /// it, and the port is hexadecimal. A wildcard is given as `0.0.0.0`, as
@@ -98,6 +132,14 @@ pub(super) mod tests {
         )
     }
 
+    /// A line of `/proc/net/tcp` for a connection from `local` to
+    /// `remote` in `state`, whose socket `uid` owns.
+    fn connection(local: &str, remote: &str, state: &str, uid: u32) -> String {
+        format!(
+            "   1: {local} {remote} {state} 00000000:00000000 00:00000000 00000000  {uid}        0 4242 1 0000000000000000 20 4 30 10 -1\n"
+        )
+    }
+
     const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 
     /// Network tables in a `/proc` of a test's own.
@@ -138,6 +180,49 @@ pub(super) mod tests {
                 (6, a("127.0.0.1:8082")),
             ])
         );
+    }
+
+    /// From 127.0.0.1:50000 to 127.0.0.1:41001, as the client's line and
+    /// the server's write them, and a v4-mapped client in `tcp6`.
+    #[test]
+    fn a_clients_owner_is_its_established_lines_uid_and_no_other() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let (client, server) = (a("127.0.0.1:50000"), a("127.0.0.1:41001"));
+        let (c, s) = ("0100007F:C350", "0100007F:A029");
+        let v4 = |lines: &[String]| vec![format!("{HEADER}{}", lines.concat())];
+        let owner = |tables: &[String]| client_owner(tables, client, server);
+        // The server's own end names the server's user, not the client's.
+        let both = [connection(c, s, "01", 1001), connection(s, c, "01", 1000)];
+        assert_eq!(owner(&v4(&both)), Some(1001));
+        // Gone, closing or in TIME_WAIT: no owner to give.
+        assert_eq!(owner(&v4(&[connection(s, c, "01", 1000)])), None);
+        for state in ["06", "08", "04"] {
+            assert_eq!(
+                owner(&v4(&[connection(c, s, state, 1001)])),
+                None,
+                "{state}"
+            );
+        }
+        // Another client, or a client of another server.
+        let other = [connection("0100007F:C351", s, "01", 1001)];
+        assert_eq!(owner(&v4(&other)), None);
+        let elsewhere = [connection(c, "0100007F:A02A", "01", 1001)];
+        assert_eq!(owner(&v4(&elsewhere)), None);
+        // Two lines that disagree name no one.
+        let two = [connection(c, s, "01", 1001), connection(c, s, "01", 0)];
+        assert_eq!(owner(&v4(&two)), None);
+        // A dual-stack client's IPv4 connection is in tcp6, v4-mapped.
+        let mapped = connection(
+            "0000000000000000FFFF00000100007F:C350",
+            "0000000000000000FFFF00000100007F:A029",
+            "01",
+            0,
+        );
+        let tables = [v4(&[]), vec![format!("{HEADER}{mapped}")]].concat();
+        assert_eq!(owner(&tables), Some(0));
+        // A line that cannot be read names no one.
+        let garbled = [connection(c, s, "01", 1001).replace(" 1001 ", " x ")];
+        assert_eq!(owner(&v4(&garbled)), None);
     }
 
     #[test]

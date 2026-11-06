@@ -8,6 +8,7 @@
 mod agents;
 mod compile;
 mod configure;
+mod dashboard;
 mod doctor;
 mod history;
 mod holder;
@@ -38,6 +39,7 @@ mod unenforced;
 
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
+pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
     NextSession, RanFile, Running, SandboxCheck, Sandboxes, Written,

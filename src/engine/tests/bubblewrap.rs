@@ -667,3 +667,25 @@ fn an_import_session_is_shown_its_copy_of_the_archive_read_only() {
         );
     }
 }
+
+/// The namespace holder installed alone, before anything of the sandbox
+/// ran, as `enclos dashboard` does: its log's folder is made first, since
+/// systemd starts no unit whose log it cannot open.
+#[test]
+fn a_namespace_holder_installed_alone_gets_its_logs_folder() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let stood = Stood::with(true, Some(services.clone()));
+    let logs = stood.engine.layout.sandbox_dir("lab").join("logs");
+    assert!(!logs.exists());
+    let socket = stood.engine.layout.holder_socket("lab");
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+    });
+    let record = stood.engine.record(&stood.name).unwrap();
+    let ((), _) = crate::notes::heard(|| stood.engine.ensure_holder(&record).unwrap());
+    late.join().unwrap();
+    assert!(logs.is_dir());
+    assert_eq!(services.started.borrow().len(), 1);
+}
