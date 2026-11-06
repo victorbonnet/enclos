@@ -1,1 +1,1 @@
-{"v":1,"id":"5d1b7e8e-6f1a-4c55-9a43-1d2f7d9e0a03","type":"hello","runtime":"hermes","agent":"main","capabilities":["notify","typing","titles","tools"]}
+{"v":1,"id":"5d1b7e8e-6f1a-4c55-9a43-1d2f7d9e0a03","type":"hello","runtime":"hermes","agent":"main","capabilities":["typing","titles","tools"]}
