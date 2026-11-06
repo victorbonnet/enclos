@@ -15,13 +15,18 @@ use jiff::tz::TimeZone;
 use super::super::descriptors::is_gone;
 use super::super::process::{Proc, PsError, Seen};
 
+/// `PF_EXITING` (`include/linux/sched.h`): the task has begun to exit.
+const PF_EXITING: u64 = 0x4;
+
 /// What `/proc/<pid>/stat` says of a process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stat {
     ppid: u32,
     pgid: u32,
-    /// Exited, or ended: no thread of it runs any more. A process whose
-    /// main thread exited is shown `Z` too, while its other threads run on.
+    /// Exiting, exited or ended, with no other thread left: it runs no code
+    /// any more. A process killed leaves its cgroup while it exits, before
+    /// it is a zombie. A process whose main thread exited is shown exiting,
+    /// then `Z`, while its other threads run on: that one still runs.
     zombie: bool,
     /// When it started, in clock ticks since boot.
     ticks: u64,
@@ -38,11 +43,12 @@ fn parse_stat(text: &str) -> Option<Stat> {
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let number = |n: usize| fields.get(n)?.parse::<u64>().ok();
     let state = fields.first()?.chars().next()?;
+    let exiting = number(6)? & PF_EXITING != 0;
     let threads = number(17)?;
     Some(Stat {
         ppid: u32::try_from(number(1)?).ok()?,
         pgid: u32::try_from(number(2)?).ok()?,
-        zombie: state == 'X' || (state == 'Z' && threads <= 1),
+        zombie: (exiting || matches!(state, 'Z' | 'X')) && threads <= 1,
         ticks: number(19)?,
         command: command.to_owned(),
     })
@@ -200,6 +206,15 @@ mod tests {
             let stat = parse_stat(&line(7, "x", state, 1, threads, 0)).unwrap();
             assert_eq!(stat.zombie, zombie, "{state} with {threads} threads");
         }
+    }
+
+    /// A process that has begun to exit runs no code, unless it is only its
+    /// main thread that exits while others run on.
+    #[test]
+    fn a_process_exiting_with_no_other_thread_runs_no_more() {
+        let exiting = |threads| line(7, "x", 'R', 1, threads, 0).replace(" 4194560 ", " 4194564 ");
+        assert!(parse_stat(&exiting(1)).unwrap().zombie);
+        assert!(!parse_stat(&exiting(3)).unwrap().zombie);
     }
 
     /// procps pads a day before the 10th; the text compared has one space.

@@ -46,9 +46,9 @@ impl PsError {
 /// What one look at a process shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seen {
-    /// It exited and was not yet reaped by its parent: it runs nothing and
-    /// holds nothing. One whose main thread exited while others run on is no
-    /// zombie.
+    /// It exited and was not yet reaped by its parent, or, where the host
+    /// shows it (Linux), it is exiting: it runs nothing. One whose main
+    /// thread exited while others run on is no zombie.
     pub zombie: bool,
     /// When it started, as `ps -o lstart` writes it in UTC with single
     /// spaces: compared as text, never parsed.
