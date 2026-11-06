@@ -2,10 +2,12 @@
 
 use super::*;
 
-/// bubblewrap runs `enclos inside` first, with the compiled file, then the
-/// session's command as it was given.
+/// A session joins the sandbox's namespace holder first (ADR 0039), then
+/// becomes bubblewrap, which runs `enclos inside` with the compiled file,
+/// then the session's command as it was given. Nothing makes a network
+/// namespace of the session's own.
 #[test]
-fn bubblewrap_runs_enclos_inside_then_the_command() {
+fn a_session_joins_the_namespace_holder_then_runs_enclos_inside_then_the_command() {
     let home = Home::new();
     let c = compiled(&home, Lists::default());
     let host = read(&home, &c, None).unwrap();
@@ -14,10 +16,17 @@ fn bubblewrap_runs_enclos_inside_then_the_command() {
         enclos: Path::new("/usr/bin/enclos"),
     };
     let file = Path::new("/c/compiled/x.json");
-    let command = command(&programs, file, &c, &host, &ctx(&home), &launch(Vec::new())).unwrap();
-    assert_eq!(command.get_program(), "/usr/bin/bwrap");
+    let ctx = ctx(&home);
+    let command = command(&programs, file, &c, &host, &ctx, &launch(Vec::new())).unwrap();
+    assert_eq!(command.get_program(), "/usr/bin/enclos");
     let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-    let at = args.iter().position(|a| *a == "/usr/bin/enclos").unwrap();
+    let socket = ctx.holder_socket.to_str().unwrap();
+    assert_eq!(
+        &args[..6],
+        ["holder", "join", "--socket", socket, "--", "/usr/bin/bwrap"]
+    );
+    assert_eq!(ctx.holder_socket, home.at(".enclos/run/lab/holder.sock"));
+    let at = args.iter().rposition(|a| *a == "/usr/bin/enclos").unwrap();
     assert_eq!(
         &args[at..],
         [
@@ -31,6 +40,7 @@ fn bubblewrap_runs_enclos_inside_then_the_command() {
             "echo hi"
         ]
     );
+    assert!(!args.contains(&"--unshare-net"), "{args:?}");
     assert_eq!(
         command.get_current_dir(),
         Some(home.sandbox_home().as_path())
@@ -72,10 +82,16 @@ fn the_environment_is_emptied_and_no_secret_is_on_the_command_line() {
         set["HOME"].as_deref(),
         Some(home.sandbox_home().as_os_str())
     );
+    // The sandbox's own loopback, which its sessions share, is reached
+    // without the proxy.
+    assert_eq!(
+        set["NO_PROXY"].as_deref(),
+        Some(std::ffi::OsStr::new(environment::OWN_LOOPBACK))
+    );
     // Nothing of this process's own variables but those every backend keeps.
     let run = command.get_envs().count();
     let mut every_backend = Command::new("/usr/bin/true");
-    environment::apply(&mut every_backend, &ctx, &launch);
+    environment::apply(&mut every_backend, &ctx, &launch, Loopback::Own);
     let expected = every_backend.get_envs().count();
     assert!(run <= expected, "{run} variables set, {expected} expected");
     // `env_clear` leaves no inherited variable: run it and look.
@@ -132,9 +148,15 @@ fn as_bubblewrap_ran(in_terminal: bool) -> (u64, String) {
         &bwrap,
         "grep '^SigIgn:' /proc/self/status | cut -f2; printf '%s\\n' \"$@\"",
     );
+    // The join, which becomes what follows its `--`, as `holder join` does.
+    let enclos = home.dir.path().join("enclos");
+    crate::test_scripts::write_script(
+        &enclos,
+        "while [ $# -gt 0 ]; do a=$1; shift; [ \"$a\" = -- ] && exec \"$@\"; done; exit 99",
+    );
     let programs = Programs {
         bwrap: &bwrap,
-        enclos: Path::new("/usr/bin/enclos"),
+        enclos: &enclos,
     };
     let mut launch = launch(Vec::new());
     launch.in_terminal = in_terminal;

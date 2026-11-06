@@ -10,6 +10,7 @@ mod compile;
 mod configure;
 mod doctor;
 mod history;
+mod holder;
 mod import;
 mod launch;
 mod listener;

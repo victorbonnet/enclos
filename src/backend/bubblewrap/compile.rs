@@ -35,17 +35,13 @@ const EXEC_SYSTEM: &[&str] = &[
 /// The ones of [`OWN_TMPFS`] the sandbox writes temporary files in.
 const OWN_TEMPORARY: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
-/// Where the relay's notices go: the sandbox's own `/tmp`, which ends with
-/// the session, so they stay out of its terminal.
-const RELAY_LOG: &str = "/tmp/enclos-relay.log";
-
-/// What the file in `compiled/` holds.
+/// What the file in `compiled/` holds. The relay to the proxy is not a
+/// session's: the sandbox's namespace holder serves it (ADR 0039).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledSandbox {
     pub bubblewrap: Bubblewrap,
     pub landlock: LandlockRules,
     pub seccomp: SeccompFilter,
-    pub relay: Relay,
     pub unenforced: Vec<Unenforced>,
 }
 
@@ -126,15 +122,6 @@ pub struct LandlockRules {
     pub scoped: Vec<String>,
 }
 
-/// The relay to the sandbox's proxy, in a session's own network namespace.
-/// Under ADR 0039 the namespace holder serves one for the whole sandbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Relay {
-    pub port: u16,
-    pub socket: String,
-    pub log: String,
-}
-
 pub fn compile(policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
     let text = serde_json::to_string_pretty(&compiled_sandbox(policy, ctx)?)
         .map_err(|e| refused(e.to_string()))?;
@@ -201,11 +188,6 @@ fn compiled_sandbox(
         },
         landlock: landlock_rules(&home, &workspaces)?,
         seccomp: seccomp::filter(),
-        relay: Relay {
-            port: ctx.proxy_port,
-            socket: text(&ctx.proxy_socket)?,
-            log: RELAY_LOG.to_owned(),
-        },
         unenforced: proposed::unenforced(policy),
     })
 }

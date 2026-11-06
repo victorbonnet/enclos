@@ -1,20 +1,27 @@
 //! The runtime's own service that listens in its sandbox (ADR 0028): where
 //! it listens, from enclos's records, so the sandbox's sessions may reach
 //! that one port; and starting it before `connect`, since a session reaches
-//! it only on the port it held when the session started.
+//! it only once it listens. On the host's loopback (Seatbelt) a session is
+//! given that port; in the sandbox's own network namespace (bubblewrap, ADR
+//! 0039) it reaches the port on its own, and its port is read there.
 
 use std::fmt;
 use std::fs::{OpenOptions, TryLockError};
+use std::net::SocketAddr;
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 use super::Engine;
 use super::service::Unit;
+use crate::backend::HeldNamespace;
 use crate::error::Result;
 use crate::layout::LayoutError;
 use crate::lifecycle::listeners::{
-    NotOnePort, ephemeral_ports, one_port, tcp_listeners, tcp_listeners_at,
+    ListenersError, NotOnePort, ephemeral_ports, one_port, tcp_listeners, tcp_listeners_at,
+    tcp_listeners_at_in, tcp_listeners_in,
 };
-use crate::lifecycle::process::is_same;
+use crate::lifecycle::proc::{program_in_pid_namespace, same_network};
+use crate::lifecycle::process::{is_same, reference};
 use crate::model::audit::Actor;
 use crate::model::sandbox::{PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind};
@@ -70,42 +77,121 @@ fn refused(e: impl fmt::Display) -> NoPort {
     NoPort::Refused(e.to_string())
 }
 
+/// Where a sandbox's runtime service listens, as the host reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Network {
+    /// The host's own, which a Seatbelt session shares.
+    Host,
+    /// The sandbox's network namespace, as its namespace holder gives it
+    /// (ADR 0039).
+    Namespace(HeldNamespace),
+}
+
 /// The port `service` listens on now: the one TCP port at 127.0.0.1 in the
 /// ephemeral range that the program its open session started holds (`enclos
-/// launch` runs it; for Hermes, the gateway itself, as its wrapper and
-/// `sandbox-exec` both exec), checked to be the same process before and after
-/// reading its ports, so a reused pid is not taken for it, and to be the only
-/// process holding 127.0.0.1 at that port, so a session reaches no other. A
-/// member it started could listen too, so members are not looked at; several
-/// open sessions, no port or several are refused rather than guessed among.
+/// launch` runs it; for Hermes, the gateway itself), checked to be the same
+/// process before and after reading its ports, so a reused pid is not taken
+/// for it, and to be the only process holding 127.0.0.1 at that port, so a
+/// session reaches no other. A member it started could listen too, so
+/// members are not looked at; several open sessions, no port or several are
+/// refused rather than guessed among. How the program and its ports are
+/// found goes by `network`: [`on_host`], or [`in_namespace`].
 pub(super) fn service_listener(
     store: &dyn StateStore,
     sandbox: &SandboxName,
     service: &str,
+    network: &Network,
 ) -> std::result::Result<u16, NoPort> {
     let root = running_session(store, sandbox, service)?;
-    let ephemeral = ephemeral_ports().map_err(refused)?;
-    let held = tcp_listeners(root.pid).map_err(refused)?;
-    let port = one_port(&held, &ephemeral).map_err(|e| {
-        let why = format!("the {service} (pid {}): {e}", root.pid);
-        match e {
-            NotOnePort::None(_) => NoPort::NotYet(why),
-            NotOnePort::Several(_) => NoPort::Refused(why),
-        }
-    })?;
-    // Nothing else at 127.0.0.1 there: a socket that shares the port
-    // (SO_REUSEPORT) would get the session's connections too.
-    let holders = tcp_listeners_at(port).map_err(refused)?;
-    if let Some((pid, _)) = holders.iter().find(|(pid, _)| *pid != root.pid) {
-        return Err(NoPort::Refused(format!(
-            "pid {pid} also listens at 127.0.0.1:{port}, the {service}'s port, so a session could reach it"
-        )));
-    }
+    let port = match network {
+        Network::Host => on_host(service, &root)?,
+        Network::Namespace(held) => in_namespace(service, &root, held)?,
+    };
     // Still the same process, so the sockets were the service's.
     if !is_same(&root).map_err(refused)? {
         return Err(NoPort::NotRunning(format!("the {service} ended")));
     }
     Ok(port)
+}
+
+/// On the host's loopback the session's root is the program, as its wrapper
+/// and `sandbox-exec` both exec, its ports and the ephemeral range are the
+/// host's, and a port in enclos's proxy range is refused.
+fn on_host(service: &str, root: &ProcessRef) -> std::result::Result<u16, NoPort> {
+    let ephemeral = ephemeral_ports().map_err(refused)?;
+    let held = tcp_listeners(root.pid).map_err(refused)?;
+    let port = chosen(service, root.pid, &held, &ephemeral)?;
+    alone_at(service, root.pid, port, tcp_listeners_at(port))?;
+    outside_proxy_range(port)
+}
+
+/// In the sandbox's network namespace the program is the second process of
+/// the session's own PID namespace, below bubblewrap, and its ports and the
+/// ephemeral range are the namespace's, which the namespace holder's
+/// `/proc/<pid>/net` and answer give: another session can listen in that
+/// range too, and the host's range is not the namespace's. enclos's proxy
+/// ports are on the host's loopback, which the namespace does not share, so
+/// one is no proxy's there.
+fn in_namespace(
+    service: &str,
+    root: &ProcessRef,
+    held: &HeldNamespace,
+) -> std::result::Result<u16, NoPort> {
+    let not_yet = || NoPort::NotYet(format!("the {service} has not started its program yet"));
+    let pid = program_in_pid_namespace(root.pid)
+        .map_err(refused)?
+        .ok_or_else(not_yet)?;
+    let program = reference(pid).map_err(refused)?.ok_or_else(not_yet)?;
+    if !same_network(program.pid, held.pid).map_err(refused)? {
+        return Err(NoPort::Refused(format!(
+            "the {service} (pid {pid}) is not in the network namespace of its sandbox's namespace holder (pid {}), as after the namespace holder started again: `enclos sandbox restart` starts them together",
+            held.pid
+        )));
+    }
+    let listening = tcp_listeners_in(held.pid, pid).map_err(refused)?;
+    let port = chosen(service, pid, &listening, &held.ephemeral)?;
+    alone_at(service, pid, port, tcp_listeners_at_in(held.pid, port))?;
+    if !is_same(&program).map_err(refused)? {
+        return Err(NoPort::NotRunning(format!("the {service}'s program ended")));
+    }
+    Ok(port)
+}
+
+/// The one port of `held`, which `program` holds, a bind on port 0 got.
+fn chosen(
+    service: &str,
+    program: u32,
+    held: &[SocketAddr],
+    ephemeral: &RangeInclusive<u16>,
+) -> std::result::Result<u16, NoPort> {
+    one_port(held, ephemeral).map_err(|e| {
+        let why = format!("the {service} (pid {program}): {e}");
+        match e {
+            NotOnePort::None(_) => NoPort::NotYet(why),
+            NotOnePort::Several(_) => NoPort::Refused(why),
+        }
+    })
+}
+
+/// Nothing but `program` at 127.0.0.1 `port`, of the `holders` found: a
+/// socket that shares the port (SO_REUSEPORT) would get the session's
+/// connections too.
+fn alone_at(
+    service: &str,
+    program: u32,
+    port: u16,
+    holders: std::result::Result<Vec<(u32, SocketAddr)>, ListenersError>,
+) -> std::result::Result<(), NoPort> {
+    match holders
+        .map_err(refused)?
+        .iter()
+        .find(|(pid, _)| *pid != program)
+    {
+        Some((pid, _)) => Err(NoPort::Refused(format!(
+            "pid {pid} also listens at 127.0.0.1:{port}, the {service}'s port, so a session could reach it"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The root of the one open session of `service` whose program still runs.
@@ -134,9 +220,9 @@ fn running_session(
 }
 
 /// `port`, unless it is one of enclos's proxy ports, which a sandbox that
-/// listens is kept from binding (ADR 0028): its service holding one means
-/// those rules did not hold, and no session may be given another sandbox's
-/// proxy.
+/// listens on the host's loopback is kept from binding (ADR 0028): its
+/// service holding one means those rules did not hold, and no session may
+/// be given another sandbox's proxy.
 pub(super) fn outside_proxy_range(port: u16) -> std::result::Result<u16, NoPort> {
     match (PORT_FIRST..=PORT_LAST).contains(&port) {
         false => Ok(port),
@@ -187,11 +273,38 @@ impl Engine {
         record.runtime.and_then(|kind| adapter(kind).listener())
     }
 
-    /// The port a session of `record` started now may reach besides its
-    /// proxy: the one its runtime's service listens on (ADR 0028).
-    /// `Ok(None)`: the runtime has no such service. An error: it has one,
-    /// and a session started now cannot reach it, with why (not running, or
-    /// its port cannot be told), for the session to say.
+    /// Where `record`'s runtime service listens: the host's loopback, or the
+    /// sandbox's network namespace, whose namespace holder not answering is
+    /// a service that cannot run yet.
+    fn service_network(&self, record: &SandboxRecord) -> std::result::Result<Network, NoPort> {
+        match self.held_namespace(record) {
+            None => Ok(Network::Host),
+            Some(Ok(held)) => Ok(Network::Namespace(held)),
+            Some(Err(why)) => Err(NoPort::NotRunning(format!(
+                "the namespace holder of sandbox {} does not answer: {why}",
+                record.name
+            ))),
+        }
+    }
+
+    /// The port `record`'s runtime service `service` listens on now, where
+    /// it listens.
+    pub(super) fn listening_port(
+        &self,
+        record: &SandboxRecord,
+        service: &str,
+    ) -> std::result::Result<u16, NoPort> {
+        let network = self.service_network(record)?;
+        service_listener(self.state.as_ref(), &record.name, service, &network)
+    }
+
+    /// The port a session of `record` started now is given to reach besides
+    /// its proxy: the one its runtime's service listens on (ADR 0028).
+    /// `Ok(None)`: the runtime has no such service, or the session's network
+    /// is the sandbox's own, where it reaches the service whenever it
+    /// listens (ADR 0039). An error: a session started now cannot reach it,
+    /// with why (not running, or its port cannot be told), for the session
+    /// to say.
     pub(super) fn service_port(
         &self,
         record: &SandboxRecord,
@@ -199,9 +312,11 @@ impl Engine {
         let Some(listener) = Self::listener(record) else {
             return Ok(None);
         };
+        if self.holder_of(record.backend).is_some() {
+            return Ok(None);
+        }
         let service = listener.service.as_str();
-        service_listener(self.state.as_ref(), &record.name, service)
-            .and_then(outside_proxy_range)
+        service_listener(self.state.as_ref(), &record.name, service, &Network::Host)
             .map(Some)
             .map_err(|why| {
                 format!(
@@ -231,7 +346,7 @@ impl Engine {
                 }
             }
         }
-        let step = match service_listener(self.state.as_ref(), name, listener.service.as_str()) {
+        let step = match self.listening_port(record, listener.service.as_str()) {
             Ok(_) => ConnectStep::Nothing,
             Err(NoPort::NotRunning(_))
                 if !self.unit_installed(name, Unit::Runtime(listener.service))? =>
@@ -288,7 +403,12 @@ impl Engine {
         let started = match step {
             ConnectStep::Nothing => return Ok(None),
             ConnectStep::Unreadable(why) => return done(false, Some(why)),
-            ConnectStep::Wait => false,
+            // A service whose namespace holder is missing never listens, as
+            // its session cannot join: one missing is installed first.
+            ConnectStep::Wait => {
+                self.ensure_holder(&record)?;
+                false
+            }
             ConnectStep::Start => {
                 // A running proxy, one an earlier `connect` started or the
                 // proxy service, gives way to the proxy service installed
@@ -328,7 +448,7 @@ impl Engine {
         let mut seen: Option<ProcessRef> = None;
         let mut restarted = false;
         let late = loop {
-            let why = match service_listener(self.state.as_ref(), name, service) {
+            let why = match self.listening_port(&record, service) {
                 Ok(_) => break None,
                 Err(NoPort::Refused(why)) => break Some(why),
                 Err(NoPort::NotRunning(why) | NoPort::NotYet(why)) => why,

@@ -401,7 +401,7 @@ impl Engine {
         // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
         let services = self
-            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop)?
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, None)?
             .into_result()?;
         self.write(
             by,
@@ -640,8 +640,9 @@ impl Engine {
             name: name.to_string(),
         })?;
         // Installed, a service comes back on its own, even with no session
-        // recorded: one whose proxy could not take its port has none.
-        if self.has_services(name)? {
+        // recorded: one whose proxy could not take its port has none. A
+        // namespace holder alone counts too.
+        if !self.installed_labels(name)?.is_empty() {
             return Err(Error::SandboxHasServices {
                 name: name.to_string(),
             });

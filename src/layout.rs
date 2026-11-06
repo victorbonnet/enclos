@@ -287,6 +287,13 @@ impl Layout {
         self.sandbox_run_dir(name).join("proxy.lock")
     }
 
+    /// The socket on which the sandbox's namespace holder hands out its
+    /// namespaces (ADR 0039): in the host-only part of the sandbox's run
+    /// folder, which no session mounts.
+    pub fn holder_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("holder.sock")
+    }
+
     /// Creates the folder of the sandbox's proxy socket.
     pub fn create_proxy_socket_dir(&self, name: &str) -> std::io::Result<()> {
         users_alone(&self.sandbox_run_dir(name).join("visible"))

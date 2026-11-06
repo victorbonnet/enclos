@@ -242,8 +242,10 @@ impl Engine {
         }
         let mut record = self.record(name)?;
         let compiled = self.compile_policy(name, record.proxy_port)?;
+        // A service's `launch` waited for both before it took the lock.
         if matches!(starting, Starting::Command { .. }) {
             self.ensure_proxy(lock, &record)?;
+            self.ensure_holder(&record)?;
         }
         let (version, snapshot) = self.active_policy(name)?;
         let (program, args) = command.split_first().ok_or_else(|| Error::Session {

@@ -121,10 +121,6 @@ fn compiled(home: &Home, lists: Lists) -> CompiledSandbox {
             "socket_families": {}
         }))
         .unwrap(),
-        relay: serde_json::from_value(serde_json::json!({
-            "port": 41001, "socket": "/x/proxy.sock", "log": "/tmp/enclos-relay.log"
-        }))
-        .unwrap(),
         unenforced: Vec::new(),
     }
 }

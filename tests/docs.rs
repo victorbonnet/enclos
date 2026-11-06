@@ -162,7 +162,7 @@ fn the_chat_tabs_control_pair_is_recorded_as_measured() {
         .find(|line| line.starts_with("- `enclos dashboard`"))
         .expect("§14's item");
     for part in [
-        "which sessions get it",
+        "every bubblewrap session now has it",
         "`NO_PROXY` for loopback is needed",
         "not shown",
     ] {
@@ -258,9 +258,8 @@ fn an_adrs_consequences_section_holds_only_its_list() {
 
 #[test]
 fn the_relay_has_one_runner_and_the_holders_part_cites_adr_0039() {
-    // ADR 0039 gives the relay to the namespace holder; until the holder is
-    // built, the design cites it where it says so and keeps the case
-    // where a session runs its relay.
+    // ADR 0039 gives the relay to the namespace holder: the design cites it
+    // where it says so, and no session runs a relay of its own.
     let design = design();
     let find = |start: &str| {
         design
@@ -272,9 +271,10 @@ fn the_relay_has_one_runner_and_the_holders_part_cites_adr_0039() {
     let networking = find("**Linux networking.**");
     assert!(networking.contains("adr/0039-"), "{networking}");
     assert!(
-        networking.contains("kill or replace its relay"),
+        networking.contains("the agent cannot kill or replace it"),
         "{networking}"
     );
+    assert!(!design.contains("--relay"));
     let backend = find("   - the bubblewrap backend");
     assert!(!backend.contains("relay"), "{backend}");
     let proxy = find("   - the proxy listening on a Unix socket");
@@ -286,8 +286,9 @@ fn bare_holders(text: &str) -> Vec<String> {
     let mut bare = Vec::new();
     for line in text.lines().map(str::to_lowercase) {
         for (at, _) in line.match_indices("holder") {
-            // A service's name, such as `enclos.<install>.<sandbox>.holder`.
-            let named = line[..at].ends_with(['.', '`']);
+            // A service's name, such as `enclos.<install>.<sandbox>.holder`,
+            // or the command's, `enclos holder`.
+            let named = line[..at].ends_with(['.', '`']) || line[..at].ends_with("enclos ");
             if !named && !line[..at].ends_with("namespace ") {
                 let start = (0..=at.saturating_sub(40))
                     .rev()
@@ -348,7 +349,7 @@ fn what_a_session_runs_first_is_in_section_5() {
     let block = at("**What a session runs first**");
     assert!(at("## 5. Isolation backends") < block);
     assert!(block < at("### Seatbelt specifics"));
-    assert!(design.contains("and `enclos inside --relay` for the one a session starts"));
+    assert!(design.contains("The relay runs in the namespace holder, `enclos holder serve`"));
 }
 
 /// `enclos inside` handles the rights of `LANDLOCK_ABI_NEEDED`, so a right of

@@ -1,6 +1,7 @@
-//! Running a program under bubblewrap: the compiled arguments, with the
-//! masks that depend on the host made from what it holds at this launch
-//! (design §5, What `wrap` does at each launch).
+//! Running a program under bubblewrap, in the sandbox's network namespace:
+//! the compiled arguments, with the masks that depend on the host made from
+//! what it holds at this launch (design §5, What `wrap` does at each
+//! launch).
 //!
 //! [`host`] reads the host, with [`masks`] saying where each mask goes;
 //! [`arguments`] only uses what they give, so the order of the masks is
@@ -14,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::compile::CompiledSandbox;
-use crate::backend::{Launch, SandboxContext, WrapError, environment, under_limits};
+use super::holder::join_args;
+use crate::backend::environment::{self, Loopback};
+use crate::backend::{Launch, SandboxContext, WrapError, under_limits};
 use crate::policy::paths::is_within;
 use arguments::arguments;
 pub(super) use host::{Host, read_host};
@@ -51,10 +54,13 @@ pub(super) struct Programs<'a> {
     pub enclos: &'a Path,
 }
 
-/// The command that runs `launch` under bubblewrap: `enclos inside` first,
-/// in the sandbox's environment, which bubblewrap passes on as it is given.
-/// It is set on bubblewrap's own process, never with `--setenv`, so no
-/// secret is ever on a command line another process can read.
+/// The command that runs `launch` under bubblewrap, in the sandbox's network
+/// namespace: `enclos holder join` enters the namespace holder's user and
+/// network namespaces (ADR 0039), then becomes bubblewrap, which makes the
+/// session's own namespaces inside them and runs `enclos inside` first. The
+/// sandbox's environment is set on the first process, which passes it on as
+/// it is given, never with `--setenv`, so no secret is ever on a command
+/// line another process can read.
 pub(super) fn command(
     programs: &Programs<'_>,
     compiled_path: &Path,
@@ -76,38 +82,41 @@ pub(super) fn command(
         )));
     }
     staged_only(&ctx.installers, &launch.reads)?;
-    let mut bwrap = Command::new(programs.bwrap);
-    bwrap
+    let mut session = Command::new(enclos);
+    session
+        .args(join_args(&ctx.holder_socket))
+        .arg(programs.bwrap)
         .args(arguments(compiled, host, &launch.reads))
         .arg(enclos)
         .args(["inside", "--compiled"])
         .arg(compiled_path);
     if launch.in_terminal {
-        bwrap.arg(super::INTERRUPTS_FLAG);
+        session.arg(super::INTERRUPTS_FLAG);
     }
-    bwrap.arg("--").arg(&launch.program).args(&launch.args);
+    session.arg("--").arg(&launch.program).args(&launch.args);
     let command = match launch.in_terminal {
-        true => out_of_reach_of_interrupts(bwrap),
-        false => bwrap,
+        true => out_of_reach_of_interrupts(session),
+        false => session,
     };
     let mut command = under_limits(command, &launch.limits);
-    environment::apply(&mut command, ctx, launch);
+    environment::apply(&mut command, ctx, launch, Loopback::Own);
     command.current_dir(&ctx.home);
     Ok(command)
 }
 
-/// Runs `bwrap` under `sh` with SIGINT and SIGQUIT ignored: bubblewrap's
-/// outer process is in the terminal's foreground group, and Ctrl-C ending
-/// it would end the session through `--die-with-parent`. `enclos inside
-/// --restore-interrupts` gives both back to the command (design §5).
-/// `/bin/sh` reads no startup file when it runs a command, and none of the
-/// sandbox's variables can name a function.
-fn out_of_reach_of_interrupts(bwrap: Command) -> Command {
+/// Runs `session` under `sh` with SIGINT and SIGQUIT ignored, as they stay
+/// through each `exec` up to bubblewrap: its outer process is in the
+/// terminal's foreground group, and Ctrl-C ending it would end the session
+/// through `--die-with-parent`. `enclos inside --restore-interrupts` gives
+/// both back to the command (design §5). `/bin/sh` reads no startup file
+/// when it runs a command, and none of the sandbox's variables can name a
+/// function.
+fn out_of_reach_of_interrupts(session: Command) -> Command {
     let mut sh = Command::new("/bin/sh");
     sh.arg("-c")
         .arg("trap '' INT QUIT; exec \"$0\" \"$@\"")
-        .arg(bwrap.get_program())
-        .args(bwrap.get_args());
+        .arg(session.get_program())
+        .args(session.get_args());
     sh
 }
 

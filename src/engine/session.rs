@@ -606,6 +606,15 @@ impl Engine {
                 record.proxy_port
             ));
         }
+        let holder = super::service::Unit::Holder;
+        if !starts_services
+            && self.holder_of(record.backend).is_some()
+            && !self.unit_installed(name, holder)?
+        {
+            changes.push(format!(
+                "start the namespace holder of sandbox {name}, whose network namespace its sessions join; it runs until `enclos sandbox stop {name}`"
+            ));
+        }
         let shown = command
             .iter()
             .map(|w| w.to_string_lossy())

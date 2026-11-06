@@ -32,10 +32,11 @@ pub enum Output {
 
 /// The commands, by their word, whose stdout is not enclos's to fill with a
 /// document: the program's they run (`connect`, `exec`, the hidden
-/// `launch` and `inside`), the services' logs (`logs`), or a long-running
+/// `launch` and `inside`, and the hidden `holder`, whose `join` becomes a
+/// session's bubblewrap), the services' logs (`logs`), or a long-running
 /// command's own log (the hidden `proxy` and `relay`).
-pub const RUNS_A_PROGRAM: [&str; 7] = [
-    "connect", "exec", "logs", "launch", "inside", "proxy", "relay",
+pub const RUNS_A_PROGRAM: [&str; 8] = [
+    "connect", "exec", "logs", "launch", "inside", "holder", "proxy", "relay",
 ];
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();

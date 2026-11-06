@@ -49,6 +49,26 @@ pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersEr
     host::tcp_listeners_at(port)
 }
 
+/// The TCP addresses `pid` listens on in the network namespace of
+/// `namespace`, a process in it. From `/proc`: only Linux gives a sandbox a
+/// network namespace of its own (ADR 0039).
+pub fn tcp_listeners_in(namespace: u32, pid: u32) -> Result<Vec<SocketAddr>, ListenersError> {
+    Ok(super::proc::tcp_listeners_in(namespace, &[pid])?
+        .into_iter()
+        .map(|(_, addr)| addr)
+        .collect())
+}
+
+/// Every process, of those `/proc` can show, that listens on TCP at
+/// 127.0.0.1 port `port` in the network namespace of `namespace`, a process
+/// in it, with the address it holds.
+pub fn tcp_listeners_at_in(
+    namespace: u32,
+    port: u16,
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    super::proc::tcp_listeners_at_in(namespace, port)
+}
+
 /// The ports the system picks from for a bind on port 0, as `sysctl` gives
 /// them on macOS and `/proc` on Linux; why not, when it cannot say.
 pub fn ephemeral_ports() -> Result<RangeInclusive<u16>, String> {

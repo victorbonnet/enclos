@@ -71,22 +71,21 @@ pub(super) struct Session<'a> {
     pub(super) restore_interrupts: bool,
 }
 
-impl SessionSteps for Running<Session<'_>> {
-    fn start_relay(&mut self) -> Result<(), InsideError> {
-        self.prepared.start_relay()
-    }
-
+impl SessionSteps for Running<'_> {
     /// Runs the command as a child, not by `exec`: as PID 1 it would ignore
     /// every signal it has no handler for, Ctrl-C included. First makes this
     /// process not dumpable, so no member can attach to it, then reaps every
-    /// orphan until the command ends.
+    /// orphan until the command ends. The command is the first process this
+    /// one starts, so it is PID 2 of the session's PID namespace, which is
+    /// how the host tells a service's program from what it started
+    /// (`lifecycle::proc::program_in_pid_namespace`).
     fn run_command(&mut self) -> Result<u8, InsideError> {
-        let Some((program, args)) = self.then.command.split_first() else {
+        let Some((program, args)) = self.session.command.split_first() else {
             return Err(InsideError::NoCommand);
         };
         rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
             .map_err(|e| InsideError::NotDumpable(e.into()))?;
-        if self.then.restore_interrupts {
+        if self.session.restore_interrupts {
             hand_back_interrupts()?;
         }
         let child =

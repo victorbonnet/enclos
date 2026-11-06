@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
-use super::listener::{NoPort, outside_proxy_range, service_listener};
+use super::listener::{Network, NoPort, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -140,6 +140,9 @@ impl Engine {
             .transpose()?;
         let network_listeners = network_listeners(&look, &running);
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
+            // The host does not reach a listener in the sandbox's own
+            // network namespace (ADR 0039, ADR 0040).
+            Some(_) if self.holder_of(record.backend).is_some() => Fact::NotProvided,
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
@@ -292,7 +295,7 @@ fn dashboard(
     if !runs {
         return Fact::Absent;
     }
-    match service_listener(store, name, service).and_then(outside_proxy_range) {
+    match service_listener(store, name, service, &Network::Host) {
         Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
         Err(NoPort::NotRunning(_)) => Fact::Absent,
         Err(why) => Fact::CannotTell(why.to_string()),

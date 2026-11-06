@@ -1,8 +1,11 @@
 //! The bubblewrap backend: Linux's sandbox (ADR 0004). It compiles a policy
 //! to one file, `wrap` runs `enclos inside` under bubblewrap with the masks
-//! the host holds at launch, and `enclos inside` applies the rest.
+//! the host holds at launch, and `enclos inside` applies the rest. Every
+//! session joins the network namespace of the sandbox's namespace holder
+//! first (ADR 0039).
 
 pub mod compile;
+pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod inside;
 mod probe;
@@ -15,7 +18,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use super::{
-    Backend, Capabilities, CompileError, Compiled, Launch, Probe, SandboxContext, WrapError,
+    Backend, Capabilities, CompileError, Compiled, HeldNamespace, Launch, NamespaceHolder, Probe,
+    SandboxContext, WrapError,
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
@@ -144,5 +148,38 @@ impl Backend for Bubblewrap {
             "cannot be tested yet: the bubblewrap backend's escape probes are not in this build"
                 .to_owned(),
         )
+    }
+
+    /// Every session joins it (ADR 0039).
+    fn namespace_holder(&self) -> Option<&dyn NamespaceHolder> {
+        Some(self)
+    }
+}
+
+impl NamespaceHolder for Bubblewrap {
+    #[cfg(target_os = "linux")]
+    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError> {
+        let enclos = self.enclos.as_deref().ok_or_else(|| {
+            WrapError("cannot find the enclos program, which runs the namespace holder".to_owned())
+        })?;
+        holder::command(&self.bwrap, enclos, ctx)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ask(&self, ctx: &SandboxContext) -> Result<HeldNamespace, String> {
+        holder::ask(&ctx.holder_socket).map(|answer| HeldNamespace {
+            pid: answer.pid,
+            ephemeral: answer.ephemeral,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn command(&self, _ctx: &SandboxContext) -> Result<Command, WrapError> {
+        Err(WrapError("the namespace holder runs on Linux".to_owned()))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn ask(&self, _ctx: &SandboxContext) -> Result<HeldNamespace, String> {
+        Err("the namespace holder runs on Linux".to_owned())
     }
 }

@@ -1,5 +1,4 @@
 use super::*;
-use std::time::Duration;
 
 /// Records what is called and fails where it is told to: nothing here is
 /// applied to any process.
@@ -37,49 +36,27 @@ impl Confine for Recorded {
 }
 
 impl SessionSteps for Recorded {
-    fn start_relay(&mut self) -> Result<(), InsideError> {
-        self.step("relay")
-    }
-
     fn run_command(&mut self) -> Result<u8, InsideError> {
         self.calls.push("command");
         Ok(0)
     }
 }
 
-impl RelaySteps for Recorded {
-    fn say_ready(&mut self) -> Result<(), InsideError> {
-        self.step("ready")
-    }
-
-    fn serve(&mut self) -> InsideError {
-        self.calls.push("serve");
-        InsideError::NoCommand
-    }
-}
-
-/// The relay is a program of its own, which Landlock's execute rules would
-/// refuse from an enclos under the user's home: it starts before them.
+/// The session starts nothing before it is confined: the relay to the proxy
+/// is the namespace holder's (ADR 0039), so the command is the first process
+/// it starts.
 #[test]
-fn the_relay_starts_before_the_rules_and_the_command_after_them() {
+fn the_rules_apply_before_the_command() {
     let mut steps = Recorded::default();
     assert_eq!(in_session(&mut steps).unwrap(), 0);
-    assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
-}
-
-#[test]
-fn the_relay_is_confined_before_it_says_ready_and_serves() {
-    let mut steps = Recorded::default();
-    as_relay(&mut steps);
-    assert_eq!(steps.calls, ["landlock", "seccomp", "ready", "serve"]);
+    assert_eq!(steps.calls, ["landlock", "seccomp", "command"]);
 }
 
 #[test]
 fn no_command_runs_once_a_step_has_failed() {
     for (fails, reached) in [
-        ("relay", &["relay"][..]),
-        ("landlock", &["relay", "landlock"]),
-        ("seccomp", &["relay", "landlock", "seccomp"]),
+        ("landlock", &["landlock"][..]),
+        ("seccomp", &["landlock", "seccomp"]),
     ] {
         let mut steps = Recorded {
             fails: Some(fails),
@@ -91,49 +68,6 @@ fn no_command_runs_once_a_step_has_failed() {
     }
 }
 
-#[test]
-fn a_relay_that_failed_to_confine_itself_never_serves() {
-    for fails in ["landlock", "seccomp", "ready"] {
-        let mut steps = Recorded {
-            fails: Some(fails),
-            ..Recorded::default()
-        };
-        as_relay(&mut steps);
-        assert!(!steps.calls.contains(&"serve"), "{fails}");
-    }
-}
-
-#[test]
-fn a_relay_waits_until_its_parent_has_changed() {
-    let looks = std::cell::Cell::new(0);
-    let now = || {
-        looks.set(looks.get() + 1);
-        match looks.get() {
-            1 | 2 => 7,
-            _ => 1,
-        }
-    };
-    wait_for_new_parent(7, now, Duration::ZERO);
-    assert_eq!(looks.get(), 3);
-}
-
-#[test]
-fn a_relays_last_line_says_why_it_stopped() {
-    let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("relay.log");
-    std::fs::write(&log, "enclos: a notice\nerror: Landlock: refused\n\n").unwrap();
-    assert_eq!(last_line(&log), "Landlock: refused");
-}
-
-#[test]
-fn a_relay_that_left_no_log_or_an_empty_one_is_said_to_have_left_no_word() {
-    let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("relay.log");
-    assert!(last_line(&log).contains("no word"));
-    std::fs::write(&log, "").unwrap();
-    assert!(last_line(&log).contains("no word"));
-}
-
 /// ADR 0037: seccomp's filter is the same, and the command runs.
 #[test]
 fn no_landlock_is_reported_and_the_session_goes_on() {
@@ -142,7 +76,7 @@ fn no_landlock_is_reported_and_the_session_goes_on() {
         ..Recorded::default()
     };
     assert_eq!(in_session(&mut steps).unwrap(), 0);
-    assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
+    assert_eq!(steps.calls, ["landlock", "seccomp", "command"]);
     assert_eq!(steps.said.len(), 1);
     assert!(steps.said[0].contains("no Landlock"), "{:?}", steps.said);
 }
@@ -180,8 +114,6 @@ fn what_compile_writes_is_what_is_read() {
     let file = dir.path().join("compiled.json");
     std::fs::write(&file, &text).unwrap();
     let prepared = Prepared::read(&file).unwrap();
-    assert_eq!(prepared.compiled.relay.log, "/tmp/enclos-relay.log");
-    assert_eq!(prepared.compiled.relay.port, 41001);
     assert!(prepared.grants.iter().any(|g| g.path == "/dev"));
     assert!(!prepared.programs.is_empty());
 }

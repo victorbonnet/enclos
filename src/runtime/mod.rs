@@ -474,10 +474,27 @@ pub struct RuntimeListener {
 
 /// A runtime's name for one of its services, stable across versions, as it
 /// names the service's label and log: the short-name rule, and never
-/// `proxy`, the sandbox's own service. Made in code, as a constant, so a
-/// name that breaks the rule does not compile.
+/// `proxy` or `holder`, the sandbox's own services. Made in code, as a
+/// constant, so a name that breaks the rule does not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceName(&'static str);
+
+/// Whether `a` and `b` are the same text, in a `const fn`, which has no
+/// string comparison.
+const fn same_bytes(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 impl ServiceName {
     pub const fn new(name: &'static str) -> ServiceName {
@@ -485,16 +502,13 @@ impl ServiceName {
             crate::model::sandbox::is_short_name(name),
             "a service name is a short name: a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
         );
-        // `const` has no string comparison; the bytes of "proxy".
-        let b = name.as_bytes();
         assert!(
-            !(b.len() == 5
-                && b[0] == b'p'
-                && b[1] == b'r'
-                && b[2] == b'o'
-                && b[3] == b'x'
-                && b[4] == b'y'),
+            !same_bytes(name, "proxy"),
             "`proxy` is the sandbox's own service, not a runtime's"
+        );
+        assert!(
+            !same_bytes(name, "holder"),
+            "`holder` is the sandbox's own service, its namespace holder (ADR 0039), not a runtime's"
         );
         ServiceName(name)
     }
@@ -541,6 +555,18 @@ mod tests {
     #[should_panic(expected = "sandbox's own service")]
     fn a_service_named_proxy_is_refused() {
         ServiceName::new("proxy");
+    }
+
+    #[test]
+    #[should_panic(expected = "its namespace holder")]
+    fn a_service_named_holder_is_refused() {
+        ServiceName::new("holder");
+    }
+
+    #[test]
+    fn a_name_that_only_starts_like_the_sandboxs_own_is_a_runtimes() {
+        assert_eq!(ServiceName::new("holders").as_str(), "holders");
+        assert_eq!(ServiceName::new("proxys").as_str(), "proxys");
     }
 
     #[test]

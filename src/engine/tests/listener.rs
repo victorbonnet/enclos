@@ -1,6 +1,6 @@
 use super::policy::with_sandbox;
 use super::*;
-use crate::engine::listener::{NoPort, outside_proxy_range, service_listener};
+use crate::engine::listener::{Network, NoPort, outside_proxy_range, service_listener};
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
@@ -140,7 +140,7 @@ fn the_service_port_is_the_one_its_own_process_holds() {
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
@@ -153,7 +153,7 @@ fn two_open_gateway_sessions_get_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (one, _) = gateway(&engine, &name, 1);
     let (two, _) = gateway(&engine, &name, 1);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(one);
     end(two);
     assert!(
@@ -173,7 +173,7 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
         started: "Thu Jan  1 00:00:00 1970".to_owned(),
     };
     record_gateway(&engine, &name, root);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     assert!(
         matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
         "{got:?}"
@@ -190,7 +190,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&child).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(child);
     assert!(
         matches!(&got, Err(NoPort::NotYet(why)) if why.contains("no TCP listener at 127.0.0.1")),
@@ -220,7 +220,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&owner).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(owner);
     end(other);
     let why = got.unwrap_err();

@@ -535,12 +535,19 @@ impl Engine {
         // installed while not recorded running.
         let installed = self.installed_labels(name)?;
         let expected = self.service_labels(name)?;
+        // A namespace holder is installed alone by a sandbox's first session,
+        // and again by the next when it is missing (ADR 0039).
+        let holder = self.label(name, super::service::Unit::Holder)?;
         let missing: Vec<String> = expected
             .iter()
-            .filter(|l| !installed.contains(l))
+            .filter(|l| **l != holder && !installed.contains(l))
             .map(ToString::to_string)
             .collect();
-        if installed.iter().any(|l| expected.contains(l)) && !missing.is_empty() {
+        if installed
+            .iter()
+            .any(|l| *l != holder && expected.contains(l))
+            && !missing.is_empty()
+        {
             let what = match missing.as_slice() {
                 [one] => format!(
                     "its service {one} is not installed while its others are, as when its launchd job was removed by hand"
