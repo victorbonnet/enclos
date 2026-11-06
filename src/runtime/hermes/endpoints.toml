@@ -33,8 +33,11 @@ allow_add = [
     # Installer: Node and npm packages
     "nodejs.org",
     "registry.npmjs.org",
-    # Installer: the browser tools and media helpers
+    # Installer: the browser tools and media helpers. On arm64 Linux the
+    # browser is Playwright's Chromium build, from its own host, where
+    # elsewhere it is Chrome for Testing, from storage.googleapis.com.
     "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
     "storage.googleapis.com",
     "ffmpeg.martin-riedl.de",
 ]

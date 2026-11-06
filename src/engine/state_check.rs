@@ -13,14 +13,13 @@ use super::Engine;
 use super::printable_line;
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::host::{program_files, program_name};
 use crate::lifecycle::look::Look;
 use crate::lifecycle::marker::{MarkerError, holders, is_held};
 use crate::lifecycle::process::{Proc, processes};
-use crate::lifecycle::programs::{lsof_name, program_files};
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionId;
-use crate::service::ServiceStatus;
 use crate::state::{StateError, StateLock, UnreadableRecord};
 
 /// Something enclos's records say that the host does not, or the reverse.
@@ -86,7 +85,7 @@ impl Remedy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repair(Fix);
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl Repair {
     /// Recording the end of `ids`, as a repair would, for a test of what
     /// it looks at before it does.
@@ -124,15 +123,15 @@ impl fmt::Display for Repair {
 /// What the host runs, listed once and shared by every sandbox looked at.
 struct Host {
     procs: Vec<Proc>,
-    /// As `lsof` writes their names: see [`lsof_name`].
+    /// As the host writes their names: see [`program_name`].
     programs: BTreeMap<u32, Vec<String>>,
 }
 
 impl Host {
-    /// Program files first: a process listed there and not by `ps` after is
-    /// one that ended between the two, not one that left its session, which
-    /// ran before either. With no sandbox, nothing is listed: no process can
-    /// be one's.
+    /// Program files first: a process listed there and not in the listing
+    /// of processes after is one that ended between the two, not one that
+    /// left its session, which ran before either. With no sandbox, nothing
+    /// is listed: no process can be one's.
     fn list(sandboxes: usize) -> Result<Host> {
         if sandboxes == 0 {
             return Ok(Host {
@@ -506,7 +505,7 @@ impl Engine {
                 path: dir.clone(),
                 source,
             })?;
-            let inside = format!("{}/", lsof_name(&real));
+            let inside = format!("{}/", program_name(&real));
             for (pid, files) in &host.programs {
                 let Some(file) = files.iter().find(|f| f.starts_with(&inside)) else {
                     continue;
@@ -531,8 +530,9 @@ impl Engine {
             }
         }
         // Services: some installed and others not, as after one's launchd
-        // job was removed by hand; one installed that enclos no longer runs;
-        // installed while not recorded running.
+        // job or systemd unit was removed by hand; one installed that enclos
+        // no longer runs; installed while not recorded running.
+        let words = self.services.hand_stop();
         let installed = self.installed_labels(name)?;
         let expected = self.service_labels(name)?;
         // A namespace holder is installed alone by a sandbox's first session,
@@ -550,11 +550,13 @@ impl Engine {
         {
             let what = match missing.as_slice() {
                 [one] => format!(
-                    "its service {one} is not installed while its others are, as when its launchd job was removed by hand"
+                    "its service {one} is not installed while its others are, as when its {} was removed by hand",
+                    words.unit
                 ),
                 more => format!(
-                    "its services {} are not installed while its others are, as when their launchd jobs were removed by hand",
-                    more.join(", ")
+                    "its services {} are not installed while its others are, as when their {}s were removed by hand",
+                    more.join(", "),
+                    words.unit
                 ),
             };
             push(
@@ -564,10 +566,10 @@ impl Engine {
                 )),
             );
         }
-        // A service whose launchd job file is there but that launchd has
-        // not loaded, as after `launchctl bootout`: it does not run until
-        // the next login loads it. Only for a sandbox recorded running: one
-        // recorded otherwise is named below for its services installed
+        // A service whose unit file is there but that does not run and will
+        // not on its own until the next login, as after `launchctl bootout`
+        // or `systemctl --user stop`. Only for a sandbox recorded running:
+        // one recorded otherwise is named below for its services installed
         // while it is not running.
         let mut unloaded = Vec::new();
         let asked: Vec<_> = installed.iter().filter(|l| expected.contains(l)).collect();
@@ -576,7 +578,7 @@ impl Engine {
             // each status with an exit code.
             self.services.available()?;
             for label in asked {
-                if self.services.status(label)? == ServiceStatus::NotLoaded {
+                if self.services.stopped_by_hand(label)? {
                     unloaded.push(label.to_string());
                 }
             }
@@ -584,17 +586,23 @@ impl Engine {
         if !unloaded.is_empty() {
             let what = match unloaded.as_slice() {
                 [one] => format!(
-                    "its service {one} is installed and not loaded, as when its launchd job was unloaded by hand: it does not run until the next login"
+                    "its service {one} is installed and {}, as when its {} was {}: it does not run until {}",
+                    words.state, words.unit, words.how, words.until
                 ),
                 more => format!(
-                    "its services {} are installed and not loaded, as when their launchd jobs were unloaded by hand: they do not run until the next login",
-                    more.join(", ")
+                    "its services {} are installed and {}, as when their {}s were {}: they do not run until {}",
+                    more.join(", "),
+                    words.state,
+                    words.unit,
+                    words.how,
+                    words.until
                 ),
             };
             push(
                 what,
                 Remedy::Manual(format!(
-                    "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, loads every service again; while a `sandbox stop` or `sandbox start` of it runs, which removes its services first, check again once it is done"
+                    "`enclos sandbox stop {name}`, then `enclos sandbox start {name}`, {} every service again; while a `sandbox stop` or `sandbox start` of it runs, which removes its services first, check again once it is done",
+                    words.again
                 )),
             );
         }

@@ -80,7 +80,7 @@ enclos audit | grep -i runtime
 enclos doctor
 ```
 
-- [ ] The dry run lists the 13 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
+- [ ] The dry run lists the 14 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
 - [ ] The install ends `Hermes is installed in sandbox lab (policy v2)`; `enclos audit` has `runtime installer lab` and `runtime installed lab hermes`, and the installer's SHA-256 is in the first one's summary.
 - [ ] Setup runs in your terminal. When the login shows a URL and a code, open the URL in your browser on the Mac and enter the code. Skip Hermes's own messaging setup: a token Hermes writes to `~/.hermes/.env` makes `runtime configure` refuse (§9).
 - [ ] `doctor` says `lab`'s next session compiles policy v2, and exits 0.
@@ -449,7 +449,7 @@ rm -rf "$ENCLOS_HOME" ~/enclos-e2e-work; unset ENCLOS_HOME
 
 ## 16. On Linux
 
-Run the guide on Linux too, on each kind of host a release supports that you have: an x86_64 desktop on Ubuntu 24.04 or later, and a Raspberry Pi on 64-bit Raspberry Pi OS (Debian 13) reached over ssh. The steps are the same, with the changes below; what a step shows only on a Mac (launchd, the Keychain, `pbpaste`, folders TCC guards) is checked here through systemd, libsecret or the secrets file, and bubblewrap instead. Hermes on Linux is still in progress (design §13, milestone 3): until it lands, a `runtime install` that fails there is not a finding, and the steps that need Hermes (3, 4, the agents in 5, 9, and the gateway in 10) wait for it.
+Run the guide on Linux too, on each kind of host a release supports that you have: an x86_64 desktop on Ubuntu 24.04 or later, and a Raspberry Pi on 64-bit Raspberry Pi OS (Debian 13) reached over ssh. The steps are the same, with the changes below; what a step shows only on a Mac (launchd, the Keychain, `pbpaste`, folders TCC guards) is checked here through systemd, libsecret or the secrets file, and bubblewrap instead.
 
 ### Before you start
 
@@ -522,6 +522,20 @@ ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
 - [ ] `start` installs a unit for each service `show` lists, named `<its label>.service`, in `~/.config/systemd/user` (or `$XDG_CONFIG_HOME/systemd/user`), and `list-units` shows each active.
 - [ ] The proxy killed from outside comes back within a few seconds under a new pid: a unit restarts on failure, never after it exits 0.
 - [ ] `stop` ends every session and leaves no unit of this home installed or loaded.
+
+### 11: state check against systemd units
+
+The first part of step 11 runs as written. Then, with `lab` started, stop its gateway's unit by hand, as `launchctl bootout` unloads it on a Mac:
+
+```bash
+systemctl --user stop 'enclos.<8 hex>.lab.gateway.service'
+enclos state check lab; echo "exit $?"
+enclos --dry-run state repair lab; echo "exit $?"
+enclos sandbox stop lab && enclos sandbox start lab
+enclos state check lab
+```
+
+- [ ] The check says the gateway is installed and stopped, as when its systemd unit was stopped by hand, that it does not run until your user's systemd starts again, and that `sandbox stop` then `sandbox start` starts every service again (exit 1); the dry run names the same, as left for you (exit 1); after stop and start, the records match (exit 0).
 
 ### 14: isolation spot checks
 
