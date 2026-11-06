@@ -49,6 +49,7 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
 | `conversation.rename` | bridge | `conversation`, `title` (empty: no name) | The person named the conversation, or cleared its name |
 | `tool` | plugin | `conversation`, `call` (the runtime's id of the call), `name`, `phase` (`start` or `end`), `label`? (at the start: what it does, one line), `ok`? and `duration_ms`? (at the end) | A tool the agent starts or ends while it works on an answer |
+| `commands` | plugin | `commands`: `[{name, description, args?}]` (`name` without its `/`; `args` what follows it, as the runtime writes it: `[name]`, `<prompt>`) | The commands a person may type to the runtime, the whole list: after the `hello`, and again when it changes |
 | `ack` | either | `of` (the acknowledged `id`) | Received and stored |
 | `error` | either | `of`?, `code`, `message` | See [Errors](#errors) |
 
@@ -122,6 +123,7 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `attachment.data` | bridge | `attachment`, `offset`, `size` (the file's), `data` (base64url, at most 45,000 bytes) | One part of it: a Noise message holds 64 KiB. A device asks for the next `offset` until it has `size` |
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
 | `tool` | bridge | as on the plugin leg | A tool the agent starts or ends, live; not kept, not synced |
+| `commands` | bridge | `agent`, `commands` (as on the plugin leg) | An agent's commands, for the person to pick from as they type `/`: after `agents.list`, one for each agent whose plugin listed them, and again when a plugin lists them anew |
 | `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, then every `message` of them after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
@@ -131,6 +133,8 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `ack`, `error` | either | as on the plugin leg | |
 
 `seq` is the bridge's, increasing per host, so one number lets a device catch up after being away.
+
+**An agent's commands** are the runtime's, which the bridge passes on without running or checking them: a command is a message like any other, sent with `message.send`. The bridge keeps the last list of each agent while it runs and gives a device each name once (lower case letters, digits, `_` and `-`, at most 32), each description on one line of at most 120 characters and `args` of at most 60, in the plugin's order until they fill 60,000 bytes, so the message fits a Noise message. When a device asks for the agents, the bridge also opens the plugin connections not yet open, so it learns the commands without waiting for a first message.
 
 **How far a conversation was read** is the bridge's too, not the runtime's: the agent does not see what the person reads in the app. A device sends `conversation.read` when the person opens the conversation or reads a message arriving in it; the bridge keeps the highest `seq`, from the conversation's owner only and never past its newest message, and sends the `conversation` again to all of the person's devices. A device that syncs, a new one or one that was away, so counts as unread only the agent's messages after `read`.
 
@@ -158,8 +162,9 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `abort` | It can stop an answer; reserved, no messages in version 1 |
 | `titles` | It names conversations (`conversation.title`) and keeps the person's names |
 | `tools` | It reports the tools it runs while it works (`tool`) |
+| `commands` | It lists the commands a person may type to it (`commands`) |
 
-Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin also has `titles` and `tools`. A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
+Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 
 ## Errors
 
