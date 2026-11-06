@@ -208,7 +208,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 19 passed' bubblewrap.log
+          grep -q 'test result: ok\. 20 passed' bubblewrap.log
       - name: The escape probes' report
         if: always()
         run: |

@@ -3,6 +3,7 @@
 pub mod bounded;
 pub mod cgroup;
 pub mod descriptors;
+pub mod inherited;
 pub mod listeners;
 pub mod look;
 pub mod lsof;
