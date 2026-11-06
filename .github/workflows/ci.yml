@@ -208,6 +208,12 @@ jobs:
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
           grep -q 'test result: ok\. 14 passed' bubblewrap.log
+      # Adds a second user to the runner, whose connections it must close.
+      - name: enclos dashboard, a second user and Ctrl-C
+        shell: bash
+        run: |
+          cargo test --locked --all-features --test dashboard on_a_runner | tee dashboard.log
+          grep -q 'test result: ok\. 1 passed' dashboard.log
 
   libsecret:
     strategy:
@@ -332,6 +338,13 @@ jobs:
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' bubblewrap.log
+      - name: enclos dashboard, a second user and Ctrl-C
+        shell: bash
+        env:
+          ENCLOS_BUBBLEWRAP_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --test dashboard on_a_runner | tee dashboard.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' dashboard.log
       - name: Scopes in the runner's user manager
         shell: bash
         env:
