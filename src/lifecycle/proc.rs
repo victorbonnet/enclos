@@ -1,10 +1,13 @@
 //! How enclos looks at processes on Linux: from `/proc`, with no `unsafe`
-//! code (ADR 0012). Markers' holders and listeners come from each process's
-//! descriptors (`descriptors`) and network tables (`net`), the ephemeral
-//! ports from `ip_local_port_range`. `lsof` gives the same on macOS;
-//! `lifecycle` picks one of the two as `host`.
+//! code (ADR 0012). Processes come from their `stat` (`processes`), the files
+//! they map from `exe` and `maps` (`programs`), markers' holders and
+//! listeners from each process's descriptors (`descriptors`) and network
+//! tables (`net`), the ephemeral ports from `ip_local_port_range`. `ps` and
+//! `lsof` give the same on macOS; `lifecycle` picks one of the two as `host`.
 
 mod net;
+mod processes;
+mod programs;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -14,6 +17,35 @@ use std::path::{Path, PathBuf};
 use super::descriptors::{self, Descriptors, PROC};
 use super::listeners::ListenersError;
 use super::marker::{Held, MarkerError};
+use super::process::{Proc, PsError, Seen};
+use super::programs::ProgramsError;
+
+pub use programs::program_name;
+
+/// Every running process but zombies.
+pub fn processes() -> Result<Vec<Proc>, PsError> {
+    processes::processes_under(Path::new(PROC), rustix::param::clock_ticks_per_second())
+}
+
+/// Whether `pid` is a zombie and when it started, or `None` when it is gone.
+pub fn seen(pid: u32) -> Result<Option<Seen>, PsError> {
+    processes::seen_under(
+        Path::new(PROC),
+        pid,
+        rustix::param::clock_ticks_per_second(),
+    )
+}
+
+/// The process group of `pid`, or `None` when it is gone.
+pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
+    processes::group_under(Path::new(PROC), pid)
+}
+
+/// The executable and mapped files of each process this user can read, by
+/// pid, each named as [`program_name`] writes a path.
+pub fn program_files() -> Result<BTreeMap<u32, Vec<String>>, ProgramsError> {
+    programs::program_files_under(Path::new(PROC))
+}
 
 /// The TCP addresses each of `pids` listens on, with the pid that holds it,
 /// each read in its own network namespace.

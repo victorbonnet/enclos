@@ -1,4 +1,5 @@
-//! How enclos looks at processes on macOS: `/usr/sbin/lsof` for markers'
+//! How enclos looks at processes on macOS: `/bin/ps` for the processes
+//! (`ps`), `/usr/sbin/lsof` for the files they map (`programs`), markers'
 //! holders and listeners, `/usr/sbin/sysctl` for the ephemeral ports. `proc`
 //! gives the same on Linux; `lifecycle` picks one of the two as `host`.
 
@@ -8,6 +9,9 @@ use std::process::{Command, Output, Stdio};
 
 use super::listeners::ListenersError;
 use super::marker::{Held, MarkerError};
+
+pub use super::programs::{lsof_name as program_name, program_files};
+pub use super::ps::{group_of, processes, seen};
 
 /// The TCP addresses each of `pids` listens on, with the pid that holds it.
 pub fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {

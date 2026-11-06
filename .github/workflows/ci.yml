@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --lib service::systemd::tests::on_a_runner | tee units.log
-          grep -q 'test result: ok\. 10 passed' units.log
+          grep -q 'test result: ok\. 11 passed' units.log
 
   cgroups:
     strategy:
@@ -208,7 +208,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 19 passed' bubblewrap.log
+          grep -q 'test result: ok\. 20 passed' bubblewrap.log
       - name: The escape probes' report
         if: always()
         run: |

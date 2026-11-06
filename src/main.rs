@@ -116,6 +116,9 @@ fn main() -> ExitCode {
         Ok(parsed) => parsed,
         Err(err) => return usage_error(&err),
     };
+    if !passes_on_what_it_inherited(&cli.command) {
+        enclos::lifecycle::inherited::pass_on_none();
+    }
     cli::output::choose(&name, cli.json, cli.text);
     // The library's notes, said as this command says its own.
     enclos::notes::send_to(cli::output::note);
@@ -349,6 +352,18 @@ fn run(cli: Cli) -> Result<u8> {
 /// `exec`, `inside`, `runtime`, and the `agent` verbs but `list`), keep running
 /// (`proxy`, `relay`, `holder`, `launch`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
+/// Whether `command` passes on to what it starts the descriptors it
+/// inherited: only those that start a session's program, whose descriptors
+/// are enclos's own, the session's marker among them. Every other command
+/// passes on its standard streams alone (`lifecycle::inherited`).
+fn passes_on_what_it_inherited(command: &Command) -> bool {
+    match command {
+        Command::Inside(_) => true,
+        Command::Holder(args) => args.joins(),
+        _ => false,
+    }
+}
+
 fn ends_on_closed_output(command: &Command) -> bool {
     match command {
         Command::Init
