@@ -62,6 +62,10 @@ impl SqliteStateStore {
         conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(self.sqlite_err())?;
+        // `init` puts the database in WAL mode, where a commit need not flush
+        // the disk: a power loss can lose the last commits, never corrupt it.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(self.sqlite_err())?;
         Ok(conn)
     }
 
@@ -272,6 +276,11 @@ impl StateStore for SqliteStateStore {
             self.connect(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
         std::fs::set_permissions(&self.db, std::fs::Permissions::from_mode(0o600))
             .map_err(io_err(&self.db))?;
+        // WAL: a read never waits for a write, so the proxy's read of the
+        // policy is not held up by other commands' writes on a slow disk.
+        // Kept in the file; a file system without it keeps the old mode.
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+            .map_err(self.sqlite_err())?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(self.sqlite_err())?;
