@@ -8,8 +8,6 @@ pub mod listeners;
 pub mod look;
 pub mod lsof;
 pub mod marker;
-#[cfg(test)]
-mod marker_race_scratch;
 pub mod members;
 pub mod proc;
 pub mod process;
