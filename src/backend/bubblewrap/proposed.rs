@@ -75,23 +75,23 @@ pub struct Host {
 }
 
 /// What the backend is built to enforce on `host` (design §5's table): a
-/// declaration the escape probes have yet to show, so nothing reads as
-/// enforced. Landlock missing or too old weakens the file and program rows
-/// (ADR 0037); an older ABI's rights still apply. `listen = false` is not
-/// held (ADR 0041). No limit is set yet, a memory limit included (ADR
-/// 0038).
+/// declaration, so nothing reads as enforced; `enclos policy test`'s escape
+/// probes show what holds on the host it runs on. Landlock missing or too
+/// old weakens the file and program rows (ADR 0037); an older ABI's rights
+/// still apply. `listen = false` is not held (ADR 0041). No limit is set
+/// yet, a memory limit included (ADR 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
     let (fs, exec) = match host.landlock_abi {
         Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
-            "the mounts and Landlock, not yet shown by the escape probes",
+            "the mounts and Landlock, which `enclos policy test` probes",
             "programs that are mounted, and Landlock's execute rules",
         ),
         Some(_) => (
-            "the mounts, and what this ABI has of Landlock, not yet shown by the escape probes",
+            "the mounts, and what this ABI has of Landlock, which `enclos policy test` probes",
             "programs that are mounted; execute rules on an older ABI are open",
         ),
         None => (
-            "writes held by the mounts alone, with no second layer, not yet shown by the escape probes",
+            "writes held by the mounts alone, with no second layer, which `enclos policy test` probes",
             "any program that is mounted: no Landlock execute rules",
         ),
     };
@@ -103,7 +103,7 @@ pub fn capabilities(host: &Host) -> Capabilities {
         network: partial("through the proxy; `listen = false` is not held"),
         exec: partial(exec),
         resources: Enforcement::Unsupported,
-        members: partial("a session's cgroup, not yet shown by the escape probes"),
+        members: partial("a session's cgroup, which `enclos policy test` probes"),
     }
 }
 
@@ -154,9 +154,10 @@ mod tests {
         }
     }
 
-    /// CLAUDE.md: nothing reads as enforced before a probe shows it.
+    /// CLAUDE.md: nothing reads as enforced on a declaration alone; what a
+    /// probe shows on a host, `policy test` says there.
     #[test]
-    fn no_area_reads_as_enforced_before_the_escape_probes_pass() {
+    fn no_area_reads_as_enforced_and_each_names_its_probes() {
         for landlock_abi in [
             None,
             Some(1),
@@ -165,11 +166,11 @@ mod tests {
         ] {
             let declared = capabilities(&Host { landlock_abi });
             assert!(
-                partial_note(&declared.fs).contains("not yet shown by the escape probes"),
+                partial_note(&declared.fs).contains("`enclos policy test` probes"),
                 "{landlock_abi:?}"
             );
             assert!(
-                partial_note(&declared.members).contains("not yet shown by the escape probes"),
+                partial_note(&declared.members).contains("`enclos policy test` probes"),
                 "{landlock_abi:?}"
             );
         }
