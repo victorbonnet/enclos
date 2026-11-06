@@ -78,32 +78,38 @@ pub struct Host {
     pub memory_not_held: Option<String>,
 }
 
-/// What the backend is built to enforce on `host` (design §5's table): a
-/// declaration, so nothing reads as enforced; `enclos policy test`'s escape
-/// probes show what holds on the host it runs on. Landlock missing or too
-/// old weakens the file and program rows (ADR 0037); an older ABI's rights
-/// still apply. `listen = false` is not held (ADR 0041). `memory` is not
-/// applied on a host whose cgroups do not hold it (ADR 0038).
+/// What the backend enforces on `host` (design §5's table). Files where the
+/// kernel has Landlock with the ABI the rules need, and members everywhere,
+/// read enforced: bubblewrap's escape probes read READY on GitHub's Ubuntu
+/// runners and on a Raspberry Pi without Landlock, and `enclos policy test`
+/// shows what holds on the host it runs on. Landlock missing or too old
+/// leaves the file and program rows degraded (ADR 0037); an older ABI's
+/// rights still apply. `listen = false` is not held (ADR 0041). `memory` is
+/// not applied on a host whose cgroups do not hold it (ADR 0038).
 pub fn capabilities(host: &Host) -> Capabilities {
-    let (fs, exec) = match host.landlock_abi {
-        Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
-            "the mounts and Landlock, which `enclos policy test` probes",
-            "programs that are mounted, and Landlock's execute rules",
-        ),
-        Some(_) => (
-            "the mounts, and what this ABI has of Landlock, which `enclos policy test` probes",
-            "programs that are mounted; execute rules on an older ABI are open",
-        ),
-        None => (
-            "writes held by the mounts alone, with no second layer, which `enclos policy test` probes",
-            "any program that is mounted: no Landlock execute rules",
-        ),
-    };
     let partial = |note: &str| Enforcement::Partial {
         note: note.to_owned(),
     };
+    let (fs, exec) = match host.landlock_abi {
+        Some(abi) if abi >= LANDLOCK_ABI_NEEDED => (
+            Enforcement::Enforced,
+            "programs that are mounted, and Landlock's execute rules",
+        ),
+        Some(_) => (
+            partial(
+                "the mounts, and what this ABI has of Landlock, which `enclos policy test` probes; the rights it lacks are not held",
+            ),
+            "programs that are mounted; execute rules on an older ABI are open",
+        ),
+        None => (
+            partial(
+                "writes held by the mounts alone, with no second layer, which `enclos policy test` probes",
+            ),
+            "any program that is mounted: no Landlock execute rules",
+        ),
+    };
     Capabilities {
-        fs: partial(fs),
+        fs,
         network: partial("through the proxy; `listen = false` is not held"),
         exec: partial(exec),
         resources: partial(&match &host.memory_not_held {
@@ -112,7 +118,7 @@ pub fn capabilities(host: &Host) -> Capabilities {
                 "open_files on each process; cpu on the sandbox's slice, its sessions and services together; memory not applied on this host, as {why}; cpu_seconds and file_size refused; not yet shown by the escape probes"
             ),
         }),
-        members: partial("a session's cgroup, which `enclos policy test` probes"),
+        members: Enforcement::Enforced,
     }
 }
 
@@ -184,25 +190,27 @@ mod tests {
         }
     }
 
-    /// CLAUDE.md: nothing reads as enforced on a declaration alone; what a
-    /// probe shows on a host, `policy test` says there.
+    /// CLAUDE.md: what reads as enforced is what the escape probes showed:
+    /// files with Landlock as the rules need it, and members on every host.
+    /// Files where Landlock is missing or older stay partial and name the
+    /// probes that show them on a host, and the rows no probe tries do too.
     #[test]
-    fn no_area_reads_as_enforced_and_each_names_its_probes() {
-        for landlock_abi in [
-            None,
-            Some(1),
-            Some(LANDLOCK_ABI_NEEDED - 1),
-            Some(LANDLOCK_ABI_NEEDED),
-        ] {
+    fn what_the_escape_probes_show_reads_as_enforced_and_no_more() {
+        let full = capabilities(&host(Some(LANDLOCK_ABI_NEEDED)));
+        assert_eq!(full.fs, Enforcement::Enforced);
+        for landlock_abi in [None, Some(1), Some(LANDLOCK_ABI_NEEDED - 1)] {
+            let degraded = capabilities(&host(landlock_abi));
+            assert!(
+                partial_note(&degraded.fs).contains("`enclos policy test` probes"),
+                "{landlock_abi:?}"
+            );
+        }
+        for landlock_abi in [None, Some(LANDLOCK_ABI_NEEDED)] {
             let declared = capabilities(&host(landlock_abi));
-            assert!(
-                partial_note(&declared.fs).contains("`enclos policy test` probes"),
-                "{landlock_abi:?}"
-            );
-            assert!(
-                partial_note(&declared.members).contains("`enclos policy test` probes"),
-                "{landlock_abi:?}"
-            );
+            assert_eq!(declared.members, Enforcement::Enforced, "{landlock_abi:?}");
+            assert!(matches!(declared.network, Enforcement::Partial { .. }));
+            assert!(matches!(declared.exec, Enforcement::Partial { .. }));
+            assert!(matches!(declared.resources, Enforcement::Partial { .. }));
         }
     }
 
