@@ -95,7 +95,6 @@ fn named_port(client: &UnixStream) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
     use std::thread;
 
     use super::*;
@@ -135,7 +134,7 @@ mod tests {
     fn a_port_nobody_listens_on_closes_the_connection_unanswered() {
         let (way_in, _folder) = served();
         let port = {
-            let gone = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let gone = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
             gone.local_addr().unwrap().port()
         };
         let mut client = way_in.connect(port).unwrap();

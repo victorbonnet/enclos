@@ -110,6 +110,12 @@ impl Engine {
         let held = holder.ask(&ctx).map_err(|why| Error::Dashboard {
             what: format!("the namespace holder of sandbox {name} does not answer: {why}"),
         })?;
+        // Told to end while the proxy or the namespace holder started.
+        if ended.load(Ordering::Relaxed) {
+            return Err(Error::Dashboard {
+                what: format!("told to end before the dashboard of sandbox {name} started"),
+            });
+        }
         let log = self.dashboard_log(name);
         let command = dashboard.command.into_words();
         let Started {

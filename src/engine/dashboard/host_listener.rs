@@ -65,21 +65,26 @@ pub(super) fn open(
     service: u16,
 ) -> io::Result<Listening> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    serve_on(
+        listener,
+        Door {
+            user,
+            owner,
+            way_in,
+            service,
+        },
+    )
+}
+
+/// Serves `listener` through `door` until the result is dropped.
+fn serve_on(listener: TcpListener, door: Door) -> io::Result<Listening> {
     // Polled, so that closing it needs no connection to wake it.
     listener.set_nonblocking(true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stopped = Arc::clone(&stop);
     let thread = thread::Builder::new()
         .name("dashboard".to_owned())
-        .spawn(move || {
-            let door = Door {
-                user,
-                owner,
-                way_in,
-                service,
-            };
-            door.serve(&listener, &stopped);
-        })?;
+        .spawn(move || door.serve(&listener, &stopped))?;
     Ok(Listening {
         stop,
         thread: Some(thread),
@@ -191,21 +196,27 @@ mod tests {
         (WayIn::new(&socket), folder)
     }
 
-    /// A listener on a free port, whose owner check answers `owner`.
+    /// A listener on a port the system chose, whose owner check answers
+    /// `owner`.
     fn listening(owner: Owner) -> (Listening, u16, tempfile::TempDir) {
         let (way_in, folder) = way_in();
-        let port = {
-            let free = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
-            free.local_addr().unwrap().port()
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let port = listener.local_addr().unwrap().port();
+        let door = Door {
+            user: ME,
+            owner,
+            way_in,
+            service: 37000,
         };
-        let listening = open(port, ME, owner, way_in, 37000).unwrap();
-        (listening, port, folder)
+        (serve_on(listener, door).unwrap(), port, folder)
     }
 
     /// What a client sending `GET` to `port` gets before the connection
-    /// closes, or within five seconds.
+    /// closes, or within five seconds: nothing when it cannot connect.
     fn fetched(port: u16) -> Vec<u8> {
-        let mut client = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let Ok(mut client) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
+            return Vec::new();
+        };
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -256,11 +267,14 @@ mod tests {
         assert_eq!(ASKED.lock().unwrap().as_slice(), [(mine, server)]);
     }
 
+    /// Another test may take the port once it is free, so what is checked
+    /// is that this listener no longer serves it.
     #[test]
     fn dropped_it_stops_listening() {
         let (listening, port, _folder) = listening(|_, _| Some(ME));
+        assert_eq!(fetched(port), b"37000 GET");
         drop(listening);
-        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+        assert_ne!(fetched(port), b"37000 GET");
     }
 
     #[test]

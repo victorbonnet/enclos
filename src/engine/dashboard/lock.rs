@@ -124,9 +124,14 @@ mod tests {
             what,
             "sandbox lab already has a dashboard: `enclos dashboard lab` (pid 4242, session 12) serves http://127.0.0.1:41003/ since 2026-11-06 10:20:30 UTC. Use that one, or end it with Ctrl-C where it runs"
         );
-        // Released once the first ends, whatever it left written.
+        // Released once the first ends, whatever it left written: soon, as a
+        // program another test starts meanwhile holds a copy until it runs.
         drop(first);
-        DashboardLock::take(&path, &name, &running(None)).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while DashboardLock::take(&path, &name, &running(None)).is_err() {
+            assert!(std::time::Instant::now() < deadline, "never released");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
