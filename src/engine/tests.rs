@@ -238,7 +238,5 @@ mod runtime;
 mod sandbox;
 mod secrets;
 mod services;
-// `state check` lists program files with `lsof`, which only macOS has here.
-#[cfg(target_os = "macos")]
 mod state_check;
 mod status;

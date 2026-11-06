@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use std::process::Stdio;
 use std::process::{Command, ExitStatus, Output};
 
@@ -269,7 +269,7 @@ fn parse(out: &Output, some: bool) -> Result<BTreeMap<u32, Vec<String>>, Program
     Ok(files)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
@@ -389,6 +389,7 @@ pub(crate) mod tests {
     }
 
     /// On this host, the whole listing leaves out no process it can read.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_listing_of_this_host_is_whole() {
         program_files().unwrap();
@@ -525,6 +526,7 @@ pub(crate) mod tests {
     /// Asked for processes that have all gone, `lsof` lists none and `ps`
     /// shows none, and neither is an error. Asked about this process too,
     /// `lsof` lists its program and `ps` shows it alone.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_look_at_gone_processes_lists_none() {
         let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
@@ -542,6 +544,7 @@ pub(crate) mod tests {
 
     /// A program in a folder whose name holds what `lsof` escapes is listed
     /// as `lsof_name` writes its path.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_program_file_is_named_as_lsof_name_writes_it() {
         let dir = tempfile::tempdir().unwrap();
