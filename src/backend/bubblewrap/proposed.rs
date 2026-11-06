@@ -1,7 +1,8 @@
-//! What the backend rests on that is still proposed or open: the
-//! dependences compiling has on ADRs 0037 to 0039 and 0041, and on design
-//! §15. Under
-//! ADR 0039 the relay changes too: see [`NAMESPACES`].
+//! What the backend rests on that depends on the host or is still open: the
+//! dependences compiling has on ADRs 0037 to 0039 and 0041, accepted, and on
+//! design §15. The module's name dates from when those ADRs were proposed.
+//! The namespace holder of ADR 0039 is not built yet; once it is, the relay
+//! changes too: see [`NAMESPACES`].
 
 use serde::{Deserialize, Serialize};
 

@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Landlock where the kernel has it, and its absence stated
@@ -8,7 +8,7 @@ Qualifies [0004](0004-linux-bubblewrap-and-landlock.md), which builds the bubble
 
 The milestone 3 host survey found that 64-bit Raspberry Pi OS's kernel does not build Landlock at all (`prototype/m3/README.md`). `CONFIG_SECURITY_LANDLOCK` is unset in every Raspberry Pi OS kernel build examined (6.12.75 and 6.18.50, `-v8` and `-2712`), measured on Raspberry Pi OS 64-bit, kernel 6.18.50, so no boot option turns it on. Under 0004 and 0009, the bubblewrap backend would refuse to run on Raspberry Pi OS, one of the platforms [0013](0013-supported-platforms.md) supports.
 
-Decision (proposed): Landlock is optional on Linux.
+Decision: Landlock is optional on Linux.
 
 - **Where the kernel has it, with the ABI the backend's rules need**, the backend applies it, as 0004 says.
 - **Where it is missing**, the backend still runs. Writes are held by bubblewrap's mounts alone (the home and workspaces bound writable, everything else read-only or not mounted), and the backend means to apply the same seccomp filter; no run has shown that it holds on a kernel without Landlock. Shown on Raspberry Pi OS: the kernel offers seccomp filters (`CONFIG_SECCOMP_FILTER=y`, with its actions in `/proc/sys/kernel/seccomp/actions_avail`, read by the survey) and bubblewrap starts (`bwrap --ro-bind / / /usr/bin/true`, exit 0). The no-Landlock mode has only been run with Landlock switched off on GitHub's Azure kernel, which has it, so a kernel without Landlock is still unproven.

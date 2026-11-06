@@ -109,7 +109,7 @@ fn check_grants(
 }
 
 /// Checks the limits a policy sets against what `backend` enforces (ADR
-/// 0033, proposed): one it cannot enforce as written is refused outright,
+/// 0033): one it cannot enforce as written is refused outright,
 /// never stored and ignored. Seatbelt holds a process to one of the limits
 /// macOS keeps for each process, open files; a process may ignore SIGXCPU
 /// and run past its CPU time, macOS refuses a memory limit, does not hold

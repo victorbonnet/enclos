@@ -257,9 +257,9 @@ fn an_adrs_consequences_section_holds_only_its_list() {
 }
 
 #[test]
-fn the_relay_has_one_runner_and_the_holders_part_is_proposed() {
-    // ADR 0039, proposed, gives the relay to the namespace holder; until it
-    // is accepted, the design cites it where it says so and keeps the case
+fn the_relay_has_one_runner_and_the_holders_part_cites_adr_0039() {
+    // ADR 0039 gives the relay to the namespace holder; until the holder is
+    // built, the design cites it where it says so and keeps the case
     // where a session runs its relay.
     let design = design();
     let find = |start: &str| {

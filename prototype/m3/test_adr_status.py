@@ -1,6 +1,7 @@
-"""ADRs 0037 to 0040 stay proposed: the owner accepts them, not a change that
-happens to edit them. Reads each ADR's front matter, by its number so a retitled
-file still counts. Pure, so it runs anywhere:
+"""ADRs 0037 to 0041 stay accepted: the owner accepted them, and a new ADR that
+supersedes one changes that, not a change that happens to edit them. Reads each
+ADR's front matter, by its number so a retitled file still counts. Pure, so it
+runs anywhere:
 
     python3 -I prototype/m3/test_adr_status.py
 
@@ -12,7 +13,7 @@ import os
 import unittest
 
 ADR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "adr")
-PROPOSED = ("0037", "0038", "0039", "0040")
+ACCEPTED = ("0037", "0038", "0039", "0040", "0041")
 
 
 def status(number, folder=ADR):
@@ -28,10 +29,10 @@ def status(number, folder=ADR):
     return fields.get("status", "").strip() or None
 
 
-class StayProposed(unittest.TestCase):
-    def test_each_stays_proposed(self):
-        for number in PROPOSED:
-            self.assertEqual(status(number), "proposed", number)
+class StayAccepted(unittest.TestCase):
+    def test_each_stays_accepted(self):
+        for number in ACCEPTED:
+            self.assertEqual(status(number), "accepted", number)
 
 
 if __name__ == "__main__":

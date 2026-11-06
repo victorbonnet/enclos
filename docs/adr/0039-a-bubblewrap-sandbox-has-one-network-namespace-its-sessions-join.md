@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A bubblewrap sandbox has one network namespace, which its sessions join
@@ -8,7 +8,7 @@ Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for 
 
 A session with a network namespace of its own cannot reach the port its runtime's service listens on, which 0028 gives every session of the sandbox: Hermes's chat in another session than its gateway fails with `Gateway connection failed; no local fallback`. bubblewrap can make a network namespace but has no option to join one. A session can join one all the same, as shown on GitHub's Ubuntu 24.04 runners, x86_64 and arm64, and Ubuntu 26.04 runner, x86_64 (`prototype/m3/README.md`). A namespace holder started with `--dev /dev` cannot be joined (EPERM): that option nests a second user namespace, and the namespace holder hands out the inner one while its network namespace belongs to the outer.
 
-Decision (proposed, not accepted):
+Decision:
 
 - **One network namespace per sandbox, kept by a namespace holder.** The namespace holder runs in bubblewrap, without `--dev /dev`, in user, PID and network namespaces of its own. It keeps the network namespace in being, runs the sandbox's relay to the proxy on its 127.0.0.1, and hands its namespaces out as descriptors over a Unix socket that no session can reach.
 - **Each session joins it the `nsenter` way.** `nsenter` enters the namespace holder's user and network namespaces, then bubblewrap makes the session's nested user namespace. Every session, a service's included, keeps its own PID and IPC namespaces.
@@ -32,7 +32,7 @@ Reason:
 
 ## Consequences
 
-- Sessions of a sandbox share what a network namespace holds. Each reaches what another listens on and can take a port there. Their abstract sockets are shared too, and only Landlock's scope separates them: EPERM with Landlock, connected without it. So where the kernel has no Landlock ([0037](0037-landlock-where-the-kernel-has-it.md), proposed), as on Raspberry Pi OS, sessions of a sandbox reach each other's abstract sockets.
+- Sessions of a sandbox share what a network namespace holds. Each reaches what another listens on and can take a port there. Their abstract sockets are shared too, and only Landlock's scope separates them: EPERM with Landlock, connected without it. So where the kernel has no Landlock ([0037](0037-landlock-where-the-kernel-has-it.md)), as on Raspberry Pi OS, sessions of a sandbox reach each other's abstract sockets.
 - 0028's rule that a session reaches its service's port and no other does not hold on Linux. A session still reaches nothing on the host's loopback and nothing of another sandbox.
 - A namespace holder restart splits the sandbox. The open sessions and the service live on in the old namespace, cut off from the proxy, and a new session is in a new one without the service; once the relay is gone a session can bind its port itself. So the namespace holder restarts only when the sandbox's sessions and services do.
 - A session cannot signal the relay, which is outside its PID namespace, and the relay reaches nothing but the proxy's socket.
