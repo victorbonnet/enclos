@@ -12,10 +12,10 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::Policy;
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::{SecretRecord, SecretRef, SecretValue};
+use crate::model::secret::{SecretRecord, SecretRef, SecretValue, StoreName};
 use crate::runtime::adapter;
+use crate::secrets::{SecretError, SecretStore};
 
-/// What `secret set` did.
 /// One way a policy gives a secret: as `variable`, to the whole sandbox,
 /// or to `agent` alone (ADR 0036).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,10 +34,13 @@ impl std::fmt::Display for Grant {
     }
 }
 
+/// What `secret set` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretSet {
     /// False when it replaced the value of a secret already set.
     pub new: bool,
+    /// The store that holds it.
+    pub store: StoreName,
     /// How the active policy gives it.
     pub granted_as: Vec<Grant>,
     /// How the pending policy gives it, if one waits.
@@ -108,7 +111,8 @@ impl Engine {
             |lock| {
                 // Again under the lock: a `sandbox rm` may have run meanwhile.
                 self.require_sandbox(&secret.sandbox)?;
-                let known = self.has_secret(secret)?;
+                let record = self.record_of(secret)?;
+                let known = record.is_some();
                 // What it reports is worked out first: once the value is
                 // stored, only recording it may fail.
                 let view = self.policy(&secret.sandbox)?;
@@ -123,20 +127,29 @@ impl Engine {
                     true => 0,
                     false => self.sessions_under_rules(&secret.sandbox)?.len(),
                 };
-                if let Err(error) = self.secrets.set(secret, value) {
+                // A secret stays in the store it first went to.
+                let store = match &record {
+                    Some(record) => self.store_of(record)?,
+                    None => self.secrets.for_new()?,
+                };
+                if let Err(mut error) = store.set(secret, value) {
+                    if !known && let Some(other) = self.secrets.new_secret_alternative(secret) {
+                        error.what = format!("{}. {other}", error.what);
+                    }
                     // A store can fail after it wrote, as when reading the
                     // value back does not answer: a new value it may have
                     // left goes again, as no record would lead to it.
                     return Err(match known || error.untouched {
                         true => error.into(),
-                        false => self.unrecorded_value(secret, false, error.into()),
+                        false => self.unrecorded_value(store, secret, false, error.into()),
                     });
                 }
-                if let Err(error) = self.state.put_secret(lock, secret) {
-                    return Err(self.unrecorded_value(secret, known, error.into()));
+                if let Err(error) = self.state.put_secret(lock, secret, store.name()) {
+                    return Err(self.unrecorded_value(store, secret, known, error.into()));
                 }
                 Ok(SecretSet {
                     new: !known,
+                    store: store.name(),
                     granted_as,
                     pending_as,
                     running,
@@ -149,20 +162,26 @@ impl Engine {
     /// The error of a `secret set` whose value may be stored but is not
     /// recorded: a new value is removed again, since no enclos command
     /// would reach it without its record; a replaced one stays, recorded.
-    fn unrecorded_value(&self, secret: &SecretRef, known: bool, error: Error) -> Error {
+    fn unrecorded_value(
+        &self,
+        store: &dyn SecretStore,
+        secret: &SecretRef,
+        known: bool,
+        error: Error,
+    ) -> Error {
         if known {
             return Error::FailedAfter {
                 error: Box::new(error),
                 done: format!("replacing the value of secret {secret} in the secret store"),
             };
         }
-        match self.secrets.remove(secret) {
+        match store.remove(secret) {
             Ok(_) => error,
             Err(e) => Error::CleanupFailed {
                 error: Box::new(error),
                 left: format!(
                     "secret {secret}'s value in the secret store with no record of it ({e}): it is {}",
-                    self.secrets.whereabouts(secret)
+                    store.whereabouts(secret)
                 ),
             },
         }
@@ -220,12 +239,12 @@ impl Engine {
             |_| "removed from the secret store".to_owned(),
             |lock| {
                 self.refuse_granted(secret)?;
-                self.require_secret(secret)?;
+                let record = self.require_secret(secret)?;
                 // The value first: should removing the record then fail, the
                 // record is left with no value, which `secret rm` run again
                 // removes. The other way round would leave a value with no
                 // record, which no enclos command reaches.
-                self.secrets.remove(secret)?;
+                self.store_of(&record)?.remove(secret)?;
                 self.state.remove_secret(lock, secret)?;
                 Ok(())
             },
@@ -233,21 +252,35 @@ impl Engine {
         Ok(Planned::Done(()))
     }
 
-    fn has_secret(&self, secret: &SecretRef) -> Result<bool> {
+    fn record_of(&self, secret: &SecretRef) -> Result<Option<SecretRecord>> {
         Ok(self
             .state
             .secrets(&secret.sandbox)?
-            .iter()
-            .any(|s| s.secret == *secret))
+            .into_iter()
+            .find(|s| s.secret == *secret))
     }
 
-    fn require_secret(&self, secret: &SecretRef) -> Result<()> {
-        match self.has_secret(secret)? {
-            true => Ok(()),
-            false => Err(Error::SecretUnknown {
-                secret: secret.clone(),
-            }),
-        }
+    fn has_secret(&self, secret: &SecretRef) -> Result<bool> {
+        Ok(self.record_of(secret)?.is_some())
+    }
+
+    fn require_secret(&self, secret: &SecretRef) -> Result<SecretRecord> {
+        self.record_of(secret)?.ok_or_else(|| Error::SecretUnknown {
+            secret: secret.clone(),
+        })
+    }
+
+    /// The store `record` names, or why it cannot be reached: never another.
+    fn store_of(
+        &self,
+        record: &SecretRecord,
+    ) -> std::result::Result<&dyn SecretStore, SecretError> {
+        self.secrets
+            .recorded(record.store)
+            .map_err(|e| SecretError {
+                what: format!("secret {}: {}", record.secret, e.what),
+                ..e
+            })
     }
 
     fn refuse_granted(&self, secret: &SecretRef) -> Result<()> {
@@ -326,7 +359,11 @@ impl Engine {
     ) -> Result<Vec<(String, SecretValue)>> {
         let mut env = Vec::new();
         for (variable, grant) in grants {
-            match self.secrets.get(&grant.0)? {
+            let value = match self.record_of(&grant.0)? {
+                Some(record) => self.store_of(&record)?.get(&grant.0)?,
+                None => None,
+            };
+            match value {
                 Some(value) => env.push((variable.clone(), value)),
                 None => {
                     return Err(Error::SecretMissing {
@@ -346,7 +383,8 @@ impl Engine {
     /// 0034); else the secrets themselves, as variables. Each agent's own
     /// go to a file of its own in that folder (ADR 0036), and a runtime
     /// with no such folder refuses them. A store that could only be read
-    /// through a dialog nobody sees refuses the start.
+    /// through a dialog nobody sees, or that does not answer, refuses the
+    /// start.
     pub(super) fn service_secrets(
         &self,
         name: &SandboxName,
@@ -358,11 +396,15 @@ impl Engine {
             self.remove_secrets_file(name)?;
             return Ok(Vec::new());
         }
-        self.secrets.readable().map_err(|e| Error::SecretsLocked {
-            sandbox: name.to_string(),
-            service: service.to_owned(),
-            why: e.what,
-        })?;
+        for record in self.granted_stores(policy)? {
+            self.store_of(&record)
+                .and_then(|store| store.readable())
+                .map_err(|e| Error::SecretsLocked {
+                    sandbox: name.to_string(),
+                    service: service.to_owned(),
+                    why: e.what,
+                })?;
+        }
         let values = self.secret_env(policy)?;
         let Some(var) = adapter(kind).secrets_folder_var() else {
             if !policy.agent_secrets.is_empty() {
@@ -400,6 +442,35 @@ impl Engine {
         Ok(vec![(var.to_owned(), named)])
     }
 
+    /// The variables with which a service reaches the stores `policy`
+    /// grants from. Nothing here looks at a store, so a start reaches no
+    /// bus for them.
+    pub(super) fn service_store_env(&self, policy: &Policy) -> Result<Vec<(String, String)>> {
+        let granted: Vec<StoreName> = self
+            .granted_stores(policy)?
+            .iter()
+            .map(|r| r.store)
+            .collect();
+        Ok(self.secrets.service_env(&granted))
+    }
+
+    /// One record of what `policy` grants per store holding any of it.
+    fn granted_stores(&self, policy: &Policy) -> Result<Vec<SecretRecord>> {
+        let mut stores: Vec<SecretRecord> = Vec::new();
+        let grants = policy
+            .secrets
+            .values()
+            .chain(policy.agent_secrets.values().flat_map(|g| g.values()));
+        for grant in grants {
+            if let Some(record) = self.record_of(&grant.0)?
+                && !stores.iter().any(|s| s.store == record.store)
+            {
+                stores.push(record);
+            }
+        }
+        Ok(stores)
+    }
+
     /// Removes the file a runtime read its secrets from, as the sandbox
     /// stops or its services start with none.
     pub(super) fn remove_secrets_file(&self, name: &SandboxName) -> Result<()> {
@@ -415,17 +486,25 @@ impl Engine {
         }
     }
 
-    /// Removes every secret of the sandbox from the secret store, as the
-    /// sandbox's record goes; returns those it could not remove.
+    /// Removes each secret from the store its record names; returns those
+    /// it could not remove.
     pub(super) fn forget_secrets(&self, records: &[SecretRecord]) -> Vec<SecretLeft> {
         records
             .iter()
-            .filter_map(|r| match self.secrets.remove(&r.secret) {
-                Ok(_) => None,
-                Err(e) => Some(SecretLeft {
-                    secret: r.secret.clone(),
-                    why: format!("{e}; it is {}", self.secrets.whereabouts(&r.secret)),
-                }),
+            .filter_map(|r| {
+                let left = |why: String| {
+                    Some(SecretLeft {
+                        secret: r.secret.clone(),
+                        why,
+                    })
+                };
+                match self.store_of(r) {
+                    Ok(store) => match store.remove(&r.secret) {
+                        Ok(_) => None,
+                        Err(e) => left(format!("{e}; it is {}", store.whereabouts(&r.secret))),
+                    },
+                    Err(e) => left(e.to_string()),
+                }
             })
             .collect()
     }

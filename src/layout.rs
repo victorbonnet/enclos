@@ -254,6 +254,11 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
+    /// The file store's one file (design §12): for the host alone.
+    pub fn secrets_file(&self) -> PathBuf {
+        self.data.join("secrets.json")
+    }
+
     /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
@@ -285,12 +290,22 @@ impl Layout {
     /// name starts with it too, such as `state.db-journal` or
     /// `audit.jsonl.torn-12`.
     pub fn hidden_files(&self) -> Vec<PathBuf> {
-        vec![
+        self.hidden_files_on(Os::current())
+    }
+
+    fn hidden_files_on(&self, os: Os) -> Vec<PathBuf> {
+        let mut files = vec![
             self.state_db(),
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
-        ]
+        ];
+        // Only Linux has the file store, as `secrets::host` picks the
+        // stores: the two change together.
+        if os == Os::Linux {
+            files.push(self.secrets_file());
+        }
+        files
     }
 
     /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
@@ -460,6 +475,39 @@ fn users_alone(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file store is on the list Seatbelt's rules and the probes read.
+    /// That a sandbox cannot read it is for the backend's rules and those
+    /// probes to show, not this list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_file_store_is_on_the_hidden_files() {
+        let layout = Layout::at("/data/enclos");
+        assert!(layout.hidden_files().contains(&layout.secrets_file()));
+        assert!(layout.secrets_file().starts_with(layout.data()));
+    }
+
+    /// The file store is hidden on Linux, the only system with one, and
+    /// macOS's list stays without it.
+    #[test]
+    fn the_hidden_files_are_each_systems_own() {
+        let layout = Layout::at("/data/enclos");
+        assert!(
+            layout
+                .hidden_files_on(Os::Linux)
+                .contains(&layout.secrets_file())
+        );
+        assert_eq!(
+            layout.hidden_files_on(Os::MacOs),
+            [
+                layout.state_db(),
+                layout.state_lock(),
+                layout.audit_log(),
+                layout.config_file()
+            ]
+        );
+        assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
+    }
 
     #[test]
     fn a_proxy_sockets_folders_are_the_users_alone() {

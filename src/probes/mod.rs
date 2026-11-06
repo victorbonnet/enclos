@@ -352,6 +352,8 @@ pub struct ProbeInputs {
     /// The enclos data folder and `config.toml`.
     pub data: PathBuf,
     pub config_file: PathBuf,
+    /// The files no sandbox may read: each that exists gets a probe.
+    pub hidden_files: Vec<PathBuf>,
     /// The sandbox's own folder, which holds its `policy.toml` and
     /// `compiled/`, and its home.
     pub sandbox_dir: PathBuf,
@@ -526,13 +528,7 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     for folder in i.unmovable.iter().filter(|f| f.is_dir()) {
         list.extend(own.of_folder(folder, i));
     }
-    for path in [
-        i.data.join("state.db"),
-        i.data.join("state.lock"),
-        i.data.join("audit.jsonl"),
-        i.config_file.clone(),
-        i.data.join("run"),
-    ] {
+    for path in i.hidden_files.iter().cloned().chain([i.data.join("run")]) {
         if path.exists() {
             list.push(read_probe("enclos files", &path));
         }
@@ -861,6 +857,14 @@ pub(crate) fn last_line(output: &str) -> String {
         .collect()
 }
 
+/// The files a test's data folder `data` hides.
+#[cfg(test)]
+pub(crate) fn hidden_in(data: &Path) -> Vec<PathBuf> {
+    ["state.db", "state.lock", "audit.jsonl", "config.toml"]
+        .map(|file| data.join(file))
+        .to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -872,6 +876,7 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            hidden_files: crate::probes::hidden_in(&dir.join("enclos")),
             sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: vec![dir.join("enclos/sandboxes/lab")],
             writes: vec![dir.join("enclos/sandboxes/home/home")],
@@ -887,6 +892,24 @@ mod tests {
             tag: 7,
             limits: Default::default(),
         }
+    }
+
+    /// A protected file gets a probe by being on the list, whichever it is:
+    /// the file store's among them on Linux (§13).
+    #[test]
+    fn every_hidden_file_that_exists_is_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut i = inputs(dir.path());
+        std::fs::create_dir_all(&i.data).unwrap();
+        let there = i.data.join("secrets.json");
+        std::fs::write(&there, "{}").unwrap();
+        i.hidden_files = vec![there.clone(), i.data.join("secrets.json.new")];
+        let read: Vec<String> = probes(&i)
+            .into_iter()
+            .filter(|p| p.route == "enclos files" && p.name.starts_with("read "))
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(read, [format!("read {}", there.display())]);
     }
 
     /// The list of a real backend, whose refusal the texts below use.

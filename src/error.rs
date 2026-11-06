@@ -271,16 +271,17 @@ pub enum Error {
     },
     /// A secret the policy grants, which the secret store does not hold.
     #[error(
-        "the policy gives secret {secret} as ${variable}, but the Keychain has no value for it; set it with `enclos secret set {secret}`"
+        "the policy gives secret {secret} as ${variable}, but the secret store has no value for it; set it with `enclos secret set {secret}`"
     )]
     SecretMissing {
         secret: crate::model::secret::SecretRef,
         variable: String,
     },
     /// A service's secrets cannot be read without a dialog nobody would
-    /// see: the service is not started, and not started again.
+    /// see, or their store does not answer: the service is not started, and
+    /// not started again.
     #[error(
-        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; unlock it (logging in to the Mac does), then run `enclos sandbox start {sandbox}`"
+        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; once it can be read (logging in usually unlocks it), run `enclos sandbox start {sandbox}`"
     )]
     SecretsLocked {
         sandbox: String,

@@ -14,8 +14,10 @@ use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
 use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
+use crate::model::secret::SecretRecord;
 use crate::model::session::{Member, SessionId, SessionRecord};
 use crate::policy;
+use crate::secrets::SecretError;
 use crate::service::ServiceLabel;
 use std::path::{Path, PathBuf};
 
@@ -552,14 +554,12 @@ impl Engine {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
                 let gone = self.require_stopped(name)?;
-                // Kept data or not, the file its services read their
-                // secrets from goes before the record (ADR 0034).
-                self.remove_secrets_file(name)?;
                 let secrets = self.state.secrets(name)?;
+                let after_record = self.remove_sandbox_secrets(name, &secrets)?;
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
-                let left = self.forget_secrets(&secrets);
+                let left = self.forget_secrets(&after_record);
                 // Nothing in it outlives the sandbox's proxy, whatever
                 // `keep_data` keeps; left behind, the next proxy of the name
                 // takes its socket over.
@@ -600,6 +600,36 @@ impl Engine {
             },
         )?;
         Ok(Planned::Done(secrets_left))
+    }
+
+    /// Removes what of `name`'s secrets goes before its record: the file its
+    /// services read them from (ADR 0034), then each value whose store keeps
+    /// the sandbox while it cannot be removed, refusing while one stays.
+    /// Returns the secrets whose values go after the record.
+    fn remove_sandbox_secrets(
+        &self,
+        name: &SandboxName,
+        secrets: &[SecretRecord],
+    ) -> Result<Vec<SecretRecord>> {
+        self.remove_secrets_file(name)?;
+        let (before_record, after_record): (Vec<_>, Vec<_>) = secrets
+            .iter()
+            .cloned()
+            .partition(|r| self.secrets.value_goes_before_record(r.store));
+        let stay = self.forget_secrets(&before_record);
+        if !stay.is_empty() {
+            return Err(Error::Secret(SecretError {
+                what: format!(
+                    "sandbox {name} was not removed, as these secrets could not be: {}. Run `enclos sandbox rm {name}` again once they can be removed",
+                    stay.iter()
+                        .map(|l| l.why.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                untouched: false,
+            }));
+        }
+        Ok(after_record)
     }
 
     /// Refuses a sandbox with services installed or sessions running, saying

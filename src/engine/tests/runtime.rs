@@ -223,14 +223,14 @@ impl Lab {
     }
 
     /// A lab whose engine keeps secrets in `secrets`.
-    fn with_secrets(secrets: Box<dyn crate::secrets::SecretStore>) -> Lab {
+    fn with_secrets(secrets: Box<dyn crate::secrets::Stores>) -> Lab {
         Lab::build(None, None, Some(secrets))
     }
 
     fn build(
         services: Option<Box<dyn crate::service::ServiceManager>>,
         stop: Option<crate::engine::StopMembers>,
-        secrets: Option<Box<dyn crate::secrets::SecretStore>>,
+        secrets: Option<Box<dyn crate::secrets::Stores>>,
     ) -> Lab {
         let (dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
         let engine = match services {
@@ -2258,6 +2258,50 @@ fn a_service_and_a_session_get_the_secrets_their_policy_grants() {
     assert!(!folder.exists());
     let found = std::fs::read_to_string(lab.home.join("gateway-env")).unwrap();
     assert!(!found.contains("stale"), "{found}");
+}
+
+/// `enclos launch` writes the sandbox's and each agent's secrets files
+/// from the file store as it does from the Keychain (ADR 0034, ADR 0036).
+#[test]
+fn launch_writes_the_secrets_files_from_the_file_store() {
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::file::FileStore;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileStore::new(dir.path().join("secrets.json"));
+    let lab = Lab::with_secrets(Box::new(store));
+    assert!(done(lab.install(RECORDS_TOKEN, Confirm::Yes).unwrap()).installed);
+    for (secret, value) in [("home/token", "tok-1"), ("home/main-bot", "123:bot")] {
+        let secret: SecretRef = secret.parse().unwrap();
+        let value = SecretValue::new(value.into()).unwrap();
+        done(
+            lab.engine
+                .secret_set(&alice(), &secret, Some(&value), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+    let before = lab.engine.layout.read_policy("home").unwrap();
+    let granted = format!(
+        "{before}\n[secrets]\nenv = {{ TOKEN = \"secret:home/token\" }}\n[secrets.agents.main]\nenv = {{ TELEGRAM_BOT_TOKEN = \"secret:home/main-bot\" }}\n"
+    );
+    lab.engine
+        .policy_edit(&alice(), &lab.name, &before, &granted, Confirm::Yes)
+        .unwrap();
+    let ended = std::sync::atomic::AtomicBool::new(false);
+    let end = lab
+        .engine
+        .launch_until(&alice(), &lab.name, "gateway", &ended)
+        .unwrap();
+    assert_eq!(end.exit, 0, "{end:?}");
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join("gateway-env")).unwrap(),
+        "TOKEN=\"tok-1\"\n"
+    );
+    let file = lab.engine.layout.agent_secrets_file("home", "main");
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        "TELEGRAM_BOT_TOKEN=\"123:bot\"\n"
+    );
 }
 
 /// What the policy grants one agent goes to that agent's own file in
