@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+#[path = "bubblewrap/limits.rs"]
 mod limits;
 
 /// One sandbox at a time: each `ENCLOS_HOME` would give its first sandbox
