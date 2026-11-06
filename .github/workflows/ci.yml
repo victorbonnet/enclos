@@ -370,6 +370,8 @@ jobs:
     if: always()
     needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
     steps:
       - name: Check needed jobs
         if: >-
@@ -377,4 +379,16 @@ jobs:
           contains(needs.*.result, 'cancelled') ||
           contains(needs.*.result, 'skipped')
         run: exit 1
-      - run: echo "All required jobs passed"
+      # `needs` sums each matrix as one result, and once read as passing
+      # while a leg had failed (run 41849592145): every job is checked too.
+      - name: Check every job of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bad=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+            --jq '.jobs[] | select(.name != "ci-ok" and .conclusion != "success") | "\(.name): \(.conclusion // .status)"')
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            exit 1
+          fi
+          echo "All jobs of this run passed"
