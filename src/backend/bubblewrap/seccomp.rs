@@ -10,7 +10,7 @@ use super::compile::strings;
 /// Refused with `EPERM`: design §14's list, then the kernel module, reboot
 /// and swap calls, and io_uring, whose operations seccomp does not see.
 /// The same on every architecture: the program that applies the filter
-/// skips a name its own lacks.
+/// skips a name its own lacks (`inside/filter.rs`).
 const SECCOMP_DENY: &[&str] = &[
     "keyctl",
     "add_key",

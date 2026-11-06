@@ -16,14 +16,15 @@
 //! that sends nothing more after the proxy has left.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+use std::os::unix::net::{SocketAddr, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::error::{Error, Result};
 use crate::net::budget::{self, Slot};
 
 /// The descriptors a relay keeps for itself: the standard streams, its
@@ -44,6 +45,17 @@ fn say(what: std::fmt::Arguments) {
 /// share. Each holds two; never none.
 fn connections_for(left: u64) -> usize {
     ((left / 2) as usize).max(1)
+}
+
+/// The listener for a relay to `socket`, on 127.0.0.1 alone.
+pub fn listen(port: u16, socket: &Path) -> Result<TcpListener> {
+    // Said now: on the first connection it would reach no one.
+    SocketAddr::from_pathname(socket).map_err(|source| Error::RelaySocket {
+        path: socket.to_path_buf(),
+        source,
+    })?;
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .map_err(|source| Error::RelayListen { port, source })
 }
 
 /// Passes each connection on `listener` to the Unix socket at `socket`,

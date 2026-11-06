@@ -174,6 +174,9 @@ pub enum Error {
         sandbox: String,
         source: std::io::Error,
     },
+    /// `enclos inside` could not bring a session up, before its command ran.
+    #[error("{why}")]
+    Inside { why: String },
     /// The relay cannot hold its port in the session's network.
     #[error("the relay cannot listen on 127.0.0.1:{port}: {source}")]
     RelayListen { port: u16, source: std::io::Error },
@@ -386,6 +389,7 @@ impl Error {
             Error::Policy(e) if e.is_refused() => exit::REFUSED,
             Error::BackendUnavailable { .. } => exit::REFUSED,
             Error::NeedsConfirmation { .. } => exit::NEEDS_CONFIRMATION,
+            Error::Inside { .. } => exit::EXEC_FAILED,
             Error::Layout(_)
             | Error::State(_)
             | Error::Audit(_)

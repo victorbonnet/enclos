@@ -328,6 +328,43 @@ fn holder_means_the_namespace_holder_alone() {
     }
 }
 
+/// `enclos inside` grants `TRUNCATE` on `/proc`, which `inside.py` does only
+/// with `--proc-truncate`: the design and the prototype's README both say so,
+/// and neither leaves the grant an open question.
+#[test]
+fn the_grant_of_truncate_on_proc_is_recorded() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("prototype/m3/README.md");
+    let readme = fs::read_to_string(path).unwrap();
+    assert!(readme.contains("`enclos inside` grants it"));
+    assert!(design().contains("`enclos inside` grants `TRUNCATE` on `/proc`"));
+    assert!(!readme.contains("should allow these writes is open"));
+}
+
+/// The code cites §5 for it.
+#[test]
+fn what_a_session_runs_first_is_in_section_5() {
+    let design = design();
+    let at = |text: &str| design.find(text).expect(text);
+    let block = at("**What a session runs first**");
+    assert!(at("## 5. Isolation backends") < block);
+    assert!(block < at("### Seatbelt specifics"));
+    assert!(design.contains("and `enclos inside --relay` for the one a session starts"));
+}
+
+/// `enclos inside` handles the rights of `LANDLOCK_ABI_NEEDED`, so a right of
+/// a newer ABI is lost on no host, a host without Landlock included.
+#[test]
+fn no_right_the_rules_never_ask_for_is_listed_as_lost() {
+    let design = design();
+    let row = design
+        .lines()
+        .find(|line| line.starts_with("| No Landlock: not built"))
+        .expect("the degraded control's row");
+    assert!(!row.contains("ABI 9"), "{row}");
+    assert!(!row.contains("host sockets"), "{row}");
+    assert!(!adr("0037-landlock-where-the-kernel-has-it.md").contains("ABI 9"));
+}
+
 #[test]
 fn the_design_ends_with_the_open_decisions_and_lays_out_every_run_folder() {
     // Nothing after §15's table makes decisions outside it, and every folder

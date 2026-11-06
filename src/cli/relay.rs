@@ -1,15 +1,14 @@
 //! `enclos relay`: a session's way to the proxy's Unix socket from its own
-//! 127.0.0.1 (design §5, Linux networking). Started by enclos itself inside
-//! the session, not typed by people. It runs where the enclos folder is out
-//! of sight, so it opens none of it.
+//! 127.0.0.1 (design §5, Linux networking). Hidden: it is for enclos to
+//! start, and nothing starts it yet. A session's relay is `enclos inside
+//! --relay` until ADR 0039 (proposed) has a namespace holder run this one.
+//! It runs where the enclos folder is out of sight, so it opens none of it.
 
-use std::net::{Ipv4Addr, TcpListener};
-use std::os::unix::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Args;
 
-use enclos::error::{Error, Result};
+use enclos::error::Result;
 
 #[derive(Args)]
 pub struct RelayArgs {
@@ -22,12 +21,5 @@ pub struct RelayArgs {
 }
 
 pub fn run(RelayArgs { port, socket }: RelayArgs) -> Result<u8> {
-    // Said now: on the first connection it would reach no one.
-    SocketAddr::from_pathname(&socket).map_err(|source| Error::RelaySocket {
-        path: socket.clone(),
-        source,
-    })?;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-        .map_err(|source| Error::RelayListen { port, source })?;
-    enclos::relay::serve(listener, &socket)
+    enclos::relay::serve(enclos::relay::listen(port, &socket)?, &socket)
 }
