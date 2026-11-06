@@ -119,6 +119,10 @@ _Avoid_: grant (a secret's or policy's word), permission
 One exchange with an agent through the mobile app, started by one person, who owns it. The runtime keeps it apart from the agent's other conversations.
 _Avoid_: session (a sandbox's word), chat, thread
 
+**Agent command**:
+A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
+_Avoid_: command alone (enclos's own), shortcut, action
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service

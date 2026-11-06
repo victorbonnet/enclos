@@ -98,6 +98,11 @@ class ToTheBridge(unittest.TestCase):
             protocol.message_out("home.lab.main", "Gateway online", kind="status"),
             "from_plugin_message_out_status.json")
         self.assert_like_fixture(protocol.typing("c-42", True), "from_plugin_typing.json")
+        self.assert_like_fixture(protocol.commands([
+            ("new", "Start a new session (fresh session ID + history)", "[name]"),
+            ("model", "Switch model for this session", "[model] [--provider name] [--global]"),
+            ("stop", "Kill all running background processes", ""),
+        ]), "from_plugin_commands.json")
         self.assert_like_fixture(
             protocol.title("c-42", "Paris weather this week"), "from_plugin_conversation_title.json")
         self.assert_like_fixture(
@@ -169,6 +174,25 @@ class Files(unittest.TestCase):
         self.assertEqual(found, [("Unicorn on the moon", "cache/generated/images/krea_1.png")])
         self.assertEqual(rest, "Here's your unicorn on the moon:\n\n"
                                "And a [link](https://enclos.dev) and ![web](https://x.y/a.png).")
+
+
+class CommandsTest(unittest.TestCase):
+    def test_each_once_without_slash_and_without_what_the_app_does_not_offer(self):
+        message = protocol.commands([
+            ("/new", "Start a new\n session", "[name]"),
+            ("new", "again", ""),
+            ("sethome", "Set the home channel", ""),
+            ("start", "Telegram's start", ""),
+            ("usage", "Show token usage", "  "),
+        ])
+        self.assertEqual(message["commands"], [
+            {"name": "new", "description": "Start a new session", "args": "[name]"},
+            {"name": "usage", "description": "Show token usage"},
+        ])
+
+    def test_hello_says_commands_only_when_listed(self):
+        self.assertNotIn("commands", protocol.hello("hermes", "main")["capabilities"])
+        self.assertIn("commands", protocol.hello("hermes", "main", ("commands",))["capabilities"])
 
 
 if __name__ == "__main__":
