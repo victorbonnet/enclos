@@ -523,6 +523,21 @@ ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
 - [ ] The proxy killed from outside comes back within a few seconds under a new pid: a unit restarts on failure, never after it exits 0.
 - [ ] `stop` ends every session and leaves no unit of this home installed or loaded.
 
+### 10: the dashboard
+
+With Hermes installed in `lab` (step 3). The host cannot reach a listener in the sandbox, so `enclos dashboard` opens its dashboard to you alone (design §6):
+
+```bash
+enclos dashboard lab                     # prints the address; Ctrl-C to end
+enclos status lab                        # in a second terminal, while it runs
+enclos dashboard lab; echo "exit $?"     # there too
+enclos audit --since 10m                 # once it has ended
+```
+
+- [ ] `dashboard` prints `http://127.0.0.1:<port>/` at the sandbox's reserved port and says it serves only you. The page opens in a browser on this host, or, on the Pi, on your own machine through `ssh -L <port>:127.0.0.1:<port> <host>`, and its pages and settings load.
+- [ ] `status` names `enclos dashboard lab` and gives no address; the second `dashboard` is refused, naming the first's pid and address, exit 1, and the first still serves.
+- [ ] Ctrl-C ends it: the address no longer answers, `enclos sandbox show lab` lists no `exec` session of it, and the audit has a `dashboard` entry and a `dashboard end` entry that says it was told to end.
+
 ### 14: isolation spot checks
 
 Each of these runs in `lab` and must fail:
