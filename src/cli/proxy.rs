@@ -20,7 +20,8 @@ enum ProxyVerb {
     Run {
         sandbox: SandboxName,
         /// The sandbox's proxy port, such as 41000: the proxy listens on it
-        /// on 127.0.0.1 and [::1].
+        /// on 127.0.0.1 and [::1], unless the sandbox's sessions reach the
+        /// proxy over its Unix socket alone.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         /// Record this proxy as the sandbox's, as its service does.

@@ -106,9 +106,11 @@ pub enum Error {
     },
     #[error(transparent)]
     Compile(#[from] crate::backend::CompileError),
-    /// Its own proxy holds the port: there is nothing to stop or recreate.
-    #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
-    ProxyRuns { sandbox: String, port: u16 },
+    /// Its own proxy holds the port, or the lock of a proxy without one:
+    /// there is nothing to stop or recreate. `on` says which: "port 41000",
+    /// or "its socket".
+    #[error("the proxy of sandbox `{sandbox}` already runs on {on}")]
+    ProxyRuns { sandbox: String, on: String },
     /// The sandbox's home is not a real folder (a link, a file, or missing),
     /// so its policy is not compiled: Seatbelt resolves the path when the
     /// policy is compiled, and a link would carry the grant elsewhere.
@@ -141,6 +143,17 @@ pub enum Error {
     ProxyListen {
         sandbox: String,
         addr: String,
+        source: std::io::Error,
+    },
+    /// The proxy cannot open the Unix socket a session with a network of
+    /// its own reaches it on, so it does not start.
+    #[error(
+        "the proxy of sandbox `{sandbox}` cannot listen on {path}: {source}{next}",
+        next = proxy_socket_next_step(.source)
+    )]
+    ProxySocket {
+        sandbox: String,
+        path: PathBuf,
         source: std::io::Error,
     },
     /// Another program holds the sandbox's proxy port on `loopback`, and
@@ -326,6 +339,20 @@ impl std::fmt::Display for HomeFound {
     }
 }
 
+/// What to do about a socket the proxy could not open, where that is known.
+fn proxy_socket_next_step(source: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::{AddrInUse, AlreadyExists, InvalidInput, NotADirectory};
+    match source.kind() {
+        InvalidInput => {
+            ". The path is too long for a Unix socket: set ENCLOS_HOME to a shorter folder, or use a shorter sandbox name"
+        }
+        AddrInUse | AlreadyExists | NotADirectory => {
+            ". Something else is at that path or in its way: move it aside, then start the proxy again"
+        }
+        _ => "",
+    }
+}
+
 impl Error {
     /// [`Error::ProxyPortTaken`] for `addr`, the address found taken.
     pub fn proxy_port_taken(sandbox: &str, addr: std::net::SocketAddr) -> Error {
@@ -358,6 +385,7 @@ impl Error {
             | Error::ProxyPortTaken { .. }
             | Error::ProxyRuns { .. }
             | Error::ProxyListen { .. }
+            | Error::ProxySocket { .. }
             | Error::ProxyStopped { .. }
             | Error::Compile(_)
             | Error::HomeNotAFolder { .. }

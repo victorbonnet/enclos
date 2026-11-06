@@ -4,7 +4,9 @@
 use std::fs::OpenOptions;
 use std::net::{Ipv6Addr, SocketAddr, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,6 +21,36 @@ use crate::state::StateLock;
 
 /// How long the proxy has to start listening.
 const PROXY_START: Duration = Duration::from_secs(5);
+
+/// Where the sandbox's sessions reach its proxy, so where a proxy just
+/// started is seen to listen.
+pub(super) enum Reached {
+    /// Its port on 127.0.0.1, which it binds after `[::1]`.
+    Port(SocketAddr),
+    /// Its Unix socket, which it opens once it holds the lock only one proxy
+    /// holds.
+    Socket(PathBuf),
+}
+
+impl Reached {
+    fn answers(&self) -> bool {
+        match self {
+            Reached::Port(addr) => {
+                TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok()
+            }
+            Reached::Socket(path) => UnixStream::connect(path).is_ok(),
+        }
+    }
+}
+
+impl std::fmt::Display for Reached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reached::Port(addr) => write!(f, "{addr}"),
+            Reached::Socket(path) => write!(f, "{}", path.display()),
+        }
+    }
+}
 
 /// Ends `child`, which this command started but could not record, so that
 /// it does not run where no `stop` finds it; `error` stays the reason.
@@ -116,15 +148,17 @@ impl Engine {
             .mode(0o600)
             .open(&log_path)
             .map_err(|e| failed(format!("cannot open {}: {e}", log_path.display())))?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], record.proxy_port));
-        // Anything else on this port, on either loopback, would receive the
-        // sandbox's traffic.
-        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, record.proxy_port));
-        if let Some(taken) = [addr, v6]
-            .into_iter()
-            .find(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
-        {
-            return Err(Error::proxy_port_taken(record.name.as_str(), taken));
+        let reached = self.proxy_reached_at(record);
+        if let Reached::Port(addr) = &reached {
+            // Anything else on this port, on either loopback, would receive
+            // the sandbox's traffic.
+            let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
+            if let Some(taken) = [*addr, v6]
+                .into_iter()
+                .find(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
+            {
+                return Err(Error::proxy_port_taken(record.name.as_str(), taken));
+            }
         }
         let child = Command::new(exe)
             .args([
@@ -141,19 +175,28 @@ impl Engine {
             .spawn()
             .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
         let mut child = child;
-        match self.record_started_proxy(lock, record, &mut child, addr, &log_path) {
+        match self.record_started_proxy(lock, record, &mut child, &reached, &log_path) {
             Ok(()) => Ok(()),
             Err(e) => Err(abandon(child, e, "the proxy")),
         }
     }
 
-    /// Waits for the proxy this command started to listen, and records it.
-    fn record_started_proxy(
+    /// Where the sandbox's sessions reach its proxy.
+    pub(super) fn proxy_reached_at(&self, record: &SandboxRecord) -> Reached {
+        match record.backend.reaches_proxy_over_socket() {
+            true => Reached::Socket(self.layout.proxy_socket(record.name.as_str())),
+            false => Reached::Port(SocketAddr::from(([127, 0, 0, 1], record.proxy_port))),
+        }
+    }
+
+    /// Waits for the proxy this command started to listen where `reached`
+    /// says, and records it.
+    pub(super) fn record_started_proxy(
         &self,
         lock: &StateLock,
         record: &SandboxRecord,
         child: &mut Child,
-        addr: SocketAddr,
+        reached: &Reached,
         log_path: &std::path::Path,
     ) -> Result<()> {
         let failed = |what: String| Error::Session { what };
@@ -175,19 +218,19 @@ impl Engine {
                 }
             };
             exited(child)?;
-            // It binds 127.0.0.1 after `[::1]`, so once 127.0.0.1 answers and
-            // the proxy is still running, it holds the port on every loopback
-            // it could. The answer itself could come from another program
-            // that took 127.0.0.1 just before the proxy did; the proxy then
-            // exits, which the second look usually catches.
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            // Once it answers and the proxy is still running, the proxy
+            // holds every listener it could. The answer itself could come
+            // from another program, or proxy, that took the place just
+            // before this one; this one then exits, which the second look
+            // usually catches.
+            if reached.answers() {
                 std::thread::sleep(Duration::from_millis(50));
                 exited(child)?;
                 break;
             }
             if start.elapsed() > PROXY_START {
                 return Err(failed(format!(
-                    "the proxy of sandbox {} did not start listening on {addr}; see {}",
+                    "the proxy of sandbox {} did not start listening on {reached}; see {}",
                     record.name,
                     log_path.display()
                 )));
