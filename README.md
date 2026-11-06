@@ -56,6 +56,15 @@ The installer always takes the latest release: it checks the archive's SHA-256 c
 
 The [getting started guide](docs/getting-started.md) explains each step and what does not work yet; [releases](docs/releases.md) says how a release is built and checked.
 
+## From Claude Code or Codex
+
+The [enclos plugin](plugins/enclos/) teaches Claude Code or Codex what enclos is and every command it has, so it can set enclos up and run it for you through the same CLI. It treats what comes from inside a sandbox as data, never sees a secret's value, and leaves logins to you.
+
+```text
+/plugin install enclos --marketplace victorbonnet/enclos     # Claude Code; then /enclos:setup
+codex plugin marketplace add victorbonnet/enclos && codex plugin add enclos@enclos   # Codex
+```
+
 ## Commands
 
 | Command | What it does |
@@ -77,6 +86,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
+- [The enclos plugin](plugins/enclos/README.md): enclos from Claude Code or Codex, and the allow rule each needs.
 - [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under, and [every setting](docs/policy-compilation.md#every-setting) it can hold.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.
 - [Decisions](docs/adr/): one short record per architecture decision.
