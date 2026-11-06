@@ -54,6 +54,23 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked --all-features
+      - name: LOOP (to drop) a Unix socket shutdown, the relay tests, then the library tests
+        run: |
+          python3 -I ci-loop/unix_eof.py 64 1500 timeout 7 unix shutdown || true
+          bin=$(cargo test --locked --all-features --lib --no-run 2>&1 | sed -n 's/.*(\(target\/debug\/deps\/enclos-[0-9a-f]*\)).*/\1/p' | head -1)
+          fails=0
+          for i in $(seq 1 200); do
+            if ! "$bin" relay:: -q > loop-out.txt 2>&1; then
+              fails=$((fails + 1))
+              echo "== relay run $i failed"
+              sed -n '/^failures:/,$p' loop-out.txt | cut -c1-300 | head -40
+            fi
+          done
+          echo "== relay:: $fails of 200 runs failed"
+          for i in $(seq 1 6); do
+            echo "== round $i"
+            cargo test --locked --all-features --lib 2>&1 | grep -E -A1 "FAILED|panicked|test result" | cut -c1-400 || true
+          done
       # A release build refuses the comparison baseline (ADR 0006): checked
       # on every change, not only when a tag is pushed.
       - name: A release refuses the comparison baseline
