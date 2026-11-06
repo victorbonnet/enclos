@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --lib service::systemd::tests::on_a_runner | tee units.log
-          grep -q 'test result: ok\. 10 passed' units.log
+          grep -q 'test result: ok\. 11 passed' units.log
 
   cgroups:
     strategy:
