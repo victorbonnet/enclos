@@ -428,6 +428,27 @@ pub fn members_in(procs: &[Proc], pids: &BTreeSet<u32>) -> (Vec<ProcessRef>, BTr
     (listed, unlisted)
 }
 
+/// The `cgroup.procs` file of the user's manager's own cgroup in the host's
+/// hierarchy, as `systemctl --user show` names that cgroup: it holds every
+/// scope and slice of the user's, so it lies outside any session's cgroup.
+pub fn manager_procs() -> Result<PathBuf, PsError> {
+    let out = Command::new(SYSTEMCTL)
+        .args(["--user", "show", "--property=ControlGroup"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PsError::Cgroup(format!("cannot run systemctl: {e}")))?;
+    if !out.status.success() {
+        return Err(PsError::Cgroup(format!(
+            "systemctl cannot say where the user's manager is: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let cgroup = parse_control_group(&String::from_utf8_lossy(&out.stdout))?.ok_or_else(|| {
+        PsError::Cgroup("systemd gave the user's manager no control group".to_owned())
+    })?;
+    Ok(Hierarchy::host().folder(&cgroup).join("cgroup.procs"))
+}
+
 /// Whether `e`, from reading a cgroup's folder, says the cgroup was removed.
 /// Once systemd removes an emptied cgroup, kernfs answers ENODEV for a file
 /// opened or read as that happens, and ENOENT only after.

@@ -33,6 +33,9 @@ const PASSED_THROUGH: &[&str] = &[
 /// understand it.
 const FALLBACK_TERM: &str = "xterm-256color";
 
+/// The variable naming the sandbox a program runs in.
+pub const SANDBOX_VARIABLE: &str = "ENCLOS_SANDBOX";
+
 /// Where a host system keeps what a session needs from it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HostSystem {
@@ -243,7 +246,7 @@ fn variables_on(
         ("XDG_STATE_HOME", format!("{home}/.local/state")),
         ("UV_CACHE_DIR", format!("{home}/.cache/uv")),
         ("npm_config_cache", format!("{home}/.npm")),
-        ("ENCLOS_SANDBOX", ctx.name.to_string()),
+        (SANDBOX_VARIABLE, ctx.name.to_string()),
         // No browser opens from a sandbox: print the URL instead of trying
         // each one, on macOS through Apple Events, which the policy refuses
         // noisily.

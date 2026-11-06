@@ -9,6 +9,7 @@ pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod inside;
 mod probe;
+pub mod probes;
 pub mod proposed;
 pub mod seccomp;
 mod wrap;
@@ -143,11 +144,14 @@ impl Backend for Bubblewrap {
             .collect()
     }
 
-    fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
-        Err(
-            "cannot be tested yet: the bubblewrap backend's escape probes are not in this build"
-                .to_owned(),
-        )
+    /// The same probes for every compiled file, which must be one this
+    /// backend wrote.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
+        if let Some(text) = compiled {
+            serde_json::from_str::<CompiledSandbox>(text)
+                .map_err(|e| format!("is not a policy compiled for bubblewrap: {e}"))?;
+        }
+        Ok(Box::new(probes::BubblewrapProbes::default()))
     }
 
     /// Every session joins it (ADR 0039).
