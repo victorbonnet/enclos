@@ -62,6 +62,28 @@ pub fn same_network(a: u32, b: u32) -> Result<bool, ListenersError> {
     same_network_under(Path::new(PROC), a, b)
 }
 
+/// The user owning the socket at `client` connected to `server`, both
+/// TCP addresses in this process's network namespace, from the kernel's
+/// tables: none unless they give exactly one, as when the client has closed
+/// its end already. A table that cannot be read is an error; `tcp6` is
+/// missing on a kernel without IPv6.
+pub fn tcp_client_owner(
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Result<Option<u32>, ListenersError> {
+    let net = Path::new(PROC).join("self/net");
+    let mut tables = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let path = net.join(table);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => tables.push(text),
+            Err(e) if table == "tcp6" && e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(proc_error(format!("{}: {e}", path.display()))),
+        }
+    }
+    Ok(net::client_owner(&tables, client, server))
+}
+
 /// The first and last port the system picks from for a bind on port 0.
 pub fn ephemeral_ports() -> Result<(u16, u16), String> {
     let path = "/proc/sys/net/ipv4/ip_local_port_range";
