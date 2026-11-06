@@ -4758,3 +4758,175 @@ fn a_start_whose_proxy_cannot_listen_fails_in_json() {
     assert_eq!(one["proxy_started"], false, "{started}");
     assert_eq!(one["error"]["exit_code"], 1, "{started}");
 }
+
+/// A running `enclos relay`, stopped when the test ends, passed or not.
+struct RelayCommand {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl RelayCommand {
+    /// `enclos relay` on a port that was free, to `socket`. Its home is
+    /// relative, which every command that opens the enclos folder refuses.
+    fn start(socket: &Path) -> RelayCommand {
+        Self::with_descriptors(socket, None).expect("the relay ended")
+    }
+
+    /// As `start`, limited to `descriptors` open files if given; `None` if
+    /// that left it too few to listen.
+    fn with_descriptors(socket: &Path, descriptors: Option<u64>) -> Option<RelayCommand> {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let limit = descriptors.map_or(":".to_string(), |n| format!("ulimit -n {n}"));
+        let child = Command::new("sh")
+            .args(["-c", &format!(r#"{limit} && exec "$@""#), "sh"])
+            .arg(env!("CARGO_BIN_EXE_enclos"))
+            .args(["relay", "--port", &port.to_string(), "--socket"])
+            .arg(socket)
+            .env("ENCLOS_HOME", "not/absolute")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut relay = RelayCommand { child, port };
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if relay.child.try_wait().unwrap().is_some() {
+                return None;
+            }
+            assert!(started.elapsed().as_secs() < 30, "the relay never listened");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some(relay)
+    }
+}
+
+impl Drop for RelayCommand {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn the_relay_passes_curl_to_its_socket_with_no_enclos_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("proxy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Stands in for the proxy, which the library's tests put behind the
+    // relay: this is the command that starts it.
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut conn in listener.incoming().flatten() {
+            let mut request = [0; 1024];
+            if conn.read(&mut request).unwrap_or(0) > 0 {
+                let _ = conn.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    let relay = RelayCommand::start(&socket);
+    let out = Command::new("curl")
+        .args(["--silent", "--max-time", "30", "--noproxy", ""])
+        .args(["--proxy", &format!("http://127.0.0.1:{}", relay.port)])
+        .args(["--output", "/dev/null", "--write-out", "%{http_code}"])
+        .arg("http://denied.test/")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "403");
+}
+
+#[test]
+fn the_relay_listens_on_127_0_0_1_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = RelayCommand::start(&dir.path().join("proxy.sock"));
+    // Neither another address of the loopback, which only a listener on
+    // every address would answer on, nor [::1].
+    for address in ["127.0.0.2", "::1"] {
+        let conn = std::net::TcpStream::connect((address, relay.port));
+        assert!(conn.is_err(), "it answers on {address}");
+    }
+}
+
+/// The next connection on `socket`, polled so a relay that died fails the
+/// test instead of hanging it.
+fn relay_opened(socket: &std::os::unix::net::UnixListener) -> std::os::unix::net::UnixStream {
+    socket.set_nonblocking(true).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        match socket.accept() {
+            Ok((conn, _)) => return conn,
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        assert!(started.elapsed().as_secs() < 30, "no connection came");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_relay_whose_stderr_was_closed_lives_through_what_it_cannot_say() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // Ten descriptors make a limit of one connection.
+    let mut relay = RelayCommand::with_descriptors(&path, Some(10)).unwrap();
+    drop(relay.child.stderr.take());
+    // Starting it left one connection, already closed.
+    drop(relay_opened(&socket));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let held = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    let _upstream = relay_opened(&socket);
+    let mut over = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    assert_eq!(std::io::Read::read(&mut over, &mut [0; 1]).unwrap_or(0), 0);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(relay.child.try_wait().unwrap(), None, "the relay ended");
+    drop(held);
+}
+
+/// With the listener its last descriptor, every accept fails. The smallest
+/// limit it can listen on depends on what the system's startup keeps open.
+#[test]
+fn a_relay_that_cannot_accept_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let mut relay = (4..16)
+        .find_map(|limit| RelayCommand::with_descriptors(&path, Some(limit)))
+        .expect("it never listened");
+    // Its backoff is 100 ms: several tries.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    relay.child.kill().unwrap();
+    relay.child.wait().unwrap();
+    let mut said = String::new();
+    let stderr = relay.child.stderr.as_mut().unwrap();
+    std::io::Read::read_to_string(stderr, &mut said).unwrap();
+    assert_eq!(
+        said.matches("cannot accept a connection").count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(said.lines().count(), 1, "{said}");
+}
+
+#[test]
+fn a_relay_port_already_taken_is_an_error_naming_it() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let out = Home::new().run(&["relay", "--port", &port.to_string(), "--socket", "s.sock"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr()
+            .contains(&format!("cannot listen on 127.0.0.1:{port}")),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn a_relay_socket_path_no_socket_can_have_is_an_error_naming_it() {
+    let path = format!("/tmp/{}", "x".repeat(200));
+    let out = Home::new().run(&["relay", "--port", "1", "--socket", &path]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains(&path), "{}", out.stderr());
+}
