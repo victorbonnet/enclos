@@ -106,6 +106,36 @@ fn every_link_inside_the_plugin_leads_somewhere() {
     assert!(broken.is_empty(), "links that lead nowhere: {broken:#?}");
 }
 
+/// The manual end-to-end test removes its home in §15: the plugin's section
+/// must make its own, or an assistant runs on the user's real state (#172).
+#[test]
+fn the_plugin_e2e_section_makes_its_own_throwaway_home() {
+    let e2e = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/manual-e2e.md"))
+        .unwrap();
+    let cleanup = e2e.find("## 15. Remove everything").unwrap();
+    let plugin = e2e.find("## 16. The enclos plugin").unwrap();
+    assert!(cleanup < plugin);
+    let section = &e2e[plugin..e2e.find("## Known gaps").unwrap()];
+    let home = section.find("export ENCLOS_HOME=").unwrap();
+    let first_prompt = section.find("1. \"What is enclos").unwrap();
+    assert!(
+        home < first_prompt,
+        "the home is set before any assistant runs"
+    );
+    assert!(
+        section.contains("NOTES.md"),
+        "the section makes its own fixtures"
+    );
+    assert!(
+        section.contains("`data` is `$ENCLOS_HOME`"),
+        "each assistant is checked against it"
+    );
+    assert!(
+        section.contains("rm -rf \"$ENCLOS_HOME\"; unset ENCLOS_HOME"),
+        "and it cleans up"
+    );
+}
+
 #[test]
 fn the_codex_manifest_names_its_skills() {
     // Codex finds a plugin's skills only through this field.
