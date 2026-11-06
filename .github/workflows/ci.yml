@@ -54,13 +54,6 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked --all-features
-      - name: LOOP (to drop) the library tests ten times
-        if: runner.os == 'Linux'
-        run: |
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            echo "== round $i"
-            cargo test --locked --all-features --lib 2>&1 | grep -E -A1 "FAILED|panicked|test result" | cut -c1-400 || true
-          done
       # A release build refuses the comparison baseline (ADR 0006): checked
       # on every change, not only when a tag is pushed.
       - name: A release refuses the comparison baseline
