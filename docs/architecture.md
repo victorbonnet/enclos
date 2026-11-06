@@ -6,7 +6,7 @@ How enclos is put together, on a Mac with the Seatbelt backend. The [design](des
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="diagrams/architecture-dark.svg">
-  <img alt="Clients (the enclos CLI; a web UI and an MCP server later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="diagrams/architecture-light.svg">
+  <img alt="Clients (the enclos CLI, which host assistants such as Claude Code and Codex also run, through the enclos plugin; a web UI later) go through one core library: state and audit, policy, runtime adapters and the backend API. Backends: Seatbelt on macOS now; bubblewrap, OpenShell and a microVM later. Seatbelt runs the runtime inside the sandbox, whose only way out is its egress proxy to allowed domains, all run as launchd services." src="diagrams/architecture-light.svg">
 </picture>
 
 The drawing is made by [`diagrams/architecture.py`](diagrams/architecture.py): edit its boxes and run `uv run --no-project python docs/diagrams/architecture.py` to redraw both themes.
