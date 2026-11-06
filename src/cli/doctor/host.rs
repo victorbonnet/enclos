@@ -177,7 +177,7 @@ mod tests {
     fn checks_as_json_keep_each_part() {
         let json = checks_json(&[
             degraded(),
-            HostCheck::fine("Landlock", "ABI 8: the rules need 6"),
+            HostCheck::fine("Landlock", "ABI 6 or later, every right the rules need"),
         ]);
         assert_eq!(json[0]["what"], "memory controller");
         assert_eq!(json[0]["verdict"], "degraded");

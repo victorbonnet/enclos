@@ -107,7 +107,7 @@ fn landlock(kernel: &Kernel) -> HostCheck {
     match kernel.landlock_abi {
         Some(abi) if abi >= LANDLOCK_ABI_NEEDED => HostCheck::fine(
             WHAT,
-            format!("ABI {abi}: the rules need {LANDLOCK_ABI_NEEDED}"),
+            format!("ABI {LANDLOCK_ABI_NEEDED} or later, every right the rules need"),
         ),
         Some(abi) => {
             let lacks: Vec<&str> = LANDLOCK_ADDS

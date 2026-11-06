@@ -106,7 +106,10 @@ fn a_host_with_every_control_says_each_is_held() {
         checks.iter().all(|c| c.verdict == Verdict::Fine),
         "{checks:?}"
     );
-    assert_eq!(checks[0].found, "ABI 8: the rules need 6");
+    assert_eq!(
+        checks[0].found,
+        "ABI 6 or later, every right the rules need"
+    );
     assert_eq!(checks[1].found, "delegated to your systemd manager");
 }
 
