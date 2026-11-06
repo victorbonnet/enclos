@@ -21,9 +21,17 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 PACKAGER = ROOT / "scripts" / "package-release.sh"
 ASSET = "enclos-aarch64-apple-darwin.tar.gz"
+LINUX_ASSETS = {
+    "x86_64": "enclos-x86_64-unknown-linux-musl.tar.gz",
+    "aarch64": "enclos-aarch64-unknown-linux-musl.tar.gz",
+}
 RELEASES = "https://github.com/victorbonnet/enclos/releases"
+# A Linux host the installer supports: Ubuntu 24.04's systemd.
+SYSTEMD_255 = "systemd 255 (255.4-1ubuntu8)\n+PAM +AUDIT +SELINUX\n"
+LINUX = {"OS": "Linux", "ARCH": "x86_64", "SYSTEMD": SYSTEMD_255}
 
 STUB = r'''
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,6 +56,17 @@ elif name == "id":
     print(value("UID", "501"))
 elif name == "sw_vers":
     print(value("MACOS_VERSION", "15.7"))
+elif name == "systemd-run":
+    said = value("SYSTEMD", "missing")
+    if said == "missing":
+        sys.exit(127)
+    print(said, end="")
+elif name == "sha256sum":
+    # The real tool where the host has one, as a Linux host does.
+    if os.path.exists("/usr/bin/sha256sum"):
+        os.execv("/usr/bin/sha256sum", ["/usr/bin/sha256sum", *args])
+    path = args[-1]
+    print(hashlib.sha256(Path(path).read_bytes()).hexdigest() + "  " + path)
 elif name == "curl":
     urls = [arg for arg in args if arg.startswith("https://")]
     if len(urls) != 1:
@@ -99,6 +118,16 @@ def fake_enclos(version="0.2.0", *, fails=False):
     ).encode()
 
 
+def asset_for(settings):
+    """The archive the installer downloads on the host `settings` describe,
+    or the macOS one where it downloads none."""
+    settings = settings or {}
+    if settings.get("OS") == "Linux":
+        arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(settings["ARCH"], settings["ARCH"])
+        return LINUX_ASSETS.get(arch, ASSET)
+    return ASSET
+
+
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="enclos installer test ")
@@ -111,7 +140,7 @@ class InstallerTests(unittest.TestCase):
         self.bin = self.root / "command stubs"
         self.bin.mkdir()
         self.log = self.root / "commands.jsonl"
-        for command in ("uname", "sysctl", "id", "sw_vers", "curl", "tar"):
+        for command in ("uname", "sysctl", "id", "sw_vers", "systemd-run", "sha256sum", "curl", "tar"):
             stub = self.bin / command
             stub.write_text("#!" + sys.executable + "\n" + textwrap.dedent(STUB), encoding="utf-8")
             stub.chmod(0o755)
@@ -150,10 +179,12 @@ class InstallerTests(unittest.TestCase):
         return binary
 
     def run_installer(self, *args, settings=None, archive=None, checksum=None, path_first=(), script=None):
-        """Runs the installer as a file, or piped when `script` gives its text."""
+        """Runs the installer as a file, or piped when `script` gives its text.
+
+        The checksum names the archive of the host `settings` describe."""
         archive = archive or self.release_archive
         if checksum is None:
-            checksum = hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + ASSET + "\n"
+            checksum = hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + asset_for(settings) + "\n"
         checksum_file = self.root / "release.tar.gz.sha256"
         checksum_file.write_text(checksum)
         env = {
@@ -356,15 +387,105 @@ class InstallerTests(unittest.TestCase):
 
     def test_unsupported_hosts_and_root_stop_before_any_download(self):
         for settings, message in (
-            ({"OS": "Linux"}, "only macOS"),
+            ({"OS": "FreeBSD"}, "supports only macOS and Linux (found FreeBSD)"),
             ({"MACOS_VERSION": "14.7"}, "macOS 15 or later"),
             ({"MACOS_VERSION": "beta"}, "Cannot tell the macOS version"),
             ({"UID": "0"}, "without sudo"),
+            ({**LINUX, "ARCH": "armv7l"}, "64-bit x86_64 or arm64 (aarch64) kernel (found armv7l)"),
+            ({**LINUX, "ARCH": "i686"}, "64-bit x86_64 or arm64 (aarch64) kernel (found i686)"),
+            ({**LINUX, "ARCH": "riscv64"}, "(found riscv64)"),
+            ({**LINUX, "UID": "0"}, "without sudo"),
         ):
             with self.subTest(settings=settings):
                 self.log.unlink(missing_ok=True)
                 self.assert_failed(self.run_installer(settings=settings), message)
                 self.assertEqual(self.commands("curl"), [])
+
+    def test_linux_installs_the_archive_for_its_architecture(self):
+        for arch, asset in (
+            ("x86_64", LINUX_ASSETS["x86_64"]),
+            ("amd64", LINUX_ASSETS["x86_64"]),
+            ("aarch64", LINUX_ASSETS["aarch64"]),
+            ("arm64", LINUX_ASSETS["aarch64"]),
+        ):
+            with self.subTest(arch=arch):
+                self.log.unlink(missing_ok=True)
+                self.installed_binary().unlink(missing_ok=True)
+                result = self.run_installer(settings={**LINUX, "ARCH": arch})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.urls(), [
+                    RELEASES + "/latest",
+                    RELEASES + "/download/v0.2.0/" + asset,
+                    RELEASES + "/download/v0.2.0/" + asset + ".sha256",
+                ])
+                with tarfile.open(self.release_archive, "r:gz") as archive:
+                    self.assertEqual(self.installed_binary().read_bytes(), archive.extractfile("enclos").read())
+                self.assertEqual(self.installed_binary().stat().st_mode & 0o777, 0o755)
+                name = "x86_64" if asset == LINUX_ASSETS["x86_64"] else "arm64"
+                self.assertIn("Downloading enclos v0.2.0 for Linux on " + name, result.stdout)
+                self.assertIn("Installed enclos in " + str(self.home / ".local") + "/bin.", result.stdout)
+                self.assertIn("enclos sandbox create lab --backend bubblewrap", result.stdout)
+                self.assertIn("docs/getting-started.md#linux-requirements", result.stdout)
+                self.assertNotIn("Warning", result.stderr)
+                # Linux's own tools: no macOS command is asked anything.
+                self.assertEqual([c["args"] for c in self.commands("systemd-run")], [["--version"]])
+                self.assertEqual(len(self.commands("sha256sum")), 1)
+                self.assertEqual(self.commands("sysctl") + self.commands("sw_vers"), [])
+
+    def test_a_mac_never_asks_for_systemd(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.commands("systemd-run") + self.commands("sha256sum"), [])
+        self.assertNotIn("bubblewrap", result.stdout)
+
+    def test_linux_below_systemd_254_or_unreadable_warns_and_still_installs(self):
+        for said, warning in (
+            ("systemd 252 (252.36-1~deb12u1)\n+PAM\n", "this host has 252, so enclos installs but refuses to start a session"),
+            ("systemd 253\n", "this host has 253"),
+            ("missing", "Cannot tell the systemd version here"),
+            ("", "Cannot tell the systemd version here"),
+            ("not systemd at all\n", "Cannot tell the systemd version here"),
+            ("systemd unknown\n", "Cannot tell the systemd version here"),
+        ):
+            with self.subTest(said=said):
+                self.installed_binary().unlink(missing_ok=True)
+                result = self.run_installer(settings={**LINUX, "SYSTEMD": said})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(self.installed_binary().is_file())
+                self.assertIn("Warning: ", result.stderr)
+                self.assertIn(warning, result.stderr)
+                self.assertIn("systemd 254 or later", result.stderr)
+        for said in ("systemd 254 (254.5-1)\n", "systemd 257 (257.9-1~deb13u1)\n", "systemd 260~rc1 (260~rc1-1)\n"):
+            with self.subTest(said=said):
+                result = self.run_installer(settings={**LINUX, "SYSTEMD": said})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("Warning", result.stderr)
+
+    def test_linux_checks_the_checksum_with_sha256sum(self):
+        settings = {**LINUX, "ARCH": "aarch64"}
+        asset = LINUX_ASSETS["aarch64"]
+        self.assert_failed(
+            self.run_installer(settings=settings, checksum="0" * 64 + "  " + asset + "\n"), "does not match")
+        self.assertEqual(len(self.commands("sha256sum")), 1)
+        self.assertEqual(self.commands("tar") + self.commands("enclos"), [])
+        # The macOS archive's checksum is not the arm64 Linux one's.
+        digest = hashlib.sha256(self.release_archive.read_bytes()).hexdigest()
+        self.assert_failed(
+            self.run_installer(settings=settings, checksum=digest + "  " + ASSET + "\n"), "names another file")
+
+    def run_packager(self, *args):
+        pack_temp = self.root / "packaging temp"
+        pack_temp.mkdir(exist_ok=True)
+        packed = subprocess.run(
+            ["/bin/bash", str(PACKAGER), *map(str, args)],
+            env={"PATH": "/usr/bin:/bin", "TMPDIR": str(pack_temp), "LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(list(pack_temp.iterdir()), [])
+        return packed
 
     def test_a_truncated_download_installs_nothing(self):
         text = INSTALLER.read_text()
@@ -379,23 +500,36 @@ class InstallerTests(unittest.TestCase):
     def test_the_release_packaging_is_what_the_installer_reads(self):
         binary = self.root / "built enclos"
         binary.write_bytes(fake_enclos())
-        out = self.root / "dist"
-        pack_temp = self.root / "packaging temp"
-        pack_temp.mkdir()
-        packed = subprocess.run(
-            ["/bin/bash", str(PACKAGER), str(binary), str(out)],
-            env={"PATH": "/usr/bin:/bin", "TMPDIR": str(pack_temp), "LC_ALL": "C"},
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        self.assertEqual(packed.returncode, 0, packed.stdout + packed.stderr)
-        self.assertEqual(list(pack_temp.iterdir()), [])
-        archive = out / ASSET
-        result = self.run_installer(archive=archive, checksum=(out / (ASSET + ".sha256")).read_text())
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.installed_binary().read_bytes(), fake_enclos())
+        for target, settings in (
+            ("aarch64-apple-darwin", {}),
+            ("x86_64-unknown-linux-musl", {**LINUX, "ARCH": "x86_64"}),
+            ("aarch64-unknown-linux-musl", {**LINUX, "ARCH": "aarch64"}),
+        ):
+            with self.subTest(target=target):
+                out = self.root / ("dist " + target)
+                packed = self.run_packager(binary, target, out)
+                self.assertEqual(packed.returncode, 0, packed.stdout + packed.stderr)
+                asset = "enclos-" + target + ".tar.gz"
+                self.assertEqual(asset, asset_for(settings))
+                self.assertEqual(sorted(p.name for p in out.iterdir()), [asset, asset + ".sha256"])
+                self.installed_binary().unlink(missing_ok=True)
+                result = self.run_installer(
+                    settings=settings, archive=out / asset, checksum=(out / (asset + ".sha256")).read_text())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.installed_binary().read_bytes(), fake_enclos())
+
+    def test_the_packaging_refuses_a_target_the_installer_does_not_know(self):
+        binary = self.root / "built enclos"
+        binary.write_bytes(fake_enclos())
+        for args in (
+            (binary, "x86_64-unknown-linux-gnu", self.root / "dist"),
+            (binary, "x86_64-apple-darwin", self.root / "dist"),
+            (binary, self.root / "dist"),
+        ):
+            with self.subTest(args=args):
+                packed = self.run_packager(*args)
+                self.assertEqual(packed.returncode, 2, packed.stdout + packed.stderr)
+                self.assertFalse((self.root / "dist").exists())
 
     def test_help_installs_nothing(self):
         result = self.run_installer("--help")

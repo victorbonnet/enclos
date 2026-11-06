@@ -46,9 +46,10 @@ jobs:
       # Here, since the prototype's workflows skip a change to docs/adr/ alone
       - name: ADRs 0037 to 0041 stay accepted
         run: python3 -I prototype/m3/test_adr_status.py
+      # On every system: each test plays a Mac or a Linux host through stubs,
+      # and runs on the host's own bash, tar and checksum tools.
       - name: Installer tests (no downloads, nothing installed)
-        if: runner.os == 'macOS'
-        run: python3 tests/test_install.py
+        run: python3 -I tests/test_install.py
       # Installs the toolchain and components pinned in rust-toolchain.toml
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -251,6 +252,101 @@ jobs:
             secrets::libsecret::tests::on_a_runner_a_bus_with_no_secret_service_uses_the_file | tee no-service.log
           grep -q 'test result: ok\. 1 passed' no-service.log
 
+  # The Linux releases are static builds against musl (docs/releases.md),
+  # built natively on these runners as release.yml builds them: the whole
+  # suite, and the runner-only tests that reach the kernel and systemd
+  # through libc, run against that build too.
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+      # The bundled SQLite, the one C dependency, built against musl too.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools bubblewrap
+      # Installs the toolchain and components pinned in rust-toolchain.toml
+      - run: rustup toolchain install
+      - run: rustup target add "$CARGO_BUILD_TARGET"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked --all-features
+      # A runner has no login session, so no user manager without this. It
+      # says nothing of what enclos does about lingering (design §15).
+      - name: A user manager for the runner
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime_dir="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
+          timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
+      # As in the bubblewrap job above.
+      - name: The AppArmor setting bubblewrap needs here
+        run: |
+          try() { bwrap --ro-bind / / true; }
+          if try; then
+            echo "setting: none (bubblewrap runs as installed)"
+          else
+            sudo tee /etc/apparmor.d/enclos-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile enclos-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/enclos-bwrap
+            try
+            echo "setting: the AppArmor profile for /usr/bin/bwrap"
+          fi
+      # On Linux only bubblewrap can run, so doctor's exit 0 says it does,
+      # with systemd 254 or later.
+      - name: The musl binary runs, and its doctor finds bubblewrap running
+        shell: bash
+        run: |
+          binary="target/$CARGO_BUILD_TARGET/debug/enclos"
+          file "$binary"
+          "$binary" --version
+          said="$(ENCLOS_HOME="$(mktemp -d)" "$binary" --text doctor)"
+          printf '%s\n' "$said"
+          grep -q 'bubblewrap: runs here' <<<"$said"
+      # The jobs above count each group's tests; here a filter that matches
+      # nothing still fails.
+      - name: Landlock and seccomp
+        shell: bash
+        env:
+          ENCLOS_CONFINEMENT_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --test inside on_a_runner | tee inside.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' inside.log
+      - name: Sandboxes and sessions under bubblewrap
+        shell: bash
+        env:
+          ENCLOS_BUBBLEWRAP_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' bubblewrap.log
+      - name: Scopes in the runner's user manager
+        shell: bash
+        env:
+          ENCLOS_CGROUP_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --lib engine::tests::runtime::cgroups::on_a_runner | tee cgroups.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' cgroups.log
+      - name: Real units
+        shell: bash
+        env:
+          ENCLOS_SYSTEMD_UNIT_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --lib service::systemd::tests::on_a_runner | tee units.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' units.log
+
   secrets:
     runs-on: ubuntu-24.04
     steps:
@@ -272,7 +368,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, secrets, deny]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny]
     runs-on: ubuntu-24.04
     steps:
       - name: Check needed jobs

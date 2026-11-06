@@ -16,7 +16,7 @@ The words used here:
 
 ## Linux requirements
 
-enclos's Linux support is in development and is not in a release yet. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
+enclos's Linux support is in development and is not in a release yet. Once a release has Linux archives, the installer below installs them on Linux on x86_64 or arm64 (aarch64), as on a Mac; until then, build from a clone. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
 
 A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`) and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
 
@@ -47,7 +47,7 @@ GitHub's Ubuntu 26.04 runner needs none: its AppArmor has a rule for bubblewrap,
 curl -fsSL https://enclos.dev/install.sh | bash
 ```
 
-The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. To install elsewhere, pass a prefix: `curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
+The installer always takes the latest release from [GitHub Releases](https://github.com/victorbonnet/enclos/releases): it checks the archive's SHA-256 checksum and the binary's version, then installs `enclos` into `~/.local/bin`, replacing an older one in one step. If that folder is not on your PATH, run the `export` line it prints. It never uses sudo, edits your shell startup files or creates sandboxes. On Linux it takes the static build for the kernel's architecture ([releases](releases.md)) and warns, but still installs, when systemd is older than 254. To install elsewhere, pass a prefix: `curl -fsSL https://enclos.dev/install.sh | bash -s -- --prefix "$HOME/tools"`, which installs into `~/tools/bin`. To check where a release was built, run `gh attestation verify` on its archive ([releases](releases.md)).
 
 To build from a clone instead, with Rust installed through [rustup](https://rustup.rs) (it picks the version pinned in `rust-toolchain.toml`):
 

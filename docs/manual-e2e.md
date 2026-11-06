@@ -1,6 +1,6 @@
 # Manual end-to-end test
 
-A walk through every enclos command and what it should do, to run by hand on a Mac before a release. Each step gives the commands, then what to expect; tick the box when it matches. Anything else is a finding: note the step, the command and its output.
+A walk through every enclos command and what it should do, to run by hand on a Mac before a release, and on Linux as [section 16](#16-on-linux) says. Each step gives the commands, then what to expect; tick the box when it matches. Anything else is a finding: note the step, the command and its output.
 
 It takes about an hour, a quarter of it Hermes's installs. It uses a throwaway enclos home, so your own `~/.enclos` and its sandboxes stay as they are, and it removes everything it made at the end. The steps that need no login, no bot and no logout were first run on macOS 26.5.2 with the release build of commit 06ad972; what they print is quoted where it helps. The whole guide ran on macOS 27.2 for milestone 2 (design §13).
 
@@ -447,6 +447,103 @@ rm -rf "$ENCLOS_HOME" ~/enclos-e2e-work; unset ENCLOS_HOME
 - [ ] `sandbox rm` without `--yes` exits 3, naming the home and the secrets it would delete; with it, it removes them.
 - [ ] `status` shows no sandbox; neither `launchctl list` nor `~/Library/LaunchAgents` has a job of this home; `security` no longer finds either bot's token (exit 44 each).
 
+## 16. On Linux
+
+Run the guide on Linux too, on each kind of host a release supports that you have: an x86_64 desktop on Ubuntu 24.04 or later, and a Raspberry Pi on 64-bit Raspberry Pi OS (Debian 13) reached over ssh. The steps are the same, with the changes below; what a step shows only on a Mac (launchd, the Keychain, `pbpaste`, folders TCC guards) is checked here through systemd, libsecret or the secrets file, and bubblewrap instead. Hermes on Linux is still in progress (design §13, milestone 3): until it lands, a `runtime install` that fails there is not a finding, and the steps that need Hermes (3, 4, the agents in 5, 9, and the gateway in 10) wait for it.
+
+### Before you start
+
+```bash
+systemd-run --version | head -1          # systemd 254 or later
+bwrap --version
+bwrap --ro-bind / / true; echo "exit $?"
+loginctl show-user "$USER" -p Linger
+```
+
+- [ ] systemd is 254 or later (Debian 12's 252 is not supported); `bwrap` is installed (`sudo apt install bubblewrap`) and starts a program, exit 0. On Ubuntu 24.04 that needs the AppArmor profile in [getting started](getting-started.md#linux-requirements); on 26.04 it needs none.
+- [ ] The build to test is on your PATH: `cargo install --locked --path .` from a clone at the commit, or better the static binary the release will ship, from a manual run of `release.yml` on that commit (`gh run download <run id> -n release-x86_64-unknown-linux-musl`, or `release-aarch64-unknown-linux-musl` on the Pi). Once released, `install.sh` installs it: it names `Linux on x86_64` or `Linux on arm64`, and prints a warning only on a systemd older than 254.
+- [ ] Note whether lingering is on: with it off, the user's services stop at your last logout, so step 10's logout leaves the sandboxes stopped until you log in again.
+
+Throughout the guide: paths are under `/home/<you>`, not `/Users/<you>`; `sed -i ''` is `sed -i`; install `curl` if the host has none.
+
+### 1 and 2: the backend
+
+```bash
+enclos init
+enclos doctor; echo "exit $?"
+enclos sandbox create lab --backend bubblewrap --template assistant
+enclos sandbox create scout --backend bubblewrap --template minimal
+```
+
+- [ ] `init` records `bubblewrap` as the default backend and seatbelt as not available here.
+- [ ] `doctor` says bubblewrap runs here, names the systemd version it found against 254, says what the backend enforces, and exits 0. On Raspberry Pi OS, whose kernel has no Landlock, it says that writes are held by the mounts alone and that any program the sandbox can read can run.
+
+### 5 and 6: sessions in a cgroup, and `policy test`
+
+Run `enclos exec lab -- /bin/sleep 120` in a second terminal, then:
+
+```bash
+enclos sandbox show lab
+systemctl --user list-units --type=scope 'enclos.*'
+systemctl --user status 'enclos.<8 hex>.lab.slice'
+enclos policy test lab
+enclos policy test scout
+```
+
+- [ ] `show` lists the `exec` session and its process; the session runs in a scope `enclos.<8 hex>.lab.<session>.scope` in the sandbox's slice, and Ctrl-C in the second terminal ends it and its scope.
+- [ ] `policy test` runs the probes every backend shares; bubblewrap's own escape probes are still to come (design §13, milestone 3). A probe that reads open is a finding; one it cannot run says why. A refusal on bubblewrap reads as a path that is not there or is empty, `Read-only file system` or `Permission denied`, not as Seatbelt's `Operation not permitted`.
+
+### 8: the secret store
+
+```bash
+enclos secret set lab/demo
+secret-tool lookup service enclos.<8 hex> account lab/demo; echo "exit $?"
+ls -l "$ENCLOS_HOME/secrets.json"
+```
+
+- [ ] `secret set` says where it stored the secret. On a desktop, where a Secret Service such as GNOME Keyring answers, it is libsecret: `secret-tool lookup` prints the value, and `secrets.json` does not exist. Where none answers, as over ssh on the Pi, it is the `0600` file: `secret-tool` finds nothing, and `secrets.json` is `-rw-------`, yours.
+- [ ] With the file store: after `chmod 644 "$ENCLOS_HOME/secrets.json"`, the next `enclos secret set lab/other` refuses, naming the file and its mode, and changes nothing; `chmod 600` puts it back.
+- [ ] After `enclos --yes secret rm lab/demo`, neither `secret-tool lookup` nor `secrets.json` has it.
+
+### 10: systemd units
+
+```bash
+enclos sandbox start lab
+enclos sandbox show lab
+systemctl --user list-units 'enclos.<8 hex>.*'
+ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
+systemctl --user kill --signal=KILL 'enclos.<8 hex>.lab.proxy.service'
+sleep 10; enclos sandbox show lab
+enclos sandbox stop lab
+systemctl --user list-units --all 'enclos.<8 hex>.*'
+ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
+```
+
+- [ ] `start` installs a unit for each service `show` lists, named `<its label>.service`, in `~/.config/systemd/user` (or `$XDG_CONFIG_HOME/systemd/user`), and `list-units` shows each active.
+- [ ] The proxy killed from outside comes back within a few seconds under a new pid: a unit restarts on failure, never after it exits 0.
+- [ ] `stop` ends every session and leaves no unit of this home installed or loaded.
+
+### 14: isolation spot checks
+
+Each of these runs in `lab` and must fail:
+
+```bash
+enclos exec lab -- /bin/ls -A "$HOME/.ssh"
+enclos exec lab -- /bin/ls "$ENCLOS_HOME/sandboxes/scout/home"
+enclos exec lab -- /usr/bin/touch "$HOME/from-the-sandbox"
+enclos exec lab -- /bin/cat "$ENCLOS_HOME/state.db" > /dev/null
+enclos exec lab -- /usr/bin/curl -sS --noproxy '*' -o /dev/null https://example.com
+enclos exec lab -- /usr/bin/curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:22
+enclos exec lab -- /usr/bin/curl -sS --noproxy '*' -o /dev/null http://127.0.0.1:22
+```
+
+- [ ] `~/.ssh` is not there or is empty, whatever it holds on the host; scout's home, `state.db` and the write fail; nothing appears in your home. Without the proxy the request fails, through it loopback gets `403`, and loopback without it cannot connect.
+- [ ] With `enclos exec lab -- /bin/sleep 120` running in a second terminal, and `pid=$(pgrep -n -x sleep)` on the host, `enclos exec scout -- /bin/cat "/proc/$pid/environ"` fails.
+
+### 15: remove everything
+
+- [ ] After `sandbox rm`, `systemctl --user list-units --all 'enclos.<8 hex>.*'` and `~/.config/systemd/user` have nothing of this home, and neither `secret-tool lookup` nor `secrets.json` holds a secret of `lab` or `scout`.
+
 ## Known gaps: not findings
 
 These are stated in the design and the release notes, so a test that shows them is expected:
@@ -455,4 +552,4 @@ These are stated in the design and the release notes, so a test that shows them 
 - Hermes's browser tools do not start in a sandbox.
 - CPU time, memory and file size limits are refused: Seatbelt cannot hold them.
 - Agents of one sandbox share its files: an agent's secrets reach it alone, but another agent of the same sandbox can read its secrets file (ADR 0036). Isolation is per sandbox.
-- Linux is milestone 3.
+- Linux is milestone 3, in progress: Hermes does not run there yet, and bubblewrap's limits and its own escape probes are still to come (design §13).
