@@ -14,7 +14,7 @@ fn a_process_holds_the_listeners_its_descriptors_name_and_no_others() {
     descriptors::fake_process(proc, 7, &["socket:[11]", "/some/file", "socket:[99]"]);
     // Gone: no tables, so it holds none.
     assert_eq!(
-        listeners_of_under(proc, &[7, 8]).unwrap(),
+        listeners_of_under(proc, &[7, 8], Tables::Own).unwrap(),
         [(7, "127.0.0.1:61374".parse().unwrap())]
     );
 }
@@ -30,7 +30,7 @@ fn a_process_that_cannot_be_read_is_an_error() {
     descriptors::fake_process(proc, 7, &[]);
     let fd = proc.join("7/fd");
     std::fs::set_permissions(&fd, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let read = listeners_of_under(proc, &[7]);
+    let read = listeners_of_under(proc, &[7], Tables::Own);
     std::fs::set_permissions(&fd, std::fs::Permissions::from_mode(0o700)).unwrap();
     let err = read.unwrap_err();
     assert!(err.to_string().contains("pid 7 cannot be read"), "{err}");
@@ -52,8 +52,15 @@ fn every_holder_of_the_port_is_named_and_a_port_not_listened_on_has_none() {
     descriptors::fake_process(proc, 8, &["socket:[11]"]);
     descriptors::fake_process(proc, 9, &["socket:[12]"]);
     let at: SocketAddr = "127.0.0.1:61374".parse().unwrap();
-    assert_eq!(listeners_at_under(proc, 61374).unwrap(), [(7, at), (8, at)]);
-    assert!(listeners_at_under(proc, 61375).unwrap().is_empty());
+    assert_eq!(
+        listeners_at_under(proc, 61374, Tables::Own).unwrap(),
+        [(7, at), (8, at)]
+    );
+    assert!(
+        listeners_at_under(proc, 61375, Tables::Own)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A socket at the port that no process shown holds is one of a process
@@ -70,7 +77,7 @@ fn a_listener_of_a_process_that_cannot_be_read_is_an_error() {
     fake_net(&proc.join("self/net"), &tcp);
     descriptors::fake_process(proc, std::process::id(), &[]);
     descriptors::fake_process(proc, 7, &["socket:[11]"]);
-    let err = listeners_at_under(proc, 61374).unwrap_err();
+    let err = listeners_at_under(proc, 61374, Tables::Own).unwrap_err();
     assert!(
         err.to_string()
             .contains("a listener at 127.0.0.1:61374 belongs to a process that cannot be read"),
@@ -107,7 +114,7 @@ fn a_process_is_seen_listening_through_a_thread() {
     descriptors::fake_process(&task, 8, &["socket:[11]"]);
     fake_net(&task.join("8/net"), &socket("0100007F:EFBE", "0A", 11));
     let fd = descriptors::refuse(&proc.join("7/fd"));
-    let read = listeners_of_under(proc, &[7]);
+    let read = listeners_of_under(proc, &[7], Tables::Own);
     fd.restore();
     assert_eq!(read.unwrap(), [(7, "127.0.0.1:61374".parse().unwrap())]);
 }
@@ -177,4 +184,118 @@ fn a_proc_that_cannot_be_read_is_an_error() {
     let entries = std::fs::read_dir(members.path()).unwrap();
     let err = marker_holders_under(Path::new("/nonexistent"), members.path(), entries).unwrap_err();
     assert!(matches!(err, MarkerError::Proc(_)), "{err}");
+}
+
+/// Under a network namespace of the sandbox's own (ADR 0039), a program's
+/// sockets are looked up in that namespace's tables, read through its
+/// namespace holder, not in the program's own folder or this process's.
+#[test]
+fn in_a_namespace_a_programs_listeners_are_read_in_its_holders_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    // The namespace holder, 50: the sandbox's tables, with the relay at the
+    // proxy port and the service at 61374.
+    let tables = [
+        socket("0100007F:A028", "0A", 10),
+        socket("0100007F:EFBE", "0A", 11),
+    ]
+    .concat();
+    fake_net(&proc.join("50/net"), &tables);
+    descriptors::fake_process(proc, 50, &["socket:[10]"]);
+    // The program, 7, whose own folder shows other tables, which hold none
+    // of its sockets.
+    fake_net(&proc.join("7/net"), &socket("0100007F:1F90", "0A", 99));
+    descriptors::fake_process(proc, 7, &["socket:[11]", "/some/file"]);
+    descriptors::fake_process(proc, std::process::id(), &[]);
+    let at: SocketAddr = "127.0.0.1:61374".parse().unwrap();
+    assert_eq!(
+        listeners_of_under(proc, &[7], Tables::Of(50)).unwrap(),
+        [(7, at)]
+    );
+    assert!(
+        listeners_of_under(proc, &[7], Tables::Own)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        listeners_at_under(proc, 61374, Tables::Of(50)).unwrap(),
+        [(7, at)]
+    );
+    // The relay's port is the namespace holder's own.
+    assert_eq!(
+        listeners_at_under(proc, 41000, Tables::Of(50)).unwrap(),
+        [(50, "127.0.0.1:41000".parse().unwrap())]
+    );
+    // A namespace holder that is gone leaves no tables to read.
+    let err = listeners_of_under(proc, &[7], Tables::Of(51)).unwrap_err();
+    assert!(err.to_string().contains("pid 51"), "{err}");
+}
+
+/// A process of a test's own `/proc`, with its parent and its pid in each
+/// PID namespace from the outermost.
+fn fake_status(proc: &Path, pid: u32, parent: u32, pids: &[u32]) {
+    let folder = proc.join(pid.to_string());
+    std::fs::create_dir_all(&folder).unwrap();
+    let nspid: Vec<String> = pids.iter().map(u32::to_string).collect();
+    std::fs::write(
+        folder.join("status"),
+        format!(
+            "Name:\tx\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{parent}\nNSpid:\t{}\n",
+            nspid.join("\t")
+        ),
+    )
+    .unwrap();
+}
+
+/// bubblewrap's outer process 100 runs `enclos inside`, 101, as PID 1 of a
+/// namespace of its own; the command it started is PID 2 there, and what
+/// the command started, or an orphan `enclos inside` reaps, is not it.
+#[test]
+fn the_program_is_the_second_process_of_the_sessions_pid_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    fake_status(proc, 1, 0, &[1]);
+    fake_status(proc, 100, 1, &[100]);
+    fake_status(proc, 101, 100, &[101, 1]);
+    assert_eq!(program_under(proc, 100).unwrap(), None);
+    fake_status(proc, 103, 101, &[103, 3]);
+    fake_status(proc, 102, 101, &[102, 2]);
+    fake_status(proc, 104, 102, &[104, 4]);
+    // Another session's, under another root.
+    fake_status(proc, 200, 1, &[200]);
+    fake_status(proc, 201, 200, &[201, 1]);
+    fake_status(proc, 202, 201, &[202, 2]);
+    assert_eq!(program_under(proc, 100).unwrap(), Some(102));
+    assert_eq!(program_under(proc, 200).unwrap(), Some(202));
+    // A root with no PID namespace below it, as a Seatbelt session's.
+    assert_eq!(program_under(proc, 104).unwrap(), None);
+    assert_eq!(program_under(proc, 999).unwrap(), None);
+}
+
+#[test]
+fn a_status_gives_the_parent_and_each_namespaces_pid() {
+    assert_eq!(
+        parse_status("Name:\tbash\nPPid:\t7\nNSpid:\t12\t2\n"),
+        Some((7, vec![12, 2]))
+    );
+    assert_eq!(parse_status("PPid:\t7\n"), None);
+    assert_eq!(parse_status("PPid:\tx\nNSpid:\t1\n"), None);
+}
+
+#[test]
+fn two_processes_share_a_network_when_their_namespace_links_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    for (pid, net) in [
+        (7, "net:[4026532001]"),
+        (8, "net:[4026532001]"),
+        (9, "net:[4026531840]"),
+    ] {
+        let ns = proc.join(pid.to_string()).join("ns");
+        std::fs::create_dir_all(&ns).unwrap();
+        std::os::unix::fs::symlink(net, ns.join("net")).unwrap();
+    }
+    assert!(same_network_under(proc, 7, 8).unwrap());
+    assert!(!same_network_under(proc, 7, 9).unwrap());
+    assert!(same_network_under(proc, 7, 10).is_err());
 }

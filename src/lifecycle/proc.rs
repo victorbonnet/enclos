@@ -15,14 +15,51 @@ use super::descriptors::{self, Descriptors, PROC};
 use super::listeners::ListenersError;
 use super::marker::{Held, MarkerError};
 
-/// The TCP addresses each of `pids` listens on, with the pid that holds it.
+/// The TCP addresses each of `pids` listens on, with the pid that holds it,
+/// each read in its own network namespace.
 pub fn tcp_listeners_of(pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
-    listeners_of_under(Path::new(PROC), pids)
+    listeners_of_under(Path::new(PROC), pids, Tables::Own)
 }
 
-/// Every process `/proc` shows listening on TCP at 127.0.0.1 port `port`.
+/// Every process `/proc` shows listening on TCP at 127.0.0.1 port `port`,
+/// in this process's network namespace.
 pub fn tcp_listeners_at(port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
-    listeners_at_under(Path::new(PROC), port)
+    listeners_at_under(Path::new(PROC), port, Tables::Own)
+}
+
+/// The TCP addresses each of `pids` listens on in the network namespace of
+/// `namespace`, a process in it, with the pid that holds it: a socket of
+/// theirs outside that namespace is not one.
+pub fn tcp_listeners_in(
+    namespace: u32,
+    pids: &[u32],
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    listeners_of_under(Path::new(PROC), pids, Tables::Of(namespace))
+}
+
+/// Every process `/proc` shows listening on TCP at 127.0.0.1 port `port` in
+/// the network namespace of `namespace`, a process in it.
+pub fn tcp_listeners_at_in(
+    namespace: u32,
+    port: u16,
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    listeners_at_under(Path::new(PROC), port, Tables::Of(namespace))
+}
+
+/// The program that `root` started in a PID namespace of its own: the
+/// process below it numbered 2 there, the first that the namespace's first
+/// process started. Under bubblewrap, `root` is bubblewrap's outer process,
+/// the namespace's first is `enclos inside`, and the second is the
+/// session's command (`inside::command`). None when no such process runs,
+/// as before the command starts.
+pub fn program_in_pid_namespace(root: u32) -> Result<Option<u32>, ListenersError> {
+    program_under(Path::new(PROC), root)
+}
+
+/// Whether processes `a` and `b` are in the same network namespace. An
+/// error when either cannot be read, as when it is gone.
+pub fn same_network(a: u32, b: u32) -> Result<bool, ListenersError> {
+    same_network_under(Path::new(PROC), a, b)
 }
 
 /// The first and last port the system picks from for a bind on port 0.
@@ -72,13 +109,38 @@ fn socket_inode(target: &Path) -> Option<u64> {
         .ok()
 }
 
-/// What `pids` listen on, under `proc`. Each is read through its own network
-/// tables, so a process in another network namespace is read in its own.
-fn listeners_of_under(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+/// Which network tables a look reads.
+#[derive(Debug, Clone, Copy)]
+enum Tables {
+    /// Each process's own, so a process in another network namespace is
+    /// read in its own; this process's for a look at a port.
+    Own,
+    /// Those of the network namespace this process is in.
+    Of(u32),
+}
+
+/// What `pids` listen on, under `proc`, in the network tables `tables` says.
+fn listeners_of_under(
+    proc: &Path,
+    pids: &[u32],
+    tables: Tables,
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+    let namespace = match tables {
+        Tables::Own => None,
+        Tables::Of(namespace) => Some(namespace_tables(proc, namespace)?),
+    };
     let mut found = BTreeSet::new();
     for &pid in pids {
-        let Some(sockets) = tables_of(proc, pid)? else {
-            continue;
+        let own;
+        let sockets = match &namespace {
+            Some(sockets) => sockets,
+            None => match tables_of(proc, pid)? {
+                Some(sockets) => {
+                    own = sockets;
+                    &own
+                }
+                None => continue,
+            },
         };
         match descriptors::of(proc, pid).map_err(proc_error)? {
             Descriptors::Open(open) => found.extend(
@@ -98,14 +160,36 @@ fn listeners_of_under(proc: &Path, pids: &[u32]) -> Result<Vec<(u32, SocketAddr)
     Ok(found.into_iter().collect())
 }
 
+/// The listening sockets of the network namespace `namespace` is in; an
+/// error when it is gone, as nothing else shows that namespace's tables.
+fn namespace_tables(
+    proc: &Path,
+    namespace: u32,
+) -> Result<BTreeMap<u64, SocketAddr>, ListenersError> {
+    tables_of(proc, namespace)?.ok_or_else(|| {
+        proc_error(format!(
+            "pid {namespace}, whose network namespace was to be read, is gone"
+        ))
+    })
+}
+
 /// Every process under `proc` listening at 127.0.0.1 port `port`, in this
-/// process's network namespace.
-fn listeners_at_under(proc: &Path, port: u16) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
+/// process's network namespace, or the one `tables` names.
+fn listeners_at_under(
+    proc: &Path,
+    port: u16,
+    tables: Tables,
+) -> Result<Vec<(u32, SocketAddr)>, ListenersError> {
     let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let net: PathBuf = proc.join("self").join("net");
     let listening = || {
-        let sockets = net::listening_sockets(&net)?
-            .ok_or_else(|| proc_error(format!("{} shows no TCP table", net.display())))?;
+        let sockets = match tables {
+            Tables::Own => {
+                let net: PathBuf = proc.join("self").join("net");
+                net::listening_sockets(&net)?
+                    .ok_or_else(|| proc_error(format!("{} shows no TCP table", net.display())))?
+            }
+            Tables::Of(namespace) => namespace_tables(proc, namespace)?,
+        };
         Ok(sockets
             .into_iter()
             .filter_map(|(inode, addr)| (addr == at).then_some(inode))
@@ -122,6 +206,67 @@ fn listeners_at_under(proc: &Path, port: u16) -> Result<Vec<(u32, SocketAddr)>, 
             .collect())
     };
     holders_among(at, listening, held)
+}
+
+/// A process's parent and its pid in each PID namespace from `proc`'s down
+/// to its own, from the `PPid` and `NSpid` lines of its `status`.
+fn parse_status(text: &str) -> Option<(u32, Vec<u32>)> {
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+            .map(str::trim)
+    };
+    let parent = field("PPid")?.parse().ok()?;
+    let pids = field("NSpid")?
+        .split_whitespace()
+        .map(|word| word.parse().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    (!pids.is_empty()).then_some((parent, pids))
+}
+
+/// What [`parse_status`] reads of every process under `proc`, by pid. A
+/// process that exits meanwhile is left out.
+fn lineages(proc: &Path) -> Result<BTreeMap<u32, (u32, Vec<u32>)>, ListenersError> {
+    let mut found = BTreeMap::new();
+    for entry in std::fs::read_dir(proc).map_err(proc_error)? {
+        let entry = entry.map_err(proc_error)?;
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let status = entry.path().join("status");
+        let text = match std::fs::read_to_string(&status) {
+            Ok(text) => text,
+            Err(e) if descriptors::is_gone(&e) => continue,
+            Err(e) => return Err(proc_error(format!("{}: {e}", status.display()))),
+        };
+        let lineage = parse_status(&text)
+            .ok_or_else(|| proc_error(format!("{} does not read", status.display())))?;
+        found.insert(pid, lineage);
+    }
+    Ok(found)
+}
+
+fn program_under(proc: &Path, root: u32) -> Result<Option<u32>, ListenersError> {
+    let every = lineages(proc)?;
+    let Some((_, root_pids)) = every.get(&root) else {
+        return Ok(None);
+    };
+    // One PID namespace below the root's, numbered `inside` there.
+    let below = |parent: u32, inside: u32| {
+        every.iter().filter_map(move |(pid, (ppid, pids))| {
+            let nested = pids.len() == root_pids.len() + 1 && pids.last() == Some(&inside);
+            (*ppid == parent && nested).then_some(*pid)
+        })
+    };
+    Ok(below(root, 1).find_map(|first| below(first, 2).next()))
+}
+
+fn same_network_under(proc: &Path, a: u32, b: u32) -> Result<bool, ListenersError> {
+    let namespace = |pid: u32| {
+        let link = proc.join(pid.to_string()).join("ns/net");
+        std::fs::read_link(&link).map_err(|e| proc_error(format!("{}: {e}", link.display())))
+    };
+    Ok(namespace(a)? == namespace(b)?)
 }
 
 /// The processes `held`, each with its sockets, that hold a socket `listening`
