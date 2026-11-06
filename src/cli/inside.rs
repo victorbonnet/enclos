@@ -14,42 +14,25 @@ pub struct InsideArgs {
     /// The session's file in `compiled/`.
     #[arg(long, value_name = "PATH")]
     compiled: PathBuf,
-    /// Be the session's relay: what a session starts of itself, on stdin the
-    /// port it holds.
-    #[arg(long, conflicts_with = "command")]
-    relay: bool,
     /// Hand Ctrl-C and Ctrl-\ back to the command, which bubblewrap's outer
     /// process was started ignoring, in a terminal's session.
-    #[arg(long, conflicts_with = "relay")]
+    #[arg(long)]
     restore_interrupts: bool,
     /// The session's command.
-    #[arg(last = true, required_unless_present = "relay")]
+    #[arg(last = true, required = true)]
     command: Vec<OsString>,
 }
 
 #[cfg(target_os = "linux")]
 pub fn run(args: InsideArgs) -> Result<u8> {
     use enclos::backend::bubblewrap::inside;
-    let failed = match args.relay {
-        true => inside::relay(&args.compiled),
-        false => match inside::session(&args.compiled, &args.command, args.restore_interrupts) {
-            Ok(code) => return Ok(code),
-            Err(e) => e,
-        },
-    };
-    Err(Error::Inside {
-        why: failed.to_string(),
-    })
+    inside::session(&args.compiled, &args.command, args.restore_interrupts)
+        .map_err(|e| Error::Inside { why: e.to_string() })
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn run(args: InsideArgs) -> Result<u8> {
-    drop((
-        args.compiled,
-        args.relay,
-        args.restore_interrupts,
-        args.command,
-    ));
+    drop((args.compiled, args.restore_interrupts, args.command));
     Err(Error::Inside {
         why: "`enclos inside` is the bubblewrap backend's, on Linux".to_owned(),
     })

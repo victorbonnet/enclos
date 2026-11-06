@@ -331,13 +331,10 @@ fn the_sandbox_gets_its_own_folders_and_only_those() {
         ]
     );
     assert_eq!(after(args, "--ro-bind-try"), [format!("{sandbox}/secrets")]);
-    assert_eq!(
-        c.relay.socket,
-        format!("{USER}/.enclos/run/home/visible/proxy.sock")
-    );
-    assert_eq!(c.relay.port, 41001);
     let mounted = args.join(" ");
     assert!(!mounted.contains("members"), "{mounted}");
+    // The namespace holder's socket is in the run folder no session mounts.
+    assert!(!mounted.contains("holder.sock"), "{mounted}");
 }
 
 #[test]
@@ -375,12 +372,14 @@ fn a_session_has_its_own_namespaces_and_no_user_namespace() {
         "--disable-userns",
         "--unshare-pid",
         "--as-pid-1",
-        "--unshare-net",
         "--unshare-ipc",
         "--die-with-parent",
     ] {
         assert!(c.bubblewrap.options.iter().any(|a| a == option), "{option}");
     }
+    // The sandbox's network namespace, which the session joined first, is
+    // shared by its sessions (ADR 0039): none of the session's own.
+    assert!(!c.bubblewrap.options.iter().any(|a| a == "--unshare-net"));
     // `wrap` empties the environment (`wrap::tests::command`), on the process,
     // where a secret is not on a command line.
     assert!(!c.bubblewrap.options.iter().any(|a| a == "--clearenv"));

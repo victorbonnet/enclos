@@ -10,6 +10,7 @@ use super::*;
 use crate::backend::bubblewrap::Bubblewrap;
 use crate::engine::start::{CommandKind, Group, Starting};
 use crate::model::agent::AgentName;
+use crate::service::fake::FakeServices;
 
 /// These tests start stand-in proxies on their sandboxes' reserved ports:
 /// one at a time, with every other test run of this user too.
@@ -21,19 +22,21 @@ fn script(path: &Path, body: &str) {
 
 /// A bubblewrap sandbox whose programs are stand-ins in `dir`: `bwrap`
 /// passes the probe, and for a session writes its arguments and variables
-/// there, then runs what follows `--`.
+/// there, then runs what follows `--`; `enclos holder join` runs what
+/// follows its `--`, and a namespace holder in this process answers on the
+/// sandbox's socket.
 struct Stood {
     dir: TempDir,
     engine: Engine,
     name: SandboxName,
     /// What the stand-in proxy listens through, already running.
-    holder: std::process::Child,
+    proxy_listener: std::process::Child,
 }
 
 impl Drop for Stood {
     fn drop(&mut self) {
-        let _ = self.holder.kill();
-        let _ = self.holder.wait();
+        let _ = self.proxy_listener.kill();
+        let _ = self.proxy_listener.wait();
     }
 }
 
@@ -46,6 +49,15 @@ impl Stood {
     /// sandbox's proxy does, or, without `opens`, with something listening
     /// on the sandbox's port and no socket.
     fn with_proxy_socket(opens: bool) -> Stood {
+        let stood = Stood::with(opens, None);
+        let socket = stood.engine.layout.holder_socket("lab");
+        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+        stood
+    }
+
+    /// With no namespace holder answering, and `services` as the service
+    /// manager when given, else none.
+    fn with(opens: bool, services: Option<std::rc::Rc<FakeServices>>) -> Stood {
         let dir = tempfile::tempdir().unwrap();
         let at = |name: &str| dir.path().join(name);
         script(
@@ -63,13 +75,23 @@ exit 99"#,
             ),
         );
         script(&at("systemd-run"), "echo 'systemd 257 (257.1-1)'");
-        script(&at("enclos"), "exit 99");
+        // `holder join`, which becomes what follows its `--`.
+        script(
+            &at("enclos"),
+            &format!(
+                r#"printf '%s\n' "$@" > '{join}'
+[ "$1 $2" = 'holder join' ] || exit 99
+while [ $# -gt 0 ]; do a=$1; shift; [ "$a" = -- ] && exec "$@"; done
+exit 99"#,
+                join = at("join").display()
+            ),
+        );
         let backend = Bubblewrap::at(&at("bwrap"), &at("systemd-run"), Some(at("enclos")));
         let layout = Layout::at(at("enclos-home"));
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
         let socket = layout.proxy_socket("lab");
-        // The proxy only tells `holder` to listen: an interpreter starting
+        // The proxy only tells its listener to listen: an interpreter starting
         // under load could take longer than the engine waits. What it did
         // is in its log, for a test that fails.
         script(
@@ -87,6 +109,10 @@ exit 99"#,
         )
         .with_exe(at("proxy"))
         .with_downloader(Box::new(LocalFiles));
+        let engine = match services {
+            Some(services) => engine.with_services(Box::new(services)),
+            None => engine,
+        };
         done(engine.init(&alice(), Confirm::Yes).unwrap());
         let name: SandboxName = "lab".parse().unwrap();
         let spec = crate::engine::SandboxSpec {
@@ -96,16 +122,16 @@ exit 99"#,
         };
         done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
         let port = engine.state.get(&name).unwrap().unwrap().proxy_port;
-        let holder = hold_port(port, &socket, &at("go"), &at("holder.log"), opens);
+        let proxy_listener = hold_port(port, &socket, &at("go"), &at("holder.log"), opens);
         Stood {
             dir,
             engine,
             name,
-            holder,
+            proxy_listener,
         }
     }
 
-    /// What the stand-in proxy and `holder` did, for a test that fails.
+    /// What the stand-in proxy and its listener did, for a test that fails.
     fn said(&mut self) -> String {
         let log = |path: &Path| match std::fs::read_to_string(path) {
             Ok(text) if text.is_empty() => "(empty)".to_owned(),
@@ -114,10 +140,10 @@ exit 99"#,
         };
         let go = self.dir.path().join("go");
         format!(
-            "proxy.log:\n{}\nholder (pid {}, {:?}):\n{}\ngo: {}",
+            "proxy.log:\n{}\nits listener (pid {}, {:?}):\n{}\ngo: {}",
             log(&self.engine.proxy_log(&self.name)),
-            self.holder.id(),
-            self.holder.try_wait(),
+            self.proxy_listener.id(),
+            self.proxy_listener.try_wait(),
             log(&self.dir.path().join("holder.log")),
             match std::fs::symlink_metadata(&go) {
                 Ok(m) => format!("{:?}", m.file_type()),
@@ -261,6 +287,16 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
         ]
     );
     assert_eq!(&args[..3], ["--ro-bind", "/", "/"]);
+    // The session joined the namespace holder first, which became
+    // bubblewrap.
+    let join = stood.read("join");
+    let join: Vec<&str> = join.lines().collect();
+    let socket = stood.engine.layout.holder_socket("lab");
+    assert_eq!(
+        &join[..5],
+        ["holder", "join", "--socket", socket.to_str().unwrap(), "--"]
+    );
+    assert!(join[5].ends_with("/bwrap"), "{join:?}");
     // The marker, open in the program bubblewrap ran.
     let members = stood.engine.layout.sandbox_dir("lab").join("members");
     let held = std::fs::read_to_string(&fds).unwrap();
@@ -271,6 +307,94 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
     assert!(env.contains(&format!("HOME={}", home.display())), "{env}");
     assert!(!env.contains("CARGO_PKG_NAME"), "{env}");
     assert_eq!(started.session.sandbox, stood.name);
+}
+
+/// The first session of a sandbox that was never started installs its
+/// namespace holder alone, as a service, and joins it once it answers
+/// (ADR 0039). Here the service manager is a stand-in, so the namespace
+/// holder that answers is one this test starts meanwhile.
+#[test]
+fn a_first_session_installs_the_namespace_holder_and_waits_for_it() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let stood = Stood::with(true, Some(services.clone()));
+    let socket = stood.engine.layout.holder_socket("lab");
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+    });
+    let starting = Starting::Command {
+        kind: CommandKind::Exec,
+        group: Group::Own,
+        reads: &[],
+    };
+    let lock = stood.engine.state.lock().unwrap();
+    let (started, said) = crate::notes::heard(|| {
+        stood
+            .engine
+            .start_session(&lock, &stood.name, &["/bin/true".into()], starting, || {
+                Ok(())
+            })
+    });
+    drop(lock);
+    late.join().unwrap();
+    let mut started = started.unwrap();
+    assert!(started.child.wait().unwrap().success());
+    stood.end_proxy();
+    let label = stood.engine.label(&stood.name, Unit::Holder).unwrap();
+    let installed = services.started.borrow();
+    let units: Vec<_> = installed.iter().filter(|u| u.label == label).collect();
+    let [unit] = units.as_slice() else {
+        panic!("{installed:?}");
+    };
+    assert_eq!(unit.args, ["holder", "run", "lab"]);
+    assert_eq!(
+        unit.log,
+        stood
+            .engine
+            .layout
+            .sandbox_dir("lab")
+            .join("logs/holder.log")
+    );
+    // It reads no secret, so it gets no way to a secret store.
+    assert_eq!(unit.env, stood.engine.layout.env());
+    // Nothing else of the sandbox's: it was never started.
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    assert!(
+        said.iter()
+            .any(|s| s.contains("starting the namespace holder of sandbox lab")),
+        "{said:?}"
+    );
+}
+
+/// `sandbox start` replaces the sandbox's services but a namespace holder
+/// that answers: its namespace holds the sessions still open, and a new one
+/// would split them (ADR 0039). One that does not answer is replaced.
+#[test]
+fn sandbox_start_keeps_a_namespace_holder_that_answers() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let stood = Stood::with(true, Some(services.clone()));
+    let label = stood.engine.label(&stood.name, Unit::Holder).unwrap();
+    let holders = || {
+        let started = services.started.borrow();
+        started.iter().filter(|u| u.label == label).count()
+    };
+    services.seed(label.as_str());
+    // None answers: it is removed and installed again with the others.
+    stood.engine.start_sandbox(&alice(), &stood.name).unwrap();
+    assert!(services.stopped.borrow().contains(&label));
+    assert_eq!(holders(), 1);
+    let proxy = stood.engine.label(&stood.name, Unit::Proxy).unwrap();
+    assert!(services.started.borrow().iter().any(|u| u.label == proxy));
+
+    services.stopped.borrow_mut().clear();
+    let socket = stood.engine.layout.holder_socket("lab");
+    crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+    stood.engine.start_sandbox(&alice(), &stood.name).unwrap();
+    assert!(!services.stopped.borrow().contains(&label));
+    assert!(services.stopped.borrow().contains(&proxy));
+    assert_eq!(holders(), 1);
 }
 
 /// `listen = false`, which every template leaves, is not held on
@@ -299,7 +423,7 @@ fn a_session_whose_policy_does_not_listen_says_at_start_that_it_is_not_held() {
     assert_eq!(
         said,
         [
-            "sandbox lab: `listen = false` is not held on bubblewrap: nothing refuses bind or listen in a session's own network namespace (enclos doctor)"
+            "sandbox lab: `listen = false` is not held on bubblewrap: nothing refuses bind or listen in the sandbox's network namespace, which its sessions share (enclos doctor)"
         ]
     );
 }

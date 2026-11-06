@@ -135,7 +135,7 @@ pub(super) fn wrap_in(
         .arg(&launch.program)
         .args(&launch.args);
     let mut command = super::super::under_limits(command, &launch.limits);
-    environment::apply(&mut command, ctx, launch);
+    environment::apply(&mut command, ctx, launch, environment::Loopback::Hosts);
     command.current_dir(&ctx.home);
     command
 }

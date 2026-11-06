@@ -441,7 +441,8 @@ impl Engine {
             name: name.to_string(),
         })?;
         let ctx = self.sandbox_context(name, record.proxy_port);
-        let path = crate::backend::environment::variables(&ctx)
+        let loopback = crate::backend::environment::Loopback::Hosts;
+        let path = crate::backend::environment::variables(&ctx, loopback)
             .into_iter()
             .find(|(k, _)| k == "PATH")
             .map(|(_, v)| v)

@@ -110,11 +110,31 @@ fn shell_command_on(system: &HostSystem, present: &dyn Fn(&str) -> bool) -> Vec<
         .collect()
 }
 
+/// Whose loopback a session's 127.0.0.1 is, which decides whether its
+/// clients ask the proxy for a connection there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loopback {
+    /// The host's, as under Seatbelt: `NO_PROXY` is empty, so a client sends
+    /// even a loopback connection to the proxy, which refuses it, and only
+    /// the runtime's service is reached directly.
+    Hosts,
+    /// The sandbox's own, which its sessions share (bubblewrap, ADR 0039):
+    /// `NO_PROXY` names it, so a client reaches what another session of the
+    /// sandbox listens on, its runtime's service included, without the
+    /// proxy, which refuses loopback.
+    Own,
+}
+
+/// What `NO_PROXY` names on a sandbox's own loopback: its addresses and
+/// name, in the form curl, Python, Node and Go all read.
+pub const OWN_LOOPBACK: &str = "127.0.0.1,localhost,::1";
+
 /// Clears `command`'s environment and sets a session's variables: the
 /// secrets `launch` grants, then the host's kept variables, then enclos's
-/// own. Set in that order, a secret never replaces a variable enclos sets
-/// or passes on, whatever the validation of a policy let through.
-pub fn apply(command: &mut Command, ctx: &SandboxContext, launch: &Launch) {
+/// own, for a session on `loopback`. Set in that order, a secret never
+/// replaces a variable enclos sets or passes on, whatever the validation of
+/// a policy let through.
+pub fn apply(command: &mut Command, ctx: &SandboxContext, launch: &Launch, loopback: Loopback) {
     command.env_clear();
     for (name, value) in &launch.env {
         command.env(name, value.expose());
@@ -122,7 +142,7 @@ pub fn apply(command: &mut Command, ctx: &SandboxContext, launch: &Launch) {
     for (name, value) in from_host() {
         command.env(name, value);
     }
-    for (name, value) in variables(ctx) {
+    for (name, value) in variables(ctx, loopback) {
         command.env(name, value);
     }
 }
@@ -194,15 +214,16 @@ fn needs_fallback_term(
     })
 }
 
-/// The variables every sandboxed program gets.
-pub fn variables(ctx: &SandboxContext) -> Vec<(String, String)> {
-    variables_on(HostSystem::current(), ctx, &on_host)
+/// The variables every sandboxed program on `loopback` gets.
+pub fn variables(ctx: &SandboxContext, loopback: Loopback) -> Vec<(String, String)> {
+    variables_on(HostSystem::current(), ctx, &on_host, loopback)
 }
 
 fn variables_on(
     system: &HostSystem,
     ctx: &SandboxContext,
     present: &dyn Fn(&str) -> bool,
+    loopback: Loopback,
 ) -> Vec<(String, String)> {
     let home = ctx.home.display().to_string();
     let proxy = format!("http://127.0.0.1:{}", ctx.proxy_port);
@@ -239,8 +260,12 @@ fn variables_on(
     ] {
         env.push((name, proxy.clone()));
     }
-    env.push(("NO_PROXY", String::new()));
-    env.push(("no_proxy", String::new()));
+    let direct = match loopback {
+        Loopback::Hosts => String::new(),
+        Loopback::Own => OWN_LOOPBACK.to_owned(),
+    };
+    env.push(("NO_PROXY", direct.clone()));
+    env.push(("no_proxy", direct));
     env.push(("NODE_USE_ENV_PROXY", "1".to_owned()));
     env.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
 }
@@ -259,7 +284,9 @@ mod tests {
     }
 
     fn on(system: &HostSystem, present: &dyn Fn(&str) -> bool) -> HashMap<String, String> {
-        variables_on(system, &ctx(), present).into_iter().collect()
+        variables_on(system, &ctx(), present, Loopback::Hosts)
+            .into_iter()
+            .collect()
     }
 
     fn all_present(_: &str) -> bool {
@@ -289,7 +316,7 @@ mod tests {
             reads: Vec::new(),
         };
         let mut command = Command::new("/bin/true");
-        apply(&mut command, &ctx(), &launch);
+        apply(&mut command, &ctx(), &launch, Loopback::Hosts);
         let env: HashMap<_, _> = command
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
@@ -319,6 +346,21 @@ mod tests {
             assert_eq!(env["NODE_USE_ENV_PROXY"], "1");
             assert_eq!(env["ENCLOS_SANDBOX"], "home");
         }
+    }
+
+    /// On the sandbox's own loopback, what another of its sessions listens
+    /// on is reached directly: the proxy refuses loopback. The proxy itself
+    /// is still every other connection's way out.
+    #[test]
+    fn on_its_own_loopback_a_session_reaches_loopback_without_the_proxy() {
+        let env: HashMap<String, String> =
+            variables_on(&LINUX, &ctx(), &all_present, Loopback::Own)
+                .into_iter()
+                .collect();
+        for name in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(env[name], "127.0.0.1,localhost,::1", "{name}");
+        }
+        assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:41001");
     }
 
     #[test]
@@ -423,7 +465,9 @@ mod tests {
 
     #[test]
     fn no_secret_is_given_as_a_variable_enclos_sets_or_passes_on() {
-        let set = variables(&ctx()).into_iter().map(|(name, _)| name);
+        let set = variables(&ctx(), Loopback::Own)
+            .into_iter()
+            .map(|(name, _)| name);
         for name in set.chain(PASSED_THROUGH.iter().map(|n| (*n).to_owned())) {
             assert!(
                 crate::model::secret::reserved_variable(&name),

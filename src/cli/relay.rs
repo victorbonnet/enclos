@@ -1,8 +1,8 @@
-//! `enclos relay`: a session's way to the proxy's Unix socket from its own
-//! 127.0.0.1 (design §5, Linux networking). Hidden: it is for enclos to
-//! start, and nothing starts it yet. A session's relay is `enclos inside
-//! --relay` until the namespace holder of ADR 0039 is built to run this one.
-//! It runs where the enclos folder is out of sight, so it opens none of it.
+//! `enclos relay`: a way to the proxy's Unix socket from 127.0.0.1 (design
+//! §5, Linux networking), on its own. Hidden: enclos starts none, as a
+//! bubblewrap sandbox's namespace holder serves the same relay in its own
+//! process (`enclos holder serve`); the tests run this one. It opens nothing
+//! of the enclos folder.
 
 use std::path::PathBuf;
 

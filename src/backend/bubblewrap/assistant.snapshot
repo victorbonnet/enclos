@@ -186,7 +186,6 @@
       "--disable-userns",
       "--unshare-pid",
       "--as-pid-1",
-      "--unshare-net",
       "--unshare-ipc",
       "--unshare-uts",
       "--unshare-cgroup-try",
@@ -291,16 +290,11 @@
       "AF_UNIX": 1
     }
   },
-  "relay": {
-    "port": 41001,
-    "socket": "/nonexistent-enclos-test/alice/.enclos/run/home/visible/proxy.sock",
-    "log": "/tmp/enclos-relay.log"
-  },
   "unenforced": [
     {
       "field": "network.listen",
       "when": "every host",
-      "why": "nothing refuses bind or listen in a session's own network namespace"
+      "why": "nothing refuses bind or listen in the sandbox's network namespace, which its sessions share"
     }
   ]
 }

@@ -1,27 +1,26 @@
 //! What the backend rests on that depends on the host or is still open: the
 //! dependences compiling has on ADRs 0037 to 0039 and 0041, accepted, and on
 //! design §15. The module's name dates from when those ADRs were proposed.
-//! The namespace holder of ADR 0039 is not built yet; once it is, the relay
-//! changes too: see [`NAMESPACES`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Capabilities, Enforcement};
 use crate::model::policy::Policy;
 
-/// Every session its own namespaces, a service's included. Under ADR 0039
-/// a session joins the namespace holder's network namespace instead, and the
-/// holder serves the one relay, so `relay` in the compiled file changes too.
-/// No user namespace is made inside (`--disable-userns`). `--as-pid-1`:
-/// without it bubblewrap's own reaper is PID 1, with no filter and no
-/// Landlock, which a member on a host with neither Landlock nor Yama could
-/// attach to; so what bubblewrap runs confines itself, stays PID 1 and reaps.
+/// The namespaces bubblewrap makes for each session, a service's included,
+/// inside the namespace holder's user and network namespaces, which the
+/// session joined first (ADR 0039): a user namespace nested in the holder's,
+/// and PID and IPC namespaces of its own, but no network namespace, as the
+/// sandbox's is shared. No user namespace is made inside
+/// (`--disable-userns`). `--as-pid-1`: without it bubblewrap's own reaper is
+/// PID 1, with no filter and no Landlock, which a member on a host with
+/// neither Landlock nor Yama could attach to; so what bubblewrap runs
+/// confines itself, stays PID 1 and reaps.
 pub(super) const NAMESPACES: &[&str] = &[
     "--unshare-user",
     "--disable-userns",
     "--unshare-pid",
     "--as-pid-1",
-    "--unshare-net",
     "--unshare-ipc",
     "--unshare-uts",
     "--unshare-cgroup-try",
@@ -124,13 +123,13 @@ pub(super) const LISTEN: &str = "network.listen";
 /// `[exec]` section joins them once a policy can hold one (ADR 0037).
 pub(super) fn unenforced(policy: &Policy) -> Vec<Unenforced> {
     let mut fields = Vec::new();
-    // Declared, not refused (ADR 0041): a network namespace of its own
+    // Declared, not refused (ADR 0041): the sandbox's network namespace
     // limits who is reached, not whether the sandbox listens.
     if !policy.net.listen {
         fields.push(Unenforced {
             field: LISTEN.to_owned(),
             when: "every host".to_owned(),
-            why: "nothing refuses bind or listen in a session's own network namespace".to_owned(),
+            why: "nothing refuses bind or listen in the sandbox's network namespace, which its sessions share".to_owned(),
         });
     }
     // ADR 0038.

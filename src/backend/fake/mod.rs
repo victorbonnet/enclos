@@ -155,7 +155,12 @@ impl Backend for FakeBackend {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
         let mut command = super::under_limits(command, &launch.limits);
-        super::environment::apply(&mut command, ctx, launch);
+        super::environment::apply(
+            &mut command,
+            ctx,
+            launch,
+            super::environment::Loopback::Hosts,
+        );
         command.env(IN_TERMINAL, launch.in_terminal.to_string());
         command.env(
             SERVICE_PORT,
@@ -205,7 +210,12 @@ mod tests {
         let fake = FakeBackend::available(BackendKind::Seatbelt);
         let wrapped = fake.wrap(Path::new("/c.fake"), &ctx, &launch).unwrap();
         let mut expected = Command::new("/usr/bin/true");
-        crate::backend::environment::apply(&mut expected, &ctx, &launch);
+        crate::backend::environment::apply(
+            &mut expected,
+            &ctx,
+            &launch,
+            crate::backend::environment::Loopback::Hosts,
+        );
         assert_eq!(envs(&wrapped), envs(&expected));
     }
 
