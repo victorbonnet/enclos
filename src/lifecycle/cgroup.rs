@@ -297,6 +297,17 @@ impl Scopes {
             .collect();
         (scope.around(command, &manager), scope)
     }
+
+    /// Holds `sandbox`'s slice, which each of its scopes sits in, to
+    /// `limits` (design §7).
+    pub fn limit_slice(
+        &self,
+        install: &str,
+        sandbox: &str,
+        limits: &super::slice::SliceLimits,
+    ) -> Result<(), PsError> {
+        super::slice::hold(&slice_name(install, sandbox), limits)
+    }
 }
 
 /// The scope a session's program runs in, and its cgroup once read.

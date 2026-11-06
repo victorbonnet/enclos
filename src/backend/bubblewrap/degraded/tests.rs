@@ -213,6 +213,25 @@ fn an_older_landlock_abi_names_what_it_lacks_and_the_kernel_that_brings_it() {
     assert!(!not_enforced(&check).contains("IOCTL_DEV"), "{check:?}");
 }
 
+/// ADR 0038: the same reading decides whether `memory` is applied.
+#[test]
+fn memory_is_held_only_where_the_controller_is_delegated() {
+    assert_eq!(memory_not_held(&Fixture::ubuntu().kernel()), None);
+    let pi = memory_not_held(&Fixture::raspberry_pi_os().kernel()).unwrap();
+    assert!(
+        pi.starts_with("memory controller: not in the kernel"),
+        "{pi}"
+    );
+    let kept = Fixture::ubuntu();
+    kept.file(MANAGER, "cpu pids\n");
+    let why = memory_not_held(&kept.kernel()).unwrap();
+    assert!(why.contains("not delegated"), "{why}");
+    let unread = Fixture::ubuntu();
+    unread.remove(MANAGER);
+    let why = memory_not_held(&unread.kernel()).unwrap();
+    assert!(why.contains("cannot be told"), "{why}");
+}
+
 /// Raspberry Pi OS: the firmware passes `cgroup_disable=memory`, and
 /// `cmdline.txt` takes the option that turns it back on.
 #[test]

@@ -131,8 +131,31 @@ impl Engine {
     ///   that change. A change that also touches rules sessions keep waits
     ///   as a whole.
     ///
-    /// `policy.toml` holds `overrides` either way.
+    /// `policy.toml` holds `overrides` either way. The acceptances this
+    /// command gives for what the change runs with not enforced are
+    /// recorded with it (ADR 0038).
     pub(super) fn propose(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        change: Change<'_>,
+    ) -> Result<Recorded> {
+        let snapshot = change.snapshot;
+        let recorded = self.propose_change(lock, by, name, change)?;
+        let at = match &recorded.applied.outcome {
+            ChangeOutcome::Pending(_) => format!(
+                "for the pending policy, with policy v{} in force",
+                recorded.applied.version.version
+            ),
+            _ => format!("at policy v{}", recorded.applied.version.version),
+        };
+        self.record_acceptances(lock, by, name, &snapshot.policy, &at)?;
+        Ok(recorded)
+    }
+
+    /// [`Engine::propose`], but for the acceptances it records.
+    fn propose_change(
         &self,
         lock: &StateLock,
         by: &Actor,

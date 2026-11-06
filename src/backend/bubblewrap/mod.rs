@@ -26,6 +26,7 @@ use super::{
 use crate::host::HostCheck;
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
+use crate::model::unenforced::NotEnforcedHere;
 use crate::probes::OwnProbes;
 
 pub use compile::{CompiledSandbox, compile};
@@ -102,11 +103,9 @@ impl Backend for Bubblewrap {
         checks
     }
 
-    /// Declared for this host's Landlock (ADR 0037).
+    /// Declared for this host's Landlock and cgroups (ADR 0037, ADR 0038).
     fn capabilities(&self) -> Capabilities {
-        capabilities(&Host {
-            landlock_abi: probe::landlock_abi(),
-        })
+        capabilities(&host())
     }
 
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
@@ -145,9 +144,10 @@ impl Backend for Bubblewrap {
         wrap::command(&programs, compiled, &parsed, &host, ctx, launch)
     }
 
-    /// `listen = false` is not held (design §15): every start says so.
+    /// `listen = false` is not held (ADR 0041), nor a field this host does
+    /// not enforce (ADR 0038): every start says so.
     fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String> {
-        proposed::unenforced(policy)
+        let listen = proposed::unenforced(policy)
             .into_iter()
             .filter(|u| u.field == proposed::LISTEN)
             .map(|u| {
@@ -155,8 +155,17 @@ impl Backend for Bubblewrap {
                     "sandbox {}: `listen = false` is not held on bubblewrap: {} (enclos doctor)",
                     ctx.name, u.why
                 )
-            })
-            .collect()
+            });
+        let here = self
+            .not_enforced_here(policy)
+            .into_iter()
+            .map(|gap| gap.said_at_start(ctx.name.as_str()));
+        listen.chain(here).collect()
+    }
+
+    /// `memory`, where this host's cgroups do not hold it (ADR 0038).
+    fn not_enforced_here(&self, policy: &Policy) -> Vec<NotEnforcedHere> {
+        proposed::not_enforced_here(policy, &host())
     }
 
     /// The same probes for every compiled file, which must be one this
@@ -172,6 +181,14 @@ impl Backend for Bubblewrap {
     /// Every session joins it (ADR 0039).
     fn namespace_holder(&self) -> Option<&dyn NamespaceHolder> {
         Some(self)
+    }
+}
+
+/// This host, as the backend's capabilities depend on it.
+fn host() -> Host {
+    Host {
+        landlock_abi: probe::landlock_abi(),
+        memory_not_held: degraded::memory_not_held(&degraded::Kernel::host()),
     }
 }
 

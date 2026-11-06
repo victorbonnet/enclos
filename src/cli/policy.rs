@@ -19,6 +19,7 @@ use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
+use enclos::model::unenforced::UnenforcedField;
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -46,7 +47,14 @@ enum PolicyVerb {
     },
     /// Edit the sandbox's policy.toml in $VISUAL or $EDITOR, then apply it:
     /// at once, or pending while sessions run under rules it changes.
-    Edit { sandbox: SandboxName },
+    Edit {
+        sandbox: SandboxName,
+        /// Run with this field not applied where this host does not enforce
+        /// it, such as `memory` without the memory controller; recorded in
+        /// the audit log, and kept until the field's value changes.
+        #[arg(long, value_name = "FIELD")]
+        accept_unenforced: Vec<UnenforcedField>,
+    },
     /// Restart the sandbox into its pending policy.
     Apply { sandbox: SandboxName },
     /// Drop the pending policy, and any edit of policy.toml not applied.
@@ -72,11 +80,23 @@ enum PolicyVerb {
         sandbox: SandboxName,
         #[arg(long, value_name = "VERSION")]
         to: u32,
+        /// Run with this field not applied where this host does not enforce
+        /// it, such as `memory` without the memory controller; recorded in
+        /// the audit log, and kept until the field's value changes.
+        #[arg(long, value_name = "FIELD")]
+        accept_unenforced: Vec<UnenforcedField>,
     },
     /// Resolve the active policy's policy.toml again against this enclos's
     /// templates, built-in defaults and the runtime's adapter; with --yes,
     /// apply what that changes, in place of a pending change.
-    Refresh { sandbox: SandboxName },
+    Refresh {
+        sandbox: SandboxName,
+        /// Run with this field not applied where this host does not enforce
+        /// it, such as `memory` without the memory controller; recorded in
+        /// the audit log, and kept until the field's value changes.
+        #[arg(long, value_name = "FIELD")]
+        accept_unenforced: Vec<UnenforcedField>,
+    },
     /// Try each way out of the sandbox from inside it; every probe must fail.
     Test {
         sandbox: SandboxName,
@@ -86,6 +106,22 @@ enum PolicyVerb {
         #[arg(long)]
         host_services: bool,
     },
+}
+
+/// The fields `args` accepts running not enforced (ADR 0038).
+pub fn accepted_unenforced(args: &PolicyArgs) -> Vec<UnenforcedField> {
+    match &args.verb {
+        PolicyVerb::Edit {
+            accept_unenforced, ..
+        }
+        | PolicyVerb::Rollback {
+            accept_unenforced, ..
+        }
+        | PolicyVerb::Refresh {
+            accept_unenforced, ..
+        } => accept_unenforced.clone(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> Result<u8> {
@@ -139,7 +175,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 engine.policy_allow(by, &sandbox, &destination, confirm)?,
             );
         }
-        PolicyVerb::Edit { sandbox } => return edit(engine, by, &sandbox, confirm),
+        PolicyVerb::Edit { sandbox, .. } => return edit(engine, by, &sandbox, confirm),
         PolicyVerb::Apply { sandbox } => {
             return match engine.policy_apply(by, &sandbox, confirm)? {
                 Planned::DryRun(plan) => {
@@ -182,11 +218,11 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
                 false => print_diff(&sandbox, &diff),
             }
         }
-        PolicyVerb::Rollback { sandbox, to } => {
+        PolicyVerb::Rollback { sandbox, to, .. } => {
             let planned = engine.policy_rollback(by, &sandbox, to, confirm)?;
             return print_replaced(engine, &sandbox, &format!("v{to}"), planned);
         }
-        PolicyVerb::Refresh { sandbox } => {
+        PolicyVerb::Refresh { sandbox, .. } => {
             let planned = engine.policy_refresh(by, &sandbox, confirm)?;
             return print_replaced(engine, &sandbox, "a refresh", planned);
         }

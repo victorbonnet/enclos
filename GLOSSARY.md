@@ -123,6 +123,14 @@ On Linux, the unit of the user's systemd manager that holds one session's proces
 **Slice**:
 On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
 
+**Limit**:
+A bound a policy sets on what a sandbox's processes use: open files on each process, or memory and a share of the CPU on the sandbox as a whole, its sessions and services together.
+_Avoid_: quota, resource cap
+
+**Acceptance**:
+The user's explicit, audited consent that a sandbox runs with a policy field this host does not enforce, such as a memory limit where the host has no memory controller. It is kept with the sandbox until the field's value changes.
+_Avoid_: override, waiver
+
 **Workspace**:
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume

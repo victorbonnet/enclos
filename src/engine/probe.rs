@@ -269,7 +269,7 @@ impl Engine {
                     let wrapped = backend
                         .wrap(&compiled, &ctx, &launch)
                         .map_err(std::io::Error::other)?;
-                    let mut out = self.run_scoped(name, wrapped)?;
+                    let mut out = self.run_scoped(name, wrapped, &launch.limits)?;
                     let (stderr, said) = set_aside_notices(&out.stdout, &out.stderr);
                     out.stderr = stderr;
                     for notice in said {
@@ -419,15 +419,17 @@ impl Engine {
     }
 
     /// Runs `wrapped`, a probe of sandbox `name`, to its end with no input,
-    /// in a scope of the sandbox's slice as a session's program runs where
-    /// this engine has scopes (design §8), then ends what it left there.
+    /// in a scope of the sandbox's slice held to `limits`, as a session's
+    /// program runs where this engine has scopes (design §8), then ends what
+    /// it left there.
     fn run_scoped(
         &self,
         name: &SandboxName,
         wrapped: Command,
+        limits: &LaunchLimits,
     ) -> std::io::Result<std::process::Output> {
         let (mut scoped, scope) = self
-            .in_scope(name, wrapped)
+            .in_scope(name, wrapped, limits)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let output = scoped.stdin(Stdio::null()).output()?;
         if let Some(scope) = scope {

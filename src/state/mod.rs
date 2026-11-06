@@ -16,6 +16,7 @@ use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, Snapsho
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
+use crate::model::unenforced::Acceptance;
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
 ///
@@ -186,6 +187,18 @@ pub trait StateStore: NetLogStore {
     fn remove_secret(&self, lock: &StateLock, secret: &SecretRef) -> Result<bool>;
     /// The sandbox's secrets, by name.
     fn secrets(&self, sandbox: &SandboxName) -> Result<Vec<SecretRecord>>;
+
+    /// Records that the sandbox runs with a field not enforced on this
+    /// host, as the user accepted it (ADR 0038), in place of an earlier
+    /// acceptance of that field.
+    fn accept_unenforced(
+        &self,
+        lock: &StateLock,
+        sandbox: &SandboxName,
+        accepted: &Acceptance,
+    ) -> Result<()>;
+    /// The sandbox's acceptances, by field.
+    fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections
