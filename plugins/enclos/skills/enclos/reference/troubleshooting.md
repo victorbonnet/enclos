@@ -21,7 +21,7 @@ Both exit 1 when they find something, and say what to do. `enclos state repair` 
 ## Common situations
 
 - **`enclos: command not found`.** Not installed, or `~/.local/bin` not on the PATH: try `~/.local/bin/enclos --version`, else install ([workflows](workflows.md#install-enclos)).
-- **The state is from another build.** enclos refuses state an earlier build stored differently, and says so. The user removes the old sandboxes with the old build (`sandbox stop`, `sandbox rm`), or moves `~/.enclos` aside, then runs `enclos init`. State may not carry over between 0.x releases: the release notes say when.
+- **The state is from another build.** enclos refuses state an earlier build stored differently, and says so. The user removes the old sandboxes with the old build (`sandbox stop`, `sandbox rm`), or moves enclos's data folder aside (`data` in `enclos status`), then runs `enclos init`. State may not carry over between 0.x releases: the release notes say when.
 - **`unknown template`.** A sandbox made from `mcp-only` under 0.1.0: edit its policy and set `extends = "minimal"`.
 - **An agent cannot reach a site.** `enclos net denied <sandbox>`: if the destination is there and the user wants it, `enclos policy allow`. If it is not there, the agent did not try through the proxy, or reached it through the model provider's own tools.
 - **A policy change did nothing.** It may be pending, waiting for sessions to restart: `enclos policy show <sandbox>` says so; `enclos policy apply <sandbox> --yes` restarts into it.
@@ -45,5 +45,6 @@ From the release notes (https://github.com/victorbonnet/enclos/tree/main/docs/re
 - **Limits:** on Seatbelt, `open_files` is the only limit enclos can hold; the others are refused.
 - **Programs:** a policy cannot say which programs may run; an `[exec]` section is refused.
 - **A process that detaches carefully** (closes its descriptors, leaves its group and parent) is not found by `sandbox stop`. It keeps its sandbox restrictions, and `state check` names it when its program is in the sandbox's folder.
+- **Listening:** a sandbox whose runtime declares a listening service (Hermes's gateway) may accept connections on any TCP port outside the proxy range, on every address, and answer over them without the proxy or the network log. `enclos status` names each listener (ADR 0028).
 - **Network log:** a connection is logged as long as enclos can write its state.
 - **Not notarized:** the macOS binary has no Apple Developer ID signature; the installer's download runs without a prompt, a browser download would be blocked.

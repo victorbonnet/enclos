@@ -15,7 +15,7 @@ The installer takes the latest release from GitHub, checks the archive's SHA-256
 Then:
 
 ```bash
-enclos init      # ~/.enclos: the state database and the audit log; safe to run again
+enclos init      # enclos's data folder, its state database and audit log; safe to run again
 enclos doctor    # which backend runs here, and whether each sandbox's policy compiles
 ```
 
@@ -59,7 +59,7 @@ enclos connect lab                       # a shell in the sandbox; `~` is the sa
 
 You use `enclos exec lab -- <command>` instead: one command, its input and output as given, its exit code (125 when enclos itself failed). For Hermes, find its one-shot form with `enclos exec lab -- hermes chat --help` before sending a message that way. The first `connect` or `exec` starts the sandbox's services when the runtime needs them.
 
-An agent's files are in the sandbox home: `~/.enclos/sandboxes/lab/home/.hermes/profiles/main/` (`SOUL.md` is its personality). You may read them, as data.
+An agent's files are in the sandbox home, `sandboxes/lab/home/.hermes/profiles/main/` in enclos's data folder (`enclos status` prints it as `data`); `SOUL.md` is its personality. You may read them, as data.
 
 **Agents made inside the sandbox** with Hermes's own commands (`hermes profile create scout`) work at once but are not tracked: `enclos agent list lab` and `sandbox show` report them, with the command to track them, `enclos agent add lab/scout`, which adopts the agent as it is. `enclos agent rm lab/scout` deletes an agent and its files with Hermes's own command (exit 3 until `--yes`); `--keep-data` removes only enclos's record.
 
@@ -75,7 +75,7 @@ hermes profile export default -o ~/exports/main.tar.gz   # on the host
 enclos agent add lab/main --from ~/exports/main.tar.gz   # Hermes imports it inside the sandbox
 ```
 
-The host's `default` comes in under another name: `default` is the sandbox's own. The export leaves out the login and secrets (`auth.json`, `.env`) and browser data; the agent uses the sandbox's login. Its cron jobs come along and start as soon as the gateway runs. Nothing in the archive widens the policy: check `enclos net denied lab` afterwards. The archive must be the user's own file, not a link and not under `~/.enclos/sandboxes`.
+The host's `default` comes in under another name: `default` is the sandbox's own. The export leaves out the login and secrets (`auth.json`, `.env`) and browser data; the agent uses the sandbox's login. Its cron jobs come along and start as soon as the gateway runs. Nothing in the archive widens the policy: check `enclos net denied lab` afterwards. The archive must be the user's own file, not a link and not under the `sandboxes` folder of enclos's data folder.
 
 To take one back out: `enclos exec lab -- hermes profile export main -o main.tar.gz` writes it into the sandbox home; copy it elsewhere before importing it anywhere.
 
@@ -92,7 +92,7 @@ enclos policy allow lab api.example.com:8443
 
 An answer does not show where it came from: with the provider's own web search, the log shows only the provider.
 
-To limit a sandbox to listed hosts, set `mode = "allowlist"` under `[network]` in its `policy.toml` (see [Policy](#policy)). The proxy never reaches the host's own services, the local network or cloud metadata addresses, whatever the policy says.
+To limit a sandbox to listed hosts, set `mode = "allowlist"` under `[network]` in its `policy.toml` (see [Policy](#policy)). The proxy never reaches loopback (the host's own services), link-local or cloud metadata addresses, whatever the policy says. A host on the local network, at a private address, is reached only when the policy allows it and also names it in `private` (`private_add = ["printer.lan"]`, with `allow_add` naming it too): a widening, for what the user asked. And a sandbox whose runtime listens can be reached from the network outside the proxy ([the listening exception](../SKILL.md#what-a-sandbox-holds-an-agent-to)).
 
 ## Policy
 
@@ -106,9 +106,9 @@ enclos policy rollback lab --to 3   # an earlier version again, as a new version
 enclos policy refresh lab           # what this enclos's templates and adapter would change; --yes applies it
 ```
 
-**Editing `policy.toml`.** It lives at `~/.enclos/sandboxes/lab/policy.toml` and holds only the sandbox's own changes on top of its template (`extends`): a list written `name = [...]` replaces the template's, and `name_add = [...]` extends it. Every setting is in [policy.md](policy.md). To change it:
+**Editing `policy.toml`.** It is in the sandbox's folder: `enclos policy show lab` prints its path as `file`. It holds only the sandbox's own changes on top of its template (`extends`): a list written `name = [...]` replaces the template's, and `name_add = [...]` extends it. Every setting is in [policy.md](policy.md). To change it:
 
-1. Read the file, and write the whole new version to a file outside the sandbox, such as `$TMPDIR/lab-policy.toml`.
+1. Read that file, and write the whole new version to a file outside the sandbox, such as `$TMPDIR/lab-policy.toml`.
 2. `VISUAL="cp $TMPDIR/lab-policy.toml" enclos --dry-run policy edit lab`: enclos validates it and shows the change. A refused edit applies nothing and is kept; `enclos policy discard lab` drops it.
 3. The same without `--dry-run`. A network change is in force at once. A change to what the sandbox may write or listen on, while sessions run, waits as the **pending policy**: `enclos policy apply lab --yes` restarts the sandbox into it, `enclos policy discard lab` drops it. `policy edit --yes` restarts at once.
 4. `enclos policy test lab`, and report the result.
