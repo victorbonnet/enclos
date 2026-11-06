@@ -66,6 +66,12 @@ What to expect: Hermes's own wizard asks for a provider, then shows a login (a U
 
 `enclos sandbox start <sandbox>`: the proxy and Hermes's gateway, in the background, now and at each login.
 
+**Check that the agent answers.** A running gateway and a `READY` policy test do not show that the provider, the model and the login work: one message does.
+
+1. Find how this Hermes takes a single message without a terminal: `enclos exec <sandbox> -- hermes chat --help` (and `enclos exec <sandbox> -- hermes --help` if `chat` has no such option). Look for an option that takes the message as an argument, prints the answer and exits, such as a query or quiet mode; use what the installed version shows, not what you remember.
+2. Send one short message to the agent with it, through `exec`, naming the agent with `-p <agent>`, such as asking it to reply with one word. `exec` exits with Hermes's own code.
+3. The check passes when the command exits 0 and prints an answer. Otherwise, show the user what it printed: a login or provider error goes back to step 6, a refused destination shows in `enclos net denied <sandbox>`. If this Hermes has no one-shot form, say so, and ask the user to confirm the agent answers in their own terminal before you call the setup done.
+
 Then give the user the line to talk to their agent in their terminal:
 
 ```bash
@@ -80,4 +86,4 @@ Suggest a first question that needs the web, such as the weather in three cities
 - **The mobile app**: [the mobile app](../enclos/reference/workflows.md#the-mobile-app), where this build has `enclos app`.
 - **Allowing enclos commands without a prompt**: the plugin's README, which says what such a rule allows.
 
-End with a short summary: the sandbox, its template, its agents, the result of `policy test`, and the commands the user will want (`enclos status`, `enclos connect <sandbox> -- <agent>`, `enclos net log <sandbox>`, `enclos sandbox stop <sandbox>`).
+End with a short summary: the sandbox, its template, its agents, the result of `policy test`, whether the agent answered through `exec`, and the commands the user will want (`enclos status`, `enclos connect <sandbox> -- <agent>`, `enclos net log <sandbox>`, `enclos sandbox stop <sandbox>`).
