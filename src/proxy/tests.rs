@@ -905,23 +905,6 @@ fn a_port_taken_on_either_loopback_is_listened_on_by_neither() {
     assert!(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok());
 }
 
-/// LOOP (to drop): the test as it was on main, as a control.
-#[test]
-fn a_port_taken_on_either_loopback_unfixed() {
-    let squatter = tcp_listener(Ipv6Addr::LOCALHOST);
-    let port = squatter.local_addr().unwrap().port();
-    let e = listen(port).unwrap_err();
-    assert_eq!(e.addr, (Ipv6Addr::LOCALHOST, port).into());
-    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
-    assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
-    let squatter = tcp_listener(Ipv4Addr::LOCALHOST);
-    let port = squatter.local_addr().unwrap().port();
-    let e = listen(port).unwrap_err();
-    assert_eq!(e.addr, (Ipv4Addr::LOCALHOST, port).into());
-    assert_eq!(e.source.kind(), io::ErrorKind::AddrInUse);
-    assert!(TcpListener::bind((Ipv6Addr::LOCALHOST, port)).is_ok());
-}
-
 #[test]
 fn serving_ends_when_any_accept_thread_ends_even_by_panicking() {
     let (done, finished) = std::sync::mpsc::channel();
