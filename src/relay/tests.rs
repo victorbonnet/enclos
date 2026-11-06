@@ -1,7 +1,7 @@
 //! The relay over a loopback port and a Unix socket in a temporary folder.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -34,7 +34,7 @@ impl Relay {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("proxy.sock");
         let upstream = UnixListener::bind(&path).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
         let port = listener.local_addr().unwrap().port();
         let socket = path.clone();
         thread::spawn(move || serve_up_to(listener, &socket, max, limit));

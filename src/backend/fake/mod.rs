@@ -6,6 +6,7 @@ use std::process::Command;
 
 use super::{
     Backend, Capabilities, CompileError, Compiled, Enforcement, Launch, Probe, SandboxContext,
+    WrapError,
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
@@ -145,7 +146,12 @@ impl Backend for FakeBackend {
     /// so that a test's program never touches the developer's own home. It also gets
     /// [`IN_TERMINAL`], so a test sees whether the program was to run in
     /// enclos's terminal, and [`SERVICE_PORT`], the service port it was given.
-    fn wrap(&self, _compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
+    fn wrap(
+        &self,
+        _compiled: &Path,
+        ctx: &SandboxContext,
+        launch: &Launch,
+    ) -> Result<Command, WrapError> {
         let mut command = Command::new(&launch.program);
         command.args(&launch.args);
         let mut command = super::under_limits(command, &launch.limits);
@@ -158,7 +164,7 @@ impl Backend for FakeBackend {
                 .map_or_else(|| "none".to_owned(), |p| p.to_string()),
         );
         command.current_dir(&ctx.home);
-        command
+        Ok(command)
     }
 
     fn own_probes(&self, _compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
@@ -187,6 +193,7 @@ mod tests {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let envs = |command: &Command| -> HashMap<OsString, Option<OsString>> {
             command
@@ -196,7 +203,7 @@ mod tests {
                 .collect()
         };
         let fake = FakeBackend::available(BackendKind::Seatbelt);
-        let wrapped = fake.wrap(Path::new("/c.fake"), &ctx, &launch);
+        let wrapped = fake.wrap(Path::new("/c.fake"), &ctx, &launch).unwrap();
         let mut expected = Command::new("/usr/bin/true");
         crate::backend::environment::apply(&mut expected, &ctx, &launch);
         assert_eq!(envs(&wrapped), envs(&expected));

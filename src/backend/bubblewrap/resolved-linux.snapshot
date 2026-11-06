@@ -180,11 +180,7 @@
       "/srv/alice-data/enclos/sandboxes/home/compiled",
       "--ro-bind-try",
       "/srv/alice-data/enclos/sandboxes/home/secrets",
-      "/srv/alice-data/enclos/sandboxes/home/secrets",
-      "--remount-ro",
-      "/srv/alice-data/enclos",
-      "--remount-ro",
-      "/srv/alice-data/systemd/user"
+      "/srv/alice-data/enclos/sandboxes/home/secrets"
     ],
     "grant_masks": {
       "unmovable": [
@@ -193,8 +189,15 @@
       "in_sandbox_home": [],
       "in_workspace": [
         "/nonexistent-enclos-test/alice/proj/config/.env"
+      ],
+      "workspaces": [
+        "/nonexistent-enclos-test/alice/proj"
       ]
     },
+    "sealed": [
+      "/srv/alice-data/enclos",
+      "/srv/alice-data/systemd/user"
+    ],
     "options": [
       "--unshare-user",
       "--disable-userns",
@@ -205,7 +208,6 @@
       "--unshare-uts",
       "--unshare-cgroup-try",
       "--die-with-parent",
-      "--clearenv",
       "--chdir",
       "/srv/alice-data/enclos/sandboxes/home/home"
     ]

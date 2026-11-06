@@ -24,3 +24,5 @@ pub mod service;
 pub mod state;
 #[cfg(test)]
 mod test_ports;
+#[cfg(test)]
+mod test_scripts;

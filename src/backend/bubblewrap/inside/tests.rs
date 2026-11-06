@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 /// Records what is called and fails where it is told to: nothing here is
 /// applied to any process.
@@ -40,9 +41,9 @@ impl SessionSteps for Recorded {
         self.step("relay")
     }
 
-    fn run_command(&mut self) -> InsideError {
+    fn run_command(&mut self) -> Result<u8, InsideError> {
         self.calls.push("command");
-        InsideError::NoCommand
+        Ok(0)
     }
 }
 
@@ -62,7 +63,7 @@ impl RelaySteps for Recorded {
 #[test]
 fn the_relay_starts_before_the_rules_and_the_command_after_them() {
     let mut steps = Recorded::default();
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
 }
 
@@ -84,7 +85,7 @@ fn no_command_runs_once_a_step_has_failed() {
             fails: Some(fails),
             ..Recorded::default()
         };
-        let stopped = in_session(&mut steps).to_string();
+        let stopped = in_session(&mut steps).unwrap_err().to_string();
         assert!(stopped.contains(fails), "{stopped}");
         assert_eq!(steps.calls, reached);
     }
@@ -140,7 +141,7 @@ fn no_landlock_is_reported_and_the_session_goes_on() {
         landlock: Some(Landlock::Missing),
         ..Recorded::default()
     };
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert_eq!(steps.calls, ["relay", "landlock", "seccomp", "command"]);
     assert_eq!(steps.said.len(), 1);
     assert!(steps.said[0].contains("no Landlock"), "{:?}", steps.said);
@@ -149,7 +150,7 @@ fn no_landlock_is_reported_and_the_session_goes_on() {
 #[test]
 fn every_rule_held_says_nothing() {
     let mut steps = Recorded::default();
-    in_session(&mut steps);
+    assert_eq!(in_session(&mut steps).unwrap(), 0);
     assert!(steps.said.is_empty());
 }
 
@@ -183,4 +184,67 @@ fn what_compile_writes_is_what_is_read() {
     assert_eq!(prepared.compiled.relay.port, 41001);
     assert!(prepared.grants.iter().any(|g| g.path == "/dev"));
     assert!(!prepared.programs.is_empty());
+}
+
+/// Every orphan the session leaves is reaped here, PID 1 of its namespace,
+/// until the command ends, whose code is the session's.
+#[test]
+fn the_session_reaps_its_orphans_until_its_command_ends() {
+    let mut found = vec![
+        Ok(Some((9, Some(Ended::Exited(0))))),
+        Err(io::Error::from(io::ErrorKind::Interrupted)),
+        Ok(Some((7, None))),
+        Ok(Some((8, Some(Ended::Killed(9))))),
+        Ok(Some((7, Some(Ended::Exited(3))))),
+        Ok(Some((7, Some(Ended::Exited(4))))),
+    ]
+    .into_iter();
+    let code = reap_until(7, || found.next().unwrap()).unwrap();
+    assert_eq!(code, 3);
+    assert_eq!(found.len(), 1, "it went on past its command");
+}
+
+/// As a shell gives it, so `connect` reports the same either way.
+#[test]
+fn a_command_a_signal_ended_gives_128_and_the_signal() {
+    let mut found = [Ok(Some((7, Some(Ended::Killed(2)))))].into_iter();
+    assert_eq!(reap_until(7, || found.next().unwrap()).unwrap(), 130);
+}
+
+#[test]
+fn a_session_that_lost_its_children_says_so() {
+    let e = reap_until(7, || Err(io::Error::from_raw_os_error(10))).unwrap_err();
+    assert!(e.to_string().contains("lost the session's command"), "{e}");
+}
+
+/// What `wait` reports of a child this test started: its exit code, the
+/// signal that ended it, and nothing for one that was only stopped. Each
+/// child is reaped by `waitpid`, which clippy's lint does not see.
+#[test]
+#[allow(clippy::zombie_processes)]
+fn a_child_that_stopped_has_not_ended() {
+    use rustix::process::{Pid, Signal, WaitOptions, kill_process, waitpid};
+    let wait = |child: &std::process::Child, options| {
+        let pid = Pid::from_child(child);
+        let (_, status) = waitpid(Some(pid), options).unwrap().unwrap();
+        Ended::of(status)
+    };
+    let exits = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 3"])
+        .spawn()
+        .unwrap();
+    assert_eq!(wait(&exits, WaitOptions::empty()), Some(Ended::Exited(3)));
+
+    let sleeps = std::process::Command::new("/usr/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = Pid::from_child(&sleeps);
+    kill_process(pid, Signal::STOP).unwrap();
+    assert_eq!(wait(&sleeps, WaitOptions::UNTRACED), None);
+    kill_process(pid, Signal::KILL).unwrap();
+    assert_eq!(
+        wait(&sleeps, WaitOptions::empty()),
+        Some(Ended::Killed(Signal::KILL.as_raw()))
+    );
 }

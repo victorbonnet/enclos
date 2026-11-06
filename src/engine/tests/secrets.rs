@@ -921,12 +921,10 @@ fn a_secret_recorded_in_a_store_this_host_lacks_is_refused() {
 /// up after it, nor of a value with no record.
 #[test]
 fn a_store_refused_on_a_locked_collection_reports_nothing_left() {
-    use std::os::unix::fs::PermissionsExt;
     let (dir, engine, _, _) = with_store();
     let script = |name: &str, text: &str| {
         let path = dir.path().join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{text}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_scripts::write_script(&path, text);
         path.display().to_string()
     };
     let engine = engine.with_secrets(Box::new(crate::secrets::libsecret::Libsecret::with_tools(

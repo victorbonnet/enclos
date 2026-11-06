@@ -64,13 +64,14 @@ def signalled(pid):
     except OSError as e:
         return errno.errorcode[e.errno]
 me = str(os.getpid())
+parent = str(os.getppid())
 relay = None
 for pid in filter(str.isdigit, os.listdir("/proc")):
     try:
         status = open(f"/proc/{pid}/status").read()
     except OSError:
         continue
-    if f"PPid:\t{me}\n" in status:
+    if f"PPid:\t{parent}\n" in status and pid != me:
         relay = int(pid)
 child = subprocess.Popen(["/usr/bin/sleep", "30"])
 print(signalled(relay), signalled(child.pid))
@@ -91,19 +92,20 @@ def opened(family):
 print(opened(40), opened(socket.AF_UNIX), opened(socket.AF_INET))
 "#;
 
-/// Prints each child's seccomp mode, no_new_privs and process group, as the
-/// kernel shows them, then the command's own group: the relay is the only
-/// child of the command.
+/// Prints each sibling's seccomp mode, no_new_privs and process group, as
+/// the kernel shows them, then the command's own group: `enclos inside`
+/// starts the relay and the command, and nothing else.
 const RELAY_STATUS: &str = r#"
 import os
 me = str(os.getpid())
+parent = str(os.getppid())
 for pid in filter(str.isdigit, os.listdir("/proc")):
     try:
         status = open(f"/proc/{pid}/status").read()
     except OSError:
         continue
     fields = dict(line.split(":\t", 1) for line in status.splitlines() if ":\t" in line)
-    if fields.get("PPid") == me:
+    if fields.get("PPid") == parent and pid != me:
         print(fields["Seccomp"], fields["NoNewPrivs"], fields["NSpgid"], os.getpgid(0))
 "#;
 
@@ -427,6 +429,67 @@ fn on_a_runner_the_relay_applied_the_filter_to_itself() {
     let status = said(&output);
     let fields: Vec<&str> = status.split_whitespace().collect();
     assert_eq!(fields[..2], ["2", "1"], "{output:?}");
+}
+
+/// `enclos inside` runs the command to its end and gives its exit code.
+#[test]
+fn on_a_runner_the_commands_exit_code_is_the_sessions() {
+    if !on_a_runner() {
+        return;
+    }
+    let (output, _dir) = Confined::new().run(&["/bin/sh", "-c", "echo ran; exit 3"]);
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert_eq!(text(&output.stdout), "ran");
+}
+
+/// Not dumpable, so the kernel gives its `/proc` entries to root, and no
+/// process of the session attaches to it or writes its memory; the command
+/// it started is dumpable, as the control.
+#[test]
+fn on_a_runner_enclos_inside_is_not_dumpable() {
+    if !on_a_runner() {
+        return;
+    }
+    let script = "import os; print(os.stat(f'/proc/{os.getppid()}/mem').st_uid, os.stat(f'/proc/{os.getpid()}/mem').st_uid == os.getuid())";
+    let (output, _dir) = Confined::new().run(&[PYTHON, "-c", script]);
+    assert_eq!(said(&output), "0 True", "{output:?}");
+}
+
+/// The signals `/proc/self/status` says the command ignores, when the
+/// session was started with SIGINT and SIGQUIT ignored, as `wrap` starts
+/// bubblewrap in a terminal, with and without the flag that hands them back.
+fn ignored_by_the_command(restore: bool) -> u64 {
+    let confined = Confined::new();
+    let mut inside = vec!["inside", "--compiled", confined.compiled.to_str().unwrap()];
+    if restore {
+        inside.push("--restore-interrupts");
+    }
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("trap '' INT QUIT; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_enclos"))
+        .args(&inside)
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "grep '^SigIgn:' /proc/self/status | cut -f2",
+        ])
+        .output()
+        .unwrap();
+    u64::from_str_radix(&said(&out), 16).unwrap()
+}
+
+/// Ctrl-C and Ctrl-\ reach the command again, which bubblewrap's outer
+/// process ignores; without the flag they stay ignored, the control.
+#[test]
+fn on_a_runner_the_command_gets_back_the_interrupts_bubblewrap_ignores() {
+    if !on_a_runner() {
+        return;
+    }
+    const INT_AND_QUIT: u64 = 0b110;
+    assert_eq!(ignored_by_the_command(false) & INT_AND_QUIT, INT_AND_QUIT);
+    assert_eq!(ignored_by_the_command(true) & INT_AND_QUIT, 0);
 }
 
 /// A terminal signals the foreground group, which is the command's.

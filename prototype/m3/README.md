@@ -178,7 +178,7 @@ From the `bwrap-prototype` workflow's runs on the Ubuntu 24.04 runners (Ubuntu 2
   - TIOCSTI with `--new-session` alone;
   - around a mask: renaming the file mask, removing a mask, a mask in a read-only grant;
   - whether Chromium opens `oom_score_adj` with `O_TRUNC`, and whether `TRUNCATE` ends its refusals: `oom-check.sh` and `test_oom.py` cover a shell's write to its own file only, and Chromium itself is still unchecked;
-  - open, not decided (design §15): renaming a folder that holds a deny entry, for which Linux has no mechanism (design §5 says it cannot be renamed; nothing here stops it), and a deny entry that is a link or sits under one: `wrap.py` hides its resolved path under the home, masks it in a grant, and refuses the session when it resolves anywhere else, a draft of one option until §15 decides. `sandbox-check.sh` plants both kinds of link; no run has shown them yet;
+  - open, not decided (design §15): renaming a folder that holds a deny entry, for which Linux has no mechanism (design §5 says it cannot be renamed; nothing here stops it), and a deny entry that is a link or sits under one: `wrap.py` hides its resolved path under the home, masks it in a grant, and refuses the session when it resolves anywhere else, a draft of one option; §15 has since decided that the backend's `wrap` masks the resolved path wherever it is, as Seatbelt does. `sandbox-check.sh` plants both kinds of link; no run has shown them yet;
   - whether a program runs through the dynamic loader or from a `memfd` where Landlock refuses its exec, and whether vsock reaches the hypervisor from the sandbox;
   - a real desktop session's sockets;
   - a kernel without Landlock;
@@ -256,7 +256,7 @@ Not used: Landlock's network rights (the network namespace holds the network), a
 
 The errno is a choice for the backend: `EPERM` reads like the kernel's own refusals, so the probes tell the filter from bubblewrap by comparing the modes, not by the error.
 
-Only `run/visible/` is mounted, read-only; the proxy's control socket and the service's state stay outside it (design §11). Nothing here refuses `bind` or `listen`, so `listen = false` is not held; design §15 holds that open decision.
+Only `run/visible/` is mounted, read-only; the proxy's control socket and the service's state stay outside it (design §11). Nothing here refuses `bind` or `listen`, so `listen = false` is not held. Design §15 has since chosen to declare it unenforced on bubblewrap and say so at each start ([ADR 0041](../../docs/adr/0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md), proposed), with Landlock's TCP bind right to come with the sandbox's shared namespace ([ADR 0039](../../docs/adr/0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md), proposed).
 
 ## Namespaces per session or per sandbox
 

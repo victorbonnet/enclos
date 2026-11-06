@@ -1,8 +1,8 @@
 //! Importing an agent from an export the runtime made on the host:
-//! `enclos agent add <sandbox>/<agent> --from <archive>` (issue #34, design
-//! §9 "Agents imported from the host"). The host copies the archive beside
-//! the sandbox home and the runtime extracts it inside the sandbox; enclos
-//! never looks inside it.
+//! `enclos agent add <sandbox>/<agent> --from <archive>` (design §9
+//! "Agents imported from the host"). The host copies the archive beside the
+//! sandbox home and the runtime extracts it inside the sandbox; enclos never
+//! looks inside it.
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -75,7 +75,7 @@ impl Engine {
         let shown = kind.display_name();
         // One copy per enclos process, so two imports of the same name never
         // share it.
-        let installers = self.layout.sandbox_dir(name.as_str()).join("installers");
+        let installers = self.layout.sandbox_installers(name.as_str());
         let copy_named = |id: &str| installers.join(format!("agent-{agent}.{id}.tar.gz"));
         let staged = copy_named(&std::process::id().to_string());
         let Some(command) = runtime.import_agent(&agent, &staged) else {
@@ -158,6 +158,9 @@ impl Engine {
             Err(e) if copied.get() => return Err(with_copy_left(e, remove_copy(&staged))),
             Err(e) => return Err(e),
         };
+        // The sandbox may not see the folder the copy is in: the session
+        // reads that one file of it.
+        let command = command.reading(vec![staged.clone()]);
         let ran = self.run_in_sandbox(by, name, command, "agent import session");
         // The copy served its one import; the sandbox keeps what it took.
         let copy_left = remove_copy(&staged);

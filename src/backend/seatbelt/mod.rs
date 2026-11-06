@@ -16,6 +16,7 @@ use std::process::Command;
 use self::probes::SeatbeltProbes;
 use super::{
     Backend, Capabilities, CompileError, Compiled, Enforcement, Launch, Probe, SandboxContext,
+    WrapError,
 };
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
@@ -125,11 +126,17 @@ impl Backend for Seatbelt {
         compile::compile(policy, ctx, baseline)
     }
 
-    fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command {
+    /// Never refused: Seatbelt reads nothing of the host at launch.
+    fn wrap(
+        &self,
+        compiled: &Path,
+        ctx: &SandboxContext,
+        launch: &Launch,
+    ) -> Result<Command, WrapError> {
         if self.baseline == Ok(Baseline::AllowDefault) {
             say_allow_default(ctx);
         }
-        wrap::wrap(compiled, ctx, launch)
+        Ok(wrap::wrap(compiled, ctx, launch))
     }
 
     /// On the baseline `compiled` says, and on a dry run, where it changes

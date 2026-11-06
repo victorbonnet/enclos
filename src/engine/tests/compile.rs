@@ -261,9 +261,11 @@ fn a_fake_backend_s_probes_run_through_the_shared_set() {
                     in_terminal: false,
                     service_port: None,
                     limits: LaunchLimits::default(),
+                    reads: Vec::new(),
                 };
                 backend
                     .wrap(std::path::Path::new("unused"), &ctx, &launch)
+                    .unwrap()
                     .stdin(std::process::Stdio::null())
                     .output()
             },
@@ -343,10 +345,12 @@ fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
         in_terminal: false,
         service_port: None,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let ctx = engine.sandbox_context(&name, 41001);
     let out = Seatbelt::default()
         .wrap(&compiled, &ctx, &launch)
+        .unwrap()
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);

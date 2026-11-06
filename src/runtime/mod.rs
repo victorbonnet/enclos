@@ -9,12 +9,13 @@ pub mod home;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::BackendKind;
 pub use home::HomePath;
 
 /// An installer enclos downloads on the host and runs inside the sandbox,
@@ -53,7 +54,13 @@ impl HomeFile {
 /// its words out, so an adapter's command cannot be started on the host by
 /// mistake.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxCommand(Vec<OsString>);
+pub struct SandboxCommand {
+    words: Vec<OsString>,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the command reads, which a backend whose sandbox does not see that
+    /// folder shows it read-only.
+    reads: Vec<PathBuf>,
+}
 
 /// `word` as a shell reads it back: quoted when it holds anything a shell
 /// would read otherwise, such as `${VAR}`, which it would expand, or starts
@@ -72,20 +79,35 @@ fn shell_word(word: &str) -> String {
 
 impl SandboxCommand {
     pub fn new(words: Vec<OsString>) -> SandboxCommand {
-        SandboxCommand(words)
+        SandboxCommand {
+            words,
+            reads: Vec::new(),
+        }
     }
 
     pub fn from_words(words: &[&str]) -> SandboxCommand {
-        SandboxCommand(words.iter().map(OsString::from).collect())
+        SandboxCommand::new(words.iter().map(OsString::from).collect())
+    }
+
+    /// The command, reading `staged`, files enclos put in the sandbox's
+    /// `installers/` folder.
+    pub fn reading(mut self, staged: Vec<PathBuf>) -> SandboxCommand {
+        self.reads = staged;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.words.is_empty()
+    }
+
+    /// The staged files it reads.
+    pub fn reads(&self) -> &[PathBuf] {
+        &self.reads
     }
 
     /// The command as a person would type it.
     pub fn shown(&self) -> String {
-        self.0
+        self.words
             .iter()
             .map(|w| shell_word(&w.to_string_lossy()))
             .collect::<Vec<_>>()
@@ -93,9 +115,15 @@ impl SandboxCommand {
     }
 
     /// The words to start it with: only the engine's code that starts a
-    /// program in a sandbox (sessions, and the service runner).
+    /// program in a sandbox (sessions, and the service runner, whose
+    /// commands are the adapter's and read nothing staged).
     pub(crate) fn into_words(self) -> Vec<OsString> {
-        self.0
+        self.into_parts().0
+    }
+
+    /// Its words and the staged files it reads, for the code that starts it.
+    pub(crate) fn into_parts(self) -> (Vec<OsString>, Vec<PathBuf>) {
+        (self.words, self.reads)
     }
 }
 
@@ -184,7 +212,9 @@ pub trait RuntimeAdapter {
     /// `[network] allow_add` and nothing else (design §7).
     fn endpoints(&self) -> &'static str;
     fn installer(&self) -> Installer;
-    fn home_files(&self) -> Vec<HomeFile>;
+    /// What the install puts in the sandbox's home, for a sandbox of
+    /// `backend`: a fix for a host tool goes only where that tool needs it.
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;
     /// What a person runs in the sandbox to log the runtime in and set it
     /// up, for enclos's messages: `enclos connect <sandbox> -- <this>`.
     /// enclos shows it, never runs it (ADR 0024).
@@ -261,9 +291,9 @@ pub trait RuntimeAdapter {
     }
     /// The runtime's own command that creates agent `name` from `archive`,
     /// an export made with the runtime's own command (for Hermes, `hermes
-    /// profile export`), run in the sandbox by `enclos agent add --from`
-    /// (issue #34). `archive` is a host path beside the sandbox home, which
-    /// the sandbox reads and never writes; the runtime extracts it inside
+    /// profile export`), run in the sandbox by `enclos agent add --from`.
+    /// `archive` is a host path beside the sandbox home, which the sandbox
+    /// reads and never writes; the runtime extracts it inside
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
@@ -319,7 +349,7 @@ pub trait RuntimeAdapter {
         None
     }
 
-    // What `enclos status` shows (issue #29). Each answer may be "cannot
+    // What `enclos status` shows. Each answer may be "cannot
     // tell", and a runtime that names nothing still gets sizes.
 
     /// Parts of the home counted on their own.

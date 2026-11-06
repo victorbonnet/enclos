@@ -673,11 +673,9 @@ mod tests {
 
     /// A `systemd-run` printing `text` and exiting with `code`.
     fn systemd_run_printing(text: &str, code: u8) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("systemd-run");
-        std::fs::write(&path, format!("#!/bin/sh\necho '{text}'\nexit {code}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scripts::write_script(&path, &format!("echo '{text}'\nexit {code}"));
         (dir, path)
     }
 

@@ -3,7 +3,6 @@
 //! policy denies. Only processes these tests start are ever signalled.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -40,6 +39,7 @@ fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
         in_terminal: false,
         service_port: None,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
         .stdin(Stdio::null())
@@ -163,8 +163,11 @@ impl World {
             in_terminal: false,
             service_port,
             limits: Default::default(),
+            reads: Vec::new(),
         };
-        let mut command: Command = Seatbelt::default().wrap(&self.compiled, &self.ctx, &launch);
+        let mut command: Command = Seatbelt::default()
+            .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap();
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().unwrap().success()
     }
@@ -179,9 +182,11 @@ impl World {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap()
             .stderr(Stdio::null())
             .output()
             .unwrap();
@@ -359,9 +364,11 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     in_terminal: false,
                     service_port: None,
                     limits: Default::default(),
+                    reads: Vec::new(),
                 };
                 let out = Seatbelt::default()
                     .wrap(&w.compiled, &w.ctx, &launch)
+                    .unwrap()
                     .stdin(Stdio::null())
                     .output()
                     .unwrap();
@@ -683,8 +690,10 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 in_terminal: false,
                 service_port: None,
                 limits: Default::default(),
+                reads: Vec::new(),
             };
-            let (ok, stdout, stderr) = output(Seatbelt::default().wrap(compiled, &w.ctx, &launch));
+            let (ok, stdout, stderr) =
+                output(Seatbelt::default().wrap(compiled, &w.ctx, &launch).unwrap());
             let Proof::Control { control, .. } = &p.proof else {
                 panic!("{} has no control", p.name);
             };
@@ -1105,6 +1114,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
             .stdout(Stdio::null())
@@ -1158,6 +1168,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())
@@ -1314,8 +1325,13 @@ fn the_mktemp_wrapper_puts_temp_files_under_the_sandbox_tmp() {
     let bin = w.ctx.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shim = bin.join("mktemp");
-    std::fs::write(&shim, include_str!("../../runtime/hermes/mktemp")).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_scripts::copy_program(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime/hermes/mktemp"
+        )),
+        &shim,
+    );
     let tmp = w.ctx.home.join("tmp").display().to_string();
     for (call, prefix) in [
         ("mktemp", "tmp."),

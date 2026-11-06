@@ -11,11 +11,12 @@ use crate::policy::paths::{FsPaths, is_within};
 /// The sandbox's own, empty places. They hide the host's sockets there
 /// (`/run/user/<uid>`, the system bus, systemd-resolved, Docker,
 /// `/tmp/.X11-unix`), so a deny entry under one needs no mask.
-pub(super) const OWN_TMPFS: &[&str] = &["/tmp", "/var/tmp", "/run", "/dev/shm"];
+pub(in crate::backend::bubblewrap) const OWN_TMPFS: &[&str] =
+    &["/tmp", "/var/tmp", "/run", "/dev/shm"];
 
 /// The sandbox's own too, and mounted after any mask, so a mask under one
 /// would not last.
-const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
+pub(in crate::backend::bubblewrap) const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
 
 /// What a later `--bind` must not uncover: a workspace may not be at or hold
 /// one of these. `/var/run` is the host's `/run` through a link.

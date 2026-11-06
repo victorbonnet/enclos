@@ -262,7 +262,10 @@ pub(crate) mod tests {
 
     impl Sleeper {
         pub(crate) fn in_folder(dir: &Path) -> Sleeper {
-            std::fs::copy(std::env::current_exe().unwrap(), dir.join("sleeper")).unwrap();
+            crate::test_scripts::copy_program(
+                &std::env::current_exe().unwrap(),
+                &dir.join("sleeper"),
+            );
             let child = Command::new("./sleeper")
                 .args([
                     "--exact",

@@ -99,13 +99,13 @@ fn agents_need_a_runtime_first() {
 /// Hermes's adapter with an installer of the test's own: `url` is a
 /// `file://` URL to it and `sha256` its hash, which the audit entry should
 /// name.
-struct TestRuntime {
+pub(super) struct TestRuntime {
     url: String,
-    sha256: String,
+    pub(super) sha256: String,
 }
 
 impl TestRuntime {
-    fn new(dir: &Path, script: &str) -> TestRuntime {
+    pub(super) fn new(dir: &Path, script: &str) -> TestRuntime {
         let installer = dir.join("install.sh");
         std::fs::write(&installer, script).unwrap();
         let digest = <sha2::Sha256 as sha2::Digest>::digest(script.as_bytes());
@@ -133,8 +133,8 @@ impl RuntimeAdapter for TestRuntime {
             args: vec!["--non-interactive".into()],
         }
     }
-    fn home_files(&self) -> Vec<HomeFile> {
-        Hermes.home_files()
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        Hermes.home_files(backend)
     }
     fn login(&self) -> String {
         Hermes.login()
@@ -158,7 +158,7 @@ impl RuntimeAdapter for TestRuntime {
 
 /// An installer that puts a `hermes` stub on the sandbox's PATH, which
 /// records its calls in the home and fails while `hermes-fails` exists.
-const INSTALLS: &str = "#!/bin/sh
+pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
 #!/bin/sh
@@ -248,12 +248,10 @@ impl Lab {
             None => engine,
         };
         let proxy = dir.path().join("proxy.sh");
-        std::fs::write(
+        crate::test_scripts::write_script(
             &proxy,
-            "#!/bin/sh\necho \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o700)).unwrap();
+            "echo \"fake proxy on port $5\" >&2\nexec /usr/bin/nc -lk 127.0.0.1 \"$5\"",
+        );
         let home = engine.layout.sandbox_home("home");
         Lab {
             _dir: dir,
@@ -335,6 +333,11 @@ fn a_dry_run_of_an_install_says_what_it_would_change_and_changes_nothing() {
     assert!(!plan.contains("also "), "{plan}");
     assert!(
         plan.contains("download the hermes installer from file://"),
+        "{plan}"
+    );
+    // A Seatbelt sandbox's host: the line a Mac has always shown.
+    assert!(
+        plan.contains(" on this Mac, as it is served now (ADR 0029)"),
         "{plan}"
     );
     assert!(plan.contains("start the proxy"), "{plan}");
@@ -3192,6 +3195,7 @@ fn a_session_starts_in_the_group_it_records_as_what_it_was_started_for() {
     let command = |group| Starting::Command {
         kind: CommandKind::Interactive,
         group,
+        reads: &[],
     };
     let sleep = ["/bin/sleep".into(), "30".into()];
     for (starting, kind, service, ours, recorded_ours) in [
@@ -3290,6 +3294,7 @@ fn a_start_that_fails_before_it_is_recorded_ends_its_program() {
         Starting::Command {
             kind: CommandKind::Interactive,
             group: Group::Own,
+            reads: &[],
         },
         Starting::Service { service: "gateway" },
     ] {
@@ -3387,6 +3392,7 @@ fn a_program_that_cannot_start_is_named_and_leaves_no_marker() {
             Starting::Command {
                 kind: CommandKind::Interactive,
                 group: Group::Own,
+                reads: &[],
             },
             format!("could not start /nonexistent/program in {}:", lab.name),
         ),

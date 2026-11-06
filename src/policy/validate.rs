@@ -236,7 +236,7 @@ fn refusals(
                 )));
             }
         }
-        // No other backend is built yet: none enforces a limit.
+        // bubblewrap enforces no limit yet, so every one is refused there.
         other if !r.is_unset() => refused.push((
             "resources",
             format!("resources: the {other} backend enforces no limit yet; leave [resources] out"),

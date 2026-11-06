@@ -147,6 +147,67 @@ jobs:
           if [ -e /proc/sys/dev/tty/legacy_tiocsti ]; then echo "legacy_tiocsti $(cat /proc/sys/dev/tty/legacy_tiocsti)"; fi
       - run: cargo test --locked --all-features --test inside on_a_runner
 
+  bubblewrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The tests that create bubblewrap sandboxes and run sessions in them
+      # run only on these throwaway runners, never on a developer's host
+      # (tests/bubblewrap.rs).
+      ENCLOS_BUBBLEWRAP_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # Installs the toolchain and components pinned in rust-toolchain.toml
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # A runner has no login session, so no user manager without this. It
+      # says nothing of what enclos does about lingering (design §15).
+      - name: A user manager for the runner
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime_dir="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >>"$GITHUB_ENV"
+          timeout 30 sh -c 'until [ -S "$1/bus" ]; do sleep 1; done' sh "$runtime_dir"
+      # The least setting the host survey found (design §5, Linux hosts): none where
+      # bubblewrap runs as installed, as on 26.04, whose own rule the
+      # profile would break; else the profile docs/getting-started.md gives,
+      # which Ubuntu 24.04's restriction on user namespaces needs.
+      - name: The AppArmor setting bubblewrap needs here
+        run: |
+          try() { bwrap --ro-bind / / true; }
+          if try; then
+            echo "setting: none (bubblewrap runs as installed)"
+          else
+            sudo tee /etc/apparmor.d/enclos-bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile enclos-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/enclos-bwrap
+            try
+            echo "setting: the AppArmor profile for /usr/bin/bwrap"
+          fi
+      - name: The host under test
+        run: |
+          uname -r
+          bwrap --version
+          systemd-run --version | head -1
+          python3 -c "import ctypes; print('Landlock ABI', ctypes.CDLL(None).syscall(444, None, 0, 1))"
+          echo "apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+      # A test renamed away would leave the filter matching nothing, and
+      # cargo test passing all the same, so the count is checked too.
+      - name: Sandboxes and sessions under bubblewrap
+        shell: bash
+        run: |
+          cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
+          grep -q 'test result: ok\. 10 passed' bubblewrap.log
+
   libsecret:
     strategy:
       fail-fast: false
@@ -211,7 +272,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, libsecret, secrets, deny]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, secrets, deny]
     runs-on: ubuntu-24.04
     steps:
       - name: Check needed jobs

@@ -76,6 +76,9 @@ pub struct SandboxContext {
     /// The socket its proxy listens on for a session with a network of its
     /// own.
     pub proxy_socket: PathBuf,
+    /// What enclos stages for an install or an import, which the sandbox
+    /// reads and never writes.
+    pub installers: PathBuf,
 }
 
 impl SandboxContext {
@@ -94,6 +97,7 @@ impl SandboxContext {
             proxy_port,
             secrets: layout.sandbox_secrets_dir(name.as_str()),
             proxy_socket: layout.proxy_socket(name.as_str()),
+            installers: layout.sandbox_installers(name.as_str()),
         }
     }
 }
@@ -128,6 +132,11 @@ pub struct Launch {
     pub service_port: Option<u16>,
     /// The limits each of its processes runs under (design §7).
     pub limits: LaunchLimits,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the program reads, as an installer and an import do; none for any
+    /// other. A backend whose sandbox does not see that folder shows each
+    /// read-only, and no more of it.
+    pub reads: Vec<PathBuf>,
 }
 
 /// The limits a program runs under, as a backend sets them: only those a
@@ -176,10 +185,10 @@ impl LaunchLimits {
 /// in the sandbox without root can raise them, then becomes the program;
 /// one it cannot set stops it with exit 125 and the field named, so no
 /// program runs without its limits. Only `open_files` is set: Seatbelt
-/// refuses the others (ADR 0033), and no other backend is built. In
-/// privileged mode (`-p`), as it runs on the host with the sandbox's
-/// variables: it then reads no `BASH_ENV` or `ENV` file, no `SHELLOPTS` and
-/// no function from them. Only `command`'s program and arguments are kept:
+/// refuses the others (ADR 0033), and bubblewrap enforces no limit yet,
+/// so every one is refused there. In privileged mode (`-p`), as it runs on
+/// the host with the sandbox's variables: it then reads no `BASH_ENV` or
+/// `ENV` file, no `SHELLOPTS` and no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`
 /// unchanged when no limit is set.
 pub fn under_limits(command: Command, limits: &LaunchLimits) -> Command {
@@ -251,6 +260,12 @@ pub(crate) fn max_files_per_process() -> Option<u64> {
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
+/// Why a program cannot start in a sandbox as the host stands at launch,
+/// when a backend reads the host then (bubblewrap's masks).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct WrapError(pub String);
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompileError {
     #[error("cannot compile the policy for {backend}: {reason}")]
@@ -273,8 +288,20 @@ pub trait Backend {
     fn capabilities(&self) -> Capabilities;
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
-    /// The command that runs `launch` inside the sandbox under `compiled`.
-    fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
+    /// The command that runs `launch` inside the sandbox under `compiled`,
+    /// or why it cannot start as the host stands now.
+    fn wrap(
+        &self,
+        compiled: &Path,
+        ctx: &SandboxContext,
+        launch: &Launch,
+    ) -> Result<Command, WrapError>;
+    /// What each session's start says of `policy` on this backend, one line
+    /// each: a field it does not hold, which the policy still runs with.
+    /// Nothing by default.
+    fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
+        Vec::new()
+    }
     /// Its escape probes and refusals for a sandbox whose compiled policy
     /// has the text `compiled`; `None` on a dry run, which compiles nothing.
     /// Fails, saying why, on a text this backend did not compile.
@@ -284,8 +311,30 @@ pub trait Backend {
 /// Every backend this build of enclos ships, in order of preference.
 ///
 /// This is the one explicit list of implementations.
+/// bubblewrap is in Linux builds alone, so a Mac's `doctor` and `sandbox
+/// create` stay as they were.
 pub fn registered() -> Vec<Box<dyn Backend>> {
-    vec![Box::new(seatbelt::Seatbelt::from_env())]
+    let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(seatbelt::Seatbelt::from_env())];
+    if cfg!(target_os = "linux") {
+        backends.push(Box::new(bubblewrap::Bubblewrap::on_host()));
+    }
+    backends
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::*;
+
+    /// Seatbelt first, so a Mac's default and `doctor` stay as they were;
+    /// bubblewrap on Linux alone. Making the list probes nothing.
+    #[test]
+    fn linux_builds_register_bubblewrap_after_seatbelt() {
+        let kinds: Vec<BackendKind> = registered().iter().map(|b| b.kind()).collect();
+        match cfg!(target_os = "linux") {
+            true => assert_eq!(kinds, [BackendKind::Seatbelt, BackendKind::Bubblewrap]),
+            false => assert_eq!(kinds, [BackendKind::Seatbelt]),
+        }
+    }
 }
 
 #[cfg(test)]

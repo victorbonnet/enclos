@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use super::Engine;
 use super::service::PROXY_WAIT;
 use crate::error::{Error, Result};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::lifecycle::process::{is_same, reference_of_child};
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
@@ -160,20 +161,22 @@ impl Engine {
                 return Err(Error::proxy_port_taken(record.name.as_str(), taken));
             }
         }
-        let child = Command::new(exe)
-            .args([
-                "proxy",
-                "run",
-                record.name.as_str(),
-                "--port",
-                &record.proxy_port.to_string(),
-            ])
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
+        // Holding no session's marker, it never ends with one.
+        let child = spawn_unmarked(
+            Command::new(exe)
+                .args([
+                    "proxy",
+                    "run",
+                    record.name.as_str(),
+                    "--port",
+                    &record.proxy_port.to_string(),
+                ])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(log),
+        )
+        .map_err(|e| failed(format!("could not start the proxy: {e}")))?;
         let mut child = child;
         match self.record_started_proxy(lock, record, &mut child, &reached, &log_path) {
             Ok(()) => Ok(()),
@@ -255,5 +258,63 @@ impl Engine {
         };
         self.state.put_session(lock, &session)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::os::unix::net::UnixListener;
+
+    /// Where sessions reach the proxy over its socket, the proxy is seen
+    /// started once the socket answers, whatever answers on the port.
+    #[test]
+    fn a_proxy_answers_once_its_socket_does_too_where_sessions_use_it() {
+        let port = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let addr = port.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.sock");
+        let socket = Reached::Socket(path.clone());
+        assert!(Reached::Port(addr).answers());
+        assert!(!socket.answers());
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(socket.answers());
+        // The port still answers, the socket no longer does.
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        assert!(Reached::Port(addr).answers());
+        assert!(!socket.answers());
+        // The socket answers, the port does not: one this test holds without
+        // listening on it, which no other test can take meanwhile, unlike a
+        // port let go a moment ago.
+        let _listener = UnixListener::bind(&path).unwrap();
+        assert!(socket.answers());
+        let (closed, _held) = held_closed();
+        assert!(!Reached::Port(closed).answers());
+    }
+
+    /// An address on 127.0.0.1 nothing listens on, held as long as what
+    /// comes with it: the local end of a connection to a listener, which a
+    /// connection to that address does not reach.
+    fn held_closed() -> (SocketAddr, (TcpListener, TcpStream)) {
+        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+        let to = listener.local_addr().unwrap();
+        let stream = crate::test_ports::clear_of_proxies(|| {
+            let stream = TcpStream::connect(to).unwrap();
+            let port = stream.local_addr().unwrap().port();
+            (stream, port)
+        });
+        (stream.local_addr().unwrap(), (listener, stream))
+    }
+
+    /// A start that fails names where the sessions reach the proxy: the
+    /// socket where they use it, the port elsewhere.
+    #[test]
+    fn a_start_that_fails_names_the_socket_or_the_port() {
+        let path = PathBuf::from("/x/proxy.sock");
+        assert_eq!(Reached::Socket(path).to_string(), "/x/proxy.sock");
+        let addr = SocketAddr::from(([127, 0, 0, 1], 41001));
+        assert_eq!(Reached::Port(addr).to_string(), "127.0.0.1:41001");
     }
 }

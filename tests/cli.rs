@@ -469,8 +469,7 @@ fn policy_allow_of_a_destination_that_does_not_parse_is_an_error() {
 #[cfg(target_os = "macos")]
 fn editor(home: &Home, script: &str) -> String {
     let path = home._dir.path().join("editor.sh");
-    std::fs::write(&path, format!("#!/bin/sh\nset -e\n{script}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    test_scripts::write_script(&path, &format!("set -e\n{script}"));
     path.display().to_string()
 }
 
@@ -1210,6 +1209,11 @@ fn sandbox_list_lines_up_its_columns_for_names_of_any_length() {
 #[cfg(target_os = "macos")]
 #[path = "../src/host_ports.rs"]
 mod host_ports;
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../src/test_scripts.rs"]
+mod test_scripts;
 
 /// Tests that start proxies take turns: proxy ports are the host's, shared
 /// by every test's enclos folder and every other test run of this user.
