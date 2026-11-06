@@ -977,7 +977,11 @@ fn report_lines(report: &serde_json::Value) -> String {
                 .unwrap_or_default()
         ));
     }
-    for (what, key) in [("Not here", "not_here"), ("Not probed", "not_probed")] {
+    for (what, key) in [
+        ("Not here", "not_here"),
+        ("Not probed", "not_probed"),
+        ("Said", "notices"),
+    ] {
         for item in report[key].as_array().into_iter().flatten() {
             lines.push(format!("{what}: {}", item.as_str().unwrap_or("?")));
         }

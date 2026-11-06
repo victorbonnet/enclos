@@ -777,6 +777,27 @@ pub fn sandboxed_script(probe: &Probe) -> String {
     format!("printf '{MARKER}\\n'; {}", probe.script)
 }
 
+/// What starts each line enclos itself writes on a session's stderr, such as
+/// `enclos inside`'s notice that the kernel has no Landlock (design §5).
+const NOTICE: &str = "enclos: ";
+
+/// A probe session's stderr with what enclos itself said there set apart,
+/// as notices, when the session ran the script (its stdout starts with the
+/// marker): those lines are not the probe's, and one read as its answer
+/// would hide it. A session that did not run the script keeps them, as one
+/// may be why.
+pub fn set_aside_notices(stdout: &[u8], stderr: &[u8]) -> (Vec<u8>, Vec<String>) {
+    if !stdout.starts_with(MARKER.as_bytes()) {
+        return (stderr.to_vec(), Vec::new());
+    }
+    let text = String::from_utf8_lossy(stderr);
+    let (notices, rest): (Vec<&str>, Vec<&str>) = text
+        .split_inclusive('\n')
+        .partition(|line| line.starts_with(NOTICE));
+    let notices = notices.iter().map(|l| l.trim_end().to_owned()).collect();
+    (rest.concat().into_bytes(), notices)
+}
+
 /// One run of a probe in the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Run {
@@ -1271,6 +1292,22 @@ mod tests {
             Run::read(false, "enclos-probe-ran\n403", "err\n"),
             ran(false, "403err\n")
         );
+    }
+
+    /// A notice of enclos's own, such as `enclos inside`'s on a kernel
+    /// without Landlock, would be read as the probe's last word: it is set
+    /// apart once the script ran, and kept as the reason when it did not.
+    #[test]
+    fn what_enclos_says_on_a_session_is_set_apart_from_a_probe_that_ran() {
+        let notice = "enclos: this kernel has no Landlock: writes are held by the mounts alone";
+        let stderr = format!("{notice}\nsh: 1: cannot open /x: No such file\n");
+        let (rest, notices) = set_aside_notices(b"enclos-probe-ran\n403", stderr.as_bytes());
+        assert_eq!(notices, [notice]);
+        assert_eq!(rest, b"sh: 1: cannot open /x: No such file\n");
+        let refused = "enclos: no namespace holder answers on /run/h.sock\n";
+        let (rest, notices) = set_aside_notices(b"", refused.as_bytes());
+        assert!(notices.is_empty());
+        assert_eq!(rest, refused.as_bytes());
     }
 
     #[test]

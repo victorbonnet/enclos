@@ -25,7 +25,8 @@ use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
-    TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, with_real_paths,
+    TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, set_aside_notices,
+    with_real_paths,
 };
 
 /// What `enclos policy test` found.
@@ -42,6 +43,9 @@ pub struct TestReport {
     /// What the report says of the backend's probes, the baseline they ran
     /// on included.
     pub notes: ReportNotes,
+    /// What enclos itself said on the probes' sessions, each once, such as
+    /// that the kernel has no Landlock (design §5): not any probe's answer.
+    pub notices: Vec<String>,
 }
 
 impl TestReport {
@@ -248,6 +252,7 @@ impl Engine {
                 list.extend(own.host_services(&inputs));
             }
             let mut results = Vec::new();
+            let mut notices: Vec<String> = Vec::new();
             for probe in list {
                 let run_in_sandbox = |script: String| {
                     let launch = Launch {
@@ -264,7 +269,15 @@ impl Engine {
                     let wrapped = backend
                         .wrap(&compiled, &ctx, &launch)
                         .map_err(std::io::Error::other)?;
-                    self.run_scoped(name, wrapped)
+                    let mut out = self.run_scoped(name, wrapped)?;
+                    let (stderr, said) = set_aside_notices(&out.stdout, &out.stderr);
+                    out.stderr = stderr;
+                    for notice in said {
+                        if !notices.contains(&notice) {
+                            notices.push(notice);
+                        }
+                    }
+                    Ok(out)
                 };
                 let outcome = run_probe(&probe, run_in_sandbox, &mut target.0);
                 results.push(ProbeResult::of(probe, outcome));
@@ -276,6 +289,7 @@ impl Engine {
                 not_here: not_here(&inputs, own.as_ref()),
                 listens: inputs.listen,
                 notes: own.notes(),
+                notices,
             })
         })
         .map(Planned::Done)
@@ -643,6 +657,7 @@ mod tests {
             not_here: Vec::new(),
             listens: false,
             notes: notes_on(Baseline::DenyDefault),
+            notices: Vec::new(),
         }
     }
 
