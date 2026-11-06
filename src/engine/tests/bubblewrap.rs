@@ -313,17 +313,20 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
 /// The first session of a sandbox that was never started installs its
 /// namespace holder alone, as a service, and joins it once it answers
 /// (ADR 0039). Here the service manager is a stand-in, so the namespace
-/// holder that answers is one this test starts meanwhile.
+/// holder that answers is one this test starts as the unit is started:
+/// before, the engine finds none.
 #[test]
 fn a_first_session_installs_the_namespace_holder_and_waits_for_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let services = std::rc::Rc::new(FakeServices::default());
     let stood = Stood::with(true, Some(services.clone()));
     let socket = stood.engine.layout.holder_socket("lab");
-    let late = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
-    });
+    let holder = stood.engine.label(&stood.name, Unit::Holder).unwrap();
+    *services.on_start.borrow_mut() = Some(Box::new(move |label| {
+        if *label == holder {
+            crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+        }
+    }));
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
@@ -338,7 +341,6 @@ fn a_first_session_installs_the_namespace_holder_and_waits_for_it() {
             })
     });
     drop(lock);
-    late.join().unwrap();
     let mut started = started.unwrap();
     assert!(started.child.wait().unwrap().success());
     stood.end_proxy();
