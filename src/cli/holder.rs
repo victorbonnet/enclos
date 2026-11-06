@@ -24,7 +24,7 @@ enum HolderVerb {
     /// service manager.
     Run { sandbox: SandboxName },
     /// Serve as the namespace holder in the namespaces bubblewrap made, on
-    /// the socket bound on stdin; run by `holder run`.
+    /// the sockets handed over on stdin; run by `holder run`.
     Serve {
         /// The sandbox's proxy port, where the relay listens on 127.0.0.1.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
@@ -62,8 +62,8 @@ pub fn run(args: HolderArgs) -> Result<u8> {
 fn serve(port: u16, proxy: &std::path::Path) -> Error {
     use std::os::fd::AsFd;
     let why = match std::io::stdin().as_fd().try_clone_to_owned() {
-        Ok(socket) => enclos::backend::bubblewrap::holder::serve(socket, port, proxy),
-        Err(e) => format!("the namespace holder's socket is not on its stdin: {e}"),
+        Ok(sockets) => enclos::backend::bubblewrap::holder::serve(sockets, port, proxy),
+        Err(e) => format!("the namespace holder's sockets are not on its stdin: {e}"),
     };
     Error::Holder { why }
 }

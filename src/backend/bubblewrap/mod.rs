@@ -26,6 +26,7 @@ use crate::host::HostCheck;
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::probes::OwnProbes;
+use crate::relay::inward::WayIn;
 
 pub use compile::{CompiledSandbox, compile};
 pub use proposed::{Host, capabilities};
@@ -186,6 +187,10 @@ impl NamespaceHolder for Bubblewrap {
             pid: answer.pid,
             ephemeral: answer.ephemeral,
         })
+    }
+
+    fn way_in(&self, ctx: &SandboxContext) -> WayIn {
+        WayIn::new(&ctx.inward_socket)
     }
 
     #[cfg(not(target_os = "linux"))]

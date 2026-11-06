@@ -294,6 +294,24 @@ impl Layout {
         self.sandbox_run_dir(name).join("holder.sock")
     }
 
+    /// The namespace holder's way in, the socket on which it relays the
+    /// host's connections to a port in the sandbox's network namespace (ADR
+    /// 0040): beside its other socket, where no session reaches.
+    pub fn inward_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("inward.sock")
+    }
+
+    /// The lock `enclos dashboard` holds while it runs for the sandbox,
+    /// which says who holds it: one at a time (ADR 0040).
+    pub fn dashboard_lock(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("dashboard.lock")
+    }
+
+    /// Creates the sandbox's folder of what runs, this user's alone.
+    pub fn create_sandbox_run_dir(&self, name: &str) -> std::io::Result<()> {
+        users_alone(&self.sandbox_run_dir(name))
+    }
+
     /// Creates the folder of the sandbox's proxy socket.
     pub fn create_proxy_socket_dir(&self, name: &str) -> std::io::Result<()> {
         users_alone(&self.sandbox_run_dir(name).join("visible"))

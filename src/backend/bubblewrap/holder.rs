@@ -4,10 +4,13 @@
 //! namespace to each session that joins it.
 //!
 //! Three hidden commands make it up. `enclos holder run <sandbox>`, which the
-//! service manager runs, binds the namespace holder's socket in the
+//! service manager runs, binds the namespace holder's two sockets in the
 //! host-only `run/<sandbox>/` and becomes bubblewrap ([`command`]), which
 //! makes user, PID and network namespaces and runs `enclos holder serve` in
-//! them ([`serve`]). Every session starts with `enclos holder join`
+//! them ([`serve`]). One hands out the namespaces; on the other, its way
+//! in, the namespace holder relays the host's connections to a port in its
+//! network namespace (ADR 0040; `relay::inward`). Every session starts
+//! with `enclos holder join`
 //! ([`join`]): it asks the namespace holder for its namespaces, enters its
 //! user namespace then its network namespace, as `nsenter` would, and
 //! becomes the session's bubblewrap, which makes the session's own user, PID
@@ -108,18 +111,23 @@ mod linux {
     /// How many connections wait for the namespace holder at once.
     const BACKLOG: i32 = 64;
 
+    /// What the message that hands the namespace holder its sockets says.
+    const SOCKETS: &str = "sockets";
+
     /// The command that becomes the namespace holder of `ctx`'s sandbox:
     /// bubblewrap running `enclos holder serve` in namespaces of its own,
-    /// with the holder's socket bound on its stdin. The relay inside serves
-    /// the sandbox's proxy port, and passes each connection to the proxy's
-    /// socket. The command starts with an empty environment: the namespace
-    /// holder reads no variable.
+    /// with the holder's socket and its way in bound, and handed over on its
+    /// stdin. The relay inside serves the sandbox's proxy port, and passes
+    /// each connection to the proxy's socket. The command starts with an
+    /// empty environment: the namespace holder reads no variable.
     pub fn command(
         bwrap: &Path,
         enclos: &Path,
         ctx: &SandboxContext,
     ) -> Result<Command, WrapError> {
         let socket = bound_socket(&ctx.holder_socket)?;
+        let inward = bound_socket(&ctx.inward_socket)?;
+        let sockets = handed_over([socket.as_fd(), inward.as_fd()])?;
         let mut command = Command::new(bwrap);
         command
             .env_clear()
@@ -130,14 +138,32 @@ mod linux {
             .arg(ctx.proxy_port.to_string())
             .arg("--proxy")
             .arg(&ctx.proxy_socket)
-            .stdin(Stdio::from(socket));
+            .stdin(Stdio::from(sockets));
         Ok(command)
+    }
+
+    /// One end of a pair of connected sockets, holding `sockets` in one
+    /// message for whoever reads it: how the namespace holder gets both of
+    /// its sockets on its stdin.
+    fn handed_over(sockets: [BorrowedFd<'_>; 2]) -> Result<OwnedFd, WrapError> {
+        let failed = |e: &dyn std::fmt::Display| {
+            WrapError(format!("cannot hand the namespace holder its sockets: {e}"))
+        };
+        let (ours, theirs) = rustix::net::socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(|e| failed(&e))?;
+        hand_out(&UnixStream::from(ours), SOCKETS, sockets).map_err(|e| failed(&e))?;
+        Ok(theirs)
     }
 
     /// A Unix socket bound at `path`, in a folder this user alone reaches,
     /// and not listening yet: the namespace holder listens on it from inside
-    /// its namespaces, so the socket's peer credentials name that process,
-    /// whose `/proc/<pid>/net` the host reads. One that a namespace holder
+    /// its namespaces, so the holder socket's peer credentials name that
+    /// process, whose `/proc/<pid>/net` the host reads. One that a namespace holder
     /// still answers on is refused, as replacing that namespace holder would
     /// split the sandbox; one left by a namespace holder that ended goes.
     fn bound_socket(path: &Path) -> Result<OwnedFd, WrapError> {
@@ -180,26 +206,37 @@ mod linux {
         Ok(socket)
     }
 
-    /// Serves as the namespace holder, in the namespaces bubblewrap made:
-    /// listens on `socket`, bound by `command`, runs the relay from
-    /// 127.0.0.1 at `port` to the proxy's socket at `proxy`, and hands each
-    /// connection its user and network namespaces, with its namespace's
-    /// ephemeral ports. Returns only what stopped it.
-    pub fn serve(socket: OwnedFd, port: u16, proxy: &Path) -> String {
-        match serving(socket, port, proxy) {
+    /// Serves as the namespace holder, in the namespaces bubblewrap made,
+    /// on the two sockets `command` bound and handed over in `sockets`:
+    /// runs the relay from 127.0.0.1 at `port` to the proxy's socket at
+    /// `proxy`, and the relay from the host on its way in, and hands each
+    /// connection to its socket its user and network namespaces, with its
+    /// namespace's ephemeral ports. Returns only what stopped it.
+    pub fn serve(sockets: OwnedFd, port: u16, proxy: &Path) -> String {
+        match serving(sockets, port, proxy) {
             Ok(never) => match never {},
             Err(why) => why,
         }
     }
 
     fn serving(
-        socket: OwnedFd,
+        sockets: OwnedFd,
         port: u16,
         proxy: &Path,
     ) -> Result<std::convert::Infallible, String> {
+        let unread = |why: &dyn std::fmt::Display| {
+            format!("cannot take the namespace holder's sockets from its stdin: {why}")
+        };
+        let sockets = UnixStream::from(sockets);
+        sockets
+            .set_read_timeout(Some(ANSWER))
+            .map_err(|e| unread(&e))?;
+        let [socket, inward] = received(&sockets).map_err(|why| unread(&why))?.1;
         // Here, so the socket's peer credentials are this process's.
         rustix::net::listen(&socket, BACKLOG)
             .map_err(|e| format!("cannot listen on the namespace holder's socket: {e}"))?;
+        rustix::net::listen(&inward, BACKLOG)
+            .map_err(|e| format!("cannot listen on the namespace holder's way in: {e}"))?;
         let listener = UnixListener::from(socket);
         let open = |kind: &str| {
             File::open(format!("/proc/self/ns/{kind}"))
@@ -214,6 +251,11 @@ mod linux {
             .name("relay".to_owned())
             .spawn(move || crate::relay::serve(relay, &proxy))
             .map_err(|e| format!("cannot start the relay: {e}"))?;
+        let inward = UnixListener::from(inward);
+        std::thread::Builder::new()
+            .name("inward".to_owned())
+            .spawn(move || crate::relay::inward::serve(inward))
+            .map_err(|e| format!("cannot start the relay from the host: {e}"))?;
         let mut failing = false;
         loop {
             match listener.accept() {
@@ -278,42 +320,47 @@ mod linux {
             .set_read_timeout(Some(ANSWER))
             .map_err(|e| unread(&e))?;
         let peer = rustix::net::sockopt::socket_peercred(&stream).map_err(|e| unread(&e))?;
-        let mut said = [0u8; 64];
-        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
-        let mut control = RecvAncillaryBuffer::new(&mut space);
-        let received = rustix::net::recvmsg(
-            &stream,
-            &mut [IoSliceMut::new(&mut said)],
-            &mut control,
-            RecvFlags::CMSG_CLOEXEC,
-        )
-        .map_err(|e| unread(&e))?;
-        let mut fds: Vec<OwnedFd> = Vec::new();
-        for message in control.drain() {
-            if let RecvAncillaryMessage::ScmRights(sent) = message {
-                fds.extend(sent);
-            }
-        }
-        let odd = |what: String| format!("the namespace holder on {at} answered {what}");
-        if received.flags.contains(ReturnFlags::CTRUNC) {
-            return Err(odd("more descriptors than its two namespaces".to_owned()));
-        }
-        let count = fds.len();
-        let namespaces: [OwnedFd; 2] = fds
-            .try_into()
-            .map_err(|_| odd(format!("{count} descriptors, not its two namespaces")))?;
-        let text = &said[..received.bytes.min(said.len())];
-        let ephemeral = ports_in(text).ok_or_else(|| {
-            odd(format!(
-                "`{}`, not its ephemeral ports",
-                String::from_utf8_lossy(text)
-            ))
+        let (said, namespaces) = received(&stream).map_err(|why| unread(&why))?;
+        let ephemeral = ports_in(&said).ok_or_else(|| {
+            format!(
+                "the namespace holder on {at} answered `{}`, not its ephemeral ports",
+                String::from_utf8_lossy(&said)
+            )
         })?;
         Ok(Answer {
             pid: peer.pid.as_raw_nonzero().get().unsigned_abs(),
             ephemeral,
             namespaces,
         })
+    }
+
+    /// What [`hand_out`] sent on `stream`: its words, and its two
+    /// descriptors, closed on `exec`. Any other count is refused.
+    fn received(stream: &UnixStream) -> Result<(Vec<u8>, [OwnedFd; 2]), String> {
+        let mut said = [0u8; 64];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let received = rustix::net::recvmsg(
+            stream,
+            &mut [IoSliceMut::new(&mut said)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut fds: Vec<OwnedFd> = Vec::new();
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(sent) = message {
+                fds.extend(sent);
+            }
+        }
+        if received.flags.contains(ReturnFlags::CTRUNC) {
+            return Err("more than two descriptors came".to_owned());
+        }
+        let count = fds.len();
+        let fds: [OwnedFd; 2] = fds
+            .try_into()
+            .map_err(|_| format!("{count} descriptors came, not two"))?;
+        Ok((said[..received.bytes.min(said.len())].to_vec(), fds))
     }
 
     /// Joins the namespace holder on `socket` the `nsenter` way: enters its
@@ -368,83 +415,7 @@ mod linux {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        /// What `serve` sends, `ask` reads back: the ports, two descriptors
-        /// that are this process's namespaces and close on `exec`, and the
-        /// namespace holder's pid from the socket.
-        #[test]
-        fn a_namespace_holders_answer_is_its_ports_its_namespaces_and_its_pid() {
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("run/lab/holder.sock");
-            stand_in(&socket, (32768, 60999));
-            let answer = ask(&socket).unwrap();
-            assert_eq!(answer.ephemeral, 32768..=60999);
-            assert_eq!(answer.pid, std::process::id());
-            let [user, net] = &answer.namespaces;
-            for (fd, kind) in [(user, "user"), (net, "net")] {
-                let held = std::fs::read_link(format!("/proc/self/fd/{}", rustix_fd(fd))).unwrap();
-                let own = std::fs::read_link(format!("/proc/self/ns/{kind}")).unwrap();
-                assert_eq!(held, own, "{kind}");
-                let flags = rustix::io::fcntl_getfd(fd).unwrap();
-                assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{kind}");
-            }
-        }
-
-        fn rustix_fd(fd: &OwnedFd) -> i32 {
-            use std::os::fd::AsRawFd;
-            fd.as_raw_fd()
-        }
-
-        #[test]
-        fn no_namespace_holder_is_said_with_its_socket() {
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("holder.sock");
-            let Err(why) = ask(&socket) else {
-                panic!("answered");
-            };
-            assert!(why.contains("no namespace holder answers on"), "{why}");
-            assert!(why.contains("holder.sock"), "{why}");
-        }
-
-        /// A join that cannot reach the namespace holder runs nothing.
-        #[test]
-        fn a_join_with_no_namespace_holder_runs_nothing() {
-            let dir = tempfile::tempdir().unwrap();
-            let ran = dir.path().join("ran");
-            let command: Vec<OsString> = vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                format!("touch '{}'", ran.display()).into(),
-            ];
-            let why = join(&dir.path().join("holder.sock"), &command);
-            assert!(why.contains("no namespace holder answers"), "{why}");
-            assert!(!ran.exists());
-        }
-
-        /// The socket is made bound and not listening, for the namespace
-        /// holder to listen on, this user's alone; one a namespace holder
-        /// answers on is left to it.
-        #[test]
-        fn the_socket_is_bound_for_the_namespace_holder_and_never_taken_from_one() {
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("run/lab/holder.sock");
-            let bound = bound_socket(&socket).unwrap();
-            let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-            let folder = std::fs::metadata(socket.parent().unwrap()).unwrap();
-            assert_eq!(folder.permissions().mode() & 0o777, 0o700);
-            // Not listening yet: nobody is answered.
-            assert!(UnixStream::connect(&socket).is_err());
-            rustix::net::listen(&bound, 1).unwrap();
-            let refused = bound_socket(&socket).unwrap_err();
-            assert!(refused.0.contains("already answers"), "{refused}");
-            drop(bound);
-            // Ended: its socket file is replaced.
-            bound_socket(&socket).unwrap();
-        }
-    }
+    mod tests;
 }
 
 #[cfg(test)]
