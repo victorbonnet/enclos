@@ -18,13 +18,13 @@ The words used here:
 
 enclos's Linux support is in development and is not in a release yet. Once a release has Linux archives, the installer below installs them on Linux on x86_64 or arm64 (aarch64), as on a Mac; until then, build from a clone. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
 
-A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`) and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
+A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`), 0.9.0 or later, and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
 
 ```bash
 enclos sandbox create lab --backend bubblewrap --template assistant
 ```
 
-`sandbox create` refuses the backend where it cannot run, and says what it found and what to do; `enclos doctor` shows the same, with what the backend enforces on this host. Where the kernel has no Landlock, as on Raspberry Pi OS, the backend still runs, and `doctor` says that writes are then held by its mounts alone and that any program the sandbox can read can run (design §5, Degraded controls on Linux).
+`sandbox create` refuses the backend where it cannot run, and says what it found and what to do; `enclos doctor` shows the same, with what the backend enforces on this host. Where the kernel has no Landlock, as on Raspberry Pi OS, the backend still runs, and `doctor` says that writes are then held by its mounts alone and that any program the sandbox can read can run (design §5, Degraded controls on Linux). Under Host, `doctor` lists each thing it checked, with the fix for each one that falls short: bubblewrap and its version, user namespaces, Landlock, the `memory` and `cpu` controllers delegated to your systemd manager, lingering, and whether a Secret Service answers. Lingering off and no Secret Service are not problems: without lingering, systemd stops your sandboxes' services at your last logout, and enclos never turns it on for you (`loginctl enable-linger` does); with no Secret Service, new secrets go to a `0600` file.
 
 On Ubuntu 24.04, AppArmor restricts the user namespaces bubblewrap makes (`kernel.apparmor_restrict_unprivileged_userns = 1`) and has no rule for it, so bubblewrap cannot start a program as installed. GitHub's Ubuntu 24.04 runners needed this profile, which lets `/usr/bin/bwrap` alone make them; it has not been tried on a desktop install yet:
 

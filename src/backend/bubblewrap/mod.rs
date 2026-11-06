@@ -5,6 +5,7 @@
 //! first (ADR 0039).
 
 pub mod compile;
+mod degraded;
 pub mod holder;
 #[cfg(target_os = "linux")]
 pub mod inside;
@@ -21,6 +22,7 @@ use super::{
     Backend, Capabilities, CompileError, Compiled, HeldNamespace, Launch, NamespaceHolder, Probe,
     SandboxContext, WrapError,
 };
+use crate::host::HostCheck;
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::probes::OwnProbes;
@@ -42,9 +44,9 @@ pub struct Bubblewrap {
     systemd_run: PathBuf,
     /// This program, which bubblewrap runs first as `enclos inside`.
     enclos: Option<PathBuf>,
-    /// [`Backend::probe`]'s answer, found once per process: it starts
+    /// What [`Backend::probe`] found, once per process: it starts
     /// bubblewrap, and every command asks it.
-    probed: OnceLock<Probe>,
+    probed: OnceLock<probe::Probed>,
 }
 
 impl Bubblewrap {
@@ -67,6 +69,11 @@ impl Bubblewrap {
             probed: OnceLock::new(),
         }
     }
+
+    fn probed(&self) -> &probe::Probed {
+        self.probed
+            .get_or_init(|| probe::probe(&probe::OnHost::new(&self.bwrap, &self.systemd_run)))
+    }
 }
 
 impl Backend for Bubblewrap {
@@ -75,15 +82,23 @@ impl Backend for Bubblewrap {
     }
 
     fn probe(&self) -> Probe {
-        self.probed
-            .get_or_init(|| probe::probe(&probe::OnHost::new(&self.bwrap, &self.systemd_run)))
-            .clone()
+        self.probed().probe.clone()
     }
 
     /// What `probe` found, which already started bubblewrap: nothing more
     /// is started here, so `doctor` changes nothing on the host either.
     fn try_run(&self) -> Probe {
         self.probe()
+    }
+
+    /// The probe's checks, up to the first that keeps bubblewrap from
+    /// running, then the degraded controls, on Linux alone.
+    fn host_checks(&self) -> Vec<HostCheck> {
+        let mut checks = self.probed().checks.clone();
+        if !checks.is_empty() {
+            checks.extend(degraded::checks(&degraded::Kernel::host()));
+        }
+        checks
     }
 
     /// Declared for this host's Landlock (ADR 0037).
