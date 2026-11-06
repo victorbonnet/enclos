@@ -20,6 +20,13 @@
 //! look: no marker is held, and `state check` alone, which tells a person
 //! so, treats that as no answer.
 //!
+//! A session in a cgroup is looked at through it too, after the listing as
+//! well: every way to make a [`Look`] takes the hierarchy and the sessions,
+//! so none can leave the cgroups out. What a session's cgroup holds counts as
+//! holding its marker, so one the listing does not show keeps the session
+//! open and is not signalled. A cgroup that cannot be read fails the look;
+//! only one removed is empty.
+//!
 //! Which listed processes are a session's is `members`'s to say; `stop`
 //! sends the signals.
 
@@ -27,10 +34,11 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::time::Duration;
 
+use super::cgroup::{Hierarchy, members_in};
 use super::marker::{Held, MarkerError, holders, is_held, name_of};
 use super::members::{Found, find, is_gone};
 use super::process::{Proc, PsError, processes};
-use super::stop::{Stopped, Survivor, Why};
+use super::stop::{Stopped, Survivor};
 use crate::model::session::{ProcessRef, SessionRecord};
 
 /// Why a look, or a stop that depends on one, failed.
@@ -42,17 +50,25 @@ pub enum LookError {
     Markers(#[from] MarkerError),
 }
 
-/// The host's processes and who holds each marker of one sandbox.
+/// The host's processes, and the sure members of each session of one
+/// sandbox that are not known by their parent or group.
 #[derive(Debug)]
 pub struct Look<'a> {
     procs: Cow<'a, [Proc]>,
-    held: Held,
+    /// By the name of each session's marker: the pids of the processes that
+    /// hold the marker, or are in the session's cgroup.
+    sure_by_session: Held,
 }
 
 impl Look<'static> {
-    /// Lists the processes, then looks at the markers in `markers`.
-    pub fn now(markers: &Path) -> Result<Look<'static>, LookError> {
-        Look::made(processes, || holders(markers))
+    /// Lists the processes, then looks at the markers in `markers`, then at
+    /// the cgroup in `cgroups` of each of `sessions`.
+    pub fn now<'s>(
+        markers: &Path,
+        cgroups: &Hierarchy,
+        sessions: impl IntoIterator<Item = &'s SessionRecord>,
+    ) -> Result<Look<'static>, LookError> {
+        Ok(Look::made(processes, || holders(markers))?.in_cgroups(cgroups, sessions)?)
     }
 
     /// `list`, then `hold`, which runs only once `list` gave a listing.
@@ -61,10 +77,10 @@ impl Look<'static> {
         hold: impl FnOnce() -> Result<Held, MarkerError>,
     ) -> Result<Look<'static>, LookError> {
         let procs = list()?;
-        let held = hold()?;
+        let sure_by_session = hold()?;
         Ok(Look {
             procs: Cow::Owned(procs),
-            held,
+            sure_by_session,
         })
     }
 
@@ -72,43 +88,75 @@ impl Look<'static> {
     /// looked at. It calls every session gone, so it is asked only about
     /// the sessions that were open: none.
     pub fn nothing_open() -> Look<'static> {
-        Look::markers_unseen(&[])
+        Look {
+            procs: Cow::Borrowed(&[]),
+            sure_by_session: Held::new(),
+        }
     }
 }
 
 impl<'a> Look<'a> {
-    /// Looks at the markers in `markers`, after `procs`, for the commands
-    /// that list the processes once for every sandbox. The listing may be
-    /// older than this look, so a process started since is not counted: a
-    /// session this calls gone is looked at again before its end is
-    /// recorded, and no signal follows from this look.
-    pub fn in_listing(procs: &'a [Proc], markers: &Path) -> Result<Look<'a>, MarkerError> {
-        Ok(Look {
+    /// Looks at the markers in `markers`, then at the cgroup in `cgroups` of
+    /// each of `sessions`, after `procs`, for the commands that list the
+    /// processes once for every sandbox. The listing may be older than this
+    /// look, so a process started since is not counted: a session this calls
+    /// gone is looked at again before its end is recorded, and no signal
+    /// follows from this look.
+    pub fn in_listing<'s>(
+        procs: &'a [Proc],
+        markers: &Path,
+        cgroups: &Hierarchy,
+        sessions: impl IntoIterator<Item = &'s SessionRecord>,
+    ) -> Result<Look<'a>, LookError> {
+        let look = Look {
             procs: Cow::Borrowed(procs),
-            held: holders(markers)?,
-        })
+            sure_by_session: holders(markers)?,
+        };
+        Ok(look.in_cgroups(cgroups, sessions)?)
     }
 
-    /// `procs`, with no look at the markers: for a sandbox whose markers
-    /// cannot be looked for, so whether one is held is not known. The
-    /// caller says so where it matters.
-    pub fn markers_unseen(procs: &'a [Proc]) -> Look<'a> {
-        Look {
+    /// `procs` and the cgroup in `cgroups` of each of `sessions`, with no
+    /// look at the markers: for a sandbox whose markers cannot be looked
+    /// for, so whether one is held is not known. The caller says so where it
+    /// matters.
+    pub fn markers_unseen<'s>(
+        procs: &'a [Proc],
+        cgroups: &Hierarchy,
+        sessions: impl IntoIterator<Item = &'s SessionRecord>,
+    ) -> Result<Look<'a>, LookError> {
+        let look = Look {
             procs: Cow::Borrowed(procs),
-            held: Held::new(),
+            sure_by_session: Held::new(),
+        };
+        Ok(look.in_cgroups(cgroups, sessions)?)
+    }
+
+    /// This look, with the processes in the cgroup of each of `sessions`
+    /// counted as sure members, as a marker's holders are. Whatever that
+    /// cgroup holds is the session's, with or without the marker, and it is
+    /// read after the listing, as the markers are.
+    fn in_cgroups<'s>(
+        mut self,
+        cgroups: &Hierarchy,
+        sessions: impl IntoIterator<Item = &'s SessionRecord>,
+    ) -> Result<Look<'a>, PsError> {
+        for session in sessions {
+            if let Some(cgroup) = &session.cgroup {
+                self.sure_by_session
+                    .entry(name_of(&session.root))
+                    .or_default()
+                    .extend(cgroups.pids(cgroup)?);
+            }
         }
+        Ok(self)
     }
 
-    /// `session`, with the listed processes holding its marker added to
-    /// those it tracked, each once.
+    /// `session`, with the listed processes holding its marker, or in its
+    /// cgroup, added to those it tracked, each once.
     pub fn marked(&self, session: &SessionRecord) -> SessionRecord {
         let mut marked = session.clone();
-        if let Some(pids) = self.held.get(&name_of(&session.root)) {
-            for p in self.procs.iter().filter(|p| pids.contains(&p.pid)) {
-                let holder = ProcessRef {
-                    pid: p.pid,
-                    started: p.started.clone(),
-                };
+        if let Some(pids) = self.sure_by_session.get(&name_of(&session.root)) {
+            for holder in members_in(&self.procs, pids).0 {
                 if !marked.tracked.contains(&holder) {
                     marked.tracked.push(holder);
                 }
@@ -129,7 +177,8 @@ impl<'a> Look<'a> {
     /// started after it, so it has no start time to be known by, but it
     /// shows the session is not over.
     pub fn is_gone(&self, session: &SessionRecord) -> bool {
-        is_gone(&self.procs, &self.marked(session)) && !is_held(&self.held, &session.root)
+        is_gone(&self.procs, &self.marked(session))
+            && !is_held(&self.sure_by_session, &session.root)
     }
 
     /// The members of `session` in this look, for ending it when there are
@@ -138,7 +187,7 @@ impl<'a> Look<'a> {
     /// open.
     pub fn left(&self, session: &SessionRecord) -> Result<Vec<Found>, MarkerError> {
         let found = self.members(session);
-        match found.is_empty() && is_held(&self.held, &session.root) {
+        match found.is_empty() && is_held(&self.sure_by_session, &session.root) {
             true => Err(MarkerError::Unlisted(session.root.pid)),
             false => Ok(found),
         }
@@ -177,7 +226,7 @@ pub fn stop_marked(
     // the marker or lost their parent.
     let signalled = survivors(&first)
         .iter()
-        .filter(|s| !matches!(s.why, Why::NotSignalled))
+        .filter(|s| s.why.signalled())
         .map(|s| ProcessRef {
             pid: s.member.pid,
             started: s.member.started.clone(),
@@ -228,6 +277,7 @@ fn merged(
 
 #[cfg(test)]
 mod tests {
+    use super::super::stop::Why;
     use super::*;
     use crate::model::now;
     use crate::model::session::{Member, SessionId, SessionKind};
@@ -252,6 +302,7 @@ mod tests {
             compiled: None,
             pgid: None,
             root: at(root),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -272,7 +323,7 @@ mod tests {
     fn look(procs: &[u32], session: &SessionRecord, held: &[u32]) -> Look<'static> {
         Look {
             procs: Cow::Owned(procs.iter().copied().map(proc_).collect()),
-            held: Held::from([(name_of(&session.root), set(held))]),
+            sure_by_session: Held::from([(name_of(&session.root), set(held))]),
         }
     }
 
@@ -401,15 +452,16 @@ mod tests {
     fn a_look_at_no_markers_counts_only_the_listing() {
         let a = session(1, 10);
         let procs = [proc_(10)];
-        assert!(!Look::markers_unseen(&procs).is_gone(&a));
-        assert!(Look::markers_unseen(&[]).is_gone(&a));
+        let unseen = |procs| Look::markers_unseen(procs, &Hierarchy::host(), [&a]).unwrap();
+        assert!(!unseen(&procs).is_gone(&a));
+        assert!(unseen(&[]).is_gone(&a));
     }
 
     #[test]
     fn with_nothing_open_nothing_was_looked_at() {
         let look = Look::nothing_open();
         assert!(look.procs.is_empty());
-        assert!(look.held.is_empty());
+        assert!(look.sure_by_session.is_empty());
     }
 
     /// A markers' folder that cannot be read is a failed look, not a look
@@ -420,16 +472,96 @@ mod tests {
         let file = dir.path().join("members");
         std::fs::write(&file, "").unwrap();
         assert!(matches!(
-            Look::in_listing(&[], &file),
-            Err(MarkerError::Folder(_))
+            Look::in_listing(&[], &file, &Hierarchy::host(), []),
+            Err(LookError::Markers(MarkerError::Folder(_)))
         ));
     }
 
     #[test]
     fn no_markers_folder_yet_is_no_marker_held() {
         let dir = tempfile::tempdir().unwrap();
-        let seen = Look::in_listing(&[], &dir.path().join("members")).unwrap();
+        let markers = dir.path().join("members");
+        let seen = Look::in_listing(&[], &markers, &Hierarchy::host(), []).unwrap();
         assert!(seen.is_gone(&session(1, 10)));
+    }
+
+    /// A stand-in for the hierarchy with `a` in a cgroup holding `text`.
+    fn in_cgroup(a: &mut SessionRecord, text: &str) -> (tempfile::TempDir, Hierarchy) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("s.scope");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("cgroup.procs"), text).unwrap();
+        a.cgroup = Some("/s.scope".parse().unwrap());
+        let cgroups = Hierarchy::at(dir.path());
+        (dir, cgroups)
+    }
+
+    #[test]
+    fn what_a_cgroup_holds_is_its_sessions_member_only() {
+        let (mut a, b) = (session(1, 10), session(2, 20));
+        let (_dir, cgroups) = in_cgroup(&mut a, "50\n");
+        let seen = look(&[50], &a, &[]).in_cgroups(&cgroups, [&a]).unwrap();
+        assert_eq!(seen.members(&a)[0].sure_ref(), Some(at(50)));
+        assert!(!seen.is_gone(&a));
+        assert!(seen.is_gone(&b));
+    }
+
+    /// As with a marker's holder: it has no start time to be known by, so
+    /// it is no member to signal, but the session is not over.
+    #[test]
+    fn what_a_cgroup_holds_that_the_listing_does_not_show_keeps_the_session_open() {
+        let mut a = session(1, 10);
+        let (_dir, cgroups) = in_cgroup(&mut a, "50\n");
+        let seen = look(&[], &a, &[]).in_cgroups(&cgroups, [&a]).unwrap();
+        assert!(seen.members(&a).is_empty());
+        assert!(!seen.is_gone(&a));
+        assert!(matches!(seen.left(&a), Err(MarkerError::Unlisted(10))));
+    }
+
+    #[test]
+    fn a_cgroup_that_cannot_be_read_fails_the_look_and_is_no_empty_answer() {
+        let mut a = session(1, 10);
+        let (_dir, cgroups) = in_cgroup(&mut a, "not a pid\n");
+        assert!(look(&[], &a, &[]).in_cgroups(&cgroups, [&a]).is_err());
+    }
+
+    #[test]
+    fn a_cgroup_systemd_removed_is_empty() {
+        let mut a = session(1, 10);
+        let (dir, cgroups) = in_cgroup(&mut a, "50\n");
+        std::fs::remove_dir_all(dir.path().join("s.scope")).unwrap();
+        let seen = look(&[], &a, &[]).in_cgroups(&cgroups, [&a]).unwrap();
+        assert!(seen.is_gone(&a));
+    }
+
+    /// No look can leave the cgroups out: each way to make one reads them.
+    #[test]
+    fn every_way_to_make_a_look_sees_what_a_sessions_cgroup_holds() {
+        let mut a = session(1, 10);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let member = child.id();
+        let (dir, cgroups) = in_cgroup(&mut a, &format!("{member}\n"));
+        let markers = dir.path().join("members");
+        let procs = [proc_(member)];
+        let looks = [
+            Look::now(&markers, &cgroups, [&a]).unwrap(),
+            Look::in_listing(&procs, &markers, &cgroups, [&a]).unwrap(),
+            Look::markers_unseen(&procs, &cgroups, [&a]).unwrap(),
+        ];
+        for seen in looks {
+            assert!(!seen.is_gone(&a));
+            let found = seen.members(&a);
+            assert_eq!(
+                found.iter().map(|f| f.member.pid).collect::<Vec<_>>(),
+                [member]
+            );
+            assert!(found[0].sure, "{found:?}");
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     /// Stops `a` with looks answering from `looks` in turn (the last one
@@ -518,6 +650,16 @@ mod tests {
         let (result, asked) = stopped_with(&a, &[&[]], vec![first.clone()]);
         assert_eq!(result, first);
         assert_eq!(asked.len(), 1);
+    }
+
+    /// One a cgroup holds and no listing shows has no start time, and no
+    /// signal was sent to it: the second stop reads the cgroup again.
+    #[test]
+    fn the_second_stop_does_not_take_an_unlisted_survivor_for_a_signalled_one() {
+        let a = session(1, 10);
+        let first = Stopped::Survivors(vec![survivor(73, Why::NotListed)]);
+        let (_, asked) = stopped_with(&a, &[&[], &[60]], vec![first, Stopped::Clean]);
+        assert_eq!(asked[1], set(&[60]));
     }
 
     /// A survivor of the first stop that still runs is reported though the

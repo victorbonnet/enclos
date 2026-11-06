@@ -1,6 +1,8 @@
 //! A runtime in a sandbox: its install, agents, settings, channels and
 //! secrets, and its service's launch and stop (design §8, §9).
 
+mod cgroups;
+
 use super::policy::with_sandbox_on;
 use super::*;
 use crate::model::agent::{AgentName, AgentRecord};
@@ -1571,6 +1573,7 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
         compiled: None,
         pgid: Some(child.id()),
         root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,
@@ -1645,6 +1648,7 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
         compiled: None,
         pgid: Some(child.id()),
         root: crate::lifecycle::process::reference_of_child(child).unwrap(),
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,
@@ -1707,6 +1711,7 @@ fn a_settings_restart_waits_until_no_one_is_connected() {
             compiled: None,
             pgid: Some(setup.id()),
             root: crate::lifecycle::process::reference_of_child(&setup).unwrap(),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: crate::model::now(),
             ended_at: None,
@@ -1911,6 +1916,7 @@ fn a_child_forked_while_stopping_is_stopped_through_its_marker() {
         compiled: None,
         pgid: Some(child.id()),
         root,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,
@@ -3010,6 +3016,7 @@ fn record_service_session(
                     compiled: None,
                     pgid,
                     root,
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,
@@ -3438,7 +3445,7 @@ fn a_runtime_that_outlives_being_told_to_end_is_audited_and_its_session_stays_op
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     // Nothing survives KILL on demand: this stop sends no signal and
     // reports the program as having survived both.
-    let lab = Lab::stopping_with(|session, _| {
+    let lab = Lab::stopping_with(|_, session, _| {
         Ok(Stopped::Survivors(vec![Survivor {
             member: Member {
                 pid: session.root.pid,
@@ -3491,7 +3498,7 @@ fn a_runtime_enclos_cannot_stop_is_audited_and_its_session_stays_open() {
 
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     // `ps` failing whenever the members are stopped: nothing is signalled.
-    let lab = Lab::stopping_with(|_, _| Err(PsError::new("ps failed")));
+    let lab = Lab::stopping_with(|_, _, _| Err(PsError::new("ps failed")));
     assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
     let ended = Arc::new(AtomicBool::new(false));
     let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
@@ -3531,9 +3538,9 @@ fn a_launch_refuses_to_start_beside_an_earlier_session_that_does_not_stop() {
     // without signalling it; every other session it stops for real.
     static STUBBORN: AtomicU32 = AtomicU32::new(0);
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
-    let lab = Lab::stopping_with(|session, grace| {
+    let lab = Lab::stopping_with(|cgroups, session, grace| {
         if session.root.pid != STUBBORN.load(Ordering::Relaxed) {
-            return crate::lifecycle::stop::stop(session, grace);
+            return crate::lifecycle::stop::stop(cgroups, session, grace);
         }
         Ok(Stopped::Survivors(vec![Survivor {
             member: Member {
@@ -3642,6 +3649,7 @@ fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
                     compiled: None,
                     pgid: None,
                     root,
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,

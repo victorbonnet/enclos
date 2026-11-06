@@ -113,6 +113,12 @@ _Avoid_: child, worker
 **Marker**:
 A file enclos gives a program as a session starts, which the program and everything it starts hold open, so that holding it proves a process is that session's member.
 
+**Scope**:
+On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
+
+**Slice**:
+On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
+
 **Workspace**:
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume

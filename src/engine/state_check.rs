@@ -467,9 +467,10 @@ impl Engine {
                     .into());
                 }
             };
+        let cgroups = self.cgroups();
         let look = match markers_found {
-            true => Look::in_listing(&host.procs, &markers_dir)?,
-            false => Look::markers_unseen(&host.procs),
+            true => Look::in_listing(&host.procs, &markers_dir, &cgroups, &open)?,
+            false => Look::markers_unseen(&host.procs, &cgroups, &open)?,
         };
         let mut gone = Vec::new();
         let mut members: BTreeSet<u32> = BTreeSet::new();

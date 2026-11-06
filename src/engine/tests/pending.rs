@@ -832,6 +832,7 @@ fn processes_that_survive_the_stop_keep_the_policy_pending_and_name_the_services
             .unwrap()
             .unwrap(),
         pgid: Some(program.id()),
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,

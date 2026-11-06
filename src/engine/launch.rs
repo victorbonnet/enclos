@@ -293,6 +293,7 @@ impl Engine {
                     // Its group only when it leads it, as under a service
                     // manager: otherwise the group is its caller's.
                     pgid: (group_of(me)? == Some(me)).then_some(me),
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,

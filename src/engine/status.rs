@@ -373,6 +373,7 @@ mod tests {
             compiled: None,
             root,
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -403,7 +404,8 @@ mod tests {
         let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
         let procs = crate::lifecycle::process::processes().unwrap();
         let running = [session_of(SessionKind::Interactive, root.clone())];
-        let look = Look::markers_unseen(&procs);
+        let hierarchy = crate::lifecycle::cgroup::Hierarchy::host();
+        let look = Look::markers_unseen(&procs, &hierarchy, &running).unwrap();
         let found = network_listeners(&look, &running);
         // The proxy runs on the host, not in the sandbox: never counted.
         let proxy = network_listeners(&look, &[session_of(SessionKind::Proxy, root)]);

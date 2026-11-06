@@ -52,6 +52,7 @@ pub(super) fn record_gateway(engine: &Engine, name: &SandboxName, root: ProcessR
                     compiled: None,
                     root,
                     pgid: None,
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,

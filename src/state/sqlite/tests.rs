@@ -109,6 +109,22 @@ fn rejects_a_newer_schema() {
 }
 
 #[test]
+fn a_new_database_has_each_sessions_cgroup() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    let declared: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('sessions') WHERE name = 'cgroup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(declared, "TEXT");
+}
+
+#[test]
 fn rejects_a_schema_its_migrations_do_not_make() {
     let (_dir, store) = store();
     let lock = store.lock().unwrap();
@@ -391,7 +407,7 @@ fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
         "INSERT INTO sandboxes (name, backend, state, created_at)
              VALUES ('home', 'seatbelt', 'created', '2026-01-02T03:04:05.678Z');
          INSERT INTO sessions (id, sandbox, kind, version, snapshot, root_pid, root_start, started_at)
-             VALUES (7, 'home', 'command', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
+             VALUES (7, 'home', 'exec', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
          INSERT INTO secrets (sandbox, name, created_at, updated_at)
              VALUES ('home', 'telegram', '2026-01-02T03:04:05.678Z', '2026-01-02T03:04:05.678Z');",
     )
@@ -411,13 +427,16 @@ fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
     let secret = secrets[0].secret.clone();
     assert!(!store.put_secret(&lock, &secret, StoreName::File).unwrap());
     assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::Keychain);
-    let conn = Connection::open(&store.db).unwrap();
-    let sessions: i64 = conn
-        .query_row("SELECT count(*) FROM sessions WHERE id = 7", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(sessions, 1);
+    assert!(store.get(&name).unwrap().is_some());
+    let sessions = store.sessions(&name, true).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, SessionId(7));
+    assert_eq!(sessions[0].root.pid, 42);
+    assert_eq!(sessions[0].cgroup, None);
+    store.track(&lock, SessionId(7), &[]).unwrap();
+    store.end_session(&lock, SessionId(7)).unwrap();
+    assert!(store.sessions(&name, true).unwrap().is_empty());
+    assert_eq!(store.sessions(&name, false).unwrap()[0].cgroup, None);
     assert!(store.remove_secret(&lock, &secret).unwrap());
     assert!(store.secrets(&name).unwrap().is_empty());
 }
@@ -597,6 +616,7 @@ fn sessions_keep_their_members_until_they_end() {
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
         root: at(10),
         pgid: None,
+        cgroup: Some("/enclos.1f2e3d4c.home.slice/s.scope".parse().unwrap()),
         tracked: vec![at(11)],
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -622,6 +642,46 @@ fn sessions_keep_their_members_until_they_end() {
     assert!(store.sessions(&name, false).unwrap().is_empty());
 }
 
+/// A row is no way around what a `Cgroup` promises: `kill` writes to it.
+#[test]
+fn a_cgroup_in_the_database_that_is_no_scope_is_a_read_error() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let session = SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: None,
+        root: ProcessRef {
+            pid: 10,
+            started: "start".into(),
+        },
+        pgid: None,
+        cgroup: None,
+        tracked: Vec::new(),
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    store.put_session(&lock, &session).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    for path in ["/", "/user.slice", "../up.scope"] {
+        conn.execute("UPDATE sessions SET cgroup = ?1", [path])
+            .unwrap();
+        let err = store.sessions(&name, true).unwrap_err();
+        assert!(
+            err.to_string().contains("is not the path of a scope"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn only_a_service_session_names_a_service() {
     use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
@@ -643,6 +703,7 @@ fn only_a_service_session_names_a_service() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -683,6 +744,7 @@ fn a_session_and_its_sandboxs_state_are_written_together_or_not_at_all() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
