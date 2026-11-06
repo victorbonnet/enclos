@@ -213,10 +213,12 @@ impl Engine {
                 match status {
                     None => Ok(()),
                     Some(status) => Err(failed(format!(
-                        "the proxy of sandbox {} exited ({status}): {}; see {}",
+                        "the proxy of sandbox {} exited ({status}): {}; see {}; DIAG port {} held by: {}",
                         record.name,
                         last_log_line(log_path),
-                        log_path.display()
+                        log_path.display(),
+                        record.proxy_port,
+                        std::process::Command::new("sh").arg("-c").arg(format!("ss -tanpeo '( sport = :{p} or dport = :{p} )' 2>&1; ss -uanp '( sport = :{p} )' 2>&1", p = record.proxy_port)).output().map(|o| String::from_utf8_lossy(&o.stdout).replace('\n', " | ")).unwrap_or_default()
                     ))),
                 }
             };
