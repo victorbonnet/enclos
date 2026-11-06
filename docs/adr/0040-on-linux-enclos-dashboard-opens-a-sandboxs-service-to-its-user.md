@@ -1,14 +1,14 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # On Linux, `enclos dashboard` opens a sandbox's dashboard to the user running it
 
 Amends [0028](0028-a-runtime-listens-and-its-sessions-reach-its-service.md) for the bubblewrap backend.
 
-0028's consequences say that the host can reach a runtime's listener: Hermes's dashboard works in the host's browser, and a listener bound to every address serves the host's network. On Linux a sandbox has its own network namespace ([0004](0004-linux-bubblewrap-and-landlock.md), [0039](0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md), proposed), so the host cannot reach a listener there, on 127.0.0.1 or on every address (ECONNREFUSED; `prototype/m3/README.md`). The gateway's own port does not help: through a path to it the page loads, but Hermes withholds the session token there, so `/api/auth/me` gets 401 and `/api/ws` 403. `hermes dashboard` publishes the token in its page, to anyone who connects, and has no auth on loopback, which every user of the host shares.
+0028's consequences say that the host can reach a runtime's listener: Hermes's dashboard works in the host's browser, and a listener bound to every address serves the host's network. On Linux a sandbox has its own network namespace ([0004](0004-linux-bubblewrap-and-landlock.md), [0039](0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md)), so the host cannot reach a listener there, on 127.0.0.1 or on every address (ECONNREFUSED; `prototype/m3/README.md`). The gateway's own port does not help: through a path to it the page loads, but Hermes withholds the session token there, so `/api/auth/me` gets 401 and `/api/ws` 403. `hermes dashboard` publishes the token in its page, to anyone who connects, and has no auth on loopback, which every user of the host shares.
 
-Decision (proposed), on the bubblewrap backend:
+Decision, on the bubblewrap backend:
 
 - **`enclos dashboard <sandbox>` is the way in.** It starts `hermes dashboard --no-open --isolated --port 0` as a recorded session under the sandbox's policy, reads the port that session holds from the host, opens a listener on the host's 127.0.0.1 at the sandbox's reserved port, and prints the URL. Each connection goes through a Unix socket in the host-only `run/<sandbox>/` to a relay in the sandbox's network namespace, then to that port.
 - **A bubblewrap sandbox's proxy serves its Unix socket alone, with no TCP listener.** Its sessions reach it through that socket and the relay, and none of them can reach the host's loopback, so a TCP listener there would serve no sandbox, only any local program, as an egress proxy logged as the sandbox's. So the sandbox's reserved port stays free for `enclos dashboard`.
@@ -31,5 +31,5 @@ Reason: the network namespace that keeps the sandbox off the host's loopback and
 - 0028's consequence that a listener bound to every address serves the host's network does not hold on Linux, and the host's browser reaches the dashboard only while `enclos dashboard` runs.
 - The listener runs inside the command, so nothing but the command opens it, and the service's port it serves comes from the host's reading, never from a file the sandbox writes.
 - The Chat tab's terminal is not shown working. On a session's compiled environment it cannot reach its backend until its session has `NO_PROXY` for loopback, and an answer is not shown even then (§14).
-- `listen = false` is not held in a sandbox's own network namespace; how that is reported is open (§15).
+- `listen = false` on bubblewrap runs declared not held and said at each start, with no acceptance asked: [0041](0041-listen-false-on-bubblewrap-runs-declared-and-said-at-each-start.md).
 - macOS behaves as 0028 says; this ADR changes nothing there.

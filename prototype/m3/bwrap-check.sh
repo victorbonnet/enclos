@@ -22,7 +22,7 @@ try() {
 }
 
 # The bubblewrap layer alone, which holds the writes where the kernel has no
-# Landlock (ADR 0037, proposed): a read-only root and no other option, then a
+# Landlock (ADR 0037): a read-only root and no other option, then a
 # write it must refuse, with the same write outside it as the control. The
 # runners' kernels have Landlock, so this records the basics, not such a kernel.
 basics() {

@@ -82,7 +82,7 @@ impl Backend for Bubblewrap {
         self.probe()
     }
 
-    /// Declared for this host's Landlock (ADR 0037, proposed).
+    /// Declared for this host's Landlock (ADR 0037).
     fn capabilities(&self) -> Capabilities {
         capabilities(&Host {
             landlock_abi: probe::landlock_abi(),

@@ -94,7 +94,7 @@ start_holder() {
 }
 
 # join_cmd HOLDER_DIR: sets JOINED to the start of a command that runs as a
-# session joined to that holder the `nsenter` way (ADR 0039, proposed). An
+# session joined to that holder the `nsenter` way (ADR 0039). An
 # array, not a function, so `"${JOINED[@]}" command &` leaves $! at timeout,
 # which passes a TERM on.
 join_cmd() {

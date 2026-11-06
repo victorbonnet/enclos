@@ -20,8 +20,7 @@
 #
 #   own          each session its own network and PID namespaces (control)
 #   nsenter      one network namespace, the holder's, entered with nsenter
-#                before bubblewrap; each session its own PIDs (ADR 0039,
-#                proposed)
+#                before bubblewrap; each session its own PIDs (ADR 0039)
 #   relay        each session its own namespaces; the gateway's port, read
 #                from the host, relayed through run/service.sock
 #

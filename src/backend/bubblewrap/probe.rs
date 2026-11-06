@@ -1,6 +1,6 @@
 //! Whether bubblewrap can run on this host (ADR 0009): Linux, bubblewrap,
 //! user namespaces, systemd 254 or later, and bubblewrap starting a program.
-//! Landlock is not required (ADR 0037, proposed): where it is missing or
+//! Landlock is not required (ADR 0037): where it is missing or
 //! older, the backend runs and declares the weaker controls.
 
 use std::path::{Path, PathBuf};
