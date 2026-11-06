@@ -498,11 +498,6 @@ impl Hierarchy {
         }
     }
 
-    /// Where the hierarchy is.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn folder(&self, cgroup: &Cgroup) -> PathBuf {
         self.root.join(cgroup.as_str().trim_start_matches('/'))
     }

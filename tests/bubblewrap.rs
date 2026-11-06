@@ -547,7 +547,9 @@ fn on_a_runner_ctrl_c_ends_a_program_that_does_not_catch_it() {
     assert!(said.trim_end().ends_with("EXIT 130"), "{said}");
 }
 
-/// What the runner's host gives the sessions, for reading the results.
+/// What the runner's host gives the sessions, for reading the results: the
+/// backend runs, and the Host section names what it found, as the job's
+/// "The host under test" step prints it, and the job's own lingering.
 #[test]
 fn on_a_runner_doctor_reports_the_backend() {
     if !on_a_runner() {
@@ -557,7 +559,22 @@ fn on_a_runner_doctor_reports_the_backend() {
     let out = lab.command(&["doctor"]).output().unwrap();
     let said = text(&out.stdout);
     println!("{said}");
+    assert!(out.status.success(), "{out:?}");
     assert!(said.contains("bubblewrap: runs here"), "{out:?}");
+    for line in [
+        "\nHost\n  systemd ",
+        "\n  bubblewrap: /usr/bin/bwrap is bubblewrap 0.",
+        "\n  user namespaces: allowed",
+        "\n  bubblewrap starts a program: it does",
+        "\n  Landlock: ABI ",
+        "\n  memory controller: delegated to your systemd manager",
+        "\n  cpu controller: delegated to your systemd manager",
+        "\n  lingering: on",
+        "\n  Secret Service: ",
+    ] {
+        assert!(said.contains(line), "{line:?} in {said}");
+    }
+    assert!(!said.contains("(degraded)"), "{said}");
 }
 
 /// The session of an install or an import reads what enclos staged in the

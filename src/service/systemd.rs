@@ -367,6 +367,15 @@ impl ServiceManager for Systemd {
     fn unset_env_command(&self, var: &str) -> String {
         format!("systemctl --user unset-environment {var}")
     }
+
+    /// Whether the user's manager, and the services with it, outlive the
+    /// last logout.
+    fn host_checks(&self) -> Vec<crate::host::HostCheck> {
+        vec![super::linger::check(
+            std::path::Path::new(super::linger::LOGINCTL),
+            rustix::process::getuid().as_raw(),
+        )]
+    }
 }
 
 #[cfg(test)]

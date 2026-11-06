@@ -63,7 +63,8 @@ impl Stood {
         script(
             &at("bwrap"),
             &format!(
-                r#"[ "$*" = '--ro-bind / / true' ] && exit 0
+                r#"[ "$*" = --version ] && echo 'bubblewrap 0.12.0' && exit 0
+[ "$*" = '--ro-bind / / true' ] && exit 0
 printf '%s\n' "$@" > '{args}'
 {{ printf '%s\n' "$@"; echo ===; }} >> '{calls}'
 env > '{env}'

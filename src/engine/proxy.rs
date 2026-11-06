@@ -298,12 +298,14 @@ mod tests {
     /// comes with it: the local end of a connection to a listener, which a
     /// connection to that address does not reach.
     fn held_closed() -> (SocketAddr, (TcpListener, TcpStream)) {
-        let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
-        let to = listener.local_addr().unwrap();
-        let stream = crate::test_ports::clear_of_proxies(|| {
-            let stream = TcpStream::connect(to).unwrap();
+        // A listener of its own for each try: Linux steps through local
+        // ports from a point each destination chooses, so connections to one
+        // listener can all land inside the proxy range.
+        let (listener, stream) = crate::test_ports::clear_of_proxies(|| {
+            let listener = crate::test_ports::tcp_listener(Ipv4Addr::LOCALHOST);
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let port = stream.local_addr().unwrap().port();
-            (stream, port)
+            ((listener, stream), port)
         });
         (stream.local_addr().unwrap(), (listener, stream))
     }

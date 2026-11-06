@@ -582,6 +582,9 @@ impl crate::secrets::Prober for RefusingService {
     fn not_answering_with(&self) -> String {
         "DBUS_SESSION_BUS_ADDRESS=".to_owned()
     }
+    fn to_answer(&self) -> String {
+        "start it".to_owned()
+    }
 }
 
 /// A new secret a Secret Service refuses is told how to go to the file
