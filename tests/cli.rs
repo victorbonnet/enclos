@@ -2147,7 +2147,7 @@ fn a_runtime_install_dry_run_starts_nothing() {
     ]);
     let plan = out.ok().stdout();
     assert!(
-        plan.contains("Would allow the 13 destinations hermes needs"),
+        plan.contains("Would allow the 14 destinations hermes needs"),
         "{plan}"
     );
     assert!(

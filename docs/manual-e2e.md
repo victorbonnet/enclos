@@ -80,7 +80,7 @@ enclos audit | grep -i runtime
 enclos doctor
 ```
 
-- [ ] The dry run lists the 13 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
+- [ ] The dry run lists the 14 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
 - [ ] The install ends `Hermes is installed in sandbox lab (policy v2)`; `enclos audit` has `runtime installer lab` and `runtime installed lab hermes`, and the installer's SHA-256 is in the first one's summary.
 - [ ] Setup runs in your terminal. When the login shows a URL and a code, open the URL in your browser on the Mac and enter the code. Skip Hermes's own messaging setup: a token Hermes writes to `~/.hermes/.env` makes `runtime configure` refuse (§9).
 - [ ] `doctor` says `lab`'s next session compiles policy v2, and exits 0.
