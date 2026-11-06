@@ -255,8 +255,7 @@ impl Engine {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let listening = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-                .is_ok()
+            super::loopback::listens(addr, std::time::Duration::from_millis(100))
         };
         proxy_ports()
             .find(|port| !used.contains(port) && !listening(*port))
