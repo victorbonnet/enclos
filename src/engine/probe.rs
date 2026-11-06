@@ -14,16 +14,18 @@ use std::time::Duration;
 use signal_hook::consts::SIGTERM;
 
 use super::Engine;
+use super::start::SCOPE_END_WAIT;
 use crate::backend::{Launch, SandboxContext};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::cgroup::Scopes;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
-    ToolCheck, not_here, outcome, probes, sandboxed_script, with_real_paths,
+    TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, with_real_paths,
 };
 
 /// What `enclos policy test` found.
@@ -114,13 +116,15 @@ fn closer(result: &ProbeResult) -> Option<Closer> {
 const TARGET_LIFETIME: &str = "3600";
 
 /// The process the signal probe aims at, started by this command in a group
-/// of its own, and always ended when the test ends.
+/// of its own, and always ended when the test ends. It carries
+/// [`TARGET_VARIABLE`], so that a probe of its environment tells it apart.
 struct Target(Child);
 
 impl Target {
     fn start() -> Result<Target> {
         Command::new("/bin/sleep")
             .arg(TARGET_LIFETIME)
+            .env(TARGET_VARIABLE, "1")
             .process_group(0)
             .spawn()
             .map(Target)
@@ -196,6 +200,11 @@ impl Engine {
         };
         self.wait_service_proxy(name)?;
         self.write(by, "policy test", Some(name.to_string()), summary, |lock| {
+            // Each probe runs in a scope, as a session's program does: on a
+            // host whose systemd cannot start one, nothing starts.
+            if let Some(what) = self.scopes.as_ref().and_then(Scopes::refusal) {
+                return Err(Error::Session { what });
+            }
             let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
             })?;
@@ -226,7 +235,6 @@ impl Engine {
 
             let mut target = Target::start()?;
             let terminal = OtherTerminal::open()?;
-            let _set_up = own.set_up(&self.layout, name);
             let inputs = self.probe_inputs(
                 name,
                 &ctx,
@@ -234,6 +242,7 @@ impl Engine {
                 Some(terminal.path.clone()),
                 limits.clone(),
             )?;
+            let _set_up = own.set_up(&self.layout, name, &inputs);
             let mut list = probes(&inputs, own.as_ref());
             if host_services {
                 list.extend(own.host_services(&inputs));
@@ -252,11 +261,10 @@ impl Engine {
                         limits: limits.clone(),
                         reads: Vec::new(),
                     };
-                    backend
+                    let wrapped = backend
                         .wrap(&compiled, &ctx, &launch)
-                        .map_err(std::io::Error::other)?
-                        .stdin(Stdio::null())
-                        .output()
+                        .map_err(std::io::Error::other)?;
+                    self.run_scoped(name, wrapped)
                 };
                 let outcome = run_probe(&probe, run_in_sandbox, &mut target.0);
                 results.push(ProbeResult::of(probe, outcome));
@@ -361,7 +369,6 @@ impl Engine {
         let mut own = backend
             .own_probes(None)
             .map_err(|what| Error::Session { what })?;
-        own.count_only(name);
         let inputs = self.probe_inputs(
             name,
             &ctx,
@@ -369,6 +376,7 @@ impl Engine {
             Some(PathBuf::from("/dev/ttys0")),
             limits,
         )?;
+        own.count_only(&self.layout, name, &inputs);
         let mut count = probes(&inputs, own.as_ref()).len();
         if host_services {
             count += own.host_services(&inputs).len();
@@ -394,6 +402,26 @@ impl Engine {
             changes,
             ..Plan::default()
         })
+    }
+
+    /// Runs `wrapped`, a probe of sandbox `name`, to its end with no input,
+    /// in a scope of the sandbox's slice as a session's program runs where
+    /// this engine has scopes (design §8), then ends what it left there.
+    fn run_scoped(
+        &self,
+        name: &SandboxName,
+        wrapped: Command,
+    ) -> std::io::Result<std::process::Output> {
+        let (mut scoped, scope) = self
+            .in_scope(name, wrapped)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let output = scoped.stdin(Stdio::null()).output()?;
+        if let Some(scope) = scope {
+            scope.end(SCOPE_END_WAIT).map_err(|e| {
+                std::io::Error::other(format!("cannot end what it left in its scope: {e}"))
+            })?;
+        }
+        Ok(output)
     }
 }
 

@@ -204,6 +204,11 @@ pub enum HostCheck {
     Target,
 }
 
+/// The variable the host gives the process it starts for the signal probe,
+/// set to `1`, so that a probe that reads that process's environment tells
+/// it from any other.
+pub const TARGET_VARIABLE: &str = "ENCLOS_PROBE_TARGET";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     /// The route it belongs to, as the report names it (design §5).
@@ -311,14 +316,26 @@ pub trait OwnProbes {
     fn refusal(&self) -> Refusal;
     /// What a report says of its probes.
     fn notes(&self) -> ReportNotes;
-    /// Sets up on the host what its probes need. The engine holds what it
+    /// Sets up on the host what its probes of a sandbox built from `i`
+    /// need, and reads what they aim at there. The engine holds what it
     /// returns until the test ends; dropping it undoes the set-up.
-    fn set_up(&mut self, _layout: &Layout, _name: &SandboxName) -> Box<dyn std::any::Any> {
+    fn set_up(
+        &mut self,
+        _layout: &Layout,
+        _name: &SandboxName,
+        _i: &ProbeInputs,
+    ) -> Box<dyn std::any::Any> {
         Box::new(())
     }
     /// Replaces [`OwnProbes::set_up`] on a dry run, which only counts the
-    /// probes.
-    fn count_only(&mut self, _name: &SandboxName) {}
+    /// probes: it starts nothing and connects to nothing.
+    fn count_only(&mut self, _layout: &Layout, _name: &SandboxName, _i: &ProbeInputs) {}
+    /// A read of `path`, which the sandbox may not see: by default one that
+    /// fails. A backend that hides a path behind an empty stand-in reads it
+    /// otherwise.
+    fn read(&self, route: &'static str, path: &Path) -> Probe {
+        read_probe(route, path)
+    }
     /// Probes of a folder that cannot move, in the order of
     /// [`ProbeInputs::unmovable`].
     fn of_folder(&self, _folder: &Path, _i: &ProbeInputs) -> Vec<Probe> {
@@ -530,7 +547,7 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     let mut list = Vec::new();
     let refusal = own.refusal();
     for path in i.read_deny.iter().filter(|p| probeable(p)) {
-        list.push(read_probe("sensitive files", path));
+        list.push(own.read("sensitive files", path));
     }
     // A grant never covers the deny list: writing there is refused even
     // inside a granted workspace or the sandbox home.
@@ -546,11 +563,11 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     }
     for path in i.hidden_files.iter().cloned().chain([i.data.join("run")]) {
         if path.exists() {
-            list.push(read_probe("enclos files", &path));
+            list.push(own.read("enclos files", &path));
         }
     }
     for dir in &i.other_sandboxes {
-        list.push(read_probe("other sandboxes", dir));
+        list.push(own.read("other sandboxes", dir));
         list.push(write_probe(
             "other sandboxes",
             &format!("write in {}", dir.join("home").display()),
@@ -721,6 +738,25 @@ pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
     }
     absent.extend(own.not_here(i));
     absent
+}
+
+/// The workspaces that are not folders yet, each as a probe not run: the
+/// sandbox may not create a workspace (design §5), so the user must, and
+/// until then the report says why it was not probed.
+pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
+    i.workspaces
+        .iter()
+        .filter(|w| !w.is_dir())
+        .map(|w| ProbeResult {
+            route: "writable folders",
+            name: format!("rename {}", w.display()),
+            outcome: Outcome::NotRun(
+                "it is not a folder yet, and the sandbox may not create it: create it on the host"
+                    .into(),
+            ),
+            closed_by: None,
+        })
+        .collect()
 }
 
 /// The script of a limit's probe: it succeeds, open, when the limit
