@@ -1,6 +1,7 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod acceptances;
 mod agents;
 mod netlog;
 mod policy;
@@ -28,6 +29,7 @@ use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, Snapsho
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
+use crate::model::unenforced::Acceptance;
 
 /// How long `lock` waits for another enclos command to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -553,6 +555,21 @@ impl StateStore for SqliteStateStore {
     fn secrets(&self, sandbox: &SandboxName) -> Result<Vec<SecretRecord>> {
         let conn = self.open()?;
         secrets::list(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
+
+    fn accept_unenforced(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        accepted: &Acceptance,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        acceptances::put(&conn, sandbox, accepted).map_err(self.sqlite_err())
+    }
+
+    fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>> {
+        let conn = self.open()?;
+        acceptances::list(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 }
 

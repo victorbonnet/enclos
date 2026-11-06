@@ -12,6 +12,7 @@ pub mod proc;
 pub mod process;
 pub mod programs;
 pub mod ps;
+pub mod slice;
 pub mod stop;
 
 /// How this host looks at processes: `ps`, `lsof` and `sysctl` on macOS,

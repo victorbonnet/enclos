@@ -40,10 +40,12 @@ pub type SecretGrants = std::collections::BTreeMap<String, super::secret::Secret
 
 /// Limits on a sandbox (design §7): `open_files`, `file_size` and
 /// `cpu_seconds` on each of its processes, `memory` and `cpu` on the
-/// sandbox as a whole. The Seatbelt backend enforces `open_files`, through
-/// the process limits macOS keeps, and refuses the others (ADR 0033), so a
-/// policy it stores holds none of them; `memory` and `cpu` are kept as
-/// written for that refusal, and for a backend that enforces them.
+/// sandbox as a whole, its sessions and services together. The Seatbelt backend
+/// enforces `open_files`, through the process limits macOS keeps, and
+/// refuses the others (ADR 0033), so a policy it stores holds none of them;
+/// bubblewrap enforces `open_files`, `memory` and `cpu`. `memory` and `cpu`
+/// are kept as written for Seatbelt's refusal, and read by
+/// [`super::limits`] for bubblewrap.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     /// The most file descriptors (files, sockets, pipes) a process holds at
