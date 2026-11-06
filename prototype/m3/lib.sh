@@ -65,3 +65,72 @@ compile_policy() {
 section() { printf '\n## %s\n\n' "$1"; }
 # The text in a fence, ending in a newline even when the input does not.
 fence() { printf '```\n'; sed -e '$a\'; printf '```\n'; }
+
+# The holder of a sandbox's namespaces (ns-holder.py), with the
+# sandbox's relay to $PROXY_SOCK and the host's way in: <folder>/host-relay.sock
+# to the port the host writes in <folder>/service.port.
+#
+# start_holder NAME: a holder for sandbox NAME in its own folder, which no
+# session mounts (it is under ~/.enclos, on the deny list). Sets HOLDER to
+# the folder; the holder's host pid is in <folder>/pid once it is ready. Not
+# run in a subshell, which would end at once and, as bubblewrap's parent,
+# take the holder with it (--die-with-parent).
+start_holder() {
+    local dir="$SBX/ns-$1"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    bwrap --unshare-user --unshare-pid --unshare-net --die-with-parent \
+        --ro-bind / / --proc /proc --tmpfs /tmp --bind "$dir" "$dir" \
+        --info-fd 3 \
+        -- /usr/bin/python3 -I "$M3/ns-holder.py" --socket "$dir/holder.sock" --info "$dir/info.json" \
+        --relay "$RELAY_PORT" "$PROXY_SOCK" --host-relay "$dir/host-relay.sock" "$dir/service.port" \
+        3>"$dir/bwrap-info.json" >"$dir/holder.out" 2>&1 &
+    echo $! >"$dir/bwrap.pid"
+    for _ in $(seq 50); do [ -e "$dir/info.json" ] && break; sleep 0.2; done
+    python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["child-pid"])' \
+        "$dir/bwrap-info.json" >"$dir/pid" 2>/dev/null
+    HOLDER="$dir"
+}
+
+# join_cmd HOLDER_DIR: sets JOINED to the start of a command that runs as a
+# session joined to that holder the `nsenter` way (ADR 0039, proposed). An
+# array, not a function, so `"${JOINED[@]}" command &` leaves $! at timeout,
+# which passes a TERM on.
+join_cmd() {
+    JOINED=(env SBX_JOIN=nsenter SBX_HOLDER="$1/holder.sock" timeout 1200 "$M3/sbx-ns.sh" --)
+}
+
+# A session left open across restarts (ns-open-session.py).
+#
+# open_session DIR ENV=VALUE...: a session with that environment (SBX_JOIN and
+# so on), waiting for commands in DIR, in the sandbox's home so both sides
+# see it. Sets OPEN_PID, for the caller's list of what it started. Not run in
+# a subshell, which would take the session with it.
+open_session() {
+    local dir="$1"
+    shift
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    env "$@" timeout 1800 "$M3/sbx-ns.sh" -- /usr/bin/python3 -I "$M3/ns-open-session.py" "$dir" \
+        </dev/null >"$dir.log" 2>&1 &
+    OPEN_PID=$!
+    for _ in $(seq 100); do [ -e "$dir/ready" ] && return 0; sleep 0.2; done
+    return 1
+}
+
+# ask DIR SECONDS command...: runs the command in that open session, prints
+# its output and returns its exit code, or says it had no answer.
+ask() {
+    local dir="$1" wait="$2" n
+    shift 2
+    n=$(find "$dir" -name '*.exit' | wc -l)
+    python3 -I -c 'import json, sys; json.dump(sys.argv[1:], sys.stdout)' "$@" >"$dir/$n.new"
+    mv "$dir/$n.new" "$dir/$n.cmd"
+    for _ in $(seq $((wait * 5))); do [ -e "$dir/$n.exit" ] && break; sleep 0.2; done
+    if [ ! -e "$dir/$n.exit" ]; then
+        echo "no answer from the open session in $wait s"
+        return 124
+    fi
+    cat "$dir/$n.out"
+    return "$(cat "$dir/$n.exit")"
+}

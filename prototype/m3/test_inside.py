@@ -7,7 +7,10 @@ to any process and python3-seccomp need not be installed. They run anywhere:
 
 import errno
 import os
+import signal
+import socket
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -103,6 +106,52 @@ class SeccompTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.applied(module)
         self.assertEqual(module.loaded, [])
+
+
+class ServiceForward(unittest.TestCase):
+    """The forward forks a child of this test, stopped at the end."""
+
+    def answer_with_port(self, text):
+        """What a client of the forward gets when the port file holds `text`."""
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path, port_file = os.path.join(d.name, "service.sock"), os.path.join(d.name, "service.port")
+        with open(port_file, "w") as f:
+            f.write(text)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen()
+        real, children = os.fork, []
+
+        def fork():
+            pid = real()
+            if pid:
+                children.append(pid)
+            return pid
+        with patch("os.fork", fork), patch.object(inside, "say"):
+            inside.start_service_forward(srv.detach(), port_file)
+        for pid in children:
+            self.addCleanup(os.waitpid, pid, 0)
+            self.addCleanup(os.kill, pid, signal.SIGKILL)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(path)
+            return client.recv(1)
+
+    def test_a_port_out_of_range_reaches_nothing(self):
+        # getaddrinfo wraps a port past 65535, so this would reach `other`.
+        with socket.socket() as other:
+            other.bind(("127.0.0.1", 0))
+            other.listen()
+            other.settimeout(0.5)
+            self.assertEqual(self.answer_with_port(str(65536 + other.getsockname()[1])), b"")
+            with self.assertRaises(TimeoutError):
+                other.accept()
+
+    def test_no_valid_port_closes_the_connection(self):
+        for text in ("0", "nope", ""):
+            with self.subTest(text=text):
+                self.assertEqual(self.answer_with_port(text), b"")
 
 
 if __name__ == "__main__":
