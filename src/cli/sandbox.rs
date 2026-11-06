@@ -14,6 +14,7 @@ use enclos::model::plan::{Confirm, Plan, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use enclos::model::session::SessionKind;
+use enclos::model::unenforced::UnenforcedField;
 use enclos::service::{ServiceLabel, ServiceStatus};
 
 #[derive(Args)]
@@ -45,6 +46,11 @@ enum SandboxVerb {
     Start {
         #[arg(required = true)]
         names: Vec<SandboxName>,
+        /// Run with this field not applied where this host does not enforce
+        /// it, such as `memory` without the memory controller; recorded in
+        /// the audit log, and kept until the field's value changes.
+        #[arg(long, value_name = "FIELD")]
+        accept_unenforced: Vec<UnenforcedField>,
     },
     /// Stop every service, session and process of each sandbox.
     Stop {
@@ -65,6 +71,16 @@ enum SandboxVerb {
         #[arg(long)]
         keep_data: bool,
     },
+}
+
+/// The fields `args` accepts running not enforced (ADR 0038).
+pub fn accepted_unenforced(args: &SandboxArgs) -> Vec<UnenforcedField> {
+    match &args.verb {
+        SandboxVerb::Start {
+            accept_unenforced, ..
+        } => accept_unenforced.clone(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> Result<u8> {
@@ -183,7 +199,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 }
             }
         }
-        SandboxVerb::Start { names } => {
+        SandboxVerb::Start { names, .. } => {
             return each(
                 &names,
                 |n| engine.require_sandbox(n),

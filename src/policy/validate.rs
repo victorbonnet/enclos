@@ -114,6 +114,9 @@ fn check_grants(
 /// macOS keeps for each process, open files; a process may ignore SIGXCPU
 /// and run past its CPU time, macOS refuses a memory limit, does not hold
 /// appends to a file size limit, and enclos has no means for a CPU share.
+/// bubblewrap holds `open_files` as Seatbelt does, and `memory` and `cpu` on
+/// the sandbox's slice; whether this host's cgroups hold `memory` is
+/// checked apart, as it depends on the host (ADR 0038).
 ///
 /// `most_open_files` is the host's own ceiling on the files one process
 /// holds (macOS's `kern.maxfilesperproc`), when it is known: a value above
@@ -178,6 +181,20 @@ pub fn validate_resources(
             )));
         }
     }
+    // The limits a sandbox's slice holds, kept as written for a backend
+    // that refuses them, read here for one that holds them.
+    if let Some(memory) = &r.memory
+        && accepted("memory")
+        && let Err(why) = crate::model::limits::memory(memory)
+    {
+        problems.push(Problem::Malformed(why));
+    }
+    if let Some(cpu) = &r.cpu
+        && accepted("cpu")
+        && let Err(why) = cpu.parse::<crate::model::limits::CpuShare>()
+    {
+        problems.push(Problem::Malformed(why));
+    }
     // A whole number of KiB, the unit of `ulimit -f`, for a backend that
     // sets it that way: a size of no whole KiB could only be cut, and one
     // under 1K would become `ulimit -f 0`, stopping every write.
@@ -222,7 +239,7 @@ fn refusals(
             }
             if let Some(memory) = &r.memory {
                 refused.push(("memory", format!(
-                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. Linux's backend is designed to hold one"
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. The bubblewrap backend, on Linux, holds one"
                 )));
             }
             if let Some(seconds) = r.cpu_seconds {
@@ -236,7 +253,20 @@ fn refusals(
                 )));
             }
         }
-        // bubblewrap enforces no limit yet, so every one is refused there.
+        // `open_files` as on Seatbelt, and `memory` and `cpu` on each
+        // sandbox's slice; the per-process limits it does not set yet.
+        BackendKind::Bubblewrap => {
+            if let Some(size) = r.file_size {
+                refused.push(("file_size", format!(
+                    "resources.file_size = {size}: the bubblewrap backend does not set a file size limit yet; leave it out"
+                )));
+            }
+            if let Some(seconds) = r.cpu_seconds {
+                refused.push(("cpu_seconds", format!(
+                    "resources.cpu_seconds = {seconds}: the bubblewrap backend does not set a CPU time limit yet; leave it out, or hold the sandbox to a share of the CPU with `cpu`"
+                )));
+            }
+        }
         other if !r.is_unset() => refused.push((
             "resources",
             format!("resources: the {other} backend enforces no limit yet; leave [resources] out"),
@@ -577,11 +607,11 @@ mod tests {
         let mut some = Policy::default();
         some.resources.open_files = Some(256);
         assert!(
-            validate_resources(&some, BackendKind::Bubblewrap, None)
+            validate_resources(&some, BackendKind::Libkrun, None)
                 .unwrap_err()
                 .is_refused()
         );
-        assert!(validate_resources(&Policy::default(), BackendKind::Bubblewrap, None).is_ok());
+        assert!(validate_resources(&Policy::default(), BackendKind::Libkrun, None).is_ok());
         for (memory, cpu) in [(Some("2G"), None), (None, Some("2.0"))] {
             policy.resources.memory = memory.map(str::to_owned);
             policy.resources.cpu = cpu.map(str::to_owned);
@@ -589,6 +619,44 @@ mod tests {
             assert!(err.is_refused(), "{err}");
             assert!(err.to_string().contains("Seatbelt"), "{err}");
         }
+    }
+
+    /// `open_files` as on Seatbelt, and the limits of a sandbox's slice.
+    #[test]
+    fn bubblewrap_accepts_open_files_memory_and_cpu() {
+        let mut policy = Policy::default();
+        policy.resources.open_files = Some(256);
+        policy.resources.memory = Some("512M".to_owned());
+        policy.resources.cpu = Some("0.5".to_owned());
+        validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap();
+        // Written wrong is malformed there, not refused.
+        for (memory, cpu, said) in [
+            ("lots", "1", "not a size"),
+            ("1M", "1", "from 64M"),
+            ("1G", "50%", "number of cores"),
+            ("1G", "0", "from 0.01"),
+        ] {
+            policy.resources.memory = Some(memory.to_owned());
+            policy.resources.cpu = Some(cpu.to_owned());
+            let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+            assert!(!err.is_refused(), "{err}");
+            assert!(err.to_string().contains(said), "{err}");
+        }
+    }
+
+    /// The per-process limits it does not set are refused, as on Seatbelt.
+    #[test]
+    fn bubblewrap_refuses_the_limits_it_does_not_set() {
+        let mut policy = Policy::default();
+        policy.resources.cpu_seconds = Some(60);
+        let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+        assert!(err.is_refused(), "{err}");
+        assert!(err.to_string().contains("cpu_seconds"), "{err}");
+        policy.resources.cpu_seconds = None;
+        policy.resources.file_size = Some("1M".parse().unwrap());
+        let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+        assert!(err.is_refused(), "{err}");
+        assert!(err.to_string().contains("file_size"), "{err}");
     }
 
     #[test]
