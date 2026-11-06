@@ -216,6 +216,7 @@ impl Engine {
             // resource probes show.
             let limits = self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
             self.ensure_proxy(lock, &record)?;
+            self.ensure_holder(&record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             // TMPDIR inside the sandbox (the policy denies /tmp): without it,
             // the probes would fail for a reason that is not the policy.

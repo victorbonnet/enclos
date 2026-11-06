@@ -11,6 +11,7 @@ pub mod fake;
 pub mod seatbelt;
 
 use std::ffi::OsString;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,6 +77,9 @@ pub struct SandboxContext {
     /// The socket its proxy listens on for a session with a network of its
     /// own.
     pub proxy_socket: PathBuf,
+    /// The socket its namespace holder hands out the sandbox's network
+    /// namespace on, for a backend whose sessions join one (ADR 0039).
+    pub holder_socket: PathBuf,
     /// What enclos stages for an install or an import, which the sandbox
     /// reads and never writes.
     pub installers: PathBuf,
@@ -97,6 +101,7 @@ impl SandboxContext {
             proxy_port,
             secrets: layout.sandbox_secrets_dir(name.as_str()),
             proxy_socket: layout.proxy_socket(name.as_str()),
+            holder_socket: layout.holder_socket(name.as_str()),
             installers: layout.sandbox_installers(name.as_str()),
         }
     }
@@ -306,6 +311,37 @@ pub trait Backend {
     /// has the text `compiled`; `None` on a dry run, which compiles nothing.
     /// Fails, saying why, on a text this backend did not compile.
     fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;
+    /// The namespace holder whose network namespace every session of a
+    /// sandbox joins (ADR 0039), for a backend that has one. None where a
+    /// session shares the host's network, as under Seatbelt.
+    fn namespace_holder(&self) -> Option<&dyn NamespaceHolder> {
+        None
+    }
+}
+
+/// The process that keeps a sandbox's one network namespace in being, so
+/// that every session of the sandbox joins it (ADR 0039). It is one of the
+/// sandbox's services: the engine installs it, and the service manager runs
+/// [`NamespaceHolder::command`]. Its socket, `SandboxContext::holder_socket`,
+/// is in the host-only part of the sandbox's run folder.
+pub trait NamespaceHolder {
+    /// The command that runs the sandbox's namespace holder in place of the
+    /// process that calls it, its socket already made, or why it cannot.
+    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError>;
+    /// What the running namespace holder says of its namespace, or why none
+    /// answers.
+    fn ask(&self, ctx: &SandboxContext) -> Result<HeldNamespace, String>;
+}
+
+/// A sandbox's network namespace, as its namespace holder gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNamespace {
+    /// The namespace holder's pid as the host sees it: `/proc/<pid>/net`
+    /// shows the namespace's tables.
+    pub pid: u32,
+    /// The ports a bind on port 0 lands in there, which a namespace has of
+    /// its own.
+    pub ephemeral: RangeInclusive<u16>,
 }
 
 /// Every backend this build of enclos ships, in order of preference.

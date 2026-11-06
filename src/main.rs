@@ -79,12 +79,15 @@ enum Command {
     /// Run a sandbox's egress proxy; started by enclos itself.
     #[command(hide = true)]
     Proxy(cli::proxy::ProxyArgs),
-    /// Pass connections on a port of 127.0.0.1 to a Unix socket; started by enclos itself inside a session.
+    /// Pass connections on a port of 127.0.0.1 to a Unix socket, as a namespace holder does.
     #[command(hide = true)]
     Relay(cli::relay::RelayArgs),
-    /// Apply a session's Landlock rules and seccomp filter to this process, start its relay and run its command; run first by bubblewrap.
+    /// Apply a session's Landlock rules and seccomp filter to this process and run its command; run first by bubblewrap.
     #[command(hide = true)]
     Inside(cli::inside::InsideArgs),
+    /// Run, serve or join a bubblewrap sandbox's namespace holder; started by the service manager, and first in every session.
+    #[command(hide = true)]
+    Holder(cli::holder::HolderArgs),
 }
 
 #[derive(Args)]
@@ -265,6 +268,7 @@ fn run(cli: Cli) -> Result<u8> {
     let command = match cli.command {
         Command::Relay(args) => return cli::relay::run(args),
         Command::Inside(args) => return cli::inside::run(args),
+        Command::Holder(args) => return cli::holder::run(args),
         command => command,
     };
     let engine = Engine::open(Layout::from_env()?);
@@ -324,7 +328,9 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
-        Command::Relay(_) | Command::Inside(_) => unreachable!("run above, with no engine"),
+        Command::Relay(_) | Command::Inside(_) | Command::Holder(_) => {
+            unreachable!("run above, before this engine opens")
+        }
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
         Command::Status(args) => cli::status::run(&engine, args),
@@ -336,7 +342,7 @@ fn run(cli: Cli) -> Result<u8> {
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
 /// `exec`, `inside`, `runtime`, and the `agent` verbs but `list`), keep running
-/// (`proxy`, `relay`, `launch`), or handle a closed output themselves (`logs`). No
+/// (`proxy`, `relay`, `holder`, `launch`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
 fn ends_on_closed_output(command: &Command) -> bool {
     match command {
@@ -356,6 +362,7 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Proxy(_)
         | Command::Relay(_)
         | Command::Inside(_)
+        | Command::Holder(_)
         | Command::Launch(_)
         | Command::Logs(_) => false,
     }

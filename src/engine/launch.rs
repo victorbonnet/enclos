@@ -144,6 +144,12 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+        // The service manager starts the namespace holder beside this
+        // service, whose session joins it (ADR 0039).
+        if let Some(holder) = self.holder_of(record.backend) {
+            let ctx = self.sandbox_context(name, record.proxy_port);
+            self.holder_answers(name, holder, &ctx, PROXY_WAIT)?;
+        }
         let mut watch = self.settings_watch(name, kind, service);
         let summary = |(started, replaced): &(Started<()>, Vec<SessionId>)| {
             let session = started.session.id;
