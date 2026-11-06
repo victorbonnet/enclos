@@ -162,7 +162,7 @@ fn the_chat_tabs_control_pair_is_recorded_as_measured() {
         .find(|line| line.starts_with("- `enclos dashboard`"))
         .expect("§14's item");
     for part in [
-        "which sessions get it",
+        "every bubblewrap session now has it",
         "`NO_PROXY` for loopback is needed",
         "not shown",
     ] {
