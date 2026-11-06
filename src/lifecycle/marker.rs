@@ -8,7 +8,10 @@
 //! no sandboxed process can open it or change its mode, and enclos keeps no
 //! copy open: the processes holding it are the program and what it started,
 //! unless one closed it or passed it on, or a process outside the sandbox
-//! changed its mode and opened it. `lsof` names them.
+//! changed its mode and opened it. The host names them (`lsof` on macOS,
+//! `/proc/<pid>/fd` on Linux; see `host`). On Linux, `O_PATH` takes no
+//! permission on the file, so any process that reaches the folder can name a
+//! marker with a descriptor; such a descriptor opens nothing and holds nothing.
 //!
 //! A marker is made in the sandbox's `members/` folder before the program
 //! starts, and named after the session's root process (its pid and start
@@ -19,9 +22,9 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 use std::process::Stdio;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::session::ProcessRef;
@@ -39,6 +42,9 @@ pub enum MarkerError {
     /// and the listing made before does not show it.
     #[error("a process that started a moment ago holds the marker of the session of pid {0}")]
     Unlisted(u32),
+    /// `/proc` could not be read: for every sandbox alike.
+    #[error("cannot look at the sandbox's markers in /proc: {0}")]
+    Proc(String),
 }
 
 /// A marker made for a program about to start, not yet held by it.
@@ -141,87 +147,74 @@ pub fn is_held(held: &Held, root: &ProcessRef) -> bool {
 }
 
 /// The processes holding each named marker in `dir`, by file name, of those
-/// `lsof` can see (the user's; root's are not listed).
+/// `lsof` or `/proc` can show (the user's; root's are not listed).
 pub fn holders(dir: &Path) -> Result<Held, MarkerError> {
     // No folder yet is no marker; a folder that cannot be read is not: read
     // here, since `lsof -w` hides its own failure to open the folder and
     // answers as for one with nothing held.
-    match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Held::new()),
         Err(e) => return Err(MarkerError::Folder(format!("{}: {e}", dir.display()))),
-        Ok(_) => {}
-    }
-    // `-w`: a warning about another file system (an unreachable network
-    // mount) is not a failure to look at this folder.
-    let out = super::bounded::output_within(
-        Command::new("/usr/sbin/lsof")
-            .env("LC_ALL", "C")
-            .args(["-nP", "-w", "-Fpn", "+d"])
-            .arg(dir),
-        super::bounded::LIMIT,
-    )
-    .map_err(|e| MarkerError::Lsof(e.to_string()))?;
-    parse(&out)
+        Ok(entries) => entries,
+    };
+    super::host::marker_holders(dir, entries)
 }
 
-/// What `lsof -Fpn +d` answered: a `p<pid>` line for each process, then an
-/// `n<path>` line for each file of the folder it holds, the folder itself
-/// for a process working in it. With nothing held it prints nothing and
-/// exits 1, as for listeners (`listeners.rs`).
-fn parse(out: &Output) -> Result<Held, MarkerError> {
-    let text = String::from_utf8_lossy(&out.stdout);
-    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    match (out.status.code(), text.trim().is_empty(), why.is_empty()) {
-        (Some(1), true, true) => return Ok(Held::new()),
-        (Some(0), false, _) | (Some(1), false, true) => {}
-        _ => return Err(MarkerError::Lsof(format!("{}: {why}", out.status))),
-    }
-    let mut held = Held::new();
-    let mut pid = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix('p') {
-            pid = Some(
-                p.parse::<u32>()
-                    .map_err(|_| MarkerError::Lsof(format!("unexpected process `{p}`")))?,
-            );
-        } else if let Some(name) = line.strip_prefix('n') {
-            let file = Path::new(name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|n| n.starts_with("root-"));
-            if let (Some(file), Some(pid)) = (file, pid) {
-                held.entry(file.to_owned()).or_default().insert(pid);
-            }
-        }
-    }
-    Ok(held)
-}
-
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::ExitStatus;
 
-    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
-        Output {
-            status: ExitStatus::from_raw(code << 8),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
+    /// The same with the kernel's own `/proc`: the program holds its marker,
+    /// and this process, which opened it `O_PATH` as any process of the user
+    /// can whatever its mode, does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_o_path_descriptor_holds_no_marker() {
+        use rustix::fs::{Mode, OFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().join("members");
+        let marker = Marker::new(&members).unwrap();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").stdin(Stdio::null());
+        let (mut child, started) = marker.spawn(&mut command).unwrap();
+        let root = ProcessRef {
+            pid: child.id(),
+            started: "Wed Oct 22 12:00:00 2026".to_owned(),
+        };
+        started.name(&root).unwrap();
+        let path = members.join(name_of(&root));
+        let named = rustix::fs::open(&path, OFlags::PATH, Mode::empty()).unwrap();
+        let held = holders(&members);
+        drop(named);
+        let _ = child.kill();
+        let _ = child.wait();
+        let pids = held.unwrap().remove(&name_of(&root)).unwrap_or_default();
+        assert!(pids.contains(&child.id()), "{pids:?}");
+        assert!(!pids.contains(&std::process::id()), "{pids:?}");
     }
 
+    /// A process whose main thread exited still holds what it held, and
+    /// its session is not over.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn lsof_output_gives_each_sessions_holders() {
-        let held = parse(&output(
-            0,
-            "p100\nf3\nn/e/sandboxes/home/members/root-7-a\np200\nfcwd\nn/e/sandboxes/home/members\nf4\nn/e/sandboxes/home/members/root-7-a\nf5\nn/e/sandboxes/home/members/root-9-b\np300\nf3\nn/e/sandboxes/home/members/starting-1-2\n",
-            "",
-        ))
-        .unwrap();
-        assert_eq!(held["root-7-a"], BTreeSet::from([100, 200]));
-        assert_eq!(held["root-9-b"], BTreeSet::from([200]));
-        assert_eq!(held.len(), 2, "{held:?}");
+    fn a_process_whose_main_thread_exited_holds_its_marker() {
+        use crate::lifecycle::process::{headless, headless_port};
+        let dir = tempfile::tempdir().unwrap();
+        let members = dir.path().join("members");
+        let marker = Marker::new(&members).unwrap();
+        let mut python = Command::new("/usr/bin/python3");
+        let (mut child, started) = marker.spawn(headless(&mut python)).unwrap();
+        headless_port(&mut child);
+        let root = ProcessRef {
+            pid: child.id(),
+            started: "Wed Oct 22 12:00:00 2026".to_owned(),
+        };
+        started.name(&root).unwrap();
+        let held = holders(&members);
+        let _ = child.kill();
+        let _ = child.wait();
+        let held = held.unwrap();
+        assert!(held[&name_of(&root)].contains(&child.id()), "{held:?}");
     }
 
     #[test]
@@ -243,13 +236,6 @@ mod tests {
         let mut command = Command::new("/nonexistent/program");
         assert!(marker.spawn(&mut command).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn nothing_held_is_no_holder_and_a_failure_is_an_error() {
-        assert!(parse(&output(1, "", "")).unwrap().is_empty());
-        assert!(parse(&output(1, "", "lsof: status error")).is_err());
-        assert!(parse(&output(0, "pnope\n", "")).is_err());
     }
 
     /// The marker's whole life with real processes: no one can open it, a

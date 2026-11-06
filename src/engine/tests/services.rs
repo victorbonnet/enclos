@@ -399,7 +399,6 @@ fn labels_of(status: &[(ServiceLabel, ServiceStatus)]) -> Vec<String> {
 /// A gateway whose session is open but which binds its listener only a
 /// second later, as one still starting: a `connect` then waits for it,
 /// and never starts the services again, which would stop it (ADR 0028).
-#[cfg(target_os = "macos")]
 #[test]
 fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
@@ -409,7 +408,10 @@ fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
         .args([
             "-MSocket",
             "-e",
-            "sleep 1; socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; sleep 30",
+            &format!(
+                "{}sleep 1; my $s = listener(INADDR_LOOPBACK); sleep 30",
+                crate::test_ports::perl_listener()
+            ),
         ])
         .spawn()
         .unwrap();

@@ -6,8 +6,10 @@
 //! A group is signalled only through its leader. Right before each signal,
 //! it checks that the target is still the same process, same pid and same
 //! start time, so a pid already reused by an unrelated process is not
-//! signalled. The check narrows the window to the moment between it and the
-//! signal; it cannot close it.
+//! signalled. On Linux a process alone is signalled through a pidfd taken
+//! before the check, which reaches no process that reused the pid. A group
+//! has no such handle, nor has a process on macOS: there the check narrows the
+//! window to the moment between it and the signal, and cannot close it.
 //!
 //! A `ps` that fails is an error, never an empty answer: "no process" from a
 //! listing that did not run would end sessions whose members still run.
@@ -93,14 +95,17 @@ fn stat_and_start(pid: u32) -> Result<Option<(String, String)>, PsError> {
         .ok_or_else(|| PsError(format!("unexpected output `{text}`")))
 }
 
-/// The start time of `pid`, or `None` when no such process runs. A process
-/// that exited but was not yet reaped by its parent (a zombie) runs
-/// nothing and holds nothing, so it does not count as running.
+/// Whether `stat`, a state as `ps` writes it, is a zombie's: a process that
+/// exited but was not yet reaped by its parent. procps writes `Zl` for one
+/// whose main thread exited while others run on, which is no zombie.
+fn is_zombie(stat: &str) -> bool {
+    stat.starts_with('Z') && !stat.contains('l')
+}
+
+/// The start time of `pid`, or `None` when no such process runs. A zombie
+/// runs nothing and holds nothing, so it does not count as running.
 pub fn start_time(pid: u32) -> Result<Option<String>, PsError> {
-    Ok(
-        stat_and_start(pid)?
-            .and_then(|(stat, started)| (!stat.starts_with('Z')).then_some(started)),
-    )
+    Ok(stat_and_start(pid)?.and_then(|(stat, started)| (!is_zombie(&stat)).then_some(started)))
 }
 
 /// A reference to a process that is running now.
@@ -133,7 +138,9 @@ pub fn group_of(pid: u32) -> Result<Option<u32>, PsError> {
         .map_err(|_| PsError(format!("unexpected group `{pgid}`")))
 }
 
-/// A process as one listing shows it.
+/// A process as one listing shows it. `command` is what `ps` calls `comm`, to
+/// show to the user and never to compare: what the process is called, which
+/// it may choose, and on Linux cut at 15 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proc {
     pub pid: u32,
@@ -150,7 +157,7 @@ fn parse_listing(line: &str) -> Option<(Proc, bool)> {
     let pid: u32 = words.next()?.parse().ok()?;
     let ppid: u32 = words.next()?.parse().ok()?;
     let pgid: u32 = words.next()?.parse().ok()?;
-    let zombie = words.next()?.starts_with('Z');
+    let zombie = is_zombie(words.next()?);
     let started = lstart(&mut words)?;
     let command = words.collect::<Vec<_>>().join(" ");
     let proc = Proc {
@@ -220,6 +227,19 @@ impl Signal {
             Signal::Hup => "HUP",
         }
     }
+
+    #[cfg(target_os = "linux")]
+    fn number(self) -> rustix::process::Signal {
+        use rustix::process::Signal as S;
+        match self {
+            Signal::Term => S::TERM,
+            Signal::Kill => S::KILL,
+            Signal::Usr1 => S::USR1,
+            Signal::Int => S::INT,
+            Signal::Quit => S::QUIT,
+            Signal::Hup => S::HUP,
+        }
+    }
 }
 
 /// What became of a signal enclos meant to send.
@@ -252,6 +272,7 @@ pub fn signal_group(leader: &ProcessRef, pgid: u32, signal: Signal) -> Result<Si
 
 /// Sends `signal` to `process` alone, only if it is still the recorded
 /// process.
+#[cfg(not(target_os = "linux"))]
 pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
     if !is_same(process)? {
         return Ok(Signalled::Gone);
@@ -259,8 +280,46 @@ pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled,
     Ok(kill(signal, i64::from(process.pid)))
 }
 
+/// As above, through a pidfd taken before the check, so a reused pid is
+/// never signalled.
+#[cfg(target_os = "linux")]
+pub fn signal_process(process: &ProcessRef, signal: Signal) -> Result<Signalled, PsError> {
+    through_pidfd(process, signal, || is_same(process))
+}
+
+/// Takes a pidfd on `process`, then asks `same`, so that the signal reaches
+/// the process that was checked or none.
+#[cfg(target_os = "linux")]
+fn through_pidfd(
+    process: &ProcessRef,
+    signal: Signal,
+    same: impl FnOnce() -> Result<bool, PsError>,
+) -> Result<Signalled, PsError> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, PidfdFlags, pidfd_open, pidfd_send_signal};
+    let target = i64::from(process.pid);
+    let pid = i32::try_from(process.pid).ok().and_then(Pid::from_raw);
+    let Some(pid) = pid.filter(|_| !never_signalled(target)) else {
+        return Ok(Signalled::Failed(format!("enclos never signals {target}")));
+    };
+    let pidfd = match pidfd_open(pid, PidfdFlags::empty()) {
+        Ok(pidfd) => pidfd,
+        Err(Errno::SRCH) => return Ok(Signalled::Gone),
+        Err(e) => return Ok(Signalled::Failed(format!("cannot open pid {target}: {e}"))),
+    };
+    if !same()? {
+        return Ok(Signalled::Gone);
+    }
+    Ok(match pidfd_send_signal(&pidfd, signal.number()) {
+        Ok(()) => Signalled::Sent,
+        Err(Errno::SRCH) => Signalled::Gone,
+        Err(e) => Signalled::Failed(e.to_string()),
+    })
+}
+
 /// Targets `kill` reads as more than one process of a session: 0 is the
-/// caller's own group and -1 every process the user owns; 1 is launchd.
+/// caller's own group and -1 every process the user owns; 1 is launchd or
+/// init.
 fn never_signalled(target: i64) -> bool {
     target.abs() <= 1
 }
@@ -281,6 +340,44 @@ fn kill(signal: Signal, target: i64) -> Signalled {
         }),
         Err(e) => Signalled::Failed(format!("cannot run /bin/kill: {e}")),
     }
+}
+
+/// `python3` set to run a test's own process whose main thread exits while
+/// another runs on, listening at 127.0.0.1 and writing its port once the main
+/// thread is gone. Python, as a test program cannot end only its main thread
+/// with no `unsafe` code.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn headless(python: &mut Command) -> &mut Command {
+    const PROGRAM: &str = r#"
+import ctypes, os, threading, time
+def serve():
+    s = listener()
+    stat = "/proc/%d/stat" % os.getpid()
+    while open(stat).read().rsplit(") ", 1)[1][0] != "Z":
+        time.sleep(0.01)
+    print(s.getsockname()[1], flush=True)
+    time.sleep(30)
+threading.Thread(target=serve).start()
+ctypes.CDLL(None).pthread_exit(None)
+"#;
+    python
+        .args([
+            "-I",
+            "-c",
+            &format!("{}{PROGRAM}", crate::test_ports::python_listener()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+}
+
+/// The port [`headless`] wrote, once its main thread is gone.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn headless_port(child: &mut Child) -> u16 {
+    use std::io::BufRead;
+    let mut line = String::new();
+    let out = child.stdout.take().unwrap();
+    std::io::BufReader::new(out).read_line(&mut line).unwrap();
+    line.trim().parse().unwrap()
 }
 
 #[cfg(test)]
@@ -363,6 +460,82 @@ mod tests {
             let err = listed(&out).unwrap_err();
             assert!(err.to_string().contains(says), "{err}");
         }
+    }
+
+    /// The variable that has [`sleeps_when_asked`] sleep.
+    #[cfg(target_os = "linux")]
+    const SLEEP: &str = "ENCLOS_TEST_SLEEP";
+
+    /// What the long-named program below runs: sleeps when asked to, passes
+    /// at once otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sleeps_when_asked() {
+        if std::env::var_os(SLEEP).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    /// procps cuts a program's name at 15 characters, so a command is for
+    /// showing only. The program is this test program through a link, whose
+    /// name the kernel takes: `/bin/sleep` may be a multi-call binary, which
+    /// exits at once under a name it does not know, and a copy being written
+    /// can be busy when run, if another test forks meanwhile.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_program_name_is_listed_cut_at_15_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("a-program-with-a-long-name");
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &long).unwrap();
+        let mut child = Command::new(&long)
+            .args([
+                "--exact",
+                "lifecycle::process::tests::sleeps_when_asked",
+                "--test-threads=1",
+            ])
+            .env(SLEEP, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let listed = processes().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let found = listed.iter().find(|p| p.pid == child.id()).unwrap();
+        assert_eq!(found.command, "a-program-with-");
+    }
+
+    /// procps writes `Zl` for a process whose main thread exited while
+    /// another runs on, and `Z` alone for one that is over.
+    #[test]
+    fn only_a_process_with_no_thread_left_is_a_zombie() {
+        let line = |stat: &str| format!("7 1 7 {stat} Thu Oct  8 09:31:55 2026 x");
+        for (stat, zombie) in [("Z", true), ("Z+", true), ("Zs", true), ("Zl", false)] {
+            assert_eq!(parse_listing(&line(stat)).unwrap().1, zombie, "{stat}");
+        }
+        assert!(!parse_listing(&line("Ss")).unwrap().1);
+        assert!(!parse_listing(&line("Sl")).unwrap().1);
+    }
+
+    /// A real one, which runs on until it is stopped: not a zombie to any
+    /// reader, and it can be signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_runs_on() {
+        let mut child = headless(&mut Command::new("/usr/bin/python3"))
+            .spawn()
+            .unwrap();
+        headless_port(&mut child);
+        let pid = child.id();
+        let (stat, _) = stat_and_start(pid).unwrap().unwrap();
+        assert!(stat.starts_with('Z') && stat.contains('l'), "{stat}");
+        let recorded = reference(pid).unwrap().expect("reads as not running");
+        assert!(processes().unwrap().iter().any(|p| p.pid == pid));
+        assert_eq!(
+            signal_process(&recorded, Signal::Term).unwrap(),
+            Signalled::Sent
+        );
+        assert!(wait_gone(&mut child));
     }
 
     #[test]
@@ -464,6 +637,33 @@ mod tests {
             Signalled::Sent
         );
         assert!(wait_gone(&mut child));
+    }
+
+    /// What exits right after the check is gone, and its pid, free again,
+    /// is not what the signal goes to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_that_ended_after_the_check_is_not_signalled() {
+        let mut child = own_group();
+        let recorded = now(child.id());
+        let result = through_pidfd(&recorded, Signal::Term, || {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            Ok(true)
+        });
+        assert_eq!(result.unwrap(), Signalled::Gone);
+    }
+
+    /// Nor is pid 1, which no process of a session can be.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_is_never_signalled_at_a_target_of_many() {
+        let init = ProcessRef {
+            pid: 1,
+            started: String::new(),
+        };
+        let result = through_pidfd(&init, Signal::Term, || panic!("looked at pid 1"));
+        assert!(matches!(result.unwrap(), Signalled::Failed(_)));
     }
 
     #[test]
