@@ -178,11 +178,12 @@ pub enum OutKind {
 }
 
 /// What a runtime can do; an unknown one, from a newer plugin, reads as
-/// `Unknown` and is ignored.
+/// `Unknown` and is ignored. Sending on its own (`kind: notify`) is not
+/// one: every runtime may. `notify`, which older plugins announce, reads
+/// as `Unknown` too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    Notify,
     Typing,
     Stream,
     Attachments,
