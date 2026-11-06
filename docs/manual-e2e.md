@@ -534,7 +534,7 @@ enclos dashboard lab; echo "exit $?"     # there too
 enclos audit --since 10m                 # once it has ended
 ```
 
-- [ ] `dashboard` prints `http://127.0.0.1:<port>/` at the sandbox's reserved port and says it serves only you. The page opens in a browser on this host, or, on the Pi, on your own machine through `ssh -L <port>:127.0.0.1:<port> <host>`, and its pages and settings load.
+- [ ] `dashboard` prints `http://127.0.0.1:<port>/` at the sandbox's reserved port and says it serves only you. The page opens in a browser on this host, or, on the Pi, on your own machine through `ssh -L <port>:127.0.0.1:<port> <host>`, and its pages and settings load. A reset connection through the tunnel, with ssh saying `administratively prohibited`, means the host's sshd does not allow TCP forwarding (`AllowTcpForwarding`): not a finding of enclos.
 - [ ] `status` names `enclos dashboard lab` and gives no address; the second `dashboard` is refused, naming the first's pid and address, exit 1, and the first still serves.
 - [ ] Ctrl-C ends it: the address no longer answers, `enclos sandbox show lab` lists no `exec` session of it, and the audit has a `dashboard` entry and a `dashboard end` entry that says it was told to end.
 
