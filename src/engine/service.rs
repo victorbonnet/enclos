@@ -257,13 +257,20 @@ impl Engine {
         name: &SandboxName,
         kept: Option<&ServiceLabel>,
     ) -> Result<Vec<ServiceLabel>> {
+        // Its entry lists what the sandbox runs with not enforced (ADR 0038).
+        let view = self.policy(name)?;
+        let record = self.record(name)?;
+        let gaps = self.accepted_gaps(name, record.backend, &view.snapshot.policy, None)?;
+        let note = super::unenforced::not_enforced_note(&gaps);
         self.write(
             by,
             "sandbox start",
             Some(name.to_string()),
-            |labels: &Vec<ServiceLabel>| joined(labels),
+            |labels: &Vec<ServiceLabel>| format!("{}{note}", joined(labels)),
             |lock| {
                 let mut record = self.record(name)?;
+                let at = format!("at policy v{}", view.version.version);
+                self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
                 let installed = (|| -> Result<Vec<ServiceLabel>> {
                     self.backend_of(name)?;
                     let store_env =

@@ -273,7 +273,12 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Holder(args) => return cli::holder::run(args),
         command => command,
     };
-    let engine = Engine::open(Layout::from_env()?);
+    let accepted = match &command {
+        Command::Policy(args) => cli::policy::accepted_unenforced(args),
+        Command::Sandbox(args) => cli::sandbox::accepted_unenforced(args),
+        _ => Vec::new(),
+    };
+    let engine = Engine::open(Layout::from_env()?).accepting_unenforced(accepted);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
     match command {
         Command::Init => {

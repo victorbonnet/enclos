@@ -197,6 +197,18 @@ fn landlock_missing(kernel: &Kernel) -> (String, Option<String>) {
     }
 }
 
+/// Why this host does not hold a `memory` limit for this user, or none when
+/// it does (ADR 0038): the memory controller as [`checks`] finds it, where
+/// anything but delegated to the user's manager, a controller that cannot
+/// be read included, counts as not held.
+pub(super) fn memory_not_held(kernel: &Kernel) -> Option<String> {
+    let check = controller(kernel, "memory");
+    match check.verdict {
+        Verdict::Fine => None,
+        _ => Some(format!("memory controller: {}", check.found)),
+    }
+}
+
 /// Whether `name`, the controller a limit of that name needs, is in the
 /// kernel and delegated to the user's systemd manager, where a session's
 /// scope sits.
