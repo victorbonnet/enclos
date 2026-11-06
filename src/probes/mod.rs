@@ -5,9 +5,11 @@
 //! carries its proof. Most have a control: a harmless check run on the host
 //! first, which shows the route works there (the same read, listing or
 //! connection with its output discarded, the same open for writing of a file
-//! that matters, which writes nothing, a check that a folder is writable, or,
-//! for a host service whose use outside would act on the host, a read-only
-//! check that the service is there). When the control fails too, the probe is
+//! that matters, which writes nothing, a check that a folder is writable, a
+//! call the host refuses too that gets as far there as the sandbox refuses
+//! it, or, for a host service whose use outside would act on the host or that
+//! the host cannot reach either, a read-only check that the service is
+//! there). When the control fails too, the probe is
 //! inconclusive, not closed: `crontab -l` fails anyway for an account
 //! without a crontab, and a connection fails anyway on a host that is
 //! offline. The probes through the proxy are their own proof: the proxy answers
@@ -204,6 +206,11 @@ pub enum HostCheck {
     Target,
 }
 
+/// The variable the host gives the process it starts for the signal probe,
+/// set to `1`, so that a probe that reads that process's environment tells
+/// it from any other.
+pub const TARGET_VARIABLE: &str = "ENCLOS_PROBE_TARGET";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     /// The route it belongs to, as the report names it (design §5).
@@ -311,14 +318,26 @@ pub trait OwnProbes {
     fn refusal(&self) -> Refusal;
     /// What a report says of its probes.
     fn notes(&self) -> ReportNotes;
-    /// Sets up on the host what its probes need. The engine holds what it
+    /// Sets up on the host what its probes of a sandbox built from `i`
+    /// need, and reads what they aim at there. The engine holds what it
     /// returns until the test ends; dropping it undoes the set-up.
-    fn set_up(&mut self, _layout: &Layout, _name: &SandboxName) -> Box<dyn std::any::Any> {
+    fn set_up(
+        &mut self,
+        _layout: &Layout,
+        _name: &SandboxName,
+        _i: &ProbeInputs,
+    ) -> Box<dyn std::any::Any> {
         Box::new(())
     }
     /// Replaces [`OwnProbes::set_up`] on a dry run, which only counts the
-    /// probes.
-    fn count_only(&mut self, _name: &SandboxName) {}
+    /// probes: it starts nothing and connects to nothing.
+    fn count_only(&mut self, _layout: &Layout, _name: &SandboxName, _i: &ProbeInputs) {}
+    /// A read of `path`, which the sandbox may not see: by default one that
+    /// fails. A backend that hides a path behind an empty stand-in reads it
+    /// otherwise.
+    fn read(&self, route: &'static str, path: &Path) -> Probe {
+        read_probe(route, path)
+    }
     /// Probes of a folder that cannot move, in the order of
     /// [`ProbeInputs::unmovable`].
     fn of_folder(&self, _folder: &Path, _i: &ProbeInputs) -> Vec<Probe> {
@@ -530,7 +549,7 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     let mut list = Vec::new();
     let refusal = own.refusal();
     for path in i.read_deny.iter().filter(|p| probeable(p)) {
-        list.push(read_probe("sensitive files", path));
+        list.push(own.read("sensitive files", path));
     }
     // A grant never covers the deny list: writing there is refused even
     // inside a granted workspace or the sandbox home.
@@ -546,11 +565,11 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     }
     for path in i.hidden_files.iter().cloned().chain([i.data.join("run")]) {
         if path.exists() {
-            list.push(read_probe("enclos files", &path));
+            list.push(own.read("enclos files", &path));
         }
     }
     for dir in &i.other_sandboxes {
-        list.push(read_probe("other sandboxes", dir));
+        list.push(own.read("other sandboxes", dir));
         list.push(write_probe(
             "other sandboxes",
             &format!("write in {}", dir.join("home").display()),
@@ -723,6 +742,25 @@ pub fn not_here(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<String> {
     absent
 }
 
+/// The workspaces that are not folders yet, each as a probe not run: the
+/// sandbox may not create a workspace (design §5), so the user must, and
+/// until then the report says why it was not probed.
+pub fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
+    i.workspaces
+        .iter()
+        .filter(|w| !w.is_dir())
+        .map(|w| ProbeResult {
+            route: "writable folders",
+            name: format!("rename {}", w.display()),
+            outcome: Outcome::NotRun(
+                "it is not a folder yet, and the sandbox may not create it: create it on the host"
+                    .into(),
+            ),
+            closed_by: None,
+        })
+        .collect()
+}
+
 /// The script of a limit's probe: it succeeds, open, when the limit
 /// `ulimit {flag}` reads is above `limit`, unlimited, or not a number.
 pub(crate) fn limit_script(flag: &str, limit: u64) -> String {
@@ -737,6 +775,27 @@ const MARKER: &str = "enclos-probe-ran";
 /// The probe's script as the sandbox runs it: the marker first.
 pub fn sandboxed_script(probe: &Probe) -> String {
     format!("printf '{MARKER}\\n'; {}", probe.script)
+}
+
+/// What starts each line enclos itself writes on a session's stderr, such as
+/// `enclos inside`'s notice that the kernel has no Landlock (design §5).
+const NOTICE: &str = "enclos: ";
+
+/// A probe session's stderr with what enclos itself said there set apart,
+/// as notices, when the session ran the script (its stdout starts with the
+/// marker): those lines are not the probe's, and one read as its answer
+/// would hide it. A session that did not run the script keeps them, as one
+/// may be why.
+pub fn set_aside_notices(stdout: &[u8], stderr: &[u8]) -> (Vec<u8>, Vec<String>) {
+    if !stdout.starts_with(MARKER.as_bytes()) {
+        return (stderr.to_vec(), Vec::new());
+    }
+    let text = String::from_utf8_lossy(stderr);
+    let (notices, rest): (Vec<&str>, Vec<&str>) = text
+        .split_inclusive('\n')
+        .partition(|line| line.starts_with(NOTICE));
+    let notices = notices.iter().map(|l| l.trim_end().to_owned()).collect();
+    (rest.concat().into_bytes(), notices)
 }
 
 /// One run of a probe in the sandbox.
@@ -1233,6 +1292,22 @@ mod tests {
             Run::read(false, "enclos-probe-ran\n403", "err\n"),
             ran(false, "403err\n")
         );
+    }
+
+    /// A notice of enclos's own, such as `enclos inside`'s on a kernel
+    /// without Landlock, would be read as the probe's last word: it is set
+    /// apart once the script ran, and kept as the reason when it did not.
+    #[test]
+    fn what_enclos_says_on_a_session_is_set_apart_from_a_probe_that_ran() {
+        let notice = "enclos: this kernel has no Landlock: writes are held by the mounts alone";
+        let stderr = format!("{notice}\nsh: 1: cannot open /x: No such file\n");
+        let (rest, notices) = set_aside_notices(b"enclos-probe-ran\n403", stderr.as_bytes());
+        assert_eq!(notices, [notice]);
+        assert_eq!(rest, b"sh: 1: cannot open /x: No such file\n");
+        let refused = "enclos: no namespace holder answers on /run/h.sock\n";
+        let (rest, notices) = set_aside_notices(b"", refused.as_bytes());
+        assert!(notices.is_empty());
+        assert_eq!(rest, refused.as_bytes());
     }
 
     #[test]

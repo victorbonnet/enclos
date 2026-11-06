@@ -15,7 +15,7 @@ const NOT_A_FOLDER: &str = "/dev/null";
 
 /// bubblewrap's arguments for one launch, from [`read_host`]'s `host`, in the
 /// order the compiled file names (design §5): the `/` bind, the masks of the
-/// home and outside it, the compiled mounts, each staged file in `reads`
+/// home and outside it, the home's listening sockets, the compiled mounts, each staged file in `reads`
 /// read-only at its own path, the unmovable folders, the masks inside the
 /// grants, each folder made here and each the compiled file seals, read-only,
 /// then the options, whose place does not matter.
@@ -52,6 +52,17 @@ pub(super) fn arguments(
             // Read-only to the sandbox, which cannot make it.
             Kind::Missing => {}
         }
+    }
+    // Over what the home's mask binds back.
+    for socket in &host.sockets {
+        push(
+            &mut args,
+            &[
+                "--ro-bind".as_ref(),
+                NOT_A_FOLDER.as_ref(),
+                socket.as_os_str(),
+            ],
+        );
     }
     args.extend(bubblewrap.mounts.iter().map(OsString::from));
     // The file itself, not its folder: what else is staged there, such as

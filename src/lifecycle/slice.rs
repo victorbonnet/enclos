@@ -63,9 +63,80 @@ pub fn hold(slice: &str, limits: &SliceLimits) -> Result<(), PsError> {
     Ok(())
 }
 
+/// Stops `slice`, which systemd keeps active once a scope started in it,
+/// and drops the limits [`hold`] set on it, once its sandbox is gone. Asks
+/// systemd first, so a slice no session ever started is left alone.
+pub fn release(slice: &str) -> Result<(), PsError> {
+    let out = systemctl(&[
+        "show",
+        "--property=ActiveState",
+        "--property=DropInPaths",
+        slice,
+    ])?;
+    let (active, drop_ins) = state_of(&String::from_utf8_lossy(&out.stdout));
+    if active {
+        systemctl(&["stop", slice])?;
+    }
+    if drop_ins {
+        systemctl(&["revert", slice])?;
+    }
+    Ok(())
+}
+
+/// Whether `systemctl show` says a unit is active, and has drop-ins.
+fn state_of(shown: &str) -> (bool, bool) {
+    let value = |name: &str| {
+        shown
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    (
+        value("ActiveState") == "active",
+        !value("DropInPaths").is_empty(),
+    )
+}
+
+/// `systemctl --user` with `args`, failing on a failure it reports.
+fn systemctl(args: &[&str]) -> Result<std::process::Output, PsError> {
+    let out = Command::new(SYSTEMCTL)
+        .arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PsError::Cgroup(format!("cannot run systemctl: {e}")))?;
+    if !out.status.success() {
+        return Err(PsError::Cgroup(format!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slice is stopped only when it runs, and reverted only when
+    /// something set its properties.
+    #[test]
+    fn a_slice_is_released_by_what_systemd_says_of_it() {
+        assert_eq!(
+            state_of(
+                "ActiveState=active\nDropInPaths=/run/user/1000/systemd/user.control/x.slice.d/50-MemoryMax.conf\n"
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            state_of("ActiveState=inactive\nDropInPaths=\n"),
+            (false, false)
+        );
+        assert_eq!(state_of(""), (false, false));
+    }
 
     /// No swap beyond the memory limit, so a process past it is stopped.
     #[test]

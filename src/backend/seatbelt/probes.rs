@@ -377,25 +377,6 @@ fn folder_probes(i: &ProbeInputs, refusal: &Refusal) -> Vec<Probe> {
     list
 }
 
-/// The workspaces that are not folders yet, each as a probe not run: the
-/// sandbox may not create a workspace (design §5), so the user must, and
-/// until then the report says why it was not probed.
-fn missing_workspaces(i: &ProbeInputs) -> Vec<ProbeResult> {
-    i.workspaces
-        .iter()
-        .filter(|w| !w.is_dir())
-        .map(|w| ProbeResult {
-            route: "writable folders",
-            name: format!("rename {}", w.display()),
-            outcome: Outcome::NotRun(
-                "it is not a folder yet, and the sandbox may not create it: create it on the host"
-                    .into(),
-            ),
-            closed_by: None,
-        })
-        .collect()
-}
-
 /// Renames `folder` into itself, with rename(2) through perl: the filesystem
 /// refuses that whatever the policy, so the folder never moves, and the
 /// same call on the host is the control.
@@ -596,7 +577,7 @@ impl OwnProbes for SeatbeltProbes {
         notes_on(self.baseline)
     }
 
-    fn set_up(&mut self, layout: &Layout, name: &SandboxName) -> Box<dyn Any> {
+    fn set_up(&mut self, layout: &Layout, name: &SandboxName, _i: &ProbeInputs) -> Box<dyn Any> {
         let keychain = KeychainProbe::store(layout, name);
         self.keychain_item = keychain
             .as_ref()
@@ -605,7 +586,7 @@ impl OwnProbes for SeatbeltProbes {
         Box::new(keychain)
     }
 
-    fn count_only(&mut self, name: &SandboxName) {
+    fn count_only(&mut self, _layout: &Layout, name: &SandboxName, _i: &ProbeInputs) {
         self.keychain_item = match cfg!(target_os = "macos") {
             true => Ok(KeychainItem {
                 service: "enclos.probe".into(),
@@ -625,7 +606,7 @@ impl OwnProbes for SeatbeltProbes {
     }
 
     fn folders_not_run(&self, i: &ProbeInputs) -> Vec<ProbeResult> {
-        missing_workspaces(i)
+        crate::probes::missing_workspaces(i)
     }
 
     fn network(&self, i: &ProbeInputs) -> Vec<Probe> {

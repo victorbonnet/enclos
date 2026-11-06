@@ -255,6 +255,26 @@ pub(super) fn agents_socket(
     })
 }
 
+/// Of the host's listening sockets, those the home's mask would show the
+/// sandbox, each at the path the sandbox reaches it by: under the user's
+/// home, but not inside the sandbox's own home or a workspace, which are
+/// its own, nor inside a path the home's mask leaves out already. No deny
+/// entry names them, and a read-only mount does not stop a connection.
+pub(super) fn home_sockets(
+    sockets: &[PathBuf],
+    grants: &Grants<'_>,
+    hidden: &BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    sockets
+        .iter()
+        .filter(|socket| socket.is_absolute())
+        .filter_map(|socket| match place(&real_path(socket), grants) {
+            Place::InHome(at) if !hidden.iter().any(|h| is_within(&at, h)) => Some(at),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The folders bound on themselves so the sandbox cannot move them: those
 /// compile listed that are there, and each between a grant and a mask in it.
 pub(super) fn unmovable(

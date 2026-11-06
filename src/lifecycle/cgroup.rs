@@ -308,6 +308,11 @@ impl Scopes {
     ) -> Result<(), PsError> {
         super::slice::hold(&slice_name(install, sandbox), limits)
     }
+
+    /// Stops `sandbox`'s slice and drops its limits, once it is removed.
+    pub fn release_slice(&self, install: &str, sandbox: &str) -> Result<(), PsError> {
+        super::slice::release(&slice_name(install, sandbox))
+    }
 }
 
 /// The scope a session's program runs in, and its cgroup once read.
@@ -439,6 +444,44 @@ pub fn members_in(procs: &[Proc], pids: &BTreeSet<u32>) -> (Vec<ProcessRef>, BTr
     (listed, unlisted)
 }
 
+/// The `cgroup.procs` file of the user's manager's own cgroup in the host's
+/// hierarchy, as `systemctl --user show` names that cgroup: it holds every
+/// scope and slice of the user's, so it lies outside any session's cgroup.
+pub fn manager_procs() -> Result<PathBuf, PsError> {
+    let out = Command::new(SYSTEMCTL)
+        .args(["--user", "show", "--property=ControlGroup"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| PsError::Cgroup(format!("cannot run systemctl: {e}")))?;
+    if !out.status.success() {
+        return Err(PsError::Cgroup(format!(
+            "systemctl cannot say where the user's manager is: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    manager_folder(
+        &String::from_utf8_lossy(&out.stdout),
+        Path::new(CGROUP_ROOT),
+    )
+    .map(|folder| folder.join("cgroup.procs"))
+}
+
+/// The folder under `root` of the cgroup `systemctl --user show
+/// --property=ControlGroup` printed for the manager itself: a path below the
+/// hierarchy's root, which is not a scope's.
+fn manager_folder(text: &str, root: &Path) -> Result<PathBuf, PsError> {
+    let value = text
+        .lines()
+        .find_map(|l| l.strip_prefix("ControlGroup="))
+        .unwrap_or_default();
+    match value.strip_prefix('/') {
+        Some(below) if below.split('/').all(|p| !p.is_empty() && p != "..") => Ok(root.join(below)),
+        _ => Err(PsError::Cgroup(format!(
+            "systemd gave the user's manager the control group `{value}`"
+        ))),
+    }
+}
+
 /// Whether `e`, from reading a cgroup's folder, says the cgroup was removed.
 /// Once systemd removes an emptied cgroup, kernfs answers ENODEV for a file
 /// opened or read as that happens, and ENOENT only after.
@@ -539,6 +582,29 @@ mod tests {
 
     fn at(path: &str) -> Cgroup {
         path.parse().unwrap()
+    }
+
+    /// The manager's own cgroup is a service's, not a scope's, and lies
+    /// below the hierarchy's root.
+    #[test]
+    fn the_managers_cgroup_is_found_below_the_root() {
+        let root = Path::new("/sys/fs/cgroup");
+        let found = manager_folder(
+            "ControlGroup=/user.slice/user-1001.slice/user@1001.service\n",
+            root,
+        );
+        assert_eq!(
+            found.unwrap(),
+            root.join("user.slice/user-1001.slice/user@1001.service")
+        );
+        for odd in [
+            "ControlGroup=\n",
+            "ControlGroup=/a/../b\n",
+            "nothing\n",
+            "ControlGroup=/\n",
+        ] {
+            assert!(manager_folder(odd, root).is_err(), "{odd}");
+        }
     }
 
     #[test]
