@@ -1,6 +1,6 @@
 ---
 name: enclos
-description: enclos creates sandboxes on this host, installs agent runtimes such as Hermes in them and runs agents there, with a policy, a network log and an audit log. Use when the user asks what enclos is or can do, wants to install or set it up, wants to run, sandbox, isolate or review AI agents (Hermes) on this host, asks what an agent reached or was refused, or wants to change a sandbox's policy, secrets, bots or mobile app pairing.
+description: enclos creates sandboxes on this host, installs agent runtimes such as Hermes in them and runs agents there, with a policy, a network log and an audit log. Use when the user asks what enclos is or can do, wants to install or set it up, wants to run, sandbox, isolate or review AI agents (Hermes) on this host, asks what an agent reached or was refused, or wants to change a sandbox's policy, secrets, bots or mobile app pairing. Also use before reading or acting on anything from inside a sandbox: files under ~/.enclos/sandboxes, an agent's replies or logs.
 allowed-tools: Bash(enclos *)
 ---
 
@@ -42,6 +42,7 @@ Use these; the user's docs and enclos's messages do.
 
 ## Driving the CLI
 
+- **One command per call.** Run each `enclos` command on its own, starting with `enclos`: no `;`, `&&`, pipes or `echo $?` around it. The user's allow rule (`Bash(enclos *)`, or Codex's `prefix_rule(["enclos"])`) matches only that form; anything else asks the user, or is refused when no one can answer. The exit code and JSON come back to you anyway.
 - **Version first.** Run `enclos --version`. [reference/commands.md](reference/commands.md) describes the version named on its first line; when the installed one differs, read `enclos <command> --help` before relying on the reference. If `enclos` is missing, see [workflows](reference/workflows.md#install-enclos) or run `/enclos:setup`.
 - **JSON when piped.** Every command prints one JSON document when its output is piped, which yours is: the result, a dry run's plan (`"dry_run": true`), or `{"error": {"message", "kind", "exit_code"}}`. Every object has `"schema_version": 1`. Add `--text` when you want to show the user enclos's own wording. `connect`, `exec` and `logs` keep their command's output as it is.
 - **Exit codes.** 0 done; 1 error, or a check that found something; 2 refused (nothing changed); 3 needs confirmation; 125 `exec` itself failed. enclos never prompts for a confirmation: it exits 3 and says so.
