@@ -6,11 +6,14 @@
 pub mod fake;
 #[cfg(target_os = "macos")]
 pub mod launchd;
+pub mod systemd;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::layout::Layout;
 
 /// A service's name for the service manager, unique on the host:
 /// `enclos.<install>.<sandbox>.<service>`, such as
@@ -83,7 +86,7 @@ pub struct ServiceError {
     pub what: String,
 }
 
-/// The host's service manager: launchd on macOS, systemd later. What the
+/// The host's service manager: launchd or systemd. What the
 /// engine relies on, for every implementation:
 ///
 /// - `start` installs a unit so it runs now and again at each login, and
@@ -99,6 +102,11 @@ pub struct ServiceError {
 pub trait ServiceManager {
     /// Whether this manager can install units now; the reason when not.
     fn available(&self) -> Result<(), ServiceError>;
+    /// Whether `installed` shows what this manager runs; the reason when
+    /// not, for a caller that expected something and got an empty list.
+    fn can_list(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
     /// Installs the unit so it starts now and again at each login.
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError>;
     /// Stops the unit and removes it, so it does not start at login.
@@ -109,21 +117,31 @@ pub trait ServiceManager {
     /// The labels installed and not removed yet that start with `prefix`,
     /// whether or not they run.
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError>;
+    /// The command a user runs to remove `var` from this manager's own
+    /// environment.
+    fn unset_env_command(&self, var: &str) -> String;
 }
 
-/// This host's service manager: launchd on macOS. Other systems have none
-/// yet, and refuse to start services.
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
 #[cfg(target_os = "macos")]
-pub fn host(user_home: &Path) -> Box<dyn ServiceManager> {
-    Box::new(launchd::Launchd::for_user(user_home))
+pub fn host(layout: &Layout) -> Box<dyn ServiceManager> {
+    Box::new(launchd::Launchd::for_user(layout.user_home()))
 }
 
-/// This host's service manager: launchd on macOS. Other systems have none
-/// yet, and refuse to start services.
-#[cfg(not(target_os = "macos"))]
-pub fn host(_user_home: &Path) -> Box<dyn ServiceManager> {
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
+#[cfg(target_os = "linux")]
+pub fn host(layout: &Layout) -> Box<dyn ServiceManager> {
+    Box::new(systemd::Systemd::for_user(layout.units_dir()))
+}
+
+/// This host's service manager: launchd on macOS, systemd on Linux. Other
+/// systems have none, and refuse to start services.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn host(_layout: &Layout) -> Box<dyn ServiceManager> {
     Box::new(Unsupported {
-        why: "enclos runs background services only on macOS for now",
+        why: "enclos runs background services only on macOS and Linux",
     })
 }
 
@@ -158,18 +176,22 @@ impl ServiceManager for Unsupported {
     fn installed(&self, _prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         Ok(Vec::new())
     }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("unset {var} where the service runs")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
-    fn this_system_has_no_service_manager_yet() {
-        let host = host(Path::new("/home/alice"));
+    fn this_system_has_no_service_manager() {
+        let host = host(&Layout::at("/home/alice/.enclos"));
         let err = host.available().unwrap_err();
-        assert!(err.what.contains("only on macOS"), "{err}");
+        assert!(err.what.contains("only on macOS and Linux"), "{err}");
         assert!(host.installed(LABEL_PREFIX).unwrap().is_empty());
     }
 

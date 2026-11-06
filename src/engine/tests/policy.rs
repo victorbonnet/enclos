@@ -22,6 +22,21 @@ pub(super) fn with_sandbox_on(backend: FakeBackend) -> (TempDir, Engine, Sandbox
     (dir, engine, name)
 }
 
+/// What a grant over the folder the user's manager reads units from would
+/// be: a unit written there runs outside the sandbox at the next login.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_grant_that_holds_the_users_unit_folder_is_refused() {
+    let (_dir, engine, name) = with_sandbox();
+    let mut policy = engine.active_policy(&name).unwrap().1.policy;
+    policy.fs.write.push("~/.config".into());
+    let err = crate::policy::validate::validate_writes(&policy, &engine.validation_context(&name))
+        .unwrap_err()
+        .to_string();
+    let units = engine.layout.units_dir().display().to_string();
+    assert!(err.contains(&units), "{err}");
+}
+
 #[test]
 fn a_new_sandbox_gets_version_1_of_its_template() {
     let (_dir, engine, name) = with_sandbox();

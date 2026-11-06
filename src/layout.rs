@@ -39,6 +39,11 @@ pub struct Layout {
     config: PathBuf,
     /// The user's home folder, which `~` in policies means.
     user_home: PathBuf,
+    /// Where the user's systemd manager looks for units first, and where
+    /// `sandbox start` installs them.
+    units_dir: PathBuf,
+    /// Where the same manager looks for units in the user's data folder.
+    data_units_dir: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +69,8 @@ impl Layout {
         Layout {
             data: root.clone(),
             config: root,
+            units_dir: units_dir(&user_home.join(".config")),
+            data_units_dir: units_dir(&user_home.join(".local/share")),
             user_home,
         }
     }
@@ -71,6 +78,8 @@ impl Layout {
     /// The same layout, with `~` meaning `home`.
     pub fn with_user_home(mut self, home: impl Into<PathBuf>) -> Layout {
         self.user_home = home.into();
+        self.units_dir = units_dir(&self.user_home.join(".config"));
+        self.data_units_dir = units_dir(&self.user_home.join(".local/share"));
         self
     }
 
@@ -86,30 +95,37 @@ impl Layout {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
+        // The XDG spec says to ignore relative values.
+        let xdg =
+            |name: &str, default: PathBuf| set(name).filter(|p| p.is_absolute()).unwrap_or(default);
+        // Units follow the variables under `ENCLOS_HOME` too: it says where
+        // enclos keeps its files, not where the user's manager looks.
+        let units_of = |layout: Layout| match os {
+            Os::MacOs => layout,
+            Os::Linux => Layout {
+                units_dir: units_dir(&xdg("XDG_CONFIG_HOME", layout.user_home.join(".config"))),
+                data_units_dir: units_dir(&xdg(
+                    "XDG_DATA_HOME",
+                    layout.user_home.join(".local/share"),
+                )),
+                ..layout
+            },
+        };
         if let Some(root) = set(HOME_VAR) {
             let layout = Layout::at(absolute(HOME_VAR, root)?);
-            return Ok(match set("HOME").filter(|h| h.is_absolute()) {
+            return Ok(units_of(match set("HOME").filter(|h| h.is_absolute()) {
                 Some(home) => layout.with_user_home(home),
                 None => layout,
-            });
+            }));
         }
         let home = absolute("HOME", set("HOME").ok_or(LayoutError::NoHome)?)?;
         Ok(match os {
             Os::MacOs => Layout::at(home.join(".enclos")).with_user_home(home),
-            Os::Linux => {
-                // The XDG spec says to ignore relative values.
-                let xdg = |name: &str, default: &str| {
-                    set(name)
-                        .filter(|p| p.is_absolute())
-                        .unwrap_or_else(|| home.join(default))
-                        .join("enclos")
-                };
-                Layout {
-                    data: xdg("XDG_DATA_HOME", ".local/share"),
-                    config: xdg("XDG_CONFIG_HOME", ".config"),
-                    user_home: home.clone(),
-                }
-            }
+            Os::Linux => units_of(Layout {
+                data: xdg("XDG_DATA_HOME", home.join(".local/share")).join("enclos"),
+                config: xdg("XDG_CONFIG_HOME", home.join(".config")).join("enclos"),
+                ..Layout::at(home.join(".enclos")).with_user_home(home)
+            }),
         })
     }
 
@@ -146,6 +162,13 @@ impl Layout {
         &self.user_home
     }
 
+    /// The folder systemd units go in, as this process's environment names
+    /// it: `$XDG_CONFIG_HOME/systemd/user` when that is an absolute path,
+    /// else `~/.config/systemd/user`.
+    pub fn units_dir(&self) -> &Path {
+        &self.units_dir
+    }
+
     /// The variables with which another enclos process, such as a service
     /// started with only `HOME`, resolves this same layout: `ENCLOS_HOME`
     /// when everything is in one folder, else both XDG folders.
@@ -163,10 +186,20 @@ impl Layout {
         ]
     }
 
-    /// The enclos data and config folders: what sandboxes may never write
-    /// outside their own home (ADR 0010).
+    /// What sandboxes may never write outside their own home: the enclos
+    /// data and config folders (ADR 0010), and on Linux the user's manager's
+    /// unit folders, which follow the XDG variables as the deny list's
+    /// entries for them cannot.
     pub fn protected(&self) -> Vec<PathBuf> {
-        self.roots()
+        self.protected_on(Os::current())
+    }
+
+    fn protected_on(&self, os: Os) -> Vec<PathBuf> {
+        let mut protected = self.roots();
+        if os == Os::Linux {
+            protected.extend([self.units_dir.clone(), self.data_units_dir.clone()]);
+        }
+        protected
     }
 
     /// The folder holding every sandbox's folder.
@@ -406,6 +439,11 @@ fn absolute(var: &'static str, path: PathBuf) -> Result<PathBuf, LayoutError> {
     }
 }
 
+/// The user's manager's folder of units under an XDG folder.
+fn units_dir(xdg_home: &Path) -> PathBuf {
+    xdg_home.join("systemd/user")
+}
+
 /// Creates `dir` and its missing parents, readable only by the user.
 fn create_dir(dir: &Path) -> Result<(), LayoutError> {
     users_alone(dir).map_err(|source| LayoutError::Io {
@@ -507,6 +545,67 @@ mod tests {
         let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
         assert_eq!(layout.data(), Path::new("/home/alice/.local/share/enclos"));
         assert_eq!(layout.config(), Path::new("/home/alice/.config/enclos"));
+    }
+
+    #[test]
+    fn linux_protects_the_unit_folders_the_xdg_variables_name() {
+        let vars = [
+            ("HOME", "/home/alice"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_CONFIG_HOME", "/home/alice/dotfiles/config"),
+        ];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(
+            layout.units_dir(),
+            Path::new("/home/alice/dotfiles/config/systemd/user")
+        );
+        assert_eq!(
+            layout.protected_on(Os::Linux),
+            [
+                PathBuf::from("/data/enclos"),
+                PathBuf::from("/home/alice/dotfiles/config/enclos"),
+                PathBuf::from("/home/alice/dotfiles/config/systemd/user"),
+                PathBuf::from("/data/systemd/user"),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_unit_folders_default_under_the_home_and_ignore_a_relative_variable() {
+        let vars = [("HOME", "/home/alice"), ("XDG_CONFIG_HOME", "relative")];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(
+            layout.units_dir(),
+            Path::new("/home/alice/.config/systemd/user")
+        );
+        assert!(
+            layout
+                .protected_on(Os::Linux)
+                .contains(&PathBuf::from("/home/alice/.local/share/systemd/user"))
+        );
+    }
+
+    #[test]
+    fn enclos_home_leaves_the_unit_folders_where_the_manager_looks() {
+        let vars = [
+            ("HOME", "/home/alice"),
+            (HOME_VAR, "/tmp/e"),
+            ("XDG_CONFIG_HOME", "/srv/config"),
+        ];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(layout.data(), Path::new("/tmp/e"));
+        assert_eq!(layout.units_dir(), Path::new("/srv/config/systemd/user"));
+    }
+
+    #[test]
+    fn macos_protects_only_enclos_folders() {
+        let vars = [("HOME", "/Users/alice"), ("XDG_CONFIG_HOME", "/cfg")];
+        let layout = Layout::resolve(Os::MacOs, env(&vars)).unwrap();
+        assert_eq!(
+            layout.protected_on(Os::MacOs),
+            [PathBuf::from("/Users/alice/.enclos")]
+        );
+        assert_eq!(layout, Layout::at("/Users/alice/.enclos"));
     }
 
     #[test]

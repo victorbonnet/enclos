@@ -29,7 +29,8 @@ pub(super) struct ServiceTimes {
     pub(super) start: Duration,
     /// How long it waits while no session of the service is open, as when
     /// the service exits at once and the service manager waits before
-    /// starting it again (launchd: 10 seconds).
+    /// starting it again (launchd: 10 seconds; systemd: 1, growing to 10 in
+    /// a crash loop).
     pub(super) gone: Duration,
     /// How often it looks.
     pub(super) poll: Duration,

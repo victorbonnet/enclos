@@ -90,7 +90,8 @@ impl Engine {
         if let Some(why) = why {
             return Err(Error::Session {
                 what: format!(
-                    "{why}: a service runs only on (deny default) (`launchctl unsetenv {BASELINE_VAR}` unsets it in the service manager's environment)"
+                    "{why}: a service runs only on (deny default) (`{}` unsets it in the service manager's environment)",
+                    self.services.unset_env_command(BASELINE_VAR),
                 ),
             });
         }
