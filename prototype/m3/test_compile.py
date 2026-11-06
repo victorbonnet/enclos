@@ -128,6 +128,10 @@ class CompileTest(Case):
         self.assertNotIn("--new-session", args)
         self.assertIn("--new-session", self.compiled("--new-session")["bwrap"])
 
+    def test_as_pid_1_is_asked_for_alone(self):
+        self.assertNotIn("--as-pid-1", self.compiled()["bwrap"])
+        self.assertIn("--as-pid-1", self.compiled("--as-pid-1")["bwrap"])
+
     def test_seccomp_refuses_the_listed_calls(self):
         s = self.compiled()["seccomp"]
         for call in ["keyctl", "bpf", "perf_event_open", "userfaultfd", "mount", "setns"]:
@@ -169,7 +173,7 @@ class CompileTest(Case):
                 patch.object(comp.os, "stat", side_effect=refused):
             c = comp.compile_policy(argparse.Namespace(
                 host_home=self.h, sandbox_dir=self.sbx, workspace=[f"{self.h}/proj"], read_only=[],
-                deny=[f"{self.h}/.ssh"], relay_port=18080, new_session=False))
+                deny=[f"{self.h}/.ssh"], relay_port=18080, new_session=False, as_pid_1=False))
         self.assertIn("@HOME_MASK@", c["bwrap"])
         self.assertIn("@GRANT_MASK@", c["bwrap"])
 
@@ -322,6 +326,33 @@ class DenyInsideAGrantTest(Case):
         self.assertEqual(view(args, f"{h}/dev/other"), ("--bind", True))
         self.assertEqual(view(args, f"{h}/dev/new-file"), ("--bind", True))
         self.assertEqual(view(args, h), ("--tmpfs", False))
+
+    def test_the_folders_above_a_mask_are_bound_on_themselves_before_it(self):
+        """So renaming one gets EBUSY: a mask names a path, and would move with it."""
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/deep/er/secret")["bwrap"]
+        binds = self.pairs(args, "--bind")
+        self.assertLess(binds.index(f"{h}/dev"), binds.index(f"{h}/dev/deep"))
+        self.assertLess(binds.index(f"{h}/dev/deep"), binds.index(f"{h}/dev/deep/er"))
+        self.assertLess(args.index(f"{h}/dev/deep/er"), args.index(f"{h}/dev/deep/er/secret"))
+
+    def test_a_folder_not_there_gets_no_bind_on_itself(self):
+        h = self.h
+        args = self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/gone/secret")["bwrap"]
+        self.assertNotIn(f"{h}/dev/gone", args)
+
+    def test_a_link_between_a_workspace_and_a_deny_entry_stops_the_session(self):
+        """The sandbox writes every folder there, so it could point a mask elsewhere."""
+        h = self.h
+        os.symlink(f"{h}/dev/other", f"{h}/dev/config")
+        with self.assertRaises(SystemExit) as refused:
+            self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/config/.env")
+        self.assertIn("link", str(refused.exception))
+
+    def test_an_entry_that_is_itself_a_link_is_not_refused(self):
+        h = self.h
+        os.symlink(f"{h}/dev/other", f"{h}/dev/entry")
+        self.compiled("--workspace", f"{h}/dev", "--deny", f"{h}/dev/entry")
 
     def test_a_file_denied_inside_a_workspace(self):
         h = self.h

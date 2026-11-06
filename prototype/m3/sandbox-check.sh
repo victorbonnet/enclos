@@ -125,6 +125,8 @@ probes+=(
     "connect-tcp 1.1.1.1 443"
     "connect-vsock 2 9"
     "connect-vsock 1 9"
+    "socket-family 40"
+    "socket-family 38 5"
     "dns example.com"
 )
 
@@ -157,6 +159,39 @@ for m in "${modes[@]}"; do
 done
 SBX_NEW_SESSION=1 SBX_SECCOMP=off tio "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" tiocsti >"$tmp/tio-newsession.tsv"
 
+# PID 1, on the case with nothing else in the way: no Landlock, and Yama, which
+# refuses an ancestor at its default of 1, set to 0. The control is bubblewrap's
+# own reaper as PID 1; the fix is what `enclos inside` is to do. Each must end
+# with no process of the namespace reachable that lacks the filter.
+yama=/proc/sys/kernel/yama/ptrace_scope
+scope=$(cat "$yama" 2>/dev/null || echo absent)
+[ "$scope" = absent ] || sudo sysctl -qw kernel.yama.ptrace_scope=0
+pid1=("ptrace 1" "open-write /proc/1/mem")
+SBX_LANDLOCK=off "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" "${pid1[@]}" \
+    >"$tmp/pid1-reaper.tsv" 2>"$tmp/pid1-reaper.err"
+SBX_LANDLOCK=off SBX_AS_PID_1=1 "$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" "${pid1[@]}" \
+    >"$tmp/pid1-inside.tsv" 2>"$tmp/pid1-inside.err"
+[ "$scope" = absent ] || sudo sysctl -qw "kernel.yama.ptrace_scope=$scope"
+
+# A folder that holds a mask, over two sessions: the first tries to move it from
+# under the mask and the second reads where it would have gone. Then the same
+# with a link in its place, which only the host can put there once the move is
+# refused: the session must not start.
+moved="$WORK/denied-holder-moved"
+"$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" "rename $WORK/denied-holder" \
+    "move $WORK/denied-holder $moved" >"$tmp/holder-first.tsv" 2>"$tmp/holder-first.err"
+"$M3/sbx.sh" -- /usr/bin/python3 -I "$M3/probe.py" \
+    "read $moved/secret/enclos-proto-planted" \
+    "read $WORK/denied-holder/secret/enclos-proto-planted" \
+    >"$tmp/holder-second.tsv" 2>"$tmp/holder-second.err"
+if [ -e "$moved" ]; then rm -rf "$WORK/denied-holder"; mv "$moved" "$WORK/denied-holder"; fi
+mv "$WORK/denied-holder" "$WORK/denied-holder-aside"
+ln -s denied-holder-aside "$WORK/denied-holder"
+"$M3/sbx.sh" -- /usr/bin/true >"$tmp/holder-link.out" 2>&1
+link_exit=$?
+rm "$WORK/denied-holder"
+mv "$WORK/denied-holder-aside" "$WORK/denied-holder"
+
 cols=("host=$tmp/host.tsv")
 tcols=("host=$tmp/tio-host.tsv")
 for m in "${modes[@]}"; do
@@ -181,13 +216,22 @@ compile_policy  # the full mode's, without --new-session, for the record
     echo
     echo "\`read $WORK/denied-file\` reads 0 bytes where the mask holds, and 8 on the host. The host column's \`denied-missing\` rows come after the sandbox modes, so they show the empty folder a mask leaves there."
     echo
-    echo "\`exec-loader\` and \`exec-memfd\` run the copy \`exec\` runs: \`ok\` where \`exec $WORK/sh-copy\` is refused shows a way round the execute rule. \`connect-vsock\` is read against the host's column: the same error in the sandbox shows a network namespace does not stand in its way."
+    echo "\`exec-loader\` and \`exec-memfd\` run the copy \`exec\` runs: \`ok\` where \`exec $WORK/sh-copy\` is refused shows a way round the execute rule. \`connect-vsock\` is read against the host's column: the same error in the sandbox shows a network namespace does not stand in its way. \`socket-family 40\` is \`AF_VSOCK\` and \`socket-family 38 5\` \`AF_ALG\`: EPERM with the filter, and any other answer without it, shows the rule on families."
     echo
     python3 -I "$M3/table.py" "${cols[@]}"
     section "TIOCSTI (under a terminal of its own)"
     echo "dev.tty.legacy_tiocsti: $(cat /proc/sys/dev/tty/legacy_tiocsti 2>/dev/null || echo absent). At 0 the kernel refuses TIOCSTI to every unprivileged process (EIO). seccomp runs before the ioctl, so EPERM where the others read EIO shows the filter matched; whether --new-session alone refuses it needs a host with the setting at 1 (a VM)."
     echo
     python3 -I "$M3/table.py" "${tcols[@]}"
+    section "Attaching to PID 1, no Landlock, ptrace_scope 0 (was $scope)"
+    echo "Must not read \`ok\` in the second column. In the first, \`ok\` shows the hole \`--as-pid-1\` closes."
+    echo
+    python3 -I "$M3/table.py" "bubblewrap's reaper=$tmp/pid1-reaper.tsv" "--as-pid-1, inside.py stays=$tmp/pid1-inside.tsv"
+    section "A folder that holds a mask, over two sessions"
+    echo "The move must not read \`ok\`, and neither read may show the planted file's 8 bytes."
+    echo
+    cat "$tmp/holder-first.tsv" "$tmp/holder-second.tsv" | fence
+    echo "A link in its place: exit $link_exit (must not be 0): $(tail -1 "$tmp/holder-link.out")"
     section "A file left in the sandbox's /tmp"
     printf -- '- %s\n' "${left[@]}"
     section "The compiled policy (full mode)"

@@ -21,7 +21,8 @@ import inside
 
 RULES = {"read": [], "execute": [], "write": [], "devices": [], "proc_write": [], "scoped": []}
 SPEC = {"errno": "EPERM", "deny": comp.SECCOMP_DENY, "ioctl": {"TIOCSTI": 0x5412},
-        "clone_flags": {"CLONE_NEWUSER": 0x10000000}, "enosys": ["clone3"]}
+        "clone_flags": {"CLONE_NEWUSER": 0x10000000}, "enosys": ["clone3"],
+        "socket_families": comp.SOCKET_FAMILIES}
 
 
 def stand_in(negative=(), raises=()):
@@ -32,10 +33,12 @@ def stand_in(negative=(), raises=()):
     module.ALLOW = "allow"
     module.ERRNO = lambda e: ("errno", e)
     module.MASKED_EQ = "masked_eq"
+    module.EQ = "eq"
     module.Arg = lambda *a: a
     module.Arch = types.SimpleNamespace(NATIVE=0)
     module.resolve_syscall = lambda arch, name: -101 if name in negative else 1
     module.rules = []
+    module.arguments = []
     module.loaded = []
 
     class SyscallFilter:
@@ -46,6 +49,7 @@ def stand_in(negative=(), raises=()):
             if name in raises:
                 raise RuntimeError(f"no rule for {name}")
             module.rules.append(name)
+            module.arguments.append((name, args))
 
         def load(self):
             module.loaded.append(True)
@@ -87,6 +91,15 @@ class SeccompTest(unittest.TestCase):
         self.assertLessEqual(set(comp.SECCOMP_DENY), set(module.rules))
         self.assertEqual(module.loaded, [True])
 
+    def test_only_the_listed_socket_families_stay_open(self):
+        module = stand_in()
+        self.applied(module)
+        refused = {a[0][2] for n, a in module.arguments if n == "socket"}
+        self.assertEqual(refused & set(comp.SOCKET_FAMILIES.values()), set())
+        for family in [40, 38, 17, 5]:  # AF_VSOCK, AF_ALG, AF_PACKET, AF_APPLETALK
+            self.assertIn(family, refused)
+        self.assertEqual(len(refused), inside.SOCKET_FAMILY_LIMIT - len(comp.SOCKET_FAMILIES))
+
     def test_arm64_skips_its_fixed_set_alone(self):
         absent = {"ioperm", "iopl", "uselib"}
         module = stand_in(negative=absent)
@@ -106,6 +119,29 @@ class SeccompTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.applied(module)
         self.assertEqual(module.loaded, [])
+
+
+class StayPid1Test(unittest.TestCase):
+    """Starts its own child; the stand-in for libc keeps this process dumpable."""
+
+    def stay(self, cmd, prctl=0):
+        libc = types.SimpleNamespace(prctl=lambda *a: prctl)
+        with patch.object(inside, "libc", libc):
+            return inside.stay_pid_1(cmd)
+
+    def test_the_commands_exit_code_comes_back(self):
+        self.assertEqual(self.stay(["true"]), 0)
+        self.assertEqual(self.stay(["false"]), 1)
+
+    def test_a_child_it_inherited_does_not_end_it_early(self):
+        orphan = os.fork()
+        if orphan == 0:
+            os._exit(7)
+        self.assertEqual(self.stay(["sh", "-c", "sleep 0.2; exit 3"]), 3)
+
+    def test_it_stops_before_the_command_if_it_stays_dumpable(self):
+        with self.assertRaises(SystemExit):
+            self.stay(["true"], prctl=-1)
 
 
 class ServiceForward(unittest.TestCase):

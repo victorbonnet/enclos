@@ -2,7 +2,7 @@
 # Runs a command in the prototype's bubblewrap sandbox:
 #
 #   [SBX_LANDLOCK=auto|off] [SBX_SECCOMP=on|off] [SBX_RELAY=1] [SBX_NEW_SESSION=1] \
-#       [SBX_PROC_TRUNCATE=1] \
+#       [SBX_PROC_TRUNCATE=1] [SBX_AS_PID_1=1] \
 #       sbx.sh -- command...
 #
 # It compiles the policy (compile.py), lists the host and finishes bubblewrap's
@@ -17,6 +17,7 @@ source "$(dirname "$0")/lib.sh"
 
 extra=()
 [ "${SBX_NEW_SESSION:-0}" = 1 ] && extra+=(--new-session)
+[ "${SBX_AS_PID_1:-0}" = 1 ] && extra+=(--as-pid-1)
 compile_policy "${extra[@]}" || exit 1
 mapfile -d '' args < <(python3 -I "$M3/wrap.py" "$SBX_COMPILED/compiled.json")
 wait $! || exit 1
@@ -25,4 +26,5 @@ inside=(--compiled "$SBX_COMPILED/compiled.json"
     --landlock "${SBX_LANDLOCK:-auto}" --seccomp "${SBX_SECCOMP:-on}")
 [ "${SBX_RELAY:-0}" = 1 ] && inside+=(--relay)
 [ "${SBX_PROC_TRUNCATE:-0}" = 1 ] && inside+=(--proc-truncate)
+[ "${SBX_AS_PID_1:-0}" = 1 ] && inside+=(--stay-pid-1)
 exec bwrap "${args[@]}" -- /usr/bin/python3 -I "$M3/inside.py" "${inside[@]}" -- "$@"

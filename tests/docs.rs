@@ -368,6 +368,61 @@ const SHARED_DENIES: &[&str] = &[
     "~/.local/share/opencode",
 ];
 
+/// A `wrap` that kept the old order would let a later `--bind` uncover a mask.
+#[test]
+fn masks_in_a_writable_folder_come_after_the_arguments_that_bind_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |file: &str| fs::read_to_string(root.join(file)).unwrap();
+    let in_order = |doc: &str, anchor: &str, words: &[&str]| {
+        let text = &doc[doc.find(anchor).expect(anchor)..];
+        let order: Vec<usize> = words
+            .iter()
+            .map(|word| text.find(word).expect(word))
+            .collect();
+        assert!(order.is_sorted(), "{anchor}: {order:?}");
+    };
+    in_order(
+        &design(),
+        "**The order `wrap` keeps:**",
+        &[
+            "the host's files, read-only",
+            "the masks over them",
+            "the writable binds",
+            "each bound on itself",
+            "the masks inside the writable binds",
+            "`--remount-ro`",
+        ],
+    );
+    in_order(
+        &read("docs/policy-compilation.md"),
+        "| `bubblewrap.root` |",
+        &[
+            "`bubblewrap.root`",
+            "`bubblewrap.root_masks`",
+            "`bubblewrap.mounts`",
+            "`bubblewrap.grant_masks`",
+            "`bubblewrap.options`",
+        ],
+    );
+}
+
+/// What compiling leaves open stays written down for the work that picks it up.
+#[test]
+fn what_compiling_leaves_to_later_work_stays_written_down() {
+    let design = design();
+    let to_verify = design
+        .split("Awaiting prototype verification")
+        .last()
+        .unwrap();
+    // A workspace through a link the user made passes every check.
+    assert!(to_verify.contains("`~/cargo -> ~/.cargo`"));
+    assert!(!design.contains("the write checks still run on real paths"));
+    // The relay moves with the namespace, so it is more than one constant.
+    assert!(design.contains("the namespace holder serves the one relay"));
+    // Landlock's rights add up, so a workspace under `/opt` runs programs.
+    assert!(design.contains("A workspace under one of them can run programs"));
+}
+
 #[test]
 fn every_deny_entry_named_from_memory_is_listed_to_verify() {
     let defaults = fs::read_to_string(

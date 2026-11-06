@@ -8,7 +8,7 @@ its output can be cached with the policy snapshot. What depends on the host
 at a session's start is wrap.py's, marked here by @HOME_MASK@ and @GRANT_MASK@.
 
     python3 -I compile.py --host-home H --sandbox-dir D --workspace W \\
-        [--read-only R] --deny H/.ssh ... [--new-session] --out compiled.json
+        [--read-only R] --deny H/.ssh ... [--new-session] [--as-pid-1] --out compiled.json
 
 The deny list is not mounted (wrap.py): every folder that holds a denied path
 gets an empty tmpfs, then each of its other entries is bound back read-only,
@@ -63,6 +63,11 @@ CLONE_NEW = {
 }
 
 
+# The only families socket(2) may open: a network namespace may not hold vsock,
+# which on a host that is itself a VM reaches the hypervisor past the proxy.
+SOCKET_FAMILIES = {"AF_UNIX": 1, "AF_INET": 2, "AF_INET6": 10, "AF_NETLINK": 16}
+
+
 def under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
@@ -109,6 +114,8 @@ def compile_policy(o):
     ]
     if o.new_session:
         args += ["--new-session"]
+    if o.as_pid_1:
+        args += ["--as-pid-1"]
     proxy = f"http://127.0.0.1:{o.relay_port}"
     env = {
         "HOME": home,
@@ -149,6 +156,7 @@ def compile_policy(o):
             "ioctl": SECCOMP_IOCTL,
             "clone_flags": CLONE_NEW,
             "enosys": ["clone3"],
+            "socket_families": SOCKET_FAMILIES,
         },
         "relay": {"port": o.relay_port, "socket": env["ENCLOS_PROXY_SOCKET"]},
     }
@@ -163,6 +171,7 @@ def main(argv=None):
     p.add_argument("--deny", action="append", default=[])
     p.add_argument("--relay-port", type=int, default=18080)
     p.add_argument("--new-session", action="store_true")
+    p.add_argument("--as-pid-1", action="store_true")
     p.add_argument("--out", required=True)
     o = p.parse_args(argv)
     with open(o.out, "w") as f:
