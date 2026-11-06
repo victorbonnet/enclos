@@ -106,6 +106,56 @@ fn every_link_inside_the_plugin_leads_somewhere() {
     assert!(broken.is_empty(), "links that lead nowhere: {broken:#?}");
 }
 
+/// The files written by hand, as opposed to the generated references.
+fn written_by_hand() -> Vec<(std::path::PathBuf, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/enclos");
+    let mut files = Vec::new();
+    markdown(&root, &mut files);
+    files
+        .into_iter()
+        .filter(|f| !f.ends_with("reference/commands.md") && !f.ends_with("reference/policy.md"))
+        .map(|f| {
+            let text = fs::read_to_string(&f).unwrap();
+            (f, text)
+        })
+        .collect()
+}
+
+/// A Linux host or an `ENCLOS_HOME` keeps enclos's files elsewhere: a path
+/// built on `~/.enclos/` would read another install's files, or none.
+#[test]
+fn no_path_assumes_the_macos_data_folder() {
+    for (file, text) in written_by_hand() {
+        assert!(!text.contains("~/.enclos/"), "{}", file.display());
+    }
+}
+
+/// A runtime that listens can be reached outside the proxy (ADR 0028): the
+/// skill says so, and nothing calls the proxy a sandbox's only way out.
+#[test]
+fn the_listening_exception_is_said() {
+    for (file, text) in written_by_hand() {
+        assert!(!text.contains("only way out"), "{}", file.display());
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/enclos/skills/enclos");
+    let skill = fs::read_to_string(root.join("SKILL.md")).unwrap();
+    assert!(skill.contains("**The exception: listening.**"));
+    let gaps = fs::read_to_string(root.join("reference/troubleshooting.md")).unwrap();
+    assert!(gaps.contains("- **Listening:**"));
+}
+
+/// A private host the policy allows and names in `private` is reachable
+/// (ADR 0017): no line promises the local network is out of reach without
+/// naming that opt-in.
+#[test]
+fn the_local_network_names_the_private_opt_in() {
+    for (file, text) in written_by_hand() {
+        for line in text.lines().filter(|l| l.contains("local network")) {
+            assert!(line.contains("`private`"), "{}: {line}", file.display());
+        }
+    }
+}
+
 #[test]
 fn the_codex_manifest_names_its_skills() {
     // Codex finds a plugin's skills only through this field.
