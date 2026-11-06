@@ -146,6 +146,11 @@ impl Engine {
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
+        // There, `enclos dashboard` opens it, with no address to give now.
+        let dashboard_command = runtime
+            .and_then(|rt| rt.dashboard())
+            .filter(|_| self.holder_of(record.backend).is_some())
+            .map(|_| format!("enclos dashboard {name}"));
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -193,6 +198,7 @@ impl Engine {
             agents,
             disk,
             dashboard,
+            dashboard_command,
             network_listeners,
             name,
         })
