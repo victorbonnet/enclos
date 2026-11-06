@@ -21,11 +21,13 @@ use std::time::Duration;
 
 use enclos_protocol::device::{
     ATTACHMENT_CHUNK, AgentInfo, Attachment, ConversationInfo, ConversationMessage, FromDevice,
-    ToDevice, decode_from_device,
+    ToDevice, commands_for_devices, decode_from_device,
 };
 use enclos_protocol::noise::{Responder, Session};
 use enclos_protocol::pairing::{check_proof, check_signature, decode, encode};
-use enclos_protocol::plugin::{Capability, FromBridge, FromPlugin, OutAttachment, OutKind};
+use enclos_protocol::plugin::{
+    Capability, Command, FromBridge, FromPlugin, OutAttachment, OutKind,
+};
 use enclos_protocol::{ConversationId, Envelope, MessageId, Person, encode_line};
 use tungstenite::handshake::server::{Request, Response};
 use tungstenite::{Message, WebSocket};
@@ -62,6 +64,9 @@ struct Hub {
     host: Option<String>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, (PluginWriter, Vec<Capability>)>>,
+    /// The commands each agent's plugin last listed, as devices get them:
+    /// kept while the bridge runs, the plugin connected or not.
+    commands: Mutex<HashMap<String, Vec<Command>>>,
     /// Connected devices: who they speak for, and where to send.
     devices: Mutex<HashMap<String, (String, Sender<ToDevice>)>>,
 }
@@ -85,6 +90,34 @@ impl Hub {
                 let _ = sender.send(message.clone());
             }
         }
+    }
+
+    /// Sends `message` to every connected device: what any person who may
+    /// reach every agent needs, such as an agent's commands.
+    fn deliver_all(&self, message: ToDevice) {
+        let devices = self.devices.lock().expect("not poisoned");
+        for (_, sender) in devices.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+
+    /// Opens, in the background, the plugin connections that are not open:
+    /// the bridge learns each agent's capabilities and commands without
+    /// waiting for a first message. One that cannot open is left for later.
+    fn open_plugins(self: &Arc<Hub>) {
+        let hub = Arc::clone(self);
+        std::thread::spawn(move || {
+            for agent in &hub.agents {
+                let open = hub
+                    .plugins
+                    .lock()
+                    .expect("not poisoned")
+                    .contains_key(&agent.name);
+                if !open {
+                    let _ = hub.plugin(&agent.name);
+                }
+            }
+        });
     }
 
     /// Sends conversation `id`, with its name and how far it was read, to
@@ -227,6 +260,19 @@ impl Hub {
                             hub.deliver_conversation(&store, &owner, id);
                         }
                     }
+                    // The commands a person may type to the agent: kept,
+                    // and passed on to every device.
+                    FromPlugin::Commands { commands } => {
+                        let commands = commands_for_devices(commands);
+                        hub.commands
+                            .lock()
+                            .expect("not poisoned")
+                            .insert(agent.clone(), commands.clone());
+                        hub.deliver_all(ToDevice::Commands {
+                            agent: agent.clone(),
+                            commands,
+                        });
+                    }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
                     FromPlugin::Tool(step) => {
@@ -264,6 +310,7 @@ pub fn serve(
         agents,
         host,
         plugins: Mutex::new(HashMap::new()),
+        commands: Mutex::new(HashMap::new()),
         devices: Mutex::new(HashMap::new()),
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
@@ -641,6 +688,19 @@ fn run_session(
                     .collect();
                 drop(plugins);
                 link.send(ToDevice::AgentsList { agents })?;
+                // Each agent's commands, as far as the bridge knows them;
+                // the others come once their plugin connects.
+                let known: Vec<(String, Vec<Command>)> = hub
+                    .commands
+                    .lock()
+                    .expect("not poisoned")
+                    .iter()
+                    .map(|(agent, commands)| (agent.clone(), commands.clone()))
+                    .collect();
+                for (agent, commands) in known {
+                    link.send(ToDevice::Commands { agent, commands })?;
+                }
+                hub.open_plugins();
             }
             FromDevice::ConversationNew {
                 conversation,

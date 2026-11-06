@@ -69,6 +69,10 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
         "message_out_status",
         include_str!("fixtures/plugin/from_plugin_message_out_status.json"),
     ),
+    (
+        "commands",
+        include_str!("fixtures/plugin/from_plugin_commands.json"),
+    ),
 ];
 
 fn json(bytes: &[u8]) -> serde_json::Value {
@@ -133,8 +137,27 @@ fn a_message_reads_as_its_fields_say() {
     assert_eq!(kind, OutKind::Notify);
     assert_eq!(reply_to, None);
 
+    let fixture = |name: &str| FROM_PLUGIN.iter().find(|(n, _)| *n == name).unwrap().1;
+
+    // The commands a person may type, each with what it does and what follows it.
+    let message = decode_from_plugin(fixture("commands").as_bytes()).unwrap();
+    let FromPlugin::Commands { commands } = message.body else {
+        panic!("not commands: {:?}", message.body);
+    };
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.args.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("new", Some("[name]")),
+            ("model", Some("[model] [--provider name] [--global]")),
+            ("stop", None)
+        ]
+    );
+
     // The runtime about itself: a status, to the agent's Home.
-    let message = decode_from_plugin(FROM_PLUGIN.last().unwrap().1.as_bytes()).unwrap();
+    let message = decode_from_plugin(fixture("message_out_status").as_bytes()).unwrap();
     let FromPlugin::MessageOut {
         kind, conversation, ..
     } = message.body
