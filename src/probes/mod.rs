@@ -5,9 +5,11 @@
 //! carries its proof. Most have a control: a harmless check run on the host
 //! first, which shows the route works there (the same read, listing or
 //! connection with its output discarded, the same open for writing of a file
-//! that matters, which writes nothing, a check that a folder is writable, or,
-//! for a host service whose use outside would act on the host, a read-only
-//! check that the service is there). When the control fails too, the probe is
+//! that matters, which writes nothing, a check that a folder is writable, a
+//! call the host refuses too that gets as far there as the sandbox refuses
+//! it, or, for a host service whose use outside would act on the host or that
+//! the host cannot reach either, a read-only check that the service is
+//! there). When the control fails too, the probe is
 //! inconclusive, not closed: `crontab -l` fails anyway for an account
 //! without a crontab, and a connection fails anyway on a host that is
 //! offline. The probes through the proxy are their own proof: the proxy answers

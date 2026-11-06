@@ -132,7 +132,7 @@ A path enclos always denies to sandboxes whatever the policy says, such as the a
 _Avoid_: system path, reserved path
 
 **Escape probe**:
-A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call the filesystem itself always refuses, that the call gets as far as the filesystem there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.
+A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call refused outside too, that it gets as far there as the sandbox refuses it, such as to the filesystem; for what the host cannot reach either, that it is there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.
 _Avoid_: test case, attack
 
 **Audit entry**:
