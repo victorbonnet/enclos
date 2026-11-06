@@ -88,6 +88,8 @@ fn every_linux_route_has_a_probe_with_a_control() {
     let own = own(everything(), Vec::new());
     let list = probes(&i, &own);
     let routes: Vec<&str> = list.iter().map(|p| p.route).collect();
+    // Those of programs the host may lack (`setuid`, `crontab`, `at`) are
+    // in `programs_that_would_gain_privileges_are_closed_by_bubblewrap_itself`.
     for route in [
         "session bus",
         "system bus",
@@ -101,7 +103,6 @@ fn every_linux_route_has_a_probe_with_a_control() {
         "ptrace",
         "environment",
         "terminals",
-        "setuid",
         "user namespace",
         "mounts",
         "cgroup",

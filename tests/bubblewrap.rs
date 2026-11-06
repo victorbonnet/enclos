@@ -1111,7 +1111,7 @@ fn on_a_runner_policy_test_is_ready_and_no_probe_gets_out() {
         ("environment", "a process outside the sandbox"),
         ("environment", "of sandbox other"),
         ("terminals", "TIOCSTI"),
-        ("setuid", "passwd"),
+        ("setuid", "chage"),
         ("user namespace", "user namespace"),
         ("mounts", "mount"),
         ("cgroup", "cgroup"),

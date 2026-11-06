@@ -290,7 +290,7 @@ impl OwnProbes for BubblewrapProbes {
             "ptrace, a user namespace and mounting (enclos does not know this architecture's system calls)",
         );
         for (program, route) in [
-            (PASSWD, "a setuid program"),
+            (CHAGE, "a setgid program"),
             (CRONTAB_PROGRAM, "crontab"),
             (ATQ, "at"),
         ] {
@@ -306,7 +306,9 @@ impl OwnProbes for BubblewrapProbes {
     }
 }
 
-const PASSWD: &str = "/usr/bin/passwd";
+/// Set-group-ID `shadow` on Debian and Ubuntu, so `chage -l` reads the
+/// user's line of `/etc/shadow`, which the user alone may not.
+const CHAGE: &str = "/usr/bin/chage";
 const CRONTAB_PROGRAM: &str = "/usr/bin/crontab";
 const ATQ: &str = "/usr/bin/atq";
 
@@ -433,11 +435,13 @@ impl BubblewrapProbes {
             probe.closed_by = Some(ITSELF);
             probe
         };
-        if Path::new(PASSWD).exists() {
+        // Not `passwd -S`, which prints the user's status without its
+        // privileges too.
+        if Path::new(CHAGE).exists() {
             list.push(itself(same_outside(
                 "setuid",
-                "run a setuid program, passwd -S",
-                &format!("{PASSWD} -S >/dev/null 2>&1"),
+                "run a setgid program, chage -l, which reads /etc/shadow",
+                &format!("{CHAGE} -l \"$(/usr/bin/id -un)\" >/dev/null 2>&1"),
             )));
         }
         if Path::new(CRONTAB_PROGRAM).exists() {

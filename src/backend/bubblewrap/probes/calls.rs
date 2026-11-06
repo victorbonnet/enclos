@@ -294,17 +294,18 @@ pub(super) fn vsock() -> Probe {
 /// Pushes a character into the input of a terminal the program opens and
 /// makes its own, as a session would type into the terminal it runs in:
 /// refused by the filter. Outside, the kernel takes it, or refuses it
-/// itself where `dev.tty.legacy_tiocsti` is off (`EIO`).
+/// itself where `dev.tty.legacy_tiocsti` is off (`EIO`). perl's `ioctl`
+/// may write to its last argument, so each is a variable.
 pub(super) fn tiocsti() -> Probe {
     let code = |end: End| {
         format!(
             r#"use POSIX ();
 open(my $m, "+<", "/dev/ptmx") or do {UNPREPARED};
-ioctl($m, 0x40045431, pack("i", 0)) or do {UNPREPARED};
+my $unlock = pack("i", 0); ioctl($m, 0x40045431, $unlock) or do {UNPREPARED};
 my $n = pack("i", 0); ioctl($m, 0x80045430, $n) or do {UNPREPARED};
 my $pid = fork(); defined($pid) or do {UNPREPARED};
 if ($pid == 0) {{ POSIX::setsid(); open(my $t, "+<", "/dev/pts/" . unpack("i", $n)) or do {UNPREPARED};
-my $w = word(ioctl($t, 0x5412, "x")); {} }}
+my $typed = "x"; my $w = word(ioctl($t, 0x5412, $typed)); {} }}
 waitpid($pid, 0); exit($? >> 8);"#,
             end.perl()
         )
@@ -389,14 +390,16 @@ impl Numbers {
 
     /// Mounts a tmpfs on `missing`, a path that is nowhere: the filter
     /// refuses the call before the kernel looks the path up, which it does
-    /// first outside (`ENOENT`), before it asks for a capability.
+    /// first outside (`ENOENT`), before it asks for a capability. perl's
+    /// `syscall` takes no constant string, so each is a variable.
     pub(super) fn mount(self, missing: &Path) -> Probe {
         call(
             "mounts",
             "mount a filesystem".to_owned(),
             |end| {
                 format!(
-                    r#"my $w = word(syscall({}, "none", $ARGV[0], "tmpfs", 0, 0) == 0); {}"#,
+                    r#"my ($source, $at, $kind) = ("none", $ARGV[0], "tmpfs");
+my $w = word(syscall({}, $source, $at, $kind, 0, 0) == 0); {}"#,
                     self.mount,
                     end.perl()
                 )
@@ -516,6 +519,44 @@ mod tests {
                 let said = String::from_utf8_lossy(&out.stdout);
                 assert!(said.contains("-e syntax OK"), "{}: {said}", probe.name);
             }
+        }
+    }
+
+    /// Each kernel call's control works on this host, outside any sandbox:
+    /// its program runs to the call and the kernel answers as it does
+    /// outside. All are harmless: a character pushed into a terminal the
+    /// program made, a mount on a path that is nowhere, a socket opened and
+    /// closed, a user namespace the program leaves as it exits, and an
+    /// attach to this test's own child that stops nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn on_linux_each_calls_control_works_here() {
+        let numbers = Numbers::here().expect("x86_64 or arm64");
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let checked = [
+            tiocsti(),
+            vsock(),
+            numbers.mount(Path::new("/enclos-probe-missing")),
+            numbers.user_namespace(),
+            numbers.ptrace(child.id()),
+        ]
+        .map(|probe| {
+            let crate::probes::Proof::Control { control, .. } = &probe.proof else {
+                panic!("{} has a control", probe.name);
+            };
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", control.as_str()])
+                .output()
+                .unwrap();
+            (probe.name, out)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        for (name, out) in checked {
+            assert!(out.status.success(), "{name}: {out:?}");
         }
     }
 

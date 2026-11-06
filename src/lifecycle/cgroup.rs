@@ -443,10 +443,27 @@ pub fn manager_procs() -> Result<PathBuf, PsError> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let cgroup = parse_control_group(&String::from_utf8_lossy(&out.stdout))?.ok_or_else(|| {
-        PsError::Cgroup("systemd gave the user's manager no control group".to_owned())
-    })?;
-    Ok(Hierarchy::host().folder(&cgroup).join("cgroup.procs"))
+    manager_folder(
+        &String::from_utf8_lossy(&out.stdout),
+        Path::new(CGROUP_ROOT),
+    )
+    .map(|folder| folder.join("cgroup.procs"))
+}
+
+/// The folder under `root` of the cgroup `systemctl --user show
+/// --property=ControlGroup` printed for the manager itself: a path below the
+/// hierarchy's root, which is not a scope's.
+fn manager_folder(text: &str, root: &Path) -> Result<PathBuf, PsError> {
+    let value = text
+        .lines()
+        .find_map(|l| l.strip_prefix("ControlGroup="))
+        .unwrap_or_default();
+    match value.strip_prefix('/') {
+        Some(below) if below.split('/').all(|p| !p.is_empty() && p != "..") => Ok(root.join(below)),
+        _ => Err(PsError::Cgroup(format!(
+            "systemd gave the user's manager the control group `{value}`"
+        ))),
+    }
 }
 
 /// Whether `e`, from reading a cgroup's folder, says the cgroup was removed.
@@ -549,6 +566,29 @@ mod tests {
 
     fn at(path: &str) -> Cgroup {
         path.parse().unwrap()
+    }
+
+    /// The manager's own cgroup is a service's, not a scope's, and lies
+    /// below the hierarchy's root.
+    #[test]
+    fn the_managers_cgroup_is_found_below_the_root() {
+        let root = Path::new("/sys/fs/cgroup");
+        let found = manager_folder(
+            "ControlGroup=/user.slice/user-1001.slice/user@1001.service\n",
+            root,
+        );
+        assert_eq!(
+            found.unwrap(),
+            root.join("user.slice/user-1001.slice/user@1001.service")
+        );
+        for odd in [
+            "ControlGroup=\n",
+            "ControlGroup=/a/../b\n",
+            "nothing\n",
+            "ControlGroup=/\n",
+        ] {
+            assert!(manager_folder(odd, root).is_err(), "{odd}");
+        }
     }
 
     #[test]
