@@ -5,6 +5,7 @@ mod cgroups;
 
 use super::policy::with_sandbox_on;
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::runtime::RuntimeKind;
 use crate::runtime::RuntimeAgentName;
@@ -1560,11 +1561,12 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
     use std::os::unix::process::CommandExt;
     let lab = Lab::new();
     let sleep = || {
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .unwrap()
+        spawn_unmarked(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0),
+        )
+        .unwrap()
     };
     let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
         id: crate::model::session::SessionId(0),
@@ -1635,11 +1637,12 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
     use std::os::unix::process::CommandExt;
     let lab = Lab::new();
     let sleep = || {
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .unwrap()
+        spawn_unmarked(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0),
+        )
+        .unwrap()
     };
     let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
         id: crate::model::session::SessionId(0),
@@ -1696,11 +1699,12 @@ fn a_settings_restart_waits_until_no_one_is_connected() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
     assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
-    let mut setup = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut setup = spawn_unmarked(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0),
+    )
+    .unwrap();
     {
         let lock = lab.engine.state.lock().unwrap();
         let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
@@ -2980,7 +2984,7 @@ fn a_launch_ends_a_service_session_whose_launch_was_killed() {
     assert!(done(lab.install(LEAVES, Confirm::Yes).unwrap()).installed);
     // As the service manager's timeout leaves it: a session open, its
     // process gone.
-    let dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = spawn_unmarked(&mut std::process::Command::new("/usr/bin/true")).unwrap();
     let root = crate::lifecycle::process::reference_of_child(&dead).unwrap();
     let mut dead = dead;
     dead.wait().unwrap();
@@ -3035,11 +3039,12 @@ fn record_service_session(
 /// with nothing waiting for it but this test.
 fn orphan_runtime() -> (std::process::Child, crate::model::session::ProcessRef) {
     use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new("/bin/sleep")
-        .arg("600")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let child = spawn_unmarked(
+        std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0),
+    )
+    .unwrap();
     let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
     (child, root)
 }
@@ -3632,10 +3637,7 @@ fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
         .expect("the install recorded a proxy")
         .clone();
     // Another session, which `start` has no reason to end.
-    let mut other = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut other = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("60")).unwrap();
     let root = crate::lifecycle::process::reference_of_child(&other).unwrap();
     lab.engine
         .write(

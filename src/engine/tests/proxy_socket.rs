@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 
 use super::policy::with_sandbox;
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::net::{Reason, Verdict};
 
 /// These tests start real proxies on their sandboxes' reserved ports: one
@@ -74,7 +75,7 @@ impl ProxyChild {
             command.env(PROXY_RECORDS, "1");
         }
         ProxyChild {
-            child: command.spawn().unwrap(),
+            child: spawn_unmarked(&mut command).unwrap(),
             port,
         }
     }

@@ -418,6 +418,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::lifecycle::cgroup::Hierarchy;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     const COMMAND: Starting = Starting::Command {
         kind: CommandKind::Exec,
@@ -440,7 +441,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("cgroup.procs"), text).unwrap();
         let cgroups = Hierarchy::at(dir.path());
-        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let child = spawn_unmarked(Command::new("/bin/sleep").arg("30")).unwrap();
         (dir, cgroups, child)
     }
 

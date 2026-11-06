@@ -3,6 +3,7 @@
 use super::policy::with_sandbox_on;
 use super::sandbox::{with_backends, without_backend};
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::probes::OwnProbes as _;
 
 #[test]
@@ -233,10 +234,7 @@ fn a_fake_backend_s_probes_run_through_the_shared_set() {
     assert_eq!(own.notes().baseline_key, None);
     assert_eq!(own.notes().comparison, None);
     // This test's own child, the signal probe's target.
-    let mut target = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut target = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("60")).unwrap();
     let ctx = engine.sandbox_context(&name, 41001);
     let inputs = engine
         .probe_inputs(

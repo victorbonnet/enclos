@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use crate::lifecycle::cgroup::{Hierarchy, SYSTEMD_RUN, Scopes, Systemd};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::lifecycle::process::{Signal, is_same, reference, signal_process};
 use crate::model::sandbox::SandboxState;
 use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
@@ -17,12 +18,12 @@ use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
 fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut lab = Lab::new();
-    let root_ended = Command::new("/bin/sh").args(["-c", ":"]).spawn();
+    let root_ended = spawn_unmarked(Command::new("/bin/sh").args(["-c", ":"]));
     let mut root_ended = root_ended.unwrap();
     let root = crate::lifecycle::process::reference_of_child(&root_ended).unwrap();
     root_ended.wait().unwrap();
     // Started apart: only the cgroup ties it to the session.
-    let mut member = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut member = spawn_unmarked(Command::new("/bin/sleep").arg("30")).unwrap();
     let hierarchy = tempfile::tempdir().unwrap();
     let scope = hierarchy.path().join("s.scope");
     std::fs::create_dir(&scope).unwrap();
@@ -77,7 +78,7 @@ fn in_stand_in(root: &Path) -> Scopes {
 fn a_stop_reads_and_kills_the_cgroup_the_engine_looks_at() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let mut lab = Lab::new();
-    let mut ended = Command::new("/bin/sh").args(["-c", ":"]).spawn().unwrap();
+    let mut ended = spawn_unmarked(Command::new("/bin/sh").args(["-c", ":"])).unwrap();
     let root = crate::lifecycle::process::reference_of_child(&ended).unwrap();
     ended.wait().unwrap();
     // A pid `ps` cannot list: the stand-in holds it for ever.
