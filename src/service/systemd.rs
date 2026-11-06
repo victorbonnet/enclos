@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
+use super::{HandStop, ServiceError, ServiceLabel, ServiceManager, ServiceStatus, ServiceUnit};
 
 pub struct Systemd {
     /// The folder unit files go in.
@@ -364,6 +364,24 @@ impl ServiceManager for Systemd {
         Ok(labels)
     }
 
+    /// A unit that is not loaded, or that ended and waits for no restart:
+    /// stopped by hand, or given up on after failing too often in a row.
+    fn stopped_by_hand(&self, label: &ServiceLabel) -> Result<bool, ServiceError> {
+        let shown = self.show(label)?;
+        Ok(shown.status() == ServiceStatus::NotLoaded || shown.ended())
+    }
+
+    /// An enabled unit starts again when the user's manager does.
+    fn hand_stop(&self) -> HandStop {
+        HandStop {
+            unit: "systemd unit",
+            state: "stopped",
+            how: "stopped by hand (`systemctl --user stop`)",
+            until: "your user's systemd starts again, at the next login or boot",
+            again: "starts",
+        }
+    }
+
     fn unset_env_command(&self, var: &str) -> String {
         format!("systemctl --user unset-environment {var}")
     }
@@ -650,6 +668,24 @@ WantedBy=default.target
         assert!(!stub.systemd.unit_path(&unit.label).exists());
     }
 
+    /// A unit that ended with no restart pending, or that the manager has
+    /// not loaded, does not run until the manager starts it again; one that
+    /// runs, or waits to be started again, does.
+    #[test]
+    fn a_unit_ended_with_no_restart_pending_reads_as_stopped_by_hand() {
+        for (shown, stopped) in [
+            (LOADED, true),
+            (NOT_FOUND, true),
+            ("LoadState=loaded\nActiveState=failed\nMainPID=0", true),
+            ("LoadState=loaded\nActiveState=activating\nMainPID=0", false),
+            ("LoadState=loaded\nActiveState=active\nMainPID=42", false),
+        ] {
+            let stub = Stub::new("UnitPath=UNITS", shown);
+            let found = stub.systemd.stopped_by_hand(&proxy().label).unwrap();
+            assert_eq!(found, stopped, "{shown}");
+        }
+    }
+
     #[test]
     fn the_search_path_is_read_as_systemctl_quotes_it() {
         assert_eq!(
@@ -867,6 +903,28 @@ WantedBy=default.target
         assert!(began.elapsed() >= STOP_TIMEOUT, "{:?}", began.elapsed());
         assert_eq!(service.lines(), ["ready", "term"]);
         assert!(!Path::new("/proc").join(pid.to_string()).exists());
+    }
+
+    /// A unit a person stops through `systemctl --user stop` stays installed
+    /// and reads as stopped by hand; while it runs, it does not.
+    #[test]
+    fn on_a_runner_a_unit_stopped_by_hand_is_told_from_a_running_one() {
+        if !on_a_runner() {
+            return;
+        }
+        let script = "echo ready; while :; do sleep 1; done";
+        let service = Started::new("byhand", script, STOP_TIMEOUT);
+        service.wait_for_lines(1);
+        service.running();
+        assert!(!service.systemd.stopped_by_hand(&service.label).unwrap());
+        let name = unit_name(&service.label);
+        service.systemd.must("stop it", &["stop", &name]).unwrap();
+        assert!(service.systemd.stopped_by_hand(&service.label).unwrap());
+        assert_eq!(
+            service.systemd.installed(service.label.as_str()).unwrap(),
+            std::slice::from_ref(&service.label)
+        );
+        service.stop_leaves_nothing_installed();
     }
 
     /// Whether process `pid` is gone within a moment: the manager reaps it.
