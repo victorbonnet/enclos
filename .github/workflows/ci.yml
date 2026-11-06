@@ -54,13 +54,6 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked --all-features
-      - name: LOOP (to drop) the library tests fifteen times
-        if: runner.os == 'Linux'
-        run: |
-          for i in $(seq 1 15); do
-            echo "== round $i"
-            cargo test --locked --all-features --lib 2>&1 | grep -E -A1 "FAILED|panicked|test result" | cut -c1-400 || true
-          done
       # A release build refuses the comparison baseline (ADR 0006): checked
       # on every change, not only when a tag is pushed.
       - name: A release refuses the comparison baseline
@@ -220,6 +213,12 @@ jobs:
         if: always()
         run: |
           cat target/tmp/policy-test-lab.txt || echo "no report: policy test did not run"
+      # Adds a second user to the runner, whose connections it must close.
+      - name: enclos dashboard, a second user and Ctrl-C
+        shell: bash
+        run: |
+          cargo test --locked --all-features --test dashboard on_a_runner | tee dashboard.log
+          grep -q 'test result: ok\. 1 passed' dashboard.log
 
   libsecret:
     strategy:
@@ -344,6 +343,13 @@ jobs:
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
           grep -Eq 'test result: ok\. [1-9][0-9]* passed' bubblewrap.log
+      - name: enclos dashboard, a second user and Ctrl-C
+        shell: bash
+        env:
+          ENCLOS_BUBBLEWRAP_TESTS: "1"
+        run: |
+          cargo test --locked --all-features --test dashboard on_a_runner | tee dashboard.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' dashboard.log
       - name: Scopes in the runner's user manager
         shell: bash
         env:
