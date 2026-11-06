@@ -308,11 +308,14 @@ jobs:
       # On Linux only bubblewrap can run, so doctor's exit 0 says it does,
       # with systemd 254 or later.
       - name: The musl binary runs, and its doctor finds bubblewrap running
+        shell: bash
         run: |
           binary="target/$CARGO_BUILD_TARGET/debug/enclos"
           file "$binary"
           "$binary" --version
-          ENCLOS_HOME="$(mktemp -d)" "$binary" doctor
+          said="$(ENCLOS_HOME="$(mktemp -d)" "$binary" --text doctor)"
+          printf '%s\n' "$said"
+          grep -q 'bubblewrap: runs here' <<<"$said"
       # The jobs above count each group's tests; here a filter that matches
       # nothing still fails.
       - name: Landlock and seccomp

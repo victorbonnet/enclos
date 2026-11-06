@@ -170,7 +170,10 @@ jobs:
       # with systemd 254 or later.
       - name: The packed binary's doctor finds bubblewrap running here
         if: runner.os == 'Linux'
-        run: ENCLOS_HOME="$(mktemp -d)" check/enclos doctor
+        run: |
+          said="$(ENCLOS_HOME="$(mktemp -d)" check/enclos --text doctor)"
+          printf '%s\n' "$said"
+          grep -q 'bubblewrap: runs here' <<<"$said"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -231,7 +234,9 @@ jobs:
           bwrap --version
           systemd-run --version | head -1
           test "$(check/enclos --version)" = "enclos $RELEASE_VERSION"
-          ENCLOS_HOME="$(mktemp -d)" check/enclos doctor
+          said="$(ENCLOS_HOME="$(mktemp -d)" check/enclos --text doctor)"
+          printf '%s\n' "$said"
+          grep -q 'bubblewrap: runs here' <<<"$said"
 
       # A container shares the runner's kernel: what it shows is the
       # distribution's userland, the part a static binary does not use.
@@ -240,14 +245,16 @@ jobs:
         if: matrix.image != ''
         run: |
           docker run --rm --privileged -v "$PWD/check:/release:ro" \
-            -e RELEASE_VERSION "$IMAGE" sh -ec '
+            -e RELEASE_VERSION -e DEBIAN_FRONTEND=noninteractive "$IMAGE" sh -ec '
               grep PRETTY_NAME /etc/os-release
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends bubblewrap systemd >/dev/null
               bwrap --version
               systemd-run --version | head -1
               test "$(/release/enclos --version)" = "enclos $RELEASE_VERSION"
-              ENCLOS_HOME="$(mktemp -d)" /release/enclos doctor
+              said="$(ENCLOS_HOME="$(mktemp -d)" /release/enclos --text doctor)"
+              printf "%s\n" "$said"
+              printf "%s\n" "$said" | grep -q "bubblewrap: runs here"
             '
 
   # Signs and publishes what `build` made, without building anything; only
