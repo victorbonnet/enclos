@@ -10,6 +10,7 @@ mod tool;
 use std::cell::OnceCell;
 use std::path::PathBuf;
 
+use crate::host::HostCheck;
 use crate::model::secret::{SecretRef, SecretValue, StoreName};
 
 /// Keeps secrets' values, outside every sandbox.
@@ -72,6 +73,8 @@ pub trait Prober: SecretStore {
     /// What, set before a command, makes this store not answer for it, as
     /// `VAR=`: the way a user sends a new secret to another store.
     fn not_answering_with(&self) -> String;
+    /// What a user does so that this store answers.
+    fn to_answer(&self) -> String;
 }
 
 /// The stores of a host, each secret in the one its record names: a value is
@@ -92,6 +95,11 @@ pub trait Stores {
     /// one `for_new` gave refused it; `None` when there is no other.
     fn new_secret_alternative(&self, _secret: &SecretRef) -> Option<String> {
         None
+    }
+    /// What `enclos doctor` shows of the stores on this host: where a new
+    /// secret goes, when there is a choice. Nothing by default.
+    fn host_checks(&self) -> Vec<HostCheck> {
+        Vec::new()
     }
 }
 
@@ -206,6 +214,34 @@ impl Stores for Picked {
         stores
             .into_iter()
             .any(|store| store.name() == name && store.removed_before_record())
+    }
+
+    /// Whether the first store answers, and so where a new secret goes: not
+    /// a problem either way (design §12).
+    fn host_checks(&self) -> Vec<HostCheck> {
+        let what = capitalized(self.preferred.name().shown());
+        let otherwise = self.otherwise.name().shown();
+        vec![match self.answers() {
+            true => HostCheck::fine(&what, "answers: a new secret goes there"),
+            false => HostCheck::note(
+                &what,
+                format!("none answers here: a new secret goes to {otherwise}"),
+                Some(format!(
+                    "to keep new secrets there instead, {}",
+                    self.preferred.to_answer()
+                )),
+            ),
+        }]
+    }
+}
+
+/// `text` with its first letter in capitals, for a heading.
+fn capitalized(text: &str) -> String {
+    let text = text.strip_prefix("the ").unwrap_or(text);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -396,6 +432,10 @@ impl Prober for Stubbed {
     fn not_answering_with(&self) -> String {
         "DBUS_SESSION_BUS_ADDRESS=".to_owned()
     }
+
+    fn to_answer(&self) -> String {
+        "start the stand-in".to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -578,5 +618,23 @@ mod tests {
         let alone = InMemory::named(StoreName::File);
         assert!(alone.recorded(StoreName::File).is_ok());
         assert!(alone.recorded(StoreName::Keychain).is_err());
+    }
+
+    /// doctor says where a new secret goes: not a problem either way.
+    #[test]
+    fn doctor_is_told_where_a_new_secret_goes() {
+        let checks = case(true).picked.host_checks();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].what, "Secret Service");
+        assert_eq!(checks[0].verdict, crate::host::Verdict::Fine);
+        assert!(checks[0].found.contains("a new secret goes there"));
+        let case = case(false);
+        let [check] = case.picked.host_checks().try_into().unwrap();
+        assert_eq!(check.verdict, crate::host::Verdict::Note);
+        assert!(check.found.contains("goes to the file store"), "{check:?}");
+        assert!(check.fix.unwrap().contains("start the stand-in"));
+        assert_eq!(case.looks.get(), 1);
+        let alone = InMemory::named(StoreName::Keychain);
+        assert!(alone.host_checks().is_empty());
     }
 }

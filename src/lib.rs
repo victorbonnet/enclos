@@ -7,6 +7,7 @@ pub mod backend;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod host;
 #[cfg(test)]
 mod host_ports;
 pub mod layout;

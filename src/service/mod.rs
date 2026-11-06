@@ -6,6 +6,7 @@
 pub mod fake;
 #[cfg(target_os = "macos")]
 pub mod launchd;
+mod linger;
 pub mod systemd;
 
 use std::ffi::OsString;
@@ -120,6 +121,11 @@ pub trait ServiceManager {
     /// The command a user runs to remove `var` from this manager's own
     /// environment.
     fn unset_env_command(&self, var: &str) -> String;
+    /// What `enclos doctor` shows of how this manager runs services on
+    /// this host, such as whether they outlive a logout. Nothing by default.
+    fn host_checks(&self) -> Vec<crate::host::HostCheck> {
+        Vec::new()
+    }
 }
 
 /// This host's service manager: launchd on macOS, systemd on Linux. Other

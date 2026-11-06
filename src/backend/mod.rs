@@ -291,6 +291,13 @@ pub trait Backend {
     /// doctor` calls it.
     fn try_run(&self) -> Probe;
     fn capabilities(&self) -> Capabilities;
+    /// What `enclos doctor` shows of what the backend needs from this host,
+    /// each with what to do: what keeps it from running, and each degraded
+    /// control. Nothing by default, and nothing where it is not on this
+    /// host.
+    fn host_checks(&self) -> Vec<crate::host::HostCheck> {
+        Vec::new()
+    }
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
     /// The command that runs `launch` inside the sandbox under `compiled`,
