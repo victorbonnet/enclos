@@ -7,7 +7,8 @@
 //! session start, without asking (ADR 0018); this is where that change is
 //! shown. It also looks for secrets in the runtime's settings files in the
 //! sandbox home. On a host where sessions run in scopes, it says which
-//! systemd it found.
+//! systemd it found; and what each backend, the service manager and the
+//! secret stores need from the host, with what to do.
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -20,6 +21,7 @@ use super::settings_secrets::SettingsFinding;
 use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
+use crate::host::HostCheck;
 use crate::layout::LayoutError;
 use crate::lifecycle::cgroup::{Scopes, Systemd};
 use crate::lifecycle::look::Look;
@@ -35,6 +37,9 @@ pub struct Doctor {
     pub backends: Vec<BackendCheck>,
     /// The host's systemd, where sessions run in scopes: on Linux.
     pub systemd: Option<Systemd>,
+    /// What each backend, the service manager and the secret stores need
+    /// from this host, in that order.
+    pub host: Vec<HostCheck>,
     pub sandboxes: Sandboxes,
 }
 
@@ -214,11 +219,12 @@ pub const MAX_LINES: usize = 2000;
 
 impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
-    /// systemd is too old or cannot be read, enclos's records cannot be
+    /// a host check blocks a backend, systemd is too old or cannot be read,
+    /// enclos's records cannot be
     /// read, or a sandbox's backend does not run, its next session cannot
     /// compile its policy, or enclos could not look at all of it. A compiled
-    /// policy that changed, and a secret found in a runtime's settings, are
-    /// reported, not problems.
+    /// policy that changed, a secret found in a runtime's settings, and a
+    /// degraded control are reported, not problems.
     pub fn has_problems(&self) -> bool {
         let sandbox = |s: &SandboxCheck| {
             !s.backend_runs()
@@ -229,6 +235,7 @@ impl Doctor {
                 || !s.unreadable.is_empty()
         };
         !self.backends.iter().any(BackendCheck::runs_here)
+            || self.host.iter().any(HostCheck::blocks_backend)
             || self.systemd.as_ref().is_some_and(|s| s.refusal().is_some())
             || match &self.sandboxes {
                 Sandboxes::NotInitialized => false,
@@ -282,9 +289,13 @@ impl Engine {
                 )
             }
         };
+        let mut host: Vec<HostCheck> = self.backends.iter().flat_map(|b| b.host_checks()).collect();
+        host.extend(self.services.host_checks());
+        host.extend(self.secrets.host_checks());
         Doctor {
             backends,
             systemd: self.scopes.as_ref().map(Scopes::systemd),
+            host,
             sandboxes,
         }
     }

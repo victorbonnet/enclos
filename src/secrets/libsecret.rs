@@ -332,6 +332,12 @@ impl Prober for Libsecret {
     fn not_answering_with(&self) -> String {
         format!("{BUS_VAR}=")
     }
+
+    fn to_answer(&self) -> String {
+        format!(
+            "run a Secret Service, such as GNOME Keyring, on your session bus ({BUS_VAR}), with {SECRET_TOOL} installed (the libsecret-tools package)"
+        )
+    }
 }
 
 #[cfg(test)]

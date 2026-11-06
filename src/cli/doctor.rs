@@ -8,9 +8,10 @@ use enclos::engine::{
     MAX_LINES, NextSession, RanFile, SandboxCheck, Sandboxes, SettingsFinding,
 };
 use enclos::error::{Result, exit};
-use enclos::lifecycle::cgroup::{SYSTEMD_NEEDED, Systemd};
 use enclos::model::agent::AgentName;
 use enclos::runtime::RuntimeAgentName;
+
+mod host;
 
 pub fn run(engine: &Engine) -> Result<u8> {
     use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
@@ -196,15 +197,9 @@ fn json(doctor: &Doctor) -> serde_json::Value {
         "records": sandboxes,
     });
     if let Some(systemd) = &doctor.systemd {
-        report["systemd"] = json!({
-            "version": match systemd {
-                Systemd::Enough(version) | Systemd::TooOld(version) => Some(version),
-                Systemd::Unreadable(_) => None,
-            },
-            "needed": SYSTEMD_NEEDED,
-            "problem": systemd.refusal(),
-        });
+        report["systemd"] = host::systemd_json(systemd);
     }
+    report["host"] = host::checks_json(&doctor.host);
     report
 }
 
@@ -214,9 +209,7 @@ pub fn shown(doctor: &Doctor) -> String {
     for b in &doctor.backends {
         out += &backend(b);
     }
-    if let Some(systemd) = &doctor.systemd {
-        out += &format!("\nSystemd\n  {}\n", hanging(&systemd_line(systemd), 2));
-    }
+    out += &host::shown(doctor.systemd.as_ref(), &doctor.host);
     out += "\nSandboxes\n";
     match &doctor.sandboxes {
         Sandboxes::NotInitialized => {
@@ -233,15 +226,6 @@ pub fn shown(doctor: &Doctor) -> String {
         }
     }
     out
-}
-
-fn systemd_line(systemd: &Systemd) -> String {
-    match systemd {
-        Systemd::Enough(version) => {
-            format!("systemd {version}: enclos needs {SYSTEMD_NEEDED} or later")
-        }
-        other => other.refusal().unwrap_or_default(),
-    }
 }
 
 fn backend(b: &BackendCheck) -> String {
@@ -515,12 +499,15 @@ mod tests {
     use enclos::backend::seatbelt::Baseline;
     use enclos::backend::{Capabilities, Enforcement};
     use enclos::engine::{Running, Written};
+    use enclos::host::{HostCheck, Verdict};
+    use enclos::lifecycle::cgroup::Systemd;
     use enclos::model::sandbox::BackendKind;
     use std::path::PathBuf;
 
     fn doctor(check: SandboxCheck) -> Doctor {
         Doctor {
             systemd: None,
+            host: Vec::new(),
             backends: vec![BackendCheck {
                 kind: BackendKind::Seatbelt,
                 state: BackendState::Runs,
@@ -602,6 +589,34 @@ mod tests {
         let text = shown(&d).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(text.contains("no such file"), "{text}");
         assert!(json(&d)["systemd"]["version"].is_null());
+    }
+
+    /// A degraded control, lingering off or no Secret Service is said, and
+    /// doctor still exits 0; what keeps a backend from running is a problem.
+    #[test]
+    fn only_a_host_check_that_blocks_is_a_problem() {
+        let mut d = doctor(compiles());
+        d.host = vec![
+            HostCheck::new(
+                "Landlock",
+                "not in this kernel",
+                Verdict::Degraded {
+                    not_enforced: "an `[exec]` section".into(),
+                    risk: "any program can run".into(),
+                },
+                None,
+            ),
+            HostCheck::note("lingering", "off", None),
+        ];
+        assert!(!d.has_problems());
+        assert_eq!(json(&d)["host"][0]["verdict"], "degraded");
+        assert!(shown(&d).contains("\nHost\n  Landlock (degraded): not in this kernel\n"));
+        d.host.push(HostCheck::blocks(
+            "bubblewrap",
+            "/usr/bin/bwrap is missing",
+            None,
+        ));
+        assert!(d.has_problems());
     }
 
     /// Each capability is a line of its own, its value in one column, and a
