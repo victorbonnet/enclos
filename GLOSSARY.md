@@ -16,6 +16,10 @@ _Avoid_: container, jail, environment, enclosure
 The isolation technology a sandbox is built on, such as Seatbelt or bubblewrap.
 _Avoid_: driver, provider, engine
 
+**Degraded control**:
+A control of a backend that depends on the host, such as Landlock or the memory controller, which the backend runs without where the host lacks it, saying what is not enforced, the risk and the fix.
+_Avoid_: missing feature, fallback mode
+
 **Policy**:
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
 _Avoid_: rules, permissions, config
