@@ -60,8 +60,12 @@ impl SqliteStateStore {
     }
 
     fn connect(&self, flags: OpenFlags) -> Result<Connection> {
-        let conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
+        let mut conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
         conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
+        // A transaction takes the write lock as it begins: one that read
+        // first would fail at once, without waiting, when it came to write
+        // while another connection writes.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
         conn.pragma_update(None, "foreign_keys", true)
             .map_err(self.sqlite_err())?;
         // `init` puts the database in WAL mode, where a commit need not flush
@@ -283,9 +287,7 @@ impl StateStore for SqliteStateStore {
         // Kept in the file; a file system without it keeps the old mode.
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .map_err(self.sqlite_err())?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(self.sqlite_err())?;
+        let tx = conn.transaction().map_err(self.sqlite_err())?;
         let from = user_version(&tx).map_err(self.sqlite_err())?;
         let current = schema::current();
         if from > current {
@@ -382,9 +384,7 @@ impl StateStore for SqliteStateStore {
         by: &Actor,
     ) -> Result<PolicyVersion> {
         let mut conn = self.open()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(self.sqlite_err())?;
+        let tx = conn.transaction().map_err(self.sqlite_err())?;
         insert_sandbox(&tx, rec, "").map_err(self.sqlite_err())?;
         let version =
             policy::append(&tx, &rec.name, snapshot, by, now(), None).map_err(self.sqlite_err())?;

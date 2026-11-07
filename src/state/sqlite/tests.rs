@@ -61,6 +61,40 @@ fn a_read_does_not_wait_for_a_write_in_progress() {
     writer.execute_batch("ROLLBACK").unwrap();
 }
 
+/// SQLite does not wait for the lock a transaction that read first needs to
+/// write: it fails at once with `database is locked`. Applying a pending
+/// policy reads it first, while a proxy may be logging a connection.
+#[test]
+fn a_write_that_reads_first_waits_for_a_write_in_progress() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
+    let active = resolve("extends = \"assistant\"\n");
+    let pending = resolve("extends = \"assistant\"\n[filesystem]\nwrite_add = [\"~/work\"]\n");
+    store.save_policy(&lock, &name, &active, &by, None).unwrap();
+    store
+        .save_pending(&lock, &name, &pending, None, &by, None)
+        .unwrap();
+
+    let writer = Connection::open(&store.db).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let done = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        writer.execute_batch("COMMIT")
+    });
+    let applied = store.apply_pending(&lock, &name, &pending.id, &by);
+    done.join().unwrap().unwrap();
+    assert_eq!(applied.unwrap().unwrap().version, 2);
+}
+
 #[test]
 fn reads_before_init_say_to_run_init() {
     let (_dir, store) = store();
