@@ -3,7 +3,7 @@
 //! have, reads the mount table and then remounts each mount read-only: one
 //! taken away in between fails its setup. The control, bubblewrap alone,
 //! fails so at times; every session starts all the same, its command run
-//! once.
+//! once. Mounting needs root: the runner's `sudo`, which asks no password.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -36,11 +36,12 @@ while os.path.exists(flag):
 os.rmdir(path)
 "#;
 
-/// A tmpfs mounted and taken away at `CHURNED` until dropped. The test
-/// stops it through a file the loop looks for, and signals nothing.
+/// A tmpfs mounted and taken away at `CHURNED` until stopped or dropped.
+/// The test stops it through a file the loop looks for, and signals
+/// nothing.
 struct Churn {
     flag: PathBuf,
-    child: Child,
+    child: Option<Child>,
 }
 
 impl Churn {
@@ -57,7 +58,7 @@ impl Churn {
             .unwrap();
         let churn = Churn {
             flag: flag.to_owned(),
-            child,
+            child: Some(child),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         while !mounted() {
@@ -67,24 +68,26 @@ impl Churn {
         churn
     }
 
-    /// Stops the loop, and says why it stopped early if it did.
+    /// Stops the loop, and says why if it had stopped before.
     fn stop(mut self) {
-        let early = self.child.try_wait().unwrap();
+        let mut child = self.child.take().unwrap();
+        let early = child.try_wait().unwrap();
         let _ = std::fs::remove_file(&self.flag);
-        let out = std::mem::replace(&mut self.child, Command::new("true").spawn().unwrap())
-            .wait_with_output()
-            .unwrap();
+        let out = child.wait_with_output().unwrap();
         assert!(
             early.is_none() && out.status.success(),
             "the churn stopped early: {out:?}"
         );
+        assert!(!mounted(), "the churn left its mount");
     }
 }
 
 impl Drop for Churn {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.flag);
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
     }
 }
 
@@ -104,43 +107,39 @@ fn bubblewrap_alone() -> Output {
         .unwrap()
 }
 
-/// TEMPORARY: how often bubblewrap alone fails under churns of each
-/// period, to choose the one the test runs under.
+/// What a session started again says (`setup`).
+const AGAIN: &str = "a mount of the host changed while bubblewrap set up, so it starts again";
+
+/// How long the churn holds its mount, and how long it leaves it away: at
+/// this pace bubblewrap alone failed about one start in twenty on the
+/// runners (5 to 11%), often enough to show and rarely enough that five
+/// starts in a row all fail almost never.
+const PACE: Duration = Duration::from_millis(1);
+
+/// Under a tmpfs mounted and taken away every millisecond under the
+/// runner's `/run`, as the runner's own sessions start: bubblewrap alone,
+/// the control, fails to set up at times; every session starts, the first
+/// installing the namespace holder, some are started again, and each runs
+/// its command once.
 #[test]
-fn on_a_runner_measure_the_churn() {
+fn on_a_runner_sessions_start_while_a_mount_of_the_host_comes_and_goes() {
     if !on_a_runner() {
         return;
     }
     let lab = Lab::new();
-    let mut report = String::new();
-    for ms in [1u64, 3, 10, 30, 100] {
-        let period = Duration::from_millis(ms);
-        let churn = Churn::start(&lab.root.path().join("churning"), period, period);
-        let (mut runs, mut failed) = (0, 0);
-        let started = Instant::now();
-        while runs < 300 && started.elapsed() < Duration::from_secs(20) {
-            let out = bubblewrap_alone();
-            runs += 1;
-            if !out.status.success() {
-                failed += 1;
-                let said = text(&out.stderr);
-                assert!(said.contains(MOUNT_CHANGED), "{said}");
-            }
+    let churn = Churn::start(&lab.root.path().join("churning"), PACE, PACE);
+    let (mut alone, mut failed, mut said) = (0, 0, String::new());
+    while failed < 3 && alone < 3000 {
+        let out = bubblewrap_alone();
+        alone += 1;
+        if !out.status.success() {
+            failed += 1;
+            said = text(&out.stderr);
+            assert!(said.contains(MOUNT_CHANGED), "{out:?}");
         }
-        let per_run = started.elapsed() / runs;
-        churn.stop();
-        report.push_str(&format!(
-            "on/off {ms} ms: {failed} of {runs} failed, {per_run:?} each\n"
-        ));
     }
-    let churn = Churn::start(
-        &lab.root.path().join("churning"),
-        Duration::from_millis(3),
-        Duration::from_millis(3),
-    );
-    let started = Instant::now();
     let (mut sessions, mut again) = (0, 0);
-    while sessions < 20 {
+    while (again < 3 || sessions < 30) && sessions < 150 {
         let out = lab
             .command(&[
                 "exec",
@@ -154,12 +153,21 @@ fn on_a_runner_measure_the_churn() {
             .unwrap();
         sessions += 1;
         assert!(out.status.success(), "session {sessions}: {out:?}");
-        again += text(&out.stderr).matches("bubblewrap was started").count();
+        assert_eq!(text(&out.stdout), "ran", "session {sessions}: {out:?}");
+        again += usize::from(text(&out.stderr).contains(AGAIN));
     }
     churn.stop();
-    report.push_str(&format!(
-        "sessions under 3 ms: {sessions} in {:?}, {again} started again\n",
-        started.elapsed()
-    ));
-    panic!("{report}");
+    let runs = std::fs::read_to_string(lab.sandbox_home().join("runs")).unwrap();
+    // Straight to the job's log, which keeps no output of a test that passes.
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "mount race: bubblewrap alone failed {failed} of {alone} starts, last with `{said}`; {sessions} sessions all started, {again} of them started again"
+    );
+    assert!(
+        failed > 0,
+        "bubblewrap alone never failed in {alone} starts: the churn did not reach its setup"
+    );
+    assert!(again > 0, "no session of {sessions} met the churn");
+    assert_eq!(runs.lines().count(), sessions, "{runs}");
 }
