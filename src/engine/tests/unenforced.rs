@@ -305,3 +305,42 @@ fn sandbox_start_says_what_is_not_applied_with_a_runtime_service() {
     assert_eq!(engine.state.acceptances(&name).unwrap().len(), 1);
     assert_eq!(entries(&engine, "accept-unenforced").len(), 1);
 }
+
+/// `doctor` lists the sandbox with each field not enforced, from the same
+/// assessment: accepted, it is reported; not accepted, a problem, as its
+/// next start is refused.
+#[test]
+fn doctor_lists_each_field_not_enforced_with_its_acceptance() {
+    use crate::engine::Sandboxes;
+    let (_dir, mut engine, _fake, name) = sandbox_with_services_on(held(), None);
+    edit_memory(&engine, &name, "1G").unwrap();
+    let looked = |engine: &Engine| {
+        let doctor = engine.doctor();
+        let Sandboxes::Listed(list) = &doctor.sandboxes else {
+            panic!("{doctor:?}");
+        };
+        let check = list.iter().find(|s| s.name == name).unwrap().clone();
+        (doctor.has_problems(), check.not_enforced)
+    };
+    let (problems, none) = looked(&engine);
+    assert!(none.is_empty());
+    assert!(!problems, "held here, nothing is a problem");
+
+    engine.backends = vec![Box::new(not_held())];
+    let (problems, listed) = looked(&engine);
+    let [missing] = listed.as_slice() else {
+        panic!("{listed:?}");
+    };
+    assert_eq!(missing.accepted, Accepted::Missing);
+    assert!(problems);
+
+    let engine = accepting(engine);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    let engine = engine.accepting_unenforced(Vec::new());
+    let (problems, listed) = looked(&engine);
+    let [kept] = listed.as_slice() else {
+        panic!("{listed:?}");
+    };
+    assert!(matches!(&kept.accepted, Accepted::Kept(a) if a.value == "1G"));
+    assert!(!problems);
+}
