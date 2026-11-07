@@ -7,6 +7,7 @@ pub mod sqlite;
 
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
@@ -261,4 +262,7 @@ pub enum StateError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    /// One error for each of several writes made in one transaction.
+    #[error(transparent)]
+    Shared(Arc<StateError>),
 }
