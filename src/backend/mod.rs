@@ -394,9 +394,14 @@ pub trait Backend {
 /// [`NamespaceHolder::command`]. Its sockets, `SandboxContext::holder_socket`
 /// and `inward_socket`, are in the host-only part of the sandbox's run folder.
 pub trait NamespaceHolder {
-    /// The command that runs the sandbox's namespace holder in place of the
-    /// process that calls it, its sockets already made, or why it cannot.
-    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError>;
+    /// Runs the sandbox's namespace holder to its end, its sockets made
+    /// afresh at each start, with `stderr` as its stderr: how it ended, or
+    /// why it could not start.
+    fn run(
+        &self,
+        ctx: &SandboxContext,
+        stderr: &std::fs::File,
+    ) -> Result<std::process::ExitStatus, WrapError>;
     /// What the running namespace holder says of its namespace, or why none
     /// answers.
     fn ask(&self, ctx: &SandboxContext) -> Result<HeldNamespace, String>;

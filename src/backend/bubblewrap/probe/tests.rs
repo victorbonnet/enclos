@@ -254,3 +254,22 @@ fn the_probe_starts_bubblewrap_with_the_root_alone_and_no_variables() {
     assert_eq!(args, ["--ro-bind", "/", "/", "true"]);
     assert!(!said.contains("HOME="), "{said}");
 }
+
+/// A mount of the host that changed while bubblewrap set up says nothing
+/// of the host: the probe starts it again, as a session's (`setup`).
+#[test]
+fn a_bubblewrap_that_met_a_mount_that_changed_is_started_again() {
+    let stand = Stand::new();
+    let starts = stand.dir.path().join("starts");
+    stand.script(
+        "bwrap",
+        &format!(
+            "[ \"$1\" = --version ] && {{ echo 'bubblewrap 0.9.0'; exit 0; }}\necho start >> '{}'\n[ \"$(wc -l < '{}')\" -gt 1 ] && exit 0\necho 'bwrap: Can'\\''t bind mount /oldroot/ on /newroot/: Unable to apply mount flags: remount \"/newroot/run/credentials/x\": No such file or directory' >&2\nexit 1",
+            starts.display(),
+            starts.display()
+        ),
+    );
+    assert_eq!(probe(&stand.host()).probe, Probe::Available);
+    let started = std::fs::read_to_string(&starts).unwrap();
+    assert_eq!(started.lines().count(), 2);
+}

@@ -37,9 +37,9 @@ fn no_namespace_holder_is_said_with_its_socket() {
     assert!(why.contains("holder.sock"), "{why}");
 }
 
-/// A join that cannot reach the namespace holder runs nothing.
+/// An enter that cannot reach the namespace holder runs nothing.
 #[test]
-fn a_join_with_no_namespace_holder_runs_nothing() {
+fn an_enter_with_no_namespace_holder_runs_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let ran = dir.path().join("ran");
     let command: Vec<OsString> = vec![
@@ -47,7 +47,7 @@ fn a_join_with_no_namespace_holder_runs_nothing() {
         "-c".into(),
         format!("touch '{}'", ran.display()).into(),
     ];
-    let why = join(&dir.path().join("holder.sock"), &command);
+    let why = enter(&dir.path().join("holder.sock"), &command);
     assert!(why.contains("no namespace holder answers"), "{why}");
     assert!(!ran.exists());
 }

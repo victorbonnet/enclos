@@ -3,38 +3,82 @@
 //! serves the sandbox's relay to its proxy on 127.0.0.1 there, and hands the
 //! namespace to each session that joins it.
 //!
-//! Three hidden commands make it up. `enclos holder run <sandbox>`, which the
+//! Four hidden commands make it up. `enclos holder run <sandbox>`, which the
 //! service manager runs, binds the namespace holder's two sockets in the
-//! host-only `run/<sandbox>/` and becomes bubblewrap ([`command`]), which
+//! host-only `run/<sandbox>/` and runs bubblewrap ([`command`]), which
 //! makes user, PID and network namespaces and runs `enclos holder serve` in
 //! them ([`serve`]). One hands out the namespaces; on the other, its way
 //! in, the namespace holder relays the host's connections to a port in its
 //! network namespace (ADR 0040; `relay::inward`). Every session starts
-//! with `enclos holder join`
-//! ([`join`]): it asks the namespace holder for its namespaces, enters its
-//! user namespace then its network namespace, as `nsenter` would, and
-//! becomes the session's bubblewrap, which makes the session's own user, PID
-//! and IPC namespaces inside them. The descriptors close on `exec`, so no
-//! session holds one.
+//! with `enclos holder join` ([`join`]), which runs `enclos holder enter`
+//! ([`enter`]): that asks the namespace holder for its namespaces, enters
+//! its user namespace then its network namespace, as `nsenter` would, and
+//! becomes the session's bubblewrap, which makes the session's own user,
+//! PID and IPC namespaces inside them. The descriptors close on `exec`, so
+//! no session holds one. `join` stays on the host, in none of the
+//! sandbox's namespaces, and waits for bubblewrap: it starts `enter` again
+//! when bubblewrap's setup met a mount that changed, as `holder run` does
+//! with its own bubblewrap (`setup`).
 //!
 //! The namespace holder runs without `--dev /dev`: bubblewrap nests a second
 //! user namespace for it, which would not own the network namespace, and no
 //! session could then join (EPERM).
 
 use std::ffi::OsString;
+use std::fs::File;
+use std::io;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::process::{Command, ExitStatus};
+
+use super::setup;
 
 /// The arguments of `enclos` that start a session joined to the namespace
-/// holder listening on `socket`: what follows them is the command it becomes.
+/// holder listening on `socket`: what follows them is the command it runs,
+/// the session's bubblewrap.
 pub(super) fn join_args(socket: &Path) -> Vec<OsString> {
+    holder_args("join", socket)
+}
+
+/// The arguments of `enclos` that enter the namespaces of the namespace
+/// holder listening on `socket`: what follows them is the command it
+/// becomes.
+fn enter_args(socket: &Path) -> Vec<OsString> {
+    holder_args("enter", socket)
+}
+
+fn holder_args(verb: &str, socket: &Path) -> Vec<OsString> {
     vec![
         "holder".into(),
-        "join".into(),
+        verb.into(),
         "--socket".into(),
         socket.into(),
         "--".into(),
     ]
+}
+
+/// Starts a session of the sandbox whose namespace holder listens on
+/// `socket`: runs `enclos holder enter` (`enclos` being this program),
+/// which enters the namespace holder's namespaces and becomes `command`,
+/// the session's bubblewrap, and waits for it, with `stderr` as the
+/// session's. It is started again while bubblewrap's setup meets a mount
+/// that changed (`setup`). How the last start ended, or why it could not
+/// start.
+pub fn join(
+    enclos: &Path,
+    socket: &Path,
+    command: &[OsString],
+    stderr: &File,
+) -> io::Result<ExitStatus> {
+    setup::run(
+        || {
+            let mut enter = Command::new(enclos);
+            enter.args(enter_args(socket)).args(command);
+            Ok(enter)
+        },
+        stderr,
+        &setup::PAUSES,
+    )
 }
 
 /// What a namespace holder says to each connection besides its descriptors:
@@ -57,7 +101,7 @@ fn ports_in(message: &[u8]) -> Option<RangeInclusive<u16>> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{Answer, ask, command, join, serve};
+pub use linux::{Answer, ask, command, enter, serve};
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use linux::stand_in;
@@ -213,6 +257,9 @@ mod linux {
     /// connection to its socket its user and network namespaces, with its
     /// namespace's ephemeral ports. Returns only what stopped it.
     pub fn serve(sockets: OwnedFd, port: u16, proxy: &Path) -> String {
+        if let Err(e) = crate::backend::bubblewrap::setup::done() {
+            return format!("cannot take its stderr back from bubblewrap: {e}");
+        }
         match serving(sockets, port, proxy) {
             Ok(never) => match never {},
             Err(why) => why,
@@ -363,13 +410,13 @@ mod linux {
         Ok((said[..received.bytes.min(said.len())].to_vec(), fds))
     }
 
-    /// Joins the namespace holder on `socket` the `nsenter` way: enters its
-    /// user namespace, which gives this process every capability there,
-    /// then its network namespace, which that user namespace owns, then
-    /// becomes `command`. Only a process with one thread may enter a user
-    /// namespace, so this runs before anything starts a thread. Returns only
-    /// what stopped it, and runs nothing then.
-    pub fn join(socket: &Path, command: &[OsString]) -> String {
+    /// Enters the namespaces of the namespace holder on `socket` the
+    /// `nsenter` way: its user namespace, which gives this process every
+    /// capability there, then its network namespace, which that user
+    /// namespace owns, then becomes `command`. Only a process with one
+    /// thread may enter a user namespace, so this runs before anything
+    /// starts a thread. Returns only what stopped it, and runs nothing then.
+    pub fn enter(socket: &Path, command: &[OsString]) -> String {
         let Some((program, args)) = command.split_first() else {
             return "no command to run".to_owned();
         };
@@ -445,6 +492,26 @@ mod tests {
                 "/data/enclos/run/lab/holder.sock",
                 "--"
             ]
+        );
+    }
+
+    /// `join` runs `enclos holder enter` with the socket and the session's
+    /// bubblewrap, and ends as it does: a stand-in for enclos says what it
+    /// was given and exits 3.
+    #[test]
+    fn a_join_runs_enter_with_the_sessions_bubblewrap_and_ends_as_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let enclos = dir.path().join("enclos");
+        crate::test_scripts::write_script(&enclos, "echo \"$@\" >&2\nexit 3");
+        let stderr = File::create(dir.path().join("stderr")).unwrap();
+        let socket = Path::new("/data/enclos/run/lab/holder.sock");
+        let bwrap: Vec<OsString> = vec!["/usr/bin/bwrap".into(), "--die-with-parent".into()];
+        let status = join(&enclos, socket, &bwrap, &stderr).unwrap();
+        assert_eq!(status.code(), Some(3));
+        let said = std::fs::read_to_string(dir.path().join("stderr")).unwrap();
+        assert_eq!(
+            said,
+            "holder enter --socket /data/enclos/run/lab/holder.sock -- /usr/bin/bwrap --die-with-parent\n"
         );
     }
 }

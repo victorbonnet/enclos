@@ -307,6 +307,29 @@ fn the_program_is_the_second_process_of_the_sessions_pid_namespace() {
     assert_eq!(program_under(proc, 999).unwrap(), None);
 }
 
+/// `enclos holder join` 300 waits for bubblewrap's outer process 301, whose
+/// `enclos inside` 302 is PID 1 of the session's namespace: the program is
+/// still the second process there. One more step on the host is not looked
+/// through.
+#[test]
+fn the_program_is_found_below_the_join_that_waits_for_bubblewrap() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    fake_status(proc, 1, 0, &[1]);
+    fake_status(proc, 300, 1, &[300]);
+    fake_status(proc, 301, 300, &[301]);
+    fake_status(proc, 302, 301, &[302, 1]);
+    assert_eq!(program_under(proc, 300).unwrap(), None);
+    fake_status(proc, 303, 302, &[303, 2]);
+    assert_eq!(program_under(proc, 300).unwrap(), Some(303));
+    fake_status(proc, 400, 1, &[400]);
+    fake_status(proc, 401, 400, &[401]);
+    fake_status(proc, 402, 401, &[402]);
+    fake_status(proc, 403, 402, &[403, 1]);
+    fake_status(proc, 404, 403, &[404, 2]);
+    assert_eq!(program_under(proc, 400).unwrap(), None);
+}
+
 /// On a `/proc` mounted with `hidepid=1`, another user's process is
 /// listed and its `status` refused: it is no process of the session's, so
 /// the look goes on without it. The root refused is a look that could not
