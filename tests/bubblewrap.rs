@@ -22,6 +22,9 @@ mod limits;
 #[path = "bubblewrap/own_places.rs"]
 mod own_places;
 
+#[path = "bubblewrap/mount_race.rs"]
+mod mount_race;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};

@@ -391,3 +391,49 @@ fn on_a_runner_the_command_is_the_only_process_enclos_inside_starts() {
     let (output, _dir) = Confined::new().run(&[PYTHON, "-c", SIBLINGS]);
     assert_eq!(said(&output), "0", "{output:?}");
 }
+
+/// Says how many of the command's descriptors open the file named first,
+/// and the variable that named bubblewrap's stderr to `enclos inside`.
+const STDERR_COPIES: &str = r#"
+import os, sys
+copies = 0
+for fd in os.listdir("/proc/self/fd"):
+    try:
+        copies += os.readlink(f"/proc/self/fd/{fd}") == sys.argv[1]
+    except OSError:
+        pass
+print("copies", copies, "variable", os.environ.get("ENCLOS_BUBBLEWRAP_STDERR", "none"), file=sys.stderr)
+"#;
+
+/// Started as a session's bubblewrap is (`setup`), with its stderr a pipe
+/// and the stderr it was given named apart: `enclos inside` says it runs
+/// and takes that stderr back, so the command writes to it at 2, holds no
+/// other copy, and never sees the variable; what enclos read on the pipe
+/// before is not passed on.
+#[test]
+fn on_a_runner_the_command_writes_to_the_stderr_given_and_holds_no_other_copy() {
+    if !on_a_runner() {
+        return;
+    }
+    let confined = Confined::new();
+    let given = confined.path("stderr");
+    let stderr = std::fs::File::create(&given).unwrap();
+    let given = given.canonicalize().unwrap();
+    let status = enclos::backend::bubblewrap::setup::run(
+        || {
+            let mut inside = Command::new(env!("CARGO_BIN_EXE_enclos"));
+            inside
+                .args(["inside", "--compiled"])
+                .arg(&confined.compiled)
+                .args(["--", PYTHON, "-c", STDERR_COPIES])
+                .arg(&given);
+            Ok(inside)
+        },
+        &stderr,
+        &enclos::backend::bubblewrap::setup::PAUSES,
+    )
+    .unwrap();
+    let said = std::fs::read_to_string(&given).unwrap();
+    assert!(status.success(), "{status} {said}");
+    assert_eq!(said, "copies 1 variable none\n");
+}
