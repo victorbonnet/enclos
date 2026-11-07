@@ -36,6 +36,20 @@ fn a_process_that_cannot_be_read_is_an_error() {
     assert!(err.to_string().contains("pid 7 cannot be read"), "{err}");
 }
 
+/// A process asked for whose whole folder is refused, as `hidepid=1`
+/// refuses another user's, is no more one that holds nothing.
+#[test]
+fn a_process_asked_for_whose_folder_is_refused_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    fake_net(&proc.join("7/net"), &socket("0100007F:EFBE", "0A", 11));
+    descriptors::fake_process(proc, 7, &["socket:[11]"]);
+    let folder = descriptors::refuse(&proc.join("7"));
+    let read = listeners_of_under(proc, &[7], Tables::Own);
+    folder.restore();
+    assert!(read.is_err(), "{read:?}");
+}
+
 #[test]
 fn every_holder_of_the_port_is_named_and_a_port_not_listened_on_has_none() {
     let dir = tempfile::tempdir().unwrap();
@@ -177,6 +191,27 @@ fn a_descriptor_that_only_names_a_marker_does_not_hold_it() {
     assert_eq!(held["root-7-a"], BTreeSet::from([100]));
 }
 
+/// Another user's process, listed with its whole folder refused as on a
+/// `/proc` mounted with `hidepid=1`, holds no marker that can be seen and
+/// does not keep the others' from being read.
+#[test]
+fn a_process_whose_folder_is_refused_does_not_stop_the_look_at_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let members = dir.path().canonicalize().unwrap().join("members");
+    std::fs::create_dir(&members).unwrap();
+    std::fs::write(members.join("root-7-a"), "").unwrap();
+    let path = members.join("root-7-a");
+    let proc = dir.path().join("proc");
+    descriptors::fake_process(&proc, std::process::id(), &[]);
+    descriptors::fake_process(&proc, 100, &[path.to_str().unwrap()]);
+    descriptors::fake_process(&proc, 200, &[]);
+    let foreign = descriptors::refuse(&proc.join("200"));
+    let entries = std::fs::read_dir(&members).unwrap();
+    let held = marker_holders_under(&proc, &members, entries);
+    foreign.restore();
+    assert_eq!(held.unwrap()["root-7-a"], BTreeSet::from([100]));
+}
+
 #[test]
 fn a_proc_that_cannot_be_read_is_an_error() {
     let members = tempfile::tempdir().unwrap();
@@ -272,6 +307,27 @@ fn the_program_is_the_second_process_of_the_sessions_pid_namespace() {
     assert_eq!(program_under(proc, 999).unwrap(), None);
 }
 
+/// On a `/proc` mounted with `hidepid=1`, another user's process is
+/// listed and its `status` refused: it is no process of the session's, so
+/// the look goes on without it. The root refused is a look that could not
+/// happen, not a session with no program yet.
+#[test]
+fn a_process_whose_status_is_refused_is_left_out_unless_it_is_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc = dir.path();
+    fake_status(proc, 7, 1, &[7]);
+    fake_status(proc, 100, 1, &[100]);
+    fake_status(proc, 101, 100, &[101, 1]);
+    fake_status(proc, 102, 101, &[102, 2]);
+    let foreign = descriptors::refuse(&proc.join("7"));
+    let program = program_under(proc, 100);
+    let refused_root = program_under(proc, 7);
+    foreign.restore();
+    assert_eq!(program.unwrap(), Some(102));
+    let err = refused_root.unwrap_err();
+    assert!(err.to_string().contains("7/status"), "{err}");
+}
+
 #[test]
 fn a_status_gives_the_parent_and_each_namespaces_pid() {
     assert_eq!(
@@ -315,4 +371,38 @@ fn a_loopback_connections_client_is_this_users() {
     drop(client);
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(tcp_client_owner(peer, server).unwrap(), None);
+}
+
+/// On a real `/proc` mounted with `hidepid=1`, where root's pid 1 is listed
+/// and refused, every scan reads and leaves it out, while a look at it alone
+/// is an error. CI's `confinement` job mounts such a `/proc` in a mount
+/// namespace of its own, leaving the runner's as it is, and runs this as the
+/// runner's user with `ENCLOS_HIDEPID_TESTS` set; elsewhere it does nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_a_runner_every_scan_leaves_out_what_hidepid_refuses() {
+    if std::env::var_os("ENCLOS_HIDEPID_TESTS").is_none() {
+        eprintln!("hidepid test not run: CI's confinement job runs it");
+        return;
+    }
+    let proc = Path::new(PROC);
+    let me = std::process::id();
+    let root = rustix::process::getuid().is_root();
+    assert!(!root, "root reads every process: run as the runner's user");
+    // The control: pid 1 is listed, and nothing in its folder reads.
+    assert!(proc.join("1").is_dir());
+    let refused = std::fs::read(proc.join("1/status")).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert!(std::fs::read_dir(proc.join("1/task")).is_err());
+
+    assert_eq!(descriptors::of(proc, 1).unwrap(), Descriptors::Unreadable);
+    let held = descriptors::every_process(proc).unwrap();
+    assert!(held.iter().any(|(pid, _)| *pid == me), "{held:?}");
+    assert!(!held.iter().any(|(pid, _)| *pid == 1), "{held:?}");
+    let every = lineages(proc).unwrap();
+    assert!(every.contains_key(&me) && !every.contains_key(&1));
+    assert_eq!(program_under(proc, me).unwrap(), None);
+    assert!(program_under(proc, 1).is_err());
+    assert!(processes().unwrap().iter().any(|p| p.pid == me));
+    assert!(program_files().unwrap().contains_key(&me));
 }
