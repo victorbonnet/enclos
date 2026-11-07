@@ -5,13 +5,13 @@ use tempfile::TempDir;
 use super::*;
 use crate::model::sandbox::BackendKind;
 
-fn store() -> (TempDir, SqliteStateStore) {
+pub(super) fn store() -> (TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteStateStore::new(dir.path().join("state.db"), dir.path().join("state.lock"));
     (dir, store)
 }
 
-fn record(name: &str) -> SandboxRecord {
+pub(super) fn record(name: &str) -> SandboxRecord {
     SandboxRecord {
         name: name.parse().unwrap(),
         backend: BackendKind::Seatbelt,

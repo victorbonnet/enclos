@@ -16,7 +16,7 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::proxy::{ActivePolicy, Listener, Proxy, listen, listen_unix};
-use crate::state::sqlite::SqliteStateStore;
+use crate::state::sqlite::{NetLogWriter, SqliteStateStore};
 
 impl Engine {
     /// The sandbox's connections, oldest first, from `since` on.
@@ -46,7 +46,8 @@ impl Engine {
             store: store(),
             sandbox: name.clone(),
         };
-        let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(store()));
+        let log = NetLogWriter::start(store());
+        let proxy = Proxy::new(name.clone(), Box::new(policy), Box::new(log));
         // Held until the process ends, as the port is.
         let (_lock, listeners) = match sandbox.backend.reaches_proxy_over_socket() {
             true => (Some(self.hold_proxy_lock(name)?), Vec::new()),

@@ -3,6 +3,7 @@
 
 mod acceptances;
 mod agents;
+mod log_writer;
 mod netlog;
 mod policy;
 mod schema;
@@ -18,6 +19,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
+
+pub use log_writer::NetLogWriter;
 
 use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore, UnreadableRecord};
 use crate::model::Timestamp;
