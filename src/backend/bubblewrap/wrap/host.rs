@@ -1,4 +1,5 @@
-//! What one launch's masks depend on, read from the host: where each mask
+//! What one launch's masks depend on, read from the host: whether a
+//! workspace leads to a place the sandbox has its own of, where each mask
 //! goes ([`super::masks`]), whether a link lies between a grant and a mask
 //! in it, what each path is now, and the home's folders on the way to a
 //! hidden path.
@@ -14,7 +15,7 @@ use super::masks::{
 };
 use super::paths;
 use crate::backend::WrapError;
-use crate::backend::bubblewrap::compile::CompiledSandbox;
+use crate::backend::bubblewrap::compile::{CompiledSandbox, OWN_PLACES};
 use crate::policy::paths::{is_within, real_path};
 
 /// What a mask covers, as the host holds it at launch.
@@ -111,6 +112,32 @@ pub(super) fn no_link_between(grant: &Path, entry: &Path) -> Result<(), WrapErro
     Ok(())
 }
 
+/// Refuses a workspace that is, holds or lies inside a place the sandbox
+/// has its own of, as written or where a link leads now, whether or not it
+/// is there yet: its bind comes after the sandbox's own mounts, and follows
+/// a link at the workspace's name inside the sandbox, so the host's would
+/// replace the sandbox's (`~/alias -> ../../run`).
+fn refuse_workspace_on_an_own_place(compiled: &CompiledSandbox) -> Result<(), WrapError> {
+    for written in paths(&compiled.bubblewrap.grant_masks.workspaces) {
+        let real = real_path(&written);
+        let Some(place) = OWN_PLACES
+            .undone_by(&written)
+            .or_else(|| OWN_PLACES.undone_by(&real))
+        else {
+            continue;
+        };
+        let through = match real == written {
+            true => String::new(),
+            false => format!(", which leads to {},", real.display()),
+        };
+        return Err(WrapError(format!(
+            "workspace {}{through} would bring back the host's {place}, which the sandbox has its own of: the session is refused; point the link elsewhere, or grant another folder",
+            written.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The folders between `grant` and `entry` that are there, parents first.
 pub(super) fn holders(grant: &Path, entry: &Path) -> Vec<PathBuf> {
     let Ok(rest) = entry.strip_prefix(grant) else {
@@ -141,17 +168,19 @@ fn with_kinds(mut found: Vec<PathBuf>) -> Result<Vec<(PathBuf, Kind)>, WrapError
 }
 
 /// What this launch's masks depend on, in the order design §5 gives:
-/// workspaces that reach a deny entry refused, the masks inside the grants,
-/// where links lead, the agent's socket, the home's listening sockets, the
-/// folders that cannot move, then the home's folders listed.
-/// `ssh_auth_sock` is the socket the host's `SSH_AUTH_SOCK` names, and
-/// `sockets` the files the host's listening sockets are bound to now.
+/// workspaces that reach a place the sandbox has its own of or a deny entry
+/// refused, the masks inside the grants, where links lead, the agent's
+/// socket, the home's listening sockets, the folders that cannot move, then
+/// the home's folders listed. `ssh_auth_sock` is the socket the host's
+/// `SSH_AUTH_SOCK` names, and `sockets` the files the host's listening
+/// sockets are bound to now.
 pub(in crate::backend::bubblewrap) fn read_host(
     compiled: &CompiledSandbox,
     sandbox_home: &Path,
     ssh_auth_sock: Option<&Path>,
     sockets: &[PathBuf],
 ) -> Result<Host, WrapError> {
+    refuse_workspace_on_an_own_place(compiled)?;
     let root_masks = &compiled.bubblewrap.root_masks;
     let grants = Grants::read(compiled, sandbox_home);
     let entries = resolved_entries(compiled);
