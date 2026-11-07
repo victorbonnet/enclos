@@ -19,6 +19,9 @@ use tempfile::TempDir;
 #[path = "bubblewrap/limits.rs"]
 mod limits;
 
+#[path = "bubblewrap/own_places.rs"]
+mod own_places;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};
