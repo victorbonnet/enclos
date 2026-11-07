@@ -506,9 +506,19 @@ fn a_refusal_because_the_policy_was_unreadable_is_not_a_destination_to_review() 
         .unwrap();
     assert_eq!(status.refused_recently, 0);
     assert_eq!(status.policy_unreadable_at, Some(now));
+    assert_eq!(status.policy_unreadable_refused, 1);
     // Not a destination to review, but a proxy to look at.
     let s = suggest(std::slice::from_ref(&status), now);
     let listed = commands(&s);
+    // What was refused, not every connection.
+    let reasons: Vec<String> = s.iter().map(Suggestion::reason).collect();
+    assert!(
+        reasons.contains(&format!(
+            "1 connection refused as the proxy could not read the policy, the last at {}",
+            now.strftime("%Y-%m-%d %H:%M UTC")
+        )),
+        "{reasons:?}"
+    );
     assert!(!listed.contains(&"enclos net denied home".into()), "{s:?}");
     assert!(listed.contains(&"enclos logs home".into()), "{s:?}");
 

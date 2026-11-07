@@ -21,7 +21,6 @@ use crate::model::policy::{NetPolicy, PendingPolicy, PolicySnapshot, PolicyVersi
 use crate::model::sandbox::SandboxName;
 use crate::model::session::{SessionKind, SessionRecord};
 use crate::policy::PolicyError;
-use crate::service::ServiceLabel;
 use crate::state::StateLock;
 
 /// A change to record with `propose`.
@@ -70,9 +69,9 @@ pub struct Restarted {
     /// What stopping the sandbox did; none when nothing of it ran or was
     /// installed.
     pub stopped: Option<StopReport>,
-    /// The services `sandbox start` installed, when the sandbox had
-    /// services installed before the restart.
-    pub started: Vec<ServiceLabel>,
+    /// What `sandbox start` did, when the sandbox had services installed
+    /// before the restart: nothing otherwise.
+    pub started: super::SandboxStarted,
 }
 
 /// What `policy discard` dropped.
@@ -613,7 +612,7 @@ impl Engine {
                         version.version
                     ),
                 })?,
-            false => Vec::new(),
+            false => super::SandboxStarted::default(),
         };
         Ok(Restarted {
             version,

@@ -111,6 +111,97 @@ impl Acceptance {
     }
 }
 
+/// Whether a field a sandbox runs with not enforced is accepted, as enclos
+/// finds it for one command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Accepted {
+    /// Kept with the sandbox at the field's value.
+    Kept(Acceptance),
+    /// By this command's `--accept-unenforced`, which records it.
+    Given,
+    /// Kept with the sandbox at another value: it no longer covers this one.
+    Stale(Acceptance),
+    /// Never given.
+    Missing,
+}
+
+/// A field a sandbox's policy sets that this host does not enforce, with
+/// whether it is accepted: the one assessment that each start, `policy
+/// test` and `doctor` report from (ADR 0038).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotEnforced {
+    pub gap: NotEnforcedHere,
+    pub accepted: Accepted,
+}
+
+impl NotEnforced {
+    /// `gap`, accepted by what is `kept` with the sandbox or `given` by
+    /// this command, or not.
+    pub fn assess(gap: NotEnforcedHere, kept: &[Acceptance], given: &[UnenforcedField]) -> Self {
+        let kept = kept.iter().find(|a| a.field == gap.field);
+        let accepted = match kept {
+            Some(a) if a.covers(&gap) => Accepted::Kept(a.clone()),
+            _ if given.contains(&gap.field) => Accepted::Given,
+            Some(a) => Accepted::Stale(a.clone()),
+            None => Accepted::Missing,
+        };
+        NotEnforced { gap, accepted }
+    }
+
+    /// Whether the sandbox may run with it not enforced.
+    pub fn is_accepted(&self) -> bool {
+        matches!(self.accepted, Accepted::Kept(_) | Accepted::Given)
+    }
+
+    /// Why a command is refused while it is not accepted, with what to do
+    /// ([`NotEnforcedHere::refusal`]), and the value an acceptance kept is
+    /// for when it is another.
+    pub fn refusal(&self, command: Option<&str>) -> String {
+        let refused = self.gap.refusal(command);
+        match &self.accepted {
+            Accepted::Stale(kept) => format!(
+                "{refused}. The acceptance kept is for {} = {}",
+                kept.field.policy_path(),
+                kept.value
+            ),
+            _ => refused,
+        }
+    }
+
+    /// The field and its acceptance in a few words, as a verdict names it:
+    /// `memory (accepted)`, `memory (not accepted)`, or `memory (accepted
+    /// at 512M, not at 1G)`.
+    pub fn named(&self) -> String {
+        let field = self.gap.field;
+        match &self.accepted {
+            Accepted::Kept(_) | Accepted::Given => format!("{field} (accepted)"),
+            Accepted::Missing => format!("{field} (not accepted)"),
+            Accepted::Stale(kept) => format!(
+                "{field} (accepted at {}, not at {})",
+                kept.value, self.gap.value
+            ),
+        }
+    }
+
+    /// The field, its value, why the host does not enforce it and its
+    /// acceptance, in a sentence: what `policy test` and `doctor` list.
+    pub fn said(&self) -> String {
+        let gap = &self.gap;
+        let accepted = match &self.accepted {
+            Accepted::Kept(a) => format!("accepted {}", a.at.strftime("%Y-%m-%d %H:%M UTC")),
+            Accepted::Given => "accepted by this command".to_owned(),
+            Accepted::Stale(a) => format!("accepted at {} only, not at this value", a.value),
+            Accepted::Missing => "not accepted".to_owned(),
+        };
+        format!(
+            "{} = {} is not applied on this host: {}; {accepted}",
+            gap.field.policy_path(),
+            gap.value,
+            gap.why
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +232,41 @@ mod tests {
         };
         assert!(accepted.covers(&gap("1G")));
         assert!(!accepted.covers(&gap("2G")));
+    }
+
+    #[test]
+    fn an_assessment_tells_kept_given_stale_and_missing_apart() {
+        let kept = |value: &str| Acceptance {
+            field: UnenforcedField::Memory,
+            value: value.to_owned(),
+            why: String::new(),
+            at: crate::model::now(),
+        };
+        let memory = [UnenforcedField::Memory];
+        let accepted = NotEnforced::assess(gap("1G"), &[kept("1G")], &[]);
+        assert!(matches!(accepted.accepted, Accepted::Kept(_)));
+        assert!(accepted.is_accepted());
+        assert_eq!(accepted.named(), "memory (accepted)");
+        // The flag accepts what nothing kept covers, a stale one included.
+        for kept in [vec![], vec![kept("512M")]] {
+            let given = NotEnforced::assess(gap("1G"), &kept, &memory);
+            assert_eq!(given.accepted, Accepted::Given);
+            assert!(given.is_accepted());
+        }
+        let stale = NotEnforced::assess(gap("1G"), &[kept("512M")], &[]);
+        assert!(matches!(stale.accepted, Accepted::Stale(_)));
+        assert!(!stale.is_accepted());
+        assert_eq!(stale.named(), "memory (accepted at 512M, not at 1G)");
+        let missing = NotEnforced::assess(gap("1G"), &[], &[]);
+        assert_eq!(missing.accepted, Accepted::Missing);
+        assert!(!missing.is_accepted());
+        assert_eq!(missing.named(), "memory (not accepted)");
+        let said = missing.said();
+        assert!(
+            said.starts_with("resources.memory = 1G is not applied on this host: "),
+            "{said}"
+        );
+        assert!(said.ends_with("; not accepted"), "{said}");
     }
 
     #[test]

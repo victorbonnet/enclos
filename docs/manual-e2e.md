@@ -492,6 +492,7 @@ enclos policy test scout
 
 - [ ] `show` lists the `exec` session and its process; the session runs in a scope `enclos.<8 hex>.lab.<session>.scope` in the sandbox's slice, and Ctrl-C in the second terminal ends it and its scope.
 - [ ] `policy test` runs the probes every backend shares and bubblewrap's own (design §5, bubblewrap's escape probes): the buses, the `systemd --user` manager, every Unix socket on the host that answers you, abstract sockets, `ptrace`, the other sandbox's processes and `secrets/` folder, TIOCSTI, a setgid program, namespaces, mounting and the session's cgroup. It is READY, or each probe that reads open is a finding to report; one it cannot run says why. On a kernel without Landlock, the report says so once. A socket in your home that no deny entry names, such as one of another enclos install, reads open.
+- [ ] On Raspberry Pi OS, `doctor` says the `memory` controller is turned off at boot (`cgroup_disable=memory`), and `enclos policy show lab --compiled` says that none of the compiled Landlock rules apply on this host. With `memory = "1G"` added under `[resources]` by `enclos policy edit lab --accept-unenforced memory`: `enclos sandbox restart lab` says `resources.memory = 1G is not applied`, `policy test lab` is READY and its verdict names `memory` as accepted (ADR 0038), and `doctor` lists `lab` with the field, why and when it was accepted, and exits 0.
 
 ### 8: the secret store
 
@@ -581,4 +582,4 @@ These are stated in the design and the release notes, so a test that shows them 
 - Hermes's browser tools do not start in a sandbox.
 - CPU time, memory and file size limits are refused: Seatbelt cannot hold them.
 - Agents of one sandbox share its files: an agent's secrets reach it alone, but another agent of the same sandbox can read its secrets file (ADR 0036). Isolation is per sandbox.
-- Linux is milestone 3, in progress: Hermes does not run there yet, and bubblewrap's limits are still to come (design §13).
+- On Linux, CPU time and file size limits are refused on bubblewrap too. On a host whose memory controller is off, as on Raspberry Pi OS, a `memory` limit runs not applied once accepted with `--accept-unenforced memory`, and every start, `policy test` and `doctor` say so (ADR 0038). On a kernel without Landlock, writes are held by the mounts alone and any program the sandbox can read can run (ADR 0037).

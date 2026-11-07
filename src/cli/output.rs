@@ -340,6 +340,35 @@ pub fn actor(by: &enclos::model::audit::Actor) -> Value {
     json!({"user": by.user, "host": by.host})
 }
 
+/// The fields a sandbox runs with not enforced on this host, each with its
+/// value, why, and its acceptance (ADR 0038), as `sandbox start`, `policy
+/// test` and `doctor` give them: `acceptance.state` is `kept` (with the
+/// value and time it was given), `given` by this command, `stale` (kept
+/// for another value, given with it) or `missing`.
+pub fn not_enforced(list: &[enclos::model::unenforced::NotEnforced]) -> Value {
+    use enclos::model::unenforced::Accepted;
+    let kept = |state: &str, a: &enclos::model::unenforced::Acceptance| json!({"state": state, "value": a.value, "at": a.at.to_string()});
+    Value::Array(
+        list.iter()
+            .map(|n| {
+                json!({
+                    "field": n.gap.field.as_str(),
+                    "setting": n.gap.field.policy_path(),
+                    "value": n.gap.value,
+                    "why": n.gap.why,
+                    "accepted": n.is_accepted(),
+                    "acceptance": match &n.accepted {
+                        Accepted::Kept(a) => kept("kept", a),
+                        Accepted::Stale(a) => kept("stale", a),
+                        Accepted::Given => json!({"state": "given"}),
+                        Accepted::Missing => json!({"state": "missing"}),
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
 /// A process: its pid and its command as `ps` lists it.
 pub fn member(pid: u32, command: &str) -> Value {
     json!({"pid": pid, "command": command})

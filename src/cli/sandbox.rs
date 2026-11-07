@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use super::output;
 use enclos::engine::{
-    Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport, printable_line,
+    Engine, PROXY_WAIT, SandboxSpec, SandboxStarted, SandboxView, ServiceLine, StopReport,
+    printable_line,
 };
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
@@ -548,7 +549,7 @@ fn restart(
             (exit::OK, stopped) => {
                 let started = engine
                     .start_sandbox(by, name)
-                    .and_then(|labels| print_started(engine, name, &labels));
+                    .and_then(|started| print_started(engine, name, &started));
                 match started {
                     Ok((code, mut started)) => {
                         started["stop"] = stopped;
@@ -667,11 +668,14 @@ fn planned_start(name: &SandboxName, plan: &Plan, labels: &[ServiceLabel]) -> Va
 pub(super) fn print_started(
     engine: &Engine,
     name: &SandboxName,
-    labels: &[ServiceLabel],
+    started: &SandboxStarted,
 ) -> Result<(u8, Value)> {
+    let labels = &started.labels;
+    // Said in text as the start installed the services.
     let mut value = json!({
         "sandbox": name.to_string(),
         "services": labels.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "not_enforced": output::not_enforced(&started.not_enforced),
         "proxy_started": null,
     });
     let shown = labels

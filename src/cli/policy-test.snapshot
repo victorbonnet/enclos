@@ -9,6 +9,7 @@ READY: no probe got out of sandbox lab: all 3 shown closed (1 by Seatbelt itself
   "baseline": "deny_default",
   "host_services_probed": true,
   "listens": false,
+  "not_enforced": [],
   "not_here": [],
   "not_probed": [
     "bootstrapping or loading a launchd job",
@@ -63,6 +64,7 @@ READY: no probe got out of sandbox lab: 3 of 4 shown closed (1 by Seatbelt itsel
   "baseline": "allow_default",
   "host_services_probed": false,
   "listens": true,
+  "not_enforced": [],
   "not_here": [
     "keychain (no login keychain here)"
   ],
@@ -126,6 +128,7 @@ NOT READY: sandbox lab: 1 of 6 probes got out (OPEN above); 1 could not run or b
   "baseline": "deny_default",
   "host_services_probed": false,
   "listens": false,
+  "not_enforced": [],
   "not_here": [],
   "not_probed": [
     "bootstrapping or loading a launchd job",
@@ -195,6 +198,7 @@ NOT READY: sandbox lab: no probe was shown closed by its route's rule, only by S
   "baseline": "deny_default",
   "host_services_probed": false,
   "listens": false,
+  "not_enforced": [],
   "not_here": [],
   "not_probed": [
     "bootstrapping or loading a launchd job",

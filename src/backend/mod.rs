@@ -353,8 +353,9 @@ pub trait Backend {
         launch: &Launch,
     ) -> Result<Command, WrapError>;
     /// What each session's start says of `policy` on this backend, one line
-    /// each: a field it does not hold, which the policy still runs with.
-    /// Nothing by default.
+    /// each: a field it holds on no host, which the policy still runs with.
+    /// A field this host does not hold ([`Backend::not_enforced_here`]) is
+    /// the engine's to say. Nothing by default.
     fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
         Vec::new()
     }
@@ -366,6 +367,13 @@ pub trait Backend {
         &self,
         _policy: &Policy,
     ) -> Vec<crate::model::unenforced::NotEnforcedHere> {
+        Vec::new()
+    }
+    /// What a policy compiled for this backend holds less of on this host
+    /// than its compiled text shows, one line each, such as rules this
+    /// kernel cannot apply: for `policy show --compiled` to say beside it.
+    /// Compiling stays pure; this reads the host. Nothing by default.
+    fn compiled_not_applied_here(&self) -> Vec<String> {
         Vec::new()
     }
     /// Its escape probes and refusals for a sandbox whose compiled policy

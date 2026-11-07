@@ -13,6 +13,7 @@ use crate::layout::LayoutError;
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionKind;
+use crate::model::unenforced::NotEnforced;
 use crate::runtime::{RuntimeService, ServiceName, adapter};
 use crate::service::{LABEL_PREFIX, ServiceError, ServiceLabel, ServiceStatus, ServiceUnit};
 
@@ -34,6 +35,15 @@ impl Unit {
             Unit::Runtime(name) => name.as_str(),
         }
     }
+}
+
+/// What `sandbox start` did: the services it installed, and what the
+/// sandbox runs with not enforced on this host, every one accepted (ADR
+/// 0038).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SandboxStarted {
+    pub labels: Vec<ServiceLabel>,
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 /// How long `launch` and `connect` wait for the sandbox's proxy to record
@@ -151,8 +161,11 @@ impl Engine {
     /// answers, whose namespace holds the sessions still open (ADR 0039). If
     /// one cannot be installed, none stays installed but that namespace
     /// holder, and the sandbox is marked failed. The services start on their
-    /// own; `proxy_started` says when the proxy has.
-    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// own; `proxy_started` says when the proxy has. Each field the sandbox
+    /// runs with not enforced on this host, every one accepted, is said in
+    /// one line once its services are installed (ADR 0038), as each of its
+    /// sessions says it too.
+    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<SandboxStarted> {
         self.require_sandbox(name)?;
         // Before anything is stopped: an unavailable manager (no login
         // session, another system) would leave the sandbox with nothing.
@@ -174,7 +187,7 @@ impl Engine {
         // end stops its runtime and records its end, which needs the lock.
         self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop, kept)?
             .into_result()?;
-        self.install_services(by, name, kept).map_err(|error| {
+        let started = self.install_services(by, name, kept).map_err(|error| {
             // None may stay installed: the undo removes them even when its
             // first entry cannot be written, as the start's entry records
             // the attempt.
@@ -201,7 +214,11 @@ impl Engine {
                     },
                 },
             }
-        })
+        })?;
+        for n in &started.not_enforced {
+            crate::notes::say(&n.gap.said_at_start(name.as_str()));
+        }
+        Ok(started)
     }
 
     /// What the service manager runs for the sandbox's service `unit`: this
@@ -256,21 +273,26 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         kept: Option<&ServiceLabel>,
-    ) -> Result<Vec<ServiceLabel>> {
-        // Its entry lists what the sandbox runs with not enforced (ADR 0038).
+    ) -> Result<SandboxStarted> {
         let view = self.policy(name)?;
-        let record = self.record(name)?;
-        let gaps = self.accepted_gaps(name, record.backend, &view.snapshot.policy, None)?;
-        let note = super::unenforced::not_enforced_note(&gaps);
         self.write(
             by,
             "sandbox start",
             Some(name.to_string()),
-            |labels: &Vec<ServiceLabel>| format!("{}{note}", joined(labels)),
+            // Its entry lists what the sandbox runs with not enforced (ADR
+            // 0038).
+            |started: &SandboxStarted| {
+                format!(
+                    "{}{}",
+                    joined(&started.labels),
+                    super::unenforced::not_enforced_note(&started.not_enforced)
+                )
+            },
             |lock| {
                 let mut record = self.record(name)?;
                 let at = format!("at policy v{}", view.version.version);
-                self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
+                let not_enforced =
+                    self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
                 let installed = (|| -> Result<Vec<ServiceLabel>> {
                     self.backend_of(name)?;
                     let store_env =
@@ -306,7 +328,10 @@ impl Engine {
                     },
                 };
                 self.state.put(lock, &record)?;
-                installed
+                Ok(SandboxStarted {
+                    labels: installed?,
+                    not_enforced,
+                })
             },
         )
     }

@@ -3,7 +3,8 @@
 //! enforce; a sandbox runs with one only when the user accepted it at that
 //! value, with `--accept-unenforced`, which is recorded with the sandbox and
 //! in an audit entry of its own, so later stores and starts need none until
-//! the value changes. A policy's checks and every start ask here.
+//! the value changes. A policy's checks, every start, `policy test` and
+//! `doctor` ask here.
 
 use super::Engine;
 use crate::error::{Error, Result};
@@ -11,7 +12,9 @@ use crate::model::audit::{Actor, Intent, Outcome};
 use crate::model::now;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
-use crate::model::unenforced::{Acceptance, NotEnforcedHere, UnenforcedField};
+use crate::model::unenforced::{
+    Acceptance, Accepted, NotEnforced, NotEnforcedHere, UnenforcedField,
+};
 use crate::policy::{PolicyError, Problem};
 use crate::state::StateLock;
 
@@ -39,37 +42,52 @@ impl Engine {
     }
 
     /// What sandbox `name`, on backend `kind`, would run with not enforced
-    /// under `policy`, each accepted: by an acceptance kept with the
-    /// sandbox at the same value, or by this command's
-    /// `--accept-unenforced`. One with neither is refused, saying to run
-    /// `command` with the flag, or, with none, the command refused.
-    pub(super) fn accepted_gaps(
+    /// under `policy` on this host, each with whether it is accepted: by an
+    /// acceptance kept with the sandbox at the same value, or by this
+    /// command's `--accept-unenforced`. What each start refuses, `policy
+    /// test` and `doctor` report and a start says is all read here.
+    pub fn not_enforced(
         &self,
         name: &SandboxName,
         kind: BackendKind,
         policy: &Policy,
-        command: Option<&str>,
-    ) -> Result<Vec<NotEnforcedHere>> {
+    ) -> Result<Vec<NotEnforced>> {
         let gaps = self.not_enforced_here(kind, policy);
         if gaps.is_empty() {
-            return Ok(gaps);
+            return Ok(Vec::new());
         }
         // A sandbox being created has no record, and no acceptance.
         let kept = match self.state.get(name)? {
             Some(_) => self.state.acceptances(name)?,
             None => Vec::new(),
         };
-        let refused: Vec<Problem> = gaps
+        Ok(gaps
+            .into_iter()
+            .map(|gap| NotEnforced::assess(gap, &kept, &self.accepting))
+            .collect())
+    }
+
+    /// What sandbox `name` would run with not enforced under `policy`, as
+    /// [`Engine::not_enforced`] finds it, every one accepted. One that is
+    /// not is refused, saying to run `command` with the flag, or, with
+    /// none, the command refused.
+    pub(super) fn accepted_gaps(
+        &self,
+        name: &SandboxName,
+        kind: BackendKind,
+        policy: &Policy,
+        command: Option<&str>,
+    ) -> Result<Vec<NotEnforced>> {
+        let assessed = self.not_enforced(name, kind, policy)?;
+        let refused: Vec<Problem> = assessed
             .iter()
-            .filter(|gap| {
-                !self.accepting.contains(&gap.field) && !kept.iter().any(|a| a.covers(gap))
-            })
-            .map(|gap| Problem::Refused(gap.refusal(command)))
+            .filter(|n| !n.is_accepted())
+            .map(|n| Problem::Refused(n.refusal(command)))
             .collect();
         if !refused.is_empty() {
             return Err(Error::Policy(PolicyError::Invalid { problems: refused }));
         }
-        Ok(gaps)
+        Ok(assessed)
     }
 
     /// Records each acceptance this command gives (`--accept-unenforced`)
@@ -78,7 +96,7 @@ impl Engine {
     /// the sandbox and gets an audit entry of its own, naming the sandbox,
     /// the field, its value, that policy and why the host does not enforce
     /// it. One already kept at the same value is left as it is. Returns
-    /// what runs not enforced.
+    /// what runs not enforced, each accepted by what is kept now.
     pub(super) fn record_acceptances(
         &self,
         lock: &StateLock,
@@ -86,14 +104,14 @@ impl Engine {
         name: &SandboxName,
         policy: &Policy,
         at: &str,
-    ) -> Result<Vec<NotEnforcedHere>> {
+    ) -> Result<Vec<NotEnforced>> {
         let kind = self.record(name)?.backend;
-        let gaps = self.accepted_gaps(name, kind, policy, None)?;
-        let kept = self.state.acceptances(name)?;
-        for gap in &gaps {
-            if kept.iter().any(|a| a.covers(gap)) {
+        let mut assessed = self.accepted_gaps(name, kind, policy, None)?;
+        for n in &mut assessed {
+            if matches!(n.accepted, Accepted::Kept(_)) {
                 continue;
             }
+            let gap = &n.gap;
             let ticket = self.audit.begin(
                 lock,
                 Intent {
@@ -122,20 +140,21 @@ impl Engine {
                 }
             };
             self.audit.finish(ticket, outcome)?;
+            n.accepted = Accepted::Kept(accepted);
         }
-        Ok(gaps)
+        Ok(assessed)
     }
 }
 
 /// How a command's audit entry names the fields it runs with not enforced,
 /// after what it did: nothing when there are none.
-pub(super) fn not_enforced_note(gaps: &[NotEnforcedHere]) -> String {
-    if gaps.is_empty() {
+pub(super) fn not_enforced_note(assessed: &[NotEnforced]) -> String {
+    if assessed.is_empty() {
         return String::new();
     }
-    let fields: Vec<String> = gaps
+    let fields: Vec<String> = assessed
         .iter()
-        .map(|g| format!("{} (accepted)", g.field.policy_path()))
+        .map(|n| format!("{} (accepted)", n.gap.field.policy_path()))
         .collect();
     format!("; not enforced on this host: {}", fields.join(", "))
 }

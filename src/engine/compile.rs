@@ -81,6 +81,12 @@ impl Engine {
         Ok(self.compiled_file(name, record.proxy_port)?.1)
     }
 
+    /// What sandbox `name`'s compiled policy holds less of on this host
+    /// than its text shows, one line each (`Backend::compiled_not_applied_here`).
+    pub fn compiled_not_applied_here(&self, name: &SandboxName) -> Result<Vec<String>> {
+        Ok(self.backend_of(name)?.compiled_not_applied_here())
+    }
+
     /// The file the active policy compiles to, and its text, without
     /// writing it.
     pub(crate) fn compiled_file(
