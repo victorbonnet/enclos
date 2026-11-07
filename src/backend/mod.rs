@@ -18,6 +18,7 @@ use std::process::Command;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::policy::own_places::OwnPlaces;
 use crate::policy::paths::real_path;
 use crate::probes::OwnProbes;
 use crate::relay::inward::WayIn;
@@ -332,6 +333,14 @@ pub trait Backend {
     /// host.
     fn host_checks(&self) -> Vec<crate::host::HostCheck> {
         Vec::new()
+    }
+    /// The places each session has its own of, such as bubblewrap's `/run`,
+    /// which no workspace may put the host's back over: a policy's
+    /// workspaces, as written and where their links lead, are checked
+    /// against them before it is stored and each time it is compiled. None
+    /// by default.
+    fn own_places(&self) -> OwnPlaces {
+        OwnPlaces::NONE
     }
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;

@@ -11,6 +11,7 @@ use super::{
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::model::unenforced::{NotEnforcedHere, UnenforcedField};
+use crate::policy::own_places::OwnPlaces;
 use crate::probes::{OwnProbes, Refusal, ReportNotes};
 
 /// The variable that tells a program the fake runs whether it was launched
@@ -59,6 +60,8 @@ pub struct FakeBackend {
     runs: Probe,
     /// Why the host it stands on does not hold `memory`, if it does not.
     memory_not_held: Option<String>,
+    /// The places it says each session has its own of.
+    own_places: OwnPlaces,
 }
 
 impl FakeBackend {
@@ -69,6 +72,7 @@ impl FakeBackend {
             probe: Probe::Available,
             runs: Probe::Available,
             memory_not_held: None,
+            own_places: OwnPlaces::NONE,
         }
     }
 
@@ -76,6 +80,12 @@ impl FakeBackend {
     /// (ADR 0038).
     pub fn without_memory_controller(mut self, why: &str) -> Self {
         self.memory_not_held = Some(why.to_owned());
+        self
+    }
+
+    /// The same fake, saying each session has `places` of its own.
+    pub fn with_own_places(mut self, places: OwnPlaces) -> Self {
+        self.own_places = places;
         self
     }
 
@@ -90,6 +100,7 @@ impl FakeBackend {
                 reason: reason.to_owned(),
             },
             memory_not_held: None,
+            own_places: OwnPlaces::NONE,
         }
     }
 
@@ -104,6 +115,7 @@ impl FakeBackend {
                 reason: reason.to_owned(),
             },
             memory_not_held: None,
+            own_places: OwnPlaces::NONE,
         }
     }
 }
@@ -130,6 +142,10 @@ impl Backend for FakeBackend {
             }],
             _ => Vec::new(),
         }
+    }
+
+    fn own_places(&self) -> OwnPlaces {
+        self.own_places
     }
 
     fn capabilities(&self) -> Capabilities {
