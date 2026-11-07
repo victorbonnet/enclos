@@ -32,8 +32,9 @@ use std::time::Duration;
 /// bubblewrap runs first takes back. Not passed on to its command.
 pub const STDERR: &str = "ENCLOS_BUBBLEWRAP_STDERR";
 
-/// The pauses before each start again: four starts in all, within a second.
-pub const PAUSES: [Duration; 3] = [
+/// The pauses before each start again: five starts in all, within a second.
+pub const PAUSES: [Duration; 4] = [
+    Duration::from_millis(50),
     Duration::from_millis(100),
     Duration::from_millis(200),
     Duration::from_millis(400),
@@ -43,8 +44,12 @@ pub const PAUSES: [Duration; 3] = [
 /// No message of bubblewrap's holds a NUL byte.
 const RUNS: &[u8] = b"\0enclos: bubblewrap set up\n";
 
-/// What bubblewrap says when a mount it read was gone when it remounted it.
-const MOUNT_CHANGED: &str = "Unable to apply mount flags: remount \"";
+/// What bubblewrap says when it could not remount a mount it read.
+const REMOUNT_FAILED: &str = "Unable to apply mount flags: remount \"";
+
+/// Why, when that mount was gone: its folder with it, or the folder alone
+/// left. bubblewrap sets no locale, so its errors are in English.
+const GONE: [&str; 2] = [": No such file or directory", ": Invalid argument"];
 
 /// At most this much of what bubblewrap says before its program runs is
 /// held. Past it, all is passed on as it comes, and nothing is started
@@ -56,9 +61,11 @@ const HELD: usize = 64 * 1024;
 /// nothing, so starting it again runs its program once.
 pub(crate) fn mount_changed(code: Option<i32>, said: &[u8]) -> bool {
     code == Some(1)
-        && String::from_utf8_lossy(said)
-            .lines()
-            .any(|line| line.starts_with("bwrap: ") && line.contains(MOUNT_CHANGED))
+        && String::from_utf8_lossy(said).lines().any(|line| {
+            line.starts_with("bwrap: ")
+                && line.contains(REMOUNT_FAILED)
+                && GONE.iter().any(|why| line.ends_with(why))
+        })
 }
 
 /// Calls `start` until what it gives did not meet a mount that changed, as
@@ -83,8 +90,9 @@ pub(crate) fn again<T>(
 /// starts it again while its setup meets a mount that changed, pausing
 /// `pauses` between starts. `stderr` is its program's stderr, and gets what
 /// bubblewrap says: at once once its program runs, and else at its end, of
-/// the last start alone. Started again, it is said once on `stderr`, before
-/// anything of the program's. Returns how the last start ended.
+/// the last start alone. Starting it again is said once on `stderr`, before
+/// the second start, so before anything of the program's. Returns how the
+/// last start ended.
 pub fn run(
     mut command: impl FnMut() -> io::Result<Command>,
     stderr: &File,
@@ -96,7 +104,13 @@ pub fn run(
         pauses,
         || {
             starts += 1;
-            start(command()?, &given, stderr, starts)
+            if starts == 2 {
+                let _ = writeln!(
+                    &*stderr,
+                    "enclos: a mount of the host changed while bubblewrap set up, so it starts again"
+                );
+            }
+            start(command()?, &given, stderr)
         },
         Start::met_a_changed_mount,
     )?;
@@ -137,10 +151,10 @@ fn inheritable(stderr: &File) -> io::Result<OwnedFd> {
     Ok(copy)
 }
 
-/// Starts `command` once, the `nth` start, its stderr a pipe and `given`
-/// named in [`STDERR`], and reads the pipe to its end: what came before its
-/// program ran is held, the rest goes to `stderr` as it comes.
-fn start(mut command: Command, given: &OwnedFd, stderr: &File, nth: usize) -> io::Result<Start> {
+/// Starts `command` once, its stderr a pipe and `given` named in
+/// [`STDERR`], and reads the pipe to its end: what came before its program
+/// ran is held, the rest goes to `stderr` as it comes.
+fn start(mut command: Command, given: &OwnedFd, stderr: &File) -> io::Result<Start> {
     let (mut pipe, writer) = io::pipe()?;
     command
         .env(STDERR, given.as_raw_fd().to_string())
@@ -150,20 +164,10 @@ fn start(mut command: Command, given: &OwnedFd, stderr: &File, nth: usize) -> io
     drop(command);
     let mut said = Vec::new();
     let unset = match read_until_set_up(&mut pipe, &mut said) {
-        Ok(true) => {
-            if nth > 1 {
-                let _ = writeln!(
-                    &*stderr,
-                    "enclos: bubblewrap was started {nth} times, as a mount of the host changed while it set up"
-                );
-            }
-            pass_on(&mut pipe, &said, stderr);
-            None
-        }
         Ok(false) if said.len() < HELD => Some(said),
-        // Too much to hold, or the pipe lost: the program may run, so it is
-        // never started again.
-        Ok(false) | Err(_) => {
+        // Its program runs; or too much to hold, or the pipe lost, and it
+        // may run: it is never started again.
+        Ok(_) | Err(_) => {
             pass_on(&mut pipe, &said, stderr);
             None
         }
