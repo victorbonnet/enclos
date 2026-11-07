@@ -14,6 +14,7 @@ use std::time::Duration;
 use signal_hook::consts::SIGTERM;
 
 use super::Engine;
+use super::policy::leaving_out;
 use super::start::SCOPE_END_WAIT;
 use crate::backend::{Launch, SandboxContext};
 use crate::error::{Error, Result};
@@ -22,6 +23,7 @@ use crate::lifecycle::cgroup::Scopes;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
+use crate::model::unenforced::NotEnforced;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
     Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
@@ -46,6 +48,9 @@ pub struct TestReport {
     /// What enclos itself said on the probes' sessions, each once, such as
     /// that the kernel has no Landlock (design §5): not any probe's answer.
     pub notices: Vec<String>,
+    /// What the sandbox's policy sets that this host does not enforce, with
+    /// whether each is accepted (ADR 0038): the probes ran without it.
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 impl TestReport {
@@ -100,13 +105,23 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::NotRun(_)))
     }
 
-    /// Whether the test passed: nothing got through, every probe ran, and at
-    /// least one was shown closed by its route's rule. An inconclusive probe
+    /// Whether the test passed: nothing got through, every probe ran, at
+    /// least one was shown closed by its route's rule, and every field this
+    /// host does not enforce is accepted (ADR 0038). An inconclusive probe
     /// does not fail it, but a test where none was closed, or only those
     /// the backend itself or the baseline closes, showed nothing about the
     /// policy's rules.
     pub fn passed(&self) -> bool {
-        self.open() == 0 && self.not_run() == 0 && self.closed_by_rule() > 0
+        self.open() == 0
+            && self.not_run() == 0
+            && self.closed_by_rule() > 0
+            && self.not_accepted().next().is_none()
+    }
+
+    /// The fields this host does not enforce that are not accepted, or
+    /// accepted at another value.
+    pub fn not_accepted(&self) -> impl Iterator<Item = &NotEnforced> {
+        self.not_enforced.iter().filter(|n| !n.is_accepted())
     }
 }
 
@@ -226,8 +241,12 @@ impl Engine {
                     what: format!("{} {why}", compiled.display()),
                 })?;
             // The limits the sandbox's processes run under, which the
-            // resource probes show.
-            let limits = self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+            // resource probes show, without what this host does not
+            // enforce: the report names each, and fails on one not
+            // accepted rather than refusing to probe.
+            let policy = self.active_policy(name)?.1.policy;
+            let not_enforced = self.not_enforced(name, record.backend, &policy)?;
+            let limits = leaving_out(self.checked_limits(&record, &policy)?, &not_enforced);
             self.ensure_proxy(lock, &record)?;
             self.ensure_holder(&record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
@@ -290,6 +309,7 @@ impl Engine {
                 listens: inputs.listen,
                 notes: own.notes(),
                 notices,
+                not_enforced,
             })
         })
         .map(Planned::Done)
@@ -372,7 +392,9 @@ impl Engine {
         let ctx = self.sandbox_context(name, record.proxy_port);
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
-        let limits = self.launch_limits(&record, &self.policy(name)?.snapshot.policy)?;
+        let policy = self.policy(name)?.snapshot.policy;
+        let not_enforced = self.not_enforced(name, record.backend, &policy)?;
+        let limits = leaving_out(self.checked_limits(&record, &policy)?, &not_enforced);
         // Not `backend_of`: a dry run asks nothing of the host, so it also
         // counts for a backend this host cannot run. It reads no compiled
         // file, which changes what closes a probe, not how many run.
@@ -660,6 +682,7 @@ mod tests {
             listens: false,
             notes: notes_on(Baseline::DenyDefault),
             notices: Vec::new(),
+            not_enforced: Vec::new(),
         }
     }
 
