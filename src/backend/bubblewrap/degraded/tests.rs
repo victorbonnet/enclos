@@ -219,7 +219,7 @@ fn memory_is_held_only_where_the_controller_is_delegated() {
     assert_eq!(memory_not_held(&Fixture::ubuntu().kernel()), None);
     let pi = memory_not_held(&Fixture::raspberry_pi_os().kernel()).unwrap();
     assert!(
-        pi.starts_with("memory controller: not in the kernel"),
+        pi.starts_with("memory controller: turned off at boot"),
         "{pi}"
     );
     let kept = Fixture::ubuntu();
@@ -238,7 +238,10 @@ fn memory_is_held_only_where_the_controller_is_delegated() {
 fn the_memory_controller_turned_off_by_the_firmware_says_what_to_add_to_cmdline_txt() {
     let fixture = Fixture::raspberry_pi_os();
     let check = fixture.check("memory controller");
-    assert!(check.found.contains("not in the kernel"), "{check:?}");
+    // The kernel has it: the command line turned it off.
+    assert!(check.found.starts_with("turned off at boot"), "{check:?}");
+    assert!(!check.found.contains("not in the kernel"), "{check:?}");
+    assert!(check.found.contains("`cgroup_disable=memory`"), "{check:?}");
     assert!(check.found.contains("`cpuset cpu io pids`"), "{check:?}");
     assert_eq!(not_enforced(&check), "a `memory` limit");
     assert!(fix(&check).contains("` cgroup_enable=memory`"), "{check:?}");
@@ -280,4 +283,18 @@ fn a_hierarchy_that_cannot_be_read_is_said_so() {
     let check = fixture.check("cpu controller");
     assert_eq!(check.verdict, Verdict::Note);
     assert!(check.found.contains("cannot read"), "{check:?}");
+}
+
+/// A controller missing with no `cgroup_disable=` for it is not in the
+/// kernel, and takes another kernel.
+#[test]
+fn a_controller_missing_with_no_boot_option_is_not_in_the_kernel() {
+    let fixture = Fixture::raspberry_pi_os();
+    fixture.file(
+        "proc/cmdline",
+        "console=tty1 cgroup_disable=hugetlb root=PARTUUID=1-02 rootwait\n",
+    );
+    let check = fixture.check("memory controller");
+    assert!(check.found.starts_with("not in the kernel"), "{check:?}");
+    assert_eq!(fix(&check), "a kernel with the memory controller");
 }

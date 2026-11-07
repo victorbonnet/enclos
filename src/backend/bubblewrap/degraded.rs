@@ -59,6 +59,16 @@ impl Kernel {
         std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
     }
 
+    /// Whether the kernel's command line turns controller `name` off at
+    /// boot (`cgroup_disable=`): the kernel has it, but it is not in use.
+    fn turned_off_at_boot(&self, name: &str) -> bool {
+        let cmdline = std::fs::read_to_string(self.proc.join("cmdline")).unwrap_or_default();
+        cmdline
+            .split_whitespace()
+            .filter_map(|o| o.strip_prefix("cgroup_disable="))
+            .any(|list| list.split(',').any(|c| c == name))
+    }
+
     /// The active LSMs, as the kernel lists them.
     fn lsms(&self) -> Result<Vec<String>, String> {
         let text = self.read(&self.sys.join("kernel/security/lsm"))?;
@@ -242,14 +252,21 @@ fn controller(kernel: &Kernel, name: &str) -> HostCheck {
         Err(why) => return HostCheck::note(&what, format!("cannot tell: {why}"), None),
     };
     if !has(&in_root) {
-        return degraded(
-            format!(
+        let turned_off = kernel.turned_off_at_boot(name);
+        let found = match turned_off {
+            true => format!(
+                "turned off at boot: the kernel's command line ({}) has `cgroup_disable={name}`, so {} lists `{}`",
+                kernel.proc.join("cmdline").display(),
+                root.display(),
+                in_root.trim()
+            ),
+            false => format!(
                 "not in the kernel: {} lists `{}`",
                 root.display(),
                 in_root.trim()
             ),
-            controller_back(kernel, name),
-        );
+        };
+        return degraded(found, controller_back(kernel, name, turned_off));
     }
     match kernel.read(&manager) {
         Ok(text) if has(&text) => HostCheck::fine(&what, "delegated to your systemd manager"),
@@ -269,15 +286,11 @@ fn controller(kernel: &Kernel, name: &str) -> HostCheck {
     }
 }
 
-/// How to bring back a controller the kernel's command line turned off.
-fn controller_back(kernel: &Kernel, name: &str) -> String {
-    let cmdline = std::fs::read_to_string(kernel.proc.join("cmdline")).unwrap_or_default();
-    let disabled = cmdline
-        .split_whitespace()
-        .filter_map(|o| o.strip_prefix("cgroup_disable="))
-        .any(|list| list.split(',').any(|c| c == name));
+/// How to bring back controller `name`, missing from the root cgroup:
+/// `turned_off` when the kernel's command line turned it off at boot.
+fn controller_back(kernel: &Kernel, name: &str, turned_off: bool) -> String {
     let firmware = kernel.boot.join("firmware/cmdline.txt");
-    match (disabled, firmware.exists()) {
+    match (turned_off, firmware.exists()) {
         // Raspberry Pi OS: the firmware passes it, and its kernels read
         // `cgroup_enable=` after the firmware's options.
         (true, true) => format!(
