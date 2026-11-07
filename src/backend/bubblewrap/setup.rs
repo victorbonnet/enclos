@@ -15,7 +15,7 @@
 //! session's and the namespace holder's, [`again`] for the backend's probe.
 //! [`run`] gives bubblewrap a pipe for its stderr, and the stderr it was
 //! given at the descriptor [`STDERR`] names. The program bubblewrap runs
-//! first calls [`done`] before anything else: it says so on the pipe, then
+//! first calls `done` before anything else: it says so on the pipe, then
 //! takes that stderr back, so what it and its command write never passes
 //! through the pipe. A bubblewrap that exits 1 with that message, its
 //! program never having said it runs, ran nothing, and is started again
