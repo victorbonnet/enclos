@@ -278,8 +278,25 @@ fn parse_status(text: &str) -> Option<(u32, Vec<u32>)> {
     (!pids.is_empty()).then_some((parent, pids))
 }
 
+/// What [`parse_status`] reads of `pid` under `proc`, or `None` when it is
+/// gone. One whose `status` is refused is an error of kind
+/// `PermissionDenied`.
+fn lineage_of(proc: &Path, pid: u32) -> io::Result<Option<(u32, Vec<u32>)>> {
+    let status = proc.join(pid.to_string()).join("status");
+    let named = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", status.display()));
+    let text = match std::fs::read_to_string(&status) {
+        Err(e) if descriptors::is_gone(&e) => return Ok(None),
+        text => text.map_err(named)?,
+    };
+    parse_status(&text)
+        .map(Some)
+        .ok_or_else(|| io::Error::other(format!("{} does not read", status.display())))
+}
+
 /// What [`parse_status`] reads of every process under `proc`, by pid. A
-/// process that exits meanwhile is left out.
+/// process that exits meanwhile is left out; so is one `/proc` refuses,
+/// which is another user's on a `/proc` mounted with `hidepid=1`, as the
+/// process listing leaves it out.
 fn lineages(proc: &Path) -> Result<BTreeMap<u32, (u32, Vec<u32>)>, ListenersError> {
     let mut found = BTreeMap::new();
     for entry in std::fs::read_dir(proc).map_err(proc_error)? {
@@ -287,28 +304,31 @@ fn lineages(proc: &Path) -> Result<BTreeMap<u32, (u32, Vec<u32>)>, ListenersErro
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
         };
-        let status = entry.path().join("status");
-        let text = match std::fs::read_to_string(&status) {
-            Ok(text) => text,
-            Err(e) if descriptors::is_gone(&e) => continue,
-            Err(e) => return Err(proc_error(format!("{}: {e}", status.display()))),
-        };
-        let lineage = parse_status(&text)
-            .ok_or_else(|| proc_error(format!("{} does not read", status.display())))?;
-        found.insert(pid, lineage);
+        match lineage_of(proc, pid) {
+            Ok(Some(lineage)) => {
+                found.insert(pid, lineage);
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(proc_error(e)),
+        }
     }
     Ok(found)
 }
 
+/// [`program_in_pid_namespace`] under `proc`. The root's own `status`
+/// refused is an error: a look that could not happen, not a session whose
+/// program has not started.
 fn program_under(proc: &Path, root: u32) -> Result<Option<u32>, ListenersError> {
-    let every = lineages(proc)?;
-    let Some((_, root_pids)) = every.get(&root) else {
+    let Some((_, root_pids)) = lineage_of(proc, root).map_err(proc_error)? else {
         return Ok(None);
     };
+    let depth = root_pids.len() + 1;
+    let every = lineages(proc)?;
     // One PID namespace below the root's, numbered `inside` there.
     let below = |parent: u32, inside: u32| {
         every.iter().filter_map(move |(pid, (ppid, pids))| {
-            let nested = pids.len() == root_pids.len() + 1 && pids.last() == Some(&inside);
+            let nested = pids.len() == depth && pids.last() == Some(&inside);
             (*ppid == parent && nested).then_some(*pid)
         })
     };

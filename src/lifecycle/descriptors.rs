@@ -75,13 +75,20 @@ pub fn is_gone(e: &io::Error) -> bool {
 
 /// The descriptors `pid` holds, under `proc`: through its own folder, or, when
 /// that is refused, through a thread that runs on. Threads share their memory,
-/// so one that is not dumpable is refused through each of them.
+/// so one that is not dumpable is refused through each of them. On a `/proc`
+/// mounted with `hidepid=1`, another user's threads cannot even be listed.
 pub fn of(proc: &Path, pid: u32) -> io::Result<Descriptors> {
     match in_folder(&proc.join(pid.to_string()))? {
         Descriptors::Unreadable => {}
         found => return Ok(found),
     }
-    for thread in other_threads(proc, pid)? {
+    let threads = match other_threads(proc, pid) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            return Ok(Descriptors::Unreadable);
+        }
+        threads => threads?,
+    };
+    for thread in threads {
         if let found @ Descriptors::Open(_) = in_folder(&thread)? {
             return Ok(found);
         }
@@ -144,9 +151,10 @@ fn in_folder(folder: &Path) -> io::Result<Descriptors> {
     Ok(Descriptors::Open(open))
 }
 
-/// The descriptors of every process this user can read, by pid. A listing
-/// where this process itself cannot be read shows nothing it can be trusted
-/// for, so it is an error, as `process::processes` treats its own.
+/// The descriptors of every process this user can read, by pid: one it
+/// cannot read, as another user's, is left out. A listing where this process
+/// itself cannot be read shows nothing it can be trusted for, so it is an
+/// error, as `process::processes` treats its own.
 pub fn every_process(proc: &Path) -> io::Result<Vec<(u32, Vec<Descriptor>)>> {
     let me = std::process::id();
     let mut found = Vec::new();

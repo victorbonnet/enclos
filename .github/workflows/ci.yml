@@ -155,7 +155,6 @@ jobs:
       - name: Scans of a /proc mounted with hidepid=1
         shell: bash
         run: |
-          cargo test --locked --all-features --lib --no-run
           sudo env "PATH=$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             ENCLOS_HIDEPID_TESTS=1 \
