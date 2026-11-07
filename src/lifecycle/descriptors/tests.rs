@@ -31,6 +31,38 @@ fn a_listing_that_does_not_show_the_caller_is_an_error() {
     assert!(every_process(&proc.path().join("none")).is_err());
 }
 
+/// On a `/proc` mounted with `hidepid=1`, another user's folder is listed
+/// and nothing in it can be read, its threads neither: that process is
+/// unreadable and left out of the listing, while the caller's is read.
+#[test]
+fn a_process_whose_whole_folder_is_refused_is_unreadable_and_left_out() {
+    let proc = tempfile::tempdir().unwrap();
+    fake_process(proc.path(), me(), &["/mine"]);
+    fake_process(proc.path(), 7, &["/theirs"]);
+    fake_process(&proc.path().join("7/task"), 8, &["/theirs"]);
+    let folder = refuse(&proc.path().join("7"));
+    let one = of(proc.path(), 7);
+    let every = every_process(proc.path());
+    folder.restore();
+    assert_eq!(one.unwrap(), Descriptors::Unreadable);
+    let every = every.unwrap();
+    assert_eq!(every.len(), 1, "{every:?}");
+    assert_eq!(every[0].0, me());
+}
+
+/// The caller refused the same way leaves a listing that cannot be trusted.
+#[test]
+fn a_listing_whose_caller_is_refused_is_an_error() {
+    let proc = tempfile::tempdir().unwrap();
+    fake_process(proc.path(), me(), &[]);
+    fake_process(proc.path(), 7, &[]);
+    let folder = refuse(&proc.path().join(me().to_string()));
+    let every = every_process(proc.path());
+    folder.restore();
+    let err = every.unwrap_err();
+    assert!(err.to_string().contains("the caller"), "{err}");
+}
+
 /// A process whose main thread exited: its own folder is root's, and
 /// the thread left on it reads what they all hold.
 #[test]
