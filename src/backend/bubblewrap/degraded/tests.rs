@@ -298,3 +298,25 @@ fn a_controller_missing_with_no_boot_option_is_not_in_the_kernel() {
     assert!(check.found.starts_with("not in the kernel"), "{check:?}");
     assert_eq!(fix(&check), "a kernel with the memory controller");
 }
+
+/// `policy show --compiled` says, from the same check, that none of the
+/// Landlock rules it shows apply on Raspberry Pi OS, that part do on an
+/// older ABI, and nothing where all do.
+#[test]
+fn the_compiled_rules_are_said_not_to_apply_where_landlock_does_not() {
+    assert_eq!(landlock_rules_here(&Fixture::ubuntu().kernel()), None);
+    let pi = landlock_rules_here(&Fixture::raspberry_pi_os().kernel()).unwrap();
+    assert_eq!(
+        pi,
+        "on this host, none of the compiled Landlock rules apply (Landlock: not in this kernel: it is built without CONFIG_SECURITY_LANDLOCK); see `enclos doctor`"
+    );
+    let mut older = Fixture::ubuntu();
+    older.landlock_abi = Some(3);
+    let said = landlock_rules_here(&older.kernel()).unwrap();
+    assert!(
+        said.starts_with(
+            "on this host, the compiled Landlock rules apply only in part (Landlock: ABI 3"
+        ),
+        "{said}"
+    );
+}

@@ -360,6 +360,13 @@ pub trait Backend {
     ) -> Vec<crate::model::unenforced::NotEnforcedHere> {
         Vec::new()
     }
+    /// What a policy compiled for this backend holds less of on this host
+    /// than its compiled text shows, one line each, such as rules this
+    /// kernel cannot apply: for `policy show --compiled` to say beside it.
+    /// Compiling stays pure; this reads the host. Nothing by default.
+    fn compiled_not_applied_here(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Its escape probes and refusals for a sandbox whose compiled policy
     /// has the text `compiled`; `None` on a dry run, which compiles nothing.
     /// Fails, saying why, on a text this backend did not compile.

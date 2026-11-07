@@ -151,6 +151,21 @@ fn landlock(kernel: &Kernel) -> HostCheck {
     }
 }
 
+/// What `policy show --compiled` says beside the Landlock rules it shows,
+/// from the check `doctor` reports: none when every rule applies here.
+pub(super) fn landlock_rules_here(kernel: &Kernel) -> Option<String> {
+    let check = landlock(kernel);
+    let applies = match (&check.verdict, kernel.landlock_abi) {
+        (Verdict::Fine, _) => return None,
+        (_, None) => "none of the compiled Landlock rules apply",
+        (_, Some(_)) => "the compiled Landlock rules apply only in part",
+    };
+    Some(format!(
+        "on this host, {applies} (Landlock: {}); see `enclos doctor`",
+        check.found
+    ))
+}
+
 /// What is known of a kernel that gives no Landlock ABI, and the fix: a
 /// boot option where it is built, another kernel where it is not.
 fn landlock_missing(kernel: &Kernel) -> (String, Option<String>) {

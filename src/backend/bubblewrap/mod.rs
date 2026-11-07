@@ -166,6 +166,14 @@ impl Backend for Bubblewrap {
         proposed::not_enforced_here(policy, &host())
     }
 
+    /// The Landlock rules, where this kernel has no Landlock or too old an
+    /// ABI (ADR 0037).
+    fn compiled_not_applied_here(&self) -> Vec<String> {
+        degraded::landlock_rules_here(&degraded::Kernel::host())
+            .into_iter()
+            .collect()
+    }
+
     /// The same probes for every compiled file, which must be one this
     /// backend wrote.
     fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String> {
