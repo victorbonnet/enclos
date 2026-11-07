@@ -139,6 +139,10 @@ _Avoid_: mount, share, volume
 An empty, read-only stand-in over a denied path that cannot be left out, such as one a grant holds, so the path exists but shows nothing and what is around it stays as it was.
 _Avoid_: stub, overlay
 
+**Own place**:
+A place each session of a sandbox has its own of instead of the host's, such as bubblewrap's `/run`, `/tmp` and `/proc`. No workspace may put the host's back over one, by its path or through a link.
+_Avoid_: reserved path, private mount
+
 **Protected path**:
 A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
 _Avoid_: system path, reserved path

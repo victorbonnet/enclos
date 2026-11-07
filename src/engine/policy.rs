@@ -17,6 +17,7 @@ use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::unenforced::UnenforcedField;
 use crate::net::host::AllowEntry;
+use crate::policy::own_places::OwnPlaces;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
 use crate::policy::{self, AdapterLayer, PolicyError, Problem};
@@ -325,7 +326,7 @@ impl Engine {
         policy: &Policy,
         backend: BackendKind,
     ) -> Result<()> {
-        validate(policy, &self.validation_context(name))?;
+        validate(policy, &self.validation_context(name, backend))?;
         validate_secrets(policy, name)?;
         validate_resources(policy, backend, crate::backend::max_files_per_process())?;
         self.accepted_gaps(name, backend, policy, None)?;
@@ -440,13 +441,25 @@ impl Engine {
         }
     }
 
-    pub(super) fn validation_context(&self, name: &SandboxName) -> ValidationContext {
+    /// What sandbox `name`'s policy is checked against, on `backend`: none
+    /// of its own places where this build does not include it, as a sandbox
+    /// there cannot start.
+    pub(super) fn validation_context(
+        &self,
+        name: &SandboxName,
+        backend: BackendKind,
+    ) -> ValidationContext {
         ValidationContext {
             paths: PathContext {
                 user_home: self.layout.user_home().to_owned(),
                 sandbox_home: self.layout.sandbox_home(name.as_str()),
             },
             protected: self.layout.protected(),
+            own_places: self
+                .backends
+                .iter()
+                .find(|b| b.kind() == backend)
+                .map_or(OwnPlaces::NONE, |b| b.own_places()),
         }
     }
 

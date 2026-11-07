@@ -30,7 +30,8 @@ fn a_write_grant_that_holds_the_users_unit_folder_is_refused() {
     let (_dir, engine, name) = with_sandbox();
     let mut policy = engine.active_policy(&name).unwrap().1.policy;
     policy.fs.write.push("~/.config".into());
-    let err = crate::policy::validate::validate_writes(&policy, &engine.validation_context(&name))
+    let ctx = engine.validation_context(&name, BackendKind::Seatbelt);
+    let err = crate::policy::validate::validate_writes(&policy, &ctx)
         .unwrap_err()
         .to_string();
     let units = engine.layout.units_dir().display().to_string();

@@ -28,6 +28,7 @@ use crate::host::HostCheck;
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::model::unenforced::NotEnforcedHere;
+use crate::policy::own_places::OwnPlaces;
 use crate::probes::OwnProbes;
 use crate::relay::inward::WayIn;
 
@@ -108,6 +109,13 @@ impl Backend for Bubblewrap {
     /// Declared for this host's Landlock and cgroups (ADR 0037, ADR 0038).
     fn capabilities(&self) -> Capabilities {
         capabilities(&host())
+    }
+
+    /// `/tmp`, `/run`, `/dev`, `/proc` and the rest, mounted before the
+    /// workspaces; `wrap` checks each workspace against them again as it
+    /// reads the host.
+    fn own_places(&self) -> OwnPlaces {
+        compile::OWN_PLACES
     }
 
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {

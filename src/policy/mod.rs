@@ -3,6 +3,7 @@
 //! snapshot (design §7, ADRs 0008, 0018). Pure functions, no I/O.
 
 pub mod file;
+pub mod own_places;
 pub mod paths;
 pub mod validate;
 
