@@ -376,7 +376,7 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
             println!("To use it in a terminal again: `enclos connect {sandbox}`.");
         }
     }
-    let (code, started) = match r.started.is_empty() {
+    let (code, started) = match r.started.labels.is_empty() {
         true => (exit::OK, Value::Null),
         // In JSON, a start that cannot be checked is said in its value.
         false => super::sandbox::print_started(engine, sandbox, &r.started)?,

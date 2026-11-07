@@ -25,16 +25,23 @@ const GATEWAY: ServiceName = ServiceName::new("gateway");
 pub(super) fn sandbox_with_services(
     runtime: Option<RuntimeKind>,
 ) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+    sandbox_with_services_on(FakeBackend::available(BackendKind::Seatbelt), runtime)
+}
+
+/// [`sandbox_with_services`], on `backend`.
+pub(super) fn sandbox_with_services_on(
+    backend: FakeBackend,
+    runtime: Option<RuntimeKind>,
+) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
     let fake = Rc::new(FakeServices::default());
-    let (dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
-        BackendKind::Seatbelt,
-    ))]);
+    let kind = backend.kind();
+    let (dir, engine) = engine_with(vec![Box::new(backend)]);
     let engine = engine.with_services(Box::new(Rc::clone(&fake)));
     done(engine.init(&alice(), Confirm::Yes).unwrap());
     let name: SandboxName = "home".parse().unwrap();
     let spec = crate::engine::SandboxSpec {
         name: name.clone(),
-        backend: BackendKind::Seatbelt,
+        backend: kind,
         template: "assistant".parse().unwrap(),
     };
     done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
@@ -477,7 +484,7 @@ fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
 #[test]
 fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
     let (_dir, engine, fake, name) = sandbox_with_services(None);
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     assert_eq!(labels, [engine.label(&name, Unit::Proxy).unwrap()]);
     assert_eq!(engine.service_labels(&name).unwrap(), labels);
     assert_eq!(state_of(&engine, &name), SandboxState::Running);
@@ -498,7 +505,7 @@ fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
 #[test]
 fn hermes_adds_one_gateway_for_the_whole_sandbox_and_stop_removes_both() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     let (proxy_label, gateway_label) = (
         engine.label(&name, Unit::Proxy).unwrap(),
         engine.label(&name, Unit::Runtime(GATEWAY)).unwrap(),
@@ -584,7 +591,7 @@ fn services_reach_the_keychain_of_the_enclos_that_started_them() {
 #[test]
 fn starting_again_replaces_the_services_and_a_failed_start_leaves_none() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     engine.start_sandbox(&alice(), &name).unwrap();
     // The earlier ones were removed first, so their processes end.
     assert_eq!(
@@ -1061,7 +1068,7 @@ fn a_sandbox_with_services_installed_is_not_removed() {
 #[test]
 fn stop_removes_every_service_under_the_sandbox_prefix_the_proxy_last() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     let prefix = labels[0].as_str().strip_suffix("proxy").unwrap().to_owned();
     // Left by a runtime that no longer declares it, and by hand.
     fake.seed(&format!("{prefix}old-mail"));

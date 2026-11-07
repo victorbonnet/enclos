@@ -53,7 +53,7 @@ pub use probe::TestReport;
 pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
-pub use service::{PROXY_WAIT, Unit};
+pub use service::{PROXY_WAIT, SandboxStarted, Unit};
 pub use session::{Left, SessionEnd};
 pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]

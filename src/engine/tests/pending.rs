@@ -415,7 +415,10 @@ fn apply_asks_then_restarts_the_sandbox_into_the_pending_policy() {
     let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
     assert_eq!(restarted.version.version, 2);
     assert_eq!(restarted.stopped.unwrap().stopped, [id]);
-    assert!(restarted.started.is_empty(), "no services were installed");
+    assert!(
+        restarted.started.labels.is_empty(),
+        "no services were installed"
+    );
     assert!(engine.policy(&name).unwrap().pending.is_none());
     assert!(writes(&engine, &name, &work));
     let commands = commands(&engine);
@@ -775,7 +778,7 @@ fn apply_stops_the_services_then_starts_them_under_the_pending_policy() {
 
     let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
     assert_eq!(restarted.stopped.as_ref().unwrap().services, installed);
-    assert_eq!(restarted.started, installed);
+    assert_eq!(restarted.started.labels, installed);
     assert_eq!(*fake.stopped.borrow(), installed);
     assert!(writes(&engine, &name, &work));
     let commands = commands(&engine);

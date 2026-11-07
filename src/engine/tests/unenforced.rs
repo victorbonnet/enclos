@@ -2,9 +2,10 @@
 //! (ADR 0038): `memory` on a bubblewrap sandbox, on a fake whose host has no
 //! memory controller.
 
+use super::services::sandbox_with_services_on;
 use super::*;
 use crate::model::sandbox::SandboxName;
-use crate::model::unenforced::UnenforcedField;
+use crate::model::unenforced::{Accepted, UnenforcedField};
 
 const NO_CONTROLLER: &str = "this host's kernel has no memory controller";
 
@@ -167,4 +168,140 @@ fn a_host_that_holds_memory_asks_no_acceptance() {
     edit_memory(&engine, &name, "1G").unwrap();
     assert!(engine.state.acceptances(&name).unwrap().is_empty());
     assert!(entries(&engine, "accept-unenforced").is_empty());
+}
+
+/// The sandbox's `policy.toml` with `memory` changed from `from` to `to`.
+fn change_memory(engine: &Engine, name: &SandboxName, from: &str, to: &str) -> Result<()> {
+    let before = engine.layout.read_policy(name.as_str()).unwrap();
+    let after = before.replace(
+        &format!("memory = \"{from}\""),
+        &format!("memory = \"{to}\""),
+    );
+    engine
+        .policy_edit(&alice(), name, &before, &after, Confirm::Ask)
+        .map(|_| ())
+}
+
+fn held() -> FakeBackend {
+    FakeBackend::available(BackendKind::Bubblewrap)
+}
+
+fn not_held() -> FakeBackend {
+    held().without_memory_controller(NO_CONTROLLER)
+}
+
+/// The one assessment each start, `policy test` and `doctor` read: a
+/// field accepted at its value, one never accepted, and one accepted at
+/// another value, as when the host held it while the value changed.
+#[test]
+fn the_assessment_tells_accepted_missing_and_stale_apart() {
+    let (_dir, mut engine, _fake, name) = sandbox_with_services_on(held(), None);
+    edit_memory(&engine, &name, "1G").unwrap();
+    let assessed = |engine: &Engine| {
+        let policy = engine.active_policy(&name).unwrap().1.policy;
+        engine
+            .not_enforced(&name, BackendKind::Bubblewrap, &policy)
+            .unwrap()
+    };
+    // Held here: nothing to report.
+    assert!(assessed(&engine).is_empty());
+
+    // The host lost the controller: not accepted.
+    engine.backends = vec![Box::new(not_held())];
+    let [missing] = <[_; 1]>::try_from(assessed(&engine)).unwrap();
+    assert_eq!(missing.accepted, Accepted::Missing);
+    assert_eq!(
+        (missing.gap.value.as_str(), missing.gap.why.as_str()),
+        ("1G", NO_CONTROLLER)
+    );
+
+    // Accepted at 1G by `sandbox start --accept-unenforced memory`.
+    let engine = accepting(engine);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    let mut engine = engine.accepting_unenforced(Vec::new());
+    let [kept] = <[_; 1]>::try_from(assessed(&engine)).unwrap();
+    assert!(
+        matches!(&kept.accepted, Accepted::Kept(a) if a.value == "1G"),
+        "{kept:?}"
+    );
+
+    // Changed to 2G while the host held it, then lost again: the
+    // acceptance kept is for 1G only.
+    engine.backends = vec![Box::new(held())];
+    change_memory(&engine, &name, "1G", "2G").unwrap();
+    engine.backends = vec![Box::new(not_held())];
+    let [stale] = <[_; 1]>::try_from(assessed(&engine)).unwrap();
+    assert!(
+        matches!(&stale.accepted, Accepted::Stale(a) if a.value == "1G"),
+        "{stale:?}"
+    );
+    // And a start says so.
+    let err = engine.check_start_limits(&name).unwrap_err().to_string();
+    assert!(err.contains("resources.memory = 2G"), "{err}");
+    assert!(
+        err.contains("The acceptance kept is for resources.memory = 1G"),
+        "{err}"
+    );
+}
+
+/// `sandbox start` says each field not applied in the foreground, once
+/// its services are installed: here a sandbox with no runtime, so no
+/// session of its own would say it.
+#[test]
+fn sandbox_start_says_what_is_not_applied_with_no_runtime() {
+    let (_dir, engine, fake, name) = sandbox_with_services_on(not_held(), None);
+    let engine = accepting(engine);
+    edit_memory(&engine, &name, "1G").unwrap();
+    let engine = engine.accepting_unenforced(Vec::new());
+    let (started, said) = crate::notes::heard(|| engine.start_sandbox(&alice(), &name));
+    let started = started.unwrap();
+    assert_eq!(
+        said,
+        [format!(
+            "sandbox home: resources.memory = 1G is not applied: {NO_CONTROLLER} (enclos doctor)"
+        )]
+    );
+    let [n] = started.not_enforced.as_slice() else {
+        panic!("{started:?}");
+    };
+    assert!(
+        matches!(&n.accepted, Accepted::Kept(a) if a.value == "1G"),
+        "{n:?}"
+    );
+    assert_eq!(started.labels.len(), fake.started.borrow().len());
+    let entry = entries(&engine, "sandbox start").pop().unwrap();
+    let message = entry.finished.unwrap().outcome.message;
+    assert!(
+        message.ends_with("; not enforced on this host: resources.memory (accepted)"),
+        "{message}"
+    );
+}
+
+/// With a runtime, whose service says it in its own log, the foreground
+/// start says it too, once. Here the host lost the controller after the
+/// policy was stored, and the start's `--accept-unenforced` accepts it.
+#[test]
+fn sandbox_start_says_what_is_not_applied_with_a_runtime_service() {
+    let (_dir, mut engine, _fake, name) =
+        sandbox_with_services_on(held(), Some(crate::model::runtime::RuntimeKind::Hermes));
+    edit_memory(&engine, &name, "1G").unwrap();
+    engine.backends = vec![Box::new(not_held())];
+    let engine = accepting(engine);
+    let (started, said) = crate::notes::heard(|| engine.start_sandbox(&alice(), &name));
+    let started = started.unwrap();
+    assert!(
+        started
+            .labels
+            .iter()
+            .any(|l| l.as_str().ends_with(".gateway")),
+        "{started:?}"
+    );
+    let lines: Vec<&String> = said
+        .iter()
+        .filter(|s| s.contains("resources.memory = 1G is not applied"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{said:?}");
+    // Given by this command, and recorded by it.
+    assert_eq!(engine.state.acceptances(&name).unwrap().len(), 1);
+    assert_eq!(entries(&engine, "accept-unenforced").len(), 1);
 }
