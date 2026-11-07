@@ -219,7 +219,8 @@ impl Stores for Picked {
     /// Whether the first store answers, and so where a new secret goes: not
     /// a problem either way (design §12).
     fn host_checks(&self) -> Vec<HostCheck> {
-        let what = capitalized(self.preferred.name().shown());
+        let preferred = self.preferred.name().shown();
+        let what = capitalized(preferred);
         let otherwise = self.otherwise.name().shown();
         vec![match self.answers() {
             true => HostCheck::fine(&what, "answers: a new secret goes there"),
@@ -227,7 +228,7 @@ impl Stores for Picked {
                 &what,
                 format!("none answers here: a new secret goes to {otherwise}"),
                 Some(format!(
-                    "to keep new secrets there instead, {}",
+                    "to keep new secrets in {preferred} rather than {otherwise}, {}",
                     self.preferred.to_answer()
                 )),
             ),
@@ -632,7 +633,15 @@ mod tests {
         let [check] = case.picked.host_checks().try_into().unwrap();
         assert_eq!(check.verdict, crate::host::Verdict::Note);
         assert!(check.found.contains("goes to the file store"), "{check:?}");
-        assert!(check.fix.unwrap().contains("start the stand-in"));
+        let fix = check.fix.unwrap();
+        assert!(fix.contains("start the stand-in"), "{fix}");
+        // The store it names, not "there".
+        assert!(
+            fix.starts_with(
+                "to keep new secrets in the Secret Service rather than the file store,"
+            ),
+            "{fix}"
+        );
         assert_eq!(case.looks.get(), 1);
         let alone = InMemory::named(StoreName::Keychain);
         assert!(alone.host_checks().is_empty());
