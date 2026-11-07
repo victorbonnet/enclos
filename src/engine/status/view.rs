@@ -114,6 +114,8 @@ pub struct SandboxStatus {
     /// The last refusal, within the last 7 days, because the proxy could
     /// not read the sandbox's policy.
     pub policy_unreadable_at: Option<Timestamp>,
+    /// How many connections the proxy refused so, in the same 7 days.
+    pub policy_unreadable_refused: u64,
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,

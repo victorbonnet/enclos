@@ -38,6 +38,7 @@ pub enum Suggestion {
     },
     LookAtProxy {
         sandbox: SandboxName,
+        refused: u64,
         last: Timestamp,
     },
     Restart {
@@ -119,8 +120,12 @@ impl Suggestion {
             Suggestion::ReviewRefused { refused, .. } => {
                 format!("{refused} destinations refused in the last {REFUSED_DAYS} days")
             }
-            Suggestion::LookAtProxy { last, .. } => format!(
-                "the proxy could not read the policy and refused every connection, last at {}",
+            Suggestion::LookAtProxy { refused, last, .. } => format!(
+                "{refused} {} refused as the proxy could not read the policy, the last at {}",
+                match refused {
+                    1 => "connection",
+                    _ => "connections",
+                },
                 last.strftime("%Y-%m-%d %H:%M UTC")
             ),
             Suggestion::Restart { .. } => {
@@ -232,6 +237,7 @@ pub fn suggest(sandboxes: &[SandboxStatus], now: Timestamp) -> Vec<Suggestion> {
         if let Some(last) = s.policy_unreadable_at {
             out.push(Suggestion::LookAtProxy {
                 sandbox: sandbox(),
+                refused: s.policy_unreadable_refused,
                 last,
             });
         }

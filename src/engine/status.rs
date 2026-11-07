@@ -121,11 +121,13 @@ impl Engine {
             .iter()
             .filter(|d| !d.reason.nothing_to_allow())
             .count();
-        let policy_unreadable_at = denied
-            .iter()
-            .filter(|d| d.reason == Reason::PolicyUnreadable)
-            .map(|d| d.last)
-            .max();
+        let unreadable = || {
+            denied
+                .iter()
+                .filter(|d| d.reason == Reason::PolicyUnreadable)
+        };
+        let policy_unreadable_at = unreadable().map(|d| d.last).max();
+        let policy_unreadable_refused = unreadable().map(|d| d.count).sum();
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(
                 list.into_iter()
@@ -195,6 +197,7 @@ impl Engine {
             last_used,
             refused_recently,
             policy_unreadable_at,
+            policy_unreadable_refused,
             agents,
             disk,
             dashboard,
