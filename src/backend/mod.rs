@@ -344,8 +344,9 @@ pub trait Backend {
         launch: &Launch,
     ) -> Result<Command, WrapError>;
     /// What each session's start says of `policy` on this backend, one line
-    /// each: a field it does not hold, which the policy still runs with.
-    /// Nothing by default.
+    /// each: a field it holds on no host, which the policy still runs with.
+    /// A field this host does not hold ([`Backend::not_enforced_here`]) is
+    /// the engine's to say. Nothing by default.
     fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
         Vec::new()
     }

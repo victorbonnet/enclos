@@ -147,10 +147,9 @@ impl Backend for Bubblewrap {
         wrap::command(&programs, compiled, &parsed, &host, ctx, launch)
     }
 
-    /// `listen = false` is not held (ADR 0041), nor a field this host does
-    /// not enforce (ADR 0038): every start says so.
+    /// `listen = false` is not held (ADR 0041): every start says so.
     fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String> {
-        let listen = proposed::unenforced(policy)
+        proposed::unenforced(policy)
             .into_iter()
             .filter(|u| u.field == proposed::LISTEN)
             .map(|u| {
@@ -158,12 +157,8 @@ impl Backend for Bubblewrap {
                     "sandbox {}: `listen = false` is not held on bubblewrap: {} (enclos doctor)",
                     ctx.name, u.why
                 )
-            });
-        let here = self
-            .not_enforced_here(policy)
-            .into_iter()
-            .map(|gap| gap.said_at_start(ctx.name.as_str()));
-        listen.chain(here).collect()
+            })
+            .collect()
     }
 
     /// `memory`, where this host's cgroups do not hold it (ADR 0038).

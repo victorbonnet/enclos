@@ -330,13 +330,14 @@ impl Engine {
                 (None, None, env, named)
             }
         };
+        let (limits, not_applied) = self.launch_limits_saying(&record, &snapshot.policy)?;
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
             env,
             in_terminal: starting.in_terminal(),
             service_port,
-            limits: self.launch_limits(&record, &snapshot.policy)?,
+            limits,
             reads: starting.reads(),
         };
         let backend = self.backend_of(name)?;
@@ -345,9 +346,16 @@ impl Engine {
             .map_err(|e| Error::Session {
                 what: format!("cannot start {named}: {e}"),
             })?;
-        // What the policy says that this backend does not hold, before the
-        // program prints anything of its own.
-        for line in backend.said_at_start(&snapshot.policy, &ctx) {
+        // What the policy says that this backend or this host does not
+        // hold, before the program prints anything of its own.
+        let host = not_applied
+            .iter()
+            .map(|n| n.gap.said_at_start(name.as_str()));
+        for line in backend
+            .said_at_start(&snapshot.policy, &ctx)
+            .into_iter()
+            .chain(host)
+        {
             crate::notes::say(&line);
         }
         let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;

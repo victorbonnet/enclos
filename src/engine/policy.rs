@@ -15,7 +15,7 @@ use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::policy::{NetMode, PendingPolicy, Policy, PolicySnapshot, PolicyVersion};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::{BackendKind, SandboxName};
-use crate::model::unenforced::UnenforcedField;
+use crate::model::unenforced::{NotEnforced, UnenforcedField};
 use crate::net::host::AllowEntry;
 use crate::policy::paths::PathContext;
 use crate::policy::validate::{ValidationContext, validate, validate_resources, validate_secrets};
@@ -371,21 +371,38 @@ impl Engine {
         record: &crate::model::sandbox::SandboxRecord,
         policy: &Policy,
     ) -> Result<LaunchLimits> {
+        Ok(self.launch_limits_saying(record, policy)?.0)
+    }
+
+    /// [`Engine::launch_limits`], with what runs not enforced, every one
+    /// accepted, for the start to say.
+    pub(super) fn launch_limits_saying(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+        policy: &Policy,
+    ) -> Result<(LaunchLimits, Vec<NotEnforced>)> {
+        let limits = self.checked_limits(record, policy)?;
+        let start = format!("enclos sandbox start {}", record.name);
+        let assessed = self.accepted_gaps(&record.name, record.backend, policy, Some(&start))?;
+        Ok((leaving_out(limits, &assessed), assessed))
+    }
+
+    /// The limits `policy` sets for sandbox `record`, checked against its
+    /// backend and the hard limits enclos runs under, each field included.
+    pub(super) fn checked_limits(
+        &self,
+        record: &crate::model::sandbox::SandboxRecord,
+        policy: &Policy,
+    ) -> Result<LaunchLimits> {
         validate_resources(
             policy,
             record.backend,
             crate::backend::max_files_per_process(),
         )?;
-        let mut limits =
+        let limits =
             LaunchLimits::of_checked(&policy.resources).map_err(|what| Error::Session { what })?;
         if let Some(why) = crate::backend::unsettable(&limits) {
             return Err(Error::Session { what: why });
-        }
-        let start = format!("enclos sandbox start {}", record.name);
-        for gap in self.accepted_gaps(&record.name, record.backend, policy, Some(&start))? {
-            match gap.field {
-                UnenforcedField::Memory => limits = limits.without_memory(),
-            }
         }
         Ok(limits)
     }
@@ -693,6 +710,17 @@ pub(super) fn with_allowed(text: &str, entry: &str) -> Result<Option<String>> {
         .ok_or_else(not_a_table)?;
     list.push(entry);
     Ok(Some(doc.to_string()))
+}
+
+/// `limits` without each field in `not_enforced`, which this host does not
+/// hold, accepted or not.
+pub(super) fn leaving_out(mut limits: LaunchLimits, not_enforced: &[NotEnforced]) -> LaunchLimits {
+    for n in not_enforced {
+        match n.gap.field {
+            UnenforcedField::Memory => limits = limits.without_memory(),
+        }
+    }
+    limits
 }
 
 #[cfg(test)]
