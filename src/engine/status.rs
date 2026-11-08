@@ -140,18 +140,22 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
-        let network_listeners = network_listeners(&look, &running);
+        // The host does not reach a listener in the sandbox's own network
+        // namespace (ADR 0039, ADR 0040), so there is none to look for.
+        let own_network = self.holder_of(record.backend).is_some();
+        let network_listeners = match own_network {
+            true => Fact::NotProvided,
+            false => network_listeners(&look, &running),
+        };
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
-            // The host does not reach a listener in the sandbox's own
-            // network namespace (ADR 0039, ADR 0040).
-            Some(_) if self.holder_of(record.backend).is_some() => Fact::NotProvided,
+            Some(_) if own_network => Fact::NotProvided,
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
         // There, `enclos dashboard` opens it, with no address to give now.
         let dashboard_command = runtime
             .and_then(|rt| rt.dashboard())
-            .filter(|_| self.holder_of(record.backend).is_some())
+            .filter(|_| own_network)
             .map(|_| format!("enclos dashboard {name}"));
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {

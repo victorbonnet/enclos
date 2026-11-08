@@ -401,6 +401,23 @@ fn sandbox_start_keeps_a_namespace_holder_that_answers() {
     assert_eq!(holders(), 1);
 }
 
+/// `status` looks for no listener of a bubblewrap sandbox: its sessions
+/// listen in its own network namespace, which the host's network does not
+/// reach (ADR 0040). A look at every member would not tell anyway, since
+/// `enclos inside`, each session's first process, is not dumpable. CI's
+/// `bubblewrap` job shows it with sessions running
+/// (`tests/bubblewrap/status.rs`).
+#[test]
+fn status_looks_for_no_listener_of_a_bubblewrap_sandbox() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let view = stood.engine.status(Some(&stood.name)).unwrap();
+    assert_eq!(
+        view.sandboxes[0].network_listeners,
+        crate::engine::Fact::NotProvided
+    );
+}
+
 /// `listen = false`, which every template leaves, is not held on
 /// bubblewrap (design §15): each start says so, once.
 #[test]

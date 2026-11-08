@@ -94,6 +94,9 @@ fn on_a_runner_status_tells_a_bubblewrap_sandboxs_listeners() {
         text(&tree.stdout)
     );
     assert!(!said.contains("your network can reach"), "{said}");
-    assert!(!sandboxed, "the session's port {port} answered at {address}");
+    assert!(
+        !sandboxed,
+        "the session's port {port} answered at {address}"
+    );
     assert!(control, "the host's listener did not answer at {address}");
 }
