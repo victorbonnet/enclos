@@ -212,3 +212,172 @@ fn accepted_access_is_not_limited_to_the_inbox_history_window() {
     }
     assert_eq!(store.accepted_access().unwrap().len(), 210);
 }
+
+fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub {
+        transport: Transport::Tailscale,
+        store_path: dir.path().join("app.db"),
+        layout: crate::layout::Layout::at(dir.path().join("enclos")),
+        bridge_private: vec![],
+        agents: vec![],
+        host: Some("owner@example.com".into()),
+        plugins: Mutex::new(HashMap::new()),
+        commands: Mutex::new(HashMap::new()),
+        groups: Mutex::new(HashMap::new()),
+        stops: Mutex::new(Default::default()),
+        devices: Mutex::new(HashMap::new()),
+    });
+    let store = hub.store().unwrap();
+    (dir, hub, store)
+}
+
+#[test]
+fn diagnostic_probe_destination_never_becomes_an_approval_request() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    hub.request_access(
+        &store,
+        "lab",
+        None,
+        Access {
+            kind: AccessKind::Network,
+            target: "probe.enclos.invalid:8443".into(),
+            private: false,
+        },
+        "Connect to the network probe",
+    )
+    .unwrap();
+    assert!(
+        store.approvals().unwrap().is_empty(),
+        "an enclos diagnostic probe must not enter the approval inbox"
+    );
+}
+
+#[test]
+fn diagnostic_probe_matching_is_exact_and_real_destinations_still_request_access() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    for target in ["PROBE.ENCLOS.INVALID.:443", "probe.enclos.invalid:8080"] {
+        hub.request_access(
+            &store,
+            "lab",
+            None,
+            Access {
+                kind: AccessKind::Network,
+                target: target.into(),
+                private: false,
+            },
+            "probe",
+        )
+        .unwrap();
+    }
+    assert!(store.approvals().unwrap().is_empty());
+    for target in [
+        "10.0.0.1:443",
+        "api.example.com:8443",
+        "other.enclos.invalid:8443",
+        "probe.enclos.invalid.example.com:443",
+    ] {
+        hub.request_access(
+            &store,
+            "lab",
+            None,
+            Access {
+                kind: AccessKind::Network,
+                target: target.into(),
+                private: true,
+            },
+            "agent work",
+        )
+        .unwrap();
+    }
+    assert_eq!(store.approvals().unwrap().len(), 4);
+}
+#[test]
+fn diagnostic_probe_existing_pending_notification_is_dismissed_and_broadcast() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let (tx, rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("d1".into(), ("owner@example.com".into(), tx));
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    a.agent.clear();
+    store.create_approval(&a).unwrap();
+    hub.dismiss_probe_requests(&store).unwrap();
+    let closed = store.approval(&a.request).unwrap().unwrap();
+    assert_eq!(closed.state, "diagnostic");
+    assert!(!closed.available);
+    assert!(!store.claim_approval(&a.request).unwrap());
+    assert!(matches!(rx.try_recv().unwrap(),ToDevice::Approval(v) if v.state=="diagnostic"));
+    hub.dismiss_probe_requests(&store).unwrap();
+    assert!(rx.try_recv().is_err());
+}
+#[test]
+fn diagnostic_probe_dismissal_preserves_existing_decisions_and_rejects_explicit_agent_requests() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    store.create_approval(&a).unwrap();
+    store.claim_approval(&a.request).unwrap();
+    assert!(store.dismiss_probe(&a).unwrap().is_none());
+    a.state = "approved".into();
+    store.put_approval(&a).unwrap();
+    hub.dismiss_probe_requests(&store).unwrap();
+    assert_eq!(
+        store.approval(&a.request).unwrap().unwrap().state,
+        "approved"
+    );
+    assert!(
+        hub.request_access(
+            &store,
+            "lab/coder",
+            Some("c1"),
+            Access {
+                kind: AccessKind::Network,
+                target: "probe.enclos.invalid:8443".into(),
+                private: false
+            },
+            "probe"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn diagnostic_probe_stale_phone_decision_cannot_approve_the_notification() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let device = Device {
+        id: "d1".into(),
+        name: "phone".into(),
+        person: "owner@example.com".into(),
+        noise_key: vec![],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+    };
+    store.add_device(&device).unwrap();
+    let mut a = approval_sample();
+    a.access.target = "probe.enclos.invalid:8443".into();
+    store.create_approval(&a).unwrap();
+    let error = hub
+        .decide_access(
+            &store,
+            &device,
+            "owner@example.com",
+            &a.request,
+            &a.revision,
+            true,
+        )
+        .unwrap_err();
+    assert!(error.contains("diagnostic"));
+    assert_eq!(
+        store.approval(&a.request).unwrap().unwrap().state,
+        "diagnostic"
+    );
+}

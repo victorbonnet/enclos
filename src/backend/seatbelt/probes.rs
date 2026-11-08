@@ -468,7 +468,10 @@ fn clone_probe(folder: &Path, tag: u32) -> Probe {
 /// to open the port there too, so the proxy listens there; whatever the
 /// sandbox reaches at that address must be the proxy.
 fn ipv6_loopback_probe(port: u16) -> Probe {
-    let url = format!("--proxy 'http://[::1]:{port}' https://probe.enclos.invalid:8443/");
+    let url = format!(
+        "--proxy 'http://[::1]:{port}' https://{}:8443/",
+        crate::probes::POLICY_PROBE_HOST
+    );
     let script = format!("{}; echo \" $?\"", curl_through_proxy(&url));
     Probe {
         route: "network",
