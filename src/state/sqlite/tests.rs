@@ -868,3 +868,158 @@ fn reports_a_corrupt_agent_or_runtime() {
     .unwrap();
     assert!(matches!(store.get(&name), Err(StateError::Corrupt { .. })));
 }
+
+#[test]
+fn diagnostic_provenance_excludes_only_host_registered_probe_connections() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    let event = NetEvent {
+        at: now(),
+        sandbox: name.clone(),
+        host: "10.0.0.1".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict: Verdict::Denied,
+        reason: Some(Reason::PrivateAddress),
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    store.begin_probe(&name, &tag).unwrap();
+    store.record_probe(&event, Some(&tag)).unwrap();
+    assert_eq!(
+        store.denied(&name).unwrap().len(),
+        1,
+        "diagnostic stays in the network log"
+    );
+    assert!(store.denied_for_approval(&name).unwrap().is_empty());
+    store.record_probe(&event, Some(&"b".repeat(64))).unwrap();
+    assert_eq!(
+        store.denied_for_approval(&name).unwrap()[0].count,
+        1,
+        "an unregistered client marker is ordinary traffic"
+    );
+    store.end_probe(&tag).unwrap();
+    store.record_probe(&event, Some(&tag)).unwrap();
+    assert_eq!(
+        store.denied_for_approval(&name).unwrap()[0].count,
+        2,
+        "closed tags cannot suppress later traffic"
+    );
+    assert_eq!(store.events(&name, None).unwrap().len(), 3);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("probe-sources.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn diagnostic_provenance_is_scoped_to_one_sandbox_and_does_not_change_enforcement() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    store.put(&lock, &record("other")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&name, &tag).unwrap();
+    let other: SandboxName = "other".parse().unwrap();
+    let e = NetEvent {
+        at: now(),
+        sandbox: other.clone(),
+        host: "10.0.0.1".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict: Verdict::Denied,
+        reason: Some(Reason::PrivateAddress),
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    store.record_probe(&e, Some(&tag)).unwrap();
+    assert_eq!(store.denied_for_approval(&other).unwrap().len(), 1);
+    assert_eq!(
+        store.events(&other, None).unwrap()[0].verdict,
+        Verdict::Denied
+    );
+}
+
+#[test]
+fn diagnostic_provenance_expires_and_survives_log_reader_reconnects() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&name, &tag).unwrap();
+    let event = NetEvent {
+        at: now(),
+        sandbox: name.clone(),
+        host: "10.0.0.1".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict: Verdict::Denied,
+        reason: Some(Reason::PrivateAddress),
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    store.record_probe(&event, Some(&tag)).unwrap();
+    let other = SqliteStateStore::new(&store.db, &store.lock_file);
+    assert!(other.denied_for_approval(&name).unwrap().is_empty());
+    let sources = Connection::open(dir.path().join("probe-sources.db")).unwrap();
+    sources
+        .execute("UPDATE runs SET expires='2000-01-01T00:00:00.000Z'", [])
+        .unwrap();
+    store.record_probe(&event, Some(&tag)).unwrap();
+    assert_eq!(other.denied_for_approval(&name).unwrap()[0].count, 1);
+}
+
+#[test]
+fn diagnostic_provenance_missing_or_corrupt_metadata_preserves_the_log_and_approval_candidates() {
+    use crate::model::net::{NetEvent, Reason, Verdict};
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let event = NetEvent {
+        at: now(),
+        sandbox: name.clone(),
+        host: "10.0.0.1".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        address: None,
+        verdict: Verdict::Denied,
+        reason: Some(Reason::PrivateAddress),
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        name_seen: None,
+    };
+    let path = dir.path().join("probe-sources.db");
+    std::fs::write(&path, []).unwrap();
+    store.record_probe(&event, Some(&"a".repeat(64))).unwrap();
+    assert_eq!(store.denied_for_approval(&name).unwrap()[0].count, 1);
+    std::fs::write(path, b"not a sqlite database").unwrap();
+    store.record_probe(&event, Some(&"a".repeat(64))).unwrap();
+    assert_eq!(store.denied_for_approval(&name).unwrap()[0].count, 2);
+}

@@ -57,16 +57,35 @@ impl Hub {
         {
             return Err("invalid access target".into());
         }
-        if store
+        if let Some(mut existing) = store
             .approvals()
             .map_err(|e| e.to_string())?
-            .iter()
-            .any(|a| {
+            .into_iter()
+            .find(|a| {
                 a.sandbox == sandbox
                     && a.access == access
                     && (a.state == "pending" || a.state == "applying")
             })
         {
+            // An authenticated agent's explicit request must not be mistaken for a probe.
+            if existing.state == "pending" && existing.agent.is_empty() && agent.contains('/') {
+                existing.agent = agent.into();
+                existing.conversation = conversation.map(str::to_owned);
+                existing.action = action
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(240)
+                    .collect();
+                if !store
+                    .refresh_approval(&existing)
+                    .map_err(|e| e.to_string())?
+                {
+                    return self.request_access(store, agent, conversation, access, action);
+                }
+                if let Some(person) = &self.host {
+                    self.deliver(person, ToDevice::Approval(existing));
+                }
+            }
             return Ok(());
         }
         let policy = sandbox
@@ -75,15 +94,22 @@ impl Hub {
             .and_then(|n| Engine::open(self.layout.clone()).policy(&n).ok())
             .map(|v| v.snapshot.id.to_string())
             .unwrap_or_default();
-        let key = crate::policy::sha256_hex(
+        let mut key = crate::policy::sha256_hex(
             format!(
                 "{sandbox}:{policy}:{}",
                 serde_json::to_string(&access).map_err(|e| e.to_string())?
             )
             .as_bytes(),
         );
-        if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
-            return Ok(());
+        if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
+            if old.state != "diagnostic" {
+                return Ok(());
+            }
+            // A later genuine attempt gets a new id; stale decisions for the test stay closed.
+            key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
+            if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
+                return Ok(());
+            }
         }
         let mut a = Approval {
             request: key,
@@ -118,10 +144,39 @@ impl Hub {
         Ok(())
     }
 
+    fn only_probe_events(&self, a: &Approval) -> bool {
+        if !a.agent.is_empty() || a.access.kind != AccessKind::Network {
+            return false;
+        }
+        let Ok(name) = a.sandbox.parse::<SandboxName>() else {
+            return false;
+        };
+        let Ok(target) = crate::net::host::AllowEntry::parse(&a.access.target) else {
+            return false;
+        };
+        let engine = Engine::open(self.layout.clone());
+        let matches = |d: &crate::model::net::DeniedDestination| {
+            d.host == target.host_text()
+                && d.port == target.port
+                && matches!(
+                    d.reason,
+                    crate::model::net::Reason::NotAllowed
+                        | crate::model::net::Reason::PrivateAddress
+                )
+        };
+        let Ok(all) = engine.net_denied(&name) else {
+            return false;
+        };
+        let Ok(ordinary) = engine.net_denied_for_approval(&name) else {
+            return false;
+        };
+        all.iter().any(matches) && !ordinary.iter().any(matches)
+    }
+
     pub(super) fn dismiss_probe_requests(&self, store: &Store) -> Result<(), String> {
         for a in store.approvals().map_err(|e| e.to_string())? {
             if a.state == "pending"
-                && diagnostic_access(&a.access)
+                && (diagnostic_access(&a.access) || self.only_probe_events(&a))
                 && let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())?
                 && let Some(person) = &self.host
             {
@@ -149,7 +204,7 @@ impl Hub {
                 .snapshot
                 .policy;
             for d in engine
-                .net_denied(&name)
+                .net_denied_for_approval(&name)
                 .map_err(|e| e.to_string())?
                 .into_iter()
                 .take(200)
@@ -216,7 +271,7 @@ impl Hub {
             .approval(id)
             .map_err(|e| e.to_string())?
             .ok_or("Unknown policy request")?;
-        if a.state == "pending" && diagnostic_access(&a.access) {
+        if a.state == "pending" && (diagnostic_access(&a.access) || self.only_probe_events(&a)) {
             if let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
                 self.deliver(person, ToDevice::Approval(closed));
             }

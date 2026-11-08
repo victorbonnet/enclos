@@ -26,6 +26,33 @@ use crate::probes::{
     ToolCheck, not_here, outcome, probes, sandboxed_script, with_real_paths,
 };
 
+struct ProbeRun<'a> {
+    store: &'a dyn crate::state::StateStore,
+    tag: String,
+}
+impl Drop for ProbeRun<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.store.end_probe(&self.tag) {
+            eprintln!("enclos: could not close diagnostic run metadata: {e}");
+        }
+    }
+}
+fn tag_probe(probe: &mut Probe, tag: &str) {
+    let mark = |script: &str| {
+        script.replace(
+            "/usr/bin/curl ",
+            &format!("/usr/bin/curl --proxy-header 'X-Enclos-Probe: {tag}' "),
+        )
+    };
+    probe.script = mark(&probe.script);
+    match &mut probe.proof {
+        Proof::Control { control, .. } | Proof::OnlyTheProxy { control } => {
+            *control = crate::probes::HostScript::new(mark(control.as_str()))
+        }
+        Proof::ProxyRefuses => (),
+    }
+}
+
 /// What `enclos policy test` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestReport {
@@ -242,7 +269,20 @@ impl Engine {
                 list.extend(own.host_services(&inputs));
             }
             let mut results = Vec::new();
-            for probe in list {
+            let tag: String = crate::bridge::ids::random_bytes(32)
+                .map_err(|e| Error::Session {
+                    what: e.to_string(),
+                })?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            self.state.begin_probe(name, &tag)?;
+            let _run = ProbeRun {
+                store: self.state.as_ref(),
+                tag: tag.clone(),
+            };
+            for mut probe in list {
+                tag_probe(&mut probe, &tag);
                 let run_in_sandbox = |script: String| {
                     let launch = Launch {
                         program: "/bin/sh".into(),
@@ -812,5 +852,35 @@ mod tests {
             run_probe(&signal, refused, &mut target.0),
             Outcome::NotRun(why) if why.contains("ended before")
         ));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_source_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_provenance_tags_the_sandbox_attempt_and_its_host_control() {
+        let script = "/usr/bin/curl --proxy http://127.0.0.1:41000 https://10.0.0.1/";
+        let mut probe = Probe {
+            route: "network",
+            name: "private address".into(),
+            script: script.into(),
+            proof: Proof::OnlyTheProxy {
+                control: crate::probes::HostScript::new(script),
+            },
+            host: None,
+            closed_by: None,
+        };
+        let tag = "a".repeat(64);
+        tag_probe(&mut probe, &tag);
+        assert!(
+            probe
+                .script
+                .contains(&format!("--proxy-header 'X-Enclos-Probe: {tag}'"))
+        );
+        let Proof::OnlyTheProxy { control } = probe.proof else {
+            panic!("wrong proof")
+        };
+        assert!(control.as_str().contains(&tag));
     }
 }

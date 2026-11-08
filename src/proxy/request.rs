@@ -30,6 +30,21 @@ pub enum Request {
     },
 }
 
+/// An opaque candidate, authenticated against a host-only active run by the log store.
+pub(super) fn probe_tag(head: &str) -> Option<String> {
+    let tags: Vec<_> = head
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("X-Enclos-Probe"))
+        .map(|(_, value)| value.trim())
+        .collect();
+    if tags.len() != 1 || tags[0].len() != 64 || !tags[0].bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(tags[0].to_owned())
+}
+
 /// Reads up to the end of the request head. Returns the head and any bytes
 /// the client already sent after it.
 pub fn read_head(stream: &mut impl Read) -> io::Result<(String, Vec<u8>)> {
@@ -193,7 +208,12 @@ pub fn origin_head(
             .to_ascii_lowercase();
         if matches!(
             name.as_str(),
-            "host" | "proxy-connection" | "proxy-authorization" | "connection" | "keep-alive"
+            "x-enclos-probe"
+                | "host"
+                | "proxy-connection"
+                | "proxy-authorization"
+                | "connection"
+                | "keep-alive"
         ) {
             continue;
         }
@@ -378,5 +398,35 @@ mod tests {
         );
         let v6 = origin_head("GET", "/", "HTTP/1.1", &[], "fd00::1", 80, 0);
         assert!(v6.contains("Host: [fd00::1]\r\n"), "{v6}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_tag_is_bounded_and_never_forwarded_upstream() {
+        let tag = "a".repeat(64);
+        assert_eq!(
+            probe_tag(&format!(
+                "CONNECT 10.0.0.1:443 HTTP/1.1\r\nX-Enclos-Probe: {tag}\r\n\r\n"
+            )),
+            Some(tag.clone())
+        );
+        assert!(
+            probe_tag("CONNECT host:443 HTTP/1.1\r\nX-Enclos-Probe: arbitrary\r\n\r\n").is_none()
+        );
+        assert!(probe_tag(&format!("CONNECT host:443 HTTP/1.1\r\nX-Enclos-Probe: {tag}\r\nX-Enclos-Probe: {tag}\r\n\r\n")).is_none());
+        let head = origin_head(
+            "GET",
+            "/",
+            "HTTP/1.1",
+            &[format!("X-Enclos-Probe: {tag}"), "X-Other: keep".into()],
+            "example.com",
+            80,
+            0,
+        );
+        assert!(!head.to_lowercase().contains("x-enclos-probe"));
+        assert!(head.contains("X-Other: keep"));
     }
 }
