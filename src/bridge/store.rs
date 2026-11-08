@@ -337,8 +337,8 @@ impl Store {
         let body = serde_json::to_string(&closed)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         Ok((self.db.execute(
-            "UPDATE approvals SET body=?2,state='diagnostic' WHERE id=?1 AND state='pending'",
-            params![a.request, body],
+            "UPDATE approvals SET body=?2,state='diagnostic' WHERE id=?1 AND state='pending' AND body=?3",
+            params![a.request, body, serde_json::to_string(a).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?],
         )? == 1)
             .then_some(closed))
     }

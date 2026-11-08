@@ -299,7 +299,7 @@ impl Engine {
             if let Some(new) = &edit.after {
                 let value = if edit.field == "write" {
                     let expanded = self
-                        .validation_context(name)
+                        .validation_context(name, self.recorded_backend(name)?)
                         .paths
                         .expand(new)
                         .map_err(|e| refused(e.to_string()))?;

@@ -381,3 +381,80 @@ fn diagnostic_probe_stale_phone_decision_cannot_approve_the_notification() {
         "diagnostic"
     );
 }
+
+#[test]
+fn diagnostic_provenance_preserves_explicit_agent_identity_and_later_real_requests() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let a = Access {
+        kind: AccessKind::Network,
+        target: "10.0.0.1:443".into(),
+        private: true,
+    };
+    hub.request_access(&store, "lab", None, a.clone(), "proxy refusal")
+        .unwrap();
+    let old = store.approvals().unwrap()[0].clone();
+    hub.request_access(
+        &store,
+        "lab/coder",
+        Some("c1"),
+        a.clone(),
+        "explicit request",
+    )
+    .unwrap();
+    assert_eq!(
+        store.approval(&old.request).unwrap().unwrap().agent,
+        "lab/coder"
+    );
+    assert!(
+        store.dismiss_probe(&old).unwrap().is_none(),
+        "stale cleanup cannot discard the agent identity update"
+    );
+    assert_eq!(
+        store.approval(&old.request).unwrap().unwrap().state,
+        "pending"
+    );
+}
+
+#[test]
+fn diagnostic_provenance_later_real_requests_get_fresh_ids_and_keep_denial_deduplication() {
+    use enclos_protocol::approval::{Access, AccessKind};
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let a = Access {
+        kind: AccessKind::Network,
+        target: "10.0.0.1:443".into(),
+        private: true,
+    };
+    hub.request_access(&store, "lab", None, a.clone(), "proxy refusal")
+        .unwrap();
+    let old = store.approvals().unwrap()[0].clone();
+    assert!(store.dismiss_probe(&old).unwrap().is_some());
+    hub.request_access(
+        &store,
+        "lab/coder",
+        Some("c1"),
+        a.clone(),
+        "genuine later attempt",
+    )
+    .unwrap();
+    let next = store
+        .approvals()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.state == "pending")
+        .unwrap();
+    assert_ne!(next.request, old.request);
+    store.claim_approval(&next.request).unwrap();
+    let mut denied = next.clone();
+    denied.state = "denied".into();
+    store.put_approval(&denied).unwrap();
+    hub.request_access(&store, "lab", None, a, "same refusal")
+        .unwrap();
+    assert!(
+        !store
+            .approvals()
+            .unwrap()
+            .iter()
+            .any(|v| v.state == "pending")
+    );
+}

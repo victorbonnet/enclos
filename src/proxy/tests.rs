@@ -1851,3 +1851,58 @@ print(answer.status, answer.read().decode())
         );
     }
 }
+
+#[test]
+fn diagnostic_provenance_keeps_private_probe_blocked_but_out_of_approvals() {
+    use crate::model::sandbox::{BackendKind, SandboxRecord, SandboxState};
+    use crate::state::StateStore;
+    use crate::state::sqlite::SqliteStateStore;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let lockfile = dir.path().join("state.lock");
+    let store = SqliteStateStore::new(&db, &lockfile);
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store
+        .put(
+            &lock,
+            &SandboxRecord {
+                name: name.clone(),
+                backend: BackendKind::Seatbelt,
+                created_from: "assistant".parse().unwrap(),
+                proxy_port: 41000,
+                runtime: None,
+                state: SandboxState::Created,
+                created_at: crate::model::now(),
+            },
+        )
+        .unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&name, &tag).unwrap();
+    drop(lock);
+    let log = SqliteStateStore::new(&db, &lockfile);
+    let proxy = start_with(
+        &["10.0.0.1".into()],
+        Box::new(FakeResolver("10.0.0.1".parse().unwrap())),
+        crate::net::addr::classify,
+        |proxy| proxy.log = Box::new(log),
+    );
+    let (_, reply) = send(
+        proxy.addr.clone(),
+        &format!("CONNECT 10.0.0.1:443 HTTP/1.1\r\nX-Enclos-Probe: {tag}\r\n\r\n"),
+    );
+    assert!(reply.starts_with("HTTP/1.1 403"));
+    assert_eq!(
+        store.events(&name, None).unwrap()[0].reason,
+        Some(Reason::PrivateAddress)
+    );
+    assert!(store.denied_for_approval(&name).unwrap().is_empty());
+    let (_, reply) = send(proxy.addr, "CONNECT 10.0.0.1:443 HTTP/1.1\r\n\r\n");
+    assert!(reply.starts_with("HTTP/1.1 403"));
+    assert_eq!(
+        store.denied_for_approval(&name).unwrap()[0].count,
+        1,
+        "a real request to the same address stays visible"
+    );
+}
