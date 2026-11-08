@@ -6,6 +6,12 @@ use crate::{
 };
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 
+fn diagnostic_access(access: &Access) -> bool {
+    access.kind == AccessKind::Network
+        && crate::net::host::AllowEntry::parse(&access.target)
+            .is_ok_and(|entry| entry.host_text() == crate::probes::POLICY_PROBE_HOST)
+}
+
 fn preview(engine: &Engine, a: &mut Approval) {
     match a
         .sandbox
@@ -36,6 +42,13 @@ impl Hub {
         access: Access,
         action: &str,
     ) -> Result<(), String> {
+        if diagnostic_access(&access) {
+            return if agent.contains('/') {
+                Err("This is an Enclos diagnostic probe destination, not an access request to approve.".into())
+            } else {
+                Ok(())
+            };
+        }
         let sandbox = agent.split('/').next().unwrap_or(agent);
         // Bounds apply before storage or display. No tool arguments or output are copied.
         if access.target.is_empty()
@@ -105,7 +118,21 @@ impl Hub {
         Ok(())
     }
 
+    pub(super) fn dismiss_probe_requests(&self, store: &Store) -> Result<(), String> {
+        for a in store.approvals().map_err(|e| e.to_string())? {
+            if a.state == "pending"
+                && diagnostic_access(&a.access)
+                && let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())?
+                && let Some(person) = &self.host
+            {
+                self.deliver(person, ToDevice::Approval(closed));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
+        self.dismiss_probe_requests(store)?;
         let engine = Engine::open(self.layout.clone());
         let sandboxes: std::collections::HashSet<_> = self
             .agents
@@ -128,6 +155,12 @@ impl Hub {
                 .take(200)
             {
                 use crate::model::net::Reason;
+                if d.host
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(crate::probes::POLICY_PROBE_HOST)
+                {
+                    continue;
+                }
                 if !matches!(d.reason, Reason::NotAllowed | Reason::PrivateAddress) {
                     continue;
                 }
@@ -183,6 +216,12 @@ impl Hub {
             .approval(id)
             .map_err(|e| e.to_string())?
             .ok_or("Unknown policy request")?;
+        if a.state == "pending" && diagnostic_access(&a.access) {
+            if let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
+                self.deliver(person, ToDevice::Approval(closed));
+            }
+            return Err("This is an Enclos diagnostic probe; no approval is needed.".into());
+        }
         if a.state != "pending" {
             self.deliver(person, ToDevice::Approval(a));
             return Ok(());

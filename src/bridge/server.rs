@@ -716,6 +716,7 @@ pub fn serve(
     }
     if let Ok(store) = hub.store() {
         let _ = store.recover_approvals();
+        let _ = hub.dismiss_probe_requests(&store);
     }
     {
         let hub = Arc::clone(&hub);
@@ -1219,6 +1220,7 @@ fn run_session(
             }
             FromDevice::Sync { since } => {
                 if hub.host.as_deref() == Some(person) {
+                    hub.dismiss_probe_requests(store)?;
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         link.send(ToDevice::Approval(a))?;
                     }

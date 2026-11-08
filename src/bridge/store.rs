@@ -322,6 +322,26 @@ impl Store {
             params![a.request, body, a.state],
         )? == 1)
     }
+    /// Reclassify a pending diagnostic notification without granting or denying access.
+    pub fn dismiss_probe(
+        &self,
+        a: &enclos_protocol::approval::Approval,
+    ) -> rusqlite::Result<Option<enclos_protocol::approval::Approval>> {
+        let mut closed = a.clone();
+        closed.state = "diagnostic".into();
+        closed.available = false;
+        closed.revision.clear();
+        closed.change = "Enclos diagnostic probe; no policy change is needed.".into();
+        closed.reason =
+            Some("This attempt comes from the built-in network probe, not agent work.".into());
+        let body = serde_json::to_string(&closed)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        Ok((self.db.execute(
+            "UPDATE approvals SET body=?2,state='diagnostic' WHERE id=?1 AND state='pending'",
+            params![a.request, body],
+        )? == 1)
+            .then_some(closed))
+    }
     pub fn put_approval(&self, a: &enclos_protocol::approval::Approval) -> rusqlite::Result<()> {
         let body = serde_json::to_string(a)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
