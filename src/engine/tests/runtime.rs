@@ -1543,20 +1543,34 @@ fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
             "delete what is left of agent home/half (~/.hermes/profiles/half), which Hermes no longer lists, with Hermes's own command"
         ]
     );
-    done(
+    // `--keep-data` says what it leaves: the folder here, nothing there.
+    let kept = |a: &str| match done(
         engine
-            .remove_agent(&alice(), &name, &agent("half"), true, Confirm::Yes)
+            .remove_agent(&alice(), &name, &agent(a), true, Confirm::Yes)
             .unwrap(),
-    );
-    // Nothing left to delete: removing them takes only the record, and
+    ) {
+        AgentRemoved::RecordOnly {
+            why: FilesKept::Asked { left },
+            ..
+        } => left,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(kept("half"), Ok(Leftover::Folder));
+    assert_eq!(kept("scout"), Ok(Leftover::Nothing));
+    // Nothing left to delete: removing it takes only the record, and
     // runs nothing in the sandbox (the fake backend would fail).
-    for a in ["scout", "ranger"] {
+    assert_eq!(
         done(
             engine
-                .remove_agent(&alice(), &name, &agent(a), false, Confirm::Yes)
+                .remove_agent(&alice(), &name, &agent("ranger"), false, Confirm::Yes)
                 .unwrap(),
-        );
-    }
+        ),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/ranger".into(),
+            why: FilesKept::RuntimeLacksIt,
+        }
+    );
     assert!(engine.agents(&name).unwrap().is_empty());
 }
 
@@ -1585,10 +1599,29 @@ fn removing_an_agent_with_its_files_asks_first() {
         ["delete agent home/scout and its files, with Hermes's own command"]
     );
     // `--keep-data` needs no confirmation and leaves the files.
-    done(
-        engine
-            .remove_agent(&alice(), &name, &scout, true, Confirm::Ask)
-            .unwrap(),
+    let Planned::DryRun(plan) = engine
+        .remove_agent(&alice(), &name, &scout, true, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert_eq!(
+        plan.changes,
+        ["remove the record of agent home/scout; its files stay (~/.hermes/profiles/scout)"]
+    );
+    assert_eq!(
+        done(
+            engine
+                .remove_agent(&alice(), &name, &scout, true, Confirm::Ask)
+                .unwrap(),
+        ),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/scout".into(),
+            why: FilesKept::Asked {
+                left: Ok(Leftover::Agent)
+            },
+        }
     );
     assert!(engine.agents(&name).unwrap().is_empty());
     assert!(

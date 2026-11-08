@@ -27,10 +27,13 @@ pub enum AgentRemoved {
 }
 
 /// Why `agent rm` removed only the record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesKept {
-    /// `--keep-data`: the runtime still has the agent.
-    Asked,
+    /// `--keep-data`, with what is left of the agent as enclos read it
+    /// then, or why it could not.
+    Asked {
+        left: std::result::Result<Leftover, Unreadable>,
+    },
     /// The runtime no longer listed the agent: nothing was left to delete.
     RuntimeLacksIt,
     /// The runtime has no command enclos can run to delete an agent: its
@@ -40,7 +43,7 @@ pub enum FilesKept {
 
 /// What is left of an agent in the sandbox home, as enclos reads it there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Leftover {
+pub enum Leftover {
     /// The runtime lists the agent.
     Agent,
     /// The runtime no longer lists it, but its folder is still there, as a
@@ -93,17 +96,12 @@ impl Engine {
         let shown = kind.display_name();
         let runtime = adapter(kind);
         let home = self.sandbox_home(name);
-        let left = match keep_data {
-            true => None,
-            false => Some(
-                leftover(&*runtime, &home, agent)
-                    .map_err(|why| cannot_tell_left(name, kind, agent, &why))?,
-            ),
-        };
-        let delete = match left {
-            None => Err(FilesKept::Asked),
-            Some(Leftover::Nothing) => Err(FilesKept::RuntimeLacksIt),
-            Some(_) => runtime
+        let left = leftover(&*runtime, &home, agent);
+        let delete = match (keep_data, &left) {
+            (true, _) => Err(FilesKept::Asked { left: left.clone() }),
+            (false, Err(why)) => return Err(cannot_tell_left(name, kind, agent, why)),
+            (false, Ok(Leftover::Nothing)) => Err(FilesKept::RuntimeLacksIt),
+            (false, Ok(_)) => runtime
                 .delete_agent(agent)
                 .ok_or(FilesKept::NoDeleteCommand),
         };
@@ -128,17 +126,26 @@ impl Engine {
         match confirm {
             Confirm::DryRun => {
                 let what = match &delete {
-                    Ok(_) if left == Some(Leftover::Folder) => format!(
+                    Ok(_) if left == Ok(Leftover::Folder) => format!(
                         "delete what is left of agent {name}/{agent} ({files}), which {shown} no longer lists, with {shown}'s own command"
                     ),
                     Ok(_) => format!(
                         "delete agent {name}/{agent} and its files, with {shown}'s own command"
                     ),
-                    Err(FilesKept::Asked) => {
-                        format!(
+                    Err(FilesKept::Asked { left }) => match left {
+                        Ok(Leftover::Agent) => format!(
                             "remove the record of agent {name}/{agent}; its files stay ({files})"
-                        )
-                    }
+                        ),
+                        Ok(Leftover::Folder) => format!(
+                            "remove the record of agent {name}/{agent}; its folder stays ({files}), which {shown} no longer lists"
+                        ),
+                        Ok(Leftover::Nothing) => format!(
+                            "remove the record of agent {name}/{agent}, which {shown} no longer has"
+                        ),
+                        Err(why) => format!(
+                            "remove the record of agent {name}/{agent}; enclos cannot tell what is left of it: {why}"
+                        ),
+                    },
                     Err(FilesKept::RuntimeLacksIt) => format!(
                         "remove the record of agent {name}/{agent}, which {shown} no longer has"
                     ),

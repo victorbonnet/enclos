@@ -39,7 +39,7 @@ mod status;
 mod tests;
 mod unenforced;
 
-pub use agent_rm::{AgentRemoved, FilesKept};
+pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use dashboard::{DashboardEnd, DashboardOpen};

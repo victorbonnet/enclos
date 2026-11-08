@@ -2726,7 +2726,8 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     assert_eq!(code, 0, "{removed}");
     assert_eq!(removed["agent"], "home/scout", "{removed}");
     assert_eq!(removed["files_removed"], false, "{removed}");
-    assert!(removed["files_kept_because"].is_string(), "{removed}");
+    assert_eq!(removed["files_kept_because"], "asked", "{removed}");
+    assert_eq!(removed["files_left"], "agent", "{removed}");
     let list = home.run(&["agent", "list", "home"]);
     assert_eq!(list.ok().stdout().lines().nth(1), Some(untracked));
 

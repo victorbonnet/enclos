@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::output;
 
-use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept};
+use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept, Leftover};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -230,11 +230,24 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                         false,
                         Some(files.to_string()),
                         Some(match why {
-                            FilesKept::Asked => "asked",
+                            FilesKept::Asked { .. } => "asked",
                             FilesKept::RuntimeLacksIt => "runtime_lacks_it",
                             FilesKept::NoDeleteCommand => "no_delete_command",
                         }),
                     ),
+                };
+                // What `--keep-data` left, as enclos read it.
+                let files_left = match &removed {
+                    AgentRemoved::RecordOnly {
+                        why: FilesKept::Asked { left },
+                        ..
+                    } => Some(match left {
+                        Ok(Leftover::Agent) => "agent",
+                        Ok(Leftover::Folder) => "folder",
+                        Ok(Leftover::Nothing) => "nothing",
+                        Err(_) => "cannot_tell",
+                    }),
+                    _ => None,
                 };
                 output::emit(&json!({
                     "agent": format!("{sandbox}/{agent}"),
@@ -242,6 +255,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                     "files_removed": files_removed,
                     "files": files,
                     "files_kept_because": kept_because,
+                    "files_left": files_left,
                 }));
                 return Ok(exit::OK);
             }
@@ -252,9 +266,20 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 AgentRemoved::RecordOnly { kind, files, why } => {
                     let runtime = kind.display_name();
                     match why {
-                        FilesKept::Asked => println!(
-                            "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
-                        ),
+                        FilesKept::Asked { left } => match left {
+                            Ok(Leftover::Agent) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
+                            ),
+                            Ok(Leftover::Folder) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. {runtime} no longer lists it, but its folder is still in the sandbox home ({files}), and {runtime} refuses to make an agent of that name until it goes: remove it with {runtime}'s own commands in `enclos connect {sandbox}`."
+                            ),
+                            Ok(Leftover::Nothing) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. Nothing of it was left in the sandbox home: {runtime} no longer had it."
+                            ),
+                            Err(why) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. enclos cannot tell what is left of it in the sandbox home ({why}): look with {runtime}'s own commands in `enclos connect {sandbox}`."
+                            ),
+                        },
                         FilesKept::RuntimeLacksIt => println!(
                             "Removed the record of agent {sandbox}/{agent}, which {runtime} no longer had."
                         ),
