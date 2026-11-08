@@ -342,6 +342,10 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 
 `enclos sandbox start <name>` does the same for the proxy and every service the runtime declares.
 
+### Shared agent photos
+
+The mobile bridge owns an optional presentation photo for each listed agent, shared across connected apps. The host owner can change or remove it from the agent page; other paired people can read it. A revision check prevents a device from overwriting a newer edit, and removal keeps its revision so delayed replies cannot restore an old photo. Bounded raster decoding and canonical JPEG re-encoding happen on the host. Photos are stored in the bridge's database, audited by device and person, and transferred over the paired Noise connection. They neither change a runtime's profile nor enter its conversation history. See [the wire contract](protocol.md#shared-agent-photos).
+
 ## 9. Component APIs
 
 Sketches in Rust. The `Engine` is the only code that combines components.
