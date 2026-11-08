@@ -25,6 +25,9 @@ mod own_places;
 #[path = "bubblewrap/mount_race.rs"]
 mod mount_race;
 
+#[path = "bubblewrap/status.rs"]
+mod status;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};

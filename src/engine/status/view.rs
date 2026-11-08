@@ -132,7 +132,9 @@ pub struct SandboxStatus {
     pub dashboard_command: Option<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback
-    /// (ADR 0028).
+    /// (ADR 0028). Not provided for a sandbox whose sessions listen in a
+    /// network namespace of its own, which the host's network does not
+    /// reach (ADR 0040).
     pub network_listeners: Fact<Vec<NetworkListener>>,
 }
 
