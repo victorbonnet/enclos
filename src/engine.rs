@@ -5,6 +5,7 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
+mod agent_rm;
 mod agents;
 mod compile;
 mod configure;
@@ -37,7 +38,8 @@ mod status;
 mod tests;
 mod unenforced;
 
-pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
+pub use agent_rm::{AgentRemoved, FilesKept};
+pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
