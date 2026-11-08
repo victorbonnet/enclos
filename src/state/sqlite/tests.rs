@@ -95,6 +95,29 @@ fn a_write_that_reads_first_waits_for_a_write_in_progress() {
     assert_eq!(applied.unwrap().unwrap().version, 2);
 }
 
+/// Each call opens its own connection, so it is often the only one open as
+/// it closes. Closing must leave the write-ahead log in place: copying it
+/// into `state.db` and deleting it holds the whole database through two
+/// flushes, and the next write's new log takes a third under the write lock.
+#[test]
+fn a_connection_closing_alone_leaves_the_log_in_place() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let mut log = store.db.clone().into_os_string();
+    log.push("-wal");
+    let log = std::fs::metadata(&log).map(|m| m.len());
+    assert!(
+        log.as_ref().is_ok_and(|&len| len > 32),
+        "the log after the connection closed: {log:?}"
+    );
+    assert_eq!(
+        store.get(&"home".parse().unwrap()).unwrap(),
+        Some(record("home"))
+    );
+}
+
 #[test]
 fn reads_before_init_say_to_run_init() {
     let (_dir, store) = store();

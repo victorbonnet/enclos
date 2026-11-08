@@ -421,6 +421,12 @@ fn a_session_whose_policy_version_is_not_recorded_is_a_problem() {
 #[test]
 fn records_that_cannot_be_read_are_a_problem() {
     let (_dir, engine, _name) = with_sandbox();
+    // The latest pages are in the write-ahead log, which goes with the file.
+    for log in ["-wal", "-shm"] {
+        let mut path = engine.layout.state_db().into_os_string();
+        path.push(log);
+        std::fs::remove_file(path).unwrap();
+    }
     std::fs::write(engine.layout.state_db(), "not a database").unwrap();
     let doctor = engine.doctor();
     assert!(
