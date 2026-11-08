@@ -211,6 +211,83 @@ fn hermes_agents_logins_and_models_show_with_what_to_do() {
 }
 
 #[test]
+fn an_agent_whose_settings_name_no_provider_is_said_with_how_to_choose_one() {
+    let (_dir, engine, name) = with_runtime();
+    let home = engine.sandbox_home(&name);
+    // Added before the sandbox's login chose a provider, as Hermes 0.23.0
+    // clones `default`'s settings: `auto`, kept after the login.
+    let main = home.join(".hermes/profiles/main");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+    std::fs::write(
+        main.join("config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: auto\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".hermes/config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    let added = done(
+        engine
+            .add_agent(&alice(), &name, "main".parse().unwrap(), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(
+        added.choose_provider.as_deref(),
+        Some("hermes -p main model")
+    );
+
+    let agents = |view: &crate::engine::StatusView| {
+        view.sandboxes[0].agents.as_ref().unwrap().agents.clone()
+    };
+    let view = engine.status(None).unwrap();
+    let [default, tracked] = &agents(&view)[..] else {
+        panic!("{:?}", agents(&view));
+    };
+    assert_eq!(
+        (&default.provider, &default.choose_provider),
+        (&Fact::Known("openai-codex".into()), &None)
+    );
+    assert_eq!(
+        (&tracked.provider, tracked.choose_provider.as_deref()),
+        (&Fact::Known("auto".into()), Some("hermes -p main model"))
+    );
+    // Not logged in yet: the login comes first, and chooses a provider.
+    assert_eq!(
+        commands(&view.suggestions),
+        ["enclos connect home -- hermes -p default setup"]
+    );
+    std::fs::write(home.join(".hermes/auth.json"), "{}").unwrap();
+    let view = engine.status(None).unwrap();
+    let suggested = &view.suggestions[0];
+    assert_eq!(
+        (suggested.kind(), suggested.target(), suggested.command()),
+        (
+            "choose_provider",
+            "home/main".to_owned(),
+            "enclos connect home -- hermes -p main model".to_owned()
+        )
+    );
+    assert_eq!(view.suggestions.len(), 1);
+    let json = serde_json::to_value(&view).unwrap();
+    let shown = &json["sandboxes"][0]["agents"]["agents"][1];
+    assert_eq!(shown["provider"], serde_json::json!({"known": "auto"}));
+    assert_eq!(shown["choose_provider"], "hermes -p main model");
+
+    // Chosen, nothing is said.
+    std::fs::write(
+        main.join("config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    let view = engine.status(None).unwrap();
+    assert_eq!(agents(&view)[1].choose_provider, None);
+    assert!(view.suggestions.is_empty(), "{:?}", view.suggestions);
+}
+
+#[test]
 fn enclos_neither_adds_nor_removes_the_built_in_agent() {
     let (_dir, engine, name) = with_runtime();
     let default: AgentName = "default".parse().unwrap();
@@ -560,6 +637,8 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                     last_active: Fact::NotProvided,
                     bytes: Fact::NotProvided,
                     model: Fact::NotProvided,
+                    provider: Fact::NotProvided,
+                    choose_provider: None,
                 })
                 .collect(),
             unreadable: None,

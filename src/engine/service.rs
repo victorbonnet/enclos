@@ -182,17 +182,24 @@ impl Engine {
         // Replacing it would split the sandbox: its open sessions would stay
         // in the old namespace, cut off from the proxy (ADR 0039).
         let kept = self.answering_holder(&record)?;
+        let kept_ref = kept.as_slice();
         let kept = kept.as_ref();
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
-        self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop, kept)?
-            .into_result()?;
+        self.remove_services(
+            by,
+            name,
+            "before sandbox start",
+            IfUnrecorded::Stop,
+            kept_ref,
+        )?
+        .into_result()?;
         let started = self.install_services(by, name, kept).map_err(|error| {
             // None may stay installed: the undo removes them even when its
             // first entry cannot be written, as the start's entry records
             // the attempt.
             let undo = "after a failed sandbox start";
-            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway, kept) {
+            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway, kept_ref) {
                 Err(left) => Error::CleanupFailed {
                     error: Box::new(error),
                     left: left.to_string(),
@@ -336,7 +343,7 @@ impl Engine {
         )
     }
 
-    /// Removes every service of the sandbox installed now but `kept`, the
+    /// Removes every service of the sandbox installed now but those `kept`, the
     /// proxy last; `stop_sandbox` calls this first, keeping none, and
     /// `start_sandbox` before it installs and after a failed install, keeping
     /// a namespace holder that answers, as `why` says.
@@ -356,10 +363,10 @@ impl Engine {
         name: &SandboxName,
         why: &str,
         if_unrecorded: IfUnrecorded,
-        kept: Option<&ServiceLabel>,
+        kept: &[ServiceLabel],
     ) -> Result<Removal> {
         let mut labels = self.installed_labels(name)?;
-        labels.retain(|l| Some(l) != kept);
+        labels.retain(|l| !kept.contains(l));
         if labels.is_empty() {
             return Ok(Removal {
                 labels,

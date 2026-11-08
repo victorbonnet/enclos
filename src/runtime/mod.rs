@@ -159,12 +159,25 @@ pub struct RuntimeFacts {
     pub install: Option<HomePath>,
 }
 
+/// Where a runtime keeps the provider an agent's model calls go to, and
+/// the values that mean the agent has none chosen: the runtime then picks
+/// one on its own, and may find none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub at: ValueAt,
+    pub unchosen: &'static [&'static str],
+    /// What a person runs in the sandbox to choose the agent's provider and
+    /// model, for enclos's messages: `enclos connect <sandbox> -- <this>`.
+    pub choose: String,
+}
+
 /// Where a runtime keeps one agent's data and the facts `status` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     /// The folder holding the agent's own data.
     pub folder: Option<HomePath>,
     pub model: Option<ValueAt>,
+    pub provider: Option<ProviderAt>,
     /// Files that change when the agent is used: the newest gives its last
     /// activity.
     pub activity: Vec<HomePath>,
@@ -294,6 +307,14 @@ pub trait RuntimeAdapter {
     /// the sandbox by `enclos agent rm`. `None`: the runtime has none, so
     /// `agent rm` removes only the record and says the files stay.
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
+    /// The runtime's own command that finishes a delete of `name` which
+    /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
+    /// rm` when that command failed after the runtime stopped listing the
+    /// agent and its folder went, and treated with it as the delete. `None`
+    /// (the default): such a failure is a failed delete.
+    fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
     /// The runtime's own command that creates agent `name` from `archive`,

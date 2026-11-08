@@ -69,6 +69,10 @@ fn the_socket_is_bound_for_the_namespace_holder_and_never_taken_from_one() {
     rustix::net::listen(&bound, 1).unwrap();
     let refused = bound_socket(&socket).unwrap_err();
     assert!(refused.0.contains("already answers"), "{refused}");
+    // Shut down as well as closed: a child another test forks meanwhile
+    // holds a copy of the descriptor until it execs, which would keep the
+    // socket answering; shutting it down ends it for every copy.
+    rustix::net::shutdown(&bound, rustix::net::Shutdown::Both).unwrap();
     drop(bound);
     // Ended: its socket file is replaced.
     bound_socket(&socket).unwrap();

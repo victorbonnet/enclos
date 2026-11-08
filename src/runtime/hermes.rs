@@ -11,9 +11,9 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener, RuntimeService,
-    SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
+    RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
+    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -262,6 +262,21 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn finish_delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
+        // Hermes 0.23.0's delete removes the profile, then exits 1 when the
+        // session and routing records under its name are not purged yet
+        // ("its session/routing identity settlement is still pending"),
+        // naming this command, which purges them, succeeds when they are
+        // already gone, and refuses while a profile of that name exists
+        // (`purge_profile_identity` in `hermes_cli/profile_identity.py`).
+        Some(SandboxCommand::from_words(&[
+            HERMES,
+            "profile",
+            "purge-identity",
+            name.as_str(),
+        ]))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
@@ -307,6 +322,22 @@ impl RuntimeAdapter for Hermes {
                 file: file("config.yaml"),
                 // Hermes reads either key.
                 keys: &["model.default", "model.model"],
+            }),
+            // Each profile keeps its own provider, which a new one copies
+            // from `default` as it is then: `auto` before the sandbox's
+            // login chose one, or after a setup that ended before the model.
+            // With `auto`, a profile falls back on the `active_provider` of
+            // its own `auth.json` only, not the root's, and says it is "not
+            // connected to any AI provider" (`resolve_provider` in
+            // `hermes_cli/auth.py`; seen with Hermes 0.23.0). Hermes's
+            // `model` command chooses a provider and model for the profile.
+            provider: Some(ProviderAt {
+                at: ValueAt {
+                    file: file("config.yaml"),
+                    keys: &["model.provider"],
+                },
+                unchosen: &["auto", ""],
+                choose: format!("{HERMES} -p {agent} model"),
             }),
             // What changed when an agent was used; `sessions/` did not (to
             // verify, design §14).
@@ -856,6 +887,10 @@ mod tests {
             Some(SandboxCommand::from_words(&[
                 "hermes", "profile", "delete", "main", "--yes"
             ]))
+        );
+        assert_eq!(
+            Hermes.finish_delete_agent(&main).unwrap().shown(),
+            "hermes profile purge-identity main"
         );
         let default: AgentName = "default".parse().unwrap();
         assert_eq!(Hermes.builtin_agent(), Some(DEFAULT_PROFILE));

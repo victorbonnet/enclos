@@ -226,6 +226,7 @@ impl Engine {
             how,
             talk: runtime.talk(&agent),
             login: runtime.login(),
+            choose_provider: self.provider_to_choose(name, &*runtime, &agent),
         }))
     }
 }

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::output;
 
-use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept};
+use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept, Leftover};
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
 use enclos::model::audit::Actor;
@@ -117,15 +117,28 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                     "copy_left": copy_left,
                     "talk": format!("enclos connect {sandbox} -- {}", added.talk),
                     "home": output::path(&engine.sandbox_home(&sandbox)),
+                    "choose_provider": added
+                        .choose_provider
+                        .as_ref()
+                        .map(|c| format!("enclos connect {sandbox} -- {c}")),
                 }));
                 return Ok(exit::OK);
             }
+            let login = format!("`enclos connect {sandbox} -- {}`", added.login);
+            // Its settings name no provider: the runtime picks one on its
+            // own, and may find none.
+            let no_provider = added.choose_provider.as_ref().map(|choose| {
+                format!(
+                    "Its settings name no provider: {kind} picks one on its own and may find none, as when the sandbox's built-in agent had none chosen when it was added. Once {kind} is logged in with {login}, choose its provider and model with `enclos connect {sandbox} -- {choose}`."
+                )
+            });
             match &added.how {
                 Added::Adopted => {
                     println!(
                         "Tracked agent {sandbox}/{name}, which {kind} already had. Talk to it with `enclos connect {sandbox} -- {}`.",
                         added.talk
                     );
+                    no_provider.iter().for_each(|n| println!("{n}"));
                     return Ok(exit::OK);
                 }
                 Added::Created(end) => {
@@ -166,7 +179,6 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 "There, ~ is the sandbox's home: {}",
                 engine.sandbox_home(&sandbox).display()
             );
-            let login = format!("`enclos connect {sandbox} -- {}`", added.login);
             if imported {
                 // That an imported agent uses the sandbox's login is still
                 // to verify (design §14).
@@ -179,10 +191,16 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 println!(
                     "Nothing in the archive widened the sandbox's policy: what the agent reaches shows in `enclos net log {sandbox}`, and what was refused in `enclos net denied {sandbox}`."
                 );
+                no_provider.iter().for_each(|n| println!("{n}"));
             } else {
-                println!(
-                    "The agent shares the sandbox's {kind} login, made with {login}; it needs no login of its own."
-                );
+                match no_provider {
+                    Some(n) => println!("{n}"),
+                    // The login is shared; the provider and model are the
+                    // agent's own settings, copied when it was made.
+                    None => println!(
+                        "The agent uses the sandbox's {kind} login, made with {login}, and starts on the provider and model the sandbox's built-in agent had: they are its own settings from now on, which changing the built-in agent's leaves as they are."
+                    ),
+                }
             }
         }
         AgentVerb::List { sandbox } => {
@@ -230,11 +248,24 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                         false,
                         Some(files.to_string()),
                         Some(match why {
-                            FilesKept::Asked => "asked",
+                            FilesKept::Asked { .. } => "asked",
                             FilesKept::RuntimeLacksIt => "runtime_lacks_it",
                             FilesKept::NoDeleteCommand => "no_delete_command",
                         }),
                     ),
+                };
+                // What `--keep-data` left, as enclos read it.
+                let files_left = match &removed {
+                    AgentRemoved::RecordOnly {
+                        why: FilesKept::Asked { left },
+                        ..
+                    } => Some(match left {
+                        Ok(Leftover::Agent) => "agent",
+                        Ok(Leftover::Folder) => "folder",
+                        Ok(Leftover::Nothing) => "nothing",
+                        Err(_) => "cannot_tell",
+                    }),
+                    _ => None,
                 };
                 output::emit(&json!({
                     "agent": format!("{sandbox}/{agent}"),
@@ -242,6 +273,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                     "files_removed": files_removed,
                     "files": files,
                     "files_kept_because": kept_because,
+                    "files_left": files_left,
                 }));
                 return Ok(exit::OK);
             }
@@ -252,9 +284,20 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
                 AgentRemoved::RecordOnly { kind, files, why } => {
                     let runtime = kind.display_name();
                     match why {
-                        FilesKept::Asked => println!(
-                            "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
-                        ),
+                        FilesKept::Asked { left } => match left {
+                            Ok(Leftover::Agent) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. Its files stay in the sandbox home ({files}), so {runtime} still has the agent and enclos reports it as one it does not track; `enclos agent add {sandbox}/{agent}` tracks it again."
+                            ),
+                            Ok(Leftover::Folder) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. {runtime} no longer lists it, but its folder is still in the sandbox home ({files}), and {runtime} refuses to make an agent of that name until it goes: remove it with {runtime}'s own commands in `enclos connect {sandbox}`."
+                            ),
+                            Ok(Leftover::Nothing) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. Nothing of it was left in the sandbox home: {runtime} no longer had it."
+                            ),
+                            Err(why) => println!(
+                                "Removed the record of agent {sandbox}/{agent}. enclos cannot tell what is left of it in the sandbox home ({why}): look with {runtime}'s own commands in `enclos connect {sandbox}`."
+                            ),
+                        },
                         FilesKept::RuntimeLacksIt => println!(
                             "Removed the record of agent {sandbox}/{agent}, which {runtime} no longer had."
                         ),

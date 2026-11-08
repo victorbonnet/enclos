@@ -265,9 +265,11 @@ fn print_agents(agents: &[AgentStatus], complete: bool, now: Timestamp) {
             fact(&a.bytes, |b| size(*b, complete)),
             fact(&a.model, Clone::clone),
         );
-        match note(a) {
-            Some(note) => println!("{line}    {note}"),
-            None => println!("{line}"),
+        let provider = a.choose_provider.as_ref().map(|_| "no provider chosen");
+        let notes: Vec<&str> = note(a).into_iter().chain(provider).collect();
+        match notes.is_empty() {
+            true => println!("{line}"),
+            false => println!("{line}    {}", notes.join("; ")),
         }
     }
 }

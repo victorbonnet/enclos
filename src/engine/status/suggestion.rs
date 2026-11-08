@@ -27,6 +27,14 @@ pub enum Suggestion {
         sandbox: SandboxName,
         agent: AgentName,
     },
+    /// The agent's settings name no provider, as when it was added before
+    /// the sandbox's login chose one.
+    ChooseProvider {
+        sandbox: SandboxName,
+        agent: AgentName,
+        /// What a person runs in the sandbox to choose it.
+        choose: String,
+    },
     LookAtAgents {
         sandbox: SandboxName,
         runtime: &'static str,
@@ -73,6 +81,7 @@ impl Suggestion {
         match self {
             Suggestion::AdoptAgent { .. } => "adopt_agent",
             Suggestion::RemoveGoneAgent { .. } => "remove_gone_agent",
+            Suggestion::ChooseProvider { .. } => "choose_provider",
             Suggestion::LookAtAgents { .. } => "look_at_agents",
             Suggestion::ReviewRefused { .. } => "review_refused",
             Suggestion::LookAtProxy { .. } => "look_at_proxy",
@@ -89,6 +98,7 @@ impl Suggestion {
         match self {
             Suggestion::AdoptAgent { sandbox, .. }
             | Suggestion::RemoveGoneAgent { sandbox, .. }
+            | Suggestion::ChooseProvider { sandbox, .. }
             | Suggestion::LookAtAgents { sandbox, .. }
             | Suggestion::ReviewRefused { sandbox, .. }
             | Suggestion::LookAtProxy { sandbox, .. }
@@ -105,7 +115,8 @@ impl Suggestion {
     pub fn target(&self) -> String {
         match self {
             Suggestion::AdoptAgent { sandbox, agent }
-            | Suggestion::RemoveGoneAgent { sandbox, agent } => format!("{sandbox}/{agent}"),
+            | Suggestion::RemoveGoneAgent { sandbox, agent }
+            | Suggestion::ChooseProvider { sandbox, agent, .. } => format!("{sandbox}/{agent}"),
             other => other.sandbox().to_string(),
         }
     }
@@ -114,6 +125,9 @@ impl Suggestion {
         match self {
             Suggestion::AdoptAgent { .. } => "made inside the sandbox, not tracked".into(),
             Suggestion::RemoveGoneAgent { .. } => "the runtime no longer has it".into(),
+            Suggestion::ChooseProvider { .. } => {
+                "its settings name no provider, so it may find none to answer with".into()
+            }
             Suggestion::LookAtAgents { runtime, why, .. } => {
                 format!("enclos cannot read {runtime}'s agents: {why}")
             }
@@ -158,6 +172,7 @@ impl Suggestion {
         match self {
             Suggestion::AdoptAgent { agent, .. } => format!("enclos agent add {sb}/{agent}"),
             Suggestion::RemoveGoneAgent { agent, .. } => format!("enclos agent rm {sb}/{agent}"),
+            Suggestion::ChooseProvider { choose, .. } => format!("enclos connect {sb} -- {choose}"),
             Suggestion::LookAtAgents { .. } => format!("enclos connect {sb}"),
             Suggestion::ReviewRefused { .. } => format!("enclos net denied {sb}"),
             Suggestion::LookAtProxy { .. } => format!("enclos logs {sb}"),
@@ -201,11 +216,24 @@ pub fn suggest(sandboxes: &[SandboxStatus], now: Timestamp) -> Vec<Suggestion> {
     let mut out = Vec::new();
     for s in sandboxes {
         let sandbox = || s.name.clone();
+        // Before the login, logging in chooses the provider.
+        let logged_in = s
+            .runtime
+            .as_ref()
+            .is_some_and(|rt| rt.logged_in != Fact::Known(false));
         if let Some(list) = &s.agents {
             for a in &list.agents {
                 let Ok(agent) = a.name.as_str().parse::<AgentName>() else {
                     continue;
                 };
+                let known = matches!(a.kind, AgentKind::Builtin | AgentKind::Tracked { .. });
+                if let Some(choose) = a.choose_provider.as_ref().filter(|_| known && logged_in) {
+                    out.push(Suggestion::ChooseProvider {
+                        sandbox: sandbox(),
+                        agent: agent.clone(),
+                        choose: choose.clone(),
+                    });
+                }
                 match a.kind {
                     AgentKind::Untracked => out.push(Suggestion::AdoptAgent {
                         sandbox: sandbox(),
