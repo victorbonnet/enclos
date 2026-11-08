@@ -12,6 +12,20 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "sandbox.policy.get")]
+    SandboxPolicyGet { sandbox: String },
+    #[serde(rename = "sandbox.policy.preview")]
+    SandboxPolicyPreview {
+        sandbox: String,
+        base: String,
+        change: crate::policy::PolicyChange,
+    },
+    #[serde(rename = "sandbox.policy.apply")]
+    SandboxPolicyApply {
+        sandbox: String,
+        #[serde(flatten)]
+        edit: crate::policy::PolicyApply,
+    },
     /// First after the handshake of a paired device: its id on this host
     /// and its hardware key's DER signature of the handshake hash.
     #[serde(rename = "auth")]
@@ -90,6 +104,9 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "sandbox.policy.get",
+    "sandbox.policy.preview",
+    "sandbox.policy.apply",
     "auth",
     "pair.request",
     "approval.decide",
@@ -112,6 +129,10 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "sandbox.policy")]
+    SandboxPolicy(crate::policy::PolicyState),
+    #[serde(rename = "sandbox.policy.preview")]
+    SandboxPolicyPreview(crate::policy::PolicyPreview),
     #[serde(rename = "approval")]
     Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
@@ -174,6 +195,8 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "sandbox.policy",
+    "sandbox.policy.preview",
     "approval",
     "authenticated",
     "pair.accepted",

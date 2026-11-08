@@ -252,6 +252,21 @@ pub struct PairingRequest {
 }
 
 impl Store {
+    /// All accepted records, without the inbox history window, for active-grant provenance.
+    pub fn accepted_access(&self) -> rusqlite::Result<Vec<enclos_protocol::approval::Approval>> {
+        let mut q = self
+            .db
+            .prepare("SELECT body FROM approvals WHERE state='approved'")?;
+        let rows = q
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|body| {
+                serde_json::from_str(&body)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })
+            .collect()
+    }
     pub fn recover_approvals(&self) -> rusqlite::Result<()> {
         for mut a in self.approvals()? {
             if a.state == "applying" {

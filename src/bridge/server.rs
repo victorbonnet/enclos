@@ -15,6 +15,8 @@ mod tests;
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "policy.rs"]
+mod policy;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -1016,6 +1018,62 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::SandboxPolicyGet { sandbox } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.managed_policy(store, &name));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyPreview {
+                sandbox,
+                base,
+                change,
+            } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| {
+                        crate::engine::Engine::open(hub.layout.clone())
+                            .mobile_policy_preview(&name, &base, &change)
+                            .map_err(|e| e.to_string())
+                    });
+                match result {
+                    Ok(mut preview) => {
+                        preview.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyApply { sandbox, edit } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
             FromDevice::ApprovalDecide {
                 request,
                 revision,
