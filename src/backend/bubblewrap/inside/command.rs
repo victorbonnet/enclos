@@ -88,14 +88,14 @@ impl SessionSteps for Running<'_> {
         if self.session.restore_interrupts {
             hand_back_interrupts()?;
         }
-        let child =
-            Command::new(program)
-                .args(args)
-                .spawn()
-                .map_err(|source| InsideError::Command {
-                    command: program.to_string_lossy().into_owned(),
-                    source,
-                })?;
+        let child = Command::new(program)
+            .args(args)
+            .env_remove(super::super::setup::STDERR)
+            .spawn()
+            .map_err(|source| InsideError::Command {
+                command: program.to_string_lossy().into_owned(),
+                source,
+            })?;
         reap_until(child.id(), || {
             rustix::process::wait(rustix::process::WaitOptions::empty())
                 .map(|found| {

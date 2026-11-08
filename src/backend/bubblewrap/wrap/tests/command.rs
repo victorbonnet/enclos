@@ -148,7 +148,8 @@ fn as_bubblewrap_ran(in_terminal: bool) -> (u64, String) {
         &bwrap,
         "grep '^SigIgn:' /proc/self/status | cut -f2; printf '%s\\n' \"$@\"",
     );
-    // The join, which becomes what follows its `--`, as `holder join` does.
+    // The join, which becomes what follows its `--`, as the `holder enter`
+    // that `holder join` runs does.
     let enclos = home.dir.path().join("enclos");
     crate::test_scripts::write_script(
         &enclos,

@@ -76,7 +76,8 @@ exit 99"#,
             ),
         );
         script(&at("systemd-run"), "echo 'systemd 257 (257.1-1)'");
-        // `holder join`, which becomes what follows its `--`.
+        // `holder join`, which here becomes what follows its `--`, as the
+        // `holder enter` it runs does.
         script(
             &at("enclos"),
             &format!(

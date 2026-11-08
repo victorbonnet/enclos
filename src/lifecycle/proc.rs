@@ -80,10 +80,12 @@ pub fn tcp_listeners_at_in(
 
 /// The program that `root` started in a PID namespace of its own: the
 /// process below it numbered 2 there, the first that the namespace's first
-/// process started. Under bubblewrap, `root` is bubblewrap's outer process,
-/// the namespace's first is `enclos inside`, and the second is the
-/// session's command (`inside::command`). None when no such process runs,
-/// as before the command starts.
+/// process started. That first process is a child of `root` or of a child
+/// of `root` in `root`'s own namespace. Under bubblewrap, `root` is `enclos
+/// holder join`, its child bubblewrap's outer process, the namespace's first
+/// is `enclos inside`, and the second is the session's command
+/// (`inside::command`). None when no such process runs, as before the
+/// command starts.
 pub fn program_in_pid_namespace(root: u32) -> Result<Option<u32>, ListenersError> {
     program_under(Path::new(PROC), root)
 }
@@ -323,16 +325,21 @@ fn program_under(proc: &Path, root: u32) -> Result<Option<u32>, ListenersError> 
     let Some((_, root_pids)) = lineage_of(proc, root).map_err(proc_error)? else {
         return Ok(None);
     };
-    let depth = root_pids.len() + 1;
+    let depth = root_pids.len();
     let every = lineages(proc)?;
-    // One PID namespace below the root's, numbered `inside` there.
-    let below = |parent: u32, inside: u32| {
+    // The children of `parent` `levels` PID namespaces below the root's,
+    // numbered `inside` in theirs.
+    let below = |parent: u32, levels: usize, inside: Option<u32>| {
         every.iter().filter_map(move |(pid, (ppid, pids))| {
-            let nested = pids.len() == depth && pids.last() == Some(&inside);
+            let nested = pids.len() == depth + levels
+                && inside.is_none_or(|inside| pids.last() == Some(&inside));
             (*ppid == parent && nested).then_some(*pid)
         })
     };
-    Ok(below(root, 1).find_map(|first| below(first, 2).next()))
+    Ok(std::iter::once(root)
+        .chain(below(root, 0, None))
+        .flat_map(|outer| below(outer, 1, Some(1)))
+        .find_map(|first| below(first, 1, Some(2)).next()))
 }
 
 fn same_network_under(proc: &Path, a: u32, b: u32) -> Result<bool, ListenersError> {

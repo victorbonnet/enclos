@@ -2,7 +2,8 @@
 //! to one file, `wrap` runs `enclos inside` under bubblewrap with the masks
 //! the host holds at launch, and `enclos inside` applies the rest. Every
 //! session joins the network namespace of the sandbox's namespace holder
-//! first (ADR 0039).
+//! first (ADR 0039). Each bubblewrap is started again while its setup meets
+//! a mount of the host that changed (`setup`).
 
 pub mod compile;
 mod degraded;
@@ -13,11 +14,13 @@ mod probe;
 pub mod probes;
 pub mod proposed;
 pub mod seccomp;
+pub mod setup;
 mod sockets;
 mod wrap;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
 
 use super::{
@@ -207,12 +210,23 @@ fn host() -> Host {
 }
 
 impl NamespaceHolder for Bubblewrap {
+    /// Started again while bubblewrap's setup meets a mount that changed
+    /// (`setup`).
     #[cfg(target_os = "linux")]
-    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError> {
+    fn run(&self, ctx: &SandboxContext, stderr: &File) -> Result<ExitStatus, WrapError> {
         let enclos = self.enclos.as_deref().ok_or_else(|| {
             WrapError("cannot find the enclos program, which runs the namespace holder".to_owned())
         })?;
-        holder::command(&self.bwrap, enclos, ctx)
+        setup::run(
+            || holder::command(&self.bwrap, enclos, ctx).map_err(std::io::Error::other),
+            stderr,
+            &setup::PAUSES,
+        )
+        .map_err(|e| {
+            WrapError(format!(
+                "cannot run bubblewrap for the namespace holder: {e}"
+            ))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -228,7 +242,7 @@ impl NamespaceHolder for Bubblewrap {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn command(&self, _ctx: &SandboxContext) -> Result<Command, WrapError> {
+    fn run(&self, _ctx: &SandboxContext, _stderr: &File) -> Result<ExitStatus, WrapError> {
         Err(WrapError("the namespace holder runs on Linux".to_owned()))
     }
 

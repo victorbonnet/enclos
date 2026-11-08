@@ -55,6 +55,8 @@ pub enum InsideError {
     Reap(io::Error),
     #[error("cannot hand Ctrl-C back to the command: {0}")]
     Interrupts(io::Error),
+    #[error("cannot take the session's stderr back from bubblewrap: {0}")]
+    Stderr(io::Error),
 }
 
 /// What confines a session, each step returning what stops it.
@@ -141,12 +143,14 @@ impl Confine for Running<'_> {
 /// Brings a session up on `path`'s file and runs `command` to its end: its
 /// exit code, or what stopped it, when no command has run. With
 /// `restore_interrupts`, the command gets Ctrl-C and Ctrl-\, which
-/// bubblewrap's outer process was started ignoring.
+/// bubblewrap's outer process was started ignoring. First of all, says that
+/// bubblewrap's setup is done and takes back the session's stderr (`setup`).
 pub fn session(
     path: &Path,
     command: &[OsString],
     restore_interrupts: bool,
 ) -> Result<u8, InsideError> {
+    super::setup::done().map_err(InsideError::Stderr)?;
     in_session(&mut Running {
         prepared: Prepared::read(path)?,
         session: Session {

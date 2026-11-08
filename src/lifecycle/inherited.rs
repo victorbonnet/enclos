@@ -10,7 +10,8 @@
 /// process still uses them. Called first, while this process runs one
 /// thread and before it opens a descriptor a program must inherit: those,
 /// such as a session's marker, are made later without the flag. Not for a
-/// command that starts a session's program (`holder join`, `inside`): what
+/// command that starts a session's program (`holder join` and `holder
+/// enter`, `inside`): what
 /// it inherited comes from enclos, the session's marker among it.
 pub fn pass_on_none() {
     close_fds::set_fds_cloexec(3, &[]);

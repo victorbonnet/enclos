@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::setup;
 use crate::backend::Probe;
 use crate::host::HostCheck;
 use crate::lifecycle::bounded::{LIMIT, output_within};
@@ -204,14 +205,22 @@ fn apparmor_restricts(host: &OnHost) -> bool {
 
 /// Whether bubblewrap starts a program with the root bound read-only and
 /// nothing else: the least a session needs, a user namespace included.
+/// Started again while its setup meets a mount that changed, as a
+/// session's is (`setup`).
 fn starts(host: &OnHost) -> HostCheck {
     const WHAT: &str = "bubblewrap starts a program";
-    let out = output_within(
-        Command::new(&host.bwrap)
-            .args(["--ro-bind", "/", "/", "true"])
-            .env_clear()
-            .stdin(Stdio::null()),
-        LIMIT,
+    let out = setup::again(
+        &setup::PAUSES,
+        || {
+            output_within(
+                Command::new(&host.bwrap)
+                    .args(["--ro-bind", "/", "/", "true"])
+                    .env_clear()
+                    .stdin(Stdio::null()),
+                LIMIT,
+            )
+        },
+        |out| setup::mount_changed(out.status.code(), &out.stderr),
     );
     let said = match out {
         Ok(out) if out.status.success() => {
