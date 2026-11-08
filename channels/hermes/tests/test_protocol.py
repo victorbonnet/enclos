@@ -150,13 +150,26 @@ class Hint(unittest.TestCase):
     def test_it_says_how_files_go_and_what_is_not_drawn(self):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
-        self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
+        self.assertIn("message HTML shows as literal text", protocol.PLATFORM_HINT)
+
+    def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
+        for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
+                       "data images/fonts", "JavaScript", "external resources, forms and navigation are blocked"):
+            self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
-        self.assertLess(len(protocol.PLATFORM_HINT), 750)
+        self.assertLess(len(protocol.PLATFORM_HINT), 1000)
 
 
 class Files(unittest.TestCase):
+    def test_an_html_artefact_uses_an_ordinary_file_attachment(self):
+        expected = json.loads(fixture("from_plugin_message_out_html.json"))
+        message = protocol.message_out(
+            expected["conversation"], expected["text"], expected["reply_to"],
+            [protocol.attachment(**expected["attachments"][0])])
+        self.assertEqual({k: v for k, v in message.items() if k != "id"},
+                         {k: v for k, v in expected.items() if k != "id"})
+
     def test_a_reply_with_an_image_has_the_fixtures_shape(self):
         expected = json.loads(fixture("from_plugin_message_out_image.json"))
         a = expected["attachments"][0]
