@@ -73,6 +73,9 @@ struct Hub {
     /// Each group's discussion, while one runs or since the last ended
     /// (ADR 0045, proposed); its turns are also in the database.
     groups: Mutex<HashMap<String, Discussion>>,
+    /// The `/stop` messages the bridge sent members: the runtime's answer
+    /// to one (Hermes: "Stopped") is not the member speaking in the group.
+    stops: Mutex<std::collections::HashSet<String>>,
     /// Connected devices: who they speak for, and where to send.
     devices: Mutex<HashMap<String, (String, Sender<ToDevice>)>>,
 }
@@ -279,6 +282,10 @@ impl Hub {
             };
         }
         drop(groups);
+        // The runtime's answer to the bridge's /stop: the "Stopped" line says it.
+        if reply_to.is_some_and(|r| self.stops.lock().expect("not poisoned").remove(r)) {
+            return None;
+        }
         // A reply to no running turn of its: kept only when its turn failed
         // because the bridge restarted (the plugin sent it again since).
         if kind == "reply"
@@ -312,7 +319,14 @@ impl Hub {
         if let Some(run) = running {
             let _ = store.turn_status(&run.turn, "cancelled", None);
             let owner = store.owner(id).ok().flatten().unwrap_or_default();
-            let _ = self.send_to(&format!("{sandbox}/{}", run.member), id, &owner, "/stop");
+            if let Ok(sent) =
+                self.send_to(&format!("{sandbox}/{}", run.member), id, &owner, "/stop")
+            {
+                self.stops
+                    .lock()
+                    .expect("not poisoned")
+                    .insert(sent.as_str().to_owned());
+            }
         }
         self.deliver_group_state(store, id);
     }
@@ -622,6 +636,7 @@ pub fn serve(
         plugins: Mutex::new(HashMap::new()),
         commands: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
+        stops: Mutex::new(std::collections::HashSet::new()),
         devices: Mutex::new(HashMap::new()),
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
