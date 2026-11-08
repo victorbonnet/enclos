@@ -233,6 +233,7 @@ mod history;
 /// The runtime's own service, whose port the sandbox's sessions reach (ADR
 /// 0028). The stand-in gateways are `perl`.
 mod listener;
+mod mobile_policy;
 mod pending;
 mod policy;
 mod proxy_socket;

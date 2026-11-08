@@ -130,7 +130,7 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
 #[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Arc::new(Hub {
+    let mut hub = Arc::new(Hub {
         transport: Transport::Tailscale,
         store_path: dir.path().join("app.db"),
         layout: crate::layout::Layout::at(dir.path().join("enclos")),
@@ -165,5 +165,50 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
             .unwrap_err()
             .contains("no longer paired")
     );
+    assert!(
+        hub.policy_authority(&store, &device, "guest@example.com", "lab")
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .unwrap_err()
+            .contains("no longer paired")
+    );
+    store.add_device(&device).unwrap();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/coder".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("unused.sock"),
+        token: "fixture".into(),
+    });
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .is_ok()
+    );
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "other")
+            .is_err()
+    );
+    store.remove_device(&device.id).unwrap();
+    assert!(
+        hub.policy_authority(&store, &device, "owner@example.com", "lab")
+            .is_err()
+    );
     assert!(store.approvals().unwrap().is_empty());
+}
+
+#[test]
+fn accepted_access_is_not_limited_to_the_inbox_history_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    for i in 0..210 {
+        let mut a = approval_sample();
+        a.request = format!("r{i}");
+        store.create_approval(&a).unwrap();
+        store.claim_approval(&a.request).unwrap();
+        a.state = "approved".into();
+        store.put_approval(&a).unwrap();
+    }
+    assert_eq!(store.accepted_access().unwrap().len(), 210);
 }

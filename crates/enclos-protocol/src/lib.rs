@@ -16,6 +16,7 @@ mod ids;
 pub mod noise;
 pub mod pairing;
 pub mod plugin;
+pub mod policy;
 pub mod preview;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};

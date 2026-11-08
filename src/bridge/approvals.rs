@@ -237,7 +237,7 @@ impl Hub {
         Ok(())
     }
 
-    fn refresh_access_context(self: &Arc<Self>, sandbox: &str) {
+    pub(super) fn refresh_access_context(self: &Arc<Self>, sandbox: &str) {
         let Ok(name) = sandbox.parse::<SandboxName>() else {
             return;
         };
