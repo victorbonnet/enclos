@@ -35,6 +35,7 @@ use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter}
 use crate::state::StateStore;
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
+pub(super) use facts::read_provider;
 use facts::{exists, newest, read_value};
 use printable::printable;
 pub use printable::printable_line;
@@ -251,7 +252,10 @@ impl Engine {
                     AgentKind::Untrackable
                 };
                 let facts = runtime.agent_facts(&agent);
+                let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
                 AgentStatus {
+                    provider,
+                    choose_provider,
                     kind,
                     last_active: newest(home, &facts.activity),
                     model: facts

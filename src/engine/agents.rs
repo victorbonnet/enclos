@@ -14,7 +14,9 @@ use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::runtime::{BuiltinAgent, RuntimeAgentName, SandboxCommand, Unreadable, adapter};
+use crate::runtime::{
+    BuiltinAgent, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter,
+};
 
 /// What `agent add` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,10 @@ pub struct AgentAdded {
     pub talk: String,
     /// What a person runs in the sandbox to log the runtime in and set it up.
     pub login: String,
+    /// What a person runs in the sandbox to choose the agent's provider and
+    /// model, when its settings name none, as when the sandbox's built-in
+    /// agent, which a new one copies, had none chosen yet.
+    pub choose_provider: Option<String>,
 }
 
 /// How the record came to be: created, adopted (ADR 0023) or imported
@@ -317,6 +323,7 @@ impl Engine {
             how,
             talk: runtime.talk(&agent),
             login: runtime.login(),
+            choose_provider: self.provider_to_choose(name, &*runtime, &agent),
         }))
     }
 
@@ -433,6 +440,18 @@ impl Engine {
             });
         }
         Ok(())
+    }
+
+    /// What a person runs in the sandbox to choose `agent`'s provider, when
+    /// its settings name none; `None` when they name one, or cannot be read.
+    pub(super) fn provider_to_choose(
+        &self,
+        name: &SandboxName,
+        runtime: &dyn RuntimeAdapter,
+        agent: &AgentName,
+    ) -> Option<String> {
+        let facts = runtime.agent_facts(&RuntimeAgentName::from(agent));
+        super::status::read_provider(&self.sandbox_home(name), facts.provider.as_ref()).1
     }
 
     pub fn agents(&self, name: &SandboxName) -> Result<Vec<AgentRecord>> {

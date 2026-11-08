@@ -11,9 +11,9 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener, RuntimeService,
-    SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
+    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
+    RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
+    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -322,6 +322,22 @@ impl RuntimeAdapter for Hermes {
                 file: file("config.yaml"),
                 // Hermes reads either key.
                 keys: &["model.default", "model.model"],
+            }),
+            // Each profile keeps its own provider, which a new one copies
+            // from `default` as it is then: `auto` before the sandbox's
+            // login chose one, or after a setup that ended before the model.
+            // With `auto`, a profile falls back on the `active_provider` of
+            // its own `auth.json` only, not the root's, and says it is "not
+            // connected to any AI provider" (`resolve_provider` in
+            // `hermes_cli/auth.py`; seen with Hermes 0.23.0). Hermes's
+            // `model` command chooses a provider and model for the profile.
+            provider: Some(ProviderAt {
+                at: ValueAt {
+                    file: file("config.yaml"),
+                    keys: &["model.provider"],
+                },
+                unchosen: &["auto", ""],
+                choose: format!("{HERMES} -p {agent} model"),
             }),
             // What changed when an agent was used; `sessions/` did not (to
             // verify, design §14).

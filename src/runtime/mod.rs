@@ -159,12 +159,25 @@ pub struct RuntimeFacts {
     pub install: Option<HomePath>,
 }
 
+/// Where a runtime keeps the provider an agent's model calls go to, and
+/// the values that mean the agent has none chosen: the runtime then picks
+/// one on its own, and may find none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub at: ValueAt,
+    pub unchosen: &'static [&'static str],
+    /// What a person runs in the sandbox to choose the agent's provider and
+    /// model, for enclos's messages: `enclos connect <sandbox> -- <this>`.
+    pub choose: String,
+}
+
 /// Where a runtime keeps one agent's data and the facts `status` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     /// The folder holding the agent's own data.
     pub folder: Option<HomePath>,
     pub model: Option<ValueAt>,
+    pub provider: Option<ProviderAt>,
     /// Files that change when the agent is used: the newest gives its last
     /// activity.
     pub activity: Vec<HomePath>,

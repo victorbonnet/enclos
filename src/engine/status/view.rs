@@ -230,6 +230,12 @@ pub struct AgentStatus {
     pub last_active: Fact<Timestamp>,
     pub bytes: Fact<u64>,
     pub model: Fact<String>,
+    pub provider: Fact<String>,
+    /// What a person runs in the sandbox to choose its provider and model,
+    /// when its settings name none: the runtime then picks one on its own,
+    /// and may find none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choose_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

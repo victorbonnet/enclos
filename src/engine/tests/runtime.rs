@@ -165,6 +165,8 @@ impl RuntimeAdapter for TestRuntime {
 /// unless `purge-fails` exists. While `gateway-runs` exists, as a running
 /// gateway owns every profile, its delete stops halfway, as Hermes
 /// 0.23.0's does: the profile marked deleted, its folder kept, exit 1.
+/// Its create copies `default`'s `config.yaml`, when there is one, as
+/// `--clone-from` does.
 pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -173,6 +175,10 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
 [ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
 [ -f \"$HOME/hermes-after-fails\" ] && [ \"$5\" = secrets.command.enabled ] && exit 3
+if [ \"$1 $2 $4 $5\" = \"profile create --clone-from default\" ] && [ -f \"$HOME/.hermes/config.yaml\" ]; then
+  mkdir -p \"$HOME/.hermes/profiles/$3\"
+  cp \"$HOME/.hermes/config.yaml\" \"$HOME/.hermes/profiles/$3/config.yaml\"
+fi
 if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/gateway-runs\" ]; then
   mkdir -p \"$HOME/.hermes/profiles/.deleted\"
   echo deleted > \"$HOME/.hermes/profiles/.deleted/$3\"
@@ -801,6 +807,40 @@ fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
                 .unwrap(),
         );
     }
+}
+
+#[test]
+fn an_agent_added_before_the_login_chose_a_provider_is_said_to_have_none() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let settings = lab.home.join(".hermes/config.yaml");
+    let add = |a: &str| {
+        done(
+            lab.engine
+                .add_agent(&alice(), &lab.name, a.parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        )
+    };
+    // Before the login: Hermes's own settings, which the new agent copies.
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(&settings, "model:\n  default: ''\n  provider: auto\n").unwrap();
+    let early = add("early");
+    assert_eq!(
+        early.choose_provider.as_deref(),
+        Some("hermes -p early model")
+    );
+    // After it, the new agent starts on the provider it chose.
+    std::fs::write(
+        &settings,
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    assert_eq!(add("late").choose_provider, None);
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/profiles/late/config.yaml")).unwrap(),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n"
+    );
 }
 
 #[test]
