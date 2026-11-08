@@ -226,7 +226,7 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --all-features --test bubblewrap on_a_runner -- --test-threads=1 | tee bubblewrap.log
-          grep -q 'test result: ok\. 22 passed' bubblewrap.log
+          grep -q 'test result: ok\. 23 passed' bubblewrap.log
       - name: The escape probes' report
         if: always()
         run: |
