@@ -9,6 +9,7 @@
 //! - [`device`], [`noise`], [`pairing`], [`preview`]: the bridge and a
 //!   paired device.
 
+pub mod approval;
 pub mod device;
 mod envelope;
 mod ids;

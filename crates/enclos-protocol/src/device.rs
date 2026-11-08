@@ -27,6 +27,12 @@ pub enum FromDevice {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push: Option<PushToken>,
     },
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide {
+        request: String,
+        revision: String,
+        approve: bool,
+    },
     #[serde(rename = "agents")]
     Agents,
     #[serde(rename = "conversation.new")]
@@ -86,6 +92,7 @@ pub enum FromDevice {
 pub const FROM_DEVICE_TYPES: &[&str] = &[
     "auth",
     "pair.request",
+    "approval.decide",
     "agents",
     "conversation.new",
     "group.new",
@@ -105,6 +112,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "approval")]
+    Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
     #[serde(rename = "authenticated")]
     Authenticated { person: String },
@@ -165,6 +174,7 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "approval",
     "authenticated",
     "pair.accepted",
     "pair.refused",

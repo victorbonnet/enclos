@@ -64,3 +64,106 @@ fn a_strange_media_type_is_a_plain_file() {
         "application/octet-stream"
     );
 }
+
+fn approval_sample() -> enclos_protocol::approval::Approval {
+    use enclos_protocol::approval::*;
+    Approval {
+        request: "r1".into(),
+        sandbox: "lab".into(),
+        agent: "lab/main".into(),
+        conversation: Some("c1".into()),
+        access: Access {
+            kind: AccessKind::Network,
+            target: "example.com".into(),
+            private: false,
+        },
+        action: "Connect to example.com".into(),
+        time: 1,
+        state: "pending".into(),
+        change: "Allow example.com".into(),
+        restart: false,
+        revision: "rev1".into(),
+        available: true,
+        reason: None,
+    }
+}
+#[test]
+fn approval_two_devices_cannot_decide_or_refresh_the_same_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let a = approval_sample();
+    assert!(first.create_approval(&a).unwrap());
+    assert!(!second.create_approval(&a).unwrap());
+    assert!(first.claim_approval(&a.request).unwrap());
+    assert!(!second.claim_approval(&a.request).unwrap());
+    assert!(!second.refresh_approval(&a).unwrap());
+    assert_eq!(
+        second.approval(&a.request).unwrap().unwrap().state,
+        "applying"
+    );
+    let mut denied = a.clone();
+    denied.state = "denied".into();
+    first.put_approval(&denied).unwrap();
+    assert!(!second.create_approval(&a).unwrap());
+    assert_eq!(
+        second.approval(&a.request).unwrap().unwrap().state,
+        "denied"
+    );
+}
+#[test]
+fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    {
+        let store = Store::open(&path).unwrap();
+        store.create_approval(&approval_sample()).unwrap();
+        store.claim_approval("r1").unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    store.recover_approvals().unwrap();
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "failed");
+    assert!(!store.claim_approval("r1").unwrap());
+}
+
+#[test]
+fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Arc::new(Hub {
+        transport: Transport::Tailscale,
+        store_path: dir.path().join("app.db"),
+        layout: crate::layout::Layout::at(dir.path().join("enclos")),
+        bridge_private: vec![],
+        agents: vec![],
+        host: Some("owner@example.com".into()),
+        plugins: Mutex::new(HashMap::new()),
+        commands: Mutex::new(HashMap::new()),
+        groups: Mutex::new(HashMap::new()),
+        stops: Mutex::new(Default::default()),
+        devices: Mutex::new(HashMap::new()),
+    });
+    let store = hub.store().unwrap();
+    let device = Device {
+        id: "d1".into(),
+        name: "phone".into(),
+        person: "owner@example.com".into(),
+        noise_key: vec![],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+    };
+    assert!(
+        hub.decide_access(&store, &device, "guest@example.com", "r1", "rev1", true)
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.decide_access(&store, &device, "owner@example.com", "r1", "rev1", true)
+            .unwrap_err()
+            .contains("no longer paired")
+    );
+    assert!(store.approvals().unwrap().is_empty());
+}
