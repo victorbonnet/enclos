@@ -1,0 +1,17 @@
+---
+status: proposed
+---
+
+# The host's person approves sandbox policy scopes from the phone
+
+Amends [0042](0042-a-bridge-on-each-host-serves-the-mobile-app.md)'s read-only consequence and §2's remote-control non-goal; narrows the future `approve` ability in [0043](0043-sharing-an-agent-is-not-hosting-it.md): it does not authorize widening a sandbox policy for another person.
+
+A refused action should be reviewable from the mobile inbox, and accepting its scope should persist in the sandbox policy and the agents' knowledge. The sandbox remains the permission boundary ([0003](0003-sandbox-is-the-permission-boundary.md)); an approval for one agent therefore affects every agent in it.
+
+Decision (proposed): only the host's own person, identified by the transport and using a still-paired device, may approve or deny a request. An unknown host identity refuses decisions. This applies to the host person's existing paired devices; pairing now carries the authority to approve these scopes, so protect those devices and unpair a lost one. Sharing chat or a runtime's approval ability confers no policy authority. The bridge previews a single destination and its port, an explicit private-address opt-in, or a writable path and everything beneath it. The engine validates that exact change under its state lock, with an unchanged policy revision and no pending changes or unapplied edits. Decisions are audited with the person, device and request. Network changes go live through the proxy; filesystem changes restart the sandbox, explicitly stated on the approval button. Sensitive read denials and enclos's protected paths remain unavailable for approval.
+
+Requests and decisions survive reconnect and bridge restart. One device claims a decision atomically; an interrupted application is marked for host review, never replayed. Denying changes no policy. The plugin persists a description of the active policy and supplies it to future model turns; that description is advisory, and the backend and proxy still enforce the policy. Approval does not automatically replay an attempted action.
+
+The proxy identifies a sandbox, not an agent: its refusals never acquire an invented agent or conversation. Hermes reports concrete file tool refusals and offers `enclos_request_access` for other actions, including a shell's refused filesystem operation. Arbitrary shell syntax is not parsed for grants. This does not observe every OS refusal, and cannot approve a new kind of capability the engine does not support.
+
+Reason: an exact scope in a persistent policy is understandable and reusable, while accepting a command string on the host would turn agent text into authority. Keeping existing policy validation and restart rules avoids a second enforcement path. An additional per-device admin enrollment could narrow authority further, but this request uses the host person's already paired devices; the future general admin surface is separate (#166).

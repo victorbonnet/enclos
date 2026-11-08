@@ -13,6 +13,9 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "approvals.rs"]
+mod approvals;
+
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -60,6 +63,7 @@ pub struct AgentEndpoint {
 struct Hub {
     transport: Transport,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// The person the host belongs to, on the transport: whose the agents'
@@ -427,9 +431,16 @@ impl Hub {
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
-        let (hello, mut reader, writer) =
+        let (hello, mut reader, mut writer) =
             connect(&endpoint.socket, &endpoint.token, &home_id(agent))
                 .map_err(|e| e.to_string())?;
+        if hello.capabilities.contains(&Capability::Approval)
+            && let Some((sandbox, _)) = agent.split_once('/')
+            && let Ok(name) = sandbox.parse()
+            && let Ok(text) = crate::engine::Engine::open(self.layout.clone()).access_context(&name)
+        {
+            let _ = writer.send(FromBridge::PolicyContext { text });
+        }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
@@ -599,6 +610,43 @@ impl Hub {
                     }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
+                    FromPlugin::ApprovalRequest {
+                        conversation,
+                        access,
+                        action,
+                    } => {
+                        // The endpoint, not the plugin's text, names its sandbox and agent.
+                        let id = conversation.as_str();
+                        if store.conversation_info(id).ok().flatten().is_some_and(|c| {
+                            format!("{}/{}", c.sandbox, c.agent) == agent
+                                || store
+                                    .members(id)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .any(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
+                        }) {
+                            match hub.request_access(&store, &agent, Some(id), access, &action) {
+                                Ok(()) => {
+                                    let _ = acks.send(FromBridge::Ack { of: message.id });
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "enclos app: could not save {agent}'s policy request: {e}"
+                                    );
+                                }
+                            }
+                        } else {
+                            let _ =
+                                acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
+                                    of: Some(message.id.clone()),
+                                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                    message:
+                                        "A policy request must name a conversation of this agent."
+                                            .into(),
+                                }));
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
+                        }
+                    }
                     FromPlugin::Tool(step) => {
                         if let Ok(Some(c)) = store.conversation_info(step.conversation.as_str())
                             && format!("{}/{}", c.sandbox, c.agent) == agent
@@ -622,6 +670,7 @@ pub fn serve(
     transport: Transport,
     port: u16,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
@@ -630,6 +679,7 @@ pub fn serve(
     let hub = Arc::new(Hub {
         transport,
         store_path,
+        layout,
         bridge_private,
         agents,
         host,
@@ -659,6 +709,27 @@ pub fn serve(
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 hub.expire_turns(&store);
+            }
+        });
+    }
+    if let Ok(store) = hub.store() {
+        let _ = store.recover_approvals();
+    }
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(store) = hub.store()
+                    && let Err(e) = hub.collect_refusals(&store)
+                {
+                    eprintln!("enclos app approvals: {e}");
+                }
+                // A policy restart closes the plugin sockets. Reopen them so cron
+                // work, too, gets fresh policy knowledge without a phone reconnect.
+                for agent in &hub.agents {
+                    let _ = hub.plugin(&agent.name);
+                }
+                std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
@@ -945,6 +1016,22 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::ApprovalDecide {
+                request,
+                revision,
+                approve,
+            } => {
+                let answer = hub.decide_access(store, device, person, &request, &revision, approve);
+                if let Err(e) = answer {
+                    link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?;
+                } else {
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
             FromDevice::Agents => {
                 let plugins = hub.plugins.lock().expect("not poisoned");
                 let agents = hub
@@ -1073,6 +1160,11 @@ fn run_session(
                 }
             }
             FromDevice::Sync { since } => {
+                if hub.host.as_deref() == Some(person) {
+                    for a in store.approvals().map_err(|e| e.to_string())? {
+                        link.send(ToDevice::Approval(a))?;
+                    }
+                }
                 // Every conversation first, named or empty, then the messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {

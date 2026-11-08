@@ -222,6 +222,7 @@ fn audit_since_keeps_recent_entries() {
     assert_eq!(recent.len(), 1);
 }
 
+mod approvals;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 mod compile;

@@ -7,6 +7,7 @@
 
 mod agents;
 mod app;
+mod approvals;
 mod compile;
 mod configure;
 mod doctor;
@@ -36,6 +37,7 @@ mod tests;
 
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
 pub use app::AppEndpoint;
+pub use approvals::AccessPlan;
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,

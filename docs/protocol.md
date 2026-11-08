@@ -1,6 +1,6 @@
 # The mobile app protocol
 
-Status: **proposed, version 1 draft**, with [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md). Nothing here is implemented yet, and no part of it is tested. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
+Status: **proposed, version 1 draft**, with [ADR 0042](adr/0042-a-bridge-on-each-host-serves-the-mobile-app.md) and [ADR 0043](adr/0043-sharing-an-agent-is-not-hosting-it.md). This is the evolving contract of the mobile PR stack; each feature records its verification separately. Its words are the glossary's: host, sandbox, agent, runtime, bridge, paired device, person, share, conversation.
 
 The protocol has two legs, one message format:
 
@@ -43,6 +43,8 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
+| `approval.request` | plugin | `conversation`, `access`: `{kind: network|write|read, target, private: boolean}`, `action` (short description) | Request a sandbox policy scope; no authority and no host command |
+| `policy.context` | bridge | `text` | The active policy described for the agent's future turns; only for plugins announcing `approval` |
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? | A person's message to the agent |
 | `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work), which every runtime may send; `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
@@ -124,6 +126,8 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
 | `tool` | bridge | as on the plugin leg | A tool the agent starts or ends, live; not kept, not synced |
 | `commands` | bridge | `agent`, `commands` (as on the plugin leg) | An agent's commands, for the person to pick from as they type `/`: after `agents.list`, one for each agent whose plugin listed them, and again when a plugin lists them anew |
+| `approval` | bridge | `request`, `sandbox`, `agent` (empty for proxy refusals), `conversation`?, `access`, `action`, `time`, `state`, `change`, `restart`, `revision`, `available`, `reason`? | A stored policy request and its exact preview, at sync and whenever it changes; only to the host's person |
+| `approval.decide` | device | `request`, `revision`, `approve` (boolean) | Approve or deny the stored scope; no target or policy edits accepted from the device |
 | `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, then every `message` of them after `since`, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
@@ -170,7 +174,7 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `typing` | It reports working on an answer |
 | `stream` | It sends a reply in parts, batched (never one message per word); version 1 defines no parts message yet |
 | `attachments` | It takes and sends files; version 1 defines none yet |
-| `approval` | It asks before running something; reserved, no messages in version 1 |
+| `approval` | It requests sandbox policy scopes and receives active policy context (`approval.request`, `policy.context`) |
 | `abort` | It can stop an answer; reserved, no messages in version 1 |
 | `titles` | It names conversations (`conversation.title`) and keeps the person's names |
 | `tools` | It reports the tools it runs while it works (`tool`) |
@@ -194,3 +198,15 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 ## Versions
 
 `v` is the protocol's version, not enclos's or the app's. A change that an older peer would misread raises it; adding an optional field, `type` or capability does not. A bridge speaks its version and the one before it for at least one release, and a device that receives `error` of code `version` tells the person to update the app.
+
+## Sandbox policy requests
+
+[ADR 0046](adr/0046-the-hosts-person-approves-sandbox-policy-scopes-from-the-phone.md), proposed. `access.kind` is `network` (one exact host:port, optional private-address opt-in), `write` (one absolute path and everything beneath it), or `read` (shown for review, never removes a read denial). `action` is an agent-supplied label, at most 240 characters; it is data, never executed. A target is at most 4,096 bytes and contains no control characters. The plugin's connection supplies its sandbox and agent; the bridge accepts only that agent's own conversation or a group it belongs to. A proxy refusal is per sandbox, with no requesting agent or conversation claimed.
+
+The host generates `change`, `restart`, `available`, `reason` and the opaque `revision`. It refuses wildcards, blocked destinations, protected filesystem paths, pending policy changes, unrelated policy edits and stale previews. A private opt-in is per host, including its other ports that the policy already allows, which the preview discloses. Write grants store and show the resolved destination, so a changed symlink invalidates the preview and cannot redirect a saved grant. A write change restarts all running sessions; services restart, interactive work ends. An unsupported request stays visible, with Deny and its reason but no approval. The device submits only the stored request id, the preview revision and its decision. The host person must match the transport's own identity and the device must still be paired. An unknown identity or other person gets `not_allowed`.
+
+States: `pending`, `applying`, `approved`, `denied`, `failed`. A database claim serializes two devices' decisions. Requests deduplicate by sandbox, access scope and active policy; a pending scope is not duplicated when the policy changes. A resolved scope may be requested again after a later policy change. They are independent of message `seq` and are included at every sync. A stale preview is refreshed and must be reviewed again. `approved` follows the engine's successful application; failure may leave a pending or active change, so `failed` says to review the host's policy. A bridge restart makes an interrupted `applying` request `failed`, never replays it. Denial changes no policy. Both decisions have audit entries naming the device and request.
+
+The bridge sends the active policy as `policy.context` after a supporting plugin's hello and after a decision, for every connected agent of the sandbox. Hermes persists it beside the channel socket and supplies it through `pre_llm_call`; a newly connected plugin gets a fresh description. It does not modify user-authored memory or imply that an inactive grant is available. The agent can use approved scopes in later work. Neither side automatically repeats an attempted action.
+
+Hermes observes concrete `read_file`, `write_file` and `patch` permission errors when their absolute path is known. It registers `enclos_request_access` for explicit requests, including file operations attempted through a shell. A proxy's recorded allowlist/private-address refusals are collected while the bridge runs. There is no attempt to infer a policy from arbitrary shell strings or to observe every backend refusal. Rerun `runtime configure <sandbox>/<agent> --channel app` for existing agents to install the updated plugin.

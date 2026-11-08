@@ -21,6 +21,9 @@ pub enum FromBridge {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home: Option<ConversationId>,
     },
+    /// Current active grants, refreshed at connect and after a policy decision.
+    #[serde(rename = "policy.context")]
+    PolicyContext { text: String },
     /// A person's message to the agent.
     #[serde(rename = "message.in")]
     MessageIn {
@@ -42,8 +45,14 @@ pub enum FromBridge {
 }
 
 /// The `type`s of [`FromBridge`].
-pub const FROM_BRIDGE_TYPES: &[&str] =
-    &["hello", "message.in", "conversation.rename", "ack", "error"];
+pub const FROM_BRIDGE_TYPES: &[&str] = &[
+    "policy.context",
+    "hello",
+    "message.in",
+    "conversation.rename",
+    "ack",
+    "error",
+];
 
 /// What a plugin sends to the bridge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +64,13 @@ pub enum FromPlugin {
         runtime: String,
         agent: String,
         capabilities: Vec<Capability>,
+    },
+    /// An attempted action the sandbox refused, or a request before trying it.
+    #[serde(rename = "approval.request")]
+    ApprovalRequest {
+        conversation: ConversationId,
+        access: crate::approval::Access,
+        action: String,
     },
     /// What the agent says.
     #[serde(rename = "message.out")]
@@ -99,6 +115,7 @@ pub enum FromPlugin {
 /// The `type`s of [`FromPlugin`].
 pub const FROM_PLUGIN_TYPES: &[&str] = &[
     "hello",
+    "approval.request",
     "message.out",
     "typing",
     "conversation.title",
