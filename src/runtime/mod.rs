@@ -296,6 +296,14 @@ pub trait RuntimeAdapter {
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
+    /// The runtime's own command that finishes a delete of `name` which
+    /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
+    /// rm` when that command failed after the runtime stopped listing the
+    /// agent and its folder went, and treated with it as the delete. `None`
+    /// (the default): such a failure is a failed delete.
+    fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
     /// The runtime's own command that creates agent `name` from `archive`,
     /// an export made with the runtime's own command (for Hermes, `hermes
     /// profile export`), run in the sandbox by `enclos agent add --from`.

@@ -159,6 +159,10 @@ impl RuntimeAdapter for TestRuntime {
 
 /// An installer that puts a `hermes` stub on the sandbox's PATH, which
 /// records its calls in the home and fails while `hermes-fails` exists.
+/// While `identity-pending` exists, its delete answers as Hermes 0.23.0's
+/// does when the profile's session and routing records are not purged:
+/// the folder removed, exit 1, naming `purge-identity`, which then succeeds
+/// unless `purge-fails` exists.
 pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -167,6 +171,12 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
 [ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
 [ -f \"$HOME/hermes-after-fails\" ] && [ \"$5\" = secrets.command.enabled ] && exit 3
+if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/identity-pending\" ]; then
+  rm -rf \"$HOME/.hermes/profiles/$3\"
+  echo \"Error: Profile '$3' was deleted, but its session/routing identity settlement is still pending — run: hermes profile purge-identity $3\" >&2
+  exit 1
+fi
+[ \"$1 $2\" = \"profile purge-identity\" ] && [ -f \"$HOME/purge-fails\" ] && exit 1
 if [ \"$1 $2\" = \"profile delete\" ] && [ ! -f \"$HOME/hermes-keeps\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
 fi
@@ -769,6 +779,83 @@ fn removing_an_agent_runs_the_runtimes_delete_then_removes_the_record() {
     assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 2);
 }
 
+/// A sandbox with Hermes's stub installed and `agents` added, each with a
+/// profile folder Hermes lists.
+fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    for a in agents {
+        let dir = lab.home.join(".hermes/profiles").join(a);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "").unwrap();
+        done(
+            lab.engine
+                .add_agent(&alice(), &lab.name, a.parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn a_delete_hermes_leaves_to_purge_is_finished_with_its_purge() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    lab_with_profiles(&lab, &["main", "stuck"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap();
+    let rm = |a: &str| {
+        lab.engine.remove_agent(
+            &alice(),
+            &lab.name,
+            &a.parse().unwrap(),
+            false,
+            Confirm::Yes,
+        )
+    };
+    // Hermes 0.23.0: the profile deleted, exit 1, the purge named.
+    std::fs::write(lab.home.join("identity-pending"), "").unwrap();
+    assert_eq!(
+        done(rm("main").unwrap()),
+        AgentRemoved::Deleted {
+            kind: RuntimeKind::Hermes
+        }
+    );
+    assert!(
+        calls().ends_with("profile delete main --yes\nprofile purge-identity main\n"),
+        "{}",
+        calls()
+    );
+    assert!(!lab.home.join(".hermes/profiles/main").exists());
+    let names: Vec<String> = lab
+        .engine
+        .agents(&lab.name)
+        .unwrap()
+        .iter()
+        .map(|a| a.name.to_string())
+        .collect();
+    assert_eq!(names, ["stuck"]);
+
+    // A purge that fails keeps the record, and says how to finish.
+    std::fs::write(lab.home.join("purge-fails"), "").unwrap();
+    let err = rm("stuck").unwrap_err().to_string();
+    assert!(
+        err.contains(
+            "`hermes profile purge-identity stuck`, which finishes its delete, exited with 1"
+        ) && err.contains("enclos connect home -- hermes profile purge-identity stuck")
+            && err.contains("its record stays"),
+        "{err}"
+    );
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+    // Once it is finished by hand, nothing is left: the record goes.
+    assert_eq!(
+        done(rm("stuck").unwrap()),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/stuck".into(),
+            why: FilesKept::RuntimeLacksIt,
+        }
+    );
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+}
+
 #[test]
 fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1272,9 +1359,8 @@ fn an_import_is_refused_when_the_runtimes_agents_cannot_be_read() {
 #[test]
 fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
     let (_dir, engine, name, make) = with_hermes();
-    make("scout");
-    make("ranger");
-    for a in ["scout", "ranger"] {
+    for a in ["scout", "ranger", "half"] {
+        make(a);
         done(
             engine
                 .add_agent(&alice(), &name, agent(a), Confirm::Yes)
@@ -1282,12 +1368,38 @@ fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
         );
     }
     let profiles = engine.sandbox_home(&name).join(".hermes/profiles");
-    // As `hermes profile delete` does: a tombstone, the folder kept.
-    std::fs::create_dir_all(profiles.join(".deleted/scout")).unwrap();
+    // As `hermes profile delete` does: a tombstone, then the folder
+    // removed. A delete that stopped halfway leaves the folder.
+    for a in ["scout", "half"] {
+        std::fs::create_dir_all(profiles.join(".deleted").join(a)).unwrap();
+    }
+    std::fs::remove_dir_all(profiles.join("scout")).unwrap();
     std::fs::remove_dir_all(profiles.join("ranger")).unwrap();
     let diff = compared(engine.check_agents(&name).unwrap());
-    assert_eq!(diff.missing, [agent("ranger"), agent("scout")]);
+    assert_eq!(
+        diff.missing,
+        [agent("half"), agent("ranger"), agent("scout")]
+    );
     assert!(diff.untracked.is_empty());
+    // What is left of the half-deleted one is Hermes's to delete: its
+    // folder would refuse an agent of that name.
+    let Planned::DryRun(plan) = engine
+        .remove_agent(&alice(), &name, &agent("half"), false, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert_eq!(
+        plan.changes,
+        [
+            "delete what is left of agent home/half (~/.hermes/profiles/half), which Hermes no longer lists, with Hermes's own command"
+        ]
+    );
+    done(
+        engine
+            .remove_agent(&alice(), &name, &agent("half"), true, Confirm::Yes)
+            .unwrap(),
+    );
     // Nothing left to delete: removing them takes only the record, and
     // runs nothing in the sandbox (the fake backend would fail).
     for a in ["scout", "ranger"] {

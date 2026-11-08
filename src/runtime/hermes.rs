@@ -262,6 +262,21 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn finish_delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
+        // Hermes 0.23.0's delete removes the profile, then exits 1 when the
+        // session and routing records under its name are not purged yet
+        // ("its session/routing identity settlement is still pending"),
+        // naming this command, which purges them, succeeds when they are
+        // already gone, and refuses while a profile of that name exists
+        // (`purge_profile_identity` in `hermes_cli/profile_identity.py`).
+        Some(SandboxCommand::from_words(&[
+            HERMES,
+            "profile",
+            "purge-identity",
+            name.as_str(),
+        ]))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
@@ -856,6 +871,10 @@ mod tests {
             Some(SandboxCommand::from_words(&[
                 "hermes", "profile", "delete", "main", "--yes"
             ]))
+        );
+        assert_eq!(
+            Hermes.finish_delete_agent(&main).unwrap().shown(),
+            "hermes profile purge-identity main"
         );
         let default: AgentName = "default".parse().unwrap();
         assert_eq!(Hermes.builtin_agent(), Some(DEFAULT_PROFILE));
