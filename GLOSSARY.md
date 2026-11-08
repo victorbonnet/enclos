@@ -131,6 +131,10 @@ _Avoid_: session (a sandbox's word), chat, thread
 A conversation between one person and several agents of one sandbox, which the bridge keeps and whose turns it runs. Each agent answers in turn, when addressed by its handle (`@main`), by `@all`, or by another member.
 _Avoid_: room (Hermes's word), channel (a messaging account), team
 
+**Artefact**:
+A page an agent makes for a person to open in the app from its conversation.
+_Avoid_: artifact, app (for a generated page)
+
 **Agent command**:
 A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
 _Avoid_: command alone (enclos's own), shortcut, action
