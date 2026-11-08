@@ -162,7 +162,9 @@ impl RuntimeAdapter for TestRuntime {
 /// While `identity-pending` exists, its delete answers as Hermes 0.23.0's
 /// does when the profile's session and routing records are not purged:
 /// the folder removed, exit 1, naming `purge-identity`, which then succeeds
-/// unless `purge-fails` exists.
+/// unless `purge-fails` exists. While `gateway-runs` exists, as a running
+/// gateway owns every profile, its delete stops halfway, as Hermes
+/// 0.23.0's does: the profile marked deleted, its folder kept, exit 1.
 pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -171,6 +173,12 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
 [ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
 [ -f \"$HOME/hermes-after-fails\" ] && [ \"$5\" = secrets.command.enabled ] && exit 3
+if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/gateway-runs\" ]; then
+  mkdir -p \"$HOME/.hermes/profiles/.deleted\"
+  echo deleted > \"$HOME/.hermes/profiles/.deleted/$3\"
+  echo \"Error: Could not remove profile directory $HOME/.hermes/profiles/$3: a running gateway still owns this profile; retry the delete once it settles\" >&2
+  exit 1
+fi
 if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/identity-pending\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
   echo \"Error: Profile '$3' was deleted, but its session/routing identity settlement is still pending — run: hermes profile purge-identity $3\" >&2
@@ -793,6 +801,146 @@ fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
                 .unwrap(),
         );
     }
+}
+
+#[test]
+fn a_delete_runs_with_the_gateway_stopped_and_a_half_deleted_agent_is_deleted_again() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    lab_with_profiles(&lab, &["writer", "reader", "other"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap();
+    let rm = |a: &str| {
+        lab.engine.remove_agent(
+            &alice(),
+            &lab.name,
+            &a.parse().unwrap(),
+            false,
+            Confirm::Yes,
+        )
+    };
+    let profile = |a: &str| lab.home.join(".hermes/profiles").join(a);
+    // A gateway that runs owns every profile; the service manager stops
+    // and starts it.
+    let runs = lab.home.join("gateway-runs");
+    std::fs::write(&runs, "").unwrap();
+
+    // Without its service installed, enclos cannot stop it: Hermes's
+    // delete stops halfway and the record stays, saying what is left.
+    let err = rm("writer").unwrap_err().to_string();
+    assert!(
+        err.contains("exited with 1 and left its folder (~/.hermes/profiles/writer), which Hermes no longer lists; its record stays")
+            && err.contains("`enclos agent rm home/writer` runs Hermes's delete again"),
+        "{err}"
+    );
+    assert!(profile("writer").exists());
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 3);
+
+    // Installed, as `sandbox start` leaves it, the gateway stops while
+    // Hermes deletes, then is installed again.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let on = runs.clone();
+    *fake.on_stop.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            let _ = std::fs::remove_file(&on);
+        }
+    }));
+    let on = runs.clone();
+    *fake.on_start.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            std::fs::write(&on, "").unwrap();
+        }
+    }));
+    let Planned::DryRun(plan) = lab
+        .engine
+        .remove_agent(
+            &alice(),
+            &lab.name,
+            &agent("reader"),
+            false,
+            Confirm::DryRun,
+        )
+        .unwrap()
+    else {
+        panic!("a dry run removed");
+    };
+    assert_eq!(
+        plan.changes,
+        [
+            format!("stop service {gateway}"),
+            "delete agent home/reader and its files, with Hermes's own command".to_owned(),
+            format!("install service {gateway} again"),
+        ]
+    );
+    let err = lab
+        .engine
+        .remove_agent(&alice(), &lab.name, &agent("reader"), false, Confirm::Ask)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "deleting agent home/reader and its files, its service gateway stopped meanwhile"
+        ),
+        "{err}"
+    );
+    // The half-deleted agent first: Hermes's delete runs again and
+    // finishes it.
+    for a in ["writer", "reader"] {
+        assert_eq!(
+            done(rm(a).unwrap()),
+            AgentRemoved::Deleted {
+                kind: RuntimeKind::Hermes
+            }
+        );
+        assert!(!profile(a).exists());
+        assert!(
+            calls().ends_with(&format!("profile delete {a} --yes\n")),
+            "{}",
+            calls()
+        );
+    }
+    assert_eq!(fake.stopped.borrow().len(), 2);
+    let started: Vec<String> = fake
+        .started
+        .borrow()
+        .iter()
+        .map(|u| u.label.to_string())
+        .collect();
+    assert_eq!(started, [gateway.to_string()]);
+    let args = fake.started.borrow()[0].args.clone();
+    assert_eq!(
+        args,
+        ["launch", "home", "gateway"].map(std::ffi::OsString::from)
+    );
+    assert!(runs.exists(), "the gateway runs again");
+    let audit = lab.audit();
+    assert!(
+        audit.contains("services remove") && audit.contains("services start"),
+        "{audit}"
+    );
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
+
+    // A gateway that cannot start again: the agent is deleted all the
+    // same, and enclos says how to start it.
+    *fake.refuse.borrow_mut() = Some("gateway".to_owned());
+    let err = rm("other").unwrap_err().to_string();
+    assert!(
+        err.contains("its gateway could not start again")
+            && err.contains("`enclos sandbox start home` starts its services again")
+            && err.contains("after deleting agent home/other and its files, and its record"),
+        "{err}"
+    );
+    assert!(!profile("other").exists());
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
 }
 
 #[test]

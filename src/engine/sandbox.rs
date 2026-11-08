@@ -400,7 +400,7 @@ impl Engine {
         // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
         let services = self
-            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, None)?
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, &[])?
             .into_result()?;
         self.write(
             by,

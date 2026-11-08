@@ -108,6 +108,23 @@ impl Engine {
                 .ok_or(FilesKept::NoDeleteCommand),
         };
         let files = runtime.agent_files(agent);
+        // The runtime's services may hold the agent's files (Hermes's
+        // gateway serves every agent): they stop while the delete runs.
+        let pausing = match &delete {
+            Ok(_) => self.installed_runtime_services(name)?,
+            Err(_) => Vec::new(),
+        };
+        let meanwhile = match pausing.as_slice() {
+            [] => String::new(),
+            units => format!(
+                ", its service {} stopped meanwhile",
+                units
+                    .iter()
+                    .map(|(u, _)| u.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        };
         match confirm {
             Confirm::DryRun => {
                 let what = match &delete {
@@ -129,23 +146,41 @@ impl Engine {
                         "remove the record of agent {name}/{agent}; {shown} has no command enclos can run to delete it, so its files stay ({files})"
                     ),
                 };
+                let stop = pausing.iter().map(|(_, l)| format!("stop service {l}"));
+                let start = pausing
+                    .iter()
+                    .map(|(_, l)| format!("install service {l} again"));
                 return Ok(Planned::DryRun(Plan {
-                    changes: vec![what],
+                    changes: stop.chain([what]).chain(start).collect(),
                     ..Plan::default()
                 }));
             }
             Confirm::Ask if delete.is_ok() => {
                 return Err(Error::NeedsConfirmation {
-                    what: format!("deleting agent {name}/{agent} and its files"),
+                    what: format!("deleting agent {name}/{agent} and its files{meanwhile}"),
                 });
             }
             _ => {}
         }
+        // The runtime's commands run as sessions of their own, which take
+        // the lock themselves; the record goes after them, below.
+        let mut not_restarted = None;
         let deleted = match delete {
-            // The runtime's commands run as sessions of their own, which
-            // take the lock themselves; the record goes after them, below.
             Ok(command) => {
-                self.delete_files(by, name, agent, command)?;
+                let why = format!("for agent rm {name}/{agent}");
+                let paused = self.pause_runtime(by, name, &why)?;
+                let deleted = self.delete_files(by, name, agent, command);
+                let resumed = self.resume_runtime(by, name, paused);
+                match (deleted, resumed) {
+                    (Ok(()), resumed) => not_restarted = resumed.err(),
+                    (Err(e), Ok(())) => return Err(e),
+                    (Err(e), Err(r)) => {
+                        return Err(Error::CleanupFailed {
+                            error: Box::new(e),
+                            left: r.to_string(),
+                        });
+                    }
+                }
                 Ok(())
             }
             Err(why) => Err(why),
@@ -178,6 +213,12 @@ impl Engine {
             },
             Err(_) => e,
         })?;
+        if let Some(error) = not_restarted {
+            return Err(Error::FailedAfter {
+                error: Box::new(error),
+                done: format!("deleting agent {name}/{agent} and its files, and its record"),
+            });
+        }
         Ok(Planned::Done(match deleted {
             Ok(()) => AgentRemoved::Deleted { kind },
             Err(why) => AgentRemoved::RecordOnly { kind, files, why },

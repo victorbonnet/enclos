@@ -19,6 +19,7 @@ mod listener;
 mod loopback;
 mod markers;
 mod net;
+mod pause;
 mod pending;
 mod policy;
 mod probe;
