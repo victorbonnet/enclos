@@ -250,7 +250,9 @@ pub enum StateError {
         "{path} was written by an unreleased build of enclos whose schema {found} differs from this one's, so it cannot be upgraded. Remove its sandboxes with that build (`enclos sandbox rm <name>`) or move the enclos folder aside, then run `enclos init` and create them again"
     )]
     UnknownSchema { path: PathBuf, found: u32 },
-    #[error("{path} holds a value enclos cannot read ({detail}). Restore state.db from a backup")]
+    #[error(
+        "{path} holds a value enclos cannot read ({detail}). Restore state.db from a backup, and remove the state.db-wal and state.db-shm beside it, which belong to the damaged one"
+    )]
     Corrupt { path: PathBuf, detail: String },
     #[error("cannot use {path}: {source}")]
     Io {

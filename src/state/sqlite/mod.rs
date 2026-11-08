@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
 
 pub use log_writer::NetLogWriter;
@@ -74,6 +75,16 @@ impl SqliteStateStore {
         // `init` puts the database in WAL mode, where a commit need not flush
         // the disk: a power loss can lose the last commits, never corrupt it.
         conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(self.sqlite_err())?;
+        // A connection that closes leaves the log in place. Each call opens
+        // its own, so most close with no other one open, and SQLite would
+        // then copy the log into `state.db` and delete it, holding the whole
+        // database through two flushes; the next write would flush a new
+        // log's header, holding the write lock. A flush can take seconds on a
+        // loaded SD card, past `LOCK_WAIT` for the calls waiting. The commit
+        // that grows the log past 1000 pages copies it instead, while other
+        // connections read and write.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
             .map_err(self.sqlite_err())?;
         Ok(conn)
     }
