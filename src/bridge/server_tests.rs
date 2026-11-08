@@ -458,3 +458,182 @@ fn diagnostic_provenance_later_real_requests_get_fresh_ids_and_keep_denial_dedup
             .any(|v| v.state == "pending")
     );
 }
+
+fn avatar_fixture(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbImage::from_fn(width, height, |x, y| {
+        image::Rgb([(x % 255) as u8, (y % 255) as u8, 80])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+fn avatar_device(id: &str, person: &str) -> Device {
+    Device {
+        id: id.into(),
+        name: id.into(),
+        person: person.into(),
+        noise_key: id.as_bytes().to_vec(),
+        device_key: id.as_bytes().to_vec(),
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+    }
+}
+#[test]
+fn avatar_normalizes_to_a_bounded_square_and_refuses_untrusted_input() {
+    use enclos_protocol::avatar::MAX_AVATAR_BYTES;
+    let input = avatar_fixture(100, 60);
+    let out = avatars::normalize(&input).unwrap();
+    let decoded = image::load_from_memory(&out).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (256, 256));
+    assert!(out.starts_with(&[0xff, 0xd8]) && out.len() <= MAX_AVATAR_BYTES);
+    for invalid in [
+        vec![],
+        vec![0; MAX_AVATAR_BYTES + 1],
+        b"<svg onload='alert(1)'/>".to_vec(),
+        input[..input.len() / 2].to_vec(),
+        avatar_fixture(513, 1),
+    ] {
+        assert!(avatars::normalize(&invalid).is_err());
+    }
+}
+#[test]
+fn avatar_persistence_conflicts_and_removal_survive_other_connections_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let original = first
+        .set_avatar("lab/coder", 0, Some(b"image"), ("d1", "owner"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.avatar("lab/coder").unwrap(), original);
+    assert_eq!(original.version, Some(crate::policy::sha256_hex(b"image")));
+    assert!(
+        second
+            .set_avatar("lab/coder", 0, None, ("d2", "owner"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(first.log_lines(10).unwrap().len(), 1);
+    let removed = second
+        .set_avatar("lab/coder", 1, None, ("d2", "owner"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.revision, 2);
+    assert_eq!(removed.image, None);
+    assert_eq!(removed.version, None);
+    drop(first);
+    drop(second);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.avatar("lab/coder").unwrap(), removed);
+    assert_eq!(reopened.avatar_metadata().unwrap()["lab/coder"].revision, 2);
+    assert!(
+        reopened
+            .set_avatar("lab/coder", 1, Some(b"stale"), ("d1", "owner"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reopened.avatar("other/coder").unwrap().revision, 0);
+}
+#[test]
+fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devices_cannot_write() {
+    use enclos_protocol::avatar::AvatarSet;
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/coder".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("unused.sock"),
+        token: "fixture".into(),
+    });
+    let owner = avatar_device("phone", "owner@example.com");
+    let guest = avatar_device("tablet", "guest@example.com");
+    let revoked = avatar_device("revoked", "owner@example.com");
+    store.add_device(&owner).unwrap();
+    store.add_device(&guest).unwrap();
+    let (s1, r1) = channel();
+    let (s2, r2) = channel();
+    let (s3, r3) = channel();
+    hub.devices.lock().unwrap().extend([
+        (owner.id.clone(), (owner.person.clone(), s1)),
+        (guest.id.clone(), (guest.person.clone(), s2)),
+        (revoked.id.clone(), (revoked.person.clone(), s3)),
+    ]);
+    let edit = AvatarSet {
+        agent: "lab/coder".into(),
+        revision: 0,
+        image: Some(encode(&avatar_fixture(40, 40))),
+    };
+    assert!(
+        hub.set_agent_avatar(&store, &guest, &guest.person, &edit, "denied".into())
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.set_agent_avatar(&store, &revoked, &revoked.person, &edit, "denied".into())
+            .is_err()
+    );
+    assert!(
+        hub.get_avatar(&store, &owner, &owner.person, "lab/missing", "read".into())
+            .is_err()
+    );
+    assert_eq!(store.avatar("lab/coder").unwrap().revision, 0);
+    let reply = hub
+        .set_agent_avatar(&store, &owner, &owner.person, &edit, "saved".into())
+        .unwrap();
+    let broadcast = r1.try_recv().unwrap();
+    assert_eq!(broadcast, r2.try_recv().unwrap());
+    assert!(r3.try_recv().is_err());
+    let ToDevice::AgentAvatar(photo) = reply else {
+        panic!("photo reply")
+    };
+    assert_eq!(photo.of, "saved");
+    assert_eq!(photo.revision, 1);
+    assert!(
+        matches!(broadcast,ToDevice::AgentAvatar(ref p) if p.of.is_empty() && p.version==photo.version)
+    );
+    assert!(
+        hub.get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
+            .is_ok()
+    );
+    assert!(
+        hub.set_agent_avatar(&store, &owner, &owner.person, &edit, "stale".into())
+            .is_err()
+    );
+    assert!(r1.try_recv().is_err());
+    for image in ["%%%".to_owned(), "A".repeat(50_000)] {
+        assert!(
+            hub.set_agent_avatar(
+                &store,
+                &owner,
+                &owner.person,
+                &AvatarSet {
+                    image: Some(image),
+                    revision: 1,
+                    ..edit.clone()
+                },
+                "bad".into()
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(store.avatar("lab/coder").unwrap().revision, 1);
+    let removal = AvatarSet {
+        revision: 1,
+        image: None,
+        ..edit
+    };
+    hub.set_agent_avatar(&store, &owner, &owner.person, &removal, "removed".into())
+        .unwrap();
+    assert!(
+        matches!(r2.try_recv().unwrap(),ToDevice::AgentAvatar(p) if p.image.is_none() && p.revision==2)
+    );
+    store.remove_device(&guest.id).unwrap();
+    assert!(
+        hub.get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
+            .is_err()
+    );
+}

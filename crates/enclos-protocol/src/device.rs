@@ -12,6 +12,10 @@ use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "agent.avatar.get")]
+    AgentAvatarGet { agent: String },
+    #[serde(rename = "agent.avatar.set")]
+    AgentAvatarSet(crate::avatar::AvatarSet),
     #[serde(rename = "sandbox.policy.get")]
     SandboxPolicyGet { sandbox: String },
     #[serde(rename = "sandbox.policy.preview")]
@@ -104,6 +108,8 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "agent.avatar.get",
+    "agent.avatar.set",
     "sandbox.policy.get",
     "sandbox.policy.preview",
     "sandbox.policy.apply",
@@ -129,6 +135,8 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "agent.avatar")]
+    AgentAvatar(crate::avatar::AgentAvatar),
     #[serde(rename = "sandbox.policy")]
     SandboxPolicy(crate::policy::PolicyState),
     #[serde(rename = "sandbox.policy.preview")]
@@ -195,6 +203,7 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "agent.avatar",
     "sandbox.policy",
     "sandbox.policy.preview",
     "approval",
@@ -278,6 +287,13 @@ pub struct PushToken {
 /// An agent a person may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::avatar::AvatarMetadata::is_default"
+    )]
+    pub avatar: crate::avatar::AvatarMetadata,
+    #[serde(default)]
+    pub can_edit_avatar: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,

@@ -15,6 +15,8 @@ mod tests;
 
 #[path = "approvals.rs"]
 mod approvals;
+#[path = "avatars.rs"]
+mod avatars;
 #[path = "policy.rs"]
 mod policy;
 
@@ -1019,6 +1021,33 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::AgentAvatarGet { agent } => {
+                match hub.get_avatar(store, device, person, &agent, message.id.to_string()) {
+                    Ok(photo) => link.send(photo)?,
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::AgentAvatarSet(edit) => {
+                match hub.set_agent_avatar(store, device, person, &edit, message.id.to_string()) {
+                    Ok(photo) => link.send(photo)?,
+                    Err(e) => {
+                        if let Ok(current) =
+                            hub.get_avatar(store, device, person, &edit.agent, String::new())
+                        {
+                            link.send(current)?;
+                        }
+                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                            of: Some(message.id),
+                            code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                            message: e,
+                        }))?;
+                    }
+                }
+            }
             FromDevice::SandboxPolicyGet { sandbox } => {
                 let result = hub
                     .policy_authority(store, device, person, &sandbox)
@@ -1092,11 +1121,14 @@ fn run_session(
                 }
             }
             FromDevice::Agents => {
+                let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
                 let plugins = hub.plugins.lock().expect("not poisoned");
                 let agents = hub
                     .agents
                     .iter()
                     .map(|a| AgentInfo {
+                        avatar: photos.get(&a.name).cloned().unwrap_or_default(),
+                        can_edit_avatar: hub.host.as_deref() == Some(person),
                         agent: a.name.clone(),
                         runtime: a.runtime.clone(),
                         capabilities: plugins
