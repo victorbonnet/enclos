@@ -77,9 +77,11 @@ host-service/member probes were not enabled on this Mac.
 
 The final OpenClaw suite passed **67 tests with zero skips** against the installed
 SDK; six launcher/owner-helper tests also passed. Hermes Python 3.13 verification
-ran 103 cases: **70 passed, 33 skipped**, with all six exact-interruption cases
-included (three fixtures and three using the pinned real public helper).
-Optional unavailable Hermes integrations remain skips rather than proof.
+ran 103 cases: **102 passed, one optional legacy-source skip**. This includes
+18 native routine, 14 native question and eight native approval checks, plus all
+six exact-interruption cases (three fixtures and three using the pinned real
+public helper). The pinned checkout was completed with its tracked cron source;
+no dependency installation or native provider/service call was needed.
 
 Android companions [#45](https://github.com/victorbonnet/enclos-app/pull/45) and
 [#46](https://github.com/victorbonnet/enclos-app/pull/46) passed offline debug APK
