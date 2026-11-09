@@ -4,6 +4,8 @@
 //! profile under `~/.hermes/profiles`, all sharing the sandbox's one Hermes
 //! login (`~/.hermes/auth.json`) (design §14: to verify in this build).
 
+mod facts;
+
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -366,6 +368,10 @@ impl RuntimeAdapter for Hermes {
         runtime.into_iter().chain(caches).collect()
     }
 
+    fn fact_value(&self, at: &ValueAt, text: &str) -> Result<Option<String>, String> {
+        facts::value(at, text)
+    }
+
     fn runtime_facts(&self) -> RuntimeFacts {
         RuntimeFacts {
             // Not on disk where enclos can rely on it: `pyproject.toml` says
@@ -388,7 +394,7 @@ impl RuntimeAdapter for Hermes {
             model: Some(ValueAt {
                 file: file("config.yaml"),
                 // Hermes reads either key.
-                keys: &["model.default", "model.model"],
+                keys: vec!["model.default".into(), "model.model".into()],
             }),
             // Each profile keeps its own provider, which a new one copies
             // from `default` as it is then: `auto` before the sandbox's
@@ -401,7 +407,7 @@ impl RuntimeAdapter for Hermes {
             provider: Some(ProviderAt {
                 at: ValueAt {
                     file: file("config.yaml"),
-                    keys: &["model.provider"],
+                    keys: vec!["model.provider".into()],
                 },
                 unchosen: &["auto", ""],
                 choose: format!("{HERMES} -p {agent} model"),
@@ -970,7 +976,7 @@ mod tests {
             main_facts.model,
             Some(ValueAt {
                 file: at(".hermes/profiles/main/config.yaml"),
-                keys: &["model.default", "model.model"],
+                keys: vec!["model.default".into(), "model.model".into()],
             })
         );
         assert_eq!(
