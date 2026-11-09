@@ -4,6 +4,7 @@ import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
+import { RoutineInventory } from './routines.js';
 import { inboundMedia, mediaFolder, stageMedia } from './media.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
@@ -44,6 +45,7 @@ export function createChannel(sdk = {}) {
   let runtime;
   const running = new Map();
   const sessionRoutes = new Map();
+  const routines = new RoutineInventory();
   let hooks = { tools: false, policy: false };
   const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
@@ -69,7 +71,10 @@ export function createChannel(sdk = {}) {
     return turn;
   }
   const assertTurn = turn => assertCurrent(turn.active.cfg, turn.active.account, turn.active.transport);
-  function registerFull(api) { hooks = registerFeatures(api, { findTurn, assertTurn, running }); }
+  function registerFull(api) {
+    hooks = registerFeatures(api, { findTurn, assertTurn, running });
+    routines.register(api);
+  }
 
   async function startAccount(ctx) {
     if (!runtime || runtime.version !== TESTED_OPENCLAW) throw new Error(`enclos requires the tested OpenClaw ${TESTED_OPENCLAW} plugin runtime`);
@@ -84,11 +89,16 @@ export function createChannel(sdk = {}) {
     let transport;
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : [])],
+      capabilities: () => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(routines.available() ? ['routines'] : [])],
       onHello(_hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
       },
       onControl(control, owner) {
+        if (control.type === 'routine.request') {
+          return routines.handle(control, { account,
+            assertCurrent: () => assertCurrent(currentConfig(ctx.cfg), account, owner),
+            write: response => owner.write(response) });
+        }
         if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
         if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
         const before = owner.state.policyContext;
@@ -248,5 +258,5 @@ export function createChannel(sdk = {}) {
       ] }),
     },
   };
-  return { plugin, setRuntime, registerFull, running };
+  return { plugin, setRuntime, registerFull, running, routines };
 }

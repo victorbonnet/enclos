@@ -100,6 +100,7 @@ mod tests {
             next_cursor: None,
             options: RoutineOptions {
                 timezone: "UTC".into(),
+                operations: None,
                 features: vec!["run".into()],
                 skills: vec![],
                 models: vec![],

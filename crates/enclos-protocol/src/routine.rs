@@ -93,6 +93,11 @@ pub struct RoutineModelChoice {
 pub struct RoutineOptions {
     /// The runtime's effective timezone, not a per-job override.
     pub timezone: String,
+    /// Supported live controls. Absent preserves the preceding contract;
+    /// an explicit empty list exposes a read-only inventory. Unknown names
+    /// confer no ability in an older app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<Vec<String>>,
     #[serde(default)]
     pub features: Vec<String>,
     #[serde(default)]
@@ -317,5 +322,17 @@ mod tests {
         assert_eq!(options.models[0].provider.as_deref(), Some("provider-a"));
         assert_eq!(options.models[1].provider.as_deref(), Some("provider-b"));
         assert_eq!(options.models[2].provider, None);
+        assert_eq!(options.operations, None);
+    }
+
+    #[test]
+    fn an_explicit_read_only_operation_set_survives_the_wire() {
+        let options: RoutineOptions =
+            serde_json::from_value(serde_json::json!({"timezone":"UTC", "operations":[]})).unwrap();
+        assert_eq!(options.operations, Some(vec![]));
+        assert_eq!(
+            serde_json::to_value(options).unwrap()["operations"],
+            serde_json::json!([])
+        );
     }
 }
