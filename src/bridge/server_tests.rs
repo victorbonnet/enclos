@@ -257,6 +257,128 @@ fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
 }
 
 #[test]
+fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    store
+        .conversation("c-archive", "lab", "main", owner)
+        .unwrap();
+    let (first_tx, first_rx) = channel();
+    let (second_tx, second_rx) = channel();
+    let (guest_tx, guest_rx) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("phone".into(), (owner.into(), first_tx));
+        devices.insert("tablet".into(), (owner.into(), second_tx));
+        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx));
+    }
+    let missing = archive_conversation(&hub, &store, owner, "missing", true).unwrap_err();
+    assert_eq!(
+        archive_conversation(&hub, &store, "guest@example.com", "c-archive", true).unwrap_err(),
+        missing
+    );
+    assert!(first_rx.try_recv().is_err());
+    assert!(
+        !store
+            .conversation_info("c-archive")
+            .unwrap()
+            .unwrap()
+            .archived
+    );
+    for archived in [true, false] {
+        let direct = archive_conversation(&hub, &store, owner, "c-archive", archived).unwrap();
+        assert_eq!(direct.archived, archived);
+        for rx in [&first_rx, &second_rx] {
+            let ToDevice::Conversation(info) = rx.try_recv().unwrap() else {
+                panic!("expected conversation metadata");
+            };
+            assert_eq!(info.conversation.as_str(), "c-archive");
+            assert_eq!(info.archived, archived);
+            assert_eq!(info, direct);
+        }
+        assert!(guest_rx.try_recv().is_err());
+        let retried = archive_conversation(&hub, &store, owner, "c-archive", archived).unwrap();
+        assert_eq!(retried, direct, "a retry returns canonical metadata too");
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+    }
+    assert!(
+        hub.plugins.lock().unwrap().is_empty(),
+        "archive never reaches a runtime"
+    );
+    assert!(
+        hub.groups.lock().unwrap().is_empty(),
+        "archive starts or stops no discussion"
+    );
+}
+
+#[test]
+fn delayed_archive_read_and_rename_snapshots_keep_their_revision() {
+    let (_dir, hub, first) = diagnostic_approval_hub();
+    let second = hub.store().unwrap();
+    let owner = "owner@example.com";
+    first
+        .conversation("c-ordered", "lab", "main", owner)
+        .unwrap();
+    first.name("c-ordered", "Before", BY_PERSON).unwrap();
+    let seq = first
+        .add("ordered-message", "c-ordered", &From::Agent, "hi", "reply")
+        .unwrap()
+        .unwrap();
+    let archive = archive_conversation(&hub, &first, owner, "c-ordered", true).unwrap();
+    let restore = archive_conversation(&hub, &second, owner, "c-ordered", false).unwrap();
+    second.name("c-ordered", "After", BY_PERSON).unwrap();
+    let renamed = conversation_info(
+        &second,
+        second.conversation_info("c-ordered").unwrap().unwrap(),
+    )
+    .unwrap();
+    first.mark_read("c-ordered", seq).unwrap();
+    // A direct sync sends metadata even when no message is newer than its cursor.
+    assert!(first.since(owner, i64::MAX).unwrap().is_empty());
+    let synced = conversation_info(&first, first.conversations(owner).unwrap().remove(0)).unwrap();
+    assert_eq!(
+        [
+            archive.revision,
+            restore.revision,
+            renamed.revision,
+            synced.revision
+        ],
+        [2, 3, 4, 5]
+    );
+    assert!(archive.archived);
+    assert_eq!(archive.title.as_deref(), Some("Before"));
+    assert!(!restore.archived);
+    assert_eq!(renamed.title.as_deref(), Some("After"));
+    assert_eq!(renamed.read, None);
+    assert_eq!(synced.read, Some(seq));
+    let (tx, rx) = channel();
+    hub.devices
+        .lock()
+        .unwrap()
+        .insert("phone".into(), (owner.into(), tx));
+    // Queued broadcasts can arrive after a direct sync, in another writer's order.
+    for snapshot in [&synced, &archive, &renamed, &restore] {
+        hub.deliver(owner, ToDevice::Conversation(snapshot.clone()));
+    }
+    for expected in [&synced, &archive, &renamed, &restore] {
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ToDevice::Conversation(expected.clone())
+        );
+    }
+    let retried = archive_conversation(&hub, &second, owner, "c-ordered", false).unwrap();
+    assert_eq!(
+        retried, synced,
+        "retry echo is canonical, not the delayed archive snapshot"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "idempotent retry does not produce another broadcast"
+    );
+}
+
+#[test]
 fn diagnostic_probe_destination_never_becomes_an_approval_request() {
     use enclos_protocol::approval::{Access, AccessKind};
     let (_dir, hub, store) = diagnostic_approval_hub();
