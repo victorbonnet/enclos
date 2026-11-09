@@ -181,6 +181,21 @@ fn is_reference(value: &Value) -> bool {
     })
 }
 
+/// The enclos channel consumes a protected JSON file, never a token value,
+/// at this one native schema field. Other token-like fields stay guarded.
+fn credential_file_field(path: &str, value: &Value) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    parts.len() == 5
+        && parts[..3] == ["channels", "enclos", "accounts"]
+        && !parts[3].is_empty()
+        && parts[4] == "tokenFile"
+        && value.as_str().is_some_and(|path| {
+            Path::new(path).is_absolute()
+                && path.len() <= 4096
+                && !path.chars().any(char::is_control)
+        })
+}
+
 impl RuntimeAdapter for OpenClaw {
     fn kind(&self) -> RuntimeKind {
         RuntimeKind::OpenClaw
@@ -375,7 +390,7 @@ impl RuntimeAdapter for OpenClaw {
         // Native config set accepts JSON5 at a parent path. Reject nested
         // credentials and authored refs too: only the typed grant-checked
         // setter below may introduce a SecretRef.
-        fn unsafe_value(value: &Value) -> bool {
+        fn unsafe_value(value: &Value, path: &str) -> bool {
             match value {
                 Value::Object(map) => {
                     (map.get("source")
@@ -383,11 +398,18 @@ impl RuntimeAdapter for OpenClaw {
                         .is_some_and(|source| matches!(source, "env" | "file" | "exec" | "store"))
                         && map.get("id").and_then(Value::as_str).is_some())
                         || map.iter().any(|(key, value)| {
-                            (names_a_secret(key) && !value.is_null() && value.as_str() != Some(""))
-                                || unsafe_value(value)
+                            let path = format!("{path}/{key}");
+                            (names_a_secret(key)
+                                && !credential_file_field(&path, value)
+                                && !value.is_null()
+                                && value.as_str() != Some(""))
+                                || unsafe_value(value, &path)
                         })
                 }
-                Value::Array(values) => values.iter().any(unsafe_value),
+                Value::Array(values) => values
+                    .iter()
+                    .enumerate()
+                    .any(|(i, value)| unsafe_value(value, &format!("{path}/{i}"))),
                 _ => false,
             }
         }
@@ -399,7 +421,7 @@ impl RuntimeAdapter for OpenClaw {
         // falls back to raw text when JSON5 fails; a structured-looking value
         // that exceeds our observation grammar is refused, never guessed raw.
         match parse(&format!("{{setting:\n{trimmed}\n}}")) {
-            Ok(parsed) if unsafe_value(&parsed["setting"]) => return None,
+            Ok(parsed) if unsafe_value(&parsed["setting"], &key.replace('.', "/")) => return None,
             Err(_) if trimmed.contains(['{', '[']) => return None,
             _ => {}
         }
@@ -524,7 +546,10 @@ impl RuntimeAdapter for OpenClaw {
                 Value::Object(map) => {
                     for (key, value) in map {
                         let path = format!("{path}/{key}");
-                        if names_a_secret(key) && value.as_str().is_some_and(|s| !s.is_empty()) {
+                        if names_a_secret(key)
+                            && !credential_file_field(&path, value)
+                            && value.as_str().is_some_and(|s| !s.is_empty())
+                        {
                             out.push(SettingsFinding::Plain {
                                 agent: file.agent.clone(),
                                 file: file.path.clone(),
@@ -824,6 +849,40 @@ mod tests {
                 .set_setting(&a, "gateway", "{auth:{token:null}}")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn the_enclos_channel_credential_file_is_a_path_not_a_plaintext_token() {
+        let a = agent("scout");
+        let file = "/private/enclos/secrets/scout.env";
+        let account = json!({"agentId":"scout", "tokenFile":file}).to_string();
+        assert!(
+            OpenClaw
+                .set_setting(&a, "channels.enclos.accounts.scout", &account)
+                .is_some()
+        );
+        for value in [
+            "{tokenFile:'SENSITIVE_EXAMPLE'}",
+            "{botToken:'/private/file'}",
+            "{tokenFile:{source:'file',id:'/UNGRANTED'}}",
+        ] {
+            assert!(
+                OpenClaw
+                    .set_setting(&a, "channels.enclos.accounts.scout", value)
+                    .is_none()
+            );
+        }
+        assert!(OpenClaw.set_setting(&a, "gateway", &account).is_none());
+        let text = json!({"channels":{"enclos":{"accounts":{"scout":{"agentId":"scout", "tokenFile":file}}}}}).to_string();
+        let findings = OpenClaw
+            .inspect_settings(&[SettingsFile {
+                agent: a,
+                path: at(CONFIG),
+                text,
+                granted: Default::default(),
+            }])
+            .unwrap();
+        assert!(findings.is_empty());
     }
 
     #[test]
