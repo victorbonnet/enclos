@@ -37,7 +37,7 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 
 The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
 
-1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation.
+1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…","home":"home.lab.main"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token. `home`, optional, is the agent's [Home](#home) conversation. Optional `capabilities`, absent meaning an empty list, advertises bridge support for `questions`.
 2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`.
 3. Then, in either direction:
 
@@ -45,6 +45,10 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 | --- | --- | --- | --- |
 | `approval.request` | plugin | `conversation`, `access`: `{kind: network|write|read, target, private: boolean}`, `action` (short description) | Request a sandbox policy scope; no authority and no host command |
 | `policy.context` | bridge | `text` | The active policy described for the agent's future turns; only for plugins announcing `approval` |
+| `question.ask` | plugin | `conversation`, `question`: `{id,text,choices,multiple}` | Introduce a structured question bound to a native waiter; see [Questions](#questions) |
+| `question.update` | plugin | `question` (id), `state`, `answer`?, `of`? | Current native question state; `of` correlates an explicit answer |
+| `question.answer` | bridge | `conversation`, `question` (id), `answer` | Answer this exact native question, separate from `message.in` |
+| `question.sync` | bridge | `questions` (up to 128 ids) | Reconcile pending questions after this agent's authenticated reconnect |
 | `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? | A person's message to the agent |
 | `message.out` | plugin | `conversation`, `text`, `kind` (`reply`, `notify` or `status`), `reply_to`?, `attachments`? (`[{file, mime, name, size}]`, see [Files](#files)) | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work), which every runtime may send; `status` is the runtime about itself (Hermes's gateway online or shutting down), not the agent |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
@@ -122,11 +126,14 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `agent.name` | bridge | `agent`, `revision`, `display_name`, `of` | Canonical shared-name metadata, correlated or broadcast |
 | `conversation.new` | device | `conversation`, `agent` | Start one; its owner is the device's person |
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
+| `question.answer` | device | `question` (id), `revision`, `answer` | Submit a typed answer or Skip for a current question owned by this person |
+| `question` | bridge | `question` (full current metadata) | Canonical question state, without a request receipt |
+| `question.result` | bridge | `of`, `question` (full current metadata) | Exact correlated native answer confirmation |
 | `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
 | `conversation.read` | device | `conversation`, `seq` | The person read it up to that message, on this device |
 | `conversation.archive` | device | `conversation`, `archived` (required boolean) | Set or clear the archived state of one of the person's conversations; see [Archived conversations](#archived-conversations) |
 | `conversation` | bridge | `conversation`, `agent`, `title`?, `titled_by`? (`agent` or `person`), `read`? (the `seq` of the last message read), `archived`? (boolean, absent means false), `revision`? (nonnegative metadata revision, absent means 0), `home`? (`true` for the agent's [Home](#home)), `members`? (a [group](#groups)'s agents, `sandbox/agent` each; `agent` is then the sandbox alone) | One of the person's conversations: each at `sync`, before the messages (so one with no message yet is known too), and again when it starts, its name or archived state changes or it was read further |
-| `message` | bridge | `conversation`, `agent` (in a group, the member who spoke, or the person's message's group), `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq`, `attachments`? (`[{id, mime, name, size}]`) | A message of a conversation, sent and received alike, in order |
+| `message` | bridge | `conversation`, `agent` (in a group, the member who spoke, or the person's message's group), `from` (`agent` or the person), `text`, `kind`, `time` (seconds since the Unix epoch, when the bridge stored it), `seq`, `attachments`? (`[{id, mime, name, size}]`), `question`? (id) | A message of a conversation, sent and received alike, in order |
 | `attachment.get` | device | `attachment` (its id), `offset` | The bytes of a file of one of the person's messages, from `offset` |
 | `attachment.data` | bridge | `attachment`, `offset`, `size` (the file's), `data` (base64url, at most 45,000 bytes) | One part of it: a Noise message holds 64 KiB. A device asks for the next `offset` until it has `size` |
 | `typing` | bridge | `conversation`, `on` | As on the plugin leg |
@@ -140,7 +147,7 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | `sandbox.policy.preview` | bridge | `sandbox`, `base`, `revision`, `change`, `changes`, `restart`, `of` | Exact host-generated effects and restart requirement |
 | `sandbox.policy.apply` | device | `sandbox`, `base`, `revision`, `change` | Apply only the freshly reviewed edit, revalidated under the engine state lock |
 
-| `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, including archived ones, then every `message` of them after `since`, then `synced` |
+| `sync` | device | `since` (a `seq`, or 0) | Every `conversation` of the person's, including archived ones, current pending questions regardless of `since`, then every `message` after `since` with current question metadata before any linked message, then `synced` |
 | `synced` | bridge | `seq` | The newest `seq` sent |
 | `status` | device | (none) | The person's devices and, for the host's user, every person's access and devices; read only |
 | `status.report` | bridge | as `enclos app status --json` | |
@@ -175,6 +182,24 @@ The `conversation` metadata has optional `archived` (`true` when archived, false
 
 This operation keeps the same id, title, read position, messages, attachments and group members. It applies to ordinary direct and group conversations. Home cannot be archived: `archived: true` for Home receives `not_allowed` without changing its metadata or broadcasting a change. This uses its stable Home identity, not its title, so renaming Home does not bypass it and an ordinary conversation named Home remains archivable. An owner's `archived: false` may still restore a Home archived by an older bridge, with the usual revision, confirmation and broadcast; legacy archived state is not cleared automatically. Home remains the runtime's home channel under the same id, including while a legacy archive awaits restoration. New messages continue to be stored and delivered without clearing an archived conversation's flag, and archiving does not cancel a group's work. No archive message or command reaches the plugin leg: Hermes and a future OpenClaw plugin need no archive-specific method. The runtime's saved memory, context and own archive flags are unchanged. The app filters active and archived views and restores visibility only on an explicit Unarchive.
 
+### Questions
+
+[ADR 0052](adr/0052-questions-keep-their-runtime-waiter-and-structured-app-controls.md), proposed. Questions are structured conversation controls backed by a runtime's existing waiting call (Hermes: `clarify`). Ordinary markdown lists remain ordinary messages. The channel advertises `questions` only when both its native adapter and the bridge's hello support it. A missing bridge capability list means text fallback; no version bump is required for these optional types and fields.
+
+A definition is `{id,text,choices,multiple}`: an immutable opaque id, nonblank question text, ordered string labels, and a multiple-selection flag. Choices default to empty and multiple defaults to false; an empty choice list asks for free text. There are at most 12 choices and at most 24 KiB of serialized definition JSON. Labels remain whole and in order. A native question outside these bounds uses readable, bounded text fallback instead of losing choices.
+
+Answers are `{kind:"choices",indices:[0,2]}`, `{kind:"text",text:"..."}` or `{kind:"skip"}`. Indices are zero-based, distinct and within this definition, with exactly one for a single-selection question; a multiple selection is stored and forwarded in ascending definition order. Other/custom text is available alongside choices. An answer has at most 8 KiB of serialized JSON. Empty text and control characters other than ordinary CR/LF/tab are refused, including NUL-prefixed runtime sentinel strings. The plugin maps the typed Skip action to its runtime's own sentinel.
+
+Canonical metadata has the definition's flattened fields plus `conversation`, requesting `agent` (`sandbox/agent`, including in groups), `state`, nonnegative `revision` and optional `answer`. States are `pending`, `answered`, `skipped`, `expired` and `cancelled`. Only `answered` has an answer, which is a choice selection or text; other states have none. Revisions fit the signed 64-bit storage range, and terminal state cannot reopen. Full metadata is bounded to 48 KiB. Metadata and readable message text travel in separate frames, each within the device transport budget.
+
+The plugin persists `question.ask` and `question.update` in its acknowledged outbox. The bridge atomically creates the question and a readable fallback history message with `kind:"question"` and its question id. Terminal settlement atomically advances the revision and appends a quiet `kind:"status"` message with that id, so incremental history sync observes completion. Repeated asks cannot alter a definition or duplicate history. Repeated or stale unsolicited terminal updates retain the first terminal result and are acknowledged. The bridge sends current `question` metadata before every live or synced history message that references it; old apps ignore the optional metadata and use the readable text. Every device sync also refreshes current pending metadata regardless of `since`, even when the introduction is older than its cursor.
+
+Only the current conversation owner on a still-paired device may submit `question.answer`, at the current revision while pending. The bridge checks the input and a live matching origin plugin, then sends a distinct correlated `question.answer` to it. The plugin checks the saved native entry identity, session key and conversation before resolving that exact waiter. It never converts the response into `message.in`, a new turn or the next pending question. A group question must originate from one of its members. Unknown and foreign controls give no existence distinction. Question answers change no sandbox policy and execute no host command.
+
+An exact native receipt and persisted canonical result produce `question.result` with the device request's `of`; an ordinary metadata broadcast is not a receipt. Two-device races keep the first native answer. A differing terminal result is a conflict; matching unsolicited metadata may update the card while its exact receipt remains pending. Disconnects and timeouts are ambiguous and never automatically resend. The app keeps the newest host-scoped revision, disables closed/offline/pending cards and refreshes ambiguous pending state at reconnect sync.
+
+On plugin reconnect, the bridge reconciles pending ids in `question.sync` batches of at most 128 for that authenticated agent. The plugin reaffirms live entries, replays settlements and expires missing entries. An orphan ask replayed from a previous process is followed by retirement too. Hermes's waiters live in memory: runtime restart does not recreate them. The adapter calls public `get_pending` / `resolve_gateway_clarify`, observes retirement and handles `retire_clarify_card`; old native APIs keep text fallback. Hermes batches arrive sequentially, one question card per native waiter. Its registered `enclos:app-questions` skill and short channel hint teach the agent to use `clarify` with choices and wait for the actual result.
+
 ### Notifications
 
 When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is
@@ -200,6 +225,7 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `tools` | It reports the tools it runs while it works (`tool`) |
 | `commands` | It lists the commands a person may type to it (`commands`) |
 | `routines` | It manages runtime-owned scheduled work through `routine.request` / `routine.response` |
+| `questions` | It publishes structured questions and resolves typed answers against exact native waiters; requires the bridge's matching hello capability |
 
 Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 

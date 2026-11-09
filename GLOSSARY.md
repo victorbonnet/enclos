@@ -154,6 +154,10 @@ _Avoid_: command alone (enclos's own), shortcut, action
 A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
 _Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
 
+**Question**:
+An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
+_Avoid_: approval (a policy request has different authority)
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service

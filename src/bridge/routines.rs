@@ -56,6 +56,7 @@ mod tests {
             host: Some(OWNER.into()),
             plugins: Mutex::new(HashMap::new()),
             routines: Mutex::new(Default::default()),
+            questions: Mutex::new(Default::default()),
             commands: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             stops: Mutex::new(Default::default()),

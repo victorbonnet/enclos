@@ -5,13 +5,19 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId};
+use crate::ids::{ConversationId, MessageId, QuestionId};
 use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
 /// What a device sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "question.answer")]
+    QuestionAnswer {
+        question: QuestionId,
+        revision: u64,
+        answer: crate::question::QuestionAnswer,
+    },
     #[serde(rename = "agent.name.get")]
     AgentNameGet { agent: String },
     #[serde(rename = "agent.name.set")]
@@ -124,6 +130,7 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "question.answer",
     "agent.name.get",
     "agent.name.set",
     "routine.request",
@@ -155,6 +162,15 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "question")]
+    Question {
+        question: crate::question::QuestionInfo,
+    },
+    #[serde(rename = "question.result")]
+    QuestionResult {
+        of: MessageId,
+        question: crate::question::QuestionInfo,
+    },
     #[serde(rename = "agent.name")]
     AgentName(crate::agent_name::AgentName),
     #[serde(rename = "routine.response")]
@@ -231,6 +247,8 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "question",
+    "question.result",
     "agent.name",
     "routine.response",
     "agent.avatar",
@@ -415,6 +433,9 @@ pub struct ConversationMessage {
     /// Seconds since the Unix epoch.
     pub time: i64,
     pub seq: i64,
+    /// Metadata arrives in a separate `question` frame before this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionId>,
     /// Its files, which the device fetches with `attachment.get`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -538,6 +559,7 @@ mod tests {
             kind: "reply".into(),
             time: 1_800_000_000,
             seq: 7,
+            question: None,
             attachments: vec![Attachment {
                 id: "a-1".into(),
                 mime: "image/png".into(),
