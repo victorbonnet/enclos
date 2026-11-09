@@ -67,6 +67,10 @@ _Avoid_: profile (Hermes's word for it), instance, persona, bot (for an agent)
 The agent a runtime always has once it is installed in a sandbox, such as Hermes's `default`. It exists as long as the runtime, and is not one enclos creates or removes.
 _Avoid_: main agent, root profile, default profile
 
+**Agent display name**:
+The human-readable name shown for an agent, shared by the people who can reach it and independent of the identifier used to address it.
+_Avoid_: nickname, alias, profile name
+
 **Untracked agent**:
 An agent the runtime has in a sandbox that enclos has no record of, usually made inside the sandbox with the runtime's own commands. It becomes a tracked agent when added.
 _Avoid_: orphan, rogue agent, unknown agent

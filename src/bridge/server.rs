@@ -13,6 +13,8 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "agent_names.rs"]
+mod agent_names;
 #[path = "approvals.rs"]
 mod approvals;
 #[path = "avatars.rs"]
@@ -1043,6 +1045,32 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::AgentNameGet { agent } => {
+                match hub.get_agent_name(store, device, person, &agent, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
+                }
+            }
+            FromDevice::AgentNameSet(edit) => {
+                match hub.set_agent_name(store, device, person, &edit, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => {
+                        if error.code == enclos_protocol::plugin::ErrorCode::Conflict
+                            && let Ok(ToDevice::AgentName(mut current)) = hub.get_agent_name(
+                                store,
+                                device,
+                                person,
+                                &edit.agent,
+                                message.id.to_string(),
+                            )
+                        {
+                            current.of.clear();
+                            link.send(ToDevice::AgentName(current))?;
+                        }
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
@@ -1151,11 +1179,15 @@ fn run_session(
             }
             FromDevice::Agents => {
                 let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
+                let names = store.agent_name_metadata().map_err(|e| e.to_string())?;
                 let plugins = hub.plugins.lock().expect("not poisoned");
                 let agents = hub
                     .agents
                     .iter()
                     .map(|a| AgentInfo {
+                        display_name: names.get(&a.name).and_then(|n| n.display_name.clone()),
+                        name_revision: names.get(&a.name).map(|n| n.revision).unwrap_or(0),
+                        can_edit_name: hub.host.as_deref() == Some(person),
                         avatar: photos.get(&a.name).cloned().unwrap_or_default(),
                         can_edit_avatar: hub.host.as_deref() == Some(person),
                         agent: a.name.clone(),
@@ -1168,7 +1200,21 @@ fn run_session(
                     })
                     .collect();
                 drop(plugins);
-                link.send(ToDevice::AgentsList { agents })?;
+                match agent_names::agent_inventory_messages(agents) {
+                    Ok(messages) => {
+                        for message in messages {
+                            link.send(message)?;
+                        }
+                    }
+                    Err(reason) => {
+                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                            of: Some(message.id),
+                            code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                            message: reason,
+                        }))?;
+                        continue;
+                    }
+                }
                 // Each agent's commands, as far as the bridge knows them;
                 // the others come once their plugin connects.
                 let known: Vec<(String, Vec<Command>)> = hub
