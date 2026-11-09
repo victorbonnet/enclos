@@ -5,7 +5,6 @@
 //! grants, and sets up a channel's bot from the same settings.
 
 use super::Engine;
-use super::settings_secrets::{dotenv_line, names_a_secret};
 use crate::error::{Error, Result};
 use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
@@ -15,6 +14,7 @@ use crate::model::policy::Policy;
 use crate::model::sandbox::SandboxName;
 use crate::model::secret::{is_variable_name, reserved_variable};
 use crate::proxy::decide::{Destination, allowed};
+use crate::runtime::settings::names_a_secret;
 use crate::runtime::{RuntimeAgentName, SandboxCommand, adapter};
 use std::path::PathBuf;
 
@@ -133,22 +133,32 @@ impl Engine {
         let secrets_file = self
             .layout
             .agent_secrets_file(name.as_str(), agent.as_str());
-        if secrets_file
-            .to_str()
-            .is_none_or(|p| p.contains(['\'', '\n', '\r']))
+        let source = runtime.agent_secrets_source(&agent, &secrets_file);
+        if source.is_some()
+            && secrets_file
+                .to_str()
+                .is_none_or(|p| p.contains(['\'', '\n', '\r']))
         {
             return Err(session(format!(
                 "{} holds a quote or a line break, which the runtime's command that reads it cannot hold: set ENCLOS_HOME to a folder without them",
                 secrets_file.display()
             )));
         }
-        let Some(mut commands) = runtime.agent_secrets_source(&agent, &secrets_file) else {
-            return Err(session(format!(
-                "{shown} gives no agent secrets of its own, so enclos sets none of its settings"
-            )));
-        };
         let view = self.policy(name)?;
         let policy = &view.snapshot.policy;
+        let mut commands = match source {
+            Some(commands) => commands,
+            None if policy
+                .agent_secrets
+                .get(agent.as_str())
+                .is_some_and(|grants| !grants.is_empty()) =>
+            {
+                return Err(session(format!(
+                    "{shown} cannot set up the protected secrets granted to agent {agent}, so enclos changes none of its settings"
+                )));
+            }
+            None => Vec::new(),
+        };
         let pending = view.pending.as_ref().map(|(_, p)| &p.policy);
         let set = |key: &str, value: &str| {
             runtime.set_setting(&agent, key, value).ok_or_else(|| {
@@ -306,9 +316,17 @@ impl Engine {
             let text = crate::runtime::home::read_text(&home, &file, 1 << 20).map_err(|e| {
                 session(format!("cannot look for a plain bot token in {file}: {e}"))
             })?;
-            if text.is_some_and(|t| holds_variable(&t, variable)) {
+            let plain = match text {
+                Some(text) => runtime
+                    .channel_token_is_plain(channel, agent, &text, variable)
+                    .map_err(|why| {
+                        session(format!("cannot inspect a plain bot token in {file}: {why}"))
+                    })?,
+                None => false,
+            };
+            if plain {
                 return Err(session(format!(
-                    "{file} in sandbox {name} holds {variable} in plain text, as {shown}'s own setup writes it, where every agent of the sandbox reads it: remove that line ({}), then run `enclos runtime configure` again, which gives the token from the secret store",
+                    "{file} in sandbox {name} holds {variable} in plain text, as {shown}'s own setup writes it, where every agent of the sandbox reads it: remove that value ({}), then run `enclos runtime configure` again, which gives the token from the secret store",
                     home.join(file.as_path()).display()
                 )));
             }
@@ -510,27 +528,9 @@ fn unreachable(name: &SandboxName, channel: Channel) -> String {
     )
 }
 
-/// Whether the `.env` text `text` sets `variable` to something: a line
-/// `variable=...` or `export variable=...`, with a value that is not empty.
-fn holds_variable(text: &str, variable: &str) -> bool {
-    text.lines()
-        .filter_map(dotenv_line)
-        .any(|(name, value)| name == variable && !matches!(value, "" | "\"\"" | "''"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_dotenv_line_setting_the_variable_is_found() {
-        for set in ["T=abc", "  T = abc", "export T=\"abc\"", "a=1\nT='x'\n"] {
-            assert!(holds_variable(set, "T"), "{set:?}");
-        }
-        for unset in ["", "T=", "T=\"\"", "# T=abc", "TT=abc", "AT=abc", "T_X=abc"] {
-            assert!(!holds_variable(unset, "T"), "{unset:?}");
-        }
-    }
 
     #[test]
     fn a_setting_is_key_equals_value_and_its_secrets_are_variables() {

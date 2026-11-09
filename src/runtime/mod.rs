@@ -6,6 +6,7 @@
 
 pub mod hermes;
 pub mod home;
+pub mod settings;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -25,6 +26,29 @@ pub struct Installer {
     pub url: String,
     /// The arguments it runs with, after the downloaded file.
     pub args: Vec<String>,
+}
+
+/// How a runtime consumer reads its protected secrets file. The filenames
+/// stay the layout's `.env` and `<agent>.env`; the declared format, not the
+/// extension, determines their contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretFileFormat {
+    /// Quoted dotenv with escaped backslashes/quotes and no interpolation.
+    EscapedDotenv,
+    /// Quoted dotenv whose consumer removes quotes without unescaping.
+    QuotedDotenv,
+    /// An object from variable names to exact JSON string values.
+    Json,
+}
+
+/// Protected-file delivery for a runtime's services. `None` for the
+/// variable means native settings already name the absolute file paths;
+/// the service receives no secret value in its startup environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretFiles {
+    pub folder_variable: Option<&'static str>,
+    pub sandbox: SecretFileFormat,
+    pub agent: SecretFileFormat,
 }
 
 /// A file the adapter puts in the sandbox home, relative to it: a plain
@@ -264,11 +288,11 @@ pub trait RuntimeAdapter {
     fn dashboard(&self) -> Option<RuntimeDashboard> {
         None
     }
-    /// The variable naming a folder whose `.env` the runtime's services
-    /// read into their own process: their secrets go there, not into their
-    /// environment, which any process of the user can read (ADR 0034).
-    /// `None` (the default): they get their secrets as variables.
-    fn secrets_folder_var(&self) -> Option<&'static str> {
+    /// The service's protected-file consumers. A declared plan is never
+    /// replaced by startup-environment delivery, even with no folder
+    /// variable. `None`: legacy sandbox-wide startup variables, with no
+    /// support for secrets granted to individual agents.
+    fn secret_files(&self) -> Option<SecretFiles> {
         None
     }
     /// Files in the home the services read only as they start, for the
@@ -347,6 +371,28 @@ pub trait RuntimeAdapter {
         _agent: &RuntimeAgentName,
     ) -> Option<(HomePath, &'static str)> {
         None
+    }
+    /// Whether bounded settings text holds a channel token as a literal
+    /// value rather than a supported secret reference. `field` is the
+    /// identifier from `channel_token_file`, interpreted by the runtime.
+    /// An unknown or malformed representation is an error, never a clean
+    /// bill of health that would allow overwriting an unexamined token.
+    fn channel_token_is_plain(
+        &self,
+        _channel: Channel,
+        _agent: &RuntimeAgentName,
+        _text: &str,
+        _field: &str,
+    ) -> Result<bool, String> {
+        Err("this runtime cannot inspect channel tokens".to_owned())
+    }
+    /// Interpret bounded settings reads with the grants of their owning
+    /// agents. Only normalized names/locations return, never secret values.
+    fn inspect_settings(
+        &self,
+        _files: &[settings::SettingsFile],
+    ) -> Result<Vec<settings::SettingsFinding>, String> {
+        Err("this runtime cannot inspect settings secrets".to_owned())
     }
     /// The runtime's own commands that make `agent` read the secrets the
     /// policy grants it from `secrets_file`, the file `enclos launch` writes
