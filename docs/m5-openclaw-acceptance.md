@@ -32,6 +32,35 @@ explicitly adapter-selected, its listener selection retains namespace checks,
 and its provider facts remain runtime-decoded. Fresh rebase verification is
 recorded separately; previous green checks are not a claim about rewritten heads.
 
+## Rebase verification
+
+The requested bases are enclos #227 (`753fc700`) and enclos-app #44 (`4e53b966`).
+The complete rebased source passed **1,758 Rust tests**: 1,514 library, 78 CLI
+unit, 102 CLI integration, 20 documentation, 38 protocol and six shared fixtures.
+Clippy, formatting and dependency policy passed. One first-run fake-proxy
+fixture met an unrelated older listener on port 41001; the unchanged suite
+passed on retry and that process was left untouched.
+
+The installed-SDK suite passed **67 tests**, the launchers **six**, and pinned
+Hermes compatibility **102**, with one optional legacy-source skip. The deletion
+fixture's port helper was then tightened and its focused real-listener test
+passed again. Android #45/#46 passed APK/unit/lint with 102/103 tests, no new
+warnings, and all remote checks on the new base.
+
+A new binary from `529c7f131e8a99018db66c6a8546703f91f2cf27` exercised the
+supported fixture-state schema upgrade (11 to 12), offline native agent
+creation, managed startup and real core/native agent deletion. The exact Gateway
+session and process identity survived deletion, and the disposable agent was
+absent in both core and native state. Main/scout authentication, channel
+configuration and settings were preserved. No model call, routine execution or
+native approval decision was requested by this check.
+
+The existing cron inventory retained two jobs. Its whole read-view digest also
+contains volatile execution/presentation fields, so it is not evidence of
+canonical before/after definition equality. No such equality is claimed by this
+rebase probe; the earlier disabled-fixture routine evidence below remains tied
+to its original run.
+
 ## Live macOS evidence, 2026-11-09
 
 The disposable test used Seatbelt, an enclos-managed proxy and launchd services,
