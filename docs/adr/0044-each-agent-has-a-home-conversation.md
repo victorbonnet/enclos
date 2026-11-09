@@ -17,6 +17,6 @@ Reason: one well-known place for what belongs to no conversation, made by enclos
 
 ## Consequences
 
-- Home is shown first and never hidden as empty; the person may also talk to the agent there. Its owner may explicitly archive it under [0049](0049-conversation-archives-belong-to-the-bridge.md), which changes its list visibility while preserving its delivery route.
+- Home is shown first and never hidden as empty; the person may also talk to the agent there. It cannot be archived under [0049](0049-conversation-archives-belong-to-the-bridge.md), so its notices keep a permanent destination in the active Inbox. An owner can unarchive a Home archived by an older bridge without changing its identity or history.
 - With sharing ([0043](0043-sharing-an-agent-is-not-hosting-it.md), proposed), Home stays the host's person's: a guest's cron jobs answer in the guest's own conversations.
 - Which of the runtime's messages are notices is the plugin's call: Hermes marks none, so its plugin recognises them (to verify against each Hermes release, design §14).

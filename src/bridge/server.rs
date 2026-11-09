@@ -1661,6 +1661,12 @@ fn archive_conversation(
     id: &str,
     archived: bool,
 ) -> Result<ConversationInfo, String> {
+    if archived
+        && is_home(id)
+        && store.owner(id).map_err(|e| e.to_string())?.as_deref() == Some(person)
+    {
+        return Err("Home cannot be archived".into());
+    }
     let changed = store
         .set_archived(id, person, archived)
         .map_err(|e| e.to_string())?
