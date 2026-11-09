@@ -177,20 +177,26 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
         .to_owned();
     let link = PairLink {
         host,
-        url,
+        url: url.clone(),
         key: key.public,
         code: code.clone(),
         expires: expires as u64,
     }
     .to_link()
     .map_err(|e| failed(e.to_string()))?;
+    // An https link opens anywhere (a chat, a note); its page hands the
+    // enclos:// link to the app. The QR code keeps the enclos:// link, which
+    // the app's scanner reads.
+    let page = enclos::bridge::page::link_to_page(&url, &link)
+        .ok_or_else(|| failed("cannot make the pairing page's link".to_owned()))?;
     let qr = QrCode::new(link.as_bytes())
         .map_err(|e| failed(format!("cannot draw the QR code: {e}")))?;
     println!(
         "{}",
         terminal_qr(&qr.render::<Dense1x2>().quiet_zone(true).build())
     );
-    println!("Scan it with the enclos app, or enter this link: {link}");
+    println!("Scan it with the enclos app, or open this link on the phone:\n  {page}");
+    println!("or enter this one in the app: {link}");
     println!("It works once, for 5 minutes, while `enclos app serve` runs.");
     let request = loop {
         if let Some(request) = store
@@ -368,8 +374,12 @@ fn chat(
         )));
     }
     let plugin_error = |e: PluginError| failed(e.to_string());
-    let (hello, mut reader, mut writer) =
-        connect(&endpoint.socket, endpoint.token.expose()).map_err(plugin_error)?;
+    let (hello, mut reader, mut writer) = connect(
+        &endpoint.socket,
+        endpoint.token.expose(),
+        &enclos::bridge::store::home_id(&format!("{sandbox}/{agent}")),
+    )
+    .map_err(plugin_error)?;
     eprintln!(
         "Talking to {sandbox}/{agent} ({}) in conversation {conversation}; Ctrl-D to stop.",
         hello.runtime
@@ -392,6 +402,7 @@ fn chat(
                 let kind = match kind {
                     OutKind::Reply => "reply",
                     OutKind::Notify => "notify",
+                    OutKind::Status => "status",
                 };
                 let new = store
                     .add(
@@ -405,6 +416,7 @@ fn chat(
                 if new.is_some() {
                     match kind {
                         "notify" => println!("\n[{conversation}, on its own] {text}"),
+                        "status" => println!("\n[{conversation}, runtime] {text}"),
                         _ => println!("\n{text}"),
                     }
                 }

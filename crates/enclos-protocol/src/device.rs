@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
 use crate::ids::{ConversationId, MessageId};
-use crate::plugin::{Capability, ErrorBody};
+use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
 /// What a device sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,15 +34,49 @@ pub enum FromDevice {
         conversation: ConversationId,
         agent: String,
     },
+    /// Starts a group with two to six agents of one sandbox.
+    #[serde(rename = "group.new")]
+    GroupNew {
+        conversation: ConversationId,
+        /// `<sandbox>/<agent>` each.
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+    /// Stops a group's discussion; what was said stays.
+    #[serde(rename = "group.stop")]
+    GroupStop { conversation: ConversationId },
     #[serde(rename = "message.send")]
     MessageSend {
         conversation: ConversationId,
         text: String,
     },
+    /// Names the conversation; an empty `title` clears the name, and the
+    /// runtime may name it again.
+    #[serde(rename = "conversation.rename")]
+    ConversationRename {
+        conversation: ConversationId,
+        title: String,
+    },
+    /// The person read the conversation up to message `seq`, on this
+    /// device: the bridge keeps it, for their other devices and the next.
+    #[serde(rename = "conversation.read")]
+    ConversationRead {
+        conversation: ConversationId,
+        seq: i64,
+    },
+    /// The bytes of an attachment of one of the person's messages, from
+    /// `offset`: the bridge answers with one `attachment.data`.
+    #[serde(rename = "attachment.get")]
+    AttachmentGet { attachment: String, offset: u64 },
     #[serde(rename = "sync")]
     Sync { since: i64 },
     #[serde(rename = "push.token")]
     PushTokenUpdate(PushToken),
+    /// The person forgets this host on the device: the bridge unpairs the
+    /// device, acknowledges, and ends the connection.
+    #[serde(rename = "device.forget")]
+    DeviceForget,
     #[serde(rename = "ack")]
     Ack { of: MessageId },
     #[serde(rename = "error")]
@@ -54,9 +88,15 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "pair.request",
     "agents",
     "conversation.new",
+    "group.new",
+    "group.stop",
     "message.send",
+    "conversation.rename",
+    "conversation.read",
+    "attachment.get",
     "sync",
     "push.token",
+    "device.forget",
     "ack",
     "error",
 ];
@@ -74,12 +114,43 @@ pub enum ToDevice {
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
+    /// One of the person's conversations: each at `sync`, before the
+    /// messages, and again whenever its name or how far it was read changes.
+    #[serde(rename = "conversation")]
+    Conversation(ConversationInfo),
     #[serde(rename = "message")]
     Message(ConversationMessage),
     #[serde(rename = "typing")]
     Typing {
         conversation: ConversationId,
         on: bool,
+    },
+    /// A tool the agent starts or ends while it works: as on the plugin
+    /// leg, live, not kept.
+    #[serde(rename = "tool")]
+    Tool(ToolStep),
+    /// The commands a person may type to an agent's runtime, whole, as its
+    /// plugin listed them ([`commands_for_devices`]): after `agents.list`,
+    /// and again when they change.
+    /// Where a group's discussion is: at `sync` and whenever it changes.
+    #[serde(rename = "group.state")]
+    GroupState(GroupState),
+    #[serde(rename = "commands")]
+    Commands {
+        /// `<sandbox>/<agent>`.
+        agent: String,
+        commands: Vec<Command>,
+    },
+    /// Bytes of an attachment, from `offset`, at most [`ATTACHMENT_CHUNK`]:
+    /// a Noise message holds 64 KiB, base64 included.
+    #[serde(rename = "attachment.data")]
+    AttachmentData {
+        attachment: String,
+        offset: u64,
+        /// The whole attachment's size.
+        size: u64,
+        /// base64url.
+        data: String,
     },
     #[serde(rename = "synced")]
     Synced { seq: i64 },
@@ -89,17 +160,81 @@ pub enum ToDevice {
     Error(ErrorBody),
 }
 
+/// The most bytes of an attachment one `attachment.data` carries: base64
+/// makes 60,000 characters of them, inside a Noise message's 65,519.
+pub const ATTACHMENT_CHUNK: usize = 45_000;
+
 pub const TO_DEVICE_TYPES: &[&str] = &[
     "authenticated",
     "pair.accepted",
     "pair.refused",
     "agents.list",
+    "conversation",
     "message",
     "typing",
+    "tool",
+    "commands",
+    "group.state",
+    "attachment.data",
     "synced",
     "ack",
     "error",
 ];
+
+/// The longest command name passed on, as Telegram and Discord allow.
+pub const MAX_COMMAND_NAME: usize = 32;
+/// The longest description passed on, in characters: a line on a phone.
+pub const MAX_COMMAND_DESCRIPTION: usize = 120;
+/// The longest `args` passed on, in characters.
+pub const MAX_COMMAND_ARGS: usize = 60;
+/// The most bytes the commands of one `commands` take: the rest of the
+/// message, and the Noise tag, fit in a Noise message's 65,519.
+pub const COMMANDS_BUDGET: usize = 60_000;
+
+/// A plugin's commands as a device gets them: each name once (lower case
+/// letters, digits, `_` and `-`, at most [`MAX_COMMAND_NAME`]; others are
+/// left out), each text on one line and cut to its limit, in the plugin's
+/// order until they fill [`COMMANDS_BUDGET`].
+pub fn commands_for_devices(commands: Vec<Command>) -> Vec<Command> {
+    fn line(text: &str, limit: usize) -> String {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(limit)
+            .collect()
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut used = 0;
+    let mut kept = Vec::new();
+    for c in commands {
+        let name = c.name.trim_start_matches('/');
+        let valid = !name.is_empty()
+            && name.len() <= MAX_COMMAND_NAME
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if !valid || !seen.insert(name.to_owned()) {
+            continue;
+        }
+        let command = Command {
+            name: name.to_owned(),
+            description: line(&c.description, MAX_COMMAND_DESCRIPTION),
+            args: c
+                .args
+                .map(|a| line(&a, MAX_COMMAND_ARGS))
+                .filter(|a| !a.is_empty()),
+        };
+        // Its JSON and the comma before the next.
+        let size = serde_json::to_vec(&command).map_or(usize::MAX, |b| b.len() + 1);
+        if used + size > COMMANDS_BUDGET {
+            break;
+        }
+        used += size;
+        kept.push(command);
+    }
+    kept
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushToken {
@@ -117,6 +252,59 @@ pub struct AgentInfo {
     pub abilities: Vec<String>,
 }
 
+/// A conversation: its agent, its name when it has one, and how far the
+/// person read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInfo {
+    pub conversation: ConversationId,
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Who named it: `agent` (its runtime), or `person`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub titled_by: Option<String>,
+    /// The `seq` of the last message the person read, on any of their
+    /// devices; none before they read any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<i64>,
+    /// The agent's Home: where what has no conversation of its own goes
+    /// (cron jobs, the runtime's notices). Shown first, never empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home: bool,
+    /// A group's members, `<sandbox>/<agent>` each, in its order; none for
+    /// a conversation with one agent. A group's `agent` is its sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+/// Where a group's discussion is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupState {
+    pub conversation: ConversationId,
+    /// `working`, `settled`, `bounded`, `stopped` or `failed`.
+    pub state: String,
+    /// The round running, from 0, and how many a discussion may have.
+    pub round: u32,
+    pub max_rounds: u32,
+    /// Each member and its turn in this discussion.
+    pub members: Vec<MemberTurn>,
+    /// Why it ended, when it did not settle (`max_rounds`, `max_replies`,
+    /// a turn's error).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A member of a group and its turn: `queued`, `working`, `replied`,
+/// `passed`, `failed`, `cancelled`, or none yet in this discussion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberTurn {
+    /// `<sandbox>/<agent>`.
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<String>,
+}
+
 /// One message of a conversation, sent or received alike.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMessage {
@@ -130,6 +318,19 @@ pub struct ConversationMessage {
     /// Seconds since the Unix epoch.
     pub time: i64,
     pub seq: i64,
+    /// Its files, which the device fetches with `attachment.get`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file of a message, as a device sees it before fetching it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The bridge's id for it.
+    pub id: String,
+    pub mime: String,
+    pub name: String,
+    pub size: u64,
 }
 
 pub fn decode_from_device(bytes: &[u8]) -> Result<Envelope<FromDevice>, DecodeError> {
@@ -145,6 +346,58 @@ mod tests {
     use super::*;
     use crate::encode_line;
 
+    fn command(name: &str, description: &str, args: Option<&str>) -> Command {
+        Command {
+            name: name.into(),
+            description: description.into(),
+            args: args.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn commands_keep_valid_names_once_each_on_one_line() {
+        let kept = commands_for_devices(vec![
+            command("new", "Start a new\n  session", Some("[name]")),
+            command("/model", "Switch model", Some("  ")),
+            command("new", "again", None),
+            command("Bad Name", "spaces and capitals", None),
+            command("", "empty", None),
+            command(&"x".repeat(33), "too long", None),
+            command("reload_mcp", &"d".repeat(200), None),
+        ]);
+        assert_eq!(
+            kept,
+            [
+                command("new", "Start a new session", Some("[name]")),
+                command("model", "Switch model", None),
+                command("reload_mcp", &"d".repeat(MAX_COMMAND_DESCRIPTION), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_stop_where_a_message_would_not_fit_a_noise_message() {
+        let many = (0..2_000)
+            .map(|i| {
+                command(
+                    &format!("c{i}"),
+                    &"é".repeat(MAX_COMMAND_DESCRIPTION),
+                    Some("[x]"),
+                )
+            })
+            .collect();
+        let kept = commands_for_devices(many);
+        assert!(!kept.is_empty() && kept.len() < 2_000);
+        let line = encode_line(&Envelope::new(
+            MessageId::new("m-1").unwrap(),
+            ToDevice::Commands {
+                agent: "lab/main".into(),
+                commands: kept,
+            },
+        ));
+        assert!(line.len() < 65_519 - 16, "{} bytes", line.len());
+    }
+
     #[test]
     fn device_messages_round_trip() {
         let id = || MessageId::new("m-1").unwrap();
@@ -159,6 +412,23 @@ mod tests {
                 text: "hi".into(),
             },
             FromDevice::Sync { since: 4 },
+            FromDevice::GroupNew {
+                conversation: ConversationId::new("g-1").unwrap(),
+                members: vec!["lab/main".into(), "lab/coder".into()],
+                title: None,
+            },
+            FromDevice::GroupStop {
+                conversation: ConversationId::new("g-1").unwrap(),
+            },
+            FromDevice::ConversationRead {
+                conversation: ConversationId::new("c-1").unwrap(),
+                seq: 7,
+            },
+            FromDevice::DeviceForget,
+            FromDevice::AttachmentGet {
+                attachment: "a-1".into(),
+                offset: 45_000,
+            },
         ] {
             let line = encode_line(&Envelope::new(id(), body.clone()));
             assert_eq!(decode_from_device(&line).unwrap().body, body);
@@ -171,9 +441,104 @@ mod tests {
             kind: "reply".into(),
             time: 1_800_000_000,
             seq: 7,
+            attachments: vec![Attachment {
+                id: "a-1".into(),
+                mime: "image/png".into(),
+                name: "unicorn.png".into(),
+                size: 1_962_976,
+            }],
         });
         let line = encode_line(&Envelope::new(id(), body.clone()));
         assert_eq!(decode_to_device(&line).unwrap().body, body);
+        let body = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("c-1").unwrap(),
+            agent: "lab/main".into(),
+            title: Some("Weather in Lyon".into()),
+            titled_by: Some("agent".into()),
+            read: Some(7),
+            home: false,
+            members: Vec::new(),
+        });
+        let line = encode_line(&Envelope::new(id(), body.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, body);
+        // Only Home says so.
+        assert!(!String::from_utf8_lossy(&line).contains("home"));
+        let home = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("home.lab.main").unwrap(),
+            agent: "lab/main".into(),
+            title: Some("Home".into()),
+            titled_by: Some("person".into()),
+            read: None,
+            home: true,
+            members: Vec::new(),
+        });
+        let line = encode_line(&Envelope::new(id(), home.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, home);
+        // A group: its sandbox, its members, and where its discussion is.
+        let group = ToDevice::Conversation(ConversationInfo {
+            conversation: ConversationId::new("g-1").unwrap(),
+            agent: "lab".into(),
+            title: Some("Launch".into()),
+            titled_by: Some("person".into()),
+            read: None,
+            home: false,
+            members: vec!["lab/main".into(), "lab/coder".into()],
+        });
+        let line = encode_line(&Envelope::new(id(), group.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""members":["lab/main","lab/coder"]"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, group);
+        let state = ToDevice::GroupState(GroupState {
+            conversation: ConversationId::new("g-1").unwrap(),
+            state: "working".into(),
+            round: 0,
+            max_rounds: 3,
+            members: vec![
+                MemberTurn {
+                    agent: "lab/main".into(),
+                    turn: Some("replied".into()),
+                },
+                MemberTurn {
+                    agent: "lab/coder".into(),
+                    turn: Some("working".into()),
+                },
+            ],
+            reason: None,
+        });
+        let line = encode_line(&Envelope::new(id(), state.clone()));
+        assert_eq!(decode_to_device(&line).unwrap().body, state);
+        let line = encode_line(&Envelope::new(id(), home.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""home":true"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, home);
+        // A conversation never read carries no `read`, and is no Home.
+        let unread =
+            br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main"}"#;
+        assert!(matches!(
+            decode_to_device(unread).unwrap().body,
+            ToDevice::Conversation(ConversationInfo {
+                read: None,
+                home: false,
+                ..
+            })
+        ));
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn a_full_attachment_chunk_fits_in_a_noise_message() {
+        use base64::Engine as _;
+        let data =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![0xA5; ATTACHMENT_CHUNK]);
+        let body = ToDevice::AttachmentData {
+            attachment: "0b8f5f0e-4a1d-4f0f-8a43-6c2a7e9d1b21".into(),
+            offset: 1_000_000_000,
+            size: 2_000_000_000,
+            data,
+        };
+        let line = encode_line(&Envelope::new(
+            MessageId::new("0b8f5f0e-4a1d-4f0f-8a43-6c2a7e9d1b22").unwrap(),
+            body,
+        ));
+        // A Noise transport message is 65,535 bytes, its tag 16 of them.
+        assert!(line.len() <= 65_535 - 16, "{} bytes", line.len());
     }
 }

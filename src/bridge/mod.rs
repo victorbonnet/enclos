@@ -3,8 +3,10 @@
 //! conversations and talks to an agent's channel plugin over its socket;
 //! the device side, over the tailnet, comes after.
 
+pub mod groups;
 pub mod ids;
 pub mod keys;
+pub mod page;
 pub mod plugin;
 pub mod server;
 pub mod store;
