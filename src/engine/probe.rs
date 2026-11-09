@@ -31,6 +31,35 @@ use crate::probes::{
     with_real_paths,
 };
 
+struct ProbeRun<'a> {
+    store: &'a dyn crate::state::StateStore,
+    tag: String,
+}
+
+impl Drop for ProbeRun<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.store.end_probe(&self.tag) {
+            eprintln!("enclos: could not close diagnostic run metadata: {e}");
+        }
+    }
+}
+
+fn tag_probe(probe: &mut Probe, tag: &str) {
+    let mark = |script: &str| {
+        script.replace(
+            "/usr/bin/curl ",
+            &format!("/usr/bin/curl --proxy-header 'X-Enclos-Probe: {tag}' "),
+        )
+    };
+    probe.script = mark(&probe.script);
+    match &mut probe.proof {
+        Proof::Control { control, .. } | Proof::OnlyTheProxy { control } => {
+            *control = crate::probes::HostScript::new(mark(control.as_str()))
+        }
+        Proof::ProxyRefuses => (),
+    }
+}
+
 /// What `enclos policy test` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestReport {
@@ -272,7 +301,20 @@ impl Engine {
             }
             let mut results = Vec::new();
             let mut notices: Vec<String> = Vec::new();
-            for probe in list {
+            let tag: String = crate::bridge::ids::random_bytes(32)
+                .map_err(|e| Error::Session {
+                    what: e.to_string(),
+                })?
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            self.state.begin_probe(name, &tag)?;
+            let _run = ProbeRun {
+                store: self.state.as_ref(),
+                tag: tag.clone(),
+            };
+            for mut probe in list {
+                tag_probe(&mut probe, &tag);
                 let run_in_sandbox = |script: String| {
                     let launch = Launch {
                         program: "/bin/sh".into(),
@@ -650,6 +692,34 @@ mod tests {
     use crate::backend::seatbelt::Baseline;
     use crate::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, SeatbeltProbes, notes_on};
     use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn diagnostic_provenance_tags_the_sandbox_attempt_and_its_host_control() {
+        let script = format!(
+            "/usr/bin/curl --proxy http://127.0.0.1:41000 https://{}:8443/",
+            crate::probes::POLICY_PROBE_HOST
+        );
+        let mut probe = Probe {
+            route: "network",
+            name: "diagnostic destination".into(),
+            script: script.clone(),
+            proof: Proof::OnlyTheProxy {
+                control: crate::probes::HostScript::new(script),
+            },
+            host: None,
+            closed_by: None,
+        };
+        let tag = "a".repeat(64);
+        tag_probe(&mut probe, &tag);
+        let marker = format!("--proxy-header 'X-Enclos-Probe: {tag}'");
+        assert!(probe.script.contains(&marker));
+        assert!(probe.script.contains(crate::probes::POLICY_PROBE_HOST));
+        let Proof::OnlyTheProxy { control } = probe.proof else {
+            panic!("wrong proof")
+        };
+        assert!(control.as_str().contains(&marker));
+        assert!(control.as_str().contains(crate::probes::POLICY_PROBE_HOST));
+    }
 
     #[test]
     fn a_password_managers_ssh_agent_in_the_home_is_a_host_socket() {

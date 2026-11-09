@@ -26,6 +26,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         "hello_home",
         include_str!("fixtures/plugin/from_bridge_hello_home.json"),
     ),
+    (
+        "routine_create",
+        include_str!("fixtures/plugin/from_bridge_routine_create.json"),
+    ),
 ];
 
 const FROM_PLUGIN: &[(&str, &str)] = &[
@@ -72,6 +76,14 @@ const FROM_PLUGIN: &[(&str, &str)] = &[
     (
         "commands",
         include_str!("fixtures/plugin/from_plugin_commands.json"),
+    ),
+    (
+        "message_out_html",
+        include_str!("fixtures/plugin/from_plugin_message_out_html.json"),
+    ),
+    (
+        "routine_response",
+        include_str!("fixtures/plugin/from_plugin_routine_response.json"),
     ),
 ];
 
@@ -170,7 +182,12 @@ fn a_message_reads_as_its_fields_say() {
     );
 
     // The bridge's hello names the agent's Home; an older one, without it, still reads.
-    let message = decode_from_bridge(FROM_BRIDGE.last().unwrap().1.as_bytes()).unwrap();
+    let hello_home = FROM_BRIDGE
+        .iter()
+        .find(|(name, _)| *name == "hello_home")
+        .unwrap()
+        .1;
+    let message = decode_from_bridge(hello_home.as_bytes()).unwrap();
     let FromBridge::Hello { home, .. } = message.body else {
         panic!("not a hello: {:?}", message.body);
     };

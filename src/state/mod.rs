@@ -207,6 +207,20 @@ pub trait StateStore: NetLogStore {
 pub trait NetLogStore {
     /// Records a connection; returns its row, for `finish`.
     fn record(&self, event: &NetEvent) -> Result<i64>;
+    /// Record diagnostic provenance only for a host-registered run; otherwise record normally.
+    fn record_probe(&self, event: &NetEvent, _tag: Option<&str>) -> Result<i64> {
+        self.record(event)
+    }
+    fn begin_probe(&self, _sandbox: &SandboxName, _tag: &str) -> Result<()> {
+        Ok(())
+    }
+    fn end_probe(&self, _tag: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Denials eligible for the approval inbox, excluding host-attributed diagnostics.
+    fn denied_for_approval(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        self.denied(sandbox)
+    }
     /// Sets a recorded connection's bytes, duration and reason, once it
     /// closed.
     fn finish(&self, row: i64, event: &NetEvent) -> Result<()>;

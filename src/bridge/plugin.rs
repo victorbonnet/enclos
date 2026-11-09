@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use enclos_protocol::plugin::{Capability, FromBridge, FromPlugin, decode_from_plugin};
@@ -46,7 +47,7 @@ pub struct PluginHello {
 
 /// Sends to the plugin.
 pub struct PluginWriter {
-    stream: UnixStream,
+    stream: Arc<Mutex<UnixStream>>,
 }
 
 /// Reads what the plugin sends.
@@ -66,11 +67,13 @@ pub fn connect(
         path: socket.display().to_string(),
         source,
     })?;
+    stream.set_write_timeout(Some(HELLO_TIMEOUT))?;
     let mut writer = PluginWriter {
-        stream: stream.try_clone()?,
+        stream: Arc::new(Mutex::new(stream.try_clone()?)),
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
+        capabilities: vec![Capability::Questions, Capability::RuntimeApprovals],
         home: ConversationId::new(home).ok(),
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
@@ -112,16 +115,24 @@ impl PluginWriter {
     /// Another writer on the same connection, for another thread.
     pub fn try_clone(&self) -> std::io::Result<PluginWriter> {
         Ok(PluginWriter {
-            stream: self.stream.try_clone()?,
+            stream: Arc::clone(&self.stream),
         })
     }
 
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        self.stream
-            .write_all(&encode_line(&Envelope::new(id.clone(), body)))?;
+        self.send_with_id(id.clone(), body)?;
         Ok(id)
+    }
+
+    /// A correlated control request retains its stable id across a reconnect.
+    pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+        self.stream
+            .lock()
+            .expect("not poisoned")
+            .write_all(&encode_line(&Envelope::new(id, body)))?;
+        Ok(())
     }
 
     /// A person's message to the agent, in `conversation`.

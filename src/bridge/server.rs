@@ -13,6 +13,19 @@
 #[path = "server_tests.rs"]
 mod tests;
 
+#[path = "agent_names.rs"]
+mod agent_names;
+#[path = "approvals.rs"]
+mod approvals;
+#[path = "avatars.rs"]
+mod avatars;
+#[path = "policy.rs"]
+mod policy;
+#[path = "questions.rs"]
+mod questions;
+#[path = "routines.rs"]
+mod routines;
+
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -60,6 +73,7 @@ pub struct AgentEndpoint {
 struct Hub {
     transport: Transport,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
     /// The person the host belongs to, on the transport: whose the agents'
@@ -67,6 +81,8 @@ struct Hub {
     host: Option<String>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, (PluginWriter, Vec<Capability>)>>,
+    routines: Mutex<routines::RoutineRequests>,
+    questions: Mutex<questions::QuestionRequests>,
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not.
     commands: Mutex<HashMap<String, Vec<Command>>>,
@@ -427,10 +443,25 @@ impl Hub {
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
-        let (hello, mut reader, writer) =
+        let (hello, mut reader, mut writer) =
             connect(&endpoint.socket, &endpoint.token, &home_id(agent))
                 .map_err(|e| e.to_string())?;
+        if hello.capabilities.contains(&Capability::Approval)
+            && let Some((sandbox, _)) = agent.split_once('/')
+            && let Ok(name) = sandbox.parse()
+            && let Ok(text) = crate::engine::Engine::open(self.layout.clone()).access_context(&name)
+        {
+            let _ = writer.send(FromBridge::PolicyContext { text });
+        }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let routine_connection = self.routine_connected(agent);
+        self.question_connected(agent, &routine_connection);
+        if (hello.capabilities.contains(&Capability::Questions)
+            || hello.capabilities.contains(&Capability::RuntimeApprovals))
+            && let Ok(store) = self.store()
+        {
+            self.sync_questions(&store, agent, &mut writer)?;
+        }
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
@@ -451,6 +482,45 @@ impl Hub {
                     }
                 };
                 match message.body {
+                    FromPlugin::RoutineResponse(reply) => {
+                        hub.routine_response(&store, &agent, &routine_connection, reply);
+                    }
+                    FromPlugin::Error(error) => {
+                        hub.question_error(&store, &agent, &routine_connection, error.clone());
+                        hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
+                    FromPlugin::QuestionAsk {
+                        conversation,
+                        question,
+                    } => {
+                        let result = hub.question_ask(
+                            &store,
+                            &agent,
+                            &routine_connection,
+                            &conversation,
+                            &question,
+                            &message.id,
+                        );
+                        questions::acknowledge_question(&mut acks, &message.id, result);
+                    }
+                    FromPlugin::QuestionUpdate {
+                        question,
+                        state,
+                        answer,
+                        of,
+                    } => {
+                        let result = hub.question_update(
+                            &store,
+                            &agent,
+                            &routine_connection,
+                            &question,
+                            state,
+                            answer,
+                            of.as_ref(),
+                            &message.id,
+                        );
+                        questions::acknowledge_question(&mut acks, &message.id, result);
+                    }
                     FromPlugin::MessageOut {
                         conversation,
                         text,
@@ -540,6 +610,7 @@ impl Hub {
                             hub.deliver(
                                 &owner,
                                 ToDevice::Message(ConversationMessage {
+                                    question: None,
                                     conversation: conversation.clone(),
                                     agent: agent.clone(),
                                     from: "agent".to_owned(),
@@ -599,6 +670,43 @@ impl Hub {
                     }
                     // A tool the agent runs, for one of its own agent's
                     // conversations: passed on live, not kept.
+                    FromPlugin::ApprovalRequest {
+                        conversation,
+                        access,
+                        action,
+                    } => {
+                        // The endpoint, not the plugin's text, names its sandbox and agent.
+                        let id = conversation.as_str();
+                        if store.conversation_info(id).ok().flatten().is_some_and(|c| {
+                            format!("{}/{}", c.sandbox, c.agent) == agent
+                                || store
+                                    .members(id)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .any(|(m, _)| format!("{}/{m}", c.sandbox) == agent)
+                        }) {
+                            match hub.request_access(&store, &agent, Some(id), access, &action) {
+                                Ok(()) => {
+                                    let _ = acks.send(FromBridge::Ack { of: message.id });
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "enclos app: could not save {agent}'s policy request: {e}"
+                                    );
+                                }
+                            }
+                        } else {
+                            let _ =
+                                acks.send(FromBridge::Error(enclos_protocol::plugin::ErrorBody {
+                                    of: Some(message.id.clone()),
+                                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                                    message:
+                                        "A policy request must name a conversation of this agent."
+                                            .into(),
+                                }));
+                            let _ = acks.send(FromBridge::Ack { of: message.id });
+                        }
+                    }
                     FromPlugin::Tool(step) => {
                         if let Ok(Some(c)) = store.conversation_info(step.conversation.as_str())
                             && format!("{}/{}", c.sandbox, c.agent) == agent
@@ -611,6 +719,8 @@ impl Hub {
                 }
             }
             // Closed: the next message to this agent opens it again.
+            hub.question_disconnected(&store, &agent, &routine_connection);
+            hub.routine_disconnected(&store, &agent, &routine_connection);
             hub.plugins.lock().expect("not poisoned").remove(&agent);
         });
         Ok(())
@@ -622,6 +732,7 @@ pub fn serve(
     transport: Transport,
     port: u16,
     store_path: std::path::PathBuf,
+    layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
 ) -> std::io::Result<()> {
@@ -630,16 +741,30 @@ pub fn serve(
     let hub = Arc::new(Hub {
         transport,
         store_path,
+        layout,
         bridge_private,
         agents,
         host,
         plugins: Mutex::new(HashMap::new()),
+        routines: Mutex::new(Default::default()),
+        questions: Mutex::new(Default::default()),
         commands: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
         stops: Mutex::new(std::collections::HashSet::new()),
         devices: Mutex::new(HashMap::new()),
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let Ok(store) = hub.store() else { return };
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                hub.expire_routines(&store);
+                hub.expire_questions(&store);
+            }
+        });
+    }
     if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
         for agent in &hub.agents {
             let _ = store.ensure_home(&agent.name, host);
@@ -659,6 +784,28 @@ pub fn serve(
             loop {
                 std::thread::sleep(Duration::from_secs(30));
                 hub.expire_turns(&store);
+            }
+        });
+    }
+    if let Ok(store) = hub.store() {
+        let _ = store.recover_approvals();
+        let _ = hub.dismiss_probe_requests(&store);
+    }
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            loop {
+                if let Ok(store) = hub.store()
+                    && let Err(e) = hub.collect_refusals(&store)
+                {
+                    eprintln!("enclos app approvals: {e}");
+                }
+                // A policy restart closes the plugin sockets. Reopen them so cron
+                // work, too, gets fresh policy knowledge without a phone reconnect.
+                for agent in &hub.agents {
+                    let _ = hub.plugin(&agent.name);
+                }
+                std::thread::sleep(Duration::from_secs(3));
             }
         });
     }
@@ -945,12 +1092,162 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::AgentNameGet { agent } => {
+                match hub.get_agent_name(store, device, person, &agent, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => link.send(ToDevice::Error(error))?,
+                }
+            }
+            FromDevice::AgentNameSet(edit) => {
+                match hub.set_agent_name(store, device, person, &edit, message.id.to_string()) {
+                    Ok(name) => link.send(name)?,
+                    Err(error) => {
+                        if error.code == enclos_protocol::plugin::ErrorCode::Conflict
+                            && let Ok(ToDevice::AgentName(mut current)) = hub.get_agent_name(
+                                store,
+                                device,
+                                person,
+                                &edit.agent,
+                                message.id.to_string(),
+                            )
+                        {
+                            current.of.clear();
+                            link.send(ToDevice::AgentName(current))?;
+                        }
+                        link.send(ToDevice::Error(error))?;
+                    }
+                }
+            }
+            FromDevice::QuestionAnswer {
+                question,
+                revision,
+                answer,
+            } => {
+                if let Err(error) = hub.question_answer(
+                    store, device, person, message.id, question, revision, answer,
+                ) {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::RoutineRequest { agent, request } => {
+                if let Err(error) =
+                    hub.routine_request(store, device, person, &agent, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
+            FromDevice::AgentAvatarGet { agent } => {
+                match hub.get_avatar(store, device, person, &agent, message.id.to_string()) {
+                    Ok(photo) => link.send(photo)?,
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::AgentAvatarSet(edit) => {
+                match hub.set_agent_avatar(store, device, person, &edit, message.id.to_string()) {
+                    Ok(photo) => link.send(photo)?,
+                    Err(e) => {
+                        if let Ok(current) =
+                            hub.get_avatar(store, device, person, &edit.agent, String::new())
+                        {
+                            link.send(current)?;
+                        }
+                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                            of: Some(message.id),
+                            code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                            message: e,
+                        }))?;
+                    }
+                }
+            }
+            FromDevice::SandboxPolicyGet { sandbox } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.managed_policy(store, &name));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyPreview {
+                sandbox,
+                base,
+                change,
+            } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| {
+                        crate::engine::Engine::open(hub.layout.clone())
+                            .mobile_policy_preview(&name, &base, &change)
+                            .map_err(|e| e.to_string())
+                    });
+                match result {
+                    Ok(mut preview) => {
+                        preview.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicyPreview(preview))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::SandboxPolicyApply { sandbox, edit } => {
+                let result = hub
+                    .policy_authority(store, device, person, &sandbox)
+                    .and_then(|name| hub.apply_managed_policy(store, device, person, &name, &edit));
+                match result {
+                    Ok(mut state) => {
+                        state.of = message.id.to_string();
+                        link.send(ToDevice::SandboxPolicy(state))?;
+                    }
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
+                }
+            }
+            FromDevice::ApprovalDecide {
+                request,
+                revision,
+                approve,
+            } => {
+                let answer = hub.decide_access(store, device, person, &request, &revision, approve);
+                if let Err(e) = answer {
+                    link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?;
+                } else {
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
             FromDevice::Agents => {
+                let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
+                let names = store.agent_name_metadata().map_err(|e| e.to_string())?;
                 let plugins = hub.plugins.lock().expect("not poisoned");
                 let agents = hub
                     .agents
                     .iter()
                     .map(|a| AgentInfo {
+                        display_name: names.get(&a.name).and_then(|n| n.display_name.clone()),
+                        name_revision: names.get(&a.name).map(|n| n.revision).unwrap_or(0),
+                        can_edit_name: hub.host.as_deref() == Some(person),
+                        avatar: photos.get(&a.name).cloned().unwrap_or_default(),
+                        can_edit_avatar: hub.host.as_deref() == Some(person),
                         agent: a.name.clone(),
                         runtime: a.runtime.clone(),
                         capabilities: plugins
@@ -961,7 +1258,21 @@ fn run_session(
                     })
                     .collect();
                 drop(plugins);
-                link.send(ToDevice::AgentsList { agents })?;
+                match agent_names::agent_inventory_messages(agents) {
+                    Ok(messages) => {
+                        for message in messages {
+                            link.send(message)?;
+                        }
+                    }
+                    Err(reason) => {
+                        link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                            of: Some(message.id),
+                            code: enclos_protocol::plugin::ErrorCode::BadMessage,
+                            message: reason,
+                        }))?;
+                        continue;
+                    }
+                }
                 // Each agent's commands, as far as the bridge knows them;
                 // the others come once their plugin connects.
                 let known: Vec<(String, Vec<Command>)> = hub
@@ -1072,12 +1383,44 @@ fn run_session(
                     hub.deliver_conversation(store, person, id);
                 }
             }
+            FromDevice::ConversationArchive {
+                conversation,
+                archived,
+            } => match archive_conversation(hub, store, person, conversation.as_str(), archived) {
+                Ok(info) => {
+                    // Canonical metadata precedes the Ack, including retries.
+                    // Revisions let devices discard older queued broadcasts.
+                    link.send(ToDevice::Conversation(info))?;
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+                Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                    of: Some(message.id),
+                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                    message: e,
+                }))?,
+            },
             FromDevice::Sync { since } => {
-                // Every conversation first, named or empty, then the messages.
+                if hub.host.as_deref() == Some(person) {
+                    hub.dismiss_probe_requests(store)?;
+                    for a in store.approvals().map_err(|e| e.to_string())? {
+                        link.send(ToDevice::Approval(a))?;
+                    }
+                }
+                // Every conversation first, archived or active, named or empty,
+                // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
                         link.send(ToDevice::Conversation(info))?;
                     }
+                }
+                // Pending cards must refresh even when their introduction predates `since`.
+                for question in store
+                    .pending_questions_for(person)
+                    .map_err(|e| e.to_string())?
+                {
+                    link.send(ToDevice::Question {
+                        question: question.info,
+                    })?;
                 }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
@@ -1095,7 +1438,17 @@ fn run_session(
                         .into_iter()
                         .map(attachment_info)
                         .collect();
+                    if let Some(question) = &m.question
+                        && let Some(current) =
+                            store.question(question).map_err(|e| e.to_string())?
+                        && current.owner == person
+                    {
+                        link.send(ToDevice::Question {
+                            question: current.info,
+                        })?;
+                    }
                     link.send(ToDevice::Message(ConversationMessage {
+                        question: m.question,
                         conversation: ConversationId::new(m.conversation)
                             .map_err(|e| e.to_string())?,
                         agent,
@@ -1302,8 +1655,38 @@ fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo>
         title: c.title,
         titled_by: c.titled_by,
         read: c.read,
+        archived: c.archived,
+        revision: c.revision,
         members,
     })
+}
+
+/// Archive is bridge metadata, independent of every runtime's session lifecycle.
+fn archive_conversation(
+    hub: &Hub,
+    store: &Store,
+    person: &str,
+    id: &str,
+    archived: bool,
+) -> Result<ConversationInfo, String> {
+    if archived
+        && is_home(id)
+        && store.owner(id).map_err(|e| e.to_string())?.as_deref() == Some(person)
+    {
+        return Err("Home cannot be archived".into());
+    }
+    let changed = store
+        .set_archived(id, person, archived)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no such conversation".to_owned())?;
+    if changed {
+        hub.deliver_conversation(store, person, id);
+    }
+    store
+        .conversation_info(id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| conversation_info(store, c))
+        .ok_or_else(|| "no such conversation".to_owned())
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a
@@ -1403,6 +1786,7 @@ fn send(
             hub.deliver(
                 person,
                 ToDevice::Message(ConversationMessage {
+                    question: None,
                     conversation: conversation.clone(),
                     agent: sandbox,
                     from: person.to_owned(),
@@ -1446,6 +1830,7 @@ fn send(
         hub.deliver(
             person,
             ToDevice::Message(ConversationMessage {
+                question: None,
                 conversation: conversation.clone(),
                 agent: name,
                 from: person.to_owned(),

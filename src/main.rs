@@ -61,7 +61,7 @@ enum Command {
     Runtime(cli::runtime::RuntimeArgs),
     /// Add, list or remove the runtime's agents.
     Agent(cli::agent::AgentArgs),
-    /// The enclos mobile app's side of this host: talk to an agent through its app channel.
+    /// Chat with an agent, serve the mobile app, pair or unpair devices, check status or read the log.
     App(cli::app::AppArgs),
     /// Show, widen, edit, apply, discard, refresh, diff, roll back or test a sandbox's policy, or list its history.
     Policy(cli::policy::PolicyArgs),

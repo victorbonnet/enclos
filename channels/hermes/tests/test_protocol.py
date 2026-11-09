@@ -23,7 +23,7 @@ def fixture(name: str) -> bytes:
 class FromTheBridge(unittest.TestCase):
     def test_every_fixture_the_bridge_sends_decodes(self):
         names = sorted(n for n in os.listdir(FIXTURES) if n.startswith("from_bridge_"))
-        self.assertEqual(len(names), 5)
+        self.assertGreaterEqual(len(names), 6)
         for name in names:
             with self.subTest(name):
                 self.assertEqual(protocol.decode_from_bridge(fixture(name)), json.loads(fixture(name)))
@@ -150,13 +150,29 @@ class Hint(unittest.TestCase):
     def test_it_says_how_files_go_and_what_is_not_drawn(self):
         self.assertIn("MEDIA:/absolute/path/to/file", protocol.PLATFORM_HINT)
         self.assertIn("remote image in markdown is not loaded", protocol.PLATFORM_HINT)
-        self.assertIn("HTML shows as literal text", protocol.PLATFORM_HINT)
+        self.assertIn("message HTML shows as literal text", protocol.PLATFORM_HINT)
+        self.assertIn("attachments open on tap (PDF/text in the app)", protocol.PLATFORM_HINT)
+        self.assertIn("clarify with questions", protocol.PLATFORM_HINT)
+
+    def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
+        for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
+                       "data images/fonts", "JavaScript", "external resources, forms and automatic navigation are blocked",
+                       "Tapped HTTP(S) links open the browser"):
+            self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):
-        self.assertLess(len(protocol.PLATFORM_HINT), 750)
+        self.assertLess(len(protocol.PLATFORM_HINT), 1000)
 
 
 class Files(unittest.TestCase):
+    def test_an_html_artefact_uses_an_ordinary_file_attachment(self):
+        expected = json.loads(fixture("from_plugin_message_out_html.json"))
+        message = protocol.message_out(
+            expected["conversation"], expected["text"], expected["reply_to"],
+            [protocol.attachment(**expected["attachments"][0])])
+        self.assertEqual({k: v for k, v in message.items() if k != "id"},
+                         {k: v for k, v in expected.items() if k != "id"})
+
     def test_a_reply_with_an_image_has_the_fixtures_shape(self):
         expected = json.loads(fixture("from_plugin_message_out_image.json"))
         a = expected["attachments"][0]

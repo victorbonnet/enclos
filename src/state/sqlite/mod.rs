@@ -6,6 +6,7 @@ mod agents;
 mod log_writer;
 mod netlog;
 mod policy;
+mod probe_sources;
 mod schema;
 mod secrets;
 mod sessions;
@@ -588,6 +589,18 @@ impl StateStore for SqliteStateStore {
 }
 
 impl NetLogStore for SqliteStateStore {
+    fn record_probe(&self, event: &NetEvent, tag: Option<&str>) -> Result<i64> {
+        self.record_probe_event(event, tag)
+    }
+    fn begin_probe(&self, sandbox: &SandboxName, tag: &str) -> Result<()> {
+        self.register_probe(sandbox, tag)
+    }
+    fn end_probe(&self, tag: &str) -> Result<()> {
+        self.close_probe(tag)
+    }
+    fn denied_for_approval(&self, sandbox: &SandboxName) -> Result<Vec<DeniedDestination>> {
+        self.user_denied(sandbox)
+    }
     fn record(&self, event: &NetEvent) -> Result<i64> {
         let conn = self.open()?;
         netlog::record(&conn, event).map_err(self.sqlite_err())

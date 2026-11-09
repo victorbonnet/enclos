@@ -5,12 +5,27 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId, Person};
+use crate::ids::{ConversationId, MessageId, Person, QuestionId};
 
 /// What the bridge sends to a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromBridge {
+    #[serde(rename = "question.answer")]
+    QuestionAnswer {
+        conversation: ConversationId,
+        question: QuestionId,
+        answer: crate::question::QuestionAnswer,
+    },
+    #[serde(rename = "question.sync")]
+    QuestionSync { questions: Vec<QuestionId> },
+    #[serde(rename = "routine.request")]
+    RoutineRequest {
+        /// Current owner-authorized targets, supplied by the bridge rather than the device.
+        allowed_deliveries: Vec<ConversationId>,
+        #[serde(flatten)]
+        request: Box<crate::routine::RoutineRequest>,
+    },
     /// First on every connection: the agent's token, and its Home
     /// conversation, where what has no conversation of its own goes (the
     /// runtime's home channel: Hermes's cron jobs, `send_message` with no
@@ -20,7 +35,12 @@ pub enum FromBridge {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home: Option<ConversationId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<Capability>,
     },
+    /// Current active grants, refreshed at connect and after a policy decision.
+    #[serde(rename = "policy.context")]
+    PolicyContext { text: String },
     /// A person's message to the agent.
     #[serde(rename = "message.in")]
     MessageIn {
@@ -42,19 +62,51 @@ pub enum FromBridge {
 }
 
 /// The `type`s of [`FromBridge`].
-pub const FROM_BRIDGE_TYPES: &[&str] =
-    &["hello", "message.in", "conversation.rename", "ack", "error"];
+pub const FROM_BRIDGE_TYPES: &[&str] = &[
+    "question.answer",
+    "question.sync",
+    "routine.request",
+    "policy.context",
+    "hello",
+    "message.in",
+    "conversation.rename",
+    "ack",
+    "error",
+];
 
 /// What a plugin sends to the bridge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromPlugin {
+    #[serde(rename = "question.ask")]
+    QuestionAsk {
+        conversation: ConversationId,
+        question: crate::question::QuestionDefinition,
+    },
+    #[serde(rename = "question.update")]
+    QuestionUpdate {
+        question: QuestionId,
+        state: crate::question::QuestionState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<crate::question::QuestionAnswer>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<MessageId>,
+    },
+    #[serde(rename = "routine.response")]
+    RoutineResponse(crate::routine::RoutineReply),
     /// The plugin's answer to the bridge's `hello`.
     #[serde(rename = "hello")]
     Hello {
         runtime: String,
         agent: String,
         capabilities: Vec<Capability>,
+    },
+    /// An attempted action the sandbox refused, or a request before trying it.
+    #[serde(rename = "approval.request")]
+    ApprovalRequest {
+        conversation: ConversationId,
+        access: crate::approval::Access,
+        action: String,
     },
     /// What the agent says.
     #[serde(rename = "message.out")]
@@ -98,7 +150,11 @@ pub enum FromPlugin {
 
 /// The `type`s of [`FromPlugin`].
 pub const FROM_PLUGIN_TYPES: &[&str] = &[
+    "question.ask",
+    "question.update",
+    "routine.response",
     "hello",
+    "approval.request",
     "message.out",
     "typing",
     "conversation.title",
@@ -195,6 +251,9 @@ pub enum Capability {
     Tools,
     /// It lists the commands a person may type to it (`commands`).
     Commands,
+    Routines,
+    Questions,
+    RuntimeApprovals,
     #[serde(other)]
     Unknown,
 }
@@ -219,6 +278,9 @@ pub enum ErrorCode {
     UnknownAgent,
     UnknownConversation,
     AgentUnavailable,
+    Conflict,
+    Unsupported,
+    NotFound,
     #[serde(other)]
     Unknown,
 }

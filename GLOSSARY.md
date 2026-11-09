@@ -154,3 +154,23 @@ _Avoid_: test case, attack
 **Audit entry**:
 The record of one state-changing command: time, user, host, command, state before and after, and result. Audit entries form an append-only, hash-chained audit log.
 _Avoid_: event, log line
+
+**Policy request**:
+A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+_Avoid_: tool approval (a runtime's own decision), command approval
+
+**Runtime approval**:
+A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
+_Avoid_: policy request, question (a request for information)
+
+**Agent command**:
+A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
+_Avoid_: command alone (enclos's own), shortcut, action
+
+**Routine**:
+A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
+_Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
+
+**Question**:
+An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
+_Avoid_: runtime approval, policy request (different authority)

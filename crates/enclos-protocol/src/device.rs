@@ -5,13 +5,47 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId};
+use crate::ids::{ConversationId, MessageId, QuestionId};
 use crate::plugin::{Capability, Command, ErrorBody, ToolStep};
 
 /// What a device sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromDevice {
+    #[serde(rename = "question.answer")]
+    QuestionAnswer {
+        question: QuestionId,
+        revision: u64,
+        answer: crate::question::QuestionAnswer,
+    },
+    #[serde(rename = "agent.name.get")]
+    AgentNameGet { agent: String },
+    #[serde(rename = "agent.name.set")]
+    AgentNameSet(crate::agent_name::NameSet),
+    #[serde(rename = "routine.request")]
+    RoutineRequest {
+        agent: String,
+        #[serde(flatten)]
+        request: crate::routine::RoutineRequest,
+    },
+    #[serde(rename = "agent.avatar.get")]
+    AgentAvatarGet { agent: String },
+    #[serde(rename = "agent.avatar.set")]
+    AgentAvatarSet(crate::avatar::AvatarSet),
+    #[serde(rename = "sandbox.policy.get")]
+    SandboxPolicyGet { sandbox: String },
+    #[serde(rename = "sandbox.policy.preview")]
+    SandboxPolicyPreview {
+        sandbox: String,
+        base: String,
+        change: crate::policy::PolicyChange,
+    },
+    #[serde(rename = "sandbox.policy.apply")]
+    SandboxPolicyApply {
+        sandbox: String,
+        #[serde(flatten)]
+        edit: crate::policy::PolicyApply,
+    },
     /// First after the handshake of a paired device: its id on this host
     /// and its hardware key's DER signature of the handshake hash.
     #[serde(rename = "auth")]
@@ -26,6 +60,12 @@ pub enum FromDevice {
         proof: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push: Option<PushToken>,
+    },
+    #[serde(rename = "approval.decide")]
+    ApprovalDecide {
+        request: String,
+        revision: String,
+        approve: bool,
     },
     #[serde(rename = "agents")]
     Agents,
@@ -65,6 +105,12 @@ pub enum FromDevice {
         conversation: ConversationId,
         seq: i64,
     },
+    /// Changes only whether the owner's conversation appears in active lists.
+    #[serde(rename = "conversation.archive")]
+    ConversationArchive {
+        conversation: ConversationId,
+        archived: bool,
+    },
     /// The bytes of an attachment of one of the person's messages, from
     /// `offset`: the bridge answers with one `attachment.data`.
     #[serde(rename = "attachment.get")]
@@ -84,8 +130,18 @@ pub enum FromDevice {
 }
 
 pub const FROM_DEVICE_TYPES: &[&str] = &[
+    "question.answer",
+    "agent.name.get",
+    "agent.name.set",
+    "routine.request",
+    "agent.avatar.get",
+    "agent.avatar.set",
+    "sandbox.policy.get",
+    "sandbox.policy.preview",
+    "sandbox.policy.apply",
     "auth",
     "pair.request",
+    "approval.decide",
     "agents",
     "conversation.new",
     "group.new",
@@ -93,6 +149,7 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "message.send",
     "conversation.rename",
     "conversation.read",
+    "conversation.archive",
     "attachment.get",
     "sync",
     "push.token",
@@ -105,6 +162,31 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToDevice {
+    #[serde(rename = "question")]
+    Question {
+        question: crate::question::QuestionInfo,
+    },
+    #[serde(rename = "question.result")]
+    QuestionResult {
+        of: MessageId,
+        question: crate::question::QuestionInfo,
+    },
+    #[serde(rename = "agent.name")]
+    AgentName(crate::agent_name::AgentName),
+    #[serde(rename = "routine.response")]
+    RoutineResponse {
+        agent: String,
+        #[serde(flatten)]
+        reply: crate::routine::RoutineReply,
+    },
+    #[serde(rename = "agent.avatar")]
+    AgentAvatar(crate::avatar::AgentAvatar),
+    #[serde(rename = "sandbox.policy")]
+    SandboxPolicy(crate::policy::PolicyState),
+    #[serde(rename = "sandbox.policy.preview")]
+    SandboxPolicyPreview(crate::policy::PolicyPreview),
+    #[serde(rename = "approval")]
+    Approval(crate::approval::Approval),
     /// The device is known and its signature holds: who it speaks for.
     #[serde(rename = "authenticated")]
     Authenticated { person: String },
@@ -115,7 +197,7 @@ pub enum ToDevice {
     #[serde(rename = "agents.list")]
     AgentsList { agents: Vec<AgentInfo> },
     /// One of the person's conversations: each at `sync`, before the
-    /// messages, and again whenever its name or how far it was read changes.
+    /// messages, and again whenever its name, read position or archive state changes.
     #[serde(rename = "conversation")]
     Conversation(ConversationInfo),
     #[serde(rename = "message")]
@@ -165,6 +247,14 @@ pub enum ToDevice {
 pub const ATTACHMENT_CHUNK: usize = 45_000;
 
 pub const TO_DEVICE_TYPES: &[&str] = &[
+    "question",
+    "question.result",
+    "agent.name",
+    "routine.response",
+    "agent.avatar",
+    "sandbox.policy",
+    "sandbox.policy.preview",
+    "approval",
     "authenticated",
     "pair.accepted",
     "pair.refused",
@@ -245,6 +335,21 @@ pub struct PushToken {
 /// An agent a person may reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInfo {
+    /// Shared presentation only: never the routing address in `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub name_revision: i64,
+    /// Always sent by new hosts; its presence advertises shared-name support.
+    #[serde(default)]
+    pub can_edit_name: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::avatar::AvatarMetadata::is_default"
+    )]
+    pub avatar: crate::avatar::AvatarMetadata,
+    #[serde(default)]
+    pub can_edit_avatar: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,
@@ -268,14 +373,24 @@ pub struct ConversationInfo {
     /// devices; none before they read any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read: Option<i64>,
+    /// Hidden from active lists until the person explicitly unarchives it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    /// Orders this conversation's metadata independently of message `seq`.
+    #[serde(default, skip_serializing_if = "revision_is_zero")]
+    pub revision: u64,
     /// The agent's Home: where what has no conversation of its own goes
-    /// (cron jobs, the runtime's notices). Shown first, never empty.
+    /// (cron jobs, the runtime's notices). Shown first when active, even empty.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub home: bool,
     /// A group's members, `<sandbox>/<agent>` each, in its order; none for
     /// a conversation with one agent. A group's `agent` is its sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<String>,
+}
+
+fn revision_is_zero(revision: &u64) -> bool {
+    *revision == 0
 }
 
 /// Where a group's discussion is.
@@ -318,6 +433,9 @@ pub struct ConversationMessage {
     /// Seconds since the Unix epoch.
     pub time: i64,
     pub seq: i64,
+    /// Metadata arrives in a separate `question` frame before this message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionId>,
     /// Its files, which the device fetches with `attachment.get`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -441,6 +559,7 @@ mod tests {
             kind: "reply".into(),
             time: 1_800_000_000,
             seq: 7,
+            question: None,
             attachments: vec![Attachment {
                 id: "a-1".into(),
                 mime: "image/png".into(),
@@ -456,6 +575,8 @@ mod tests {
             title: Some("Weather in Lyon".into()),
             titled_by: Some("agent".into()),
             read: Some(7),
+            archived: false,
+            revision: 0,
             home: false,
             members: Vec::new(),
         });
@@ -469,6 +590,8 @@ mod tests {
             title: Some("Home".into()),
             titled_by: Some("person".into()),
             read: None,
+            archived: false,
+            revision: 0,
             home: true,
             members: Vec::new(),
         });
@@ -481,6 +604,8 @@ mod tests {
             title: Some("Launch".into()),
             titled_by: Some("person".into()),
             read: None,
+            archived: false,
+            revision: 0,
             home: false,
             members: vec!["lab/main".into(), "lab/coder".into()],
         });
@@ -521,6 +646,54 @@ mod tests {
             })
         ));
         assert!(decode_to_device(br#"{"v":1,"id":"m","type":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn archive_requests_are_explicit_and_conversation_metadata_defaults_to_active() {
+        for archived in [true, false] {
+            let body = FromDevice::ConversationArchive {
+                conversation: ConversationId::new("c-1").unwrap(),
+                archived,
+            };
+            let line = encode_line(&Envelope::new(MessageId::new("a-1").unwrap(), body.clone()));
+            assert_eq!(decode_from_device(&line).unwrap().body, body);
+        }
+        for suffix in ["", ",\"archived\":null", ",\"archived\":\"true\""] {
+            let line = format!(
+                r#"{{"v":1,"id":"a-1","type":"conversation.archive","conversation":"c-1"{suffix}}}"#
+            );
+            assert!(matches!(
+                decode_from_device(line.as_bytes()),
+                Err(DecodeError::Bad { .. })
+            ));
+        }
+        let old =
+            br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main"}"#;
+        let ToDevice::Conversation(mut info) = decode_to_device(old).unwrap().body else {
+            panic!("not conversation metadata");
+        };
+        assert!(!info.archived);
+        assert_eq!(info.revision, 0);
+        for archived in [true, false] {
+            info.archived = archived;
+            let body = ToDevice::Conversation(info.clone());
+            let line = encode_line(&Envelope::new(MessageId::new("m").unwrap(), body.clone()));
+            assert_eq!(decode_to_device(&line).unwrap().body, body);
+            assert_eq!(
+                String::from_utf8_lossy(&line).contains("archived"),
+                archived
+            );
+            assert!(!String::from_utf8_lossy(&line).contains("revision"));
+        }
+        info.revision = 7;
+        let body = ToDevice::Conversation(info);
+        let line = encode_line(&Envelope::new(MessageId::new("m").unwrap(), body.clone()));
+        assert!(String::from_utf8_lossy(&line).contains(r#""revision":7"#));
+        assert_eq!(decode_to_device(&line).unwrap().body, body);
+        assert!(matches!(
+            decode_to_device(br#"{"v":1,"id":"m","type":"conversation","conversation":"c-1","agent":"lab/main","revision":-1}"#),
+            Err(DecodeError::Bad { .. })
+        ));
     }
 
     #[test]

@@ -36,7 +36,14 @@ const APP_PLUGIN_YAML: &str = include_str!("../../channels/hermes/enclos/plugin.
 const APP_PLUGIN_INIT: &str = include_str!("../../channels/hermes/enclos/__init__.py");
 const APP_PLUGIN_ADAPTER: &str = include_str!("../../channels/hermes/enclos/adapter.py");
 const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/protocol.py");
+const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/approvals.py");
 const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
+const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
+const APP_PLUGIN_QUESTIONS: &str = include_str!("../../channels/hermes/enclos/questions.py");
+const APP_PLUGIN_RUNTIME_APPROVALS: &str =
+    include_str!("../../channels/hermes/enclos/runtime_approvals.py");
+const APP_PLUGIN_QUESTIONS_SKILL: &str =
+    include_str!("../../channels/hermes/enclos/skills/app-questions/SKILL.md");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
 
 /// Hermes's built-in profile, the root of its home.
@@ -282,6 +289,11 @@ impl RuntimeAdapter for Hermes {
                 file("adapter.py", APP_PLUGIN_ADAPTER)?,
                 file("protocol.py", APP_PLUGIN_PROTOCOL)?,
                 file("outbox.py", APP_PLUGIN_OUTBOX)?,
+                file("approvals.py", APP_PLUGIN_APPROVALS)?,
+                file("routines.py", APP_PLUGIN_ROUTINES)?,
+                file("questions.py", APP_PLUGIN_QUESTIONS)?,
+                file("runtime_approvals.py", APP_PLUGIN_RUNTIME_APPROVALS)?,
+                file("skills/app-questions/SKILL.md", APP_PLUGIN_QUESTIONS_SKILL)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
                 HERMES,
@@ -1062,6 +1074,11 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/adapter.py",
                 ".hermes/profiles/main/plugins/enclos/protocol.py",
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
+                ".hermes/profiles/main/plugins/enclos/approvals.py",
+                ".hermes/profiles/main/plugins/enclos/routines.py",
+                ".hermes/profiles/main/plugins/enclos/questions.py",
+                ".hermes/profiles/main/plugins/enclos/runtime_approvals.py",
+                ".hermes/profiles/main/plugins/enclos/skills/app-questions/SKILL.md",
             ]
         );
         assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));

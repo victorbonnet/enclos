@@ -15,8 +15,9 @@ VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_ID_BYTES = 128
 
-FROM_BRIDGE_TYPES = ("hello", "message.in", "conversation.rename", "ack", "error")
-CAPABILITIES = ("typing", "titles", "tools")
+FROM_BRIDGE_TYPES = ("policy.context", "hello", "message.in", "conversation.rename", "routine.request",
+                     "question.answer", "question.sync", "ack", "error")
+CAPABILITIES = ("typing", "titles", "tools", "approval")
 # The longest label of a tool step: a line on a phone.
 MAX_TOOL_LABEL_CHARS = 120
 # The longest conversation title sent (Hermes' own limit is 100 characters).
@@ -28,13 +29,19 @@ MAX_TITLE_CHARS = 100
 # docs/protocol.md). Short, as it is in every prompt; it changes when the
 # app's list does.
 PLATFORM_HINT = (
-    "You are talking with the user through the enclos mobile app, on their phone. "
+    "You are talking through the enclos mobile app. "
     "Markdown renders: bold, italic, strikethrough, inline code, headings, lists, quotes, "
-    "fenced code blocks, tables and links. Use it when it makes a reply easier to read "
-    "on a phone screen, and keep tables narrow. A single newline is a line break. "
-    "To send an image or a file, write MEDIA:/absolute/path/to/file on its own line: an image "
-    "shows in the conversation, another file as an attachment, and the person can share either. "
-    "A remote image in markdown is not loaded, and HTML shows as literal text."
+    "fenced code blocks, tables and links. Keep tables narrow. A newline is a line break. "
+    "Send MEDIA:/absolute/path/to/file on its own line: images show in the conversation; "
+    "attachments open on tap (PDF/text in the app) and can be shared. "
+    "Use clarify with questions:[{question,choices,multi_select?}] for decisions: short labels in choices; "
+    "Other text and Skip are offered. Wait for results. Native approval buttons, when supported, "
+    "answer Hermes's own gate; questions are no substitute and never change sandbox policy. "
+    "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
+    "it opens in the app. Use inline CSS and data images/fonts; JavaScript, external "
+    "resources, forms and automatic navigation are blocked. Tapped HTTP(S) links open the browser. "
+    "A remote image in markdown is not loaded, "
+    "and message HTML shows as literal text."
 )
 
 
@@ -158,8 +165,13 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         _check_id(message.get("id"), "id")
         if kind == "hello":
             _check_text(message.get("token"), "token")
+            capabilities = message.get("capabilities", [])
+            if not isinstance(capabilities, list) or not all(isinstance(c, str) for c in capabilities):
+                raise ValueError("capabilities must be a list of strings")
             if message.get("home") is not None:
                 _check_id(message.get("home"), "home")
+        elif kind == "policy.context":
+            _check_text(message.get("text"), "text")
         elif kind == "message.in":
             _check_id(message.get("conversation"), "conversation")
             _check_id(message.get("person"), "person")
@@ -167,6 +179,23 @@ def decode_from_bridge(line: bytes) -> dict[str, Any]:
         elif kind == "conversation.rename":
             _check_id(message.get("conversation"), "conversation")
             _check_text(message.get("title"), "title")
+        elif kind == "routine.request":
+            from .routines import RoutineError, validate_request
+            try:
+                validate_request(message)
+            except RoutineError as error:
+                raise ValueError(str(error)) from None
+        elif kind == "question.answer":
+            from .questions import validate_answer
+            _check_id(message.get("conversation"), "conversation")
+            _check_id(message.get("question"), "question")
+            validate_answer(message.get("answer"))
+        elif kind == "question.sync":
+            ids = message.get("questions")
+            if not isinstance(ids, list) or len(ids) > 128:
+                raise ValueError("questions must contain at most 128 ids")
+            for question_id in ids:
+                _check_id(question_id, "question")
         elif kind == "ack":
             _check_id(message.get("of"), "of")
         elif kind == "error":
