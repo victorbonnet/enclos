@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { createChannel, resolveAccount, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { message } from '../protocol.js';
+import { mediaFolder } from '../media.js';
 import { accountFixture, bridge, waitFor } from './helpers.js';
 
 function nativeHarness(cfg) {
@@ -174,4 +176,27 @@ test('typing, exact tool events, native commands and policy requests keep their 
   assert.equal(channel.running.get('main').transport.state.policyContext, policy.text);
   live = false;
   await assert.rejects(tool.execute('tool-call', { kind: 'read', target: '/tmp/requested', action: 'Read it again' }), /retired invocation/);
+});
+
+test('files enter the native context and an HTML artefact leaves through ordinary media', async t => {
+  const account = accountFixture(t), cfg = configured(account), folder = path.dirname(account.socket);
+  const sdk = { mediaRoots: () => [folder], async loadMedia(url, options) {
+    assert.deepEqual(options.localRoots, [folder]);
+    return { buffer: readFileSync(url), fileName: path.basename(url), contentType: 'text/html' };
+  } };
+  const channel = createChannel(sdk), native = nativeHarness(cfg);
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('attachments'));
+  writeFileSync(path.join(mediaFolder(account), 'input.txt'), 'hello file', { mode: 0o600 });
+  const input = message('message.in', { conversation: 'files', person: 'alice', text: '', attachments: [{ file: 'input.txt', name: 'input.txt', mime: 'text/plain', size: 10 }] });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.deepEqual(native.calls.contexts[0].media, [{ path: path.join(mediaFolder(account), 'input.txt'), contentType: 'text/plain', messageId: input.id }]);
+  const html = path.join(folder, 'answer.html'); writeFileSync(html, '<!doctype html><p>Static answer</p>');
+  await owner.next('message.out');
+  await channel.plugin.outbound.sendMedia({ cfg, accountId: 'main', to: 'files', text: 'Open the page', mediaUrl: html });
+  const outgoing = await owner.next('message.out');
+  assert.equal(outgoing.text, 'Open the page'); assert.equal(outgoing.attachments[0].mime, 'text/html');
+  assert.equal(outgoing.attachments[0].name, 'answer.html');
+  assert.equal(readFileSync(path.join(mediaFolder(account), outgoing.attachments[0].file), 'utf8'), '<!doctype html><p>Static answer</p>');
 });
