@@ -4,6 +4,7 @@ use crate::engine::listener::{Network, NoPort, outside_proxy_range, service_list
 use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
+use crate::runtime::ListenerPorts;
 
 /// A stand-in gateway: `perl` running `script`, which prints each port
 /// it listens on, one a line, then waits.
@@ -139,14 +140,77 @@ fn the_service_port_is_the_one_its_own_process_holds() {
 }
 
 #[test]
+fn a_configured_service_port_does_not_have_to_be_ephemeral() {
+    let (_dir, engine, name) = with_sandbox();
+    let ephemeral = crate::lifecycle::listeners::ephemeral_ports().unwrap();
+    let candidates = if *ephemeral.start() > 1024 {
+        1024..=*ephemeral.start() - 1
+    } else if *ephemeral.end() < u16::MAX {
+        *ephemeral.end() + 1..=u16::MAX
+    } else {
+        // This host has no unprivileged non-ephemeral port to exercise.
+        // The pure selector test still covers both kinds of port.
+        return;
+    };
+    let script = format!(
+        "my $s; for my $port ({}..{}) {{ next if $port >= {} && $port <= {}; socket(my $candidate, PF_INET, SOCK_STREAM, 0) or die qq(socket: $!); next unless bind($candidate, sockaddr_in($port, INADDR_LOOPBACK)); listen($candidate, 1) or die qq(listen: $!); $s = $candidate; last; }} die qq(no configured port) unless $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30",
+        candidates.start(),
+        candidates.end(),
+        crate::model::sandbox::PORT_FIRST,
+        crate::model::sandbox::PORT_LAST,
+    );
+    let (child, ports) = perl(&script, 1);
+    record_gateway(
+        &engine,
+        &name,
+        crate::lifecycle::process::reference_of_child(&child).unwrap(),
+    );
+    let selected = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::SingleLoopback,
+    );
+    let unchanged = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    end(child);
+    assert!(!ephemeral.contains(&ports[0]));
+    assert_eq!(selected, Ok(ports[0]));
+    assert!(matches!(unchanged, Err(NoPort::NotYet(_))), "{unchanged:?}");
+}
+
+#[test]
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::SingleLoopback,
+    );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
         "{got:?}"
+    );
+    assert!(
+        matches!(&configured, Err(NoPort::Refused(why)) if why.contains("listens on 2 ports")),
+        "{configured:?}"
     );
 }
 
@@ -155,7 +219,13 @@ fn two_open_gateway_sessions_get_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (one, _) = gateway(&engine, &name, 1);
     let (two, _) = gateway(&engine, &name, 1);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
     end(one);
     end(two);
     assert!(
@@ -175,10 +245,27 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
         started: "Thu Jan  1 00:00:00 1970".to_owned(),
     };
     record_gateway(&engine, &name, root);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::SingleLoopback,
+    );
     assert!(
         matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
         "{got:?}"
+    );
+    assert!(
+        matches!(configured, Err(NoPort::NotRunning(_))),
+        "{configured:?}"
     );
 }
 
@@ -192,11 +279,28 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&child).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::SingleLoopback,
+    );
     end(child);
     assert!(
         matches!(&got, Err(NoPort::NotYet(why)) if why.contains("no TCP listener at 127.0.0.1")),
         "{held:?}"
+    );
+    assert!(
+        matches!(configured, Err(NoPort::NotYet(_))),
+        "{configured:?}"
     );
 
     // Sharing 127.0.0.1 at its port with another process (SO_REUSEPORT):
@@ -223,13 +327,30 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&owner).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
+    let got = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::Ephemeral,
+    );
+    let configured = service_listener(
+        engine.state.as_ref(),
+        &name,
+        "gateway",
+        &Network::Host,
+        ListenerPorts::SingleLoopback,
+    );
     end(owner);
     end(other);
     let why = got.unwrap_err();
     assert!(
         matches!(&why, NoPort::Refused(why) if why.contains("also listens at 127.0.0.1")),
         "{why:?}"
+    );
+    assert!(
+        matches!(&configured, Err(NoPort::Refused(why)) if why.contains("also listens at 127.0.0.1")),
+        "{configured:?}"
     );
 }
 
