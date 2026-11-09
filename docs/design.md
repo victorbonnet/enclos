@@ -627,6 +627,7 @@ pub trait RuntimeAdapter {
         &self,
         _agent: &RuntimeAgentName,
         _socket: &Path,
+        _token_file: &Path,
         _home: &str,
         _bridge_key: &str,
     ) -> Option<AppChannel>;
