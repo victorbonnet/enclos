@@ -37,6 +37,30 @@ function configured(...accounts) {
     bindings: accounts.map(a => ({ agentId: a.agentId, match: { channel: 'enclos', accountId: a.accountId } })) };
 }
 
+test('a native service-backed routine response is live, agent-bound and read-only', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  const native = nativeHarness(cfg); let service;
+  channel.setRuntime(native.api);
+  channel.registerFull({ registerService(value) { service = value; } });
+  const job = { id: 'native-fixture', agentId: account.agentId, name: 'Fixture', enabled: false,
+    schedule: { kind: 'every', everyMs: 3600000 }, payload: { kind: 'agentTurn', message: 'Read this native fixture.' } };
+  const cron = { list: async () => [job], isEnabled: async () => true };
+  await service.start({ getCron: () => cron });
+  t.after(() => service.stop());
+  await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('routines'));
+  const request = message('routine.request', { action: 'list' }); owner.send(request);
+  const list = await owner.next('routine.response', request.id);
+  assert.deepEqual(list.options.operations, ['get']);
+  assert.equal(list.routines[0].editable, false);
+  const get = message('routine.request', { action: 'get', routine: job.id }); owner.send(get);
+  assert.equal((await owner.next('routine.response', get.id)).routine.definition.prompt, job.payload.message);
+  const remove = message('routine.request', { action: 'delete', routine: job.id, revision: list.routines[0].revision }); owner.send(remove);
+  assert.equal((await owner.next('error', remove.id)).code, 'unsupported');
+  assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, []);
+});
+
 async function start(t, channel, cfg, account) {
   const controller = new AbortController();
   const lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: account.accountId, abortSignal: controller.signal, setStatus() {} });
