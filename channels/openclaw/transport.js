@@ -171,6 +171,15 @@ export class ChannelTransport {
     return outgoing.id;
   }
 
+  assertControlPeer(peer) {
+    try {
+      if (this.closed || this.peer !== peer || !peer || peer.destroyed || !peer.authenticated ||
+          peer.tokenDigest !== digest(readToken(this.account.tokenFile))) throw new Error();
+    } catch {
+      throw new ProtocolError('agent_unavailable', 'The requesting bridge disconnected or its credentials changed. Reconnect and refresh.');
+    }
+  }
+
   write(value, peer = this.peer) {
     if (!peer || peer.destroyed || !peer.authenticated) return false;
     try {

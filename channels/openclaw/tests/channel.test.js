@@ -273,3 +273,29 @@ test('native fallback rendering precedes delivery and rechecks the account after
   assert.equal((await owner.next('error', input.id)).code, 'agent_unavailable');
   assert.deepEqual(channel.running.get('main').transport.state.outbox, []);
 });
+
+test('native titles and human renames cross the authenticated channel using the exact route', async t => {
+  const account = accountFixture(t), cfg = configured(account), native = nativeHarness(cfg), channel = createChannel();
+  let row = { sessionId: 'test-owned', updatedAt: 42, autoLabel: 'Native title' }, selected;
+  native.api.agent = { session: {
+    resolveStorePath: () => '/test-owned/store',
+    async getSessionEntryAsync(target) { selected = target; return row; },
+    async prepareSessionEntryPatch(params) {
+      assert.equal(params.sessionKey, selected.sessionKey); params.authority.assertCurrent();
+      row = { ...row, ...await params.prepare(row, { existingEntry: row }) };
+      params.authority.assertCurrent(); return row;
+    },
+  } };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('titles'));
+  const input = message('message.in', { conversation: 'c', person: 'alice', text: 'hello' });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.equal((await owner.next('conversation.title')).title, 'Native title');
+  const rename = message('conversation.rename', { conversation: 'c', title: 'Human title' });
+  owner.send(rename); await owner.next('ack', rename.id);
+  const titled = await owner.next('conversation.title'); assert.equal(titled.title, 'Human title'); assert.equal(titled.conversation, 'c');
+  assert.equal(row.updatedAt, 42); assert.equal(row.label, undefined);
+  assert.equal(selected.sessionKey, native.calls.dispatch[0].route.sessionKey);
+  assert.equal(selected.agentId, 'main');
+});
