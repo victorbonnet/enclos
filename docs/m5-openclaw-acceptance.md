@@ -42,7 +42,9 @@ No credential values or provider profile files form part of this record.
 | Managed lifecycle | Clean stop/restart reported no survivors for the test session; authenticated model use worked after restart. |
 | Actual model | Production launcher returned exactly `M5_OK` in 14.23 seconds; native terminal receipt reported zero successful tool calls. |
 | macOS certificate roots | Original native model failed with `UnknownIssuer`. The supported public CA bundle restored verified TLS; executable regression failed before the launcher fix and passed after. Explicit CA overrides remain honored. |
-| Baseline app channel | Installed OpenClaw loaded the real package. Main/scout `/help` round trips retained reply correlation; a wrong socket token was refused. |
+| Managed channel setup | After scoped cleanup of the earlier manual prototype, both agents configured through actual `runtime configure --channel app`. One linked package, separate token/state paths and exact native bindings were verified; no hand-written managed setup. |
+| Actual app channel | Wrong token refused; main/scout `/help` replies correlated. Main returned exact `M5_CHANNEL_OK` through the final native channel. |
+| Native read-only routines | Native inventory and unsupported heartbeat details behaved explicitly. A main-owned agent-turn fixture, disabled from creation with no delivery, returned its complete 51-byte prompt and daily interval, with `editable=false`. Scout excluded it and returned `not_found`. |
 
 The prototype's earlier, narrower observations remain in
 [its evidence record](../prototype/m5/README.md). Those observations do not become
@@ -109,8 +111,10 @@ attached to its actual tested version and environment.
   state, archives, files/static HTML, commands, typing/tool events and titles.
 - [ ] Exact cancellation and policy requests on the real phone, including stale
   controls, reconnects, another conversation and a later run.
-- [ ] Read-only native routine inventory/details, unsupported schedule handling
-  and scheduled delivery while the phone/bridge is away and after restart.
+- [x] Live native read-only inventory/details, unsupported heartbeat refusal and
+  exact foreign-agent exclusion through the managed channel.
+- [ ] Routine display on the phone, unsupported schedule handling and scheduled
+  delivery while the phone/bridge is away and after restart.
 - [ ] Native approval cards, actual offered scopes, two-device races, external
   settlement, expiry/restart and older-peer complete fallback; question text.
 - [ ] Dashboard handoff, status/doctor/logs, proxy allow/deny, audit verification
