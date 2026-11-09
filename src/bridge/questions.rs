@@ -36,6 +36,9 @@ struct Pending {
 #[derive(Default)]
 pub(super) struct QuestionRequests {
     connections: HashMap<String, String>,
+    /// Device support is declared on each authenticated connection, not
+    /// inferred from the agent or persisted with the pairing.
+    scope_devices: std::collections::HashSet<String>,
     pending: HashMap<String, Pending>,
     // Keep ambiguous outcomes too: replaying a device packet must never resend an answer.
     completed: VecDeque<(String, Request, ToDevice)>,
@@ -110,6 +113,32 @@ pub(super) fn acknowledge_question(
 }
 
 impl Hub {
+    pub(super) fn question_device_capabilities(&self, device: &str, capabilities: &[Capability]) {
+        let mut requests = self.questions.lock().expect("not poisoned");
+        if capabilities.contains(&Capability::RuntimeApprovalScopes) {
+            requests.scope_devices.insert(device.into());
+        } else {
+            requests.scope_devices.remove(device);
+        }
+    }
+
+    pub(super) fn question_supported_by_device(
+        &self,
+        device: &str,
+        question: &QuestionDefinition,
+    ) -> bool {
+        question
+            .approval
+            .as_ref()
+            .is_none_or(|approval| approval.scopes.is_none())
+            || self
+                .questions
+                .lock()
+                .expect("not poisoned")
+                .scope_devices
+                .contains(device)
+    }
+
     pub(super) fn question_connected(&self, agent: &str, connection: &str) {
         self.questions
             .lock()
@@ -144,7 +173,7 @@ impl Hub {
         question: &QuestionDefinition,
         id: &MessageId,
     ) -> Result<(), QuestionStoreError> {
-        if question.approval.is_some()
+        if let Some(approval) = &question.approval
             && !self
                 .plugins
                 .lock()
@@ -152,10 +181,12 @@ impl Hub {
                 .get(agent)
                 .is_some_and(|(_, capabilities)| {
                     capabilities.contains(&Capability::RuntimeApprovals)
+                        && (approval.scopes.is_none()
+                            || capabilities.contains(&Capability::RuntimeApprovalScopes))
                 })
         {
             return Err(QuestionStoreError::Invalid(
-                "The runtime does not support native command approvals.".into(),
+                "The runtime has not negotiated these native approval scopes.".into(),
             ));
         }
         question.validate().map_err(QuestionStoreError::Invalid)?;
@@ -357,6 +388,13 @@ impl Hub {
         let current = self
             .question_authority(store, device, person, &question)
             .map_err(|_| failure(original.clone(), ErrorCode::NotFound, "No such question."))?;
+        if !self.question_supported_by_device(&device.id, &current.info.definition) {
+            return Err(failure(
+                original,
+                ErrorCode::Unsupported,
+                "This device has not negotiated native approval scopes. Use the runtime's instructions.",
+            ));
+        }
         answer
             .validate(&current.info.definition)
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e))?;
@@ -426,12 +464,19 @@ impl Hub {
                 "The agent is disconnected. Reconnect and review this question before answering.",
             ));
         };
-        let capability = if current.info.definition.approval.is_some() {
-            Capability::RuntimeApprovals
+        let capability = if let Some(approval) = &current.info.definition.approval {
+            if approval.scopes.is_some() {
+                Capability::RuntimeApprovalScopes
+            } else {
+                Capability::RuntimeApprovals
+            }
         } else {
             Capability::Questions
         };
-        if !capabilities.contains(&capability) {
+        if !capabilities.contains(&capability)
+            || (current.info.definition.approval.is_some()
+                && !capabilities.contains(&Capability::RuntimeApprovals))
+        {
             return Err(failure(
                 original,
                 ErrorCode::Unsupported,
@@ -507,12 +552,12 @@ impl Hub {
         question: &QuestionId,
         response: ToDevice,
     ) {
+        let Some(current) = store.question(question).ok().flatten() else {
+            return;
+        };
         if !bounded(&response)
-            || store
-                .question(question)
-                .ok()
-                .flatten()
-                .is_none_or(|q| q.owner != person)
+            || current.owner != person
+            || !self.question_supported_by_device(device, &current.info.definition)
         {
             return;
         }
@@ -558,6 +603,18 @@ impl Hub {
             })
         });
         let paired = store.devices().unwrap_or_default();
+        let scoped = current
+            .info
+            .definition
+            .approval
+            .as_ref()
+            .is_some_and(|a| a.scopes.is_some());
+        let scope_devices = self
+            .questions
+            .lock()
+            .expect("not poisoned")
+            .scope_devices
+            .clone();
         let devices = self.devices.lock().expect("not poisoned");
         for (device, (person, sender)) in devices.iter() {
             if person == &current.owner
@@ -565,7 +622,9 @@ impl Hub {
                     .iter()
                     .any(|d| d.id == *device && d.person == *person)
             {
-                let _ = sender.send(question.clone());
+                if !scoped || scope_devices.contains(device) {
+                    let _ = sender.send(question.clone());
+                }
                 if let Some(message) = &message
                     && bounded(message)
                 {

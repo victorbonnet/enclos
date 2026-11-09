@@ -121,6 +121,7 @@ fn native(hub: &Arc<Hub>, capabilities: Vec<Capability>) -> Native {
         assert_eq!(token, "secret");
         assert!(bridge_caps.contains(&Capability::Questions));
         assert!(bridge_caps.contains(&Capability::RuntimeApprovals));
+        assert!(bridge_caps.contains(&Capability::RuntimeApprovalScopes));
         stream
             .write_all(&encode_line(&Envelope::new(
                 MessageId::new("hello").unwrap(),
@@ -727,6 +728,24 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
         "no history was introduced after since"
     );
     assert!(!pending.iter().any(|message| matches!(message, ToDevice::Question { question } if question.definition.id.as_str() == "foreign-question")));
+    let scoped = independent_scopes("scoped-before-sync");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &scoped,
+            "scoped-introduction",
+        )
+        .unwrap();
+    let legacy = sync(0);
+    assert!(!legacy.iter().any(|message| matches!(message,
+        ToDevice::Question { question } if question.definition.id == scoped.id)));
+    assert!(legacy.iter().any(|message| matches!(message,
+        ToDevice::Message(message) if message.question.as_ref() == Some(&scoped.id) && message.text.contains("native-7"))));
+    hub.question_device_capabilities("phone", &[Capability::RuntimeApprovalScopes]);
+    let modern = sync(0);
+    assert!(modern.iter().any(|message| matches!(message,
+        ToDevice::Question { question } if question.definition == scoped)));
     store
         .settle_question(
             AGENT,
@@ -778,12 +797,127 @@ fn approval_definition(id: &str, smart_denied: bool) -> QuestionDefinition {
                 vec![Action::Once, Action::Session, Action::Always, Action::Deny]
             },
             smart_denied,
+            scopes: None,
         }),
     }
 }
 
 fn approval(action: enclos_protocol::question::RuntimeApprovalAction) -> QuestionAnswer {
     QuestionAnswer::Approval { action }
+}
+
+fn independent_scopes(id: &str) -> QuestionDefinition {
+    use enclos_protocol::question::{RuntimeApprovalAction as Action, RuntimeApprovalScopes};
+    let mut definition = approval_definition(id, false);
+    let native = definition.approval.as_mut().unwrap();
+    native.actions = vec![Action::Once, Action::Always, Action::Deny];
+    native.scopes = Some(RuntimeApprovalScopes {
+        description: "Always remembers exact argv and working directory.".into(),
+        fallback: "Use the native runtime approval surface for request native-7.".into(),
+    });
+    definition
+}
+
+#[test]
+fn independent_native_scopes_negotiate_plugin_and_device_separately() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, legacy, legacy_rx) = fixture();
+    let (modern, modern_rx) = phone(&hub, &store, "modern", OWNER);
+    hub.question_device_capabilities(&modern.id, &[Capability::RuntimeApprovalScopes]);
+    let mut native = native(
+        &hub,
+        vec![
+            Capability::RuntimeApprovals,
+            Capability::RuntimeApprovalScopes,
+        ],
+    );
+    let definition = independent_scopes("native-scopes");
+    ask(&mut native, &modern_rx, &definition);
+    let ToDevice::Message(fallback) = next(&legacy_rx) else {
+        panic!("legacy device gets readable history only")
+    };
+    assert!(fallback.text.contains("Always allow") && fallback.text.contains("native-7"));
+    assert!(!fallback.text.contains("/approve") && !fallback.text.contains("pattern"));
+    assert!(legacy_rx.try_recv().is_err());
+    assert!(!hub.question_supported_by_device(&legacy.id, &definition));
+    assert!(hub.question_supported_by_device(&modern.id, &definition));
+    let error = hub
+        .question_answer(
+            &store,
+            &legacy,
+            OWNER,
+            MessageId::new("old-answer").unwrap(),
+            definition.id.clone(),
+            0,
+            approval(Action::Always),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unsupported);
+    assert!(hub.questions.lock().unwrap().pending.is_empty());
+    hub.question_answer(
+        &store,
+        &modern,
+        OWNER,
+        MessageId::new("new-answer").unwrap(),
+        definition.id.clone(),
+        0,
+        approval(Action::Always),
+    )
+    .unwrap();
+    let request = native.receive();
+    assert!(matches!(
+        request.body,
+        FromBridge::QuestionAnswer {
+            answer: QuestionAnswer::Approval {
+                action: Action::Always
+            },
+            ..
+        }
+    ));
+    native.send(
+        "native-receipt",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Always)),
+            of: Some(request.id),
+        },
+    );
+    native.ack("native-receipt");
+    assert!(
+        matches!(next(&modern_rx), ToDevice::Question { question } if question.definition == definition)
+    );
+    assert!(matches!(next(&modern_rx), ToDevice::Message(_)));
+    assert!(
+        matches!(next(&modern_rx), ToDevice::QuestionResult { question, .. } if question.answer == Some(approval(Action::Always)))
+    );
+    assert!(matches!(next(&legacy_rx), ToDevice::Message(_)));
+    assert!(legacy_rx.try_recv().is_err());
+    hub.question_device_capabilities(&modern.id, &[]);
+    assert!(
+        !hub.question_supported_by_device(&modern.id, &definition),
+        "capabilities do not survive a reconnect/downgrade"
+    );
+}
+
+#[test]
+fn a_legacy_approval_plugin_cannot_send_independent_scopes() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = independent_scopes("unnegotiated");
+    native.send(
+        "unsupported-scopes",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition.clone(),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::Error(error) if error.code == ErrorCode::BadMessage)
+    );
+    native.ack("unsupported-scopes");
+    assert!(store.question(&definition.id).unwrap().is_none());
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

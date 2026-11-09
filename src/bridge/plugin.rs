@@ -73,7 +73,11 @@ pub fn connect(
     };
     writer.send(FromBridge::Hello {
         token: token.to_owned(),
-        capabilities: vec![Capability::Questions, Capability::RuntimeApprovals],
+        capabilities: vec![
+            Capability::Questions,
+            Capability::RuntimeApprovals,
+            Capability::RuntimeApprovalScopes,
+        ],
         home: ConversationId::new(home).ok(),
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;

@@ -595,6 +595,7 @@ mod runtime_approval_tests {
                 reason: "Install dependencies.".into(),
                 actions: vec![Action::Once, Action::Session, Action::Always, Action::Deny],
                 smart_denied: false,
+                scopes: None,
             }),
         }
     }

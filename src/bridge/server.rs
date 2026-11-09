@@ -955,8 +955,16 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
             break message;
         }
     };
+    let mut device_capabilities = Vec::new();
     let device = match (first.body, known) {
-        (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
+        (
+            FromDevice::Auth {
+                device,
+                sig,
+                capabilities,
+            },
+            Some(known),
+        ) if known.id == device => {
             let sig = decode("sig", &sig).map_err(|e| e.to_string())?;
             if check_signature(&known.device_key, link.session.handshake_hash(), &sig).is_err() {
                 return Err(refuse(
@@ -972,6 +980,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
                     &format!("the device is {}'s, and {person} is calling", known.person),
                 ));
             }
+            device_capabilities = capabilities;
             known
         }
         (FromDevice::Auth { .. }, _) => {
@@ -1012,6 +1021,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         let _ = store.ensure_home(&agent.name, hub.host.as_deref().unwrap_or(&person));
     }
     let (sender, outbox) = channel();
+    hub.question_device_capabilities(&device.id, &device_capabilities);
     hub.devices
         .lock()
         .expect("not poisoned")
@@ -1022,6 +1032,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let ended = run_session(hub, &store, &mut link, &device, &person, &outbox);
     hub.devices.lock().expect("not poisoned").remove(&device.id);
+    hub.question_device_capabilities(&device.id, &[]);
     let _ = store.device_seen(&device.id);
     let _ = store.log(
         Some(&device.id),
@@ -1498,9 +1509,11 @@ fn run_session(
                     .pending_questions_for(person)
                     .map_err(|e| e.to_string())?
                 {
-                    link.send(ToDevice::Question {
-                        question: question.info,
-                    })?;
+                    if hub.question_supported_by_device(&device.id, &question.info.definition) {
+                        link.send(ToDevice::Question {
+                            question: question.info,
+                        })?;
+                    }
                 }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
@@ -1522,6 +1535,7 @@ fn run_session(
                         && let Some(current) =
                             store.question(question).map_err(|e| e.to_string())?
                         && current.owner == person
+                        && hub.question_supported_by_device(&device.id, &current.info.definition)
                     {
                         link.send(ToDevice::Question {
                             question: current.info,
