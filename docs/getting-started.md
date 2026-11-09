@@ -2,6 +2,8 @@
 
 This guide runs Hermes agents in a sandbox on your Mac. It creates a sandbox called `lab` with two agents, `main` and `scout`. Pick any name you like for the sandbox; avoid `home`, which makes paths such as `sandboxes/home/home` hard to read.
 
+For the M5 OpenClaw runtime, follow [OpenClaw on a Mac](openclaw.md), including its native agent selection, protected Gateway credential and provider-login steps.
+
 The words used here:
 
 - **Sandbox:** an isolated environment with its own home folder, policy and network proxy.
