@@ -164,6 +164,10 @@ read_deny = [
     "~/.config/Claude",
     "~/.codex",
     "~/.hermes",
+    # OpenClaw's default and --dev state roots. Other --profile names and
+    # relocated host state need explicit read_deny_add entries (paths are literal).
+    "~/.openclaw",
+    "~/.openclaw-dev",
     "~/.gemini",
     "~/.cursor",
     "~/Library/Application Support/Cursor",
