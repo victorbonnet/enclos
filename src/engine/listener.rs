@@ -17,8 +17,8 @@ use crate::backend::HeldNamespace;
 use crate::error::Result;
 use crate::layout::LayoutError;
 use crate::lifecycle::listeners::{
-    ListenersError, NotOnePort, ephemeral_ports, one_port, tcp_listeners, tcp_listeners_at,
-    tcp_listeners_at_in, tcp_listeners_in,
+    ListenersError, NotOnePort, ephemeral_ports, one_loopback_port, one_port, tcp_listeners,
+    tcp_listeners_at, tcp_listeners_at_in, tcp_listeners_in,
 };
 use crate::lifecycle::proc::{program_in_pid_namespace, same_network};
 use crate::lifecycle::process::{is_same, reference};
@@ -26,7 +26,7 @@ use crate::model::audit::Actor;
 use crate::model::sandbox::{PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord};
 use crate::model::session::{ProcessRef, SessionKind};
 use crate::runtime::home::stat;
-use crate::runtime::{RuntimeListener, adapter};
+use crate::runtime::{ListenerPorts, RuntimeListener, adapter};
 use crate::state::StateStore;
 
 /// The limits of `connect`'s wait for the service to listen.
@@ -87,8 +87,8 @@ pub(super) enum Network {
     Namespace(HeldNamespace),
 }
 
-/// The port `service` listens on now: the one TCP port at 127.0.0.1 in the
-/// ephemeral range that the program its open session started holds (`enclos
+/// The port `service` listens on now: the one TCP port at 127.0.0.1 selected
+/// by its adapter that the program its open session started holds (`enclos
 /// launch` runs it; for Hermes, the gateway itself), checked to be the same
 /// process before and after reading its ports, so a reused pid is not taken
 /// for it, and to be the only process holding 127.0.0.1 at that port, so a
@@ -101,11 +101,12 @@ pub(super) fn service_listener(
     sandbox: &SandboxName,
     service: &str,
     network: &Network,
+    selection: ListenerPorts,
 ) -> std::result::Result<u16, NoPort> {
     let root = running_session(store, sandbox, service)?;
     let port = match network {
-        Network::Host => on_host(service, &root)?,
-        Network::Namespace(held) => in_namespace(service, &root, held)?,
+        Network::Host => on_host(service, &root, selection)?,
+        Network::Namespace(held) => in_namespace(service, &root, held, selection)?,
     };
     // Still the same process, so the sockets were the service's.
     if !is_same(&root).map_err(refused)? {
@@ -117,10 +118,13 @@ pub(super) fn service_listener(
 /// On the host's loopback the session's root is the program, as its wrapper
 /// and `sandbox-exec` both exec, its ports and the ephemeral range are the
 /// host's, and a port in enclos's proxy range is refused.
-fn on_host(service: &str, root: &ProcessRef) -> std::result::Result<u16, NoPort> {
-    let ephemeral = ephemeral_ports().map_err(refused)?;
+fn on_host(
+    service: &str,
+    root: &ProcessRef,
+    selection: ListenerPorts,
+) -> std::result::Result<u16, NoPort> {
     let held = tcp_listeners(root.pid).map_err(refused)?;
-    let port = chosen(service, root.pid, &held, &ephemeral)?;
+    let port = chosen(service, root.pid, &held, selection, ephemeral_ports)?;
     alone_at(service, root.pid, port, tcp_listeners_at(port))?;
     outside_proxy_range(port)
 }
@@ -136,6 +140,7 @@ pub(super) fn in_namespace(
     service: &str,
     root: &ProcessRef,
     held: &HeldNamespace,
+    selection: ListenerPorts,
 ) -> std::result::Result<u16, NoPort> {
     let not_yet = || NoPort::NotYet(format!("the {service} has not started its program yet"));
     let pid = program_in_pid_namespace(root.pid)
@@ -149,7 +154,9 @@ pub(super) fn in_namespace(
         )));
     }
     let listening = tcp_listeners_in(held.pid, pid).map_err(refused)?;
-    let port = chosen(service, pid, &listening, &held.ephemeral)?;
+    let port = chosen(service, pid, &listening, selection, || {
+        Ok(held.ephemeral.clone())
+    })?;
     alone_at(service, pid, port, tcp_listeners_at_in(held.pid, port))?;
     if !is_same(&program).map_err(refused)? {
         return Err(NoPort::NotRunning(format!("the {service}'s program ended")));
@@ -157,14 +164,20 @@ pub(super) fn in_namespace(
     Ok(port)
 }
 
-/// The one port of `held`, which `program` holds, a bind on port 0 got.
+/// Select the runtime-declared port from its program's sockets. Read the
+/// network's ephemeral range only when that strategy needs it.
 fn chosen(
     service: &str,
     program: u32,
     held: &[SocketAddr],
-    ephemeral: &RangeInclusive<u16>,
+    selection: ListenerPorts,
+    ephemeral: impl FnOnce() -> std::result::Result<RangeInclusive<u16>, String>,
 ) -> std::result::Result<u16, NoPort> {
-    one_port(held, ephemeral).map_err(|e| {
+    let selected = match selection {
+        ListenerPorts::Ephemeral => one_port(held, &ephemeral().map_err(refused)?),
+        ListenerPorts::SingleLoopback => one_loopback_port(held),
+    };
+    selected.map_err(|e| {
         let why = format!("the {service} (pid {program}): {e}");
         match e {
             NotOnePort::None(_) => NoPort::NotYet(why),
@@ -292,10 +305,16 @@ impl Engine {
     pub(super) fn listening_port(
         &self,
         record: &SandboxRecord,
-        service: &str,
+        listener: &RuntimeListener,
     ) -> std::result::Result<u16, NoPort> {
         let network = self.service_network(record)?;
-        service_listener(self.state.as_ref(), &record.name, service, &network)
+        service_listener(
+            self.state.as_ref(),
+            &record.name,
+            listener.service.as_str(),
+            &network,
+            listener.ports,
+        )
     }
 
     /// The port a session of `record` started now is given to reach besides
@@ -316,7 +335,7 @@ impl Engine {
             return Ok(None);
         }
         let service = listener.service.as_str();
-        service_listener(self.state.as_ref(), &record.name, service, &Network::Host)
+        service_listener(self.state.as_ref(), &record.name, service, &Network::Host, listener.ports)
             .map(Some)
             .map_err(|why| {
                 format!(
@@ -346,7 +365,7 @@ impl Engine {
                 }
             }
         }
-        let step = match self.listening_port(record, listener.service.as_str()) {
+        let step = match self.listening_port(record, &listener) {
             Ok(_) => ConnectStep::Nothing,
             Err(NoPort::NotRunning(_))
                 if !self.unit_installed(name, Unit::Runtime(listener.service))? =>
@@ -448,7 +467,7 @@ impl Engine {
         let mut seen: Option<ProcessRef> = None;
         let mut restarted = false;
         let late = loop {
-            let why = match self.listening_port(&record, service) {
+            let why = match self.listening_port(&record, &listener) {
                 Ok(_) => break None,
                 Err(NoPort::Refused(why)) => break Some(why),
                 Err(NoPort::NotRunning(why) | NoPort::NotYet(why)) => why,
@@ -508,5 +527,47 @@ impl Engine {
             Err(TryLockError::Error(e)) => return Err(io(e).into()),
         }
         Ok(file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_selection_needs_no_host_or_namespace_ephemeral_range() {
+        // This candidate also lies in the host proxy range: namespace
+        // selection accepts it, while on_host separately excludes it.
+        let held = [SocketAddr::from(([127, 0, 0, 1], PORT_FIRST))];
+        assert_eq!(
+            chosen("gateway", 1, &held, ListenerPorts::SingleLoopback, || {
+                panic!("configured selection must not read an ephemeral range")
+            }),
+            Ok(PORT_FIRST)
+        );
+        assert!(matches!(
+            outside_proxy_range(PORT_FIRST),
+            Err(NoPort::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn ephemeral_selection_uses_the_networks_own_range() {
+        let held = [
+            SocketAddr::from(([127, 0, 0, 1], 18789)),
+            SocketAddr::from(([127, 0, 0, 1], 61374)),
+        ];
+        for (range, port) in [(18000..=20000, 18789), (60000..=65000, 61374)] {
+            assert_eq!(
+                chosen("gateway", 1, &held, ListenerPorts::Ephemeral, || Ok(range)),
+                Ok(port)
+            );
+        }
+        assert!(matches!(
+            chosen("gateway", 1, &held, ListenerPorts::SingleLoopback, || {
+                panic!("configured selection must not read an ephemeral range")
+            }),
+            Err(NoPort::Refused(_))
+        ));
     }
 }

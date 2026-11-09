@@ -27,7 +27,7 @@ use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::SessionId;
-use crate::runtime::{RuntimeDashboard, adapter};
+use crate::runtime::{ListenerPorts, RuntimeDashboard, adapter};
 use lock::{DashboardLock, Running};
 
 /// How long the dashboard has to listen once its session started: a
@@ -146,7 +146,12 @@ impl Engine {
             if listening.is_some() || failed.is_some() {
                 return;
             }
-            let why = match in_namespace("dashboard", &session.root, &held) {
+            let why = match in_namespace(
+                "dashboard",
+                &session.root,
+                &held,
+                ListenerPorts::Ephemeral,
+            ) {
                 Ok(port) => match host_listener::open(
                     record.proxy_port,
                     user,

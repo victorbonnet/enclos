@@ -577,12 +577,29 @@ pub struct RuntimeService {
     pub restart: Option<Signal>,
 }
 
-/// A runtime service that listens in its sandbox, on a loopback port it
-/// picks when it starts, which the runtime's own clients dial (ADR 0028).
+/// Which of a service root process's own IPv4 loopback ports may be its
+/// listener. This selects candidates, never grants access: the engine still
+/// requires one port, exclusive ownership by the recorded process and a
+/// port outside enclos's proxy range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerPorts {
+    /// A bind on port 0, as Hermes uses. Fixed auxiliary listeners outside
+    /// the host's ephemeral range do not become candidates.
+    Ephemeral,
+    /// The service uses a configured port rather than a bind on port 0.
+    /// Exactly one positive port at 127.0.0.1 must be held by its recorded
+    /// root process. Multiple ports are refused rather than guessed among.
+    SingleLoopback,
+}
+
+/// A runtime service that listens in its sandbox, whose port the runtime's
+/// own clients dial (ADR 0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeListener {
     /// One of the runtime's [`RuntimeAdapter::services`].
     pub service: ServiceName,
+    /// How to select its port from the recorded service process's sockets.
+    pub ports: ListenerPorts,
     /// The path of the page the service serves on its listener for a
     /// browser on the host, such as `/` for Hermes's dashboard. `enclos
     /// status` shows it at the port sessions are given, while the service
