@@ -1,13 +1,15 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { createChannel, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
 import { commandCatalog } from '../features.js';
 import { stageMedia } from '../media.js';
 import { createNativeTitles } from '../native-titles.js';
-import { accountFixture } from './helpers.js';
+import { createNativeApprovals } from '../native-approvals.js';
+import { message } from '../protocol.js';
+import { accountFixture, bridge, waitFor } from './helpers.js';
 
 const installed = process.env.ENCLOS_OPENCLAW_PACKAGE;
 // Native database helpers also own a shared schema/lease registry. Select a
@@ -41,6 +43,62 @@ test('the installed public SDK registers the package and builds isolated session
   const listed = commandCatalog(commands.listNativeCommandSpecsForConfig, {});
   assert.ok(listed.some(c => c.name === 'help'));
   assert.ok(listed.every(c => c.description.length <= 120 && /^[a-z0-9_-]{1,32}$/.test(c.name)));
+});
+
+test('the combined channel registers the native approval context with its actual persisted route', { skip: !installed }, async t => {
+  const load = name => import(pathToFileURL(path.join(installed, `dist/plugin-sdk/${name}.js`)));
+  const [delivery, handler, contexts, routing] = await Promise.all(['approval-delivery-runtime', 'approval-handler-runtime', 'channel-runtime-context', 'routing'].map(load));
+  const account = accountFixture(t), cfg = { channels: { enclos: { accounts: { main: account } } },
+    agents: { ownership: 'explicit', entries: { main: {} } }, bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] };
+  let registration, disposed = false;
+  const nativeApprovals = createNativeApprovals({ ...delivery, ...handler, ...contexts,
+    resolveApprovalOverGateway() { throw new Error('No decision or Gateway client is needed by this registration fixture'); } });
+  const channelRuntime = { routing,
+    inbound: { ingress: { resolve: async () => ({ ingress: { admission: 'dispatch' }, senderAccess: { allowed: true }, routeAccess: { allowed: true }, activationAccess: {}, commandAccess: {} }) },
+      buildContext: value => value, dispatch: async () => {} },
+    runtimeContexts: { register(params) { registration = params; return { dispose() { disposed = true; } }; } } };
+  const channel = createChannel({ nativeApprovals });
+  assert.equal(channel.plugin.approvalCapability, nativeApprovals.approvalCapability);
+  channel.setRuntime({ version: TESTED_OPENCLAW, channel: channelRuntime, config: { current: () => cfg } });
+  const abort = new AbortController();
+  const lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: 'main', abortSignal: abort.signal, setStatus() {} });
+  t.after(async () => { abort.abort(); await lifetime; });
+  await waitFor(() => existsSync(account.socket));
+  assert.equal(registration.channelId, 'enclos'); assert.equal(registration.accountId, 'main');
+  assert.equal(registration.capability, 'approval.native');
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  const hello = await owner.hello({ capabilities: ['runtime_approvals', 'runtime_approval_scopes'] });
+  assert.ok(hello.capabilities.includes('runtime_approvals')); assert.ok(hello.capabilities.includes('runtime_approval_scopes'));
+  assert.equal('token' in channel.running.get('main').transport.bridgeHello, false);
+  const input = message('message.in', { conversation: 'exact-conversation', person: 'alice', text: 'Fixture attribution only' });
+  owner.send(input); await owner.next('ack', input.id);
+  const active = channel.running.get('main');
+  const sessionKey = active.sessionKeyFor(input.conversation, input.person);
+  const expected = routing.buildAgentSessionKey({ agentId: 'main', channel: 'enclos', accountId: 'main',
+    peer: { kind: 'direct', id: active.transport.state.routes[input.conversation].peer }, dmScope: 'per-account-channel-peer' });
+  assert.equal(sessionKey, expected);
+  const request = { id: 'native-registration-fixture', createdAtMs: Date.now(), expiresAtMs: Date.now() + 60000,
+    request: { command: 'fixture only', host: 'gateway', agentId: 'main', turnSourceChannel: 'enclos', turnSourceAccountId: 'main', turnSourceTo: input.conversation, sessionKey } };
+  assert.equal(registration.context.target(request)?.person, 'alice');
+  assert.equal(registration.context.target({ ...request, request: { ...request.request, sessionKey: `${sessionKey}-other` } }), null);
+  const sync = message('question.sync', { questions: ['ordinary-unowned-card', 'oc-exec-unowned-card'] });
+  owner.send(sync);
+  const expired = await owner.next('question.update');
+  assert.equal(expired.question, 'oc-exec-unowned-card'); assert.equal(expired.state, 'expired');
+  await owner.next('ack', sync.id);
+  // Deliberately retain that structured outbox entry. A downgraded bridge
+  // must not receive it during replay or from onHello reconciliation.
+  await owner.close(); await waitFor(() => active.transport.peer == null);
+  const legacy = await bridge(account.socket); t.after(() => legacy.close());
+  const legacyHello = await legacy.hello();
+  assert.equal(legacyHello.capabilities.includes('runtime_approvals'), false);
+  await new Promise(setImmediate);
+  assert.equal(legacy.pending.some(frame => ['question.ask', 'question.update'].includes(frame.type)), false);
+  active.transport.assertControlPeer(active.transport.peer);
+  writeFileSync(account.tokenFile, JSON.stringify({ MOBILE_APP_TOKEN: 'rotated-fixture-token' }), { mode: 0o600 });
+  assert.throws(() => active.transport.assertControlPeer(active.transport.peer), { code: 'agent_unavailable' });
+  abort.abort(); await lifetime;
+  assert.equal(disposed, true); assert.equal(registration.context.isCurrent(), false);
 });
 
 test('the installed scoped media loader preserves HTML and rejects an unrelated local root', { skip: !installed }, async t => {

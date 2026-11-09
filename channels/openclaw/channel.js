@@ -87,7 +87,8 @@ export function createChannel(sdk = {}) {
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
     if (hasMedia) mediaFolder(account);
-    let transport, titles;
+    let transport, titles, approvals;
+    const controllers = () => [titles, approvals].filter(Boolean);
     const sessionKeyFor = (conversation, person) => {
       const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
       if (!saved) return undefined;
@@ -97,9 +98,11 @@ export function createChannel(sdk = {}) {
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: () => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(routines.available() ? ['routines'] : []), ...(titles?.available ? ['titles'] : [])],
-      onHello(_hello, owner) {
+      capabilities: hello => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
+      onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
+        for (const controller of controllers()) controller.onHello?.(hello);
       },
       async onControl(control, owner, requestPeer) {
         owner.assertControlPeer(requestPeer);
@@ -107,14 +110,18 @@ export function createChannel(sdk = {}) {
           return routines.handle(control, { account,
             assertCurrent: () => {
               assertCurrent(currentConfig(ctx.cfg), account, owner);
-              if (owner.peer !== requestPeer || requestPeer.destroyed || !requestPeer.authenticated) {
-                throw new ProtocolError('agent_unavailable', 'The requesting bridge disconnected. Refresh its routines.');
-              }
+              owner.assertControlPeer(requestPeer);
             },
             write: response => owner.write(response, requestPeer) });
         }
-        if (await titles?.handleControl(control, () => owner.assertControlPeer(requestPeer))) return;
-        owner.assertControlPeer(requestPeer);
+        // Reconciliation batches may mix module-owned question ids. Every
+        // controller must see them even when an earlier one handled a part.
+        let handled = false;
+        for (const controller of controllers()) {
+          const accepted = await controller.handleControl?.(control, () => owner.assertControlPeer(requestPeer));
+          handled = accepted === true || handled;
+        }
+        if (handled) return;
         if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
         if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
         const before = owner.state.policyContext;
@@ -189,14 +196,18 @@ export function createChannel(sdk = {}) {
     });
     running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });
     const stop = async () => {
-      titles?.close();
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
       for (const [key, turn] of sessionRoutes) if (turn.active?.transport === transport) sessionRoutes.delete(key);
+      // Account authority ends first. Cleanup of one controller cannot prevent
+      // another from revoking its native contexts and process-local bindings.
+      for (const controller of controllers()) { try { controller.close?.(); } catch { /* Authority is already revoked. */ } }
       await transport.close();
       ctx.setStatus?.({ accountId: account.accountId, running: false, connected: false });
     };
     try {
       titles = createNativeTitles(runtime, account, transport, { currentConfig: () => currentConfig(ctx.cfg),
+        assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
+      approvals = sdk.nativeApprovals?.attach(account, transport, { cfg: ctx.cfg, channelRuntime: channel, abortSignal: ctx.abortSignal,
         assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
       await transport.start();
       ctx.setStatus?.({ accountId: account.accountId, running: true, connected: true });
@@ -236,6 +247,7 @@ export function createChannel(sdk = {}) {
     id: 'enclos',
     meta: { id: 'enclos', label: 'enclos app', selectionLabel: 'enclos app', docsPath: '/channels/enclos', blurb: 'Conversations through the host\'s enclos bridge.' },
     capabilities: { chatTypes: ['direct'], media: hasMedia, nativeCommands: false, blockStreaming: false, reply: true },
+    ...(sdk.nativeApprovals ? { approvalCapability: sdk.nativeApprovals.approvalCapability } : {}),
     reload: { configPrefixes: ['channels.enclos', 'bindings'] },
     config: {
       listAccountIds: cfg => Object.keys(cfg.channels?.enclos?.accounts ?? {}).sort(),
