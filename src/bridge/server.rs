@@ -977,6 +977,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
+        capabilities: vec!["approval.close".into()],
     })?;
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
@@ -1233,6 +1234,16 @@ fn run_session(
                     }))?;
                 } else {
                     link.send(ToDevice::Ack { of: message.id })?;
+                }
+            }
+            FromDevice::ApprovalClose { request } => {
+                match hub.close_access(store, device, person, &request) {
+                    Ok(()) => link.send(ToDevice::Ack { of: message.id })?,
+                    Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                        of: Some(message.id),
+                        code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                        message: e,
+                    }))?,
                 }
             }
             FromDevice::Agents => {

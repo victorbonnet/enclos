@@ -246,6 +246,54 @@ impl Hub {
         Ok(())
     }
 
+    fn approval_authority(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), String> {
+        if self.host.as_deref() != Some(person) {
+            return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
+        }
+        // Recheck revocation immediately before the action, not just at the handshake.
+        if !store
+            .devices()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|d| d.id == device.id && d.person == person)
+        {
+            return Err("This device is no longer paired.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn close_access(
+        &self,
+        store: &Store,
+        device: &Device,
+        person: &str,
+        id: &str,
+    ) -> Result<(), String> {
+        self.approval_authority(store, device, person)?;
+        // The store transition also checks the state atomically against other devices.
+        store
+            .close_approval(id, &device.id, person)
+            .map_err(|e| e.to_string())?;
+        let a = store
+            .approval(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("Unknown policy request")?;
+        let applying = a.state == "applying";
+        self.deliver(person, ToDevice::Approval(a));
+        if applying {
+            return Err(
+                "This request is already being decided. Wait for the result before closing it."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn decide_access(
         self: &Arc<Self>,
         store: &Store,
@@ -255,18 +303,7 @@ impl Hub {
         revision: &str,
         approve: bool,
     ) -> Result<(), String> {
-        if self.host.as_deref() != Some(person) {
-            return Err("Only the host's person can decide sandbox policy requests. The host's identity must be known.".into());
-        }
-        // Recheck revocation immediately before the decision, not just at the handshake.
-        if !store
-            .devices()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|d| d.id == device.id && d.person == person)
-        {
-            return Err("This device is no longer paired.".into());
-        }
+        self.approval_authority(store, device, person)?;
         let mut a = store
             .approval(id)
             .map_err(|e| e.to_string())?

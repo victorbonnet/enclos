@@ -152,6 +152,140 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
 }
 
 #[test]
+fn approval_close_persists_without_rewriting_the_request_or_deciding_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let store = Store::open(&path).unwrap();
+    let mut a = approval_sample();
+    a.available = false;
+    a.reason = Some("This scope cannot be approved from the phone.".into());
+    store.create_approval(&a).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let body = || {
+        db.query_row("SELECT body FROM approvals WHERE id='r1'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap()
+    };
+    let original_body = body();
+    assert!(
+        store
+            .close_approval("r1", "phone", "owner@example.com")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .close_approval("r1", "tablet", "owner@example.com")
+            .unwrap()
+    );
+    assert!(!store.claim_approval("r1").unwrap());
+    assert!(!store.refresh_approval(&a).unwrap());
+    assert!(!store.create_approval(&a).unwrap());
+    assert_eq!(body(), original_body);
+    assert!(store.accepted_access().unwrap().is_empty());
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    reopened.recover_approvals().unwrap();
+    a.state = "closed".into();
+    assert_eq!(reopened.approval("r1").unwrap(), Some(a.clone()));
+    assert_eq!(reopened.approvals().unwrap(), vec![a]);
+    let log = reopened.log_lines(20).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].event, "approval.closed");
+    assert_eq!(log[0].device.as_deref(), Some("phone"));
+    assert_eq!(log[0].person.as_deref(), Some("owner@example.com"));
+    assert_eq!(log[0].reason.as_deref(), Some("r1"));
+}
+
+#[test]
+fn approval_close_allows_failed_requests_but_preserves_inflight_and_terminal_decisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("app.db")).unwrap();
+    for state in [
+        "failed",
+        "applying",
+        "approved",
+        "denied",
+        "diagnostic",
+        "closed",
+    ] {
+        let mut a = approval_sample();
+        a.request = state.into();
+        a.state = state.into();
+        store.create_approval(&a).unwrap();
+        assert_eq!(
+            store
+                .close_approval(state, "phone", "owner@example.com")
+                .unwrap(),
+            state == "failed"
+        );
+        assert_eq!(
+            store.approval(state).unwrap().unwrap().state,
+            if state == "failed" { "closed" } else { state }
+        );
+    }
+    assert!(
+        !store
+            .close_approval("unknown", "phone", "owner@example.com")
+            .unwrap()
+    );
+    assert_eq!(store.log_lines(20).unwrap().len(), 1);
+}
+
+#[test]
+fn approval_close_and_audit_are_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let store = Store::open(&path).unwrap();
+    store.create_approval(&approval_sample()).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_close_log BEFORE INSERT ON log WHEN NEW.event='approval.closed' BEGIN SELECT RAISE(ABORT, 'test audit failure'); END;",
+    )
+    .unwrap();
+    assert!(
+        store
+            .close_approval("r1", "phone", "owner@example.com")
+            .is_err()
+    );
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "pending");
+    assert!(store.log_lines(20).unwrap().is_empty());
+}
+
+#[test]
+fn approval_close_races_with_claim_and_exactly_one_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let store = Store::open(&path).unwrap();
+    store.create_approval(&approval_sample()).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let close = {
+        let path = path.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let store = Store::open(&path).unwrap();
+            barrier.wait();
+            store
+                .close_approval("r1", "phone", "owner@example.com")
+                .unwrap()
+        })
+    };
+    let claim = std::thread::spawn(move || {
+        let store = Store::open(&path).unwrap();
+        barrier.wait();
+        store.claim_approval("r1").unwrap()
+    });
+    let closed = close.join().unwrap();
+    let claimed = claim.join().unwrap();
+    assert_ne!(closed, claimed);
+    assert_eq!(
+        store.approval("r1").unwrap().unwrap().state,
+        if closed { "closed" } else { "applying" }
+    );
+    assert_eq!(store.log_lines(20).unwrap().len(), usize::from(closed));
+}
+
+#[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
     let mut hub = Arc::new(Hub {
@@ -258,6 +392,139 @@ fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
     });
     let store = hub.store().unwrap();
     (dir, hub, store)
+}
+
+#[test]
+fn approval_close_requires_the_host_person_and_a_still_paired_device() {
+    let (_dir, mut hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.create_approval(&approval_sample()).unwrap();
+    assert!(
+        hub.close_access(&store, &device, "guest@example.com", "r1")
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert!(
+        hub.close_access(&store, &device, owner, "r1")
+            .unwrap_err()
+            .contains("no longer paired")
+    );
+    let mut other_person = device.clone();
+    other_person.person = "guest@example.com".into();
+    store.add_device(&other_person).unwrap();
+    assert!(hub.close_access(&store, &device, owner, "r1").is_err());
+    store.remove_device(&device.id).unwrap();
+    store.add_device(&device).unwrap();
+    assert_eq!(
+        hub.close_access(&store, &device, owner, "unknown")
+            .unwrap_err(),
+        "Unknown policy request"
+    );
+    Arc::get_mut(&mut hub).unwrap().host = None;
+    assert!(
+        hub.close_access(&store, &device, owner, "r1")
+            .unwrap_err()
+            .contains("Only the host")
+    );
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "pending");
+    assert!(store.log_lines(20).unwrap().is_empty());
+}
+
+#[test]
+fn approval_close_reaches_all_owner_devices_without_policy_or_runtime_work() {
+    let (dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.add_device(&device).unwrap();
+    let mut a = approval_sample();
+    a.available = false;
+    a.reason = Some("This scope cannot be approved from the phone.".into());
+    store.create_approval(&a).unwrap();
+    let (first_tx, first_rx) = channel();
+    let (second_tx, second_rx) = channel();
+    let (guest_tx, guest_rx) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("phone".into(), (owner.into(), first_tx));
+        devices.insert("tablet".into(), (owner.into(), second_tx));
+        devices.insert("guest".into(), ("guest@example.com".into(), guest_tx));
+    }
+    // There is deliberately no initialized policy engine or runtime in this fixture.
+    assert!(!dir.path().join("enclos").exists());
+    for _ in 0..2 {
+        hub.close_access(&store, &device, owner, "r1").unwrap();
+        for rx in [&first_rx, &second_rx] {
+            let ToDevice::Approval(closed) = rx.try_recv().unwrap() else {
+                panic!("expected the canonical policy request");
+            };
+            let mut expected = a.clone();
+            expected.state = "closed".into();
+            assert_eq!(closed, expected);
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(guest_rx.try_recv().is_err());
+    }
+    for approve in [true, false] {
+        hub.decide_access(&store, &device, owner, "r1", "rev1", approve)
+            .unwrap();
+        for rx in [&first_rx, &second_rx] {
+            assert!(matches!(rx.try_recv().unwrap(), ToDevice::Approval(a) if a.state == "closed"));
+        }
+    }
+    assert_eq!(store.log_lines(20).unwrap().len(), 1);
+    assert!(store.accepted_access().unwrap().is_empty());
+    assert!(!dir.path().join("enclos").exists());
+}
+
+#[test]
+fn approval_close_waits_for_an_inflight_decision_then_can_close_its_failure() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.add_device(&device).unwrap();
+    let mut a = approval_sample();
+    store.create_approval(&a).unwrap();
+    store.claim_approval("r1").unwrap();
+    assert!(
+        hub.close_access(&store, &device, owner, "r1")
+            .unwrap_err()
+            .contains("already being decided")
+    );
+    assert_eq!(store.approval("r1").unwrap().unwrap().state, "applying");
+    assert!(store.log_lines(20).unwrap().is_empty());
+    a.state = "failed".into();
+    a.reason = Some("Decision failed; review active policy.".into());
+    store.put_approval(&a).unwrap();
+    hub.close_access(&store, &device, owner, "r1").unwrap();
+    a.state = "closed".into();
+    assert_eq!(store.approval("r1").unwrap(), Some(a));
+}
+
+#[test]
+fn approval_closed_requests_are_not_recreated_by_collection_or_agent_retries() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("phone", owner);
+    store.add_device(&device).unwrap();
+    let access = approval_sample().access;
+    hub.request_access(&store, "lab", None, access.clone(), "proxy refusal")
+        .unwrap();
+    let request = store.approvals().unwrap().remove(0).request;
+    hub.close_access(&store, &device, owner, &request).unwrap();
+    for (agent, conversation) in [("lab", None), ("lab/main", Some("c1"))] {
+        hub.request_access(&store, agent, conversation, access.clone(), "same refusal")
+            .unwrap();
+    }
+    let reopened = hub.store().unwrap();
+    reopened.recover_approvals().unwrap();
+    hub.request_access(&reopened, "lab", None, access, "same refusal after restart")
+        .unwrap();
+    let requests = reopened.approvals().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].request, request);
+    assert_eq!(requests[0].state, "closed");
+    assert_eq!(reopened.log_lines(20).unwrap().len(), 1);
 }
 
 #[test]
