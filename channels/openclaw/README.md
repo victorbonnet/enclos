@@ -175,6 +175,11 @@ live exact attempt. Only `applied: true` with the same request id, creation and
 expiration, complete display command, chosen decision and terminal status emits
 `answered` with that control id. Consent does not mean execution succeeded.
 External decisions emit neutral `resolved`, without an action or receipt.
+The exact requesting bridge peer and token are checked again by the native
+commit authorizer and after resolution. Revocation before commit denies the
+decision. If the native decision was already confirmed when receipt authority
+is lost, private evidence is retained and reconciliation shows only its neutral
+terminal state; the successor connection does not receive an answer receipt.
 Timeouts and ambiguous failures expire the app's control lease and retain the
 uncertain receipt; they never retry a native decision. Reconnect reuses current
 bindings. Restart expires old cards; only a fresh native pending callback creates

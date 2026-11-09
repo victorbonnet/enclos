@@ -15,6 +15,7 @@ const bytes = value => Buffer.byteLength(JSON.stringify(value));
 const digest = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const supports = hello => ['runtime_approvals', 'runtime_approval_scopes'].every(c => hello?.capabilities?.includes(c));
 const terminal = state => ['answered', 'resolved', 'expired', 'cancelled'].includes(state);
+const settledState = status => ['expired', 'cancelled'].includes(status) ? status : 'resolved';
 
 function text(value, name) {
   if (typeof value !== 'string' || !value.trim() || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(value)) throw new Error(`invalid native approval ${name}`);
@@ -148,6 +149,9 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
     for (const control of saved.controls) {
       checkedId(control?.id); checkedId(control.question, 'question');
       if (!/^[0-9a-f]{64}$/u.test(control.hash ?? '')) throw new Error('invalid saved native approval receipt');
+      const outcome = control.nativeOutcome;
+      if (outcome != null && (typeof outcome.applied !== 'boolean' || !['allowed', 'denied', 'expired', 'cancelled'].includes(outcome.status) ||
+          (outcome.applied ? !decisions.has(outcome.action) || outcome.status !== (outcome.action === 'deny' ? 'denied' : 'allowed') : outcome.action != null))) throw new Error('invalid saved native approval outcome');
       if (controls.has(control.id)) throw new Error('duplicate saved native approval receipt');
       controls.set(control.id, control);
     }
@@ -199,7 +203,9 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
       authorize(params) {
         if (params.approvalKind !== 'exec' || !params.request || !owner.target(params.request)) return false;
         const attempt = attempts.get(params.request.id);
-        return Boolean(attempt && attempt.record.state === 'pending' && params.senderId === attempt.record.person &&
+        if (!attempt) return false;
+        try { attempt.assertControlCurrent(); } catch { return false; }
+        return Boolean(attempt.record.state === 'pending' && params.senderId === attempt.record.person &&
           fingerprint(params.request) === fingerprint(attempt.native));
       },
       prepare(request, view) {
@@ -257,8 +263,9 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
           } else fallback(record);
         }
       },
-      async handleControl(control) {
+      async handleControl(control, assertControlCurrent = () => {}) {
         if (control.type === 'question.sync') {
+          assertControlCurrent();
           if (!Array.isArray(control.questions) || control.questions.length > 128) throw new ProtocolError('bad_message', 'invalid question reconciliation batch', control.id);
           const ids = control.questions.filter(id => typeof id === 'string' && id.startsWith(PREFIX));
           for (const id of ids) {
@@ -271,6 +278,7 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
           return ids.length > 0;
         }
         if (control.type !== 'question.answer' || typeof control.question !== 'string' || !control.question.startsWith(PREFIX)) return false;
+        assertControlCurrent();
         checkedId(control.id); checkedId(control.question, 'question'); checkedId(control.conversation, 'conversation');
         const hash = digest([control.question, control.conversation, control.answer]);
         const old = controls.get(control.id);
@@ -292,34 +300,44 @@ export function createNativeApprovals(sdk, { now = Date.now, requestTimeoutMs = 
         }
         const receipt = { id: control.id, question: record.id, hash };
         controls.set(control.id, receipt); record.attempted = true; persist();
-        binding.inFlight = control.id; attempts.set(binding.native.id, binding);
+        binding.inFlight = control.id; binding.assertControlCurrent = assertControlCurrent; attempts.set(binding.native.id, binding);
         let timer;
         try {
+          assertControlCurrent();
           const outcome = await Promise.race([
             sdk.resolveApprovalOverGateway({ cfg: context.cfg, approvalKind: 'exec', approvalId: binding.native.id,
               decision: decisions.get(action), channel: 'enclos', accountId: account.accountId, senderId: record.person }),
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('native approval deadline')), requestTimeoutMs); timer.unref?.(); }),
           ]);
-          if (!owner.isCurrent()) throw new Error('native channel stopped while the decision was in flight');
           const canonical = outcome?.approval;
           if (typeof outcome?.applied !== 'boolean' || canonical?.id !== binding.native.id || canonical?.presentation?.kind !== 'exec' ||
               canonical.createdAtMs !== binding.native.createdAtMs || canonical.expiresAtMs !== binding.native.expiresAtMs ||
               canonical.presentation.commandText !== record.definition.approval.command) throw new Error('native approval result does not identify this request');
           if (!['allowed', 'denied', 'expired', 'cancelled'].includes(canonical.status) ||
               (outcome.applied && (canonical.decision !== decisions.get(action) || canonical.status !== (action === 'deny' ? 'denied' : 'allowed')))) throw new Error('native approval decision was not confirmed');
+          // A confirmed native decision remains evidence even when its source
+          // peer is revoked before receipt publication. It never authorizes a
+          // retry or turns a successor connection into the consenting peer.
+          receipt.nativeOutcome = { applied: outcome.applied, status: canonical.status, ...(outcome.applied ? { action } : {}) };
+          persist();
+          assertControlCurrent();
+          if (!owner.isCurrent()) throw new Error('native channel stopped while the decision was in flight');
           if (outcome.applied && canonical.decision === decisions.get(action) && canonical.status === (action === 'deny' ? 'denied' : 'allowed')) {
             receipt.response = update(record, 'answered', { action, of: control.id });
           } else {
-            update(record, canonical.status === 'expired' ? 'expired' : canonical.status === 'cancelled' ? 'cancelled' : 'resolved');
+            update(record, settledState(canonical.status));
             receipt.response = message('error', { of: control.id, code: 'conflict', message: 'The native approval was settled elsewhere; no decision receipt was issued.' });
             transport.write(receipt.response);
           }
           persist(); live.delete(record.id);
         } catch {
-          if (record.state === 'pending') { update(record, binding.deferred ?? 'expired'); live.delete(record.id); }
-          receipt.response = message('error', { of: control.id, code: 'agent_unavailable', message: 'The native decision was not confirmed. Its outcome may be unknown; it will not be retried.' });
-          persist(); transport.write(receipt.response);
-        } finally { clearTimeout(timer); attempts.delete(binding.native.id); binding.inFlight = null; }
+          if (record.state === 'pending') { update(record, receipt.nativeOutcome ? settledState(receipt.nativeOutcome.status) : binding.deferred ?? 'expired'); live.delete(record.id); }
+          receipt.response = message('error', { of: control.id, code: 'agent_unavailable', message: receipt.nativeOutcome
+            ? 'OpenClaw settled this request, but its originating bridge lost receipt authority. Refresh the canonical state; this decision will not be retried.'
+            : 'The native decision was not confirmed. Its outcome may be unknown; it will not be retried.' });
+          persist();
+          try { assertControlCurrent(); transport.write(receipt.response); } catch { /* Only canonical terminal state may reach a successor peer. */ }
+        } finally { clearTimeout(timer); attempts.delete(binding.native.id); binding.inFlight = null; binding.assertControlCurrent = undefined; }
         return true;
       },
       close() {
