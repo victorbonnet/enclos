@@ -60,7 +60,10 @@ runtime's ingress resolver, context builder and dispatcher. An explicit native
 account binding must select the configured agent. A stable digest of person and
 conversation becomes the peer under `per-account-channel-peer`; distinct direct
 conversations and bridge group members never collapse into the native main
-session. The exact ingress result is passed to the native context builder.
+session. Home has its own deterministic account/agent/conversation route even
+before a person first speaks there. Its first authenticated inbound message binds
+the owner without replacing that native session or inventing a human identity
+for earlier output. The exact ingress result is passed to the native context builder.
 Bridge groups remain direct per-member contexts; OpenClaw's broadcast coordinator
 is not enabled for them. Account authority is rechecked after asynchronous
 preparation and before dispatch/delivery.
