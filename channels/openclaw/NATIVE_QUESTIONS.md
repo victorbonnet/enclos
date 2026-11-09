@@ -4,6 +4,7 @@ Tested source: the installed public OpenClaw **2026.11.2** package. This channel
 preserves native question text and trusted Control UI flows. It does not advertise
 the enclos `questions` capability or accept `question.answer`/`question.sync`.
 Unsupported controls remain explicit `unsupported` errors.
+Richer native cards are tracked in [follow-up #225](https://github.com/victorbonnet/enclos/issues/225).
 
 ## Implemented delivery
 
@@ -41,17 +42,22 @@ than the current enclos structured question contract:
 | `registerChannelDelivery` | Notifies native expiry/cancellation/settlement through a display `statusLine` | No typed authoritative answer receipt; a line such as `Answered` cannot establish which phone action was accepted |
 
 The resolver uses `bindAgentToolGatewayRequest({ hostedOnly: true })` with
-`operator.questions` and can fall back to the normal Gateway transport when no
-owned hosted caller is admitted. An enclos Unix socket callback must not obtain
-that authority by inventing a request scope or borrowing broad Gateway
-credentials. The public general `dispatchGatewayMethod` is explicitly scoped to
-authenticated plugin HTTP/RPC handlers. In contrast, the native account lifecycle
-provides an explicit `approval.native` context restricted to `approval.resolve`;
-that approval principal does not authorize question methods.
+`operator.questions`. Native `server-channels` wraps account startup in an owned
+Gateway context resolver with `inheritRequestScope: false`; Unix callbacks
+created in that account lifecycle inherit its hosted resolver. The public
+question helper can therefore legitimately use that owned hosted context without
+forging a request scope. A stale owned resolver fails rather than silently
+selecting another Gateway. Outside an owned hosted context, the helper can fall
+back to the normal Gateway transport, so a future channel integration must retain
+the account's hosted ownership and must not supply `gatewayUrl` or borrow broad
+Gateway credentials. The public general `dispatchGatewayMethod` remains scoped
+to authenticated plugin HTTP/RPC handlers. The separate explicit
+`approval.native` context is restricted to `approval.resolve` and does not itself
+authorize question methods.
 
-A future card implementation therefore needs an established native channel
-question capability, or an explicitly authenticated public handler with exact
-account/person/session authority. It also needs native read/reconciliation,
+A future card implementation must bind the public hosted helper to the exact
+delivered question, account/person/session and current native waiter. The
+remaining contract gaps are native read/reconciliation,
 offered-control negotiation (without invented Other/Skip), and typed terminal
 receipts or a neutral externally-resolved state. Native batches, multiple
 selections, forms and secret requests must retain their native flow until each
