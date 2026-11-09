@@ -23,6 +23,12 @@ if [ "$proxy_port" -lt 41000 ] || [ "$proxy_port" -gt 41999 ]; then
     exit 2
 fi
 export OPENCLAW_GATEWAY_PORT=$((proxy_port + 2000))
+# An enclos owner helper, intercepted here rather than forwarded as a native
+# CLI option. It retains this same private state/port and carries no token.
+if [ "${1:-}" = --enclos-owner-delete ]; then
+    shift
+    exec "$HOME/.local/share/openclaw/tools/node/bin/node" "$HOME/bin/enclos-openclaw-delete.mjs" "$@"
+fi
 if [ "${1:-}" = gateway ] && [ "${2:-}" = run ]; then
     shift 2
     set -- gateway run --bind loopback --port "$OPENCLAW_GATEWAY_PORT" "$@"

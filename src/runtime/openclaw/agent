@@ -8,7 +8,7 @@ case "$operation" in
             --workspace "$HOME/.openclaw/workspaces/$agent" --non-interactive --json
         ;;
     delete)
-        exec "$HOME/bin/openclaw" agents delete "$agent" --force --json
+        exec "$HOME/bin/openclaw" --enclos-owner-delete "$agent"
         ;;
     *) exit 2 ;;
 esac

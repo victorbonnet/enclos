@@ -218,6 +218,11 @@ impl RuntimeAdapter for OpenClaw {
                 executable: true,
             },
             HomeFile {
+                path: "bin/enclos-openclaw-delete.mjs",
+                contents: include_str!("openclaw/delete.mjs"),
+                executable: false,
+            },
+            HomeFile {
                 path: "bin/enclos-openclaw-enable-telegram",
                 contents: include_str!("openclaw/enable-telegram"),
                 executable: true,
@@ -272,18 +277,29 @@ impl RuntimeAdapter for OpenClaw {
         if agents.len() == 1 {
             return Ok(agents.into_iter().next());
         }
-        if value.pointer("/agents/ownership").and_then(Value::as_str) != Some("explicit")
-            && let Some(entries) = value.pointer("/agents/list").and_then(Value::as_array)
-        {
-            let defaults: Vec<_> = entries
-                .iter()
-                .filter(|e| e.get("default").and_then(Value::as_bool) == Some(true))
-                .collect();
+        if value.pointer("/agents/ownership").and_then(Value::as_str) != Some("explicit") {
+            let defaults: Vec<&str> = if let Some(entries) =
+                value.pointer("/agents/entries").and_then(Value::as_object)
+            {
+                entries
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.get("default").and_then(Value::as_bool) == Some(true)
+                    })
+                    .map(|(id, _)| id.as_str())
+                    .collect()
+            } else {
+                value
+                    .pointer("/agents/list")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|entry| entry.get("default").and_then(Value::as_bool) == Some(true))
+                    .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+                    .collect()
+            };
             if defaults.len() == 1 {
-                return Ok(defaults[0]
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(RuntimeAgentName::new));
+                return Ok(RuntimeAgentName::new(defaults[0]));
             }
         }
         Ok(None)
@@ -356,8 +372,36 @@ impl RuntimeAdapter for OpenClaw {
         key: &str,
         value: &str,
     ) -> Option<SandboxCommand> {
-        if value.contains("${") {
+        // Native config set accepts JSON5 at a parent path. Reject nested
+        // credentials and authored refs too: only the typed grant-checked
+        // setter below may introduce a SecretRef.
+        fn unsafe_value(value: &Value) -> bool {
+            match value {
+                Value::Object(map) => {
+                    (map.get("source")
+                        .and_then(Value::as_str)
+                        .is_some_and(|source| matches!(source, "env" | "file" | "exec" | "store"))
+                        && map.get("id").and_then(Value::as_str).is_some())
+                        || map.iter().any(|(key, value)| {
+                            (names_a_secret(key) && !value.is_null() && value.as_str() != Some(""))
+                                || unsafe_value(value)
+                        })
+                }
+                Value::Array(values) => values.iter().any(unsafe_value),
+                _ => false,
+            }
+        }
+        if value.contains("${") || value.len() > MAX_CONFIG as usize {
             return None;
+        }
+        let trimmed = value.trim();
+        // Wrapping also handles leading/trailing JSON5 comments. Native set
+        // falls back to raw text when JSON5 fails; a structured-looking value
+        // that exceeds our observation grammar is refused, never guessed raw.
+        match parse(&format!("{{setting:\n{trimmed}\n}}")) {
+            Ok(parsed) if unsafe_value(&parsed["setting"]) => return None,
+            Err(_) if trimmed.contains(['{', '[']) => return None,
+            _ => {}
         }
         if key == format!("channels.telegram.accounts.{agent}.enabled") && value == "true" {
             return Some(SandboxCommand::from_words(&[
@@ -664,6 +708,14 @@ mod tests {
         );
         save(
             home.path(),
+            "{agents:{entries:{scout:{default:true},writer:{}}}}",
+        );
+        assert_eq!(
+            OpenClaw.default_agent(home.path()).unwrap(),
+            Some(agent("scout"))
+        );
+        save(
+            home.path(),
             "{agents:{list:[{id:'scout',default:true},{id:'writer'}]}}",
         );
         assert_eq!(
@@ -740,6 +792,37 @@ mod tests {
             OpenClaw
                 .import_agent(&"scout".parse().unwrap(), Path::new("/tmp/export.tgz"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parent_json5_settings_cannot_smuggle_literal_credentials_or_unchecked_refs() {
+        let a = agent("scout");
+        for value in [
+            "{auth:{mode:'token',token:'SENSITIVE_EXAMPLE'}}",
+            "/* JSON5 prefix */ {auth:{token:'SENSITIVE_EXAMPLE'}} // suffix",
+            "{accounts:{scout:{botToken:'SENSITIVE_EXAMPLE'}}}",
+            "[{apiKey:'SENSITIVE_EXAMPLE'}]",
+            "{anything:{source:'file',provider:'enclos-sandbox',id:'/UNGRANTED'}}",
+            "{anything:{source:'env',provider:'default',id:'UNGRANTED'}}",
+            "{anything:{source:'env',id:'UNGRANTED'}}",
+            "{$include:'elsewhere.json'}",
+        ] {
+            assert!(OpenClaw.set_setting(&a, "gateway", value).is_none());
+        }
+        assert!(
+            OpenClaw
+                .set_setting(
+                    &a,
+                    "models",
+                    "{provider:{baseUrl:'https://example.test'}, max_tokens:123}"
+                )
+                .is_some()
+        );
+        assert!(
+            OpenClaw
+                .set_setting(&a, "gateway", "{auth:{token:null}}")
+                .is_some()
         );
     }
 
