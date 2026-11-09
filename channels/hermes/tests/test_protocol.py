@@ -23,7 +23,7 @@ def fixture(name: str) -> bytes:
 class FromTheBridge(unittest.TestCase):
     def test_every_fixture_the_bridge_sends_decodes(self):
         names = sorted(n for n in os.listdir(FIXTURES) if n.startswith("from_bridge_"))
-        self.assertEqual(len(names), 5)
+        self.assertEqual(len(names), 6)
         for name in names:
             with self.subTest(name):
                 self.assertEqual(protocol.decode_from_bridge(fixture(name)), json.loads(fixture(name)))

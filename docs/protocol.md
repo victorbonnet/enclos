@@ -196,6 +196,7 @@ A plugin's `hello` and each agent of `agents.list` name what the runtime does, a
 | `titles` | It names conversations (`conversation.title`) and keeps the person's names |
 | `tools` | It reports the tools it runs while it works (`tool`) |
 | `commands` | It lists the commands a person may type to it (`commands`) |
+| `routines` | It manages runtime-owned scheduled work through `routine.request` / `routine.response` |
 
 Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titles` and `tools`, and `commands` when it can read the gateway's: Hermes's own that are not for its terminal only and those its plugins register, as its Telegram and Slack menus list them, without `/sethome` (which the plugin answers), `/start` and `/topic` (Telegram's). A runtime reached through `enclos exec` (Claude Code, Codex) has none, and the bridge sends a `message` of `kind: notify` when its turn ends.
 
@@ -210,7 +211,10 @@ Hermes and OpenClaw are meant to have `typing`; the Hermes plugin also has `titl
 | `version` | `v` is one the receiver does not speak; it then closes |
 | `not_allowed` | The person may not do this (no share, or not that ability) |
 | `unknown_agent`, `unknown_conversation` | No such agent or conversation for this person |
-| `agent_unavailable` | The plugin is not reachable (sandbox stopped, plugin not connected); the message is kept and sent when it is |
+| `agent_unavailable` | The plugin is not reachable, disconnected or timed out; conversation messages are kept for later delivery, but live routine controls are not queued |
+| `conflict` | A definition changed, a request id was reused, or a runtime cannot confirm a mutation; refresh before deciding whether to retry |
+| `unsupported` | The runtime or routine does not support this control |
+| `not_found` | The runtime no longer has the requested routine |
 
 ## Versions
 
@@ -244,6 +248,38 @@ Each policy-test run registers a random, sandbox-scoped, expiring marker in host
 
 Pending proxy notifications whose matching refusal history is entirely verified diagnostic traffic are retired without changing policy. A genuine refusal to the same host keeps the notification eligible. An explicit authenticated agent request retains its identity and is not retired by this test-source filter; if it supplies identity after a proxy-only request, the existing pending row is enriched. A later genuine request after a diagnostic notification was closed gets a different id, preserving both stale-decision protection and denial deduplication. Historical untagged log rows are not guessed to be diagnostics; only individually verified legacy probe events can be backfilled.
 
+
+## Routines
+
+An agent's optional `routines` capability exposes its runtime's scheduler ([ADR 0050](adr/0050-routines-stay-with-the-runtime.md), proposed). These are live controls: the bridge keeps neither definitions nor a second scheduler. They require the transport-identified host's person on a still-paired device, even for a list; a conversation share alone confers no routine-management authority. A runtime without the capability keeps the ordinary conversation channel.
+
+Both legs use `routine.request` and `routine.response`. The device request names `agent` (`<sandbox>/<agent>`); the bridge's authenticated plugin connection already identifies it. A response carries `of`, the original request id, and the same device-side `agent`. An `error` uses the same correlation. The bridge uses a separate plugin request id, binds pending work to the requesting device and plugin connection, and accepts only a matching response of the expected result kind. A routine response is not a conversation message and is never placed in its message outbox.
+
+| `action` | Request fields | Successful `result` |
+| --- | --- | --- |
+| `list` | optional `cursor` | `list`: bounded `routines` summaries, optional `next_cursor`, runtime `options`, bridge-authorized `deliveries`, `deliveries_limited` |
+| `get` | `routine` id | `routine`: one complete definition and summary |
+| `create` | `definition` | `routine`: the saved routine |
+| `update` | `routine`, `revision`, `definition` | `routine`: the saved routine |
+| `set_enabled` | `routine`, `revision`, explicit `enabled` boolean | `routine`: its confirmed state |
+| `run` | `routine`, `revision` | `run`: accepted routine id; acceptance is not completion |
+| `delete` | `routine`, `revision` | `deleted`: removed routine id; this does not promise cancellation of running work |
+
+Fields are flat beside the envelope, for example `{"v":1,"id":"r1","type":"routine.request","agent":"lab/main","action":"list"}` and `{"v":1,"id":"r2","type":"routine.response","agent":"lab/main","of":"r1","result":"list","routines":[],"options":{"timezone":"Europe/Paris","features":[],"skills":[],"models":[],"toolsets":[]},"deliveries":[],"deliveries_limited":false}`.
+
+`schedule` is typed: `{kind:"cron",expression:"0 9 * * *"}`, `{kind:"interval",minutes:60}` or `{kind:"once",at:"2026-12-01T09:00:00+01:00"}`. Daily, Weekly and Monthly are editor presets for five-field cron. The adapter validates native syntax and computes actual run times. `options.timezone` describes the runtime's effective timezone; it is not an editable per-routine timezone. `features` names supported controls: `skills`, `model`, `provider`, `toolsets`, `script`, `script_only`, `working_directory` and `run`; unknown names are ignored. Skill/toolset choices have `id` and `label`. Model choices additionally have optional `provider`: selecting one changes the model/provider pair together, even if two providers use the same model id. Saved values absent from a catalog remain unchanged.
+
+A `definition` has optional `name`, `prompt`, `schedule`, optional `delivery` conversation id, `skills`, optional `model`/`provider`, optional `toolsets`, optional `script`, `script_only`, and optional `working_directory`. Missing/null toolsets means runtime defaults; `[]` deliberately selects none. Missing delivery means save output without sending it. Scripts name relative files under the agent's scripts directory, including resolved symlink containment; script-only requires a script. A working directory is an existing absolute directory and conveys no additional sandbox access. Definitions are bounded (including an 8 KiB prompt); oversized existing native definitions produce an explicit error rather than a truncated editable prompt. Native fields outside this interface survive updates.
+
+Summaries contain opaque `id` and editable-definition `revision`, name, schedule, enabled state, bounded prompt preview, `delivery_label`, `editable`, and optional observed `state`, `paused_reason`, `last_error`, `next_run_at`, `last_run_at` and `last_status`. A disabled routine may be completed rather than paused. A revision covers the definition, not scheduler progress; the adapter compares it under the runtime's lock before changing an existing routine. Native jobs whose targets or settings cannot safely be edited may be shown read-only. This includes external channel destinations rather than making the app rewrite them into an app conversation. A full definition is loaded only on request; lists paginate at most 25 summaries rather than sending every prompt in one Noise frame. Plugin results are bounded to 44 KiB before bridge enrichment; device results stay within 60 KiB.
+
+The bridge supplies delivery choices, never trusting a plugin-supplied catalog: only the host person's direct/Home conversations with this exact agent, including archived ones. Groups, another agent's conversations, and another person's conversations are refused. To bound a response it offers Home plus at most 50 recently created conversations and sets `deliveries_limited` when more exist; a full definition preserves its authorized saved target even when that target falls outside the picker. Its internal plugin request carries the allowed conversation ids so the adapter can also check an existing target before a mutation. That list is not accepted from a device. The bridge does not execute scripts, change policy or run a host shell command.
+
+Requests are not queued when the agent is unavailable, and mutations are not automatically replayed after timeout or disconnect. A lost reply after dispatch can leave the outcome unknown; refresh before retrying. The Hermes adapter deduplicates creation using trusted request identity stored with the native job, without writing the jobs file itself. A scheduler-registration failure after a job was saved reports that outcome and does not invite another create. Bounded live replay handling protects repeated requests; it does not promise exactly-once execution across every crash.
+
+Hermes keeps a versioned, bounded receipt beside its channel socket for each app-created routine (request fingerprint and native id only), retaining that receipt after deletion so retrying an old create cannot recreate it. The native job's origin marker recovers a create interrupted before its receipt was written. `run` claims a native manual attempt before returning acceptance, then dispatches the exact claimed snapshot asynchronously; a paused routine must be resumed first. Native manual execution may advance the next interval occurrence; the app shows the scheduler's resulting next-run time.
+
+Hermes revision comparison and mutation share its native reentrant jobs lock. Its normal cross-process file lock can fall back to in-process locking after a native timeout or locking failure; protection against concurrent native CLI changes inherits that documented limitation ([source evidence](research/hermes-routines.md)). The plugin does not replace its scheduler's locking implementation.
 
 ## Shared agent photos
 

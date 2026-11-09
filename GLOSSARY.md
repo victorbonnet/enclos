@@ -143,6 +143,10 @@ _Avoid_: artifact, app (for a generated page)
 A command a person types to an agent's runtime in a conversation, `/` and its name, such as `/new` or `/model`. It is the runtime's: the bridge lists an agent's commands for the app, and passes them on as messages, without running them.
 _Avoid_: command alone (enclos's own), shortcut, action
 
+**Routine**:
+A task an agent's runtime keeps and runs on a schedule, with instructions and an optional place to deliver its result.
+_Avoid_: automation, scheduled session, cron job (except when naming a runtime's own feature)
+
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
