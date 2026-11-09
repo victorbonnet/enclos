@@ -174,15 +174,15 @@ export function createChannel() {
         if (account.agentId !== params.agentId) return null;
         const active = running.get(account.accountId);
         if (!active) return null;
-        const to = target(params.target, account);
-        const saved = active.transport.state.routes[to];
-        // Unsolicited Home can be delivered without creating shared context.
-        // Other outbound sessions need their known person/conversation route.
+        const to = target(params.target, { ...account, home: active.transport.home });
+        const saved = active.transport.state.routes[to] ?? (to === active.transport.home ? active.transport.homeRoute() : undefined);
+        // First-use Home owns a dedicated native session without asserting a
+        // human identity. Other destinations need their known ownership route.
         if (!saved) return null;
         const sessionKey = active.channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: saved.peer }, dmScope: 'per-account-channel-peer' });
         return { sessionKey, baseSessionKey: sessionKey, recipientSessionExact: true,
-          peer: { kind: 'direct', id: to }, chatType: 'direct', from: saved.person, to };
+          peer: { kind: 'direct', id: to }, chatType: 'direct', from: saved.person ?? `enclos:${account.accountId}`, to };
       },
     },
     conversationBindings: { supportsCurrentConversationBinding: false },
