@@ -8,14 +8,16 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeKind {
     Hermes,
+    OpenClaw,
 }
 
 impl RuntimeKind {
-    pub const ALL: [RuntimeKind; 1] = [RuntimeKind::Hermes];
+    pub const ALL: [RuntimeKind; 2] = [RuntimeKind::Hermes, RuntimeKind::OpenClaw];
 
     pub fn as_str(self) -> &'static str {
         match self {
             RuntimeKind::Hermes => "hermes",
+            RuntimeKind::OpenClaw => "openclaw",
         }
     }
 
@@ -23,6 +25,7 @@ impl RuntimeKind {
     pub fn display_name(self) -> &'static str {
         match self {
             RuntimeKind::Hermes => "Hermes",
+            RuntimeKind::OpenClaw => "OpenClaw",
         }
     }
 }
@@ -63,10 +66,11 @@ mod tests {
     #[test]
     fn kinds_parse() {
         assert_eq!("hermes".parse::<RuntimeKind>(), Ok(RuntimeKind::Hermes));
+        assert_eq!("openclaw".parse::<RuntimeKind>(), Ok(RuntimeKind::OpenClaw));
         let err = "claude".parse::<RuntimeKind>().unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown runtime `claude`: this enclos knows hermes"
+            "unknown runtime `claude`: this enclos knows hermes, openclaw"
         );
     }
 }

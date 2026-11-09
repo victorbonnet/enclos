@@ -190,18 +190,18 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
-    fn channel_token_file(
+    fn channel_token_files(
         &self,
         channel: Channel,
         agent: &RuntimeAgentName,
-    ) -> Option<(HomePath, &'static str)> {
+    ) -> Vec<(HomePath, &'static str)> {
         // Hermes's setup writes a profile's bot token to its `.env`
         // (`save_env_value` in `hermes_cli/setup_platforms.py`).
         let file = match agent.as_str() == DEFAULT_PROFILE.as_str() {
             true => ".hermes/.env".to_owned(),
             false => format!(".hermes/profiles/{agent}/.env"),
         };
-        Some((at(&file), channel.token_variable()))
+        vec![(at(&file), channel.token_variable())]
     }
 
     fn agent_secrets_source(
@@ -213,10 +213,13 @@ impl RuntimeAdapter for Hermes {
         // sandbox's secrets file reaches them all alike; a profile's own
         // `secrets.command` gives what it prints to that profile alone
         // (`agent/secret_sources/command.py`, Hermes 0.22.5), read here from
-        // the file `enclos launch` writes its grants to (ADR 0036). Run by
-        // Hermes through `/bin/sh -c`; the path is enclos's, quoted whole
-        // (the engine refuses one holding a quote or a line break).
-        let read = format!("cat '{}'", secrets_file.display());
+        // the file `enclos launch` writes its grants to (ADR 0036). Hermes
+        // runs it through `/bin/sh -c`, so this adapter quotes the path.
+        let path = secrets_file.to_str()?;
+        if path.contains(['\n', '\r']) {
+            return None;
+        }
+        let read = format!("cat '{}'", path.replace('\'', "'\\''"));
         let set = |key: &str, value: &str| self.set_setting(agent, key, value);
         Some(vec![
             set("secrets.command.command", &read)?,
@@ -266,6 +269,7 @@ impl RuntimeAdapter for Hermes {
 
     fn channel_settings(
         &self,
+        _agent: &RuntimeAgentName,
         channel: Channel,
         token: &str,
         answers: &[ChannelUser],
@@ -495,6 +499,7 @@ impl RuntimeAdapter for Hermes {
         // (`after_create_agent`), and a line outside it says nothing. YAML
         // may fold the command over two lines, both inside the block.
         let secrets_file = secrets_file.to_string_lossy();
+        let quoted_file = secrets_file.replace('\'', "'\\''");
         let (mut reads, mut on) = (false, false);
         let (mut in_secrets, mut block) = (false, None);
         for line in text.lines() {
@@ -511,7 +516,7 @@ impl RuntimeAdapter for Hermes {
             }
             match block {
                 Some(at) if indent > at => {
-                    reads |= content.contains(&*secrets_file);
+                    reads |= content.contains(&*secrets_file) || content.contains(&quoted_file);
                     on |= content == "enabled: true";
                 }
                 _ => block = (in_secrets && content == "command:").then_some(indent),
@@ -648,6 +653,25 @@ impl RuntimeAdapter for Hermes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_protected_source_path_with_a_quote_is_passed_literally_to_the_shell() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("one'quote.env");
+        std::fs::write(&file, "harmless fixture").unwrap();
+        let commands = Hermes
+            .agent_secrets_source(&RuntimeAgentName::new("main").unwrap(), &file)
+            .unwrap();
+        let words = commands[0].clone().into_words();
+        let read = words.last().unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(read)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"harmless fixture");
+    }
     use crate::policy::file::{FsLayer, PolicyFile};
 
     #[test]
@@ -764,7 +788,12 @@ mod tests {
         );
         assert_eq!(
             Hermes
-                .channel_settings(Channel::Telegram, "TELEGRAM_BOT_TOKEN_MAIN", &users)
+                .channel_settings(
+                    &RuntimeAgentName::new("main").unwrap(),
+                    Channel::Telegram,
+                    "TELEGRAM_BOT_TOKEN_MAIN",
+                    &users
+                )
                 .unwrap(),
             [
                 ("TELEGRAM_ALLOWED_USERS".to_owned(), "111,222".to_owned()),
@@ -779,17 +808,11 @@ mod tests {
         // another agent's in its own folder's.
         let default = RuntimeAgentName::new("default").unwrap();
         assert_eq!(
-            Hermes
-                .channel_token_file(Channel::Telegram, &default)
-                .unwrap()
-                .0,
+            Hermes.channel_token_files(Channel::Telegram, &default)[0].0,
             at(".hermes/.env")
         );
         assert_eq!(
-            Hermes
-                .channel_token_file(Channel::Telegram, &agent)
-                .unwrap()
-                .0,
+            Hermes.channel_token_files(Channel::Telegram, &agent)[0].0,
             at(".hermes/profiles/main/.env")
         );
     }

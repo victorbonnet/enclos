@@ -32,6 +32,7 @@ enclos-protocol = { version = "0.1.0", path = "crates/enclos-protocol" }
 icu_properties = "2.3.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 jiff = { version = "0.2.38", features = ["serde"] }
+json5 = "1.3.7"
 psl = "2.1.242"
 qrcode = { version = "0.14.1", default-features = false }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
