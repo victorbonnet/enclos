@@ -144,6 +144,43 @@ impl Hub {
         question: &QuestionDefinition,
         id: &MessageId,
     ) -> Result<(), QuestionStoreError> {
+        if question.approval.is_some()
+            && !self
+                .plugins
+                .lock()
+                .expect("not poisoned")
+                .get(agent)
+                .is_some_and(|(_, capabilities)| {
+                    capabilities.contains(&Capability::RuntimeApprovals)
+                })
+        {
+            return Err(QuestionStoreError::Invalid(
+                "The runtime does not support native command approvals.".into(),
+            ));
+        }
+        question.validate().map_err(QuestionStoreError::Invalid)?;
+        // Refuse before persistence if a future fallback renderer exceeds the device frame.
+        let introduction = ToDevice::Message(ConversationMessage {
+            conversation: conversation.clone(),
+            agent: agent.into(),
+            from: "agent".into(),
+            text: question.fallback_text(),
+            kind: if question.approval.is_some() {
+                "runtime_approval"
+            } else {
+                "question"
+            }
+            .into(),
+            time: i64::MAX,
+            seq: i64::MAX,
+            attachments: vec![],
+            question: Some(question.id.clone()),
+        });
+        if !bounded(&introduction) {
+            return Err(QuestionStoreError::Invalid(
+                "The readable question history exceeds the device frame limit.".into(),
+            ));
+        }
         let requests = self.questions.lock().expect("not poisoned");
         if !requests
             .connections
@@ -298,7 +335,11 @@ impl Hub {
         store
             .question(id)
             .map_err(|_| ())?
-            .filter(|question| question.owner == person)
+            .filter(|question| {
+                question.owner == person
+                    && (question.info.definition.approval.is_none()
+                        || self.host.as_deref() == Some(person))
+            })
             .ok_or(())
     }
 
@@ -385,7 +426,12 @@ impl Hub {
                 "The agent is disconnected. Reconnect and review this question before answering.",
             ));
         };
-        if !capabilities.contains(&Capability::Questions) {
+        let capability = if current.info.definition.approval.is_some() {
+            Capability::RuntimeApprovals
+        } else {
+            Capability::Questions
+        };
+        if !capabilities.contains(&capability) {
             return Err(failure(
                 original,
                 ErrorCode::Unsupported,

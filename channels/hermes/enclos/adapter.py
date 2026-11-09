@@ -12,6 +12,7 @@ this channel's own variable, which `enclos runtime configure` turns on.
 """
 
 import asyncio
+import contextvars
 import logging
 import mimetypes
 import os
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "enclos"
 HELLO_TIMEOUT_SECONDS = 10
+_APPROVAL_SEND = contextvars.ContextVar("enclos_runtime_approval_send", default=False)
 
 # The connected adapters and their event loops, for the tool hooks, which
 # Hermes calls from the agent's worker threads.
@@ -129,6 +131,7 @@ class EnclosAdapter(BasePlatformAdapter):
         logger.info("[%s] Bridge connected", self.name)
         self._adopt_home(hello.get("home"))
         self._questions.bridge_supports = "questions" in hello.get("capabilities", [])
+        self._questions.bridge_runtime_supports = "runtime_approvals" in hello.get("capabilities", [])
         try:
             listed = _hermes_commands()
             capabilities = ["commands"] if listed else []
@@ -136,11 +139,13 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("routines")
             if self._questions.available:
                 capabilities.append("questions")
+            if self._questions.approvals_available:
+                capabilities.append("runtime_approvals")
             await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
             for message in self._questions.prepare_replay():
-                if message["type"].startswith("question.") and not self._questions.available:
+                if not self._questions.can_deliver(message):
                     continue
                 await self._write(message)
             await self._questions.fallback_cards()
@@ -274,6 +279,20 @@ class EnclosAdapter(BasePlatformAdapter):
     async def retire_clarify_card(self, clarify_id, notice):
         await self._questions.retire(clarify_id)
 
+    async def _send_exec_approval_prompt(self, prompt):
+        saved, question_id = await self._questions.ask_approval(prompt)
+        return SendResult(success=saved, message_id=question_id,
+                          error=None if saved else "The runtime approval could not be saved.")
+
+    async def send_exec_approval(self, *args, **kwargs):
+        # Keep the native visibility/Deny-only flow and old call signatures. Its
+        # ordinary full-command pre-send must stay literal and frame-bounded too.
+        token = _APPROVAL_SEND.set(True)
+        try:
+            return await super().send_exec_approval(*args, **kwargs)
+        finally:
+            _APPROVAL_SEND.reset(token)
+
     # Files the agent sends. Hermes finds them in a reply (MEDIA:/path tags,
     # bare absolute paths) and calls the method for their kind; each is copied
     # at once into the channel's media folder, beside the socket, where the
@@ -362,14 +381,19 @@ class EnclosAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
+        literal_approval = _APPROVAL_SEND.get() or bool((metadata or {}).get("is_approval_prompt"))
+        if literal_approval and len(protocol.encode_line(protocol.message_out(chat_id, content, reply_to))) > questions.MAX_APPROVAL_FRAME_BYTES:
+            # Refuse before persistence. Base's visibility gate then keeps Deny
+            # alone; our fallback sends complete, independently fenced parts.
+            return SendResult(success=False, error="The approval text exceeds one safe message frame.")
         # A local markdown image (`![x](cache/generated/images/y.png)`), which
         # Hermes does not take for a file: sent as one, out of the text.
-        rest, images = protocol.local_images(content)
+        rest, images = (content, []) if literal_approval else protocol.local_images(content)
         files = [(found, None) for found in (self._local_image(p) for _, p in images) if found]
         if files:
             return await self._send_files(chat_id, files, rest, reply_to)
         # Hermes about itself (gateway online, shutting down): a quiet line.
-        notice = protocol.is_notice(content)
+        notice = False if literal_approval else protocol.is_notice(content)
         message = protocol.message_out(chat_id, content, reply_to, kind="status" if notice else None)
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")

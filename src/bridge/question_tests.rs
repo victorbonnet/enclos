@@ -120,6 +120,7 @@ fn native(hub: &Arc<Hub>, capabilities: Vec<Capability>) -> Native {
         };
         assert_eq!(token, "secret");
         assert!(bridge_caps.contains(&Capability::Questions));
+        assert!(bridge_caps.contains(&Capability::RuntimeApprovals));
         stream
             .write_all(&encode_line(&Envelope::new(
                 MessageId::new("hello").unwrap(),
@@ -146,6 +147,7 @@ fn definition(id: &str) -> QuestionDefinition {
         text: "Que choisir ?".into(),
         choices: vec!["Résultats 🤖".into(), "Classement".into()],
         multiple: true,
+        approval: None,
     }
 }
 
@@ -165,7 +167,7 @@ fn ask(native: &mut Native, rx: &Receiver<ToDevice>, definition: &QuestionDefini
         matches!(next(rx), ToDevice::Question { question } if question.definition == *definition && question.state == QuestionState::Pending)
     );
     assert!(
-        matches!(next(rx), ToDevice::Message(message) if message.question.as_ref() == Some(&definition.id) && message.kind == "question")
+        matches!(next(rx), ToDevice::Message(message) if message.question.as_ref() == Some(&definition.id) && message.kind == if definition.approval.is_some() { "runtime_approval" } else { "question" })
     );
 }
 
@@ -758,4 +760,511 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
     }
     socket.close(None).unwrap();
     assert_eq!(thread.join().unwrap(), Err("closed".into()));
+}
+
+fn approval_definition(id: &str, smart_denied: bool) -> QuestionDefinition {
+    use enclos_protocol::question::{RuntimeApprovalAction as Action, RuntimeApprovalDefinition};
+    QuestionDefinition {
+        id: QuestionId::new(id).unwrap(),
+        text: "Allow this command?".into(),
+        choices: vec![],
+        multiple: false,
+        approval: Some(RuntimeApprovalDefinition {
+            command: "npm install --ignore-scripts".into(),
+            reason: "Install the project's dependencies.".into(),
+            actions: if smart_denied {
+                vec![Action::Once, Action::Deny]
+            } else {
+                vec![Action::Once, Action::Session, Action::Always, Action::Deny]
+            },
+            smart_denied,
+        }),
+    }
+}
+
+fn approval(action: enclos_protocol::question::RuntimeApprovalAction) -> QuestionAnswer {
+    QuestionAnswer::Approval { action }
+}
+
+#[test]
+fn runtime_approval_uses_its_own_capability_exact_receipt_and_scope_history() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("command-1", false);
+    ask(&mut native, &rx, &definition);
+    let history = store.since(OWNER, 0).unwrap();
+    assert_eq!(history[0].kind, "runtime_approval");
+    assert!(history[0].text.contains("npm install --ignore-scripts"));
+    assert!(
+        history[0]
+            .text
+            .contains("Install the project's dependencies.")
+    );
+    for command in ["/approve", "/approve session", "/approve always", "/deny"] {
+        assert!(history[0].text.contains(command));
+    }
+    let original = MessageId::new("allow-session").unwrap();
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        original.clone(),
+        definition.id.clone(),
+        0,
+        approval(Action::Session),
+    )
+    .unwrap();
+    let request = native.receive();
+    assert_eq!(
+        request.body,
+        FromBridge::QuestionAnswer {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition.id.clone(),
+            answer: approval(Action::Session)
+        }
+    );
+    assert!(rx.try_recv().is_err());
+    native.send(
+        "watcher",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Session)),
+            of: None,
+        },
+    );
+    native.ack("watcher");
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.answer == Some(approval(Action::Session)))
+    );
+    assert!(
+        matches!(next(&rx), ToDevice::Message(message) if message.kind == "status" && message.text.contains("runtime session") && !message.text.contains("executed"))
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "native metadata alone is never a receipt"
+    );
+    native.send(
+        "receipt",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Session)),
+            of: Some(request.id),
+        },
+    );
+    native.ack("receipt");
+    next(&rx);
+    next(&rx);
+    assert!(
+        matches!(next(&rx), ToDevice::QuestionResult { of, question } if of == original && question.answer == Some(approval(Action::Session)) && question.revision == 1)
+    );
+    assert_eq!(store.since(OWNER, 0).unwrap().len(), 2);
+}
+
+#[test]
+fn runtime_approval_decisions_require_known_host_person_and_current_conversation_owner() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, _rx) = fixture();
+    let mut native = native(
+        &hub,
+        vec![Capability::Questions, Capability::RuntimeApprovals],
+    );
+    let owned = approval_definition("owned-approval", false);
+    let foreign = approval_definition("guest-approval", false);
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &owned,
+            "owned-intro",
+        )
+        .unwrap();
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("foreign").unwrap(),
+            &foreign,
+            "foreign-intro",
+        )
+        .unwrap();
+    let (guest, _guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
+    for (caller, person, question) in [
+        (&guest, "guest@example.com", &foreign.id),
+        (&guest, "guest@example.com", &owned.id),
+        (&device, OWNER, &foreign.id),
+    ] {
+        let error = hub
+            .question_answer(
+                &store,
+                caller,
+                person,
+                MessageId::new("unauthorized").unwrap(),
+                question.clone(),
+                0,
+                approval(Action::Deny),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert_eq!(error.message, "No such question.");
+    }
+    let ordinary = definition("guest-question");
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("foreign").unwrap(),
+            &ordinary,
+            "ordinary-intro",
+        )
+        .unwrap();
+    hub.question_answer(
+        &store,
+        &guest,
+        "guest@example.com",
+        MessageId::new("guest-answer").unwrap(),
+        ordinary.id.clone(),
+        0,
+        QuestionAnswer::Skip,
+    )
+    .unwrap();
+    assert!(
+        matches!(native.receive().body, FromBridge::QuestionAnswer { question, answer: QuestionAnswer::Skip, .. } if question == ordinary.id)
+    );
+    for host in [None, Some("another-person@example.com".to_owned())] {
+        let (_dir, mut hub, store, device, _rx) = fixture();
+        Arc::get_mut(&mut hub).unwrap().host = host;
+        let definition = approval_definition("unknown-host", false);
+        store
+            .ask_question(
+                AGENT,
+                &ConversationId::new("owned").unwrap(),
+                &definition,
+                "approval-intro",
+            )
+            .unwrap();
+        assert_eq!(
+            hub.question_answer(
+                &store,
+                &device,
+                OWNER,
+                MessageId::new("decision").unwrap(),
+                definition.id,
+                0,
+                approval(Action::Once)
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::NotFound
+        );
+    }
+}
+
+#[test]
+fn runtime_approval_rejects_unoffered_or_generic_answers_before_native_dispatch() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("once-only", true);
+    ask(&mut native, &rx, &definition);
+    for (index, answer) in [
+        approval(Action::Session),
+        approval(Action::Always),
+        QuestionAnswer::Skip,
+        QuestionAnswer::Choices { indices: vec![0] },
+        QuestionAnswer::Text {
+            text: "/approve always".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = hub
+            .question_answer(
+                &store,
+                &device,
+                OWNER,
+                MessageId::new(format!("bad-{index}")).unwrap(),
+                definition.id.clone(),
+                0,
+                answer,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadMessage);
+    }
+    assert!(hub.questions.lock().unwrap().pending.is_empty());
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        MessageId::new("deny").unwrap(),
+        definition.id.clone(),
+        0,
+        approval(Action::Deny),
+    )
+    .unwrap();
+    let request = native.receive();
+    assert!(matches!(
+        request.body,
+        FromBridge::QuestionAnswer {
+            answer: QuestionAnswer::Approval {
+                action: Action::Deny
+            },
+            ..
+        }
+    ));
+    store.remove_device(&device.id).unwrap();
+    native.send(
+        "denied",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Deny)),
+            of: Some(request.id),
+        },
+    );
+    native.ack("denied");
+    assert!(
+        rx.try_recv().is_err(),
+        "a revoked phone receives neither command metadata nor a receipt"
+    );
+    assert_eq!(
+        store.question(&definition.id).unwrap().unwrap().info.answer,
+        Some(approval(Action::Deny))
+    );
+}
+
+#[test]
+fn questions_capability_does_not_authorize_runtime_approval_controls_or_introductions() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::Questions]);
+    let definition = approval_definition("not-supported", false);
+    native.send(
+        "unsupported-intro",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition.clone(),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::Error(error) if error.code == ErrorCode::BadMessage)
+    );
+    native.ack("unsupported-intro");
+    assert!(store.question(&definition.id).unwrap().is_none());
+    assert!(rx.try_recv().is_err());
+    store
+        .ask_question(
+            AGENT,
+            &ConversationId::new("owned").unwrap(),
+            &definition,
+            "saved-intro",
+        )
+        .unwrap();
+    let error = hub
+        .question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("unsupported-answer").unwrap(),
+            definition.id,
+            0,
+            approval(Action::Once),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unsupported);
+    let ordinary = super::tests::definition("ordinary");
+    ask(&mut native, &rx, &ordinary);
+    assert_eq!(
+        hub.question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("wrong-kind").unwrap(),
+            ordinary.id,
+            0,
+            approval(Action::Once)
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::BadMessage
+    );
+}
+
+#[test]
+fn runtime_approval_native_race_stale_origin_and_resolved_external_state_never_invent_success() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("race", false);
+    ask(&mut native, &rx, &definition);
+    let (second, second_rx) = phone(&hub, &store, "second-phone", OWNER);
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        MessageId::new("allow").unwrap(),
+        definition.id.clone(),
+        0,
+        approval(Action::Once),
+    )
+    .unwrap();
+    let first = native.receive();
+    hub.question_answer(
+        &store,
+        &second,
+        OWNER,
+        MessageId::new("deny").unwrap(),
+        definition.id.clone(),
+        0,
+        approval(Action::Deny),
+    )
+    .unwrap();
+    let second_request = native.receive();
+    let epoch = hub.questions.lock().unwrap().connections[AGENT].clone();
+    assert!(
+        hub.question_update(
+            &store,
+            "lab/helper",
+            &epoch,
+            &definition.id,
+            QuestionState::Answered,
+            Some(approval(Action::Always)),
+            Some(&first.id),
+            &MessageId::new("wrong-origin").unwrap()
+        )
+        .is_err()
+    );
+    native.send(
+        "deny-wins",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Deny)),
+            of: Some(second_request.id),
+        },
+    );
+    native.ack("deny-wins");
+    next(&rx);
+    next(&rx);
+    assert!(matches!(next(&rx), ToDevice::Error(error) if error.code == ErrorCode::Conflict));
+    next(&second_rx);
+    next(&second_rx);
+    assert!(
+        matches!(next(&second_rx), ToDevice::QuestionResult { question, .. } if question.answer == Some(approval(Action::Deny)))
+    );
+    native.send(
+        "late-allow",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Answered,
+            answer: Some(approval(Action::Once)),
+            of: Some(first.id),
+        },
+    );
+    native.ack("late-allow");
+    assert_eq!(
+        store.question(&definition.id).unwrap().unwrap().info.answer,
+        Some(approval(Action::Deny))
+    );
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = super::tests::native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("resolved-elsewhere", false);
+    ask(&mut native, &rx, &definition);
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        MessageId::new("allow").unwrap(),
+        definition.id.clone(),
+        0,
+        approval(Action::Always),
+    )
+    .unwrap();
+    let _request = native.receive();
+    native.send(
+        "external",
+        FromPlugin::QuestionUpdate {
+            question: definition.id.clone(),
+            state: QuestionState::Resolved,
+            answer: None,
+            of: None,
+        },
+    );
+    native.ack("external");
+    assert!(
+        matches!(next(&rx), ToDevice::Question { question } if question.state == QuestionState::Resolved && question.answer.is_none())
+    );
+    assert!(
+        matches!(next(&rx), ToDevice::Message(message) if message.text == "Runtime approval resolved in the runtime.")
+    );
+    assert!(matches!(next(&rx), ToDevice::Error(error) if error.code == ErrorCode::Conflict));
+    assert_eq!(store.since(OWNER, 0).unwrap().len(), 2);
+}
+
+#[test]
+fn deny_only_runtime_gate_cannot_be_upgraded_to_allow_once() {
+    use enclos_protocol::question::RuntimeApprovalAction as Action;
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let mut definition = approval_definition("deny-only", true);
+    definition.approval.as_mut().unwrap().actions = vec![Action::Deny];
+    ask(&mut native, &rx, &definition);
+    let error = hub
+        .question_answer(
+            &store,
+            &device,
+            OWNER,
+            MessageId::new("allow-once").unwrap(),
+            definition.id.clone(),
+            0,
+            approval(Action::Once),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::BadMessage);
+    hub.question_answer(
+        &store,
+        &device,
+        OWNER,
+        MessageId::new("deny").unwrap(),
+        definition.id,
+        0,
+        approval(Action::Deny),
+    )
+    .unwrap();
+    assert!(matches!(
+        native.receive().body,
+        FromBridge::QuestionAnswer {
+            answer: QuestionAnswer::Approval {
+                action: Action::Deny
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn newline_heavy_command_is_preserved_in_bounded_native_and_legacy_history_frames() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let mut definition = approval_definition("multiline-command", false);
+    let command = format!("{}echo complete", "\n".repeat(11_000));
+    definition.approval.as_mut().unwrap().command = command.clone();
+    definition.validate().unwrap();
+    ask(&mut native, &rx, &definition);
+    native.send(
+        "replay",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("owned").unwrap(),
+            question: definition.clone(),
+        },
+    );
+    native.ack("replay");
+    for message in [next(&rx), next(&rx)] {
+        assert!(bounded(&message));
+    }
+    let history = store.since(OWNER, 0).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].kind, "runtime_approval");
+    assert!(history[0].text.contains(&command));
 }

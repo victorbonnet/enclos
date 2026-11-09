@@ -253,6 +253,7 @@ pub enum Capability {
     Commands,
     Routines,
     Questions,
+    RuntimeApprovals,
     #[serde(other)]
     Unknown,
 }

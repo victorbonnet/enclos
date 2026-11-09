@@ -456,7 +456,8 @@ impl Hub {
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
         self.question_connected(agent, &routine_connection);
-        if hello.capabilities.contains(&Capability::Questions)
+        if (hello.capabilities.contains(&Capability::Questions)
+            || hello.capabilities.contains(&Capability::RuntimeApprovals))
             && let Ok(store) = self.store()
         {
             self.sync_questions(&store, agent, &mut writer)?;

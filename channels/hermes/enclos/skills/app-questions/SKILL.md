@@ -33,3 +33,5 @@ clarify({"questions":[{"question":"What name should the report use?"}]})
 Offer at most four choices. Keep detail in the question and labels short so the whole card fits. Other and Skip are app controls; Hermes supplies them. On an older app or runtime, the same tool can show a numbered text question, and the person replies in the composer.
 
 Use policy request tools for sandbox access; answering a question does not change policy. Request a concrete scope through `enclos_request_access` and wait for the person's decision in the policy inbox.
+
+Hermes creates and waits for its own command approval cards. Let the person answer that native approval; a `clarify` answer supplies no command authorization. Session and always choices are Hermes pattern grants, while Enclos sandbox policy stays unchanged.

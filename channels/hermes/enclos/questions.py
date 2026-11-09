@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import protocol
+from . import protocol, runtime_approvals
 
 MAX_DEFINITION_BYTES = 24 * 1024
 MAX_ANSWER_BYTES = 8 * 1024
 MAX_CHOICES = 12
 MAX_NATIVE_CHOICES = 4
 TEXT_CHUNK_BYTES = 24 * 1024
+MAX_APPROVAL_FRAME_BYTES = 24 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +42,22 @@ def validate_definition(value):
         _text(label, "choice")
     if not isinstance(value.get("multiple", False), bool):
         raise ValueError("multiple must be a boolean")
+    approval = value.get("approval")
+    if approval is not None:
+        if choices or value.get("multiple", False) or not isinstance(approval, dict):
+            raise ValueError("runtime approvals have no question choices")
+        _text(approval.get("command"), "approval.command")
+        _text(approval.get("reason"), "approval.reason")
+        actions = approval.get("actions")
+        if (not isinstance(actions, list) or not actions or any(a not in runtime_approvals.ACTIONS for a in actions)
+                or actions != [a for a in runtime_approvals.ACTIONS if a in actions] or "deny" not in actions
+                or (actions != ["deny"] and "once" not in actions)
+                or ("always" in actions and "session" not in actions)):
+            raise ValueError("runtime approval actions must preserve the native order and scopes")
+        if not isinstance(approval.get("smart_denied", False), bool):
+            raise ValueError("smart_denied must be a boolean")
+        if approval.get("smart_denied", False) and actions not in (["deny"], ["once", "deny"]):
+            raise ValueError("smart deny only offers a one-operation override")
     if _size(value) > MAX_DEFINITION_BYTES:
         raise ValueError("question exceeds 24 KiB")
     return value
@@ -50,6 +67,14 @@ def validate_answer(value, definition=None):
     if not isinstance(value, dict) or _size(value) > MAX_ANSWER_BYTES:
         raise ValueError("answer must be an object of at most 8 KiB")
     kind = value.get("kind")
+    approval = definition.get("approval") if definition else None
+    if kind == "approval":
+        if (set(value) != {"kind", "action"} or value.get("action") not in runtime_approvals.ACTIONS
+                or (definition is not None and (approval is None or value["action"] not in approval["actions"]))):
+            raise ValueError("select an offered native approval action")
+        return value
+    if approval is not None:
+        raise ValueError("runtime approval requires an explicit native approval action")
     if kind == "skip" and set(value) == {"kind"}:
         return value
     if kind == "text" and set(value) == {"kind", "text"}:
@@ -120,10 +145,13 @@ class Card:
 
 
 class Manager:
-    def __init__(self, adapter, native=_native):
+    def __init__(self, adapter, native=_native, approvals_native=runtime_approvals.native_api):
         self.adapter = adapter
         self.native = native
         self.bridge_supports = False
+        self.bridge_runtime_supports = False
+        self.approvals_native = approvals_native
+        self.approval_ids: set[str] = set()
         self.cards: dict[str, Card] = {}
         self.tasks: set[asyncio.Task] = set()
         self.orphan_retries: set[str] = set()
@@ -131,6 +159,21 @@ class Manager:
     @property
     def available(self):
         return self.bridge_supports and self.native() is not None
+
+    @property
+    def approvals_available(self):
+        return self.bridge_runtime_supports and self.approvals_native() is not None
+
+    def can_deliver(self, message):
+        if not message["type"].startswith("question."):
+            return True
+        if message["type"] == "question.ask":
+            return self.bridge_runtime_supports if message["question"].get("approval") else self.bridge_supports
+        approval = (message.get("question") in self.approval_ids or message.get("state") == "resolved"
+                    or (message.get("answer") or {}).get("kind") == "approval")
+        if approval:
+            return self.bridge_runtime_supports
+        return self.bridge_supports or self.bridge_runtime_supports
 
     def _queue(self, message):
         try:
@@ -142,7 +185,7 @@ class Manager:
     async def _emit(self, message):
         if not self._queue(message):
             return False
-        if self.bridge_supports:
+        if self.can_deliver(message):
             await self.adapter._write(message)
         return True
 
@@ -150,6 +193,42 @@ class Manager:
         task = asyncio.create_task(coroutine)
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+
+    async def approval_text_fallback(self, prompt):
+        def fits(text):
+            return len(protocol.encode_line(protocol.message_out(prompt.chat_id, text))) <= MAX_APPROVAL_FRAME_BYTES
+        for chunk in runtime_approvals.fallback_chunks(
+                prompt, fits, getattr(self.adapter, "typed_command_prefix", "/")):
+            result = await self.adapter.send(prompt.chat_id, chunk,
+                metadata={**(prompt.metadata or {}), "is_approval_prompt": True})
+            if not result.success:
+                return False
+        return True
+
+    async def ask_approval(self, prompt):
+        if not self.approvals_available or not getattr(prompt, "request_id", None):
+            return await self.approval_text_fallback(prompt), None
+        native = self.approvals_native()
+        matching = [row for row in native.list_gateway_approvals(prompt.session_key)
+                    if row.get("request_id") == prompt.request_id]
+        if len(matching) != 1:
+            return True, None  # Already withdrawn; never bind to another pending request.
+        definition = runtime_approvals.definition(prompt, protocol.new_id())
+        try:
+            validate_definition(definition)
+        except ValueError:
+            return await self.approval_text_fallback(prompt), None
+        binding = runtime_approvals.Binding(native, prompt, prompt.request_id, prompt.session_key, matching[0])
+        if not binding.observe(asyncio.get_running_loop()):
+            return True, None
+        card = Card(definition, prompt.chat_id, prompt.request_id, prompt.session_key, binding, native)
+        self.cards[definition["id"]] = card
+        self.approval_ids.add(definition["id"])
+        if not await self._emit(protocol._message("question.ask", conversation=prompt.chat_id, question=definition)):
+            self.cards.pop(definition["id"], None)
+            return False, None
+        self._track(self._watch(card))
+        return True, definition["id"]
 
     async def ask(self, chat_id, question, choices, clarify_id, session_key, metadata=None):
         native = self.native()
@@ -205,12 +284,16 @@ class Manager:
         return True
 
     def _live(self, card):
+        if card.definition.get("approval"):
+            return card.entry.pending()
         return (card.native.get_pending(card.native_id) is card.entry
                 and card.entry.session_key == card.session_key and not card.entry.event.is_set()
                 and list(card.entry.choices or []) == card.definition["choices"]
                 and bool(card.entry.multi_select) == card.definition["multiple"])
 
     def _observed(self, card):
+        if card.definition.get("approval"):
+            return card.entry.observed()
         raw = card.entry.response
         if raw == card.native.SKIPPED:
             return "skipped", None
@@ -249,20 +332,21 @@ class Manager:
         update = protocol._message("question.update", **fields)
         card.update = update
         card.queued = self._queue(update)
-        if card.queued and self.bridge_supports:
+        if card.queued and self.can_deliver(update):
             await self.adapter._write(update)
         return card.queued
 
     async def _watch(self, card):
         while card.state == "pending":
-            if not self._live(card):
-                await self._settle(card, *self._observed(card))
+            observed = self._observed(card) if card.definition.get("approval") or not self._live(card) else None
+            if observed is not None:
+                await self._settle(card, *observed)
                 break
             await asyncio.sleep(0.1)
         while not card.queued:
             await asyncio.sleep(0.25)
             card.queued = self._queue(card.update)
-            if card.queued and self.bridge_supports:
+            if card.queued and self.can_deliver(card.update):
                 await self.adapter._write(card.update)
 
     async def answer(self, message):
@@ -274,6 +358,9 @@ class Manager:
             answer = validate_answer(message["answer"], card.definition)
         except ValueError as error:
             await self.adapter._write(protocol.error("bad_message", str(error), message["id"]))
+            return
+        if card.definition.get("approval"):
+            await self._answer_approval(card, answer, message["id"])
             return
         if card.state != "pending":
             await self._settle(card, card.state, card.answer, of=message["id"])
@@ -294,6 +381,20 @@ class Manager:
         else:
             await self._settle(card, *self._observed(card), of=message["id"])
 
+    async def _answer_approval(self, card, answer, request_id):
+        if card.state == "answered":
+            await self._settle(card, card.state, card.answer, of=request_id)
+            return
+        if card.state == "pending" and self._live(card) and card.entry.resolve(answer["action"]):
+            # No await separates the exact resolver from durable correlated settlement.
+            await self._settle(card, "answered", answer, of=request_id)
+            return
+        observed = self._observed(card)
+        if card.state == "pending" and observed is not None:
+            await self._settle(card, *observed)
+        await self.adapter._write(protocol.error("agent_unavailable",
+            "The runtime approval was already resolved or is no longer available.", request_id))
+
     async def sync(self, ids):
         for question_id in ids:
             card = self.cards.get(question_id)
@@ -304,7 +405,9 @@ class Manager:
             elif self._live(card):
                 await self._emit(protocol._message("question.update", question=question_id, state="pending"))
             else:
-                await self._settle(card, *self._observed(card))
+                observed = self._observed(card)
+                if observed is not None:
+                    await self._settle(card, *observed)
 
     def prepare_replay(self):
         pending = self.adapter._outbox.pending()
@@ -314,6 +417,8 @@ class Manager:
         for message in pending:
             if message["type"] == "question.ask":
                 question_id = message["question"]["id"]
+                if message["question"].get("approval"):
+                    self.approval_ids.add(question_id)
                 if question_id not in self.cards and question_id not in settled:
                     update = protocol._message("question.update", question=question_id, state="expired")
                     if not self._queue(update) and question_id not in self.orphan_retries:
@@ -327,16 +432,19 @@ class Manager:
             while True:
                 await asyncio.sleep(0.25)
                 if self._queue(update):
-                    if self.bridge_supports:
+                    if self.can_deliver(update):
                         await self.adapter._write(update)
                     return
         finally:
             self.orphan_retries.discard(update["question"])
 
     async def fallback_cards(self):
-        if not self.available:
-            for card in self.cards.values():
-                if card.state == "pending" and self._live(card):
+        for card in self.cards.values():
+            if card.state == "pending" and self._live(card):
+                if card.definition.get("approval"):
+                    if not self.approvals_available:
+                        await self.approval_text_fallback(card.entry.prompt)
+                elif not self.available:
                     await self.text_fallback(card.conversation, card.entry.question, card.entry.choices,
                                              card.native_id)
 
@@ -349,13 +457,14 @@ class Manager:
 
     async def retire(self, native_id):
         for card in self.cards.values():
-            if card.native_id == native_id and card.state == "pending":
+            if card.native_id == native_id and card.state == "pending" and not card.definition.get("approval"):
                 await self._settle(card, *self._observed(card))
 
     async def close(self):
         for card in self.cards.values():
             if card.state == "pending":
-                await self._settle(card, *(self._observed(card) if not self._live(card) else ("cancelled", None)))
+                observed = self._observed(card) if not self._live(card) else None
+                await self._settle(card, *(observed or ("cancelled", None)))
         for task in self.tasks:
             task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)

@@ -1,0 +1,332 @@
+"""Runtime approvals: typed transport and optional pinned native-source/Event harness."""
+
+import asyncio
+import importlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import types
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from enclos import protocol, questions, runtime_approvals
+from enclos.outbox import Outbox
+
+
+def prompt(command="echo test", actions=("once", "session", "always", "deny"), **fields):
+    return types.SimpleNamespace(chat_id="c", session_key="session", request_id="request-1",
+        text="A command needs approval; no answer means it will not run.", command=command,
+        description="Native test reason", smart_denied=False, metadata=None,
+        actions=[(a.title(), a, "") for a in actions], **fields)
+
+
+class RuntimeApprovalProtocol(unittest.TestCase):
+    def test_approval_definitions_and_answers_are_separate_from_questions(self):
+        definition = runtime_approvals.definition(prompt(), "q")
+        self.assertEqual(questions.validate_definition(definition), definition)
+        answer = {"kind": "approval", "action": "once"}
+        self.assertEqual(questions.validate_answer(answer, definition), answer)
+        self.assertEqual(protocol.decode_from_bridge(protocol.encode_line(protocol._message(
+            "question.answer", question="q", conversation="c", answer=answer)))["answer"], answer)
+        for other in ({"kind": "skip"}, {"kind": "text", "text": "/approve"},
+                      {"kind": "choices", "indices": [0]}):
+            with self.assertRaises(ValueError):
+                questions.validate_answer(other, definition)
+        with self.assertRaises(ValueError):
+            questions.validate_answer(answer, {"id": "q", "text": "Q?", "choices": [], "multiple": False})
+
+    def test_action_order_flags_and_deny_only_are_preserved(self):
+        for actions in (("deny",), ("once", "deny"), ("once", "session", "deny"), runtime_approvals.ACTIONS):
+            definition = runtime_approvals.definition(prompt(actions=actions), "q")
+            questions.validate_definition(definition)
+            self.assertEqual(definition["approval"]["actions"], list(actions))
+        for actions in (("once",), ("once", "always", "deny"), ("deny", "once"), ("once", "once", "deny"), ("wat", "deny")):
+            with self.subTest(actions=actions), self.assertRaises(ValueError):
+                questions.validate_definition(runtime_approvals.definition(prompt(actions=actions), "q"))
+        definition = runtime_approvals.definition(prompt(actions=("deny",)), "q")
+        with self.assertRaises(ValueError):
+            questions.validate_answer({"kind": "approval", "action": "once"}, definition)
+        definition["approval"]["smart_denied"] = True
+        questions.validate_definition(definition)
+        definition["approval"]["actions"] = list(runtime_approvals.ACTIONS)
+        with self.assertRaises(ValueError):
+            questions.validate_definition(definition)
+
+    def test_controls_and_mixed_choice_metadata_are_rejected(self):
+        definition = runtime_approvals.definition(prompt(), "q")
+        definition["approval"]["command"] = "a\r\nb\tc"
+        questions.validate_definition(definition)
+        for changes in ({"choices": ["allow"]}, {"multiple": True},
+                        {"approval": {**definition["approval"], "command": "\0once"}},
+                        {"approval": {**definition["approval"], "reason": " "}}):
+            with self.assertRaises(ValueError):
+                questions.validate_definition({**definition, **changes})
+        for answer in ({"kind": "approval", "action": "\0once"},
+                       {"kind": "approval", "action": "all"},
+                       {"kind": "approval", "action": "deny", "indices": [0]}):
+            with self.assertRaises(ValueError):
+                questions.validate_answer(answer, definition)
+
+
+class RuntimeApprovalFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_old_bridge_or_api_keeps_full_typed_native_fallback(self):
+        adapter = types.SimpleNamespace(send=AsyncMock(return_value=types.SimpleNamespace(success=True)))
+        native = Mock(return_value=None)
+        manager = questions.Manager(adapter, approvals_native=native)
+        self.assertFalse(manager.approvals_available)
+        self.assertEqual(await manager.ask_approval(prompt()), (True, None))
+        native.assert_not_called()
+        manager.bridge_runtime_supports = True
+        self.assertFalse(manager.approvals_available)
+        self.assertEqual(await manager.ask_approval(prompt()), (True, None))
+        text = "\n".join(call.args[1] for call in adapter.send.await_args_list)
+        for command in ("/approve", "/approve session", "/approve always", "/deny", "echo test"):
+            self.assertIn(command, text)
+        self.assertFalse(manager.cards)
+        self.assertTrue(all(call.kwargs["metadata"]["is_approval_prompt"] for call in adapter.send.await_args_list))
+
+
+@unittest.skipUnless(os.environ.get("ENCLOS_HERMES_LEGACY_SOURCE"), "optional old Hermes source")
+class NativeLegacyFallback(unittest.TestCase):
+    def test_old_native_signature_and_missing_exact_apis_use_typed_fallback(self):
+        script = """
+import asyncio, os, sys
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
+sys.path[:0] = [sys.argv[1], sys.argv[2], sys.argv[3]]
+os.environ['HERMES_HOME'] = sys.argv[4]
+os.environ['HERMES_RUNTIME_DIR'] = sys.argv[4] + '/run'
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
+from enclos.adapter import EnclosAdapter
+from enclos import questions, runtime_approvals
+from enclos.outbox import Outbox
+assert runtime_approvals.native_api() is None
+async def check():
+    adapter = EnclosAdapter.__new__(EnclosAdapter)
+    BasePlatformAdapter.__init__(adapter, PlatformConfig(enabled=True), Platform.LOCAL)
+    adapter._outbox = Outbox(sys.argv[4] + '/outbox')
+    adapter._write = AsyncMock(return_value=True)
+    adapter._check_title_soon = Mock()
+    adapter._questions = questions.Manager(adapter)
+    adapter._questions.bridge_runtime_supports = True
+    result = await adapter.send_exec_approval(chat_id='c', command='echo not-executed', session_key='old')
+    assert result.success
+    messages = adapter._outbox.pending()
+    assert all(m['type'] == 'message.out' for m in messages)
+    text = '\\n'.join(m['text'] for m in messages)
+    assert all(c in text for c in ['/approve', '/approve session', '/approve always', '/deny', 'echo not-executed'])
+    assert not adapter._questions.cards
+asyncio.run(check())
+"""
+        with tempfile.TemporaryDirectory() as home:
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+                str(Path(__file__).resolve().parents[1]), os.environ["ENCLOS_HERMES_LEGACY_SOURCE"],
+                os.environ.get("ENCLOS_HERMES_TEST_DEPS", ""), home], capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+@unittest.skipUnless(os.environ.get("ENCLOS_HERMES_APPROVAL_SOURCE"), "optional pinned Hermes approval source")
+class NativeHermesRuntimeApprovals(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        (self.home / "config.yaml").write_text("approvals:\n  timeout: 5\n")
+        self.env = patch.dict(os.environ, {"HERMES_HOME": str(self.home), "HERMES_RUNTIME_DIR": str(self.home / "run")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        for folder in (os.environ["ENCLOS_HERMES_APPROVAL_SOURCE"], os.environ.get("ENCLOS_HERMES_TEST_DEPS")):
+            if folder:
+                sys.path.insert(0, folder)
+                self.addCleanup(sys.path.remove, folder)
+        self.native = importlib.import_module("tools.approval")
+        self.wait = importlib.import_module("tools.approval_gateway_wait")
+        base = importlib.import_module("gateway.platforms.base")
+        config = importlib.import_module("gateway.config")
+        sys.modules.pop("enclos.adapter", None)
+        self.adapter_module = importlib.import_module("enclos.adapter")
+        self.addCleanup(sys.modules.pop, "enclos.adapter", None)
+        self.adapter = self.adapter_module.EnclosAdapter.__new__(self.adapter_module.EnclosAdapter)
+        base.BasePlatformAdapter.__init__(self.adapter, config.PlatformConfig(enabled=True), config.Platform.LOCAL)
+        self.adapter._outbox = Outbox(str(self.home / "outbox"))
+        self.adapter._write = AsyncMock(return_value=True)
+        self.adapter._check_title_soon = Mock()
+        self.adapter._local_image = Mock(side_effect=AssertionError("approval text must remain literal"))
+        self.manager = questions.Manager(self.adapter)
+        self.manager.bridge_supports = self.manager.bridge_runtime_supports = True
+        self.adapter._questions = self.manager
+        self.assertIs(runtime_approvals.native_api(), self.native)
+        self.scope = f"native-test-{uuid.uuid4()}"
+        self.workers = []
+        self.addAsyncCleanup(self.cleanup_native)
+        self.addAsyncCleanup(self.manager.close)
+
+    async def cleanup_native(self):
+        for row in self.native.list_gateway_approvals(self.scope):
+            self.native.withdraw_gateway_approval(self.scope, row["request_id"], "test ended")
+        for worker, result in self.workers:
+            await asyncio.to_thread(worker.join, 3)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn("error", result, result.get("error"))
+
+    async def start(self, command="echo not-executed", **flags):
+        loop = asyncio.get_running_loop()
+        published, result = threading.Event(), {}
+        def notify(data):
+            result["request"] = data
+            result["core_reasons"] = []
+            self.native.register_gateway_settle(self.scope, data["request_id"], result["core_reasons"].append)
+            try:
+                result["send"] = asyncio.run_coroutine_threadsafe(self.adapter.send_exec_approval(
+                    chat_id="c", command=data["command"], description=data["description"],
+                    session_key=self.scope, request_id=data["request_id"], **flags), loop).result(5)
+            finally:
+                published.set()
+        def waiting_agent():
+            try:
+                result["decision"] = self.wait._await_gateway_decision(self.scope, notify,
+                    {"command": command, "description": "Native test reason", "pattern_key": command,
+                     "pattern_keys": [command], **flags})
+            except BaseException as error:
+                result["error"] = error
+                published.set()
+        worker = threading.Thread(target=waiting_agent)
+        self.workers.append((worker, result))
+        worker.start()
+        self.assertTrue(await asyncio.to_thread(published.wait, 6))
+        self.assertNotIn("error", result, result.get("error"))
+        self.assertTrue(result["send"].success)
+        card = next((c for c in self.manager.cards.values() if c.native_id == result["request"]["request_id"]), None)
+        return card, result, worker
+
+    def answer(self, card, action):
+        return protocol._message("question.answer", question=card.definition["id"], conversation="c",
+                                 answer={"kind": "approval", "action": action})
+
+    def updates(self):
+        return [m for m in self.adapter._outbox.pending() if m["type"] == "question.update"]
+
+    async def test_own_exact_decision_unblocks_native_wait_with_correlated_receipt(self):
+        card, result, worker = await self.start()
+        request = self.answer(card, "session")
+        await self.manager.answer(request)
+        await asyncio.to_thread(worker.join, 2)
+        self.assertEqual(result["decision"]["choice"], "session")
+        self.assertEqual(result["core_reasons"], ["resolved"])
+        self.assertEqual(self.updates()[-1]["of"], request["id"])
+        self.assertEqual(self.updates()[-1]["answer"], {"kind": "approval", "action": "session"})
+        await asyncio.sleep(0.15)
+        self.assertEqual(card.state, "answered")
+
+    async def test_stale_request_does_not_resolve_the_next_native_request(self):
+        old, first, worker = await self.start("first-never-executed")
+        self.native.withdraw_gateway_approval(self.scope, old.native_id, "withdrawn")
+        await asyncio.to_thread(worker.join, 2)
+        new, second, second_worker = await self.start("second-never-executed")
+        await self.manager.answer(self.answer(old, "once"))
+        self.assertTrue(second_worker.is_alive())
+        self.assertEqual([p["request_id"] for p in self.native.list_gateway_approvals(self.scope)], [new.native_id])
+        self.assertEqual(self.native.resolve_gateway_approval_card(self.scope, "once", old.native_id), 0)
+        await self.manager.answer(self.answer(new, "deny"))
+        await asyncio.to_thread(second_worker.join, 2)
+        self.assertEqual(second["decision"]["choice"], "deny")
+
+    async def test_external_decision_preserves_core_hook_and_has_no_invented_action(self):
+        card, result, worker = await self.start()
+        self.assertEqual(self.native.resolve_gateway_approval(self.scope, "always", request_id=card.native_id), 1)
+        await asyncio.to_thread(worker.join, 2)
+        await asyncio.sleep(0.15)
+        self.assertEqual(result["core_reasons"], ["resolved"])
+        self.assertEqual(card.state, "resolved")
+        self.assertNotIn("answer", self.updates()[-1])
+        request = self.answer(card, "always")
+        await self.manager.answer(request)
+        self.assertEqual(self.adapter._write.call_args.args[0]["type"], "error")
+        self.assertEqual(self.adapter._write.call_args.args[0]["of"], request["id"])
+        self.assertNotIn("of", self.updates()[-1])
+
+    async def test_external_answer_during_publication_still_closes_the_published_exact_card(self):
+        async def delivered(message):
+            if message["type"] == "question.ask":
+                card = self.manager.cards[message["question"]["id"]]
+                self.assertEqual(self.native.resolve_gateway_approval(self.scope, "once", request_id=card.native_id), 1)
+            return True
+        self.adapter._write.side_effect = delivered
+        card, result, worker = await self.start()
+        await asyncio.to_thread(worker.join, 2)
+        await asyncio.sleep(0.15)
+        self.assertEqual(result["decision"]["choice"], "once")
+        self.assertEqual(card.state, "resolved")
+        self.assertEqual([m["type"] for m in self.adapter._outbox.pending()], ["question.ask", "question.update"])
+        self.assertNotIn("answer", self.updates()[-1])
+
+    async def test_smart_deny_and_native_visibility_deny_only_remain_restricted(self):
+        card, result, worker = await self.start(smart_denied=True, allow_session=False, allow_permanent=False)
+        self.assertEqual(card.definition["approval"]["actions"], ["once", "deny"])
+        await self.manager.answer(self.answer(card, "always"))
+        self.assertTrue(worker.is_alive())
+        await self.manager.answer(self.answer(card, "deny"))
+        await asyncio.to_thread(worker.join, 2)
+        card, result, worker = await self.start("x" * 4000 + "```")
+        self.assertEqual(card.definition["approval"]["actions"], ["deny"])
+        self.assertEqual(self.native.resolve_gateway_approval_card(self.scope, "once", card.native_id), 0)
+        await self.manager.answer(self.answer(card, "once"))
+        self.assertTrue(worker.is_alive())
+        await self.manager.answer(self.answer(card, "deny"))
+
+    async def test_timeout_and_withdrawal_close_cards_without_authorizing(self):
+        (self.home / "config.yaml").write_text("approvals:\n  timeout: 0\n")
+        card, result, worker = await self.start()
+        await asyncio.to_thread(worker.join, 2)
+        await asyncio.sleep(0.15)
+        self.assertFalse(result["decision"]["resolved"])
+        self.assertEqual(card.state, "expired")
+
+    async def test_oversized_literal_fallback_bounds_every_frame_and_keeps_all_command_bytes(self):
+        command = 'echo "![x](/test-only/image.png)"\n' + ('"\\`~' * 22000)
+        card, result, worker = await self.start(command)
+        self.assertIsNone(card)
+        messages = self.adapter._outbox.pending()
+        self.assertTrue(messages)
+        self.assertTrue(all(len(protocol.encode_line(m)) <= questions.MAX_APPROVAL_FRAME_BYTES for m in messages))
+        self.assertTrue(all(m["type"] == "message.out" and not m.get("attachments") for m in messages))
+        parts = []
+        for message in messages:
+            text = message["text"]
+            if text.startswith("Complete command:\n"):
+                block = text.removeprefix("Complete command:\n")
+                fence, rest = block.split("\n", 1)
+                self.assertTrue(fence.startswith("```") or fence.startswith("~~~"))
+                self.assertTrue(rest.endswith("\n" + fence))
+                parts.append(rest[:-(len(fence) + 1)])
+        self.assertEqual("".join(parts), command)
+        self.assertEqual(messages[-1]["text"], "Reply with /deny.")
+        self.assertEqual(self.native.resolve_gateway_approval_card(self.scope, "once", result["request"]["request_id"]), 0)
+        self.native.resolve_gateway_approval_card(self.scope, "deny", result["request"]["request_id"])
+
+    async def test_approval_send_preserves_markdown_image_and_notice_looking_command_literals(self):
+        command = 'echo "![x](/test-only/image.png)"'
+        self.manager.bridge_runtime_supports = False
+        card, result, worker = await self.start(command)
+        self.assertIsNone(card)
+        self.assertTrue(any(command in m["text"] for m in self.adapter._outbox.pending()))
+        self.assertTrue(all(m["kind"] == "notify" and not m.get("attachments") for m in self.adapter._outbox.pending()))
+        self.native.resolve_gateway_approval(self.scope, "deny", request_id=result["request"]["request_id"])
+        with patch.object(protocol, "is_notice", side_effect=AssertionError("approval text must not be classified")):
+            result = await self.adapter.send("c", "♻️ Gateway online is literal text", metadata={"is_approval_prompt": True})
+            self.assertTrue(result.success)
+        before = len(self.adapter._outbox.pending())
+        result = await self.adapter.send("c", "x" * 80000, metadata={"is_approval_prompt": True, "_interim_send": True})
+        self.assertFalse(result.success)
+        self.assertEqual(len(self.adapter._outbox.pending()), before)
+
+
+if __name__ == "__main__":
+    unittest.main()
