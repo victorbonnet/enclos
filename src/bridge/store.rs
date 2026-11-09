@@ -583,15 +583,19 @@ impl Store {
         rows.collect()
     }
 
-    /// Archives or restores an owner's conversation. `None` means unknown or
-    /// owned by someone else; `Some` says whether the flag changed. Content,
-    /// routing, read positions and running work are untouched.
+    /// Archives or restores an owner's conversation. `None` means unknown,
+    /// owned by someone else, or an attempt to archive Home; `Some` says
+    /// whether the flag changed. A legacy archived Home may be restored.
+    /// Content, routing, read positions and running work are untouched.
     pub fn set_archived(
         &self,
         id: &str,
         owner: &str,
         archived: bool,
     ) -> rusqlite::Result<Option<bool>> {
+        if archived && is_home(id) {
+            return Ok(None);
+        }
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -1418,7 +1422,72 @@ mod tests {
     }
 
     #[test]
-    fn archived_groups_and_home_keep_their_routing_and_running_work() {
+    fn home_archive_is_refused_but_a_legacy_archive_can_be_restored() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "owner@example.com";
+        let home = home_id("lab/main");
+        store.ensure_home("lab/main", owner).unwrap();
+        store.name(&home, "Agent notices", BY_PERSON).unwrap();
+        store
+            .add("notice", &home, &From::Agent, "scheduled result", "notify")
+            .unwrap();
+        let before = store.conversation_info(&home).unwrap().unwrap();
+        let route = store.conversation_of(&home).unwrap();
+        assert_eq!(store.set_archived(&home, owner, true).unwrap(), None);
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap(), before);
+        assert_eq!(
+            store.set_archived(&home, owner, false).unwrap(),
+            Some(false)
+        );
+
+        // An older bridge could archive Home. Its owner can still restore it.
+        store
+            .db
+            .execute(
+                "UPDATE conversations SET archived = 1 WHERE id = ?1",
+                [&home],
+            )
+            .unwrap();
+        assert_eq!(
+            store.set_archived(&home, "another person", false).unwrap(),
+            None
+        );
+        assert_eq!(store.set_archived(&home, owner, true).unwrap(), None);
+        assert!(store.conversation_info(&home).unwrap().unwrap().archived);
+        assert_eq!(store.set_archived(&home, owner, false).unwrap(), Some(true));
+        let restored = store.conversation_info(&home).unwrap().unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.revision, before.revision + 1);
+        assert_eq!(restored.title, before.title);
+        assert_eq!(store.conversation_of(&home).unwrap(), route);
+        assert_eq!(
+            store.messages_after(&home, 0).unwrap()[0].text,
+            "scheduled result"
+        );
+        assert_eq!(
+            Store::open(&path)
+                .unwrap()
+                .conversation_info(&home)
+                .unwrap()
+                .unwrap(),
+            restored
+        );
+
+        // A regular conversation called Home is still an ordinary conversation.
+        store
+            .conversation("c-home-title", "lab", "main", owner)
+            .unwrap();
+        store.name("c-home-title", "Home", BY_PERSON).unwrap();
+        assert_eq!(
+            store.set_archived("c-home-title", owner, true).unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn archived_groups_keep_their_routing_and_running_work() {
         let folder = tempfile::tempdir().unwrap();
         let store = Store::open(&folder.path().join("app.db")).unwrap();
         let owner = "victor@example.com";
@@ -1456,31 +1525,8 @@ mod tests {
             )
             .unwrap();
         assert!(store.conversation_info("g-1").unwrap().unwrap().archived);
-        store.ensure_home("lab/main", owner).unwrap();
-        let home = home_id("lab/main");
-        assert_eq!(store.set_archived(&home, owner, true).unwrap(), Some(true));
-        store.ensure_home("lab/main", owner).unwrap();
-        store
-            .add(
-                "home-notify",
-                &home,
-                &From::Agent,
-                "scheduled result",
-                "notify",
-            )
-            .unwrap();
-        let info = store.conversation_info(&home).unwrap().unwrap();
-        assert!(info.archived);
-        assert_eq!(info.title.as_deref(), Some("Home"));
-        assert_eq!(store.owner(&home).unwrap().as_deref(), Some(owner));
-        assert_eq!(
-            store.messages_after(&home, 0).unwrap()[0].text,
-            "scheduled result"
-        );
-        for id in ["g-1", home.as_str()] {
-            assert_eq!(store.set_archived(id, owner, false).unwrap(), Some(true));
-            assert!(!store.conversation_info(id).unwrap().unwrap().archived);
-        }
+        assert_eq!(store.set_archived("g-1", owner, false).unwrap(), Some(true));
+        assert!(!store.conversation_info("g-1").unwrap().unwrap().archived);
     }
 
     #[test]
