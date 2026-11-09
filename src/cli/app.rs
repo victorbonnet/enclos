@@ -13,6 +13,7 @@ use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
 use enclos::bridge::keys::bridge_keypair;
 use enclos::bridge::plugin::{PluginError, connect};
+use enclos::bridge::provisioning::Host;
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
 use enclos::bridge::store::{From, Store};
@@ -55,6 +56,11 @@ enum AppVerb {
         /// `tailscale`, through `tailscale serve`, is the only one for now.
         #[arg(long, default_value = "tailscale")]
         transport: Transport,
+        /// The host user's transport login, for sandbox creation and runtime
+        /// installation. Read from `tailscale status` when left out. When
+        /// neither supplies it, the bridge serves conversations only.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Pair a device: prints a QR code for the enclos app to scan, then
     /// asks you to confirm the device that used it.
@@ -88,7 +94,11 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             target,
             conversation,
         } => chat(engine, by, target, conversation),
-        AppVerb::Serve { port, transport } => serve(engine, port, transport),
+        AppVerb::Serve {
+            port,
+            transport,
+            owner,
+        } => serve(engine, by, port, transport, owner),
         AppVerb::Pair { url, transport } => pair(engine, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
         AppVerb::Unpair { device } => unpair(engine, &device),
@@ -105,7 +115,13 @@ fn open_store(engine: &Engine) -> Result<Store> {
         .map_err(|e| failed(format!("cannot open the bridge's database: {e}")))
 }
 
-fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
+fn serve(
+    engine: &Engine,
+    by: &Actor,
+    port: u16,
+    transport: Transport,
+    owner: Option<String>,
+) -> Result<u8> {
     let key = bridge_keypair(&engine.app_key_path())
         .map_err(|e| failed(format!("cannot read or make the bridge's key: {e}")))?;
     let mut agents = Vec::new();
@@ -128,6 +144,17 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
     for agent in &agents {
         eprintln!("  {}", agent.name);
     }
+    let owner = owner.or_else(|| transport.host_person());
+    if owner.is_none() {
+        eprintln!(
+            "The host user's transport login could not be read. Sandbox creation and runtime installation are unavailable; set --owner <login> to enable them."
+        );
+    }
+    let executable = std::env::current_exe().map_err(|e| {
+        failed(format!(
+            "cannot locate enclos for runtime installation: {e}"
+        ))
+    })?;
     server::serve(
         transport,
         port,
@@ -135,6 +162,7 @@ fn serve(engine: &Engine, port: u16, transport: Transport) -> Result<u8> {
         engine.app_layout(),
         key.private,
         agents,
+        Host::new(engine.app_layout(), by.clone(), executable, owner),
     )
     .map_err(|e| failed(format!("the bridge cannot listen on 127.0.0.1:{port}: {e}")))?;
     Ok(exit::OK)

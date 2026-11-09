@@ -24,7 +24,7 @@ impl Hub {
             return Err("This device is no longer paired.".into());
         }
         if !self
-            .agents
+            .agent_endpoints()?
             .iter()
             .any(|a| a.name.split('/').next() == Some(sandbox))
         {

@@ -189,8 +189,8 @@ impl Hub {
     pub(super) fn collect_refusals(&self, store: &Store) -> Result<(), String> {
         self.dismiss_probe_requests(store)?;
         let engine = Engine::open(self.layout.clone());
-        let sandboxes: std::collections::HashSet<_> = self
-            .agents
+        let endpoints = self.agent_endpoints()?;
+        let sandboxes: std::collections::HashSet<_> = endpoints
             .iter()
             .filter_map(|a| a.name.split_once('/').map(|(s, _)| s))
             .collect();

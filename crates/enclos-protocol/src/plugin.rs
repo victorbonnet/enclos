@@ -281,6 +281,8 @@ pub enum ErrorCode {
     Conflict,
     Unsupported,
     NotFound,
+    Busy,
+    OperationFailed,
     #[serde(other)]
     Unknown,
 }

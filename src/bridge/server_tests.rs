@@ -293,6 +293,8 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
         store_path: dir.path().join("app.db"),
         layout: crate::layout::Layout::at(dir.path().join("enclos")),
         bridge_private: vec![],
+        provisioning: None,
+        provisioning_busy: Mutex::new(Default::default()),
         agents: vec![],
         host: Some("owner@example.com".into()),
         plugins: Mutex::new(HashMap::new()),
@@ -380,6 +382,8 @@ fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
         store_path: dir.path().join("app.db"),
         layout: crate::layout::Layout::at(dir.path().join("enclos")),
         bridge_private: vec![],
+        provisioning: None,
+        provisioning_busy: Mutex::new(Default::default()),
         agents: vec![],
         host: Some("owner@example.com".into()),
         plugins: Mutex::new(HashMap::new()),
@@ -1564,4 +1568,89 @@ fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devic
         hub.get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
             .is_err()
     );
+}
+
+#[test]
+fn an_unpaired_device_cannot_use_provisioning_on_its_existing_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("bridge.db")).unwrap();
+    let device = Device {
+        id: "device".into(),
+        name: "phone".into(),
+        person: "owner@example.org".into(),
+        noise_key: vec![1; 32],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: 0,
+        seen: None,
+    };
+    store.add_device(&device).unwrap();
+    assert!(still_paired(&store, &device, "owner@example.org").unwrap());
+    assert!(!still_paired(&store, &device, "other@example.org").unwrap());
+    store.remove_device(&device.id).unwrap();
+    assert!(!still_paired(&store, &device, "owner@example.org").unwrap());
+}
+
+#[test]
+fn provisioning_preserves_owner_checks_busy_guard_and_correlated_results() {
+    let (_dir, mut hub, store) = diagnostic_approval_hub();
+    let person = "owner@example.com";
+    let device = Device {
+        id: "phone-setup".into(),
+        name: "phone".into(),
+        person: person.into(),
+        noise_key: vec![42; 32],
+        device_key: vec![],
+        push_key: vec![],
+        push_token: None,
+        paired: now(),
+        seen: None,
+    };
+    store.add_device(&device).unwrap();
+    let mutable = Arc::get_mut(&mut hub).unwrap();
+    mutable.provisioning = Some(Host::new(
+        mutable.layout.clone(),
+        crate::model::audit::Actor {
+            user: "local".into(),
+            host: "host".into(),
+        },
+        "/unused/enclos".into(),
+        Some(person.into()),
+    ));
+    mutable
+        .provisioning_busy
+        .get_mut()
+        .unwrap()
+        .insert("lab".into());
+    let (sender, outbox) = channel();
+    mutable
+        .devices
+        .get_mut()
+        .unwrap()
+        .insert(device.id.clone(), (person.into(), sender));
+    let operation = || Operation::create("lab", "minimal").unwrap();
+    let id = || MessageId::new("setup-request").unwrap();
+    assert_eq!(
+        hub.begin(operation(), id(), &device, "guest@example.com")
+            .unwrap_err()
+            .code,
+        ErrorCode::NotAllowed
+    );
+    assert_eq!(
+        hub.begin(operation(), id(), &device, person)
+            .unwrap_err()
+            .code,
+        ErrorCode::Busy
+    );
+    assert!(outbox.try_recv().is_err());
+    hub.provisioning_busy.lock().unwrap().clear();
+    hub.begin(operation(), id(), &device, person).unwrap();
+    assert!(
+        matches!(outbox.recv_timeout(Duration::from_secs(5)).unwrap(), ToDevice::OperationProgress {of, operation, sandbox, ..} if of == id() && operation == "sandbox.create" && sandbox == "lab")
+    );
+    assert!(
+        matches!(outbox.recv_timeout(Duration::from_secs(5)).unwrap(), ToDevice::Error(ErrorBody {of:Some(of), code: ErrorCode::OperationFailed, ..}) if of == id())
+    );
+    assert!(!hub.provisioning_busy.lock().unwrap().contains("lab"));
 }

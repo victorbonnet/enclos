@@ -26,7 +26,7 @@ mod questions;
 #[path = "routines.rs"]
 mod routines;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -50,11 +50,13 @@ use super::groups::{
 };
 use super::ids::{new_id, random_bytes};
 use super::plugin::{PluginWriter, connect};
+use super::provisioning::{Completed, Host, Operation};
 use super::store::{
     BY_AGENT, BY_PERSON, Conversation, Device, From, PairingRequest, Store, StoredAttachment,
     home_id, is_home, now,
 };
 use super::transport::Transport;
+use enclos_protocol::plugin::{ErrorBody, ErrorCode};
 
 /// How long a pairing waits for the terminal's answer.
 const PAIRING_WAIT: Duration = Duration::from_secs(120);
@@ -76,6 +78,8 @@ struct Hub {
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
+    provisioning: Option<Host>,
+    provisioning_busy: Mutex<HashSet<String>>,
     /// The person the host belongs to, on the transport: whose the agents'
     /// Home conversations are. Unknown, the first person who connects.
     host: Option<String>,
@@ -97,6 +101,118 @@ struct Hub {
 }
 
 impl Hub {
+    fn begin(
+        self: &Arc<Self>,
+        operation: Operation,
+        of: MessageId,
+        device: &Device,
+        person: &str,
+    ) -> Result<(), ErrorBody> {
+        if !self
+            .provisioning
+            .as_ref()
+            .is_some_and(|h| h.is_owner(person))
+        {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::NotAllowed,
+                message: "only the host's user can manage sandboxes".to_owned(),
+            });
+        }
+        let sandbox = operation.sandbox().to_owned();
+        let verb = operation.verb().to_owned();
+        let mut busy = self.provisioning_busy.lock().expect("not poisoned");
+        if !busy.insert(sandbox.clone()) {
+            return Err(ErrorBody {
+                of: Some(of),
+                code: ErrorCode::Busy,
+                message: format!("an operation is already running in sandbox {sandbox}"),
+            });
+        }
+        drop(busy);
+        self.deliver(
+            person,
+            ToDevice::OperationProgress {
+                of: of.clone(),
+                operation: verb.clone(),
+                sandbox: sandbox.clone(),
+                message: operation.progress().to_owned(),
+            },
+        );
+        let hub = Arc::clone(self);
+        let person = person.to_owned();
+        let device = device.id.clone();
+        std::thread::spawn(move || {
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!("{verb} started"),
+                    Some(&sandbox),
+                );
+            }
+            let result = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .execute(&operation, &person);
+            let failed = result.as_ref().err().cloned();
+            let response = match result {
+                Ok(Completed::Created) => ToDevice::SandboxCreated {
+                    of,
+                    sandbox: sandbox.clone(),
+                },
+                Ok(Completed::Installed { runtime, login }) => ToDevice::RuntimeInstalled {
+                    of,
+                    sandbox: sandbox.clone(),
+                    runtime,
+                    login,
+                },
+                Err(message) => ToDevice::Error(ErrorBody {
+                    of: Some(of),
+                    code: ErrorCode::OperationFailed,
+                    message,
+                }),
+            };
+            // Release before completing: a next request may follow at once.
+            hub.provisioning_busy
+                .lock()
+                .expect("not poisoned")
+                .remove(&sandbox);
+            hub.deliver(&person, response);
+            if let Ok(sandboxes) = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .sandboxes()
+            {
+                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+            }
+            if let Ok(store) = hub.store() {
+                let _ = store.log(
+                    Some(&device),
+                    Some(&person),
+                    &format!(
+                        "{verb} {}",
+                        if failed.is_some() {
+                            "failed"
+                        } else {
+                            "completed"
+                        }
+                    ),
+                    Some(&sandbox),
+                );
+            }
+        });
+        Ok(())
+    }
+    fn agent_endpoints(&self) -> Result<Vec<AgentEndpoint>, String> {
+        match &self.provisioning {
+            Some(host) => host.agents(),
+            None => Ok(self.agents.clone()),
+        }
+    }
+
     fn store(&self) -> Result<Store, String> {
         Store::open(&self.store_path).map_err(|e| format!("cannot open the bridge's database: {e}"))
     }
@@ -132,7 +248,7 @@ impl Hub {
     fn open_plugins(self: &Arc<Hub>) {
         let hub = Arc::clone(self);
         std::thread::spawn(move || {
-            for agent in &hub.agents {
+            for agent in &hub.agent_endpoints().unwrap_or_default() {
                 let open = hub
                     .plugins
                     .lock()
@@ -438,8 +554,8 @@ impl Hub {
         if plugins.contains_key(agent) {
             return Ok(());
         }
-        let endpoint = self
-            .agents
+        let endpoints = self.agent_endpoints()?;
+        let endpoint = endpoints
             .iter()
             .find(|a| a.name == agent)
             .ok_or_else(|| format!("no agent {agent} with an app channel"))?;
@@ -735,15 +851,18 @@ pub fn serve(
     layout: crate::layout::Layout,
     bridge_private: Vec<u8>,
     agents: Vec<AgentEndpoint>,
+    provisioning: Host,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    let host = transport.host_person();
+    let host = provisioning.owner().map(str::to_owned);
     let hub = Arc::new(Hub {
         transport,
         store_path,
         layout,
         bridge_private,
         agents,
+        provisioning: Some(provisioning),
+        provisioning_busy: Mutex::new(HashSet::new()),
         host,
         plugins: Mutex::new(HashMap::new()),
         routines: Mutex::new(Default::default()),
@@ -766,7 +885,7 @@ pub fn serve(
         });
     }
     if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
-        for agent in &hub.agents {
+        for agent in &hub.agent_endpoints().unwrap_or_default() {
             let _ = store.ensure_home(&agent.name, host);
         }
     }
@@ -802,7 +921,7 @@ pub fn serve(
                 }
                 // A policy restart closes the plugin sockets. Reopen them so cron
                 // work, too, gets fresh policy knowledge without a phone reconnect.
-                for agent in &hub.agents {
+                for agent in &hub.agent_endpoints().unwrap_or_default() {
                     let _ = hub.plugin(&agent.name);
                 }
                 std::thread::sleep(Duration::from_secs(3));
@@ -977,13 +1096,21 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
     };
     link.send(ToDevice::Authenticated {
         person: person.clone(),
-        capabilities: vec!["approval.close".into()],
+        capabilities: if hub
+            .provisioning
+            .as_ref()
+            .is_some_and(|h| h.is_owner(&person))
+        {
+            vec!["approval.close".to_owned(), "sandboxes".to_owned()]
+        } else {
+            vec!["approval.close".to_owned()]
+        },
     })?;
     let _ = store.device_seen(&device.id);
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
     // The agents' Homes, made at start when the transport names the host's
     // person; else this person's, the first to connect.
-    for agent in &hub.agents {
+    for agent in &hub.agent_endpoints().unwrap_or_default() {
         let _ = store.ensure_home(&agent.name, hub.host.as_deref().unwrap_or(&person));
     }
     let (sender, outbox) = channel();
@@ -1246,12 +1373,77 @@ fn run_session(
                     }))?,
                 }
             }
+            FromDevice::Sandboxes
+            | FromDevice::Runtimes
+            | FromDevice::SandboxCreate { .. }
+            | FromDevice::RuntimeInstall { .. } => {
+                if !hub
+                    .provisioning
+                    .as_ref()
+                    .is_some_and(|h| h.is_owner(person))
+                    || !still_paired(store, device, person).map_err(|e| e.to_string())?
+                {
+                    link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::NotAllowed,
+                        message: "only the host's user can manage sandboxes".to_owned(),
+                    }))?;
+                    continue;
+                }
+                let operation = match message.body {
+                    FromDevice::Sandboxes => {
+                        match hub
+                            .provisioning
+                            .as_ref()
+                            .expect("provisioning request checked")
+                            .sandboxes()
+                        {
+                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
+                            Err(why) => link.send(ToDevice::Error(ErrorBody {
+                                of: Some(message.id),
+                                code: ErrorCode::OperationFailed,
+                                message: why,
+                            }))?,
+                        }
+                        continue;
+                    }
+                    FromDevice::Runtimes => {
+                        link.send(ToDevice::RuntimesList {
+                            runtimes: hub
+                                .provisioning
+                                .as_ref()
+                                .expect("provisioning request checked")
+                                .runtimes(),
+                        })?;
+                        continue;
+                    }
+                    FromDevice::SandboxCreate { sandbox, template } => {
+                        Operation::create(&sandbox, &template)
+                    }
+                    FromDevice::RuntimeInstall { sandbox, runtime } => {
+                        Operation::install(&sandbox, &runtime)
+                    }
+                    _ => unreachable!("matched provisioning requests"),
+                };
+                match operation {
+                    Ok(operation) => {
+                        if let Err(error) = hub.begin(operation, message.id, device, person) {
+                            link.send(ToDevice::Error(error))?;
+                        }
+                    }
+                    Err(why) => link.send(ToDevice::Error(ErrorBody {
+                        of: Some(message.id),
+                        code: ErrorCode::BadMessage,
+                        message: why,
+                    }))?,
+                }
+            }
             FromDevice::Agents => {
                 let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
                 let names = store.agent_name_metadata().map_err(|e| e.to_string())?;
                 let plugins = hub.plugins.lock().expect("not poisoned");
-                let agents = hub
-                    .agents
+                let endpoints = hub.agent_endpoints()?;
+                let agents = endpoints
                     .iter()
                     .map(|a| AgentInfo {
                         display_name: names.get(&a.name).and_then(|n| n.display_name.clone()),
@@ -1306,7 +1498,9 @@ fn run_session(
                     continue;
                 };
                 // A Home is the bridge's to make, for the host's person.
-                if !hub.agents.iter().any(|a| a.name == agent) || is_home(conversation.as_str()) {
+                if !hub.agent_endpoints()?.iter().any(|a| a.name == agent)
+                    || is_home(conversation.as_str())
+                {
                     continue;
                 }
                 store
@@ -1328,7 +1522,7 @@ fn run_session(
                     let Some((s, n)) = m.split_once('/') else {
                         continue;
                     };
-                    if hub.agents.iter().any(|a| &a.name == m)
+                    if hub.agent_endpoints()?.iter().any(|a| &a.name == m)
                         && sandbox.get_or_insert(s.to_owned()) == s
                         && !names.iter().any(|x| x == n)
                     {
@@ -1761,6 +1955,14 @@ fn rename(
         }
     }
     Ok(())
+}
+
+/// A connection can outlive `app unpair`. Privileged requests check the
+/// current pairing instead of relying only on the earlier handshake.
+fn still_paired(store: &Store, device: &Device, person: &str) -> rusqlite::Result<bool> {
+    Ok(store
+        .device_by_noise_key(&device.noise_key)?
+        .is_some_and(|known| known.id == device.id && known.person == person))
 }
 
 /// A person's message: stored, passed to the agent's plugin, and echoed

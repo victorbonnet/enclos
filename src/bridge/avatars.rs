@@ -63,7 +63,7 @@ impl Hub {
         {
             return Err("This device is no longer paired.".into());
         }
-        if !self.agents.iter().any(|a| a.name == agent) {
+        if !self.agent_endpoints()?.iter().any(|a| a.name == agent) {
             return Err("This agent is no longer listed by its host.".into());
         }
         if write && self.host.as_deref() != Some(person) {

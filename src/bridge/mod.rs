@@ -8,6 +8,7 @@ pub mod ids;
 pub mod keys;
 pub mod page;
 pub mod plugin;
+pub mod provisioning;
 pub mod server;
 pub mod store;
 pub mod transport;

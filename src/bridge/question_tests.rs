@@ -48,6 +48,8 @@ fn fixture() -> (
         store_path: dir.path().join("app.db"),
         layout: crate::layout::Layout::at(dir.path().join("enclos")),
         bridge_private: vec![],
+        provisioning: None,
+        provisioning_busy: Mutex::new(Default::default()),
         agents: vec![AgentEndpoint {
             name: AGENT.into(),
             runtime: "hermes".into(),
