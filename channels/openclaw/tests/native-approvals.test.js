@@ -29,9 +29,9 @@ function transport(saved) {
     send(conversation, text, fields) { return this.enqueue(message('message.out', { conversation, text, ...fields })); } };
 }
 
-function fixture(t, { hello = modern, saved, resolve, timeout } = {}) {
+function fixture(t, { hello = modern, saved, resolve, timeout, beforeAuthorize } = {}) {
   const wire = transport(saved); wire.bridgeHello = hello;
-  let adapter, capability, context, disposed = false, current = true, calls = 0;
+  let adapter, capability, context, disposed = false, current = true, calls = 0, authorized;
   const sdk = {
     CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY: 'approval.native',
     createChannelApprovalNativeRuntimeAdapterAsync(spec) { return adapter = spec; },
@@ -41,8 +41,9 @@ function fixture(t, { hello = modern, saved, resolve, timeout } = {}) {
       calls++;
       assert.equal(params.channel, 'enclos'); assert.equal(params.senderId, 'alice'); assert.equal(params.accountId, 'main');
       assert.equal(params.approvalKind, 'exec');
-      const authorized = await capability.authorizeActorActionAsync({ ...params, action: 'approve', request: currentNative });
-      assert.equal(authorized.authorized, true);
+      if (beforeAuthorize) await beforeAuthorize();
+      authorized = (await capability.authorizeActorActionAsync({ ...params, action: 'approve', request: currentNative })).authorized;
+      if (!authorized) throw new Error('native reviewer refused this decision');
       return resolve ? resolve(params, currentNative) : outcome(currentNative, params.decision);
     },
   };
@@ -53,7 +54,7 @@ function fixture(t, { hello = modern, saved, resolve, timeout } = {}) {
   let currentNative;
   const base = () => ({ accountId: 'main', cfg: {}, context });
   return { wire, controller, factory, adapter, capability,
-    calls: () => calls, disposed: () => disposed, revoke() { current = false; },
+    calls: () => calls, authorized: () => authorized, disposed: () => disposed, revoke() { current = false; },
     async deliver(request = nativeRequest(), view = viewFor(request)) {
       currentNative = request;
       const p = { ...base(), request, approvalKind: 'exec', view };
@@ -169,6 +170,49 @@ test('native event racing an exact answer waits for canonical receipt', async t 
   assert.equal(f.wire.frames.some(frame => frame.type === 'question.update'), false);
   release(); await pending;
   assert.equal(last(f.wire).state, 'answered'); assert.equal(last(f.wire).of, control.id);
+});
+
+for (const changed of ['token', 'peer']) test(`a ${changed} revocation during the native read denies commit authorization`, async t => {
+  let resume, entered;
+  const blocked = new Promise(resolve => { resume = resolve; });
+  const observed = new Promise(resolve => { entered = resolve; });
+  const initial = { token: 'fixture-token', peer: {} }, current = { ...initial };
+  const assertPeer = () => { if (current.token !== initial.token || current.peer !== initial.peer) throw new Error('revoked control peer'); };
+  const f = fixture(t, { beforeAuthorize: async () => { entered(); await blocked; } });
+  const delivery = await f.deliver(), control = answer(delivery);
+  const pending = f.controller.handleControl(control, assertPeer);
+  await observed; current[changed] = changed === 'token' ? 'rotated-fixture-token' : {}; resume(); await pending;
+  assert.equal(f.authorized(), false);
+  assert.equal(f.wire.frames.some(frame => frame.state === 'answered' || frame.of === control.id), false);
+  assert.equal(f.wire.state.nativeApprovals.records[0].state, 'expired');
+  // Reconciliation from a current successor reports the closed lease; retrying
+  // the old control returns evidence, never another native decision.
+  await f.controller.handleControl(message('question.sync', { questions: [delivery.entry.question] }), () => {});
+  assert.equal(last(f.wire).state, 'expired');
+  await f.controller.handleControl(control, () => {}); assert.equal(f.calls(), 1);
+});
+
+test('peer revocation before dispatch refuses without consuming the pending native question', async t => {
+  const f = fixture(t), delivery = await f.deliver();
+  await assert.rejects(f.controller.handleControl(answer(delivery), () => { throw new Error('revoked control peer'); }), /revoked/);
+  assert.equal(f.calls(), 0);
+  assert.equal(f.wire.state.nativeApprovals.records[0].attempted, false);
+  assert.equal(f.wire.state.nativeApprovals.controls.length, 0);
+});
+
+test('revocation after native application retains confirmed evidence without an answer receipt', async t => {
+  let current = true;
+  const assertPeer = () => { if (!current) throw new Error('revoked control peer'); };
+  const f = fixture(t, { resolve(_params, request) { current = false; return outcome(request); } });
+  const delivery = await f.deliver(), control = answer(delivery);
+  await f.controller.handleControl(control, assertPeer);
+  assert.equal(f.authorized(), true);
+  assert.equal(f.wire.frames.some(frame => frame.state === 'answered' || frame.of === control.id), false);
+  assert.equal(f.wire.state.nativeApprovals.records[0].state, 'resolved');
+  assert.deepEqual(f.wire.state.nativeApprovals.controls[0].nativeOutcome, { applied: true, status: 'allowed', action: 'once' });
+  await f.controller.handleControl(message('question.sync', { questions: [delivery.entry.question] }), () => {});
+  assert.equal(last(f.wire).state, 'resolved'); assert.equal(last(f.wire).answer, undefined); assert.equal(last(f.wire).of, undefined);
+  await f.controller.handleControl(control, () => {}); assert.equal(f.calls(), 1); assert.equal(last(f.wire).code, 'agent_unavailable');
 });
 
 test('ambiguous RPC failure expires the control lease and is never replayed', async t => {
