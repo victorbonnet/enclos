@@ -6,6 +6,7 @@ import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
 import { RoutineInventory } from './routines.js';
 import { inboundMedia, mediaFolder, stageMedia } from './media.js';
+import { createNativeTitles } from './native-titles.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -86,14 +87,22 @@ export function createChannel(sdk = {}) {
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
     if (hasMedia) mediaFolder(account);
-    let transport;
+    let transport, titles;
+    const sessionKeyFor = (conversation, person) => {
+      const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
+      if (!saved) return undefined;
+      if (person != null && saved.person !== person) throw new ProtocolError('not_allowed', 'native conversation belongs to another person');
+      return channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos', accountId: account.accountId,
+        peer: { kind: 'direct', id: saved.peer }, dmScope: 'per-account-channel-peer' });
+    };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: () => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(routines.available() ? ['routines'] : [])],
+      capabilities: () => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(routines.available() ? ['routines'] : []), ...(titles?.available ? ['titles'] : [])],
       onHello(_hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
       },
-      onControl(control, owner, requestPeer) {
+      async onControl(control, owner, requestPeer) {
+        owner.assertControlPeer(requestPeer);
         if (control.type === 'routine.request') {
           return routines.handle(control, { account,
             assertCurrent: () => {
@@ -104,6 +113,8 @@ export function createChannel(sdk = {}) {
             },
             write: response => owner.write(response, requestPeer) });
         }
+        if (await titles?.handleControl(control, () => owner.assertControlPeer(requestPeer))) return;
+        owner.assertControlPeer(requestPeer);
         if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
         if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
         const before = owner.state.policyContext;
@@ -120,6 +131,7 @@ export function createChannel(sdk = {}) {
         if (nativeRoute.agentId !== account.agentId || nativeRoute.matchedBy === 'default') throw new Error('enclos account needs an explicit native binding to its agent');
         const sessionKey = channel.routing.buildAgentSessionKey({ agentId: account.agentId, channel: 'enclos',
           accountId: account.accountId, peer: { kind: 'direct', id: route.peer }, dmScope: 'per-account-channel-peer' });
+        titles?.watch(incoming.conversation);
         sessionRoutes.set(sessionKey, { active: running.get(account.accountId), conversation: incoming.conversation });
         const isCommand = channel.text?.hasControlCommand?.(incoming.text, cfg) ?? incoming.text.trimStart().startsWith('/');
         const ingress = await channel.inbound.ingress.resolve({
@@ -172,17 +184,20 @@ export function createChannel(sdk = {}) {
             if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
               { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
           } },
-        }); } finally { typing(false); }
+        }); } finally { typing(false); void titles?.refresh(incoming.conversation); }
       },
     });
-    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg });
+    running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });
     const stop = async () => {
+      titles?.close();
       if (running.get(account.accountId)?.transport === transport) running.delete(account.accountId);
       for (const [key, turn] of sessionRoutes) if (turn.active?.transport === transport) sessionRoutes.delete(key);
       await transport.close();
       ctx.setStatus?.({ accountId: account.accountId, running: false, connected: false });
     };
     try {
+      titles = createNativeTitles(runtime, account, transport, { currentConfig: () => currentConfig(ctx.cfg),
+        assertCurrent: () => assertCurrent(ctx.cfg, account, transport), sessionKeyFor });
       await transport.start();
       ctx.setStatus?.({ accountId: account.accountId, running: true, connected: true });
       if (ctx.abortSignal.aborted) return;

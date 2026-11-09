@@ -122,7 +122,14 @@ Control UI guidance. No structured question capability is advertised; see
 [the tested native question boundary](NATIVE_QUESTIONS.md) for the supported
 subset and the public APIs needed for richer controls.
 
-Titles/rename, structured questions, runtime approvals and typed
+Native titles come from the public session metadata getter and keyed native
+session invalidations. Human rename/clear uses the public prepared metadata patch
+with an exact account/route authority fence and preserves native activity time.
+It changes the native display title, whose values may repeat; native addressable
+labels keep their separate meaning and validation. Renaming a conversation before
+it has a native session keeps the name in the bridge without creating a session.
+
+Structured questions, runtime approvals and typed
 interruption remain separate work. Unsupported controls return `unsupported`.
 Structured native
 control modules can gate live sends and durable replay with `canDeliver`; the
