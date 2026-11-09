@@ -29,7 +29,7 @@ use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxRecord};
 use crate::model::session::SessionId;
-use crate::runtime::{RuntimeAdapter, RuntimeDashboard, adapter};
+use crate::runtime::{ListenerPorts, RuntimeAdapter, RuntimeDashboard, adapter};
 use local::Local;
 use lock::{DashboardLock, Running};
 
@@ -206,7 +206,7 @@ impl Engine {
                 }
             } else {
                 let (way_in, held) = namespace.as_ref().expect("a namespace or a private socket");
-                match in_namespace("dashboard", &session.root, held) {
+                match in_namespace("dashboard", &session.root, held, ListenerPorts::Ephemeral) {
                     Ok(port) => host_listener::open(
                         record.proxy_port,
                         user,
