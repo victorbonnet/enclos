@@ -161,6 +161,10 @@ export function createChannel(sdk = {}) {
           dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
           delivery: { async deliver(payload) {
             assertAuthority();
+            // Preserve the complete native fallback for batches, forms and
+            // presentations that this channel cannot faithfully control.
+            if (sdk.renderPayload) payload = await sdk.renderPayload(payload);
+            assertAuthority();
             const urls = [...new Set([...(payload.mediaUrl ? [payload.mediaUrl] : []), ...(payload.mediaUrls ?? [])])];
             if (urls.length && !hasMedia) throw new Error('enclos OpenClaw channel media is not enabled');
             const attachments = urls.length ? await stageMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }) : [];
@@ -260,6 +264,7 @@ export function createChannel(sdk = {}) {
         'For a static HTML artefact, use a self-contained UTF-8 .html file with inline CSS and data images/fonts. Scripts, remote assets, forms and automatic navigation are unavailable; deliberate HTTP(S) links open the browser.',
         'If sandbox policy refuses access, request the exact scope with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
         'Remote markdown images are links; HTML in text is literal. Home is the bridge-owned permanent destination for output without another conversation.',
+        'Preserve complete native question prompts and follow the native tool result. Do not invent mobile question buttons or successful answer receipts. Secrets must use the native trusted Control UI, never chat.',
       ] }),
     },
   };
