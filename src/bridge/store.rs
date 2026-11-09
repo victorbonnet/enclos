@@ -8,6 +8,10 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+#[path = "question_store.rs"]
+mod question_store;
+pub use question_store::{QuestionChange, QuestionStoreError, StoredQuestion};
+
 /// Who wrote a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum From {
@@ -20,6 +24,7 @@ pub enum From {
 /// One stored message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
+    pub question: Option<enclos_protocol::QuestionId>,
     pub seq: i64,
     pub id: String,
     pub conversation: String,
@@ -35,6 +40,18 @@ fn message_row(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let person: Option<String> = row.get(3)?;
     let speaker: Option<String> = row.get(7)?;
     Ok(Message {
+        question: row
+            .get::<_, Option<String>>(8)?
+            .map(|id| {
+                enclos_protocol::QuestionId::new(id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()?,
         seq: row.get(0)?,
         id: row.get(1)?,
         conversation: row.get(2)?,
@@ -162,10 +179,24 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "speaker") {
         db.execute_batch("ALTER TABLE messages ADD COLUMN speaker TEXT")?;
     }
+    if !columns.iter().any(|c| c == "question") {
+        db.execute_batch("ALTER TABLE messages ADD COLUMN question TEXT")?;
+    }
     Ok(())
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS questions (
+    id TEXT PRIMARY KEY,
+    conversation TEXT NOT NULL REFERENCES conversations(id),
+    agent TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    definition TEXT NOT NULL,
+    state TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(typeof(revision)='integer' AND revision>=0),
+    answer TEXT,
+    ask_message TEXT NOT NULL UNIQUE
+);
 CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0), display_name TEXT);
 CREATE TABLE IF NOT EXISTS agent_avatars (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>=0), version TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
@@ -188,7 +219,8 @@ CREATE TABLE IF NOT EXISTS messages (
     person TEXT,
     text TEXT NOT NULL,
     kind TEXT NOT NULL,
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    question TEXT
 );
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
@@ -770,7 +802,7 @@ impl Store {
     /// The messages of `owner`'s conversations after `since`, in order.
     pub fn since(&self, owner: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker FROM messages m
+            "SELECT m.seq, m.id, m.conversation, m.person, m.text, m.kind, m.at, m.speaker, m.question FROM messages m
              JOIN conversations c ON c.id = m.conversation
              WHERE c.owner = ?1 AND m.seq > ?2 ORDER BY m.seq",
         )?;
@@ -781,7 +813,7 @@ impl Store {
     /// The messages of conversation `id` after `since`, in order.
     pub fn messages_after(&self, id: &str, since: i64) -> rusqlite::Result<Vec<Message>> {
         let mut query = self.db.prepare(
-            "SELECT seq, id, conversation, person, text, kind, at, speaker FROM messages
+            "SELECT seq, id, conversation, person, text, kind, at, speaker, question FROM messages
              WHERE conversation = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = query.query_map(params![id, since], message_row)?;

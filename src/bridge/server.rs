@@ -21,6 +21,8 @@ mod approvals;
 mod avatars;
 #[path = "policy.rs"]
 mod policy;
+#[path = "questions.rs"]
+mod questions;
 #[path = "routines.rs"]
 mod routines;
 
@@ -80,6 +82,7 @@ struct Hub {
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, (PluginWriter, Vec<Capability>)>>,
     routines: Mutex<routines::RoutineRequests>,
+    questions: Mutex<questions::QuestionRequests>,
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not.
     commands: Mutex<HashMap<String, Vec<Command>>>,
@@ -452,6 +455,12 @@ impl Hub {
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
         let routine_connection = self.routine_connected(agent);
+        self.question_connected(agent, &routine_connection);
+        if hello.capabilities.contains(&Capability::Questions)
+            && let Ok(store) = self.store()
+        {
+            self.sync_questions(&store, agent, &mut writer)?;
+        }
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
@@ -476,7 +485,40 @@ impl Hub {
                         hub.routine_response(&store, &agent, &routine_connection, reply);
                     }
                     FromPlugin::Error(error) => {
+                        hub.question_error(&store, &agent, &routine_connection, error.clone());
                         hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
+                    FromPlugin::QuestionAsk {
+                        conversation,
+                        question,
+                    } => {
+                        let result = hub.question_ask(
+                            &store,
+                            &agent,
+                            &routine_connection,
+                            &conversation,
+                            &question,
+                            &message.id,
+                        );
+                        questions::acknowledge_question(&mut acks, &message.id, result);
+                    }
+                    FromPlugin::QuestionUpdate {
+                        question,
+                        state,
+                        answer,
+                        of,
+                    } => {
+                        let result = hub.question_update(
+                            &store,
+                            &agent,
+                            &routine_connection,
+                            &question,
+                            state,
+                            answer,
+                            of.as_ref(),
+                            &message.id,
+                        );
+                        questions::acknowledge_question(&mut acks, &message.id, result);
                     }
                     FromPlugin::MessageOut {
                         conversation,
@@ -567,6 +609,7 @@ impl Hub {
                             hub.deliver(
                                 &owner,
                                 ToDevice::Message(ConversationMessage {
+                                    question: None,
                                     conversation: conversation.clone(),
                                     agent: agent.clone(),
                                     from: "agent".to_owned(),
@@ -675,6 +718,7 @@ impl Hub {
                 }
             }
             // Closed: the next message to this agent opens it again.
+            hub.question_disconnected(&store, &agent, &routine_connection);
             hub.routine_disconnected(&store, &agent, &routine_connection);
             hub.plugins.lock().expect("not poisoned").remove(&agent);
         });
@@ -702,6 +746,7 @@ pub fn serve(
         host,
         plugins: Mutex::new(HashMap::new()),
         routines: Mutex::new(Default::default()),
+        questions: Mutex::new(Default::default()),
         commands: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
         stops: Mutex::new(std::collections::HashSet::new()),
@@ -715,6 +760,7 @@ pub fn serve(
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 hub.expire_routines(&store);
+                hub.expire_questions(&store);
             }
         });
     }
@@ -1071,6 +1117,17 @@ fn run_session(
                     }
                 }
             }
+            FromDevice::QuestionAnswer {
+                question,
+                revision,
+                answer,
+            } => {
+                if let Err(error) = hub.question_answer(
+                    store, device, person, message.id, question, revision, answer,
+                ) {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::RoutineRequest { agent, request } => {
                 if let Err(error) =
                     hub.routine_request(store, device, person, &agent, message.id, request)
@@ -1355,6 +1412,15 @@ fn run_session(
                         link.send(ToDevice::Conversation(info))?;
                     }
                 }
+                // Pending cards must refresh even when their introduction predates `since`.
+                for question in store
+                    .pending_questions_for(person)
+                    .map_err(|e| e.to_string())?
+                {
+                    link.send(ToDevice::Question {
+                        question: question.info,
+                    })?;
+                }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
@@ -1371,7 +1437,17 @@ fn run_session(
                         .into_iter()
                         .map(attachment_info)
                         .collect();
+                    if let Some(question) = &m.question
+                        && let Some(current) =
+                            store.question(question).map_err(|e| e.to_string())?
+                        && current.owner == person
+                    {
+                        link.send(ToDevice::Question {
+                            question: current.info,
+                        })?;
+                    }
                     link.send(ToDevice::Message(ConversationMessage {
+                        question: m.question,
                         conversation: ConversationId::new(m.conversation)
                             .map_err(|e| e.to_string())?,
                         agent,
@@ -1709,6 +1785,7 @@ fn send(
             hub.deliver(
                 person,
                 ToDevice::Message(ConversationMessage {
+                    question: None,
                     conversation: conversation.clone(),
                     agent: sandbox,
                     from: person.to_owned(),
@@ -1752,6 +1829,7 @@ fn send(
         hub.deliver(
             person,
             ToDevice::Message(ConversationMessage {
+                question: None,
                 conversation: conversation.clone(),
                 agent: name,
                 from: person.to_owned(),

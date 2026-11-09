@@ -20,7 +20,8 @@ pub mod pairing;
 pub mod plugin;
 pub mod policy;
 pub mod preview;
+pub mod question;
 pub mod routine;
 
 pub use envelope::{DecodeError, Envelope, MAX_MESSAGE_BYTES, VERSION, decode, encode_line};
-pub use ids::{ConversationId, IdError, MessageId, Person};
+pub use ids::{ConversationId, IdError, MessageId, Person, QuestionId};
