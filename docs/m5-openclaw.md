@@ -90,7 +90,7 @@ The host stack is published in this order; each PR carries its own changes and e
 | M5-11a | [#233](https://github.com/victorbonnet/enclos/pull/233) | Generic independently negotiated native approval scopes. |
 | M5-11b | [#234](https://github.com/victorbonnet/enclos/pull/234) | Native approval lifecycle, exact cancellation and deployment assets. |
 
-The app companion stack is [#42](https://github.com/victorbonnet/enclos-app/pull/42) → [#45](https://github.com/victorbonnet/enclos-app/pull/45) (routine operations) → [#46](https://github.com/victorbonnet/enclos-app/pull/46) (native approval scopes). Android build/unit/lint and remote CI have passed for the companions; physical-device and iOS coverage remain distinct.
+The app companion stack is [#44](https://github.com/victorbonnet/enclos-app/pull/44) → [#45](https://github.com/victorbonnet/enclos-app/pull/45) (routine operations) → [#46](https://github.com/victorbonnet/enclos-app/pull/46) (native approval scopes). Android build/unit/lint and remote CI have passed for the companions; physical-device and iOS coverage remain distinct.
 
 **M5-12** maintains [the acceptance record](m5-openclaw-acceptance.md), final regression evidence and outstanding manual macOS checks. **M5-13** is the final Linux-specific implementation/acceptance on the new host. Neither the original planning research nor one successful model call completes those gates.
 
