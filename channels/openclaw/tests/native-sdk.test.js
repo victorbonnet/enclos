@@ -167,3 +167,54 @@ test('installed native session workers read, rename and clear only the selected 
   assert.equal(duplicate.displayName, 'Duplicate display title'); assert.equal(duplicate.label, undefined);
   assert.equal((await sdk.getSessionEntryAsync({ agentId: 'main', sessionKey: `${sessionKey}-other`, storePath, readConsistency: 'latest' })).label, 'Addressable native label');
 });
+
+test('installed native inbound dispatch retains each exact upstream run abort signal', { skip: !installed }, async t => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/channel-inbound.js')));
+  const folder = mkdtempSync('/private/tmp/enclos-native-abort-');
+  const cfg = { agents: { ownership: 'explicit', entries: { main: { workspace: folder } } }, session: { store: path.join(folder, 'sessions.json') } };
+  const seen = new Map(), ended = [], running = [], failures = [];
+  const one = new AbortController(), two = new AbortController(), three = new AbortController();
+  t.after(async () => { one.abort(); two.abort(); three.abort(); await Promise.allSettled(running); rmSync(folder, { recursive: true, force: true }); });
+  const waitSeen = async id => {
+    const deadline = Date.now() + 15000;
+    while (!seen.has(id)) {
+      if (failures.length) throw failures[0];
+      if (Date.now() > deadline) throw new Error(`native resolver did not begin: ${id}`);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  const run = (id, controller) => sdk.dispatchChannelInboundTurn({ cfg, channel: 'enclos', accountId: 'main', messageId: id,
+    route: { agentId: 'main', sessionKey: 'agent:main:enclos:main:direct:abort-test', dmScope: 'per-account-channel-peer' },
+    ctxPayload: { Body: 'test-owned native dispatcher fixture', RawBody: 'test-owned native dispatcher fixture',
+      From: 'enclos:alice', To: 'enclos:test', Provider: 'enclos', Surface: 'enclos', ChatType: 'direct',
+      AccountId: 'main', MessageSid: id, SenderId: 'alice', SessionKey: 'agent:main:enclos:main:direct:abort-test' },
+    replyOptions: { abortSignal: controller.signal },
+    replyResolver: async (_ctx, options) => {
+      assert.ok(options.abortSignal); seen.set(id, options.abortSignal);
+      await new Promise(resolve => {
+        if (options.abortSignal.aborted) resolve();
+        else options.abortSignal.addEventListener('abort', resolve, { once: true });
+      });
+      ended.push(id); return undefined;
+    },
+    delivery: { async deliver() { throw new Error('cancelled native fixture must not deliver output'); } },
+  }).catch(error => {
+    if (!controller.signal.aborted) failures.push(error);
+  });
+  const first = run('owned-first', one); running.push(first);
+  await waitSeen('owned-first');
+  const second = run('owned-second', two); running.push(second);
+  // The same native session serializes replies. Cancelling its queued ingress
+  // must not select the running ingress by a global session-id lookup.
+  two.abort(); await second;
+  assert.equal(seen.has('owned-second'), false);
+  assert.equal(seen.get('owned-first').aborted, false); assert.equal(ended.includes('owned-first'), false);
+  one.abort(); await first;
+  assert.equal(seen.get('owned-first').aborted, true); assert.ok(ended.includes('owned-first'));
+  const replacement = run('owned-third', three); running.push(replacement);
+  await waitSeen('owned-third');
+  assert.equal(seen.get('owned-third').aborted, false);
+  three.abort(); await replacement;
+  assert.ok(ended.includes('owned-third'));
+  assert.deepEqual(failures, []);
+});

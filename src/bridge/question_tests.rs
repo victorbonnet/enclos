@@ -60,7 +60,6 @@ fn fixture() -> (
         questions: Mutex::new(Default::default()),
         commands: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
-        stops: Mutex::new(Default::default()),
         devices: Mutex::new(HashMap::new()),
     });
     let store = hub.store().unwrap();

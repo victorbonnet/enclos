@@ -23,6 +23,10 @@ const FROM_BRIDGE: &[(&str, &str)] = &[
         include_str!("fixtures/plugin/from_bridge_conversation_rename.json"),
     ),
     (
+        "turn_abort",
+        include_str!("fixtures/plugin/from_bridge_turn_abort.json"),
+    ),
+    (
         "hello_home",
         include_str!("fixtures/plugin/from_bridge_hello_home.json"),
     ),

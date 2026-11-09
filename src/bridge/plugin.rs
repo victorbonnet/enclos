@@ -77,6 +77,7 @@ pub fn connect(
             Capability::Questions,
             Capability::RuntimeApprovals,
             Capability::RuntimeApprovalScopes,
+            Capability::Abort,
         ],
         home: ConversationId::new(home).ok(),
     })?;
@@ -116,6 +117,13 @@ pub fn connect(
 }
 
 impl PluginWriter {
+    #[cfg(test)]
+    pub(super) fn for_test(stream: UnixStream) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(stream)),
+        }
+    }
+
     /// Another writer on the same connection, for another thread.
     pub fn try_clone(&self) -> std::io::Result<PluginWriter> {
         Ok(PluginWriter {

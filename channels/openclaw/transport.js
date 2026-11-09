@@ -259,6 +259,14 @@ export class ChannelTransport {
     });
   }
 
+  assertControlPeer(peer) {
+    let tokenCurrent = false;
+    try { tokenCurrent = peer?.tokenDigest === digest(readToken(this.account.tokenFile)); } catch { /* A missing/changed credential revokes controls. */ }
+    if (this.closed || this.peer !== peer || !peer?.authenticated || peer.destroyed || !tokenCurrent) {
+      throw new ProtocolError('agent_unavailable', 'the authenticated bridge control is no longer current');
+    }
+  }
+
   receive(incoming, peer) {
     if (incoming.type === 'ack') {
       const index = this.state.outbox.findIndex(p => p.id === incoming.of);
@@ -272,7 +280,7 @@ export class ChannelTransport {
     if (incoming.type !== 'message.in') {
       if (this.onControl) {
         Promise.resolve().then(() => this.onControl(incoming, this, peer)).then(() => this.write(message('ack', { of: incoming.id }), peer)).catch(error => {
-          this.write(message('error', { of: incoming.id, code: error.code ?? 'unsupported', message: error instanceof ProtocolError ? error.message : 'native control could not be confirmed' }), peer);
+          this.write(message('error', { of: incoming.id, code: error instanceof ProtocolError ? error.code : 'agent_unavailable', message: error instanceof ProtocolError ? error.message : 'native control could not be confirmed' }), peer);
         });
         return;
       }
@@ -280,7 +288,7 @@ export class ChannelTransport {
       return;
     }
     this.accept(incoming).then(() => this.write(message('ack', { of: incoming.id }), peer)).catch(error => {
-      this.write(message('error', { of: incoming.id, code: error.code ?? 'agent_unavailable',
+      this.write(message('error', { of: incoming.id, code: error instanceof ProtocolError ? error.code : 'agent_unavailable',
         message: error instanceof ProtocolError ? error.message : 'native delivery could not be confirmed; refresh before intentionally sending again' }), peer);
     });
   }

@@ -193,7 +193,7 @@ test('typing, exact tool events, native commands and policy requests keep their 
   await start(t, channel, cfg, account);
   const owner = await bridge(account.socket); t.after(() => owner.close());
   const hello = await owner.hello();
-  assert.deepEqual(hello.capabilities, ['typing', 'commands', 'tools', 'approval']);
+  assert.deepEqual(hello.capabilities, ['typing', 'abort', 'commands', 'tools', 'approval']);
   assert.deepEqual((await owner.next('commands')).commands, [{ name: 'help', description: 'Native help on one line' }]);
   const policy = message('policy.context', { text: 'Sandbox access: read the permitted workspace only.' });
   owner.send(policy); await owner.next('ack', policy.id);
@@ -298,4 +298,39 @@ test('native titles and human renames cross the authenticated channel using the 
   assert.equal(row.updatedAt, 42); assert.equal(row.label, undefined);
   assert.equal(selected.sessionKey, native.calls.dispatch[0].route.sessionKey);
   assert.equal(selected.agentId, 'main');
+});
+
+test('typed abort keeps exact native signals apart and cancels preparation before dispatch', async t => {
+  const account = accountFixture(t), cfg = configured(account), native = nativeHarness(cfg), channel = createChannel();
+  const signals = new Map(); let release, preparing = false;
+  const preparation = new Promise(resolve => { release = resolve; });
+  const ingress = native.api.channel.inbound.ingress.resolve;
+  native.api.channel.inbound.ingress.resolve = async params => {
+    const result = await ingress(params);
+    if (params.contextBinding.messageId === 'prepare') { preparing = true; await preparation; }
+    return result;
+  };
+  native.api.channel.inbound.dispatch = async params => {
+    signals.set(params.messageId, params.replyOptions.abortSignal);
+    await new Promise(resolve => params.replyOptions.abortSignal.addEventListener('abort', resolve, { once: true }));
+  };
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const owner = await bridge(account.socket); t.after(() => owner.close());
+  assert.ok((await owner.hello()).capabilities.includes('abort'));
+  const send = id => owner.send({ ...message('message.in', { conversation: 'c', person: 'alice', text: 'hello' }), id });
+  const abort = async (of, conversation = 'c') => {
+    const control = message('turn.abort', { of, conversation }); owner.send(control); await owner.next('ack', control.id);
+  };
+  send('first'); send('second'); await waitFor(() => signals.size === 2);
+  await abort('first', 'different'); assert.equal(signals.get('first').aborted, false);
+  await abort('first'); await owner.next('ack', 'first'); assert.equal(signals.get('first').aborted, true);
+  await abort('first'); assert.equal(signals.get('second').aborted, false);
+  await abort('second'); await owner.next('ack', 'second');
+  send('prepare'); await waitFor(() => preparing);
+  await abort('prepare'); release();
+  assert.equal((await owner.next('error', 'prepare')).code, 'agent_unavailable');
+  assert.equal(signals.has('prepare'), false);
+  send('successor'); await waitFor(() => signals.has('successor'));
+  await abort('first'); assert.equal(signals.get('successor').aborted, false);
+  await abort('successor'); await owner.next('ack', 'successor');
 });
