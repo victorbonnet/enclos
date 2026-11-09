@@ -574,12 +574,13 @@ pub trait RuntimeAdapter {
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand> { None }   // the runtime's own import of its export, run in the sandbox
     fn usage(&self, agents: &[RuntimeAgentName], since: i64, report: &Path) -> Option<SandboxCommand> { None }  // reads the runtime's own usage records in the sandbox and writes a usage report (§11, Usage); None: not provided
 
-    fn channel_token_file(&self, channel: Channel, agent: &RuntimeAgentName) -> Option<(HomePath, &'static str)>;
+    fn channel_token_files(&self, channel: Channel, agent: &RuntimeAgentName) -> Vec<(HomePath, &'static str)>;
     fn channel_token_is_plain(&self, channel: Channel, agent: &RuntimeAgentName, text: &str, field: &str) -> Result<bool, String>;
     fn inspect_settings(&self, files: &[settings::SettingsFile]) -> Result<Vec<settings::SettingsFinding>, String>;
     fn agent_secrets_source(&self, agent: &RuntimeAgentName, secrets_file: &Path) -> Option<Vec<SandboxCommand>>;
     fn set_setting(&self, agent: &RuntimeAgentName, key: &str, value: &str) -> Option<SandboxCommand>;
-    fn channel_settings(&self, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
+    fn set_secret_setting(&self, agent: &RuntimeAgentName, key: &str, variable: &str, target: SecretTarget) -> Option<SandboxCommand>;
+    fn channel_settings(&self, agent: &RuntimeAgentName, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
     fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path, home: &str, bridge_key: &str) -> Option<AppChannel>;
 
     // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.
