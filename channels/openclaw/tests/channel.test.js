@@ -99,6 +99,23 @@ test('disabled or rebound account authority is checked after awaited native prep
   await assert.rejects(channel.plugin.outbound.sendText({ cfg, accountId: 'main', to: 'home', text: 'must not send' }));
 });
 
+test('first-use Home has a native route before a person speaks and retains it afterwards', async t => {
+  const account = accountFixture(t); const cfg = configured(account); const channel = createChannel(); const native = nativeHarness(cfg);
+  channel.setRuntime(native.api); await start(t, channel, cfg, account);
+  const before = await channel.plugin.messaging.resolveOutboundSessionRoute({ cfg, accountId: 'main', agentId: 'main', target: 'home' });
+  assert.ok(before.sessionKey.includes(':enclos:main:direct:'));
+  assert.equal(before.from, 'enclos:main');
+  assert.equal(await channel.plugin.messaging.resolveOutboundSessionRoute({ cfg, accountId: 'main', agentId: 'scout', target: 'home' }), null);
+  const owner = await bridge(account.socket); t.after(() => owner.close()); await owner.hello();
+  const input = message('message.in', { conversation: account.home, person: 'alice', text: 'hello Home' });
+  owner.send(input); await owner.next('ack', input.id);
+  assert.equal(native.calls.dispatch.at(-1).route.sessionKey, before.sessionKey);
+  const after = await channel.plugin.messaging.resolveOutboundSessionRoute({ cfg, accountId: 'main', agentId: 'main', target: 'home' });
+  assert.equal(after.sessionKey, before.sessionKey); assert.equal(after.from, 'alice');
+  const stranger = message('message.in', { conversation: account.home, person: 'bob', text: 'different owner' });
+  owner.send(stranger); assert.equal((await owner.next('error', stranger.id)).code, 'not_allowed');
+});
+
 test('missing native binding and unsupported controls have no hidden fallback dispatch', async t => {
   const account = accountFixture(t); const cfg = configured(account); const channel = createChannel(); const native = nativeHarness(cfg);
   native.api.channel.routing.resolveAgentRoute = () => ({ agentId: 'main', matchedBy: 'default' });
