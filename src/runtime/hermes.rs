@@ -1131,6 +1131,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/plugin.yaml",
                 ".hermes/profiles/main/plugins/enclos/__init__.py",
                 ".hermes/profiles/main/plugins/enclos/adapter.py",
+                ".hermes/profiles/main/plugins/enclos/interrupts.py",
                 ".hermes/profiles/main/plugins/enclos/protocol.py",
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
                 ".hermes/profiles/main/plugins/enclos/approvals.py",
