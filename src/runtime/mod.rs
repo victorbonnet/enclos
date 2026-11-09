@@ -504,10 +504,13 @@ pub trait RuntimeAdapter {
     /// against (ADR 0060, proposed). The agent's token is a secret the
     /// policy grants it as `MOBILE_APP_TOKEN`. `None`: the runtime has no
     /// such channel.
+    /// `token_file` is the core-owned protected per-agent secret file,
+    /// passed explicitly so file consumers never infer layout.
     fn app_channel(
         &self,
         _agent: &RuntimeAgentName,
         _socket: &Path,
+        _token_file: &Path,
         _home: &str,
         _bridge_key: &str,
     ) -> Option<AppChannel> {
