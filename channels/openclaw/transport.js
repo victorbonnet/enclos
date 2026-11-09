@@ -76,8 +76,14 @@ export class ChannelTransport {
       if (!receipt || !/^[0-9a-f]{64}$/.test(receipt.hash ?? '') || !['dispatching', 'received'].includes(receipt.status)) throw new Error('invalid enclos channel receipt');
     }
     for (const [conversation, route] of Object.entries(this.state.routes)) {
-      checkedId(conversation, 'conversation'); checkedId(route?.person, 'person');
-      if (route.peer !== digest([conversation, route.person])) throw new Error('invalid enclos channel conversation route');
+      checkedId(conversation, 'conversation');
+      if (route?.kind === 'home') {
+        if (route.person != null) checkedId(route.person, 'person');
+        if (route.peer !== this.homePeer(conversation)) throw new Error('invalid enclos channel Home route');
+      } else {
+        checkedId(route?.person, 'person');
+        if (route.peer !== digest([conversation, route.person])) throw new Error('invalid enclos channel conversation route');
+      }
     }
     for (const pending of this.state.outbox) {
       checkedId(pending?.id); checkedId(pending?.conversation, 'conversation');
@@ -103,11 +109,32 @@ export class ChannelTransport {
 
   route(conversation, person) {
     checkedId(conversation, 'conversation'); checkedId(person, 'person');
-    const current = this.state.routes[conversation];
+    const current = this.state.routes[conversation] ?? (conversation === this.home ? this.homeRoute() : undefined);
+    if (current?.kind === 'home' && current.person == null) {
+      // Home can receive native output before its person first speaks there.
+      // Bind the first authenticated inbound owner without replacing context.
+      current.person = person;
+      try { this.save(); } catch (error) { current.person = null; throw error; }
+      return current;
+    }
     if (current && current.person !== person) throw new ProtocolError('not_allowed', 'conversation belongs to another person');
     if (current) return current;
     if (Object.keys(this.state.routes).length >= MAX_ROUTES) throw new Error('channel conversation registry is full');
     const route = { person, peer: digest([conversation, person]) };
+    this.state.routes[conversation] = route;
+    try { this.save(); } catch (error) { delete this.state.routes[conversation]; throw error; }
+    return route;
+  }
+
+  homePeer(conversation) {
+    return digest(['enclos-home', this.account.accountId, this.account.agentId, conversation]);
+  }
+
+  homeRoute() {
+    const conversation = checkedId(this.home, 'home');
+    if (this.state.routes[conversation]) return this.state.routes[conversation];
+    if (Object.keys(this.state.routes).length >= MAX_ROUTES) throw new Error('channel conversation registry is full');
+    const route = { kind: 'home', person: null, peer: this.homePeer(conversation) };
     this.state.routes[conversation] = route;
     try { this.save(); } catch (error) { delete this.state.routes[conversation]; throw error; }
     return route;
