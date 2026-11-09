@@ -61,6 +61,26 @@ test('a native service-backed routine response is live, agent-bound and read-onl
   assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, []);
 });
 
+test('an awaited routine response never moves to a replacement bridge connection', async t => {
+  const account = accountFixture(t), cfg = configured(account), channel = createChannel();
+  channel.setRuntime(nativeHarness(cfg).api); let service, release, entered = false;
+  channel.registerFull({ registerService(value) { service = value; } });
+  const blocked = new Promise(resolve => { release = resolve; });
+  const cron = { async list() { entered = true; await blocked; return []; } };
+  await service.start({ getCron: () => cron }); t.after(() => service.stop());
+  await start(t, channel, cfg, account);
+  const original = await bridge(account.socket); await original.hello();
+  const request = message('routine.request', { action: 'list' }); original.send(request);
+  await waitFor(() => entered);
+  await original.close();
+  await waitFor(() => channel.running.get(account.accountId).transport.peer == null);
+  const replacement = await bridge(account.socket); t.after(() => replacement.close()); await replacement.hello();
+  release();
+  await new Promise(setImmediate);
+  assert.equal(replacement.pending.some(value => value.type === 'routine.response' || value.of === request.id), false);
+  assert.deepEqual(channel.running.get(account.accountId).transport.state.outbox, []);
+});
+
 async function start(t, channel, cfg, account) {
   const controller = new AbortController();
   const lifetime = channel.plugin.gateway.startAccount({ cfg, accountId: account.accountId, abortSignal: controller.signal, setStatus() {} });

@@ -93,11 +93,16 @@ export function createChannel(sdk = {}) {
       onHello(_hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
       },
-      onControl(control, owner) {
+      onControl(control, owner, requestPeer) {
         if (control.type === 'routine.request') {
           return routines.handle(control, { account,
-            assertCurrent: () => assertCurrent(currentConfig(ctx.cfg), account, owner),
-            write: response => owner.write(response) });
+            assertCurrent: () => {
+              assertCurrent(currentConfig(ctx.cfg), account, owner);
+              if (owner.peer !== requestPeer || requestPeer.destroyed || !requestPeer.authenticated) {
+                throw new ProtocolError('agent_unavailable', 'The requesting bridge disconnected. Refresh its routines.');
+              }
+            },
+            write: response => owner.write(response, requestPeer) });
         }
         if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
         if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
