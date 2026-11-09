@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { createChannel, sessionPeer, TESTED_OPENCLAW } from '../channel.js';
+import { commandCatalog } from '../features.js';
 
 const installed = process.env.ENCLOS_OPENCLAW_PACKAGE;
 test('the installed public SDK registers the package and builds isolated session keys', { skip: !installed }, async () => {
@@ -24,4 +25,8 @@ test('the installed public SDK registers the package and builds isolated session
     bindings: [{ agentId: 'main', match: { channel: 'enclos', accountId: 'main' } }] },
     channel: 'enclos', accountId: 'main', peer: { kind: 'direct', id: 'one' }, dmScope: 'per-account-channel-peer' });
   assert.equal(bound.agentId, 'main'); assert.equal(bound.matchedBy, 'binding.account');
+  const commands = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/native-command-registry.js')));
+  const listed = commandCatalog(commands.listNativeCommandSpecsForConfig, {});
+  assert.ok(listed.some(c => c.name === 'help'));
+  assert.ok(listed.every(c => c.description.length <= 120 && /^[a-z0-9_-]{1,32}$/.test(c.name)));
 });

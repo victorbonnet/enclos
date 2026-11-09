@@ -47,11 +47,16 @@ export function readToken(file) {
 function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 
 export class ChannelTransport {
-  constructor(account, { onMessage, onStop = () => {}, capabilities = [] }) {
+  constructor(account, { onMessage, onControl, onHello, onStop = () => {}, capabilities = [], canDeliver = () => true }) {
     this.account = account;
     this.onMessage = onMessage;
+    this.onControl = onControl;
+    this.onHello = onHello;
     this.onStop = onStop;
     this.capabilities = capabilities;
+    this.bridgeCapabilities = new Set();
+    this.bridgeHello = undefined;
+    this.canDeliver = canDeliver;
     this.inflight = new Map();
     this.peer = null;
     this.server = null;
@@ -86,12 +91,17 @@ export class ChannelTransport {
       }
     }
     for (const pending of this.state.outbox) {
-      checkedId(pending?.id); checkedId(pending?.conversation, 'conversation');
-      if (pending.v !== 1 || pending.type !== 'message.out' || typeof pending.text !== 'string' ||
-          !['reply', 'notify', 'status'].includes(pending.kind)) throw new Error('invalid enclos channel outbox entry');
-      if (pending.reply_to != null) checkedId(pending.reply_to, 'reply_to');
+      checkedId(pending?.id);
+      if (pending?.type === 'question.update') checkedId(pending.question, 'question');
+      else checkedId(pending?.conversation, 'conversation');
+      if (pending.v !== 1 || !['message.out', 'approval.request', 'conversation.title', 'question.ask', 'question.update'].includes(pending.type)) throw new Error('invalid enclos channel outbox entry');
+      if (pending.type === 'message.out') {
+        if (typeof pending.text !== 'string' || !['reply', 'notify', 'status'].includes(pending.kind)) throw new Error('invalid enclos channel message');
+        if (pending.reply_to != null) checkedId(pending.reply_to, 'reply_to');
+      }
       encode(pending);
     }
+    if (this.state.policyContext != null && (typeof this.state.policyContext !== 'string' || Buffer.byteLength(this.state.policyContext) > 48 * 1024)) throw new Error('invalid saved sandbox policy context');
     this.home = account.home;
   }
 
@@ -145,9 +155,14 @@ export class ChannelTransport {
     checkedId(conversation, 'conversation');
     if (typeof text !== 'string') throw new Error('outbound text must be text');
     if (replyTo != null) checkedId(replyTo, 'reply_to');
-    if (this.state.outbox.length >= MAX_OUTBOX) throw new Error('too many replies waiting for the bridge');
     const outgoing = message('message.out', { conversation, text,
       kind: kind ?? (replyTo ? 'reply' : 'notify'), ...(replyTo ? { reply_to: replyTo } : {}) });
+    return this.enqueue(outgoing);
+  }
+
+  enqueue(outgoing) {
+    if (this.closed) throw new Error('channel account is stopped');
+    if (this.state.outbox.length >= MAX_OUTBOX) throw new Error('too many messages waiting for the bridge');
     encode(outgoing); // Reject before persistence.
     this.state.outbox.push(outgoing);
     try { this.save(); } catch (error) { this.state.outbox.pop(); throw error; }
@@ -157,6 +172,10 @@ export class ChannelTransport {
 
   write(value, peer = this.peer) {
     if (!peer || peer.destroyed || !peer.authenticated) return false;
+    try {
+      if (peer.tokenDigest !== digest(readToken(this.account.tokenFile))) { peer.destroy(); return false; }
+      if (!this.canDeliver(value, this.bridgeHello)) return false;
+    } catch { peer.destroy(); return false; }
     const bytes = encode(value);
     if (peer.writableLength + bytes.length > MAX_STATE_BYTES) { peer.destroy(); return false; }
     peer.write(bytes);
@@ -211,15 +230,20 @@ export class ChannelTransport {
             peer.tokenDigest = digest(token);
             peer.authenticated = true; clearTimeout(timer);
             if (incoming.home) this.home = incoming.home;
-            this.write(message('hello', { runtime: 'openclaw', agent: this.account.agentId, capabilities: this.capabilities }), peer);
+            this.bridgeCapabilities = new Set(incoming.capabilities ?? []);
+            const { token: _token, ...bridgeHello } = incoming;
+            this.bridgeHello = bridgeHello;
+            const capabilities = typeof this.capabilities === 'function' ? this.capabilities(bridgeHello) : this.capabilities;
+            this.write(message('hello', { runtime: 'openclaw', agent: this.account.agentId, capabilities }), peer);
             for (const pending of this.state.outbox) this.write(pending, peer);
+            Promise.resolve(this.onHello?.(bridgeHello, this)).catch(() => {});
           } else {
             if (peer.tokenDigest !== digest(readToken(this.account.tokenFile))) { peer.destroy(); return; }
             this.receive(incoming, peer);
           }
         } catch (error) {
           if (!peer.authenticated) { peer.destroy(); return; }
-          this.write(message('error', { code: error.code ?? 'bad_message', message: 'invalid bridge message', ...(error.of ? { of: error.of } : {}) }), peer);
+          this.write(message('error', { code: error instanceof ProtocolError ? error.code : 'bad_message', message: 'invalid bridge message', ...(error.of ? { of: error.of } : {}) }), peer);
         }
       }
     });
@@ -236,6 +260,12 @@ export class ChannelTransport {
     }
     if (incoming.type === 'error') return;
     if (incoming.type !== 'message.in') {
+      if (this.onControl) {
+        Promise.resolve().then(() => this.onControl(incoming, this)).then(() => this.write(message('ack', { of: incoming.id }), peer)).catch(error => {
+          this.write(message('error', { of: incoming.id, code: error.code ?? 'unsupported', message: error instanceof ProtocolError ? error.message : 'native control could not be confirmed' }), peer);
+        });
+        return;
+      }
       this.write(message('error', { of: incoming.id, code: 'unsupported', message: 'this OpenClaw channel does not implement this control' }), peer);
       return;
     }
