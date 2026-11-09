@@ -4,7 +4,7 @@ One channel package runs inside a sandbox's OpenClaw gateway. Each configured
 account belongs to an agent and listens on that agent's Unix socket. The host's
 bridge dials in and presents the agent's token; the sandbox gains no outbound
 route to the host. Text and unsolicited output are baseline. Typing, native
-command discovery, exact tool events and sandbox policy requests are negotiated
+command discovery, files, exact tool events and sandbox policy requests are negotiated
 only when their native adapters/hooks have been registered.
 
 The package is tested against **OpenClaw 2026.11.2**. `PluginRuntime.version` is
@@ -95,9 +95,18 @@ requests an explicit typed scope through a V2 invocation guard. No shell text is
 parsed. Requests grant nothing. Bounded, persisted `policy.context` is added to
 matching future native prompts; the bridge retains approval authority.
 
-Titles/rename, files/HTML, routines, questions, runtime approvals and typed
+The native scoped media loader reads permitted local files, preserving native
+local-root/reader policy. Remote output URLs are not fetched automatically. Files
+are copied into the existing media folder with opaque names before a reply is
+queued; HTML is an ordinary `text/html` attachment whose bytes are preserved.
+Inbound metadata names only a bounded regular file of that same media folder,
+never a path or symlink. There are at most ten files and 25 MiB total per message.
+The prompt explains markdown, files and the app's static HTML behavior. The app
+continues to own rendering and blocking scripts/network assets in artefacts.
+
+Titles/rename, routines, questions, runtime approvals and typed
 interruption remain separate work. Unsupported controls return `unsupported`.
-The prompt hint continues to reflect text-only delivery. Structured native
+Structured native
 control modules can gate live sends and durable replay with `canDeliver`; the
 retained bridge hello excludes its token.
 
