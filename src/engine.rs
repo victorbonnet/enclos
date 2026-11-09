@@ -45,6 +45,7 @@ pub(crate) mod tests;
 mod unenforced;
 mod usage;
 
+pub use crate::runtime::settings::{Held, SettingsFinding};
 pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
 pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use app::{AppAgent, AppAgents, AppEndpoint};
@@ -67,7 +68,6 @@ pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
 pub use service::{PROXY_WAIT, SandboxStarted, Unit};
 pub use session::{Left, SessionEnd};
-pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use staging::home_files_script;
 use staging::{Curl, Downloader};

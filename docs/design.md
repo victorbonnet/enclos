@@ -561,6 +561,7 @@ pub trait RuntimeAdapter {
     fn services(&self) -> Vec<RuntimeService>;                                 // its background processes, each named; Hermes: one gateway
     fn listener(&self) -> Option<RuntimeListener> { None }                     // ADR 0028: the service that listens, whose port the sandbox's sessions reach
     fn dashboard(&self) -> Option<RuntimeDashboard> { None }                   // ADR 0040: namespace relay; ADR 0063 (proposed): inherited Unix listener on macOS
+    fn secret_files(&self) -> Option<SecretFiles> { None }                     // explicit sandbox/agent file formats and optional folder variable
     fn settings_files(&self, agents: &[RuntimeAgentName]) -> Vec<HomePath> { /* those of the built-in agent and of `agents` */ }  // ADR 0031: read only as its services start; a change restarts each service with a `restart` signal
     fn agent_settings_files(&self, agent: &RuntimeAgentName) -> Vec<HomePath> { Vec::new() }  // those of one agent, which `doctor` looks at against what the policy grants it
     fn reads_agent_secrets(&self, text: &str, secrets_file: &Path) -> bool { false }  // whether a settings file has the agent read its secrets file
@@ -571,6 +572,14 @@ pub trait RuntimeAdapter {
     fn finish_delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // finishes a delete that failed after the agent and its folder went: Hermes 0.23.0's `profile purge-identity`
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand> { None }   // the runtime's own import of its export, run in the sandbox
     fn usage(&self, agents: &[RuntimeAgentName], since: i64, report: &Path) -> Option<SandboxCommand> { None }  // reads the runtime's own usage records in the sandbox and writes a usage report (§11, Usage); None: not provided
+
+    fn channel_token_file(&self, channel: Channel, agent: &RuntimeAgentName) -> Option<(HomePath, &'static str)>;
+    fn channel_token_is_plain(&self, channel: Channel, agent: &RuntimeAgentName, text: &str, field: &str) -> Result<bool, String>;
+    fn inspect_settings(&self, files: &[settings::SettingsFile]) -> Result<Vec<settings::SettingsFinding>, String>;
+    fn agent_secrets_source(&self, agent: &RuntimeAgentName, secrets_file: &Path) -> Option<Vec<SandboxCommand>>;
+    fn set_setting(&self, agent: &RuntimeAgentName, key: &str, value: &str) -> Option<SandboxCommand>;
+    fn channel_settings(&self, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
+    fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path, home: &str, bridge_key: &str) -> Option<AppChannel>;
 
     // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.
     fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> { Vec::new() }             // Runtime | Cache
