@@ -11,6 +11,13 @@ use crate::ids::{ConversationId, MessageId, Person};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromBridge {
+    #[serde(rename = "routine.request")]
+    RoutineRequest {
+        /// Current owner-authorized targets, supplied by the bridge rather than the device.
+        allowed_deliveries: Vec<ConversationId>,
+        #[serde(flatten)]
+        request: Box<crate::routine::RoutineRequest>,
+    },
     /// First on every connection: the agent's token, and its Home
     /// conversation, where what has no conversation of its own goes (the
     /// runtime's home channel: Hermes's cron jobs, `send_message` with no
@@ -46,6 +53,7 @@ pub enum FromBridge {
 
 /// The `type`s of [`FromBridge`].
 pub const FROM_BRIDGE_TYPES: &[&str] = &[
+    "routine.request",
     "policy.context",
     "hello",
     "message.in",
@@ -58,6 +66,8 @@ pub const FROM_BRIDGE_TYPES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum FromPlugin {
+    #[serde(rename = "routine.response")]
+    RoutineResponse(crate::routine::RoutineReply),
     /// The plugin's answer to the bridge's `hello`.
     #[serde(rename = "hello")]
     Hello {
@@ -114,6 +124,7 @@ pub enum FromPlugin {
 
 /// The `type`s of [`FromPlugin`].
 pub const FROM_PLUGIN_TYPES: &[&str] = &[
+    "routine.response",
     "hello",
     "approval.request",
     "message.out",
@@ -212,6 +223,7 @@ pub enum Capability {
     Tools,
     /// It lists the commands a person may type to it (`commands`).
     Commands,
+    Routines,
     #[serde(other)]
     Unknown,
 }
@@ -236,6 +248,9 @@ pub enum ErrorCode {
     UnknownAgent,
     UnknownConversation,
     AgentUnavailable,
+    Conflict,
+    Unsupported,
+    NotFound,
     #[serde(other)]
     Unknown,
 }

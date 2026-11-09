@@ -39,6 +39,7 @@ const APP_PLUGIN_ADAPTER: &str = include_str!("../../channels/hermes/enclos/adap
 const APP_PLUGIN_PROTOCOL: &str = include_str!("../../channels/hermes/enclos/protocol.py");
 const APP_PLUGIN_APPROVALS: &str = include_str!("../../channels/hermes/enclos/approvals.py");
 const APP_PLUGIN_OUTBOX: &str = include_str!("../../channels/hermes/enclos/outbox.py");
+const APP_PLUGIN_ROUTINES: &str = include_str!("../../channels/hermes/enclos/routines.py");
 const GATEWAY: ServiceName = ServiceName::new("gateway");
 
 /// Hermes's built-in profile, the root of its home.
@@ -285,6 +286,7 @@ impl RuntimeAdapter for Hermes {
                 file("protocol.py", APP_PLUGIN_PROTOCOL)?,
                 file("outbox.py", APP_PLUGIN_OUTBOX)?,
                 file("approvals.py", APP_PLUGIN_APPROVALS)?,
+                file("routines.py", APP_PLUGIN_ROUTINES)?,
             ],
             commands: vec![SandboxCommand::from_words(&[
                 HERMES,
@@ -1000,6 +1002,7 @@ mod tests {
                 ".hermes/profiles/main/plugins/enclos/protocol.py",
                 ".hermes/profiles/main/plugins/enclos/outbox.py",
                 ".hermes/profiles/main/plugins/enclos/approvals.py",
+                ".hermes/profiles/main/plugins/enclos/routines.py",
             ]
         );
         assert!(app.files.iter().all(|(_, contents)| !contents.is_empty()));

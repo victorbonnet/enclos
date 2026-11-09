@@ -19,6 +19,8 @@ mod approvals;
 mod avatars;
 #[path = "policy.rs"]
 mod policy;
+#[path = "routines.rs"]
+mod routines;
 
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
@@ -75,6 +77,7 @@ struct Hub {
     host: Option<String>,
     /// Open plugin connections, by agent.
     plugins: Mutex<HashMap<String, (PluginWriter, Vec<Capability>)>>,
+    routines: Mutex<routines::RoutineRequests>,
     /// The commands each agent's plugin last listed, as devices get them:
     /// kept while the bridge runs, the plugin connected or not.
     commands: Mutex<HashMap<String, Vec<Command>>>,
@@ -446,6 +449,7 @@ impl Hub {
             let _ = writer.send(FromBridge::PolicyContext { text });
         }
         let mut acks = writer.try_clone().map_err(|e| e.to_string())?;
+        let routine_connection = self.routine_connected(agent);
         plugins.insert(agent.to_owned(), (writer, hello.capabilities));
         let hub = Arc::clone(self);
         let agent = agent.to_owned();
@@ -466,6 +470,12 @@ impl Hub {
                     }
                 };
                 match message.body {
+                    FromPlugin::RoutineResponse(reply) => {
+                        hub.routine_response(&store, &agent, &routine_connection, reply);
+                    }
+                    FromPlugin::Error(error) => {
+                        hub.routine_error(&store, &agent, &routine_connection, error);
+                    }
                     FromPlugin::MessageOut {
                         conversation,
                         text,
@@ -663,6 +673,7 @@ impl Hub {
                 }
             }
             // Closed: the next message to this agent opens it again.
+            hub.routine_disconnected(&store, &agent, &routine_connection);
             hub.plugins.lock().expect("not poisoned").remove(&agent);
         });
         Ok(())
@@ -688,12 +699,23 @@ pub fn serve(
         agents,
         host,
         plugins: Mutex::new(HashMap::new()),
+        routines: Mutex::new(Default::default()),
         commands: Mutex::new(HashMap::new()),
         groups: Mutex::new(HashMap::new()),
         stops: Mutex::new(std::collections::HashSet::new()),
         devices: Mutex::new(HashMap::new()),
     });
     // Each agent's Home, the host's person's, before anything is sent to it.
+    {
+        let hub = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            let Ok(store) = hub.store() else { return };
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                hub.expire_routines(&store);
+            }
+        });
+    }
     if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
         for agent in &hub.agents {
             let _ = store.ensure_home(&agent.name, host);
@@ -1021,6 +1043,13 @@ fn run_session(
             continue;
         };
         match message.body {
+            FromDevice::RoutineRequest { agent, request } => {
+                if let Err(error) =
+                    hub.routine_request(store, device, person, &agent, message.id, request)
+                {
+                    link.send(ToDevice::Error(error))?;
+                }
+            }
             FromDevice::AgentAvatarGet { agent } => {
                 match hub.get_avatar(store, device, person, &agent, message.id.to_string()) {
                     Ok(photo) => link.send(photo)?,

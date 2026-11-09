@@ -28,6 +28,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from . import protocol
 from .outbox import Outbox
 from . import approvals
+from . import routines
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,9 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        self._routines = routines.Manager(self._path)
+        self._routines.dispatch = self._dispatch_routine
+        self._routines.runtime = self._routine_runtime
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -123,7 +127,10 @@ class EnclosAdapter(BasePlatformAdapter):
         self._adopt_home(hello.get("home"))
         try:
             listed = _hermes_commands()
-            await self._write(protocol.hello("hermes", self._agent, ("commands",) if listed else ()))
+            capabilities = ["commands"] if listed else []
+            if self._routines.available:
+                capabilities.append("routines")
+            await self._write(protocol.hello("hermes", self._agent, tuple(capabilities)))
             if listed:
                 await self._write(protocol.commands(listed))
             for message in self._outbox.pending():
@@ -145,6 +152,7 @@ class EnclosAdapter(BasePlatformAdapter):
         restart. What a /sethome set before is replaced."""
         if not home:
             return
+        self._routines.home_channel = home
         os.environ["MOBILE_APP_HOME_CHANNEL"] = home
         try:
             from gateway.config import HomeChannel, persist_home_channel
@@ -189,6 +197,12 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._on_message(message)
         elif kind == "conversation.rename":
             await self._rename(message["conversation"], message["title"])
+        elif kind == "routine.request":
+            try:
+                result = await asyncio.to_thread(self._routines.handle, message)
+                await self._write(protocol._message("routine.response", of=message["id"], **result))
+            except routines.RoutineError as error:
+                await self._write(protocol.error(error.code, str(error), message["id"]))
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
         else:
@@ -209,6 +223,33 @@ class EnclosAdapter(BasePlatformAdapter):
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
             raw_message=message, timestamp=datetime.now(tz=UTC)))
         await self._write(protocol.ack(message["id"]))
+
+    def _routine_runtime(self):
+        runner = getattr(self, "gateway_runner", None)
+        adapters = {self.platform: self}
+        if runner is not None and callable(getattr(runner, "_adapters_for_profile", None)):
+            try:
+                from hermes_constants import profile_name_for_home
+                scoped = runner._adapters_for_profile(profile_name_for_home(self._routines.home))
+                if scoped.get(self.platform) is self:
+                    adapters = scoped
+            except Exception:
+                # An older gateway's launch-profile map may name another
+                # agent's adapter. App-owned jobs can always use this one.
+                logger.debug("[%s] Using this app adapter for routine delivery", self.name)
+        return adapters, self._loop
+
+    def _dispatch_routine(self, provider, claimed) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            asyncio.to_thread(self._routines.execute, provider, claimed), self._loop)
+
+        def finished(result):
+            try:
+                result.result()
+            except Exception:
+                logger.warning("[%s] A native routine worker could not finish", self.name, exc_info=True)
+
+        future.add_done_callback(finished)
 
     # Files the agent sends. Hermes finds them in a reply (MEDIA:/path tags,
     # bare absolute paths) and calls the method for their kind; each is copied

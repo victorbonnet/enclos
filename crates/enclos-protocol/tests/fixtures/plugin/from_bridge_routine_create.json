@@ -1,0 +1,1 @@
+{"v":1,"id":"routine-create-1","type":"routine.request","allowed_deliveries":["home.lab.main","c-42"],"action":"create","definition":{"name":"Morning summary","prompt":"Summarize today's calendar.","schedule":{"kind":"cron","expression":"0 9 * * *"},"delivery":"c-42","skills":[],"toolsets":[],"script_only":false}}
