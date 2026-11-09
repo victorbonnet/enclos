@@ -1991,9 +1991,19 @@ struct Link {
     session: Session,
     /// When the device last sent anything, a ping included.
     heard: std::time::Instant,
+    /// Negotiated on this authenticated connection alone.
+    scoped_approvals: bool,
 }
 
 impl Link {
+    fn supports_question(&self, question: &enclos_protocol::question::QuestionDefinition) -> bool {
+        self.scoped_approvals
+            || question
+                .approval
+                .as_ref()
+                .is_none_or(|a| a.scopes.is_none())
+    }
+
     fn send(&mut self, body: ToDevice) -> Result<(), String> {
         let id = MessageId::new(new_id().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let plain = encode_line(&Envelope::new(id, body));
@@ -2263,6 +2273,7 @@ fn connection(
         socket,
         session,
         heard: std::time::Instant::now(),
+        scoped_approvals: false,
     };
     let known = store
         .device_by_noise_key(&noise_key)
@@ -2291,11 +2302,17 @@ fn connection(
             Err(Unread::Ended(why)) => return Err(why),
         }
     };
-    // In time: what follows is under its own bounds, not this deadline (a
-    // pairing the person confirms waits at most PAIRING_WAIT)
     drop(first_message_due);
+    let mut device_capabilities = Vec::new();
     let device = match (first.body, known) {
-        (FromDevice::Auth { device, sig }, Some(known)) if known.id == device => {
+        (
+            FromDevice::Auth {
+                device,
+                sig,
+                capabilities,
+            },
+            Some(known),
+        ) if known.id == device => {
             let sig = decode("sig", &sig)
                 .map_err(|e| unusable_first(&mut link, Some(&known.id), bad_field(&first.id, e)))?;
             if check_signature(
@@ -2319,6 +2336,7 @@ fn connection(
                     &format!("the device is {}'s, and {person} is calling", known.person),
                 ));
             }
+            device_capabilities = capabilities;
             match &known.node {
                 Some(node) if *node == caller.node_id => {}
                 Some(_) => {
@@ -2386,11 +2404,13 @@ fn connection(
     let _ = store.log(Some(&device.id), Some(&person), "connected", None);
     hub.ensure_homes(&store);
     let (sender, outbox) = channel();
+    link.scoped_approvals = device_capabilities.contains(&Capability::RuntimeApprovalScopes);
     let this = hub.generations.fetch_add(1, Ordering::Relaxed);
-    hub.devices
-        .lock()
-        .expect("not poisoned")
-        .insert(device.id.clone(), (person.clone(), sender, this));
+    {
+        let mut devices = hub.devices.lock().expect("not poisoned");
+        hub.question_device_capabilities(&device.id, &device_capabilities);
+        devices.insert(device.id.clone(), (person.clone(), sender, this));
+    }
     link.socket
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -2401,6 +2421,7 @@ fn connection(
         let mut devices = hub.devices.lock().expect("not poisoned");
         if devices.get(&device.id).map(|d| d.2) == Some(this) {
             devices.remove(&device.id);
+            hub.question_device_capabilities(&device.id, &[]);
         }
     }
     let _ = store.device_seen(&device.id);
@@ -2773,8 +2794,14 @@ fn run_session(
                     revision,
                     answer,
                 };
-                if let Err(error) = hub.question_answer(store, device, person, message.id, request)
-                {
+                if let Err(error) = hub.question_answer_on_connection(
+                    store,
+                    device,
+                    person,
+                    message.id,
+                    request,
+                    link.scoped_approvals,
+                ) {
                     link.send(ToDevice::Error(error))?;
                 }
             }
@@ -3153,7 +3180,9 @@ fn run_session(
                 }
                 .map_err(|e| e.to_string())?;
                 for question in questions {
-                    if hub.shows_question(person, &question.info.definition) {
+                    if link.supports_question(&question.info.definition)
+                        && hub.shows_question(person, &question.info.definition)
+                    {
                         link.send(ToDevice::Question {
                             question: question.info,
                         })?;
@@ -3285,6 +3314,7 @@ fn send_history(
         if let Some(question) = &m.question
             && let Some(current) = store.question(question).map_err(|e| e.to_string())?
             && current.owner == person
+            && link.supports_question(&current.info.definition)
             && hub.shows_question(person, &current.info.definition)
         {
             link.send(ToDevice::Question {
@@ -4430,6 +4460,7 @@ mod connection_end_tests {
             FromDevice::Auth {
                 device: phone.id.clone(),
                 sig: encode(signature.to_der().as_bytes()),
+                capabilities: Vec::new(),
             },
         );
         let first = device.receive();
@@ -7079,6 +7110,7 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
             FromDevice::Auth {
                 device: phone.id.clone(),
                 sig: "not base64!".to_owned(),
+                capabilities: Vec::new(),
             },
         );
         assert_eq!(
