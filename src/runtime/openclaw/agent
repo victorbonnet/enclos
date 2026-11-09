@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+operation=$1
+agent=$2
+case "$operation" in
+    add)
+        exec "$HOME/bin/openclaw" agents add "$agent" \
+            --workspace "$HOME/.openclaw/workspaces/$agent" --non-interactive --json
+        ;;
+    delete)
+        exec "$HOME/bin/openclaw" agents delete "$agent" --force --json
+        ;;
+    *) exit 2 ;;
+esac
