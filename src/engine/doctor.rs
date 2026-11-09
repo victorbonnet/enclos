@@ -18,8 +18,8 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use super::Engine;
+use super::SettingsFinding;
 use super::compile::compiled_stem;
-use super::settings_secrets::SettingsFinding;
 use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
