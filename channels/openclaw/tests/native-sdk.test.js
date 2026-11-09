@@ -48,3 +48,29 @@ test('the installed scoped media loader preserves HTML and rejects an unrelated 
   const excluded = path.join(outside, 'outside.txt'); writeFileSync(excluded, 'fixture');
   await assert.rejects(loader.loadWebMediaRaw(excluded, { localRoots: [workspace] }));
 });
+
+test('the installed native fallback retains every question and respects existing fallback text', { skip: !installed }, async () => {
+  const sdk = await import(pathToFileURL(path.join(installed, 'dist/plugin-sdk/interactive-runtime.js')));
+  const id = `ask_${'a'.repeat(32)}`;
+  const payload = { channelData: { askUser: { questionId: id } }, presentation: { title: 'Questions for you', blocks: [
+    { type: 'text', text: 'First question?' },
+    { type: 'buttons', buttons: [
+      { label: 'First option', action: { type: 'question', questionId: id, optionValue: 'first' } },
+      { label: 'Second option', action: { type: 'question', questionId: id, optionValue: 'second' } },
+    ] },
+    { type: 'context', text: 'Keep this complete explanation.' },
+    { type: 'text', text: 'Second question?' },
+    { type: 'select', placeholder: 'Choose several', options: [
+      { label: 'Third option', value: 'third' }, { label: 'Fourth option', value: 'fourth' },
+    ] },
+  ] } };
+  const rendered = await sdk.renderPresentationForDelivery({}, payload);
+  assert.equal(rendered.presentation, undefined);
+  assert.equal(rendered.text, 'Questions for you\n\nFirst question?\n\n- First option\n- Second option\n\nKeep this complete explanation.\n\nSecond question?\n\nChoose several:\n- Third option\n- Fourth option');
+  assert.deepEqual(rendered.channelData, payload.channelData);
+  assert.equal(rendered.text.includes(id), false);
+  const fallback = 'Complete native text, including the native answer instructions.';
+  assert.equal((await sdk.renderPresentationForDelivery({}, { ...payload, text: fallback, presentationTextMode: 'fallback' })).text, fallback);
+  const credential = { text: 'Never send credentials in chat; open the trusted Control UI.', channelData: payload.channelData };
+  assert.equal(await sdk.renderPresentationForDelivery({}, credential), credential);
+});
