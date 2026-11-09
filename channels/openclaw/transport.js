@@ -262,7 +262,7 @@ export class ChannelTransport {
     if (incoming.type === 'error') return;
     if (incoming.type !== 'message.in') {
       if (this.onControl) {
-        Promise.resolve().then(() => this.onControl(incoming, this)).then(() => this.write(message('ack', { of: incoming.id }), peer)).catch(error => {
+        Promise.resolve().then(() => this.onControl(incoming, this, peer)).then(() => this.write(message('ack', { of: incoming.id }), peer)).catch(error => {
           this.write(message('error', { of: incoming.id, code: error.code ?? 'unsupported', message: error instanceof ProtocolError ? error.message : 'native control could not be confirmed' }), peer);
         });
         return;
