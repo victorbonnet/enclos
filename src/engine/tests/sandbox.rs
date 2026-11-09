@@ -836,6 +836,147 @@ fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
 }
 
 #[test]
+fn connecting_an_existing_app_grant_refuses_survivors_before_configuring_or_starting() {
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::{InMemory, SecretStore};
+    use crate::service::fake::FakeServices;
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::rc::Rc;
+
+    // The app socket's full path must fit before this can reach stop.
+    let dir = tempfile::Builder::new()
+        .prefix("ea-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = Rc::new(InMemory::default());
+    let services = Rc::new(FakeServices::default());
+    let layout = Layout::at(dir.path().join("e"));
+    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let audit = JsonlAuditLog::new(layout.audit_log());
+    let engine = Engine::new(
+        layout,
+        Box::new(state),
+        Box::new(audit),
+        vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+    )
+    .with_secrets(Box::new(Rc::clone(&store)))
+    .with_services(Box::new(Rc::clone(&services)));
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "home".parse().unwrap();
+    done(
+        engine
+            .create_sandbox(&alice(), spec("home"), Confirm::Yes)
+            .unwrap(),
+    );
+    let lock = engine.state.lock().unwrap();
+    let mut record = engine.state.get(&name).unwrap().unwrap();
+    record.runtime = Some(crate::model::runtime::RuntimeKind::Hermes);
+    engine.state.put(&lock, &record).unwrap();
+    drop(lock);
+    done(
+        engine
+            .policy_refresh(&alice(), &name, Confirm::Yes)
+            .unwrap(),
+    );
+    let token: SecretRef = "home/app-token".parse().unwrap();
+    let value = SecretValue::new("private-existing-token".into()).unwrap();
+    done(
+        engine
+            .secret_set(&alice(), &token, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let before = engine.layout.read_policy("home").unwrap();
+    let after = format!(
+        "{before}\n[secrets.agents.default]\nenv = {{ MOBILE_APP_TOKEN = \"secret:home/app-token\" }}\n"
+    );
+    done(
+        engine
+            .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+            .unwrap(),
+    );
+    let policy = engine.policy(&name).unwrap();
+    let audit_before = engine.audit(None).unwrap().len();
+
+    // The parent exits, leaving a descendant which stop can count but
+    // must not signal. An existing grant must not bypass that refusal.
+    let mut program = spawn_unmarked(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .unwrap();
+    let session = SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind: SessionKind::Interactive,
+        service: None,
+        version: policy.version.version,
+        snapshot: policy.snapshot.id.clone(),
+        compiled: None,
+        root: reference(program.id()).unwrap().unwrap(),
+        pgid: Some(program.id()),
+        cgroup: None,
+        tracked: Vec::new(),
+        started_at: crate::model::now(),
+        ended_at: None,
+    };
+    let lock = engine.state.lock().unwrap();
+    let id = engine.state.put_session(&lock, &session).unwrap();
+    drop(lock);
+    let start = std::time::Instant::now();
+    let sleep = loop {
+        let view = engine.show_sandbox(&name).unwrap();
+        if let Some(member) = view.sessions[0]
+            .members
+            .iter()
+            .find(|member| member.pid != program.id())
+        {
+            break member.clone();
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    program.stdin.take().unwrap().write_all(b"\n").unwrap();
+    program.wait().unwrap();
+
+    let result =
+        engine.connect_agent_to_app(&alice(), &name, &"default".parse().unwrap(), Confirm::Yes);
+    let failed = matches!(
+        engine.show_sandbox(&name).unwrap().record.state,
+        SandboxState::Failed { .. }
+    );
+    let configured = engine.audit(None).unwrap()[audit_before..]
+        .iter()
+        .any(|entry| entry.intent.command == "runtime configure");
+    let started = !services.started.borrow().is_empty();
+
+    // End the intentionally surviving process before checking the result.
+    let sleep = ProcessRef {
+        pid: sleep.pid,
+        started: sleep.started,
+    };
+    crate::lifecycle::process::signal_process(&sleep, crate::lifecycle::process::Signal::Kill)
+        .unwrap();
+    let start = std::time::Instant::now();
+    while crate::lifecycle::process::is_same(&sleep).unwrap() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let stopped = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
+    assert_eq!(stopped.gone, [id]);
+
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("survived its stop"), "{error}");
+    assert!(failed);
+    assert!(!configured, "configuration ran despite a surviving session");
+    assert!(!started, "services started despite a surviving session");
+    assert_eq!(engine.policy(&name).unwrap(), policy);
+    assert_eq!(store.get(&token).unwrap(), Some(value));
+}
+
+#[test]
 fn stopping_a_sandbox_with_nothing_running_marks_it_stopped() {
     let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
     let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());

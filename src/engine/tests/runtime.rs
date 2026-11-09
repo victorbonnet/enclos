@@ -1329,6 +1329,67 @@ fn agent(name: &str) -> AgentName {
 }
 
 #[test]
+fn creating_a_new_profile_never_adopts_and_adopting_never_creates() {
+    let (_dir, engine, name, make) = with_hermes();
+    make("scout");
+    let audited = engine.audit(None).unwrap().len();
+    let error = engine
+        .create_agent(&alice(), &name, agent("scout"), Confirm::Yes)
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+    assert!(engine.agents(&name).unwrap().is_empty());
+    let error = engine
+        .adopt_agent(&alice(), &name, agent("missing"), Confirm::Yes)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no new agent was created"),
+        "{error}"
+    );
+    assert!(engine.agents(&name).unwrap().is_empty());
+    assert_eq!(engine.audit(None).unwrap().len(), audited);
+    let adopted = done(
+        engine
+            .adopt_agent(&alice(), &name, agent("scout"), Confirm::Ask)
+            .unwrap(),
+    );
+    assert_eq!(adopted.how, Added::Adopted);
+    assert_eq!(engine.agents(&name).unwrap()[0].name, agent("scout"));
+    assert!(engine.state.sessions(&name, false).unwrap().is_empty());
+}
+
+#[test]
+fn creating_a_profile_keeps_running_sessions_and_services() {
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&services))));
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let sleeping = super::sandbox::Sleeping::new();
+    let session = super::sandbox::session_of(&lab.engine, &lab.name, sleeping.process());
+    let session_id = super::sandbox::put(&lab.engine, &session);
+    let stops = services.stopped.borrow().len();
+    let starts = services.started.borrow().len();
+    let created = done(
+        lab.engine
+            .create_agent(&alice(), &lab.name, agent("scout"), Confirm::Ask)
+            .unwrap(),
+    );
+    assert!(matches!(created.how, Added::Created(_)));
+    assert_eq!(services.stopped.borrow().len(), stops);
+    assert_eq!(services.started.borrow().len(), starts);
+    assert!(crate::lifecycle::process::is_same(&sleeping.process()).unwrap());
+    assert!(
+        lab.engine
+            .state
+            .sessions(&lab.name, true)
+            .unwrap()
+            .iter()
+            .any(|session| session.id == session_id)
+    );
+    assert!(lab.engine.app_agents().unwrap().is_empty());
+}
+
+#[test]
 fn an_agent_made_inside_the_sandbox_is_reported_then_adopted() {
     let (_dir, engine, name, make) = with_hermes();
     make("scout");

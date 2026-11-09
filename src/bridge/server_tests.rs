@@ -441,6 +441,10 @@ fn approval_close_reaches_all_owner_devices_without_policy_or_runtime_work() {
     let owner = "owner@example.com";
     let device = avatar_device("phone", owner);
     store.add_device(&device).unwrap();
+    store.add_device(&avatar_device("tablet", owner)).unwrap();
+    store
+        .add_device(&avatar_device("guest", "guest@example.com"))
+        .unwrap();
     let mut a = approval_sample();
     a.available = false;
     a.reason = Some("This scope cannot be approved from the phone.".into());
@@ -535,6 +539,13 @@ fn approval_closed_requests_are_not_recreated_by_collection_or_agent_retries() {
 fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";
+    for (id, person) in [
+        ("phone", owner),
+        ("tablet", owner),
+        ("guest", "guest@example.com"),
+    ] {
+        store.add_device(&avatar_device(id, person)).unwrap();
+    }
     store
         .conversation("c-archive", "lab", "main", owner)
         .unwrap();
@@ -591,6 +602,7 @@ fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
 fn home_archive_is_rejected_without_a_broadcast_and_unarchive_still_recovers_it() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";
+    store.add_device(&avatar_device("phone", owner)).unwrap();
     let home = home_id("lab/main");
     store.ensure_home("lab/main", owner).unwrap();
     let (tx, rx) = channel();
@@ -638,6 +650,7 @@ fn delayed_archive_read_and_rename_snapshots_keep_their_revision() {
     let (_dir, hub, first) = diagnostic_approval_hub();
     let second = hub.store().unwrap();
     let owner = "owner@example.com";
+    first.add_device(&avatar_device("phone", owner)).unwrap();
     first
         .conversation("c-ordered", "lab", "main", owner)
         .unwrap();
@@ -764,6 +777,9 @@ fn diagnostic_probe_matching_is_exact_and_real_destinations_still_request_access
 #[test]
 fn diagnostic_probe_existing_pending_notification_is_dismissed_and_broadcast() {
     let (_dir, hub, store) = diagnostic_approval_hub();
+    store
+        .add_device(&avatar_device("d1", "owner@example.com"))
+        .unwrap();
     let (tx, rx) = channel();
     hub.devices
         .lock()
@@ -1593,6 +1609,67 @@ fn an_unpaired_device_cannot_use_provisioning_on_its_existing_connection() {
 }
 
 #[test]
+fn agent_updates_stop_reaching_a_revoked_device_on_its_existing_connection() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let person = "owner@example.com";
+    let phone = avatar_device("owner-phone", person);
+    let tablet = avatar_device("owner-tablet", person);
+    let guest = avatar_device("guest-phone", "guest@example.com");
+    for device in [&phone, &tablet, &guest] {
+        store.add_device(device).unwrap();
+    }
+    let (phone_sender, phone_updates) = channel();
+    let (tablet_sender, tablet_updates) = channel();
+    let (guest_sender, guest_updates) = channel();
+    hub.devices.lock().unwrap().extend([
+        (phone.id.clone(), (phone.person.clone(), phone_sender)),
+        (tablet.id.clone(), (tablet.person.clone(), tablet_sender)),
+        (guest.id.clone(), (guest.person.clone(), guest_sender)),
+    ]);
+    let messages = [
+        ToDevice::SandboxAgentsList {
+            of: None,
+            sandbox: "lab".into(),
+            agents: vec![enclos_protocol::device::SandboxAgentInfo {
+                agent: "coder".into(),
+                runtime: "hermes".into(),
+                app_channel: false,
+            }],
+        },
+        ToDevice::AgentCreated {
+            of: MessageId::new("create-request").unwrap(),
+            sandbox: "lab".into(),
+            agent: "coder".into(),
+            runtime: "hermes".into(),
+            app_channel: false,
+            setup: Some("enclos agent connect lab/coder --restart".into()),
+        },
+        ToDevice::AgentConnected {
+            of: MessageId::new("connect-request").unwrap(),
+            sandbox: "lab".into(),
+            agent: "coder".into(),
+            runtime: "hermes".into(),
+            app_channel: true,
+        },
+    ];
+    for message in &messages {
+        hub.deliver(person, message.clone());
+        assert_eq!(phone_updates.try_recv().unwrap(), *message);
+        assert_eq!(tablet_updates.try_recv().unwrap(), *message);
+        assert!(guest_updates.try_recv().is_err());
+    }
+
+    store.remove_device(&tablet.id).unwrap();
+    assert!(hub.devices.lock().unwrap().contains_key(&tablet.id));
+    for message in &messages {
+        hub.deliver(person, message.clone());
+        assert_eq!(phone_updates.try_recv().unwrap(), *message);
+        assert!(tablet_updates.try_recv().is_err());
+        assert!(guest_updates.try_recv().is_err());
+    }
+}
+
+#[test]
 fn provisioning_preserves_owner_checks_busy_guard_and_correlated_results() {
     let (_dir, mut hub, store) = diagnostic_approval_hub();
     let person = "owner@example.com";
@@ -1631,18 +1708,30 @@ fn provisioning_preserves_owner_checks_busy_guard_and_correlated_results() {
         .insert(device.id.clone(), (person.into(), sender));
     let operation = || Operation::create("lab", "minimal").unwrap();
     let id = || MessageId::new("setup-request").unwrap();
-    assert_eq!(
-        hub.begin(operation(), id(), &device, "guest@example.com")
-            .unwrap_err()
-            .code,
-        ErrorCode::NotAllowed
-    );
-    assert_eq!(
-        hub.begin(operation(), id(), &device, person)
-            .unwrap_err()
-            .code,
-        ErrorCode::Busy
-    );
+    for operation in [
+        operation(),
+        Operation::create_agent("lab", "scout").unwrap(),
+        Operation::connect_agent("lab", "scout").unwrap(),
+    ] {
+        assert_eq!(
+            hub.begin(operation, id(), &device, "guest@example.com")
+                .unwrap_err()
+                .code,
+            ErrorCode::NotAllowed
+        );
+    }
+    for operation in [
+        operation(),
+        Operation::create_agent("lab", "scout").unwrap(),
+        Operation::connect_agent("lab", "scout").unwrap(),
+    ] {
+        assert_eq!(
+            hub.begin(operation, id(), &device, person)
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+    }
     assert!(outbox.try_recv().is_err());
     hub.provisioning_busy.lock().unwrap().clear();
     hub.begin(operation(), id(), &device, person).unwrap();

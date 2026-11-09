@@ -2645,6 +2645,53 @@ fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn agent_new_and_connect_report_safe_structured_results_without_running_setup() {
+    let dir = tempfile::Builder::new()
+        .prefix("ecli-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = Home {
+        root: dir.path().join("e"),
+        _dir: dir,
+    };
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let make = record_hermes(&home, "home");
+    make("scout");
+    home.run(&["--yes", "policy", "refresh", "home"]).ok();
+    let before = home.audit_lines().len();
+    let (code, duplicate) = home.json(&["agent", "add", "home/scout", "--new"]);
+    assert_eq!(code, 1, "{duplicate}");
+    assert!(
+        duplicate["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already exists")
+    );
+    let (code, confirmation) = home.json(&["agent", "connect", "home/scout"]);
+    assert_ne!(code, 0, "{confirmation}");
+    assert!(
+        confirmation["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--restart")
+    );
+    let (code, plan) = home.json(&["--dry-run", "agent", "connect", "home/scout", "--restart"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(plan["dry_run"], true);
+    assert!(
+        plan["changes"]
+            .to_string()
+            .contains("ending its running sessions")
+    );
+    assert_eq!(home.audit_lines().len(), before);
+    let (_, agents) = home.json(&["agent", "list", "home"]);
+    assert_eq!(agents["agents"], serde_json::json!([]));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let home = Home::new();
     home.init(1);

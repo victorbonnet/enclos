@@ -8,6 +8,7 @@
 mod agent_rm;
 mod agents;
 mod app;
+mod app_connect;
 mod approvals;
 mod compile;
 mod configure;

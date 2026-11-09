@@ -6,11 +6,12 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use enclos_protocol::device::{RuntimeInfo, SandboxInfo};
+use enclos_protocol::device::{RuntimeInfo, SandboxAgentInfo, SandboxInfo};
 use serde_json::Value;
 
 use crate::engine::{Engine, SandboxSpec};
 use crate::layout::Layout;
+use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Planned};
 use crate::model::policy::TemplateName;
@@ -26,6 +27,14 @@ pub enum Operation {
     Install {
         name: SandboxName,
         runtime: RuntimeKind,
+    },
+    AgentCreate {
+        name: SandboxName,
+        agent: AgentName,
+    },
+    AgentConnect {
+        name: SandboxName,
+        agent: AgentName,
     },
 }
 
@@ -51,9 +60,34 @@ impl Operation {
         })
     }
 
+    pub fn create_agent(sandbox: &str, agent: &str) -> Result<Self, String> {
+        Ok(Self::AgentCreate {
+            name: sandbox
+                .parse::<SandboxName>()
+                .map_err(|error| error.to_string())?,
+            agent: agent
+                .parse::<AgentName>()
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
+    pub fn connect_agent(sandbox: &str, agent: &str) -> Result<Self, String> {
+        Ok(Self::AgentConnect {
+            name: sandbox
+                .parse::<SandboxName>()
+                .map_err(|error| error.to_string())?,
+            agent: agent
+                .parse::<AgentName>()
+                .map_err(|error| error.to_string())?,
+        })
+    }
+
     pub fn sandbox(&self) -> &str {
         match self {
-            Self::Create { name, .. } | Self::Install { name, .. } => name.as_str(),
+            Self::Create { name, .. }
+            | Self::Install { name, .. }
+            | Self::AgentCreate { name, .. }
+            | Self::AgentConnect { name, .. } => name.as_str(),
         }
     }
 
@@ -61,6 +95,8 @@ impl Operation {
         match self {
             Self::Create { .. } => "sandbox.create",
             Self::Install { .. } => "runtime.install",
+            Self::AgentCreate { .. } => "agent.create",
+            Self::AgentConnect { .. } => "agent.connect",
         }
     }
 
@@ -70,6 +106,10 @@ impl Operation {
             Self::Install { .. } => {
                 "Downloading and running the runtime's installer inside the sandbox. This can take several minutes…"
             }
+            Self::AgentCreate { .. } => "Creating the agent inside its sandbox…",
+            Self::AgentConnect { .. } => {
+                "Connecting the agent to the app and restarting its sandbox…"
+            }
         }
     }
 }
@@ -77,7 +117,19 @@ impl Operation {
 #[derive(Debug)]
 pub enum Completed {
     Created,
-    Installed { runtime: String, login: String },
+    Installed {
+        runtime: String,
+        login: String,
+    },
+    AgentCreated {
+        agent: String,
+        runtime: String,
+        setup: String,
+    },
+    AgentConnected {
+        agent: String,
+        runtime: String,
+    },
 }
 
 /// Data a worker needs to open its own engine and to identify its caller in
@@ -123,6 +175,13 @@ impl Host {
         }).collect()
     }
 
+    pub fn sandbox_agents(&self, sandbox: &str) -> Result<Vec<SandboxAgentInfo>, String> {
+        let name = sandbox
+            .parse::<SandboxName>()
+            .map_err(|error| error.to_string())?;
+        sandbox_agents(&Engine::open(self.layout.clone()), &name)
+    }
+
     /// Refreshes from host state, so setting up a new sandbox's app channel
     /// never needs a bridge restart.
     pub fn agents(&self) -> Result<Vec<super::server::AgentEndpoint>, String> {
@@ -143,7 +202,7 @@ impl Host {
 
     pub fn execute(&self, operation: &Operation, person: &str) -> Result<Completed, String> {
         if !self.is_owner(person) {
-            return Err("only the host's user can create sandboxes or install runtimes".to_owned());
+            return Err("only the host's user can manage sandboxes and agents".to_owned());
         }
         // The authenticated transport login identifies who requested the
         // change; the host is the one executing it.
@@ -164,7 +223,84 @@ impl Host {
                 Ok(Completed::Created)
             }
             Operation::Install { name, runtime } => self.install(name, *runtime),
+            Operation::AgentCreate { name, agent } => self.agent_operation(name, agent, false),
+            Operation::AgentConnect { name, agent } => self.agent_operation(name, agent, true),
         }
+    }
+
+    fn agent_operation(
+        &self,
+        name: &SandboxName,
+        agent: &AgentName,
+        connecting: bool,
+    ) -> Result<Completed, String> {
+        let target = format!("{name}/{agent}");
+        let verb = if connecting { "connect" } else { "add" };
+        let option = if connecting { "--restart" } else { "--new" };
+        let result = self.command_result(
+            &["--json", "agent", verb, &target, option],
+            "agent operation",
+        )?;
+        if connecting {
+            if result["sandbox"].as_str() != Some(name.as_str())
+                || result["agent"].as_str() != Some(agent.as_str())
+                || result["app_channel"].as_bool() != Some(true)
+            {
+                return Err("the app connection returned an incomplete or mismatched result; refresh the sandbox before trying again".to_owned());
+            }
+        } else if result["agent"].as_str() != Some(target.as_str())
+            || result["how"].as_str() != Some("created")
+        {
+            return Err("the agent was not created as a new profile; refresh the sandbox before trying again".to_owned());
+        }
+        let runtime = result["runtime"]
+            .as_str()
+            .filter(|value| value.parse::<RuntimeKind>().is_ok())
+            .ok_or_else(|| "the agent operation returned no known runtime".to_owned())?
+            .to_owned();
+        Ok(if connecting {
+            Completed::AgentConnected {
+                agent: agent.to_string(),
+                runtime,
+            }
+        } else {
+            Completed::AgentCreated {
+                agent: agent.to_string(),
+                runtime,
+                setup: format!("enclos agent connect {target} --restart"),
+            }
+        })
+    }
+
+    fn command_result(&self, arguments: &[&str], label: &str) -> Result<Value, String> {
+        let mut child = Command::new(&self.executable)
+            .args(arguments)
+            .envs(self.layout.env())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("cannot start the {label}: {error}"))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let output = std::thread::spawn(move || read_bounded(stdout, 65_536));
+        let status = child
+            .wait()
+            .map_err(|error| format!("cannot wait for the {label}: {error}"))?;
+        let bytes = output
+            .join()
+            .map_err(|_| format!("cannot read the {label} result"))??;
+        let result: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("the {label} exited with {status} without a readable result; check the sandbox on the host"))?;
+        if let Some(message) = result["error"]["message"].as_str() {
+            return Err(message.to_owned());
+        }
+        if !status.success() {
+            return Err(format!(
+                "the {label} failed; refresh the sandbox and check it on the host"
+            ));
+        }
+        Ok(result)
     }
 
     fn install(&self, name: &SandboxName, runtime: RuntimeKind) -> Result<Completed, String> {
@@ -235,6 +371,38 @@ fn read_bounded(mut stream: impl Read, limit: usize) -> Result<Vec<u8>, String> 
         saved.extend_from_slice(&chunk[..keep]);
     }
     Ok(saved)
+}
+
+fn sandbox_agents(engine: &Engine, name: &SandboxName) -> Result<Vec<SandboxAgentInfo>, String> {
+    use std::collections::BTreeSet;
+    engine
+        .require_sandbox(name)
+        .map_err(|error| error.to_string())?;
+    let Some(kind) = engine.runtime(name).map_err(|error| error.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let runtime = crate::runtime::adapter(kind);
+    let found = runtime
+        .agents_in(&engine.sandbox_home(name))
+        .map_err(|why| format!("cannot read the runtime's agents in sandbox {name}: {why}"))?;
+    let mut names = found
+        .into_iter()
+        .filter_map(|agent| agent.as_str().parse::<AgentName>().ok())
+        .collect::<BTreeSet<_>>();
+    if let Some(builtin) = runtime.builtin_agent() {
+        names.insert(builtin.agent_name());
+    }
+    let configured = engine.app_agents().map_err(|error| error.to_string())?;
+    Ok(names
+        .into_iter()
+        .map(|agent| SandboxAgentInfo {
+            app_channel: configured
+                .iter()
+                .any(|(sandbox, candidate, _)| sandbox == name && candidate == agent.as_str()),
+            agent: agent.to_string(),
+            runtime: kind.to_string(),
+        })
+        .collect())
 }
 
 fn sandbox_list(engine: &Engine) -> Result<Vec<SandboxInfo>, String> {
@@ -353,6 +521,11 @@ mod tests {
             }]
         );
         assert!(engine.app_agents().unwrap().is_empty());
+        assert!(
+            sandbox_agents(&engine, &"lab".parse().unwrap())
+                .unwrap()
+                .is_empty()
+        );
         let view = engine.show_sandbox(&"lab".parse().unwrap()).unwrap();
         assert_eq!(view.record.backend, BackendKind::Seatbelt);
         assert_eq!(view.template.as_str(), "minimal");
@@ -373,6 +546,34 @@ mod tests {
             )
             .unwrap_err()
             .contains("already exists")
+        );
+        // Management inventory includes runtime profiles before chat setup,
+        // including valid profiles the host has not explicitly tracked yet.
+        use crate::state::StateStore;
+        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let name = "lab".parse().unwrap();
+        let lock = state.lock().unwrap();
+        let mut record = state.get(&name).unwrap().unwrap();
+        record.runtime = Some(RuntimeKind::Hermes);
+        state.put(&lock, &record).unwrap();
+        drop(lock);
+        let profiles = layout.sandbox_home("lab").join(".hermes/profiles");
+        for profile in ["scout", "my_bot"] {
+            std::fs::create_dir_all(profiles.join(profile)).unwrap();
+            std::fs::write(profiles.join(profile).join("config.yaml"), "").unwrap();
+        }
+        let inventory = sandbox_agents(&engine, &name).unwrap();
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|agent| agent.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "scout"]
+        );
+        assert!(
+            inventory
+                .iter()
+                .all(|agent| agent.runtime == "hermes" && !agent.app_channel)
         );
     }
 
@@ -470,6 +671,78 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 .unwrap_err()
                 .contains("only the host's user")
         );
+    }
+
+    #[test]
+    fn agent_children_have_exact_noninteractive_arguments_and_correlated_results() {
+        for (operation, expected_args, result) in [
+            (
+                Operation::create_agent("lab", "scout").unwrap(),
+                "--json agent add lab/scout --new",
+                r#"{"agent":"lab/scout","runtime":"hermes","how":"created"}"#,
+            ),
+            (
+                Operation::connect_agent("lab", "scout").unwrap(),
+                "--json agent connect lab/scout --restart",
+                r#"{"sandbox":"lab","agent":"scout","runtime":"hermes","app_channel":true}"#,
+            ),
+        ] {
+            let body = format!(
+                "test \"$*\" = '{expected_args}' || exit 10\nif read -r ignored; then exit 12; fi\nprintf '%s\\n' '{result}'\n"
+            );
+            let (_dir, host) = fake_host(&body);
+            match host.execute(&operation, "owner@example.org").unwrap() {
+                Completed::AgentCreated {
+                    agent,
+                    runtime,
+                    setup,
+                } => {
+                    assert_eq!(agent, "scout");
+                    assert_eq!(runtime, "hermes");
+                    assert_eq!(setup, "enclos agent connect lab/scout --restart");
+                }
+                Completed::AgentConnected { agent, runtime } => {
+                    assert_eq!(agent, "scout");
+                    assert_eq!(runtime, "hermes");
+                }
+                _ => panic!("wrong completion"),
+            }
+        }
+    }
+
+    #[test]
+    fn create_refuses_adoption_and_connect_refuses_wrong_or_failed_results() {
+        for (connect, result) in [
+            (
+                false,
+                r#"{"agent":"lab/scout","runtime":"hermes","how":"adopted"}"#,
+            ),
+            (
+                true,
+                r#"{"sandbox":"other","agent":"scout","runtime":"hermes","app_channel":true}"#,
+            ),
+            (
+                true,
+                r#"{"sandbox":"lab","agent":"scout","runtime":"hermes","app_channel":false}"#,
+            ),
+            (
+                true,
+                r#"{"error":{"message":"a different policy is pending"}}"#,
+            ),
+        ] {
+            let (_dir, host) = fake_host(&format!("printf '%s\\n' '{result}'\n"));
+            let operation = if connect {
+                Operation::connect_agent("lab", "scout")
+            } else {
+                Operation::create_agent("lab", "scout")
+            }
+            .unwrap();
+            assert!(host.execute(&operation, "owner@example.org").is_err());
+        }
+        for invalid in ["../profile", "--yes", "my_bot", "", "a;id"] {
+            assert!(Operation::create_agent("lab", invalid).is_err());
+            assert!(Operation::connect_agent("lab", invalid).is_err());
+        }
     }
 
     #[test]

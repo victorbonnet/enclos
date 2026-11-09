@@ -1042,6 +1042,16 @@ impl Store {
         rows.collect()
     }
 
+    /// Whether this device is still paired for the person receiving an
+    /// update. Session senders can outlive a device's removal from the store.
+    pub fn device_is_paired(&self, id: &str, person: &str) -> rusqlite::Result<bool> {
+        self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1 AND person = ?2)",
+            params![id, person],
+            |row| row.get(0),
+        )
+    }
+
     /// Removes a device; whether there was one.
     pub fn remove_device(&self, id: &str) -> rusqlite::Result<bool> {
         Ok(self

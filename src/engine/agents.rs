@@ -84,6 +84,13 @@ enum Adoption {
     Create(SandboxCommand),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentAddition {
+    CreateOrAdopt,
+    New,
+    Existing,
+}
+
 impl Added {
     /// The `agent add` audit entry's outcome.
     fn outcome(&self) -> String {
@@ -226,6 +233,42 @@ impl Engine {
         agent: AgentName,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::CreateOrAdopt)
+    }
+
+    /// Creates a new agent, refusing a name the runtime already has rather
+    /// than adopting it. A remote Create action must not silently take over
+    /// an agent made inside the sandbox (ADR 0023).
+    pub fn create_agent(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        confirm: Confirm,
+    ) -> Result<Planned<AgentAdded>> {
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::New)
+    }
+
+    /// Tracks an agent the runtime already has, refusing a missing one
+    /// rather than falling back to creation during a connection request.
+    pub fn adopt_agent(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        confirm: Confirm,
+    ) -> Result<Planned<AgentAdded>> {
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::Existing)
+    }
+
+    fn add_or_create_agent(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        confirm: Confirm,
+        mode: AgentAddition,
+    ) -> Result<Planned<AgentAdded>> {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
@@ -239,7 +282,21 @@ impl Engine {
         // When the list cannot be read, enclos cannot tell which, and says
         // so rather than run the runtime on a guess.
         let adoption = match runtime.agents_in(&home) {
+            Ok(found) if mode == AgentAddition::New && runtime_has(&found) => {
+                return Err(Error::Session {
+                    what: format!(
+                        "agent {agent} already exists in sandbox {name}; choose a new name"
+                    ),
+                });
+            }
             Ok(found) if runtime_has(&found) => Adoption::Adopt,
+            Ok(_) if mode == AgentAddition::Existing => {
+                return Err(Error::Session {
+                    what: format!(
+                        "agent {agent} no longer exists in sandbox {name}; no new agent was created"
+                    ),
+                });
+            }
             Ok(_) => Adoption::Create(runtime.create_agent(&agent)),
             Err(why) => {
                 return Err(Error::Session {

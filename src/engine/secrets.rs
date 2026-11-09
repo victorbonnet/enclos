@@ -70,6 +70,69 @@ pub struct SecretLeft {
 }
 
 impl Engine {
+    /// Keeps a granted app token intact, or stores a fresh token at an
+    /// unused reference. Ungranted records never lend their value to a new
+    /// grant, even when an earlier connection attempt left one behind.
+    pub(super) fn ensure_app_channel_secret(
+        &self,
+        by: &Actor,
+        secret: &SecretRef,
+        granted: bool,
+    ) -> Result<()> {
+        self.write(
+            by,
+            "app channel token",
+            Some(secret.to_string()),
+            |created: &bool| {
+                if *created { "stored a new app token" } else { "kept the existing app token" }.to_owned()
+            },
+            |lock| {
+                self.require_sandbox(&secret.sandbox)?;
+                if let Some(record) = self.record_of(secret)? {
+                    if !granted {
+                        return Err(Error::Session {
+                            what: "The new app token reference is already used by another secret. Retry the connection to choose a fresh reference; no existing value was changed or granted.".to_owned(),
+                        });
+                    }
+                    if self.store_of(&record)?.get(secret)?.is_none() {
+                        return Err(Error::Session {
+                            what: format!("the app channel secret {secret} has no stored value; restore it on the host before connecting the agent"),
+                        });
+                    }
+                    return Ok(false);
+                }
+                if granted {
+                    return Err(Error::Session {
+                        what: format!("the granted app channel secret {secret} has no record; restore it on the host before connecting the agent"),
+                    });
+                }
+                let mut bytes = crate::bridge::ids::random_bytes(32).map_err(|error| Error::Session {
+                    what: format!("cannot make a random app token: {error}"),
+                })?;
+                let text = bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                zeroize::Zeroize::zeroize(&mut bytes);
+                let value = SecretValue::new(text).expect("random hex is a nonempty secret value");
+                let store = self.secrets.for_new()?;
+                if store.get(secret)?.is_some() {
+                    return Err(Error::Session {
+                        what: "The new app token reference already has an unrecorded stored value. Retry to choose a fresh reference; no existing value was changed or granted.".to_owned(),
+                    });
+                }
+                if let Err(error) = store.set(secret, &value) {
+                    return Err(match error.untouched {
+                        true => error.into(),
+                        false => self.unrecorded_value(store, secret, false, error.into()),
+                    });
+                }
+                if let Err(error) = self.state.put_secret(lock, secret, store.name()) {
+                    return Err(self.unrecorded_value(store, secret, false, error.into()));
+                }
+                Ok(true)
+            },
+        )?;
+        Ok(())
+    }
+
     /// Stores `value` as `secret`, in the secret store, and records that
     /// the sandbox has it; its value goes nowhere else. A session receives
     /// it only once its policy grants it, from its next start. A dry run

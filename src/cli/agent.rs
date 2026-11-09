@@ -31,11 +31,23 @@ impl AgentArgs {
 
 #[derive(Subcommand)]
 enum AgentVerb {
+    /// Connect an existing agent to the mobile app, giving it a private
+    /// app token and restarting only its sandbox.
+    Connect {
+        agent: AgentTarget,
+        /// Accept stopping this sandbox's running sessions and starting
+        /// its services again with the app channel configured.
+        #[arg(long)]
+        restart: bool,
+    },
     /// Add an agent, such as `lab/main`: the runtime creates it in the
     /// sandbox, imports it with --from, or enclos tracks one the runtime
     /// already has there.
     Add {
         agent: AgentTarget,
+        /// Require a new agent; never adopt one the runtime already has.
+        #[arg(long = "new", conflicts_with = "from")]
+        new_only: bool,
         /// An export the runtime's own command made on the host (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
@@ -75,10 +87,35 @@ impl FromStr for AgentTarget {
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Result<u8> {
     match args.verb {
-        AgentVerb::Add { agent, from } => {
+        AgentVerb::Connect { agent, restart } => {
+            let AgentTarget { sandbox, agent } = agent;
+            let confirm = if restart && confirm != Confirm::DryRun {
+                Confirm::Yes
+            } else {
+                confirm
+            };
+            match engine.connect_agent_to_app(by, &sandbox, &agent, confirm)? {
+                Planned::DryRun(plan) => output::show_plan(&plan),
+                Planned::Done(_) if output::json() => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "agent": agent.to_string(),
+                    "runtime": engine.runtime(&sandbox)?.map(|runtime| runtime.to_string()),
+                    "app_channel": true,
+                })),
+                Planned::Done(_) => println!(
+                    "Agent {sandbox}/{agent} is connected to the mobile app; sandbox {sandbox}'s services were started with its app channel."
+                ),
+            }
+        }
+        AgentVerb::Add {
+            agent,
+            from,
+            new_only,
+        } => {
             let AgentTarget { sandbox, agent } = agent;
             let planned = match &from {
                 Some(archive) => engine.import_agent(by, &sandbox, agent, archive, confirm)?,
+                None if new_only => engine.create_agent(by, &sandbox, agent, confirm)?,
                 None => engine.add_agent(by, &sandbox, agent, confirm)?,
             };
             let added = match planned {

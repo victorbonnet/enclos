@@ -76,6 +76,12 @@ pub enum FromDevice {
     Sandboxes,
     #[serde(rename = "runtimes")]
     Runtimes,
+    #[serde(rename = "sandbox.agents")]
+    SandboxAgents { sandbox: String },
+    #[serde(rename = "agent.create")]
+    AgentCreate { sandbox: String, agent: String },
+    #[serde(rename = "agent.connect")]
+    AgentConnect { sandbox: String, agent: String },
     #[serde(rename = "sandbox.create")]
     SandboxCreate {
         sandbox: String,
@@ -161,6 +167,9 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "agents",
     "sandboxes",
     "runtimes",
+    "sandbox.agents",
+    "agent.create",
+    "agent.connect",
     "sandbox.create",
     "runtime.install",
     "conversation.new",
@@ -225,6 +234,32 @@ pub enum ToDevice {
     SandboxesList { sandboxes: Vec<SandboxInfo> },
     #[serde(rename = "runtimes.list")]
     RuntimesList { runtimes: Vec<RuntimeInfo> },
+    /// Owner inventory, including profiles without an app channel yet.
+    #[serde(rename = "sandbox.agents.list")]
+    SandboxAgentsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<MessageId>,
+        sandbox: String,
+        agents: Vec<SandboxAgentInfo>,
+    },
+    #[serde(rename = "agent.created")]
+    AgentCreated {
+        of: MessageId,
+        sandbox: String,
+        agent: String,
+        runtime: String,
+        app_channel: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<String>,
+    },
+    #[serde(rename = "agent.connected")]
+    AgentConnected {
+        of: MessageId,
+        sandbox: String,
+        agent: String,
+        runtime: String,
+        app_channel: bool,
+    },
     #[serde(rename = "operation.progress")]
     OperationProgress {
         of: MessageId,
@@ -306,6 +341,9 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "agents.list",
     "sandboxes.list",
     "runtimes.list",
+    "sandbox.agents.list",
+    "agent.created",
+    "agent.connected",
     "operation.progress",
     "sandbox.created",
     "runtime.installed",
@@ -488,6 +526,15 @@ pub struct RuntimeInfo {
     pub runtime: String,
     pub name: String,
     pub description: String,
+}
+
+/// One runtime agent in the owner's sandbox, whether its app channel is set up or not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxAgentInfo {
+    /// The short runtime agent name, without the sandbox prefix.
+    pub agent: String,
+    pub runtime: String,
+    pub app_channel: bool,
 }
 
 /// One message of a conversation, sent or received alike.
@@ -866,9 +913,49 @@ mod tests {
                 runtime: "hermes".into(),
                 login: "enclos connect lab -- hermes setup".into(),
             },
+            ToDevice::SandboxAgentsList {
+                of: Some(id.clone()),
+                sandbox: "lab".into(),
+                agents: vec![SandboxAgentInfo {
+                    agent: "scout".into(),
+                    runtime: "hermes".into(),
+                    app_channel: false,
+                }],
+            },
+            ToDevice::AgentCreated {
+                of: id.clone(),
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+                runtime: "hermes".into(),
+                app_channel: false,
+                setup: Some("enclos agent connect lab/scout --restart".into()),
+            },
+            ToDevice::AgentConnected {
+                of: id.clone(),
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+                runtime: "hermes".into(),
+                app_channel: true,
+            },
         ] {
             let line = encode_line(&Envelope::new(id.clone(), body.clone()));
             assert_eq!(decode_to_device(&line).unwrap().body, body);
+        }
+        for body in [
+            FromDevice::SandboxAgents {
+                sandbox: "lab".into(),
+            },
+            FromDevice::AgentCreate {
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+            },
+            FromDevice::AgentConnect {
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+            },
+        ] {
+            let line = encode_line(&Envelope::new(id.clone(), body.clone()));
+            assert_eq!(decode_from_device(&line).unwrap().body, body);
         }
         assert_eq!(
             decode_to_device(

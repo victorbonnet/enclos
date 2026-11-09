@@ -168,6 +168,25 @@ impl Hub {
                     runtime,
                     login,
                 },
+                Ok(Completed::AgentCreated {
+                    agent,
+                    runtime,
+                    setup,
+                }) => ToDevice::AgentCreated {
+                    of,
+                    sandbox: sandbox.clone(),
+                    agent,
+                    runtime,
+                    app_channel: false,
+                    setup: Some(setup),
+                },
+                Ok(Completed::AgentConnected { agent, runtime }) => ToDevice::AgentConnected {
+                    of,
+                    sandbox: sandbox.clone(),
+                    agent,
+                    runtime,
+                    app_channel: true,
+                },
                 Err(message) => ToDevice::Error(ErrorBody {
                     of: Some(of),
                     code: ErrorCode::OperationFailed,
@@ -187,6 +206,24 @@ impl Hub {
                 .sandboxes()
             {
                 hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+            }
+            if matches!(
+                operation,
+                Operation::AgentCreate { .. } | Operation::AgentConnect { .. }
+            ) && let Ok(agents) = hub
+                .provisioning
+                .as_ref()
+                .expect("provisioning request checked")
+                .sandbox_agents(&sandbox)
+            {
+                hub.deliver(
+                    &person,
+                    ToDevice::SandboxAgentsList {
+                        of: None,
+                        sandbox: sandbox.clone(),
+                        agents,
+                    },
+                );
             }
             if let Ok(store) = hub.store() {
                 let _ = store.log(
@@ -225,9 +262,10 @@ impl Hub {
 
     /// Sends `message` to every connected device of `person`.
     fn deliver(&self, person: &str, message: ToDevice) {
+        let Ok(store) = self.store() else { return };
         let devices = self.devices.lock().expect("not poisoned");
-        for (owner, sender) in devices.values() {
-            if owner == person {
+        for (id, (owner, sender)) in devices.iter() {
+            if owner == person && store.device_is_paired(id, person).unwrap_or(false) {
                 let _ = sender.send(message.clone());
             }
         }
@@ -1101,7 +1139,11 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
             .as_ref()
             .is_some_and(|h| h.is_owner(&person))
         {
-            vec!["approval.close".to_owned(), "sandboxes".to_owned()]
+            vec![
+                "approval.close".to_owned(),
+                "sandboxes".to_owned(),
+                "agents.create".to_owned(),
+            ]
         } else {
             vec!["approval.close".to_owned()]
         },
@@ -1375,8 +1417,11 @@ fn run_session(
             }
             FromDevice::Sandboxes
             | FromDevice::Runtimes
+            | FromDevice::SandboxAgents { .. }
             | FromDevice::SandboxCreate { .. }
-            | FromDevice::RuntimeInstall { .. } => {
+            | FromDevice::RuntimeInstall { .. }
+            | FromDevice::AgentCreate { .. }
+            | FromDevice::AgentConnect { .. } => {
                 if !hub
                     .provisioning
                     .as_ref()
@@ -1417,11 +1462,45 @@ fn run_session(
                         })?;
                         continue;
                     }
+                    FromDevice::SandboxAgents { sandbox } => {
+                        if let Err(error) = sandbox.parse::<crate::model::sandbox::SandboxName>() {
+                            link.send(ToDevice::Error(ErrorBody {
+                                of: Some(message.id),
+                                code: ErrorCode::BadMessage,
+                                message: error.to_string(),
+                            }))?;
+                            continue;
+                        }
+                        match hub
+                            .provisioning
+                            .as_ref()
+                            .expect("provisioning request checked")
+                            .sandbox_agents(&sandbox)
+                        {
+                            Ok(agents) => link.send(ToDevice::SandboxAgentsList {
+                                of: Some(message.id),
+                                sandbox,
+                                agents,
+                            })?,
+                            Err(why) => link.send(ToDevice::Error(ErrorBody {
+                                of: Some(message.id),
+                                code: ErrorCode::OperationFailed,
+                                message: why,
+                            }))?,
+                        }
+                        continue;
+                    }
                     FromDevice::SandboxCreate { sandbox, template } => {
                         Operation::create(&sandbox, &template)
                     }
                     FromDevice::RuntimeInstall { sandbox, runtime } => {
                         Operation::install(&sandbox, &runtime)
+                    }
+                    FromDevice::AgentCreate { sandbox, agent } => {
+                        Operation::create_agent(&sandbox, &agent)
+                    }
+                    FromDevice::AgentConnect { sandbox, agent } => {
+                        Operation::connect_agent(&sandbox, &agent)
                     }
                     _ => unreachable!("matched provisioning requests"),
                 };
