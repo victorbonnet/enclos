@@ -28,6 +28,10 @@ _Avoid_: rules, permissions, config
 A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
 _Avoid_: tool approval (a runtime's own decision), command approval
 
+**Runtime approval**:
+A runtime's request for a person's decision before an operation continues, with the operation and allowed consent scopes supplied by that runtime. It changes no sandbox policy.
+_Avoid_: policy request, question (a request for information)
+
 **Compiled policy**:
 A backend's own file generated from a policy snapshot, such as a Seatbelt `.sb` file, which the backend applies to a session.
 _Avoid_: profile, sandbox profile, rules file
@@ -156,7 +160,7 @@ _Avoid_: automation, scheduled session, cron job (except when naming a runtime's
 
 **Question**:
 An agent's request for a choice or missing information in a conversation, which that conversation's owner may answer or skip.
-_Avoid_: approval (a policy request has different authority)
+_Avoid_: runtime approval, policy request (different authority)
 
 **Service**:
 A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
