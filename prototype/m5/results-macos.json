@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-09",
+  "os": {"version": "27.2", "build": "26B123", "architecture": "arm64"},
+  "runtime": "2026.11.2",
+  "runtime_commit": "b556fdf",
+  "node": "24.22.1",
+  "installer_sha256": "2218bac9796a5da99f6be8e7cc838420e282aca7897bea80a8f40dab0f6bfc3d",
+  "installer_exit": 0,
+  "native_host_service": "skipped-runtime-only",
+  "observed_install_hosts": ["nodejs.org", "registry.npmjs.org"],
+  "created_agent": "scout",
+  "observed_roster": ["main", "scout"],
+  "native_config_roster": "agents.entries",
+  "gateway": {"native_ready_log": true, "root_owns_ipv4_and_ipv6_loopback": true, "authenticated_rpc": "not-yet-probed"},
+  "secrets": {"file_mode": "0600", "test_token_absent_from_startup_environment": true, "test_token_absent_from_native_config": true},
+  "audit": {"entries": 28, "intact": true, "unfinished": 0},
+  "acceptance": {"macos": "partial-prototype-only", "linux": "deferred-new-host"}
+}
