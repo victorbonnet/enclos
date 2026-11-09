@@ -1,0 +1,11 @@
+# Install hosts observed in the macOS M5 prototype; subscription hosts
+# confirmed in the installed OpenClaw OpenAI provider. Other providers and
+# task-specific hosts remain explicit grants under the minimal template.
+[network]
+listen = true
+allow_add = [
+    "nodejs.org",
+    "registry.npmjs.org",
+    "auth.openai.com",
+    "chatgpt.com",
+]
