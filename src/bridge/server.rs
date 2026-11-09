@@ -1319,6 +1319,22 @@ fn run_session(
                     hub.deliver_conversation(store, person, id);
                 }
             }
+            FromDevice::ConversationArchive {
+                conversation,
+                archived,
+            } => match archive_conversation(hub, store, person, conversation.as_str(), archived) {
+                Ok(info) => {
+                    // Canonical metadata precedes the Ack, including retries.
+                    // Revisions let devices discard older queued broadcasts.
+                    link.send(ToDevice::Conversation(info))?;
+                    link.send(ToDevice::Ack { of: message.id })?;
+                }
+                Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+                    of: Some(message.id),
+                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+                    message: e,
+                }))?,
+            },
             FromDevice::Sync { since } => {
                 if hub.host.as_deref() == Some(person) {
                     hub.dismiss_probe_requests(store)?;
@@ -1326,7 +1342,8 @@ fn run_session(
                         link.send(ToDevice::Approval(a))?;
                     }
                 }
-                // Every conversation first, named or empty, then the messages.
+                // Every conversation first, archived or active, named or empty,
+                // then the messages. Metadata does not depend on `since`.
                 for c in store.conversations(person).map_err(|e| e.to_string())? {
                     if let Some(info) = conversation_info(store, c) {
                         link.send(ToDevice::Conversation(info))?;
@@ -1555,8 +1572,32 @@ fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo>
         title: c.title,
         titled_by: c.titled_by,
         read: c.read,
+        archived: c.archived,
+        revision: c.revision,
         members,
     })
+}
+
+/// Archive is bridge metadata, independent of every runtime's session lifecycle.
+fn archive_conversation(
+    hub: &Hub,
+    store: &Store,
+    person: &str,
+    id: &str,
+    archived: bool,
+) -> Result<ConversationInfo, String> {
+    let changed = store
+        .set_archived(id, person, archived)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no such conversation".to_owned())?;
+    if changed {
+        hub.deliver_conversation(store, person, id);
+    }
+    store
+        .conversation_info(id)
+        .map_err(|e| e.to_string())?
+        .and_then(|c| conversation_info(store, c))
+        .ok_or_else(|| "no such conversation".to_owned())
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a

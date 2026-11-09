@@ -60,9 +60,14 @@ pub struct Conversation {
     pub titled_by: Option<String>,
     /// The `seq` of the last message its owner read, on any device.
     pub read: Option<i64>,
+    /// Hidden from active lists until its owner explicitly restores it.
+    pub archived: bool,
+    /// Monotonic metadata order, independent of message `seq`.
+    pub revision: u64,
 }
 
 fn conversation_row(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
+    let revision: i64 = row.get(7)?;
     Ok(Conversation {
         id: row.get(0)?,
         sandbox: row.get(1)?,
@@ -70,6 +75,10 @@ fn conversation_row(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         title: row.get(3)?,
         titled_by: row.get(4)?,
         read: row.get(5)?,
+        archived: row.get(6)?,
+        revision: revision
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, revision))?,
     })
 }
 
@@ -133,6 +142,11 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
         ("title", "TEXT"),
         ("titled_by", "TEXT"),
         ("read", "INTEGER"),
+        ("archived", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "revision",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(typeof(revision) = 'integer' AND revision >= 0)",
+        ),
     ] {
         if !columns.iter().any(|c| c == column) {
             db.execute_batch(&format!(
@@ -162,7 +176,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     created INTEGER NOT NULL,
     title TEXT,
     titled_by TEXT,
-    read INTEGER
+    read INTEGER,
+    archived INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(typeof(revision) = 'integer' AND revision >= 0)
 );
 CREATE TABLE IF NOT EXISTS messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -453,13 +469,48 @@ impl Store {
         Ok(Store { db })
     }
 
-    /// The person's conversations, the oldest first.
+    /// All of the person's conversations, archived included, the oldest first.
     pub fn conversations(&self, owner: &str) -> rusqlite::Result<Vec<Conversation>> {
         let mut query = self.db.prepare(
-            "SELECT id, sandbox, agent, title, titled_by, read FROM conversations WHERE owner = ?1 ORDER BY created, id",
+            "SELECT id, sandbox, agent, title, titled_by, read, archived, revision FROM conversations WHERE owner = ?1 ORDER BY created, id",
         )?;
         let rows = query.query_map(params![owner], conversation_row)?;
         rows.collect()
+    }
+
+    /// Archives or restores an owner's conversation. `None` means unknown or
+    /// owned by someone else; `Some` says whether the flag changed. Content,
+    /// routing, read positions and running work are untouched.
+    pub fn set_archived(
+        &self,
+        id: &str,
+        owner: &str,
+        archived: bool,
+    ) -> rusqlite::Result<Option<bool>> {
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current = tx
+            .query_row(
+                "SELECT archived FROM conversations WHERE id = ?1 AND owner = ?2",
+                params![id, owner],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        if let Some(current) = current {
+            let changed = current != archived;
+            if changed {
+                tx.execute(
+                    "UPDATE conversations SET archived = ?3, revision = revision + 1 WHERE id = ?1 AND owner = ?2",
+                    params![id, owner, archived],
+                )?;
+            }
+            tx.commit()?;
+            Ok(Some(changed))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Its owner read conversation `id` up to message `seq`; whether that
@@ -467,7 +518,7 @@ impl Store {
     /// conversation's newest message.
     pub fn mark_read(&self, id: &str, seq: i64) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
-            "UPDATE conversations SET read = ?2 WHERE id = ?1
+            "UPDATE conversations SET read = ?2, revision = revision + 1 WHERE id = ?1
              AND (read IS NULL OR read < ?2)
              AND ?2 <= (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation = ?1)",
             params![id, seq],
@@ -483,17 +534,17 @@ impl Store {
         let title = title.trim();
         let changed = match (by, title.is_empty()) {
             (BY_PERSON, true) => self.db.execute(
-                "UPDATE conversations SET title = NULL, titled_by = NULL WHERE id = ?1 AND title IS NOT NULL",
+                "UPDATE conversations SET title = NULL, titled_by = NULL, revision = revision + 1 WHERE id = ?1 AND title IS NOT NULL",
                 params![id],
             )?,
             (BY_PERSON, false) => self.db.execute(
-                "UPDATE conversations SET title = ?2, titled_by = ?3 WHERE id = ?1
+                "UPDATE conversations SET title = ?2, titled_by = ?3, revision = revision + 1 WHERE id = ?1
                  AND (title IS NOT ?2 OR titled_by IS NOT ?3)",
                 params![id, title, BY_PERSON],
             )?,
             (_, true) => 0,
             _ => self.db.execute(
-                "UPDATE conversations SET title = ?2, titled_by = ?3 WHERE id = ?1
+                "UPDATE conversations SET title = ?2, titled_by = ?3, revision = revision + 1 WHERE id = ?1
                  AND titled_by IS NOT ?4 AND title IS NOT ?2",
                 params![id, title, by, BY_PERSON],
             )?,
@@ -534,7 +585,7 @@ impl Store {
     pub fn conversation_info(&self, id: &str) -> rusqlite::Result<Option<Conversation>> {
         self.db
             .query_row(
-                "SELECT id, sandbox, agent, title, titled_by, read FROM conversations WHERE id = ?1",
+                "SELECT id, sandbox, agent, title, titled_by, read, archived, revision FROM conversations WHERE id = ?1",
                 params![id],
                 conversation_row,
             )
@@ -574,7 +625,7 @@ impl Store {
         if self.conversation_of(&id)?.is_some() {
             if !owner.is_empty() {
                 self.db.execute(
-                    "UPDATE conversations SET owner = ?2 WHERE id = ?1 AND owner = ''",
+                    "UPDATE conversations SET owner = ?2, revision = revision + 1 WHERE id = ?1 AND owner = ''",
                     params![id, owner],
                 )?;
             }
@@ -648,18 +699,33 @@ impl Store {
         members: &[String],
         owner: &str,
     ) -> rusqlite::Result<(String, Vec<String>)> {
+        // Publish a complete member list and its revision together, including
+        // when two devices try to create the same group at once.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let (_, _, owner) = self.conversation(id, sandbox, "", owner)?;
         let known = !self.members(id)?.is_empty();
+        let mut changed = false;
         for (position, agent) in members.iter().enumerate().filter(|_| !known) {
-            self.db.execute(
+            changed |= tx.execute(
                 "INSERT OR IGNORE INTO members (conversation, agent, position) VALUES (?1, ?2, ?3)",
                 params![id, agent, position as i64],
+            )? != 0;
+        }
+        if changed {
+            tx.execute(
+                "UPDATE conversations SET revision = revision + 1 WHERE id = ?1",
+                [id],
             )?;
         }
-        Ok((
+        let result = (
             owner,
             self.members(id)?.into_iter().map(|(a, _)| a).collect(),
-        ))
+        );
+        tx.commit()?;
+        Ok(result)
     }
 
     /// A group's members, in its order, each with the `seq` of the last of
@@ -1066,11 +1132,261 @@ mod tests {
             .unwrap();
         }
         let store = Store::open(&path).unwrap();
+        assert!(!store.conversation_info("c-1").unwrap().unwrap().archived);
+        assert_eq!(store.conversation_info("c-1").unwrap().unwrap().revision, 0);
+        assert_eq!(store.set_archived("c-1", "v", true).unwrap(), Some(true));
         assert_eq!(store.since("v", 0).unwrap()[0].from, From::Agent);
         store
             .group("g-1", "lab", &["main".into(), "coder".into()], "v")
             .unwrap();
         assert_eq!(store.members("g-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn archiving_is_owned_persistent_and_preserves_the_conversation() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store.name("c-1", "Keep this history", BY_PERSON).unwrap();
+        let seq = store
+            .add("m-1", "c-1", &From::Agent, "first reply", "reply")
+            .unwrap()
+            .unwrap();
+        store.mark_read("c-1", seq).unwrap();
+        let file = StoredAttachment {
+            id: "a-1".into(),
+            conversation: "c-1".into(),
+            mime: "text/html".into(),
+            name: "report.html".into(),
+            size: 123,
+        };
+        store.add_attachment(&file, "m-1").unwrap();
+        let before = store.conversation_info("c-1").unwrap().unwrap();
+        assert_eq!(
+            store.set_archived("c-1", "someone-else", true).unwrap(),
+            None
+        );
+        assert_eq!(store.set_archived("missing", owner, true).unwrap(), None);
+        assert_eq!(
+            store.conversation_info("c-1").unwrap(),
+            Some(before.clone())
+        );
+        assert_eq!(store.set_archived("c-1", owner, true).unwrap(), Some(true));
+        assert_eq!(store.set_archived("c-1", owner, true).unwrap(), Some(false));
+        assert_eq!(
+            store.conversation_info("c-1").unwrap(),
+            Some(Conversation {
+                archived: true,
+                revision: before.revision + 1,
+                ..before.clone()
+            })
+        );
+        // A reply, a repeated creation and a reconnect never restore it implicitly.
+        store
+            .add("m-2", "c-1", &From::Agent, "later reply", "notify")
+            .unwrap();
+        store
+            .conversation("c-1", "other", "replacement", "someone-else")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.conversation_info("c-1").unwrap(),
+            Some(Conversation {
+                archived: true,
+                revision: before.revision + 1,
+                ..before.clone()
+            })
+        );
+        assert_eq!(
+            store.conversations(owner).unwrap().len(),
+            1,
+            "sync includes archived metadata"
+        );
+        assert!(store.conversations("someone-else").unwrap().is_empty());
+        assert_eq!(store.since(owner, 0).unwrap().len(), 2);
+        assert_eq!(
+            store.messages_after("c-1", 0).unwrap()[0].text,
+            "first reply"
+        );
+        assert_eq!(store.attachments_of("m-1").unwrap(), [file]);
+        assert_eq!(store.set_archived("c-1", owner, false).unwrap(), Some(true));
+        assert_eq!(
+            store.set_archived("c-1", owner, false).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            store.conversation_info("c-1").unwrap(),
+            Some(Conversation {
+                revision: before.revision + 2,
+                ..before
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_revisions_advance_only_with_committed_changes() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        let first = Store::open(&path).unwrap();
+        let second = Store::open(&path).unwrap();
+        first.conversation("c-1", "lab", "main", "owner").unwrap();
+        let revision = |store: &Store| store.conversation_info("c-1").unwrap().unwrap().revision;
+        assert_eq!(revision(&first), 0);
+        first.name("c-1", "Before", BY_AGENT).unwrap();
+        assert_eq!(revision(&second), 1);
+        first.name("c-1", "Before", BY_AGENT).unwrap();
+        assert_eq!(
+            revision(&second),
+            1,
+            "repeated metadata is not another revision"
+        );
+        second.set_archived("c-1", "owner", true).unwrap();
+        assert_eq!(revision(&first), 2);
+        second.set_archived("c-1", "owner", true).unwrap();
+        second.set_archived("c-1", "other", false).unwrap();
+        assert_eq!(revision(&first), 2);
+        first.set_archived("c-1", "owner", false).unwrap();
+        first.name("c-1", "After", BY_PERSON).unwrap();
+        assert_eq!(revision(&second), 4);
+        let seq = first
+            .add("m-1", "c-1", &From::Agent, "hello", "reply")
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision(&second), 4, "messages have their own sequence");
+        second.mark_read("c-1", seq).unwrap();
+        assert_eq!(revision(&first), 5);
+        second.mark_read("c-1", seq).unwrap();
+        first
+            .name("c-1", "Agent cannot replace the person's name", BY_AGENT)
+            .unwrap();
+        assert_eq!(revision(&first), 5);
+        first.name("c-1", "", BY_PERSON).unwrap();
+        assert_eq!(
+            revision(&second),
+            6,
+            "clearing a title changes metadata too"
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(revision(&Store::open(&path).unwrap()), 6);
+    }
+
+    #[test]
+    fn home_owner_claim_and_group_creation_publish_new_metadata_revisions() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.ensure_home("lab/main", "").unwrap();
+        let home = home_id("lab/main");
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 1);
+        store.ensure_home("lab/main", "owner").unwrap();
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 2);
+        store.ensure_home("lab/main", "other").unwrap();
+        assert_eq!(store.conversation_info(&home).unwrap().unwrap().revision, 2);
+        store
+            .group("g-1", "lab", &["main".into(), "coder".into()], "owner")
+            .unwrap();
+        assert_eq!(store.conversation_info("g-1").unwrap().unwrap().revision, 1);
+        store
+            .group("g-1", "lab", &["other".into()], "owner")
+            .unwrap();
+        assert_eq!(store.conversation_info("g-1").unwrap().unwrap().revision, 1);
+        assert_eq!(store.members("g-1").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn metadata_revision_overflow_cannot_change_the_metadata() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store.conversation("c-1", "lab", "main", "owner").unwrap();
+        assert!(
+            store
+                .db
+                .execute(
+                    "UPDATE conversations SET revision = -1 WHERE id = 'c-1'",
+                    []
+                )
+                .is_err()
+        );
+        store
+            .db
+            .execute(
+                "UPDATE conversations SET revision = ?1 WHERE id = 'c-1'",
+                [i64::MAX],
+            )
+            .unwrap();
+        let before = store.conversation_info("c-1").unwrap();
+        assert!(store.name("c-1", "must not appear", BY_PERSON).is_err());
+        assert!(store.set_archived("c-1", "owner", true).is_err());
+        assert_eq!(store.conversation_info("c-1").unwrap(), before);
+    }
+
+    #[test]
+    fn archived_groups_and_home_keep_their_routing_and_running_work() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        store
+            .group("g-1", "lab", &["main".into(), "coder".into()], owner)
+            .unwrap();
+        store
+            .turn(
+                "t-1",
+                "g-1",
+                1,
+                0,
+                "main",
+                "running",
+                Some("sent-1"),
+                Some(4),
+                None,
+            )
+            .unwrap();
+        store.saw("g-1", "main", 4).unwrap();
+        let members = store.members("g-1").unwrap();
+        let turns = store.running_turns().unwrap();
+        let route = store.conversation_of("g-1").unwrap();
+        assert_eq!(store.set_archived("g-1", owner, true).unwrap(), Some(true));
+        assert_eq!(store.members("g-1").unwrap(), members);
+        assert_eq!(store.running_turns().unwrap(), turns);
+        assert_eq!(store.conversation_of("g-1").unwrap(), route);
+        store
+            .add(
+                "g-reply",
+                "g-1",
+                &From::Member("main".into()),
+                "still working",
+                "reply",
+            )
+            .unwrap();
+        assert!(store.conversation_info("g-1").unwrap().unwrap().archived);
+        store.ensure_home("lab/main", owner).unwrap();
+        let home = home_id("lab/main");
+        assert_eq!(store.set_archived(&home, owner, true).unwrap(), Some(true));
+        store.ensure_home("lab/main", owner).unwrap();
+        store
+            .add(
+                "home-notify",
+                &home,
+                &From::Agent,
+                "scheduled result",
+                "notify",
+            )
+            .unwrap();
+        let info = store.conversation_info(&home).unwrap().unwrap();
+        assert!(info.archived);
+        assert_eq!(info.title.as_deref(), Some("Home"));
+        assert_eq!(store.owner(&home).unwrap().as_deref(), Some(owner));
+        assert_eq!(
+            store.messages_after(&home, 0).unwrap()[0].text,
+            "scheduled result"
+        );
+        for id in ["g-1", home.as_str()] {
+            assert_eq!(store.set_archived(id, owner, false).unwrap(), Some(true));
+            assert!(!store.conversation_info(id).unwrap().unwrap().archived);
+        }
     }
 
     #[test]
