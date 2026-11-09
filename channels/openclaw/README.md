@@ -113,6 +113,8 @@ rewritten. Unsupported native schedules or incomplete definitions report
 preconditions for changes/removal/manual runs or complete agent-targeted
 creation, so all writes are refused before scheduler access. See the
 [source evidence](../../docs/research/openclaw-routines.md).
+Read-only inventory/details are M5's agreed scope; mutation parity is tracked
+in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
 
 Titles/rename, structured questions, runtime approvals and typed
 interruption remain separate work. Unsupported controls return `unsupported`.
