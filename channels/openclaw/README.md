@@ -116,6 +116,12 @@ creation, so all writes are refused before scheduler access. See the
 Read-only inventory/details are M5's agreed scope; mutation parity is tracked
 in [enclos#226](https://github.com/victorbonnet/enclos/issues/226).
 
+Native question presentations retain the complete public text fallback, including
+batches and multiple selections. Credential requests retain their native trusted
+Control UI guidance. No structured question capability is advertised; see
+[the tested native question boundary](NATIVE_QUESTIONS.md) for the supported
+subset and the public APIs needed for richer controls.
+
 Titles/rename, structured questions, runtime approvals and typed
 interruption remain separate work. Unsupported controls return `unsupported`.
 Structured native
