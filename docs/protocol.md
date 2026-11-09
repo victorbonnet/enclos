@@ -117,6 +117,9 @@ The hardware key never signs anything but handshake hashes and pairing requests.
 | --- | --- | --- | --- |
 | `agents` | device | (none) | List what this person may reach |
 | `agents.list` | bridge | `agents`: `[{"agent":"lab/main","runtime":"hermes","capabilities":[…],"abilities":["read","chat"]}]` | The list, filtered to what is shared with the person |
+| `agent.name.get` | device | `agent` | Fetch an agent's shared display name; see [Agent display names](#agent-display-names) |
+| `agent.name.set` | device | `agent`, `revision`, required nullable `display_name` | Set or clear its shared display name |
+| `agent.name` | bridge | `agent`, `revision`, `display_name`, `of` | Canonical shared-name metadata, correlated or broadcast |
 | `conversation.new` | device | `conversation`, `agent` | Start one; its owner is the device's person |
 | `message.send` | device | `conversation`, `text` | A message to the conversation's agent |
 | `conversation.rename` | device | `conversation`, `title` (empty: no name) | Name one of the person's conversations, or clear its name |
@@ -280,6 +283,24 @@ Requests are not queued when the agent is unavailable, and mutations are not aut
 Hermes keeps a versioned, bounded receipt beside its channel socket for each app-created routine (request fingerprint and native id only), retaining that receipt after deletion so retrying an old create cannot recreate it. The native job's origin marker recovers a create interrupted before its receipt was written. `run` claims a native manual attempt before returning acceptance, then dispatches the exact claimed snapshot asynchronously; a paused routine must be resumed first. Native manual execution may advance the next interval occurrence; the app shows the scheduler's resulting next-run time.
 
 Hermes revision comparison and mutation share its native reentrant jobs lock. Its normal cross-process file lock can fall back to in-process locking after a native timeout or locking failure; protection against concurrent native CLI changes inherits that documented limitation ([source evidence](research/hermes-routines.md)). The plugin does not replace its scheduler's locking implementation.
+
+## Agent display names
+
+The bridge owns one optional human-readable name for each listed `<sandbox>/<agent>` ([ADR 0051](adr/0051-agent-display-names-belong-to-the-bridge.md), proposed). `agents.list` adds optional `display_name`, nonnegative `name_revision` (absent means 0), and `can_edit_name`. Supporting hosts always include `can_edit_name`, false for non-owners; its presence signals support so an app does not send name controls to an older host. At the newest accepted revision, a missing/null display name means show the stable agent identifier.
+
+Ordinary inventories inline names in `agents.list`. If their names would make that message too large for a Noise frame, the bridge omits all inline display names and sends `name_revision: 0` while retaining support/permission flags, then follows the list with individual `agent.name` messages with empty `of` for every non-default name state. Cleared names with a nonzero revision are included, so a tombstone still replaces an older cached label. Each emitted envelope stays within a 60 KiB budget. If the inventory is still too large without names, the bridge sends a correlated `bad_message` error; this change adds no inventory pagination.
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `agent.name.get` | device | `agent` | Fetch the current display name and revision |
+| `agent.name.set` | device | `agent`, required `revision`, required nullable `display_name` | Set the shared display name, or explicitly clear it with null |
+| `agent.name` | bridge | `agent`, `revision`, `display_name`, `of` | Current canonical name, correlated to a request or broadcast with empty `of` |
+
+Names are trimmed Unicode text, at most 100 Unicode scalar values and 400 UTF-8 bytes. Blank names, control characters and line separators are refused; clearing requires explicit null, not an omitted field. Names need not be unique. The host's transport-identified person on a still-paired device may edit them; paired people who can see the agent may read them. Unknown or unauthorized targets are refused. The bridge compares the revision and commits the new name and device/person log entry atomically. Clearing retains an increasing revision. An unchanged confirmed value need not advance it.
+
+A successful edit sends the canonical `agent.name` with the request id in `of` and broadcasts it to eligible connected devices with empty `of`. A stale edit changes nothing: the requester receives current metadata with empty `of`, followed by a correlated `conflict` error. The metadata refresh therefore cannot be mistaken for a successful edit. Devices keep the highest observed name revision for the full host/sandbox/agent address across agent lists, broadcasts and their local cache. Reconnecting and fresh lists restore the shared value; clearing the phone cache removes no host name.
+
+App names are confirmed host metadata, never optimistic local aliases or offline-queued edits. A timeout or disconnect requires refreshing before retrying. This adds no plugin message and calls no runtime rename command. An agent named `comptoir-dev` can display **Gégé Commit** while its canonical address, `@comptoir-dev` routing handle, runtime paths, configuration and messages stay intact. Native channels and the runtime's own identity are unchanged.
 
 ## Shared agent photos
 

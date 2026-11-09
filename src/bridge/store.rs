@@ -166,6 +166,7 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
 }
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS agent_names (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(typeof(revision) = 'integer' AND revision >= 0), display_name TEXT);
 CREATE TABLE IF NOT EXISTS agent_avatars (agent TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>=0), version TEXT, image BLOB);
 CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS conversations (
@@ -276,6 +277,110 @@ pub struct PairingRequest {
 }
 
 impl Store {
+    /// The host's shared display name, or the stable identifier at revision zero.
+    pub fn agent_name(
+        &self,
+        agent: &str,
+    ) -> rusqlite::Result<enclos_protocol::agent_name::NameMetadata> {
+        self.db
+            .query_row(
+                "SELECT revision,display_name FROM agent_names WHERE agent=?1",
+                [agent],
+                |row| {
+                    let revision: i64 = row.get(0)?;
+                    if revision < 0 {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(enclos_protocol::agent_name::NameMetadata {
+                        revision,
+                        display_name: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map(|name| name.unwrap_or_default())
+    }
+
+    pub fn agent_name_metadata(
+        &self,
+    ) -> rusqlite::Result<
+        std::collections::HashMap<String, enclos_protocol::agent_name::NameMetadata>,
+    > {
+        let mut query = self
+            .db
+            .prepare("SELECT agent,revision,display_name FROM agent_names")?;
+        query
+            .query_map([], |row| {
+                let revision: i64 = row.get(1)?;
+                if revision < 0 {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                Ok((
+                    row.get(0)?,
+                    enclos_protocol::agent_name::NameMetadata {
+                        revision,
+                        display_name: row.get(2)?,
+                    },
+                ))
+            })?
+            .collect()
+    }
+
+    /// Compare-and-set, metadata and audit entry commit together; a clear retains its revision.
+    pub fn set_agent_name(
+        &self,
+        agent: &str,
+        expected: i64,
+        display_name: Option<&str>,
+        by: (&str, &str),
+    ) -> rusqlite::Result<Option<enclos_protocol::agent_name::NameMetadata>> {
+        if expected < 0 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let current = tx
+            .query_row(
+                "SELECT revision,display_name FROM agent_names WHERE agent=?1",
+                [agent],
+                |row| {
+                    Ok(enclos_protocol::agent_name::NameMetadata {
+                        revision: row.get(0)?,
+                        display_name: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        if current.revision != expected {
+            return Ok(None);
+        }
+        if current.display_name.as_deref() == display_name {
+            return Ok(Some(current));
+        }
+        let next = enclos_protocol::agent_name::NameMetadata {
+            revision: current
+                .revision
+                .checked_add(1)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            display_name: display_name.map(str::to_owned),
+        };
+        tx.execute("INSERT INTO agent_names (agent,revision,display_name) VALUES (?1,?2,?3) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,display_name=excluded.display_name", params![agent,next.revision,next.display_name])?;
+        tx.execute(
+            "INSERT INTO log(at,device,person,event,reason) VALUES (?1,?2,?3,'agent.name.set',?4)",
+            params![
+                now(),
+                by.0,
+                by.1,
+                format!("{agent} revision {}", next.revision)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(next))
+    }
+
     /// The shared photo, or revision zero before the first edit.
     pub fn avatar(&self, agent: &str) -> rusqlite::Result<StoredAvatar> {
         self.db

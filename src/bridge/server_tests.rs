@@ -630,6 +630,471 @@ fn avatar_device(id: &str, person: &str) -> Device {
         seen: None,
     }
 }
+
+#[test]
+fn shared_agent_names_survive_restart_clear_and_stale_writers_without_renaming_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let original = Store::open(&path).unwrap();
+    original
+        .conversation("conversation", "lab", "comptoir-dev", "owner")
+        .unwrap();
+    original.ensure_home("lab/comptoir-dev", "owner").unwrap();
+    original
+        .add(
+            "message",
+            "conversation",
+            &super::super::store::From::Agent,
+            "Existing history",
+            "reply",
+        )
+        .unwrap();
+    original
+        .set_avatar("lab/comptoir-dev", 0, Some(b"photo"), ("phone", "owner"))
+        .unwrap();
+    let conversations = original.conversations("owner").unwrap();
+    let messages = original.messages_after("conversation", 0).unwrap();
+    let photo = original.avatar("lab/comptoir-dev").unwrap();
+    drop(original);
+    // The preceding bridge has no name table: opening it must add only that table.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE agent_names")
+        .unwrap();
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    assert_eq!(first.agent_name("lab/comptoir-dev").unwrap().revision, 0);
+    let saved = first
+        .set_agent_name(
+            "lab/comptoir-dev",
+            0,
+            Some("Gégé Commit"),
+            ("phone", "owner"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.revision, 1);
+    assert_eq!(second.agent_name("lab/comptoir-dev").unwrap(), saved);
+    assert!(
+        second
+            .set_agent_name(
+                "lab/comptoir-dev",
+                0,
+                Some("Stale name"),
+                ("tablet", "owner")
+            )
+            .unwrap()
+            .is_none()
+    );
+    let no_change = second
+        .set_agent_name(
+            "lab/comptoir-dev",
+            1,
+            Some("Gégé Commit"),
+            ("tablet", "owner"),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(no_change, saved);
+    assert_eq!(
+        first
+            .log_lines(20)
+            .unwrap()
+            .iter()
+            .filter(|l| l.event == "agent.name.set")
+            .count(),
+        1
+    );
+    let cleared = second
+        .set_agent_name("lab/comptoir-dev", 1, None, ("tablet", "owner"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.revision, 2);
+    assert_eq!(cleared.display_name, None);
+    drop(first);
+    drop(second);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(reopened.agent_name("lab/comptoir-dev").unwrap(), cleared);
+    assert_eq!(
+        reopened.agent_name_metadata().unwrap()["lab/comptoir-dev"],
+        cleared
+    );
+    assert!(
+        reopened
+            .set_agent_name("lab/comptoir-dev", 1, Some("Old name"), ("phone", "owner"))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(reopened.conversations("owner").unwrap(), conversations);
+    assert_eq!(
+        reopened.messages_after("conversation", 0).unwrap(),
+        messages
+    );
+    assert_eq!(reopened.avatar("lab/comptoir-dev").unwrap(), photo);
+    assert_eq!(
+        reopened.conversation_of("conversation").unwrap().unwrap().1,
+        "comptoir-dev"
+    );
+}
+
+#[test]
+fn shared_name_revisions_never_overflow_or_accept_noninteger_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let store = Store::open(&path).unwrap();
+    store
+        .set_agent_name("lab/main", 0, Some("Original"), ("phone", "owner"))
+        .unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    for revision in ["-1", "1.5", "9223372036854775808"] {
+        assert!(
+            db.execute_batch(&format!(
+                "UPDATE agent_names SET revision={revision} WHERE agent='lab/main'"
+            ))
+            .is_err()
+        );
+    }
+    db.execute(
+        "UPDATE agent_names SET revision=?1 WHERE agent='lab/main'",
+        [i64::MAX],
+    )
+    .unwrap();
+    assert!(
+        store
+            .set_agent_name("lab/main", i64::MAX, Some("Overflow"), ("phone", "owner"))
+            .is_err()
+    );
+    let kept = store.agent_name("lab/main").unwrap();
+    assert_eq!(kept.revision, i64::MAX);
+    assert_eq!(kept.display_name.as_deref(), Some("Original"));
+    assert_eq!(
+        store
+            .log_lines(20)
+            .unwrap()
+            .iter()
+            .filter(|l| l.event == "agent.name.set")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn simultaneous_name_edits_have_one_winner_at_the_same_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let ready = Arc::new(std::sync::Barrier::new(3));
+    let edits: Vec<_> = [(first, "Gégé Commit"), (second, "Another name")]
+        .into_iter()
+        .map(|(store, name)| {
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.wait();
+                store
+                    .set_agent_name("lab/comptoir-dev", 0, Some(name), ("phone", "owner"))
+                    .unwrap()
+            })
+        })
+        .collect();
+    ready.wait();
+    let outcomes: Vec<_> = edits.into_iter().map(|edit| edit.join().unwrap()).collect();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_some()).count(),
+        1
+    );
+    let saved = Store::open(&path).unwrap();
+    assert_eq!(saved.agent_name("lab/comptoir-dev").unwrap().revision, 1);
+    assert_eq!(saved.log_lines(10).unwrap().len(), 1);
+}
+
+#[test]
+fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombstones() {
+    use enclos_protocol::agent_name::NameMetadata;
+    use enclos_protocol::noise::{Initiator, MAX_NOISE_MESSAGE, Responder, generate_keypair};
+    let original: Vec<_> = (0..100)
+        .map(|i| AgentInfo {
+            agent: format!("lab/comptoir-dev-{i:03}"),
+            runtime: "hermes".into(),
+            capabilities: vec![
+                Capability::Typing,
+                Capability::Titles,
+                Capability::Tools,
+                Capability::Commands,
+                Capability::Approval,
+            ],
+            abilities: vec!["read".into(), "chat".into()],
+            avatar: enclos_protocol::avatar::AvatarMetadata {
+                revision: 1,
+                version: Some("f".repeat(64)),
+            },
+            can_edit_avatar: true,
+            can_edit_name: true,
+            display_name: (i > 1).then(|| "🦀".repeat(100)),
+            name_revision: i64::from(i),
+        })
+        .collect();
+    let raw = serde_json::to_vec(&enclos_protocol::Envelope::new(
+        MessageId::new("m".repeat(128)).unwrap(),
+        ToDevice::AgentsList {
+            agents: original.clone(),
+        },
+    ))
+    .unwrap();
+    assert!(
+        raw.len() + 16 > MAX_NOISE_MESSAGE,
+        "the original valid named inventory reproduces an oversized Noise frame: {}",
+        raw.len()
+    );
+    let messages = agent_names::agent_inventory_messages(original.clone()).unwrap();
+    assert_eq!(
+        messages.len(),
+        100,
+        "one inventory, 98 labels and one cleared tombstone"
+    );
+    let ToDevice::AgentsList { agents: inventory } = &messages[0] else {
+        panic!("inventory must precede names");
+    };
+    assert_eq!(inventory.len(), original.len());
+    for (snapshot, canonical) in inventory.iter().zip(&original) {
+        assert_eq!(snapshot.agent, canonical.agent);
+        assert_eq!(snapshot.capabilities, canonical.capabilities);
+        assert_eq!(snapshot.abilities, canonical.abilities);
+        assert_eq!(snapshot.avatar, canonical.avatar);
+        assert_eq!(snapshot.can_edit_name, canonical.can_edit_name);
+        assert_eq!(snapshot.can_edit_avatar, canonical.can_edit_avatar);
+        assert_eq!(snapshot.name_revision, 0);
+        assert_eq!(snapshot.display_name, None);
+    }
+    let bridge_key = generate_keypair().unwrap();
+    let device_key = generate_keypair().unwrap();
+    let mut initiator = Initiator::new(&device_key.private, &bridge_key.public).unwrap();
+    let mut responder = Responder::new(&bridge_key.private).unwrap();
+    responder.read_hello(&initiator.hello().unwrap()).unwrap();
+    let (answer, mut bridge_session) = responder.answer().unwrap();
+    let mut device_session = initiator.finish(&answer).unwrap();
+    let mut restored: HashMap<_, _> = inventory
+        .iter()
+        .map(|agent| (agent.agent.clone(), NameMetadata::default()))
+        .collect();
+    for message in messages {
+        let encoded = serde_json::to_vec(&enclos_protocol::Envelope::new(
+            MessageId::new("m".repeat(128)).unwrap(),
+            message,
+        ))
+        .unwrap();
+        assert!(encoded.len() <= agent_names::AGENT_MESSAGE_BUDGET);
+        let encrypted = bridge_session.encrypt(&encoded).unwrap();
+        assert!(encrypted.len() <= MAX_NOISE_MESSAGE);
+        let decoded =
+            enclos_protocol::device::decode_to_device(&device_session.decrypt(&encrypted).unwrap())
+                .unwrap();
+        if let ToDevice::AgentName(name) = decoded.body {
+            assert!(name.of.is_empty());
+            *restored
+                .get_mut(&name.agent)
+                .expect("canonical inventory address") = NameMetadata {
+                revision: name.revision,
+                display_name: name.display_name,
+            };
+        }
+    }
+    for agent in &original {
+        assert_eq!(
+            restored[&agent.agent],
+            NameMetadata {
+                revision: agent.name_revision,
+                display_name: agent.display_name.clone()
+            }
+        );
+    }
+    assert_eq!(restored["lab/comptoir-dev-001"].display_name, None);
+    assert_eq!(
+        restored["lab/comptoir-dev-001"].revision, 1,
+        "cleared state keeps its revision"
+    );
+    let normal = agent_names::agent_inventory_messages(original[2..3].to_vec()).unwrap();
+    assert_eq!(
+        normal,
+        vec![ToDevice::AgentsList {
+            agents: original[2..3].to_vec()
+        }],
+        "ordinary inventories keep names inline"
+    );
+    let too_many: Vec<_> = (0..500)
+        .map(|i| {
+            let mut agent = original[0].clone();
+            agent.agent = format!("lab/agent-{i:03}");
+            agent
+        })
+        .collect();
+    assert!(
+        agent_names::agent_inventory_messages(too_many).is_err(),
+        "an oversized base inventory reports a size error rather than truncating agents"
+    );
+}
+
+#[test]
+fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices() {
+    use enclos_protocol::agent_name::NameSet;
+    use enclos_protocol::plugin::ErrorCode;
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.extend(
+        ["lab/comptoir-dev", "other/comptoir-dev", "lab/Geg"].map(|name| AgentEndpoint {
+            name: name.into(),
+            runtime: "hermes".into(),
+            socket: dir.path().join("not-connected.sock"),
+            token: "fixture".into(),
+        }),
+    );
+    let owner = avatar_device("phone", "owner@example.com");
+    let guest = avatar_device("tablet", "guest@example.com");
+    let revoked = avatar_device("revoked", "owner@example.com");
+    store.add_device(&owner).unwrap();
+    store.add_device(&guest).unwrap();
+    let (s1, r1) = channel();
+    let (s2, r2) = channel();
+    let (s3, r3) = channel();
+    hub.devices.lock().unwrap().extend([
+        (owner.id.clone(), (owner.person.clone(), s1)),
+        (guest.id.clone(), (guest.person.clone(), s2)),
+        (revoked.id.clone(), (revoked.person.clone(), s3)),
+    ]);
+    let edit = NameSet {
+        agent: "lab/comptoir-dev".into(),
+        revision: 0,
+        display_name: Some("  Gégé Commit  ".into()),
+    };
+    assert_eq!(
+        hub.set_agent_name(&store, &guest, &guest.person, &edit, "denied".into())
+            .unwrap_err()
+            .code,
+        ErrorCode::NotAllowed
+    );
+    assert_eq!(
+        hub.set_agent_name(&store, &revoked, &revoked.person, &edit, "denied".into())
+            .unwrap_err()
+            .code,
+        ErrorCode::NotAllowed
+    );
+    assert_eq!(
+        hub.get_agent_name(
+            &store,
+            &owner,
+            &owner.person,
+            "missing/agent",
+            "read".into()
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::NotAllowed
+    );
+    let reply = hub
+        .set_agent_name(&store, &owner, &owner.person, &edit, "saved".into())
+        .unwrap();
+    let ToDevice::AgentName(name) = reply else {
+        panic!("not a name reply");
+    };
+    assert_eq!(name.of, "saved");
+    assert_eq!(name.agent, "lab/comptoir-dev");
+    assert_eq!(name.display_name.as_deref(), Some("Gégé Commit"));
+    assert_eq!(name.revision, 1);
+    let published = r1.try_recv().unwrap();
+    assert_eq!(published, r2.try_recv().unwrap());
+    assert!(r3.try_recv().is_err());
+    assert!(
+        matches!(published, ToDevice::AgentName(ref n) if n.of.is_empty() && n.display_name == name.display_name && n.agent == "lab/comptoir-dev")
+    );
+    assert!(
+        hub.get_agent_name(&store, &guest, &guest.person, &edit.agent, "read".into())
+            .is_ok()
+    );
+    assert_eq!(
+        hub.set_agent_name(&store, &owner, &owner.person, &edit, "stale".into())
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert!(r1.try_recv().is_err());
+    for bad in [Some(""), Some("\n"), Some("bad\u{2028}name")] {
+        let invalid = NameSet {
+            revision: 1,
+            display_name: bad.map(str::to_owned),
+            ..edit.clone()
+        };
+        assert_eq!(
+            hub.set_agent_name(&store, &owner, &owner.person, &invalid, "bad".into())
+                .unwrap_err()
+                .code,
+            ErrorCode::BadMessage
+        );
+    }
+    let negative = NameSet {
+        revision: -1,
+        ..edit.clone()
+    };
+    assert_eq!(
+        hub.set_agent_name(&store, &owner, &owner.person, &negative, "bad".into())
+            .unwrap_err()
+            .code,
+        ErrorCode::BadMessage
+    );
+    assert_eq!(store.agent_name("lab/comptoir-dev").unwrap().revision, 1);
+    assert_eq!(
+        store.agent_name("other/comptoir-dev").unwrap().display_name,
+        None,
+        "equal handles on other sandboxes retain their names"
+    );
+    let same_handle = NameSet {
+        revision: 1,
+        display_name: Some("Geg".into()),
+        ..edit.clone()
+    };
+    hub.set_agent_name(
+        &store,
+        &owner,
+        &owner.person,
+        &same_handle,
+        "collision".into(),
+    )
+    .unwrap();
+    assert_eq!(
+        store.agent_name("lab/Geg").unwrap().display_name,
+        None,
+        "a display name never addresses another agent"
+    );
+    assert_eq!(hub.agents[0].name, "lab/comptoir-dev");
+    assert!(hub.plugins.lock().unwrap().is_empty());
+    r1.try_recv().unwrap();
+    r2.try_recv().unwrap();
+    let no_change = NameSet {
+        revision: 2,
+        ..same_handle.clone()
+    };
+    hub.set_agent_name(&store, &owner, &owner.person, &no_change, "noop".into())
+        .unwrap();
+    assert!(r1.try_recv().is_err());
+    assert!(r2.try_recv().is_err());
+    store.remove_device(&guest.id).unwrap();
+    assert_eq!(
+        hub.get_agent_name(&store, &guest, &guest.person, &edit.agent, "read".into())
+            .unwrap_err()
+            .code,
+        ErrorCode::NotAllowed
+    );
+    let clear = NameSet {
+        revision: 2,
+        display_name: None,
+        ..edit
+    };
+    hub.set_agent_name(&store, &owner, &owner.person, &clear, "clear".into())
+        .unwrap();
+    assert!(
+        matches!(r1.try_recv().unwrap(), ToDevice::AgentName(n) if n.revision == 3 && n.display_name.is_none())
+    );
+    assert!(r2.try_recv().is_err());
+    assert!(r3.try_recv().is_err());
+}
 #[test]
 fn avatar_normalizes_to_a_bounded_square_and_refuses_untrusted_input() {
     use enclos_protocol::avatar::MAX_AVATAR_BYTES;
