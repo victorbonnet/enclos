@@ -548,7 +548,7 @@ pub trait RuntimeAdapter {
     fn set_setting(&self, agent: &RuntimeAgentName, key: &str, value: &str) -> Option<SandboxCommand>;
     fn set_secret_setting(&self, agent: &RuntimeAgentName, key: &str, variable: &str, target: SecretTarget) -> Option<SandboxCommand>;
     fn channel_settings(&self, agent: &RuntimeAgentName, channel: Channel, token: &str, answers: &[ChannelUser]) -> Option<Vec<(String, String)>>;
-    fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path, home: &str) -> Option<AppChannel>;
+    fn app_channel(&self, agent: &RuntimeAgentName, socket: &Path, token_file: &Path, home: &str) -> Option<AppChannel>;
 
     // For `enclos status`: `HomePath`s (plain components inside the home), read by the engine. Defaults name nothing.
     fn disk_parts(&self) -> Vec<(DiskPart, HomePath)> { Vec::new() }             // Runtime | Cache
