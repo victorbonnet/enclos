@@ -245,7 +245,7 @@ impl RuntimeAdapter for OpenClaw {
         ]
     }
     fn login(&self) -> String {
-        "openclaw models auth login --provider openai --device-code --set-default".into()
+        "openclaw models auth login --provider openai --device-code".into()
     }
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
         SandboxCommand::from_words(&["enclos-openclaw-agent", "add", name.as_str()])
