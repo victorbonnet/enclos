@@ -5,7 +5,7 @@ export const VERSION = 1;
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 const known = new Set(['hello', 'message.in', 'ack', 'error', 'policy.context',
-  'conversation.rename', 'conversation.delete', 'held_task.resume', 'task.get', 'routine.request', 'question.answer', 'question.sync']);
+  'conversation.rename', 'conversation.delete', 'held_task.resume', 'task.get', 'turn.abort', 'routine.request', 'question.answer', 'question.sync']);
 
 export class ProtocolError extends Error {
   constructor(code, message, of) { super(message); this.code = code; this.of = of; }
@@ -45,6 +45,8 @@ export function decode(line) {
       for (const field of ['task', 'revision', 'person', 'device']) checkedId(value[field], field);
     } else if (value.type === 'task.get') {
       checkedId(value.task, 'task');
+    } else if (value.type === 'turn.abort') {
+      checkedId(value.conversation, 'conversation'); checkedId(value.of, 'of');
     } else if (value.type === 'ack') checkedId(value.of, 'of');
     else if (value.type === 'conversation.rename') {
       checkedId(value.conversation, 'conversation');
