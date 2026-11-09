@@ -7,6 +7,7 @@ import { commandCatalog, registerFeatures } from './features.js';
 import { RoutineInventory } from './routines.js';
 import { inboundMedia, mediaFolder, stageMedia } from './media.js';
 import { createNativeTitles } from './native-titles.js';
+import { createNativeTurns } from './native-turns.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -88,7 +89,8 @@ export function createChannel(sdk = {}) {
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
     if (hasMedia) mediaFolder(account);
     let transport, titles, approvals;
-    const controllers = () => [titles, approvals].filter(Boolean);
+    const turns = createNativeTurns(() => assertCurrent(ctx.cfg, account, transport));
+    const controllers = () => [turns, titles, approvals].filter(Boolean);
     const sessionKeyFor = (conversation, person) => {
       const saved = transport.state.routes[conversation] ?? (conversation === transport.home ? transport.homeRoute() : undefined);
       if (!saved) return undefined;
@@ -98,7 +100,7 @@ export function createChannel(sdk = {}) {
     };
     transport = new ChannelTransport(account, {
       supportsAttachments: hasMedia,
-      capabilities: hello => ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
+      capabilities: hello => ['typing', 'abort', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : []), ...(titles?.available ? ['titles'] : []), ...(routines.available() ? ['routines'] : []), ...controllers().flatMap(controller => controller.capabilities?.(hello) ?? [])],
       canDeliver: (frame, hello) => controllers().every(controller => controller.canDeliver?.(frame, hello) !== false),
       onHello(hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
@@ -122,6 +124,7 @@ export function createChannel(sdk = {}) {
           handled = accepted === true || handled;
         }
         if (handled) return;
+        owner.assertControlPeer(requestPeer);
         if (control.type !== 'policy.context' || !hooks.policy) throw new ProtocolError('unsupported', 'this native control is unavailable');
         if (typeof control.text !== 'string' || Buffer.byteLength(control.text) > 48 * 1024) throw new ProtocolError('bad_message', 'policy context must be at most 48 KiB of text');
         const before = owner.state.policyContext;
@@ -129,8 +132,10 @@ export function createChannel(sdk = {}) {
         try { owner.save(); } catch (error) { owner.state.policyContext = before; throw error; }
       },
       async onMessage(incoming, route) {
+        const execution = turns.begin(incoming);
+        try {
         const cfg = currentConfig(ctx.cfg);
-        const assertAuthority = () => assertCurrent(cfg, account, transport);
+        const assertAuthority = () => { assertCurrent(cfg, account, transport); execution.signal.throwIfAborted(); };
         assertAuthority();
         const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
@@ -177,6 +182,7 @@ export function createChannel(sdk = {}) {
           cfg, channel: 'enclos', accountId: account.accountId,
           route: { agentId: account.agentId, sessionKey, dmScope: 'per-account-channel-peer' },
           ctxPayload, messageId: incoming.id, assertAuthority,
+          replyOptions: { abortSignal: execution.signal },
           dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
           delivery: { async deliver(payload) {
             assertAuthority();
@@ -192,6 +198,7 @@ export function createChannel(sdk = {}) {
               { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
           } },
         }); } finally { typing(false); void titles?.refresh(incoming.conversation); }
+        } finally { execution.finish(); }
       },
     });
     running.set(account.accountId, { transport, channel, account, cfg: ctx.cfg, sessionKeyFor });

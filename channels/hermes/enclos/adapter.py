@@ -38,6 +38,7 @@ from . import decisions
 from . import held_tasks
 from . import routines
 from . import questions
+from . import interrupts
 from . import runtime_approvals
 from . import tasks
 
@@ -108,6 +109,9 @@ class EnclosAdapter(BasePlatformAdapter):
                                      os.environ.get("ENCLOS_SANDBOX", ""), self._agent))
         # By message id: a policy request's tool call waiting for the bridge.
         self._answers: dict[str, asyncio.Future] = {}
+        self._interrupts = interrupts.Manager(self, self._interrupt_session_key,
+            lifecycle=all(callable(getattr(BasePlatformAdapter, hook, None))
+                          for hook in ("on_processing_start", "on_processing_complete")))
         # This agent's blocked tasks on Hermes's kanban board (ADR 0066): the
         # agent is the Hermes profile its socket names.
         self._held = held_tasks.Manager(self._agent, self._write)
@@ -148,6 +152,7 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         _ADAPTERS.discard(self)
+        self._interrupts.close()
         await self._reporter.stop()
         await self._questions.close()
         await self._held.close()
@@ -211,6 +216,8 @@ class EnclosAdapter(BasePlatformAdapter):
                 capabilities.append("questions")
             if self._questions.approvals_available:
                 capabilities.append("runtime_approvals")
+            if self._interrupts.available:
+                capabilities.append("abort")
             if self._held.native:
                 capabilities.append("held_tasks")
             capabilities.extend(self._reporter.capabilities)
@@ -326,6 +333,12 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.ack(message["id"]))
         elif kind == "message.in":
             await self._on_message(message)
+        elif kind == "turn.abort":
+            try:
+                await self._interrupts.abort(message)
+                await self._write(protocol.ack(message["id"]))
+            except protocol.DecodeError as e:
+                await self._write(protocol.error(e.code, str(e), message["id"]))
         elif kind == "conversation.delete":
             task = asyncio.create_task(conversations.handle(self, message))
             self._routine_tasks.add(task)
@@ -409,13 +422,40 @@ class EnclosAdapter(BasePlatformAdapter):
             await self.send(message["conversation"], runtime_approvals.TYPED_ANSWER, reply_to=message["id"])
             await self._write(protocol.ack(message["id"]))
             return
-        await self.handle_message(event)
+        try:
+            self._interrupts.admit(event)
+        except protocol.DecodeError as e:
+            await self._write(protocol.error(e.code, str(e), message["id"]))
+            return
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            self._interrupts.complete(event)
+            raise
+        if getattr(event, "_gateway_accepted", True) is False:
+            self._interrupts.complete(event)
         # Only once the runtime has it: if handle_message raised, the bridge
         # sends it again and it must not read as a duplicate
         self._seen[message["id"]] = None
         while len(self._seen) > SEEN_MESSAGES:
             self._seen.popitem(last=False)
         await self._write(protocol.ack(message["id"]))
+
+    def _interrupt_session_key(self, event) -> str:
+        from gateway.session import build_session_key
+        return build_session_key(event.source, profile=self._session_key_profile(event.source))
+
+    async def on_processing_start(self, event) -> None:
+        self._interrupts.start(event)
+        native_hook = getattr(super(), "on_processing_start", None)
+        if callable(native_hook):
+            await native_hook(event)
+
+    async def on_processing_complete(self, event, outcome) -> None:
+        self._interrupts.complete(event)
+        native_hook = getattr(super(), "on_processing_complete", None)
+        if callable(native_hook):
+            await native_hook(event, outcome)
 
     def _routine_runtime(self):
         runner = getattr(self, "gateway_runner", None)
