@@ -478,6 +478,8 @@ mod tests {
             "~/Library/Application Support/Bitwarden CLI",
             // Other assistant tools
             "~/Library/Application Support/Claude",
+            "~/.openclaw",
+            "~/.openclaw-dev",
             "~/.gemini",
             "~/.cursor",
             "~/Library/Application Support/Cursor",

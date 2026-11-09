@@ -84,6 +84,8 @@
         "/nonexistent-enclos-test/alice/.netrc",
         "/nonexistent-enclos-test/alice/.node_repl_history",
         "/nonexistent-enclos-test/alice/.npmrc",
+        "/nonexistent-enclos-test/alice/.openclaw",
+        "/nonexistent-enclos-test/alice/.openclaw-dev",
         "/nonexistent-enclos-test/alice/.password-store",
         "/nonexistent-enclos-test/alice/.pgpass",
         "/nonexistent-enclos-test/alice/.pki",
