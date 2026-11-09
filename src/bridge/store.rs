@@ -598,6 +598,24 @@ impl Store {
         )? == 1)
     }
 
+    /// Closes attention only. The original request and policy decision stay intact.
+    /// The first write races with claim_approval; only one transition can win.
+    pub fn close_approval(&self, id: &str, device: &str, person: &str) -> rusqlite::Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE approvals SET state='closed' WHERE id=?1 AND state IN ('pending','failed')",
+            [id],
+        )? == 1;
+        if changed {
+            tx.execute(
+                "INSERT INTO log (at,device,person,event,reason) VALUES (?1,?2,?3,'approval.closed',?4)",
+                params![now(), device, person, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let db = Connection::open(path)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;

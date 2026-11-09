@@ -156,7 +156,7 @@ The record of one state-changing command: time, user, host, command, state befor
 _Avoid_: event, log line
 
 **Policy request**:
-A proposed scope of access for a sandbox, which the host's person may approve or deny. Approving it changes the sandbox's policy for all of its agents.
+A proposed scope of access for a sandbox, which the host's person may approve, deny or close without a new decision. Approval changes the sandbox's policy for all of its agents; closing puts the request aside without accepting or rejecting its scope.
 _Avoid_: tool approval (a runtime's own decision), command approval
 
 **Runtime approval**:
