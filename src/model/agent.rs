@@ -74,6 +74,39 @@ pub struct AgentRecord {
     pub created_at: Timestamp,
 }
 
+/// Bounded initial instructions for a newly created runtime profile.
+/// Existing profiles are never changed through the Create action.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentInstructions(String);
+
+impl fmt::Debug for AgentInstructions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentInstructions")
+            .field("bytes", &self.0.len())
+            .finish()
+    }
+}
+
+pub const MAX_AGENT_INSTRUCTIONS_BYTES: usize = 8192;
+
+impl AgentInstructions {
+    pub fn new(text: String) -> Result<Self, String> {
+        if text.len() > MAX_AGENT_INSTRUCTIONS_BYTES {
+            return Err(format!(
+                "agent instructions must be at most {MAX_AGENT_INSTRUCTIONS_BYTES} UTF-8 bytes"
+            ));
+        }
+        if text.trim().is_empty() || text.contains('\0') {
+            return Err("agent instructions must contain text and no NUL characters".to_owned());
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +131,26 @@ mod tests {
             &"a".repeat(42),
         ] {
             assert!(bad.parse::<AgentName>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn initial_instructions_are_bounded_as_utf8_without_changing_the_text() {
+        let text = "# Voice\nBe direct. λ\n";
+        assert_eq!(AgentInstructions::new(text.into()).unwrap().as_str(), text);
+        assert!(
+            !format!("{:?}", AgentInstructions::new(text.into()).unwrap()).contains("Be direct")
+        );
+        assert!(AgentInstructions::new("a".repeat(MAX_AGENT_INSTRUCTIONS_BYTES)).is_ok());
+        assert!(AgentInstructions::new("λ".repeat(MAX_AGENT_INSTRUCTIONS_BYTES / 2)).is_ok());
+        for invalid in [
+            "".into(),
+            " \n\t".into(),
+            "a\0b".into(),
+            "a".repeat(MAX_AGENT_INSTRUCTIONS_BYTES + 1),
+            "λ".repeat(MAX_AGENT_INSTRUCTIONS_BYTES / 2 + 1),
+        ] {
+            assert!(AgentInstructions::new(invalid).is_err());
         }
     }
 }

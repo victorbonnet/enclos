@@ -99,6 +99,29 @@ impl Engine {
         files: &[(HomePath, &str)],
         tag: &str,
     ) -> Result<SandboxCommand> {
+        self.stage_home_copy_checked(name, files, tag, false)
+    }
+
+    /// Initial instructions must not follow a cloned link into another
+    /// profile. Check destination components inside the sandbox before
+    /// replacing the new profile's own file.
+    pub(super) fn stage_profile_instructions(
+        &self,
+        name: &SandboxName,
+        file: HomePath,
+        text: &str,
+        tag: &str,
+    ) -> Result<SandboxCommand> {
+        self.stage_home_copy_checked(name, &[(file, text)], tag, true)
+    }
+
+    fn stage_home_copy_checked(
+        &self,
+        name: &SandboxName,
+        files: &[(HomePath, &str)],
+        tag: &str,
+        refuse_links: bool,
+    ) -> Result<SandboxCommand> {
         let dir = self.layout.sandbox_installers(name.as_str());
         std::fs::create_dir_all(&dir).map_err(io(&dir))?;
         let mut staged = Vec::new();
@@ -116,7 +139,22 @@ impl Engine {
             .zip(&places)
             .map(|(path, place)| (path.as_path(), place.as_str(), false))
             .collect();
-        let script = copy_into_home_script(&copies);
+        let mut script = String::new();
+        if refuse_links {
+            for (file, _) in files {
+                let mut prefix = PathBuf::new();
+                for component in file.as_path().components() {
+                    prefix.push(component);
+                    script.push_str(&format!("if test -L \"$HOME\"/{}; then echo 'enclos: cannot save initial instructions through a symbolic link' >&2; exit 1; fi\n", sh_word(&prefix.display().to_string())));
+                }
+                let target = format!(
+                    "\"$HOME\"/{}",
+                    sh_word(&file.as_path().display().to_string())
+                );
+                script.push_str(&format!("if test -e {target} && ! test -f {target}; then echo 'enclos: initial instructions must replace a plain file' >&2; exit 1; fi\n"));
+            }
+        }
+        script.push_str(&copy_into_home_script(&copies));
         let words: Vec<OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
         Ok(SandboxCommand::new(words).reading(staged))
     }

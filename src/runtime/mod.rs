@@ -284,6 +284,12 @@ pub trait RuntimeAdapter {
     fn agent_settings_files(&self, _agent: &RuntimeAgentName) -> Vec<HomePath> {
         Vec::new()
     }
+    /// The initial instructions of an agent, read by the runtime as that
+    /// profile's identity. Only newly created profiles are written here;
+    /// the client supplies content, never a path. None: unsupported.
+    fn agent_instructions_file(&self, _agent: &AgentName) -> Option<HomePath> {
+        None
+    }
     /// Whether `text`, a settings file of an agent, has it read its secrets
     /// from `secrets_file`, as [`RuntimeAdapter::agent_secrets_source`] sets
     /// up (ADR 0036).

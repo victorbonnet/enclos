@@ -1,5 +1,6 @@
 //! `enclos agent`: the runtime's agents in a sandbox.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -10,7 +11,7 @@ use super::output;
 
 use enclos::engine::{Added, AgentCheck, AgentRemoved, Engine, FilesKept, Leftover};
 use enclos::error::{Result, exit};
-use enclos::model::agent::AgentName;
+use enclos::model::agent::{AgentInstructions, AgentName, MAX_AGENT_INSTRUCTIONS_BYTES};
 use enclos::model::audit::Actor;
 use enclos::model::plan::{Confirm, Planned};
 use enclos::model::sandbox::SandboxName;
@@ -48,6 +49,10 @@ enum AgentVerb {
         /// Require a new agent; never adopt one the runtime already has.
         #[arg(long = "new", conflicts_with = "from")]
         new_only: bool,
+        /// Read this new profile's initial instructions as UTF-8 on stdin.
+        /// Requires --new; the text never becomes a command argument.
+        #[arg(long, requires = "new_only", conflicts_with = "from")]
+        instructions_stdin: bool,
         /// An export the runtime's own command made on the host (for Hermes, `hermes profile export`); the runtime imports it inside the sandbox.
         #[arg(long, value_name = "ARCHIVE")]
         from: Option<PathBuf>,
@@ -111,11 +116,37 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             agent,
             from,
             new_only,
+            instructions_stdin,
         } => {
             let AgentTarget { sandbox, agent } = agent;
+            let instructions = if instructions_stdin {
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .lock()
+                    .take(MAX_AGENT_INSTRUCTIONS_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| enclos::error::Error::Session {
+                        what: format!("cannot read initial instructions: {error}"),
+                    })?;
+                let text = String::from_utf8(bytes).map_err(|_| enclos::error::Error::Session {
+                    what: "initial instructions must be UTF-8 text".to_owned(),
+                })?;
+                Some(
+                    AgentInstructions::new(text)
+                        .map_err(|what| enclos::error::Error::Session { what })?,
+                )
+            } else {
+                None
+            };
             let planned = match &from {
                 Some(archive) => engine.import_agent(by, &sandbox, agent, archive, confirm)?,
-                None if new_only => engine.create_agent(by, &sandbox, agent, confirm)?,
+                None if new_only => engine.create_agent_with_instructions(
+                    by,
+                    &sandbox,
+                    agent,
+                    instructions.as_ref(),
+                    confirm,
+                )?,
                 None => engine.add_agent(by, &sandbox, agent, confirm)?,
             };
             let added = match planned {

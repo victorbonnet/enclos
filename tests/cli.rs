@@ -2646,6 +2646,7 @@ fn record_hermes(home: &Home, name: &str) -> impl Fn(&str) {
 #[cfg(target_os = "macos")]
 #[test]
 fn agent_new_and_connect_report_safe_structured_results_without_running_setup() {
+    use std::io::Write;
     let dir = tempfile::Builder::new()
         .prefix("ecli-")
         .tempdir_in("/tmp")
@@ -2661,6 +2662,54 @@ fn agent_new_and_connect_report_safe_structured_results_without_running_setup() 
     make("scout");
     home.run(&["--yes", "policy", "refresh", "home"]).ok();
     let before = home.audit_lines().len();
+    let invalid_flags = home.run(&["agent", "add", "home/new-agent", "--instructions-stdin"]);
+    assert_ne!(invalid_flags.code(), 0);
+    assert!(invalid_flags.stderr().contains("--new"));
+    for (input, expected_code) in [
+        ("# Voice\nLiteral $(do-not-run) λ\n", 0),
+        (" \n", 1),
+        ("a\0b", 1),
+    ] {
+        let mut child = home
+            .piped(&[
+                "--dry-run",
+                "agent",
+                "add",
+                "home/new-agent",
+                "--new",
+                "--instructions-stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(expected_code),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        if expected_code == 0 {
+            assert_eq!(doc["dry_run"], true);
+            assert!(doc["changes"].to_string().contains("SOUL.md"));
+            assert!(!doc.to_string().contains(input));
+        }
+    }
+    assert!(
+        !home
+            .root
+            .join("sandboxes/home/home/.hermes/profiles/new-agent")
+            .exists()
+    );
     let (code, duplicate) = home.json(&["agent", "add", "home/scout", "--new"]);
     assert_eq!(code, 1, "{duplicate}");
     assert!(

@@ -178,6 +178,8 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 if [ \"$1 $2 $4 $5\" = \"profile create --clone-from default\" ] && [ -f \"$HOME/.hermes/config.yaml\" ]; then
   mkdir -p \"$HOME/.hermes/profiles/$3\"
   cp \"$HOME/.hermes/config.yaml\" \"$HOME/.hermes/profiles/$3/config.yaml\"
+  if [ -f \"$HOME/.hermes/SOUL.md\" ]; then cp \"$HOME/.hermes/SOUL.md\" \"$HOME/.hermes/profiles/$3/SOUL.md\"; fi
+  if [ -f \"$HOME/hermes-link-soul\" ]; then rm -f \"$HOME/.hermes/profiles/$3/SOUL.md\"; ln -s \"$HOME/.hermes/keep-soul\" \"$HOME/.hermes/profiles/$3/SOUL.md\"; fi
 fi
 if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/gateway-runs\" ]; then
   mkdir -p \"$HOME/.hermes/profiles/.deleted\"
@@ -1359,6 +1361,7 @@ fn creating_a_new_profile_never_adopts_and_adopting_never_creates() {
 
 #[test]
 fn creating_a_profile_keeps_running_sessions_and_services() {
+    use crate::model::agent::AgentInstructions;
     use crate::service::fake::FakeServices;
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let services = std::rc::Rc::new(FakeServices::default());
@@ -1369,12 +1372,52 @@ fn creating_a_profile_keeps_running_sessions_and_services() {
     let session_id = super::sandbox::put(&lab.engine, &session);
     let stops = services.stopped.borrow().len();
     let starts = services.started.borrow().len();
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(lab.home.join(".hermes/config.yaml"), "").unwrap();
+    let default_soul = lab.home.join(".hermes/SOUL.md");
+    std::fs::write(&default_soul, "inherited identity").unwrap();
     let created = done(
         lab.engine
             .create_agent(&alice(), &lab.name, agent("scout"), Confirm::Ask)
             .unwrap(),
     );
     assert!(matches!(created.how, Added::Created(_)));
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/profiles/scout/SOUL.md")).unwrap(),
+        "inherited identity"
+    );
+    let text = "# Identity\nLiteral: $(touch \"$HOME/injected\") `id` 'quoted' λ\n";
+    let instructions = AgentInstructions::new(text.into()).unwrap();
+    done(
+        lab.engine
+            .create_agent_with_instructions(
+                &alice(),
+                &lab.name,
+                agent("custom"),
+                Some(&instructions),
+                Confirm::Ask,
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/profiles/custom/SOUL.md")).unwrap(),
+        text
+    );
+    assert_eq!(
+        std::fs::read_to_string(&default_soul).unwrap(),
+        "inherited identity"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/profiles/scout/SOUL.md")).unwrap(),
+        "inherited identity"
+    );
+    assert!(!lab.home.join("injected").exists());
+    assert!(!lab.audit().contains(text));
+    assert!(
+        !std::fs::read_to_string(lab.home.join("hermes-calls"))
+            .unwrap()
+            .contains(text)
+    );
     assert_eq!(services.stopped.borrow().len(), stops);
     assert_eq!(services.started.borrow().len(), starts);
     assert!(crate::lifecycle::process::is_same(&sleeping.process()).unwrap());
@@ -1387,6 +1430,94 @@ fn creating_a_profile_keeps_running_sessions_and_services() {
             .any(|session| session.id == session_id)
     );
     assert!(lab.engine.app_agents().unwrap().is_empty());
+}
+
+#[test]
+fn an_instructions_copy_failure_reports_the_created_profile_without_success_or_adoption() {
+    use crate::model::agent::AgentInstructions;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(lab.home.join(".hermes/config.yaml"), "").unwrap();
+    crate::test_scripts::write_script(
+        &lab.home.join(".local/bin/cp"),
+        "case \"$1\" in *agent-instructions-*) exit 9 ;; esac\nexec /bin/cp \"$@\"",
+    );
+    let instructions = AgentInstructions::new("Custom identity".into()).unwrap();
+    let error = lab
+        .engine
+        .create_agent_with_instructions(
+            &alice(),
+            &lab.name,
+            agent("custom"),
+            Some(&instructions),
+            Confirm::Ask,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("profile exists"), "{error}");
+    assert!(
+        error.to_string().contains("instructions were not saved"),
+        "{error}"
+    );
+    assert!(
+        compared(lab.engine.check_agents(&lab.name).unwrap())
+            .untracked
+            .contains(&agent("custom"))
+    );
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+    let duplicate = lab
+        .engine
+        .create_agent_with_instructions(
+            &alice(),
+            &lab.name,
+            agent("custom"),
+            Some(&instructions),
+            Confirm::Ask,
+        )
+        .unwrap_err();
+    assert!(
+        duplicate.to_string().contains("already exists"),
+        "{duplicate}"
+    );
+}
+
+#[test]
+fn initial_instructions_refuse_a_cloned_soul_symlink_without_changing_its_target() {
+    use crate::model::agent::AgentInstructions;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(lab.home.join(".hermes/config.yaml"), "").unwrap();
+    std::fs::write(lab.home.join(".hermes/keep-soul"), "existing identity").unwrap();
+    std::fs::write(lab.home.join("hermes-link-soul"), "").unwrap();
+    let instructions = AgentInstructions::new("new identity".into()).unwrap();
+    let error = lab
+        .engine
+        .create_agent_with_instructions(
+            &alice(),
+            &lab.name,
+            agent("custom"),
+            Some(&instructions),
+            Confirm::Ask,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("profile exists"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/keep-soul")).unwrap(),
+        "existing identity"
+    );
+    assert!(
+        lab.home
+            .join(".hermes/profiles/custom/SOUL.md")
+            .is_symlink()
+    );
+    assert!(
+        compared(lab.engine.check_agents(&lab.name).unwrap())
+            .untracked
+            .contains(&agent("custom"))
+    );
 }
 
 #[test]

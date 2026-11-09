@@ -1143,6 +1143,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
                 "approval.close".to_owned(),
                 "sandboxes".to_owned(),
                 "agents.create".to_owned(),
+                "agents.create.instructions".to_owned(),
             ]
         } else {
             vec!["approval.close".to_owned()]
@@ -1496,9 +1497,11 @@ fn run_session(
                     FromDevice::RuntimeInstall { sandbox, runtime } => {
                         Operation::install(&sandbox, &runtime)
                     }
-                    FromDevice::AgentCreate { sandbox, agent } => {
-                        Operation::create_agent(&sandbox, &agent)
-                    }
+                    FromDevice::AgentCreate {
+                        sandbox,
+                        agent,
+                        instructions,
+                    } => Operation::create_agent_with_instructions(&sandbox, &agent, instructions),
                     FromDevice::AgentConnect { sandbox, agent } => {
                         Operation::connect_agent(&sandbox, &agent)
                     }

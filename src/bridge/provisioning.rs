@@ -1,7 +1,7 @@
 //! The host owner's small provisioning surface for the mobile app. Every
 //! change goes through the same engine and audit log as its CLI command.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::engine::{Engine, SandboxSpec};
 use crate::layout::Layout;
-use crate::model::agent::AgentName;
+use crate::model::agent::{AgentInstructions, AgentName};
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Planned};
 use crate::model::policy::TemplateName;
@@ -31,6 +31,7 @@ pub enum Operation {
     AgentCreate {
         name: SandboxName,
         agent: AgentName,
+        instructions: Option<AgentInstructions>,
     },
     AgentConnect {
         name: SandboxName,
@@ -61,6 +62,14 @@ impl Operation {
     }
 
     pub fn create_agent(sandbox: &str, agent: &str) -> Result<Self, String> {
+        Self::create_agent_with_instructions(sandbox, agent, None)
+    }
+
+    pub fn create_agent_with_instructions(
+        sandbox: &str,
+        agent: &str,
+        instructions: Option<String>,
+    ) -> Result<Self, String> {
         Ok(Self::AgentCreate {
             name: sandbox
                 .parse::<SandboxName>()
@@ -68,6 +77,7 @@ impl Operation {
             agent: agent
                 .parse::<AgentName>()
                 .map_err(|error| error.to_string())?,
+            instructions: instructions.map(AgentInstructions::new).transpose()?,
         })
     }
 
@@ -223,8 +233,14 @@ impl Host {
                 Ok(Completed::Created)
             }
             Operation::Install { name, runtime } => self.install(name, *runtime),
-            Operation::AgentCreate { name, agent } => self.agent_operation(name, agent, false),
-            Operation::AgentConnect { name, agent } => self.agent_operation(name, agent, true),
+            Operation::AgentCreate {
+                name,
+                agent,
+                instructions,
+            } => self.agent_operation(name, agent, false, instructions.as_ref()),
+            Operation::AgentConnect { name, agent } => {
+                self.agent_operation(name, agent, true, None)
+            }
         }
     }
 
@@ -233,13 +249,19 @@ impl Host {
         name: &SandboxName,
         agent: &AgentName,
         connecting: bool,
+        instructions: Option<&AgentInstructions>,
     ) -> Result<Completed, String> {
         let target = format!("{name}/{agent}");
         let verb = if connecting { "connect" } else { "add" };
         let option = if connecting { "--restart" } else { "--new" };
+        let mut arguments = vec!["--json", "agent", verb, &target, option];
+        if instructions.is_some() {
+            arguments.push("--instructions-stdin");
+        }
         let result = self.command_result(
-            &["--json", "agent", verb, &target, option],
+            &arguments,
             "agent operation",
+            instructions.map(AgentInstructions::as_str),
         )?;
         if connecting {
             if result["sandbox"].as_str() != Some(name.as_str())
@@ -272,11 +294,20 @@ impl Host {
         })
     }
 
-    fn command_result(&self, arguments: &[&str], label: &str) -> Result<Value, String> {
+    fn command_result(
+        &self,
+        arguments: &[&str],
+        label: &str,
+        input: Option<&str>,
+    ) -> Result<Value, String> {
         let mut child = Command::new(&self.executable)
             .args(arguments)
             .envs(self.layout.env())
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0)
@@ -284,6 +315,15 @@ impl Host {
             .map_err(|error| format!("cannot start the {label}: {error}"))?;
         let stdout = child.stdout.take().expect("piped stdout");
         let output = std::thread::spawn(move || read_bounded(stdout, 65_536));
+        let sent = if let Some(input) = input {
+            child
+                .stdin
+                .take()
+                .expect("piped instructions")
+                .write_all(input.as_bytes())
+        } else {
+            Ok(())
+        };
         let status = child
             .wait()
             .map_err(|error| format!("cannot wait for the {label}: {error}"))?;
@@ -300,6 +340,7 @@ impl Host {
                 "the {label} failed; refresh the sandbox and check it on the host"
             ));
         }
+        sent.map_err(|error| format!("cannot send the initial instructions: {error}"))?;
         Ok(result)
     }
 
@@ -707,6 +748,36 @@ printf '%s\n' '{"sandbox":"lab","runtime":"hermes","installed":true,"login":"enc
                 }
                 _ => panic!("wrong completion"),
             }
+        }
+    }
+
+    #[test]
+    fn initial_instructions_go_only_to_child_stdin_and_are_validated_before_running() {
+        let text = "# Voice\nLiteral $(do-not-run) 'quoted' λ\n";
+        let (_dir, host) = fake_host(
+            r#"
+test "$*" = '--json agent add lab/scout --new --instructions-stdin' || exit 10
+cat > "$ENCLOS_HOME-received"
+printf '%s\n' '{"agent":"lab/scout","runtime":"hermes","how":"created"}'
+"#,
+        );
+        let operation =
+            Operation::create_agent_with_instructions("lab", "scout", Some(text.into())).unwrap();
+        assert!(matches!(
+            host.execute(&operation, "owner@example.org").unwrap(),
+            Completed::AgentCreated { .. }
+        ));
+        let received = _dir.path().join("data-received");
+        assert_eq!(std::fs::read_to_string(received).unwrap(), text);
+        for invalid in [
+            "".into(),
+            " \n".into(),
+            "a\0b".into(),
+            "a".repeat(crate::model::agent::MAX_AGENT_INSTRUCTIONS_BYTES + 1),
+        ] {
+            assert!(
+                Operation::create_agent_with_instructions("lab", "scout", Some(invalid)).is_err()
+            );
         }
     }
 

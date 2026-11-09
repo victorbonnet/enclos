@@ -79,7 +79,12 @@ pub enum FromDevice {
     #[serde(rename = "sandbox.agents")]
     SandboxAgents { sandbox: String },
     #[serde(rename = "agent.create")]
-    AgentCreate { sandbox: String, agent: String },
+    AgentCreate {
+        sandbox: String,
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
     #[serde(rename = "agent.connect")]
     AgentConnect { sandbox: String, agent: String },
     #[serde(rename = "sandbox.create")]
@@ -948,6 +953,12 @@ mod tests {
             FromDevice::AgentCreate {
                 sandbox: "lab".into(),
                 agent: "scout".into(),
+                instructions: None,
+            },
+            FromDevice::AgentCreate {
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+                instructions: Some("# Voice\nBe direct. λ\n".into()),
             },
             FromDevice::AgentConnect {
                 sandbox: "lab".into(),

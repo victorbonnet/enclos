@@ -187,6 +187,10 @@ impl RuntimeAdapter for Hermes {
         format!("~/.hermes/profiles/{name}")
     }
 
+    fn agent_instructions_file(&self, name: &AgentName) -> Option<HomePath> {
+        agent_folder(&RuntimeAgentName::from(name)).child("SOUL.md")
+    }
+
     fn channel_token_file(
         &self,
         channel: Channel,

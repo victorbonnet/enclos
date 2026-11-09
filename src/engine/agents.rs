@@ -8,7 +8,7 @@ use super::Engine;
 use super::import::{Archive, LeftCopy};
 use super::session::SessionEnd;
 use crate::error::{Error, Result};
-use crate::model::agent::{AgentName, AgentRecord};
+use crate::model::agent::{AgentInstructions, AgentName, AgentRecord};
 use crate::model::audit::Actor;
 use crate::model::now;
 use crate::model::plan::{Confirm, Plan, Planned};
@@ -233,7 +233,7 @@ impl Engine {
         agent: AgentName,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
-        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::CreateOrAdopt)
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::CreateOrAdopt, None)
     }
 
     /// Creates a new agent, refusing a name the runtime already has rather
@@ -246,7 +246,21 @@ impl Engine {
         agent: AgentName,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
-        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::New)
+        self.create_agent_with_instructions(by, name, agent, None, confirm)
+    }
+
+    /// Creates a new profile, optionally replacing only its own inherited
+    /// initial instructions. The adapter supplies the path; the text is
+    /// staged and copied by a command running inside the sandbox.
+    pub fn create_agent_with_instructions(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: AgentName,
+        instructions: Option<&AgentInstructions>,
+        confirm: Confirm,
+    ) -> Result<Planned<AgentAdded>> {
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::New, instructions)
     }
 
     /// Tracks an agent the runtime already has, refusing a missing one
@@ -258,7 +272,7 @@ impl Engine {
         agent: AgentName,
         confirm: Confirm,
     ) -> Result<Planned<AgentAdded>> {
-        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::Existing)
+        self.add_or_create_agent(by, name, agent, confirm, AgentAddition::Existing, None)
     }
 
     fn add_or_create_agent(
@@ -268,12 +282,22 @@ impl Engine {
         agent: AgentName,
         confirm: Confirm,
         mode: AgentAddition,
+        instructions: Option<&AgentInstructions>,
     ) -> Result<Planned<AgentAdded>> {
         let kind = self.runtime_of(name)?;
         let runtime = adapter(kind);
         let shown = kind.display_name();
         self.refuse_builtin(name, kind, agent.as_str())?;
         self.refuse_known_agent(name, &agent)?;
+        let instructions_file = instructions
+            .map(|_| {
+                runtime
+                    .agent_instructions_file(&agent)
+                    .ok_or_else(|| Error::Session {
+                        what: format!("{shown} does not support initial profile instructions"),
+                    })
+            })
+            .transpose()?;
         let home = self.sandbox_home(name);
         let runtime_has =
             |found: &[RuntimeAgentName]| found.contains(&RuntimeAgentName::from(&agent));
@@ -320,7 +344,7 @@ impl Engine {
         }
         let files = runtime.agent_files(&agent);
         if confirm == Confirm::DryRun {
-            let changes = match &adoption {
+            let mut changes = match &adoption {
                 Adoption::Adopt => vec![format!(
                     "record agent {name}/{agent}, which {shown} already has in the sandbox"
                 )],
@@ -338,6 +362,9 @@ impl Engine {
                         .collect()
                 }
             };
+            if let Some(file) = &instructions_file {
+                changes.insert(changes.len() - 1, format!("write the supplied initial instructions to {file} inside sandbox {name}, only for its new profile {agent}"));
+            }
             return Ok(Planned::DryRun(Plan {
                 changes,
                 ..Plan::default()
@@ -369,6 +396,33 @@ impl Engine {
                             done: format!("creating agent {agent} in sandbox {name}"),
                         });
                     }
+                }
+                if let (Some(instructions), Some(file)) = (instructions, instructions_file) {
+                    let applied = (|| {
+                        let command = self.stage_profile_instructions(
+                            name,
+                            file,
+                            instructions.as_str(),
+                            &format!("agent-instructions-{agent}-{}", std::process::id()),
+                        )?;
+                        let ended = self.run_in_sandbox(by, name, command, "agent instructions")?;
+                        if ended.exit != 0 {
+                            return Err(Error::Session {
+                                what: format!(
+                                    "saving initial instructions exited with {}",
+                                    ended.exit
+                                ),
+                            });
+                        }
+                        Ok(())
+                    })();
+                    applied.map_err(|error| Error::FailedAfter {
+                        done: format!("creating agent {agent} in sandbox {name}"),
+                        error: Box::new(Error::WithContext {
+                            what: format!("{error}. The profile exists, but its initial instructions were not saved. Review its instructions on the host before connecting it to the app."),
+                            error: Box::new(error),
+                        }),
+                    })?;
                 }
                 Added::Created(created)
             }
