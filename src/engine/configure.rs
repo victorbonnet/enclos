@@ -443,7 +443,10 @@ impl Engine {
         }
         // The agent's Home conversation, as the bridge names it (ADR 0044).
         let home = crate::bridge::store::home_id(&format!("{name}/{agent}"));
-        let Some(app) = runtime.app_channel(agent, &socket, &home) else {
+        let token_file = self
+            .layout
+            .agent_secrets_file(name.as_str(), agent.as_str());
+        let Some(app) = runtime.app_channel(agent, &socket, &token_file, &home) else {
             return Err(session(format!(
                 "{shown} has no app channel enclos can set up"
             )));

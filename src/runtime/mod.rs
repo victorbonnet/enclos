@@ -475,11 +475,14 @@ pub trait RuntimeAdapter {
     /// the sandbox home that enclos's bridge connects to, and its `home`
     /// conversation, the runtime's home channel (ADR 0044, proposed). The
     /// agent's token is a secret the policy grants it as `MOBILE_APP_TOKEN`.
+    /// `token_file` is the core-owned protected per-agent secret file; a
+    /// file-consuming adapter uses this explicit path without inferring layout.
     /// `None`: the runtime has no such channel.
     fn app_channel(
         &self,
         _agent: &RuntimeAgentName,
         _socket: &Path,
+        _token_file: &Path,
         _home: &str,
     ) -> Option<AppChannel> {
         None
