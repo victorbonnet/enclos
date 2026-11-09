@@ -537,6 +537,7 @@ pub trait RuntimeAdapter {
     fn builtin_agent(&self) -> Option<BuiltinAgent>;                            // permanent identity, if any; not the runtime's selected default
     fn default_agent(&self, home: &Path) -> Result<Option<RuntimeAgentName>, Unreadable>; // selected native target, read from installed state
     fn delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand>;
+    fn agent_delete_mode(&self) -> AgentDeleteMode;                             // pause the runtime or use its running native service
     fn finish_delete_agent(&self, agent: &AgentName) -> Option<SandboxCommand> { None }  // finishes a delete that failed after the agent and its folder went: Hermes 0.23.0's `profile purge-identity`
     fn import_agent(&self, agent: &AgentName, archive: &Path) -> Option<SandboxCommand>;
 

@@ -9,9 +9,9 @@ use serde_json::{Value, json};
 use super::home::{read_text, unreadable};
 use super::settings::{Held, SettingsFile, SettingsFinding, dotenv_line, names_a_secret};
 use super::{
-    AgentFacts, DiskPart, HomeFile, HomePath, Installer, ListenerPorts, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService, SandboxCommand,
-    SecretFileFormat, SecretFiles, SecretTarget, ServiceName, Unreadable, ValueAt,
+    AgentDeleteMode, AgentFacts, DiskPart, HomeFile, HomePath, Installer, ListenerPorts, NotRead,
+    RuntimeAdapter, RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService,
+    SandboxCommand, SecretFileFormat, SecretFiles, SecretTarget, ServiceName, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
@@ -229,6 +229,9 @@ impl RuntimeAdapter for OpenClaw {
     }
     fn create_agent(&self, name: &AgentName) -> SandboxCommand {
         SandboxCommand::from_words(&["enclos-openclaw-agent", "add", name.as_str()])
+    }
+    fn agent_delete_mode(&self) -> AgentDeleteMode {
+        AgentDeleteMode::RuntimeService
     }
     fn delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
         Some(SandboxCommand::from_words(&[

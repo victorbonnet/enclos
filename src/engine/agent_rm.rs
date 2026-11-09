@@ -10,7 +10,9 @@ use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::runtime::RuntimeKind;
 use crate::model::sandbox::SandboxName;
-use crate::runtime::{RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter, home};
+use crate::runtime::{
+    AgentDeleteMode, RuntimeAdapter, RuntimeAgentName, SandboxCommand, Unreadable, adapter, home,
+};
 
 /// What `agent rm` did. The record is gone either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +93,26 @@ impl Engine {
         keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<AgentRemoved>> {
+        let runtime = adapter(self.runtime_of(name)?);
+        self.remove_agent_with(by, name, agent, keep_data, confirm, &*runtime)
+    }
+
+    /// `remove_agent` with its adapter given, so tests can exercise native
+    /// deletion against a service of their own without installing a runtime.
+    pub(crate) fn remove_agent_with(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        keep_data: bool,
+        confirm: Confirm,
+        runtime: &dyn RuntimeAdapter,
+    ) -> Result<Planned<AgentRemoved>> {
         self.agent_of(name, agent.as_str())?;
         let kind = self.runtime_of(name)?;
         let shown = kind.display_name();
-        let runtime = adapter(kind);
         let home = self.sandbox_home(name);
-        let left = leftover(&*runtime, &home, agent);
+        let left = leftover(runtime, &home, agent);
         let delete = match (keep_data, &left) {
             (true, _) => Err(FilesKept::Asked { left: left.clone() }),
             (false, Err(why)) => return Err(cannot_tell_left(name, kind, agent, why)),
@@ -106,11 +122,12 @@ impl Engine {
                 .ok_or(FilesKept::NoDeleteCommand),
         };
         let files = runtime.agent_files(agent);
-        // The runtime's services may hold the agent's files (Hermes's
-        // gateway serves every agent): they stop while the delete runs.
+        // Some native commands need files released; others call their
+        // running service to delete the agent. The adapter declares which.
+        let pause = runtime.agent_delete_mode() == AgentDeleteMode::PauseRuntime;
         let pausing = match &delete {
-            Ok(_) => self.installed_runtime_services(name)?,
-            Err(_) => Vec::new(),
+            Ok(_) if pause => self.installed_runtime_services(name)?,
+            _ => Vec::new(),
         };
         let meanwhile = match pausing.as_slice() {
             [] => String::new(),
@@ -175,9 +192,15 @@ impl Engine {
         let deleted = match delete {
             Ok(command) => {
                 let why = format!("for agent rm {name}/{agent}");
-                let paused = self.pause_runtime(by, name, &why)?;
-                let deleted = self.delete_files(by, name, agent, command);
-                let resumed = self.resume_runtime(by, name, paused);
+                let paused = match pause {
+                    true => Some(self.pause_runtime(by, name, &why)?),
+                    false => None,
+                };
+                let deleted = self.delete_files(by, name, agent, command, runtime);
+                let resumed = match paused {
+                    Some(paused) => self.resume_runtime(by, name, paused),
+                    None => Ok(()),
+                };
                 match (deleted, resumed) {
                     (Ok(()), resumed) => not_restarted = resumed.err(),
                     (Err(e), Ok(())) => return Err(e),
@@ -242,14 +265,14 @@ impl Engine {
         name: &SandboxName,
         agent: &AgentName,
         delete: SandboxCommand,
+        runtime: &dyn RuntimeAdapter,
     ) -> Result<()> {
         let kind = self.runtime_of(name)?;
         let shown = kind.display_name();
-        let runtime = adapter(kind);
         let home = self.sandbox_home(name);
         let files = runtime.agent_files(agent);
         let end = self.run_in_sandbox(by, name, delete, "agent rm run")?;
-        let left = leftover(&*runtime, &home, agent)
+        let left = leftover(runtime, &home, agent)
             .map_err(|why| cannot_tell_left(name, kind, agent, &why))?;
         let how = |end: &super::SessionEnd| match end.signal {
             Some(signal) => format!("was ended by signal {signal}"),

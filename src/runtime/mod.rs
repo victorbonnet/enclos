@@ -216,6 +216,19 @@ pub struct AgentFacts {
     pub activity: Vec<HomePath>,
 }
 
+/// How an agent's native delete command uses the runtime's services.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentDeleteMode {
+    /// Stop installed runtime services while their files are deleted, then
+    /// install them again. Hermes's gateway holds every agent's files.
+    #[default]
+    PauseRuntime,
+    /// Keep runtime services running: the native command deletes through
+    /// one of them. The command must refuse if its service is unavailable;
+    /// agent removal does not start it or substitute an offline delete.
+    RuntimeService,
+}
+
 /// The agent a runtime always has once installed, such as Hermes's
 /// `default`. Made in code, as a constant, so a name that is not a valid
 /// agent name does not compile: enclos shows it, and names it in commands.
@@ -349,6 +362,11 @@ pub trait RuntimeAdapter {
     /// `agent rm` removes only the record and says the files stay.
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
+    }
+    /// Whether native deletion needs the runtime's services stopped or
+    /// available. The default preserves runtimes that delete files offline.
+    fn agent_delete_mode(&self) -> AgentDeleteMode {
+        AgentDeleteMode::PauseRuntime
     }
     /// The runtime's own command that finishes a delete of `name` which
     /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
