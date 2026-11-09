@@ -505,6 +505,14 @@ impl RuntimeAdapter for OpenClaw {
                     include_str!("../../channels/openclaw/native-titles.js"),
                 ),
                 (
+                    plugin.child("native-approvals.js")?,
+                    include_str!("../../channels/openclaw/native-approvals.js"),
+                ),
+                (
+                    plugin.child("native-turns.js")?,
+                    include_str!("../../channels/openclaw/native-turns.js"),
+                ),
+                (
                     plugin.child("openclaw.plugin.json")?,
                     include_str!("../../channels/openclaw/openclaw.plugin.json"),
                 ),
