@@ -1,9 +1,11 @@
 import { defineChannelPluginEntry } from 'openclaw/plugin-sdk/channel-core';
 import type { PluginRuntime } from 'openclaw/plugin-sdk/channel-core';
 import { listNativeCommandSpecsForConfig } from 'openclaw/plugin-sdk/native-command-registry';
+import { loadWebMediaRaw } from 'openclaw/plugin-sdk/web-media';
+import { getAgentScopedMediaLocalRoots } from 'openclaw/plugin-sdk/media-local-roots';
 import { createChannel } from './channel.js';
 
-const channel = createChannel({ commands: listNativeCommandSpecsForConfig });
+const channel = createChannel({ commands: listNativeCommandSpecsForConfig, loadMedia: loadWebMediaRaw, mediaRoots: getAgentScopedMediaLocalRoots });
 export default defineChannelPluginEntry({
   id: 'enclos',
   name: 'enclos app',

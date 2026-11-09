@@ -30,7 +30,7 @@ export function registerFeatures(api, { findTurn, assertTurn, running }) {
       if (phase === 'start') fields.label = line(name, 120);
       else {
         fields.ok = !event.error && event.result?.isError !== true;
-        if (Number.isFinite(event.durationMs) && event.durationMs >= 0) fields.duration_ms = Math.floor(event.durationMs);
+        if (Number.isFinite(event.durationMs) && event.durationMs >= 0) fields.duration_ms = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(event.durationMs));
       }
       turn.active.transport.write(message('tool', fields));
       if (phase === 'end' && policy) {

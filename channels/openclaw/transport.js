@@ -47,7 +47,7 @@ export function readToken(file) {
 function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 
 export class ChannelTransport {
-  constructor(account, { onMessage, onControl, onHello, onStop = () => {}, capabilities = [], canDeliver = () => true }) {
+  constructor(account, { onMessage, onControl, onHello, onStop = () => {}, capabilities = [], canDeliver = () => true, supportsAttachments = false }) {
     this.account = account;
     this.onMessage = onMessage;
     this.onControl = onControl;
@@ -57,6 +57,7 @@ export class ChannelTransport {
     this.bridgeCapabilities = new Set();
     this.bridgeHello = undefined;
     this.canDeliver = canDeliver;
+    this.supportsAttachments = supportsAttachments;
     this.inflight = new Map();
     this.peer = null;
     this.server = null;
@@ -150,13 +151,13 @@ export class ChannelTransport {
     return route;
   }
 
-  send(conversation, text, { replyTo, kind } = {}) {
+  send(conversation, text, { replyTo, kind, attachments } = {}) {
     if (this.closed) throw new Error('channel account is stopped');
     checkedId(conversation, 'conversation');
     if (typeof text !== 'string') throw new Error('outbound text must be text');
     if (replyTo != null) checkedId(replyTo, 'reply_to');
     const outgoing = message('message.out', { conversation, text,
-      kind: kind ?? (replyTo ? 'reply' : 'notify'), ...(replyTo ? { reply_to: replyTo } : {}) });
+      kind: kind ?? (replyTo ? 'reply' : 'notify'), ...(replyTo ? { reply_to: replyTo } : {}), ...(attachments?.length ? { attachments } : {}) });
     return this.enqueue(outgoing);
   }
 
@@ -276,8 +277,8 @@ export class ChannelTransport {
   }
 
   async accept(incoming) {
-    if (incoming.attachments?.length) throw new ProtocolError('unsupported', 'this channel does not yet accept attachments');
-    const hash = digest([incoming.conversation, incoming.person, incoming.text]);
+    if (incoming.attachments?.length && !this.supportsAttachments) throw new ProtocolError('unsupported', 'this channel does not yet accept attachments');
+    const hash = digest([incoming.conversation, incoming.person, incoming.text, ...(incoming.attachments?.length ? [incoming.attachments] : [])]);
     const old = this.state.receipts[incoming.id];
     if (old) {
       if (old.hash !== hash) throw new ProtocolError('conflict', 'message id was reused for different input');

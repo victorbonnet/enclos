@@ -4,6 +4,7 @@ import path from 'node:path';
 import { ChannelTransport, readToken } from './transport.js';
 import { checkedId, message, ProtocolError } from './protocol.js';
 import { commandCatalog, registerFeatures } from './features.js';
+import { inboundMedia, mediaFolder, stageMedia } from './media.js';
 
 export const TESTED_OPENCLAW = '2026.11.2';
 const nativeId = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -44,6 +45,7 @@ export function createChannel(sdk = {}) {
   const running = new Map();
   const sessionRoutes = new Map();
   let hooks = { tools: false, policy: false };
+  const hasMedia = typeof sdk.loadMedia === 'function' && typeof sdk.mediaRoots === 'function';
   const currentConfig = fallback => runtime?.config?.current?.() ?? fallback;
   const assertCurrent = (cfg, account, transport) => {
     const now = resolveAccount(currentConfig(cfg), account.accountId);
@@ -78,9 +80,11 @@ export function createChannel(sdk = {}) {
     const account = resolveAccount(ctx.cfg, ctx.accountId);
     if (!account.enabled) throw new Error('enclos account is disabled');
     if (running.has(account.accountId)) throw new Error('enclos account is already running');
+    if (hasMedia) mediaFolder(account);
     let transport;
     transport = new ChannelTransport(account, {
-      capabilities: ['typing', ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : [])],
+      supportsAttachments: hasMedia,
+      capabilities: ['typing', ...(hasMedia ? ['attachments'] : []), ...(sdk.commands ? ['commands'] : []), ...(hooks.tools ? ['tools'] : []), ...(hooks.policy ? ['approval'] : [])],
       onHello(_hello, owner) {
         if (sdk.commands) owner.write(message('commands', { commands: commandCatalog(sdk.commands, currentConfig(ctx.cfg)) }));
       },
@@ -95,6 +99,7 @@ export function createChannel(sdk = {}) {
         const cfg = currentConfig(ctx.cfg);
         const assertAuthority = () => assertCurrent(cfg, account, transport);
         assertAuthority();
+        const media = hasMedia ? inboundMedia(account, incoming.attachments, incoming.id) : [];
         const nativeRoute = channel.routing.resolveAgentRoute({ cfg, channel: 'enclos', accountId: account.accountId,
           peer: { kind: 'direct', id: incoming.conversation }, dmScope: 'per-account-channel-peer' });
         if (nativeRoute.agentId !== account.agentId || nativeRoute.matchedBy === 'default') throw new Error('enclos account needs an explicit native binding to its agent');
@@ -129,6 +134,7 @@ export function createChannel(sdk = {}) {
             routeSessionKey: sessionKey, dispatchSessionKey: sessionKey, persistedSessionKey: sessionKey, dmScope: 'per-account-channel-peer' },
           reply: { to: incoming.conversation, originatingTo: incoming.conversation, nativeChannelId: incoming.conversation, sourceReplyDeliveryMode: 'direct' },
           message: { body: incoming.text, rawBody: incoming.text, bodyForAgent: incoming.text, commandBody: incoming.text, inboundEventKind: 'user_request' },
+          media,
           command: { kind: isCommand ? 'text-slash' : 'normal', body: incoming.text, authorized: isCommand && ingress.commandAccess?.authorized === true },
           channelIngress: ingress,
         });
@@ -140,9 +146,12 @@ export function createChannel(sdk = {}) {
           dispatcherOptions: { onReplyStart: () => typing(true), onIdle: () => typing(false), onCleanup: () => typing(false) },
           delivery: { async deliver(payload) {
             assertAuthority();
-            if (payload.mediaUrl || payload.mediaUrls?.length) throw new Error('enclos OpenClaw channel media is not enabled yet');
-            if (payload.text) return { messageId: transport.send(incoming.conversation, payload.text,
-              { replyTo: incoming.id, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
+            const urls = [...new Set([...(payload.mediaUrl ? [payload.mediaUrl] : []), ...(payload.mediaUrls ?? [])])];
+            if (urls.length && !hasMedia) throw new Error('enclos OpenClaw channel media is not enabled');
+            const attachments = urls.length ? await stageMedia(account, urls, { sdk, cfg, assertCurrent: assertAuthority }) : [];
+            assertAuthority();
+            if (payload.text || attachments.length) return { messageId: transport.send(incoming.conversation, payload.text ?? '',
+              { replyTo: incoming.id, attachments, ...(payload.isStatusNotice ? { kind: 'status' } : {}) }) };
           } },
         }); } finally { typing(false); }
       },
@@ -176,10 +185,23 @@ export function createChannel(sdk = {}) {
     return { channel: 'enclos', to, messageId: id };
   }
 
+  async function sendMedia(ctx) {
+    if (!hasMedia) throw new Error('native media support is unavailable');
+    const account = resolveAccount(ctx.cfg, ctx.accountId), active = running.get(account.accountId);
+    if (!active) throw new Error('enclos account is not running');
+    const assertAuthority = () => { ctx.signal?.throwIfAborted(); ctx.assertDirectAdapterHandoff?.(); assertCurrent(ctx.cfg, account, active.transport); };
+    assertAuthority();
+    const attachments = await stageMedia(account, [ctx.mediaUrl], { sdk, cfg: ctx.cfg, access: ctx, assertCurrent: assertAuthority });
+    await ctx.onPlatformSendDispatch?.(); assertAuthority();
+    const to = target(ctx.to, { ...account, home: active.transport.home });
+    const id = active.transport.send(to, ctx.text ?? '', { attachments, ...(ctx.replyToId ? { replyTo: ctx.replyToId } : {}) });
+    return { channel: 'enclos', to, messageId: id };
+  }
+
   const plugin = {
     id: 'enclos',
     meta: { id: 'enclos', label: 'enclos app', selectionLabel: 'enclos app', docsPath: '/channels/enclos', blurb: 'Conversations through the host\'s enclos bridge.' },
-    capabilities: { chatTypes: ['direct'], media: false, nativeCommands: false, blockStreaming: false, reply: true },
+    capabilities: { chatTypes: ['direct'], media: hasMedia, nativeCommands: false, blockStreaming: false, reply: true },
     reload: { configPrefixes: ['channels.enclos', 'bindings'] },
     config: {
       listAccountIds: cfg => Object.keys(cfg.channels?.enclos?.accounts ?? {}).sort(),
@@ -193,11 +215,12 @@ export function createChannel(sdk = {}) {
       describeAccount: account => ({ accountId: account.accountId, enabled: account.enabled, configured: true }),
     },
     gateway: { startAccount },
-    outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText },
+    outbound: { deliveryMode: 'direct', textChunkLimit: 8000, sendText, ...(hasMedia ? { sendMedia } : {}) },
     messaging: {
       targetPrefixes: ['enclos'], targetIdComparison: 'case-sensitive',
       normalizeTarget(raw) { try { return checkedId(raw.startsWith('enclos:') ? raw.slice(7) : raw); } catch { return undefined; } },
       inferTargetChatType: () => 'direct',
+      resolveInboundAttachmentRoots: ({ cfg, accountId }) => [path.join(path.dirname(resolveAccount(cfg, accountId).socket), 'media')],
       async resolveOutboundSessionRoute(params) {
         const account = resolveAccount(params.cfg, params.accountId);
         if (account.agentId !== params.agentId) return null;
@@ -218,7 +241,9 @@ export function createChannel(sdk = {}) {
     agentPrompt: {
       inboundFormattingHints: () => ({ text_markup: 'markdown', rules: [
         'The person is using the enclos mobile app. Use CommonMark, fenced code and narrow tables.',
-        'This channel currently sends text. Do not claim a file or interactive control was delivered.',
+        hasMedia ? 'For a file, write it to a permitted local path and send MEDIA:/absolute/path/file. Images and files travel through the app channel, never a host URL.' : 'This channel currently sends text. Do not claim a file was delivered.',
+        'For a static HTML artefact, use a self-contained UTF-8 .html file with inline CSS and data images/fonts. Scripts, remote assets, forms and automatic navigation are unavailable; deliberate HTTP(S) links open the browser.',
+        'If sandbox policy refuses access, request the exact scope with enclos_request_access when available. A request grants nothing; wait for approval and updated policy.',
         'Remote markdown images are links; HTML in text is literal. Home is the bridge-owned permanent destination for output without another conversation.',
       ] }),
     },
