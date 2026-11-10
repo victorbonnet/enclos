@@ -316,8 +316,9 @@ pub enum CompileError {
     },
 }
 
-/// One isolation technology. Prepares, wraps and finds members; never
-/// supervises.
+/// One isolation technology. Compiles a policy and wraps a program in it;
+/// never supervises. Finding a sandbox's members is the lifecycle's (design
+/// §8), not a backend's.
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     /// Checks, without side effects, whether this backend works on this host.

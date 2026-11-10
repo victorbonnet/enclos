@@ -324,7 +324,7 @@ Every template reads the host broadly, minus the sensitive deny list (§5). Vali
 **Starting a session: `enclos connect home -- main`, step by step**
 
 1. Take the state lock; open an audit entry. (Proposed in [ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md): first, for a runtime that declares a listening service, start the sandbox's services when no session of that service is open, and wait for it to listen; give the session its port in step 5.)
-2. Load the record and the active snapshot; compile it, and write the compiled policy to the file named after its text's digest unless that file already holds that text (an upgrade that compiles it differently writes a new file, which is how what enclos adds when it compiles a policy, made stricter, reaches new sessions without asking; `enclos doctor` lists what changed); `prepare`.
+2. Load the record and the active snapshot; compile it, and write the compiled policy to the file named after its text's digest unless that file already holds that text (an upgrade that compiles it differently writes a new file, which is how what enclos adds when it compiles a policy, made stricter, reaches new sessions without asking; `enclos doctor` lists what changed).
 3. Start the proxy if it is not running, with the active network policy and the proxy's address, and record it beside the sessions (the proxy service when the sandbox is started; otherwise a process this `connect` starts). Read the secrets the session's snapshot grants from the secret store, on the host; one missing fails the start (step 7).
 4. Still under the lock, start the program as step 5 says, holding its marker, and name the marker after it; then record the session with its snapshot and compiled-policy hashes, and the sandbox as `Running`, in one transaction; close the audit entry; release the lock. A failure before the session is recorded kills the program.
 5. Set those secrets as environment variables, before the sandbox's own, which they never replace; wrap the command (the one after `--`; a shell when none is given, §5) and run it with the caller's input and output, in its terminal when it has one, tracking its members. It inherits no other descriptor of the caller's, and neither does anything else enclos starts, such as the proxy of step 3, which runs on after the command: each command but those on a session's way to its program (`holder join`, `inside`, whose descriptors come from enclos, the marker among them) marks every descriptor it inherited above its standard streams close-on-exec as it starts, so that a lock, pipe or terminal its caller passed on is never held for the life of a proxy or a session. The `test` job (`what_connect_starts_holds_none_of_its_callers_descriptors`, Seatbelt) and the `bubblewrap` job (`on_a_runner_what_connect_starts_holds_none_of_its_callers_descriptors`) show it, each with a host control that holds the descriptor. `enclos launch <sandbox> <service>` does the same for a runtime service, for the service manager, after stopping any session of the same service still open (§4); for a runtime that reads its secrets from a file, it writes them there instead and sets only the variable naming its folder ([ADR 0034](adr/0034-a-service-reads-its-secrets-from-a-file-its-sandbox-alone-reads.md)).
@@ -385,25 +385,23 @@ pub fn diff(before: &Policy, after: &Policy) -> PolicyDiff;
 pub fn needs_restart(diff: &PolicyDiff, caps: &Capabilities) -> bool;
 ```
 
-**Backend** (prepares, wraps and finds members; never supervises)
+**Backend** (compiles and wraps; never supervises: finding a sandbox's members is the lifecycle's, §8)
 
 ```rust
 pub trait Backend {
     fn kind(&self) -> BackendKind;
-    fn probe(&self) -> Probe;
+    fn probe(&self) -> Probe;     // whether it works on this host, with no side effects
+    fn try_run(&self) -> Probe;   // whether a program runs in it; starts one, so only `doctor` asks
     fn capabilities(&self) -> Capabilities;
+    fn host_checks(&self) -> Vec<HostCheck>;   // what `doctor` shows of what it needs from this host; none by default
     fn own_places(&self) -> OwnPlaces;   // what each session has its own of, which no workspace may put the host's back over; none by default
-    fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled>;   // pure; adds protected paths and host-service blocks
-    fn prepare(&self, sb: &SandboxRecord, compiled: &Compiled) -> Result<()>;
-    fn wrap(&self, sb: &SandboxRecord, session: &SessionRecord, cmd: &Command) -> Result<Command>;
-    fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String>;   // a line per field not held, said at each start; none by default
+    fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;   // pure; adds protected paths and host-service blocks
+    fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Result<Command, WrapError>;   // or why it cannot start as the host stands
+    fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String>;   // a line per field held on no host, said at each start; none by default
+    fn not_enforced_here(&self, policy: &Policy) -> Vec<NotEnforcedHere>;   // fields this host does not hold, run once accepted (ADR 0038); none by default
+    fn compiled_not_applied_here(&self) -> Vec<String>;   // what this host holds less of than the compiled text shows, for `policy show --compiled`; none by default
     fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;   // its escape probes and refusals
-    fn members(&self, sb: &SandboxRecord) -> Result<Vec<Member>>;
-    fn signal_members(&self, sb: &SandboxRecord, signal: StopSignal) -> Result<()>;   // Term | Kill
-    fn denials(&self, sb: &SandboxRecord, since: Timestamp) -> Result<Vec<Denial>>;
-    fn teardown(&self, sb: &SandboxRecord, keep_data: bool) -> Result<()>;
-    fn up(&self, _sb: &SandboxRecord) -> Result<()> { Ok(()) }     // a VM boots here
-    fn down(&self, _sb: &SandboxRecord) -> Result<()> { Ok(()) }
+    fn namespace_holder(&self) -> Option<&dyn NamespaceHolder>;   // whose network namespace every session joins (ADR 0039); none by default
 }
 ```
 
@@ -427,11 +425,16 @@ pub enum ProxyRequest { Reload { net: NetPolicy }, Stats }
 
 ```rust
 pub trait ServiceManager {
-    fn install(&self, unit: &ServiceUnit) -> Result<()>;
-    fn uninstall(&self, name: &ServiceName) -> Result<()>;
-    fn start(&self, name: &ServiceName) -> Result<()>;
-    fn stop(&self, name: &ServiceName, grace: Duration) -> Result<()>;
-    fn status(&self, name: &ServiceName) -> Result<ServiceStatus>;
+    fn available(&self) -> Result<()>;   // whether it can install units now; why not
+    fn can_list(&self) -> Result<()>;    // whether `installed` shows what it runs; why not
+    fn start(&self, unit: &ServiceUnit) -> Result<()>;   // installs it to run now and at each login, replacing one of the same label
+    fn stop(&self, label: &ServiceLabel) -> Result<()>;  // tells it to end, kills it after its stop_timeout, and removes it
+    fn status(&self, label: &ServiceLabel) -> Result<ServiceStatus>;
+    fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>>;   // installed and not removed, running or not
+    fn stopped_by_hand(&self, label: &ServiceLabel) -> Result<bool>;  // installed, and will not run on its own until `hand_stop` says
+    fn hand_stop(&self) -> HandStop;
+    fn unset_env_command(&self, var: &str) -> String;   // how the user removes `var` from the manager's own environment
+    fn host_checks(&self) -> Vec<HostCheck>;   // what `doctor` shows of how it runs services here; none by default
 }
 ```
 
@@ -452,8 +455,10 @@ pub trait SecretStore {
 pub trait Stores {                                 // a host's stores
     fn for_new(&self) -> Result<&dyn SecretStore>;   // where a new secret goes
     fn recorded(&self, name: StoreName) -> Result<&dyn SecretStore>;   // that store, or refused: never another
-    fn service_env(&self) -> Vec<(String, String)>;
+    fn service_env(&self, granted: &[StoreName]) -> Vec<(String, String)>;   // how a service reaches the stores its policy's secrets are in
     fn value_goes_before_record(&self, name: StoreName) -> bool;   // that store's own, answering or not
+    fn new_secret_alternative(&self, secret: &SecretRef) -> Option<String>;   // how to send it to another store when `for_new`'s refused it
+    fn host_checks(&self) -> Vec<HostCheck>;   // where a new secret goes, when there is a choice; none by default
 }
 ```
 
