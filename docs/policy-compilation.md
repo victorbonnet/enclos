@@ -72,7 +72,7 @@ A sandbox starts from a template, named when it is created (`--template`) and ke
 
 Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
 
-A `coding` template is planned (design §7) and does not exist yet.
+There is no `coding` template: a coding agent uses `minimal` or `assistant` with its project folder in `write_add`, where it writes in place (design §7).
 
 ## Every setting
 

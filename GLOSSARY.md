@@ -52,7 +52,7 @@ A policy snapshot saved for a sandbox because the user declined the restart it n
 _Avoid_: draft, staged policy
 
 **Template**:
-A reusable policy that a sandbox's policy extends, such as `minimal`, `assistant` or `coding`.
+A reusable policy that a sandbox's policy extends, such as `minimal` or `assistant`.
 _Avoid_: preset, base policy
 
 **Runtime**:
