@@ -3,6 +3,7 @@
 use super::policy::with_sandbox_on;
 use super::sandbox::{with_backends, without_backend};
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::probes::OwnProbes as _;
 
 #[test]
@@ -233,10 +234,7 @@ fn a_fake_backend_s_probes_run_through_the_shared_set() {
     assert_eq!(own.notes().baseline_key, None);
     assert_eq!(own.notes().comparison, None);
     // This test's own child, the signal probe's target.
-    let mut target = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut target = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("60")).unwrap();
     let ctx = engine.sandbox_context(&name, 41001);
     let inputs = engine
         .probe_inputs(
@@ -312,6 +310,39 @@ fn the_write_rules_are_checked_again_as_the_paths_are_when_compiled() {
     let err = engine.compile_policy(&name, 41001).unwrap_err();
     assert!(matches!(err, Error::ActivePolicyInvalid { .. }), "{err}");
     assert!(err.to_string().contains("through a link"), "{err}");
+}
+
+/// The backend's own places, checked when a policy is stored and each time
+/// it is compiled, through a link as it is then: a workspace that led to a
+/// folder of the user's may lead to `/dev` by the next session.
+#[test]
+fn a_workspace_that_leads_to_the_backends_own_place_is_refused_when_stored_and_compiled() {
+    use crate::policy::own_places::{OwnPlace, OwnPlaces, links};
+    let dev = OwnPlaces(&[OwnPlace {
+        path: "/dev",
+        holds_workspaces: false,
+    }]);
+    let (dir, engine, name) =
+        with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt).with_own_places(dev));
+    let user = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(user.join("work")).unwrap();
+    let alias = user.join("alias");
+    std::os::unix::fs::symlink("work", &alias).unwrap();
+    grant_writes(&engine, &name, "\"~/alias\"");
+    engine.compile_policy(&name, 41001).unwrap();
+
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(links::relative(&user, "/dev"), &alias).unwrap();
+    let err = engine.compile_policy(&name, 41001).unwrap_err();
+    assert!(matches!(err, Error::ActivePolicyInvalid { .. }), "{err}");
+    assert!(err.to_string().contains("host's /dev"), "{err}");
+
+    // Stored again, as any change to the policy stores it.
+    let err = engine
+        .policy_allow(&alice(), &name, "api.example.org", Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("host's /dev"), "{err}");
+    assert_eq!(err.exit_code(), 2);
 }
 
 /// With macOS's own Seatbelt: the sandbox cannot put a link in place of

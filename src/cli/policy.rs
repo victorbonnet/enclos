@@ -150,9 +150,18 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: PolicyArgs) -> R
             sandbox, compiled, ..
         } if compiled => {
             let text = engine.compiled_text(&sandbox)?;
+            // Said apart from the text, which stays what was compiled.
+            let not_applied = engine.compiled_not_applied_here(&sandbox)?;
             match output::json() {
-                true => output::emit(&json!({"sandbox": sandbox.to_string(), "compiled": text})),
-                false => print!("{text}"),
+                true => output::emit(&json!({
+                    "sandbox": sandbox.to_string(),
+                    "compiled": text,
+                    "not_applied_here": not_applied,
+                })),
+                false => {
+                    print!("{text}");
+                    not_applied.iter().for_each(|line| output::note(line));
+                }
             }
         }
         PolicyVerb::Show {
@@ -376,7 +385,7 @@ fn print_restarted(engine: &Engine, sandbox: &SandboxName, r: &Restarted) -> Res
             println!("To use it in a terminal again: `enclos connect {sandbox}`.");
         }
     }
-    let (code, started) = match r.started.is_empty() {
+    let (code, started) = match r.started.labels.is_empty() {
         true => (exit::OK, Value::Null),
         // In JSON, a start that cannot be checked is said in its value.
         false => super::sandbox::print_started(engine, sandbox, &r.started)?,

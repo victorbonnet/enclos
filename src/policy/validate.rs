@@ -3,8 +3,10 @@
 //! Refused: a write to enclos's own folders except the sandbox's own home,
 //! also through a broad path or a symlink; a workspace inside the home or
 //! inside another workspace, or one reached through a symlink the sandbox
-//! can change; a dropped built-in read-deny entry; a path the compiled
-//! policy cannot hold; a destination the proxy never lets a sandbox reach.
+//! can change; a workspace that would put the host's back over a place the
+//! backend gives each session of its own, as written or through a symlink;
+//! a dropped built-in read-deny entry; a path the compiled policy cannot
+//! hold; a destination the proxy never lets a sandbox reach.
 //! Malformed: a path or destination that does not parse, a
 //! `network.private` opt-in for a host not in `network.allow`, or a write
 //! grant at or inside a deny-list path. A policy exits 2 only when every
@@ -13,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use super::file::PolicyFile;
+use super::own_places::OwnPlaces;
 use super::paths::{PathContext, is_within, links_on_the_way, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
@@ -27,6 +30,8 @@ pub struct ValidationContext {
     pub paths: PathContext,
     /// The enclos data and config folders.
     pub protected: Vec<PathBuf>,
+    /// The places the sandbox's backend gives each session of its own.
+    pub own_places: OwnPlaces,
 }
 
 pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyError> {
@@ -329,6 +334,32 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     check_nesting(&granted, &own_home, problems);
     check_links(&granted, &own_home, problems);
     check_hidden(&granted, policy, ctx, &own_home, problems);
+    check_own_places(&granted, ctx.own_places, &own_home, problems);
+}
+
+/// A workspace at, holding or inside a place the backend gives each session
+/// of its own, as written or where a symlink the user made leads: its bind
+/// comes after that place is made, so the host's would replace the
+/// sandbox's (`~/alias -> ../../run`). The sandbox home is left out, as the
+/// compiler binds it as its own.
+fn check_own_places(
+    granted: &[Granted],
+    own_places: OwnPlaces,
+    own_home: &Path,
+    problems: &mut Vec<Problem>,
+) {
+    for g in granted.iter().filter(|g| !is_within(&g.path, own_home)) {
+        let undone = own_places
+            .undone_by(&g.expanded)
+            .or_else(|| own_places.undone_by(&g.path));
+        if let Some(place) = undone {
+            problems.push(Problem::Refused(format!(
+                "filesystem.write: `{}` ({}) would bring back the host's {place}, which the sandbox has its own of; grant another folder",
+                g.entry,
+                g.path.display()
+            )));
+        }
+    }
 }
 
 /// A folder granted at or inside a path the deny list hides: the deny list wins
@@ -461,7 +492,7 @@ fn check_default_denies(policy: &Policy, problems: &mut Vec<Problem>) {
         .collect();
     if !dropped.is_empty() {
         problems.push(Problem::Refused(format!(
-            "filesystem.read_deny leaves out paths enclos always hides: {}; add your own with read_deny_add instead, and a version from before enclos hid them cannot be restored: make its change again with `policy edit`",
+            "filesystem.read_deny leaves out paths enclos always hides: {}; add your own with read_deny_add instead",
             dropped.join(", ")
         )));
     }
@@ -744,6 +775,7 @@ mod tests {
                 sandbox_home,
             },
             protected: vec![enclos],
+            own_places: OwnPlaces::NONE,
         };
         Fixture { _dir: dir, ctx }
     }
@@ -1075,4 +1107,6 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("~/.ssh"), "{found:?}");
     }
+
+    mod own_places;
 }

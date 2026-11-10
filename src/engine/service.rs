@@ -13,6 +13,7 @@ use crate::layout::LayoutError;
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionKind;
+use crate::model::unenforced::NotEnforced;
 use crate::runtime::{RuntimeService, ServiceName, adapter};
 use crate::service::{LABEL_PREFIX, ServiceError, ServiceLabel, ServiceStatus, ServiceUnit};
 
@@ -34,6 +35,15 @@ impl Unit {
             Unit::Runtime(name) => name.as_str(),
         }
     }
+}
+
+/// What `sandbox start` did: the services it installed, and what the
+/// sandbox runs with not enforced on this host, every one accepted (ADR
+/// 0038).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SandboxStarted {
+    pub labels: Vec<ServiceLabel>,
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 /// How long `launch` and `connect` wait for the sandbox's proxy to record
@@ -119,10 +129,25 @@ impl Engine {
         self.logs_dir(name).join(format!("{}.log", unit.as_str()))
     }
 
+    /// Makes the folder of the sandbox's logs, which a service's unit
+    /// appends to: the service manager makes no folder, and does not start
+    /// a unit whose log it cannot open.
+    pub(super) fn create_logs_dir(&self, name: &SandboxName) -> Result<()> {
+        let logs = self.logs_dir(name);
+        std::fs::create_dir_all(&logs).map_err(|source| LayoutError::Io { path: logs, source })?;
+        Ok(())
+    }
+
     /// The proxy's log, whether the service manager or a session started
     /// it, so that `enclos logs` shows it either way.
     pub(super) fn proxy_log(&self, name: &SandboxName) -> PathBuf {
         self.log_file(name, Unit::Proxy)
+    }
+
+    /// The log of `enclos dashboard`'s program, beside the services' so
+    /// that `enclos logs` shows it.
+    pub(super) fn dashboard_log(&self, name: &SandboxName) -> PathBuf {
+        self.logs_dir(name).join("dashboard.log")
     }
 
     pub(super) fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
@@ -136,8 +161,11 @@ impl Engine {
     /// answers, whose namespace holds the sessions still open (ADR 0039). If
     /// one cannot be installed, none stays installed but that namespace
     /// holder, and the sandbox is marked failed. The services start on their
-    /// own; `proxy_started` says when the proxy has.
-    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// own; `proxy_started` says when the proxy has. Each field the sandbox
+    /// runs with not enforced on this host, every one accepted, is said in
+    /// one line once its services are installed (ADR 0038), as each of its
+    /// sessions says it too.
+    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<SandboxStarted> {
         self.require_sandbox(name)?;
         // Before anything is stopped: an unavailable manager (no login
         // session, another system) would leave the sandbox with nothing.
@@ -154,17 +182,24 @@ impl Engine {
         // Replacing it would split the sandbox: its open sessions would stay
         // in the old namespace, cut off from the proxy (ADR 0039).
         let kept = self.answering_holder(&record)?;
+        let kept_ref = kept.as_slice();
         let kept = kept.as_ref();
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
-        self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop, kept)?
-            .into_result()?;
-        self.install_services(by, name, kept).map_err(|error| {
+        self.remove_services(
+            by,
+            name,
+            "before sandbox start",
+            IfUnrecorded::Stop,
+            kept_ref,
+        )?
+        .into_result()?;
+        let started = self.install_services(by, name, kept).map_err(|error| {
             // None may stay installed: the undo removes them even when its
             // first entry cannot be written, as the start's entry records
             // the attempt.
             let undo = "after a failed sandbox start";
-            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway, kept) {
+            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway, kept_ref) {
                 Err(left) => Error::CleanupFailed {
                     error: Box::new(error),
                     left: left.to_string(),
@@ -186,7 +221,11 @@ impl Engine {
                     },
                 },
             }
-        })
+        })?;
+        for n in &started.not_enforced {
+            crate::notes::say(&n.gap.said_at_start(name.as_str()));
+        }
+        Ok(started)
     }
 
     /// What the service manager runs for the sandbox's service `unit`: this
@@ -241,21 +280,26 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         kept: Option<&ServiceLabel>,
-    ) -> Result<Vec<ServiceLabel>> {
-        // Its entry lists what the sandbox runs with not enforced (ADR 0038).
+    ) -> Result<SandboxStarted> {
         let view = self.policy(name)?;
-        let record = self.record(name)?;
-        let gaps = self.accepted_gaps(name, record.backend, &view.snapshot.policy, None)?;
-        let note = super::unenforced::not_enforced_note(&gaps);
         self.write(
             by,
             "sandbox start",
             Some(name.to_string()),
-            |labels: &Vec<ServiceLabel>| format!("{}{note}", joined(labels)),
+            // Its entry lists what the sandbox runs with not enforced (ADR
+            // 0038).
+            |started: &SandboxStarted| {
+                format!(
+                    "{}{}",
+                    joined(&started.labels),
+                    super::unenforced::not_enforced_note(&started.not_enforced)
+                )
+            },
             |lock| {
                 let mut record = self.record(name)?;
                 let at = format!("at policy v{}", view.version.version);
-                self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
+                let not_enforced =
+                    self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
                 let installed = (|| -> Result<Vec<ServiceLabel>> {
                     self.backend_of(name)?;
                     let store_env =
@@ -266,9 +310,7 @@ impl Engine {
                         .map(|unit| self.service_unit(&record, unit, &store_env))
                         .filter(|unit| !matches!(unit, Ok(u) if Some(&u.label) == kept))
                         .collect::<Result<Vec<ServiceUnit>>>()?;
-                    let logs = self.logs_dir(name);
-                    std::fs::create_dir_all(&logs)
-                        .map_err(|source| LayoutError::Io { path: logs, source })?;
+                    self.create_logs_dir(name)?;
                     // A proxy `connect` started would hold the port the
                     // service needs, and what a runtime service left running
                     // would run beside the new one.
@@ -293,12 +335,15 @@ impl Engine {
                     },
                 };
                 self.state.put(lock, &record)?;
-                installed
+                Ok(SandboxStarted {
+                    labels: installed?,
+                    not_enforced,
+                })
             },
         )
     }
 
-    /// Removes every service of the sandbox installed now but `kept`, the
+    /// Removes every service of the sandbox installed now but those `kept`, the
     /// proxy last; `stop_sandbox` calls this first, keeping none, and
     /// `start_sandbox` before it installs and after a failed install, keeping
     /// a namespace holder that answers, as `why` says.
@@ -318,10 +363,10 @@ impl Engine {
         name: &SandboxName,
         why: &str,
         if_unrecorded: IfUnrecorded,
-        kept: Option<&ServiceLabel>,
+        kept: &[ServiceLabel],
     ) -> Result<Removal> {
         let mut labels = self.installed_labels(name)?;
-        labels.retain(|l| Some(l) != kept);
+        labels.retain(|l| !kept.contains(l));
         if labels.is_empty() {
             return Ok(Removal {
                 labels,

@@ -159,12 +159,25 @@ pub struct RuntimeFacts {
     pub install: Option<HomePath>,
 }
 
+/// Where a runtime keeps the provider an agent's model calls go to, and
+/// the values that mean the agent has none chosen: the runtime then picks
+/// one on its own, and may find none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub at: ValueAt,
+    pub unchosen: &'static [&'static str],
+    /// What a person runs in the sandbox to choose the agent's provider and
+    /// model, for enclos's messages: `enclos connect <sandbox> -- <this>`.
+    pub choose: String,
+}
+
 /// Where a runtime keeps one agent's data and the facts `status` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     /// The folder holding the agent's own data.
     pub folder: Option<HomePath>,
     pub model: Option<ValueAt>,
+    pub provider: Option<ProviderAt>,
     /// Files that change when the agent is used: the newest gives its last
     /// activity.
     pub activity: Vec<HomePath>,
@@ -243,6 +256,13 @@ pub trait RuntimeAdapter {
     fn listener(&self) -> Option<RuntimeListener> {
         None
     }
+    /// The runtime's dashboard, a page for a browser on the host, served by
+    /// a command of its own: what `enclos dashboard` runs where the host
+    /// cannot reach the sandbox's listeners (ADR 0040). `None` (the
+    /// default): the runtime has none.
+    fn dashboard(&self) -> Option<RuntimeDashboard> {
+        None
+    }
     /// The variable naming a folder whose `.env` the runtime's services
     /// read into their own process: their secrets go there, not into their
     /// environment, which any process of the user can read (ADR 0034).
@@ -287,6 +307,14 @@ pub trait RuntimeAdapter {
     /// the sandbox by `enclos agent rm`. `None`: the runtime has none, so
     /// `agent rm` removes only the record and says the files stay.
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
+    /// The runtime's own command that finishes a delete of `name` which
+    /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
+    /// rm` when that command failed after the runtime stopped listing the
+    /// agent and its folder went, and treated with it as the delete. `None`
+    /// (the default): such a failure is a failed delete.
+    fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
     /// The runtime's own command that creates agent `name` from `archive`,
@@ -470,6 +498,19 @@ pub struct RuntimeListener {
     /// status` shows it at the port sessions are given, while the service
     /// has one.
     pub page: Option<&'static str>,
+}
+
+/// A runtime's dashboard, served by a command run in its sandbox as a
+/// session of its own (ADR 0040).
+#[derive(Debug, Clone)]
+pub struct RuntimeDashboard {
+    /// Serves the dashboard on 127.0.0.1, at a port the kernel picks, in a
+    /// server of its own whatever else runs in the sandbox, and runs until
+    /// it is stopped: the port is read from the host, never from what the
+    /// command says.
+    pub command: SandboxCommand,
+    /// The path of its page, such as `/`.
+    pub page: &'static str,
 }
 
 /// A runtime's name for one of its services, stable across versions, as it

@@ -16,6 +16,9 @@ pub struct FakeServices {
     /// Runs after each stop that worked, given its label, for a test to act
     /// in between.
     pub on_stop: RefCell<Option<Meanwhile>>,
+    /// Runs after each start that worked, given its label, as the job the
+    /// manager would start.
+    pub on_start: RefCell<Option<Meanwhile>>,
     /// Processes a test started to stand in for a unit's job: stopping the
     /// unit ends and reaps them, as launchd's `bootout` waits for the job
     /// to exit.
@@ -82,6 +85,9 @@ impl ServiceManager for FakeServices {
         // As launchd's `start`, a unit already there is replaced.
         self.started.borrow_mut().retain(|u| u.label != unit.label);
         self.started.borrow_mut().push(unit.clone());
+        if let Some(meanwhile) = self.on_start.borrow().as_ref() {
+            meanwhile(&unit.label);
+        }
         Ok(())
     }
 

@@ -35,6 +35,7 @@ use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter}
 use crate::state::StateStore;
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
+pub(super) use facts::read_provider;
 use facts::{exists, newest, read_value};
 use printable::printable;
 pub use printable::printable_line;
@@ -121,11 +122,13 @@ impl Engine {
             .iter()
             .filter(|d| !d.reason.nothing_to_allow())
             .count();
-        let policy_unreadable_at = denied
-            .iter()
-            .filter(|d| d.reason == Reason::PolicyUnreadable)
-            .map(|d| d.last)
-            .max();
+        let unreadable = || {
+            denied
+                .iter()
+                .filter(|d| d.reason == Reason::PolicyUnreadable)
+        };
+        let policy_unreadable_at = unreadable().map(|d| d.last).max();
+        let policy_unreadable_refused = unreadable().map(|d| d.count).sum();
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(
                 list.into_iter()
@@ -138,14 +141,23 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
-        let network_listeners = network_listeners(&look, &running);
+        // The host does not reach a listener in the sandbox's own network
+        // namespace (ADR 0039, ADR 0040), so there is none to look for.
+        let own_network = self.holder_of(record.backend).is_some();
+        let network_listeners = match own_network {
+            true => Fact::NotProvided,
+            false => network_listeners(&look, &running),
+        };
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
-            // The host does not reach a listener in the sandbox's own
-            // network namespace (ADR 0039, ADR 0040).
-            Some(_) if self.holder_of(record.backend).is_some() => Fact::NotProvided,
+            Some(_) if own_network => Fact::NotProvided,
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
+        // There, `enclos dashboard` opens it, with no address to give now.
+        let dashboard_command = runtime
+            .and_then(|rt| rt.dashboard())
+            .filter(|_| own_network)
+            .map(|_| format!("enclos dashboard {name}"));
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -190,9 +202,11 @@ impl Engine {
             last_used,
             refused_recently,
             policy_unreadable_at,
+            policy_unreadable_refused,
             agents,
             disk,
             dashboard,
+            dashboard_command,
             network_listeners,
             name,
         })
@@ -242,7 +256,10 @@ impl Engine {
                     AgentKind::Untrackable
                 };
                 let facts = runtime.agent_facts(&agent);
+                let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
                 AgentStatus {
+                    provider,
+                    choose_provider,
                     kind,
                     last_active: newest(home, &facts.activity),
                     model: facts
@@ -363,6 +380,7 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     /// A running session of `kind` whose root is `root`.
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
@@ -396,11 +414,12 @@ mod tests {
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
-        let mut child = std::process::Command::new("/usr/bin/perl")
-            .args(["-e", &listens()])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_unmarked(
+            std::process::Command::new("/usr/bin/perl")
+                .args(["-e", &listens()])
+                .stdout(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
         let mut port = || lines.next().unwrap().unwrap();
         let (wide, narrow) = (port(), port());

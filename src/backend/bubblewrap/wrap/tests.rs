@@ -173,5 +173,6 @@ fn staged(home: &Home) -> Vec<PathBuf> {
 mod command;
 mod links;
 mod masks;
+mod own_places;
 mod sockets;
 mod staged;

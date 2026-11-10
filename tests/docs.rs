@@ -83,7 +83,9 @@ fn the_verdict_on_a_field_not_enforced_is_spelled_out_in_one_document() {
     // others name the rule and point to the one that gives it.
     let spelled_out: Vec<String> = docs_markdown()
         .into_iter()
-        .filter(|(_, text)| text.contains("field not enforced: ") || text.contains("not_enforced"))
+        .filter(|(_, text)| {
+            text.contains("field not enforced: ") || text.contains("`not_enforced`")
+        })
         .map(|(name, _)| name)
         .collect();
     assert_eq!(spelled_out.len(), 1, "{spelled_out:?}");
@@ -220,12 +222,19 @@ fn a_bubblewrap_sandboxs_proxy_leaves_its_reserved_port_to_enclos_dashboard() {
     };
     let milestone_bullet = find("   - the proxy listening on a Unix socket");
     let network_section = find("**The runtime's own service on Linux**");
-    let awaiting_item = find("- `enclos dashboard`");
     for text in [&adr_0040, &milestone_bullet, &network_section] {
         assert!(text.contains("no TCP listener"), "{text}");
     }
     assert!(!milestone_bullet.contains("beside its TCP listener"));
-    assert!(awaiting_item.contains("reserved port"), "{awaiting_item}");
+    assert!(
+        network_section.contains("reserved port"),
+        "{network_section}"
+    );
+    // Shown beside the sandbox's own proxy, no longer a stand-in's.
+    let shown = find(
+        "Shown on GitHub's Ubuntu 24.04 runners, x86_64 and arm64, and Ubuntu 26.04 runner, x86_64 (CI's `bubblewrap` job, `tests/dashboard.rs`)",
+    );
+    assert!(shown.contains("beside the sandbox's own proxy"), "{shown}");
 }
 
 #[test]
@@ -287,9 +296,15 @@ fn bare_holders(text: &str) -> Vec<String> {
     for line in text.lines().map(str::to_lowercase) {
         for (at, _) in line.match_indices("holder") {
             // A service's name, such as `enclos.<install>.<sandbox>.holder`,
-            // or the command's, `enclos holder`.
-            let named = line[..at].ends_with(['.', '`']) || line[..at].ends_with("enclos ");
-            if !named && !line[..at].ends_with("namespace ") {
+            // the command's, `enclos holder`, or a file's, `holder.rs`.
+            let named = line[..at].ends_with(['.', '`'])
+                || line[..at].ends_with("enclos ")
+                || line[at..].starts_with("holder.rs");
+            // Also the code's names: `namespace_holder`, `NamespaceHolder`.
+            let namespace = line[..at]
+                .trim_end_matches([' ', '_'])
+                .ends_with("namespace");
+            if !named && !namespace {
                 let start = (0..=at.saturating_sub(40))
                     .rev()
                     .find(|i| line.is_char_boundary(*i))

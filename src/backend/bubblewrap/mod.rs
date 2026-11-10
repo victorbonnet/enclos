@@ -2,7 +2,8 @@
 //! to one file, `wrap` runs `enclos inside` under bubblewrap with the masks
 //! the host holds at launch, and `enclos inside` applies the rest. Every
 //! session joins the network namespace of the sandbox's namespace holder
-//! first (ADR 0039).
+//! first (ADR 0039). Each bubblewrap is started again while its setup meets
+//! a mount of the host that changed (`setup`).
 
 pub mod compile;
 mod degraded;
@@ -13,11 +14,13 @@ mod probe;
 pub mod probes;
 pub mod proposed;
 pub mod seccomp;
+pub mod setup;
 mod sockets;
 mod wrap;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::sync::OnceLock;
 
 use super::{
@@ -28,7 +31,9 @@ use crate::host::HostCheck;
 use crate::model::policy::Policy;
 use crate::model::sandbox::BackendKind;
 use crate::model::unenforced::NotEnforcedHere;
+use crate::policy::own_places::OwnPlaces;
 use crate::probes::OwnProbes;
+use crate::relay::inward::WayIn;
 
 pub use compile::{CompiledSandbox, compile};
 pub use proposed::{Host, capabilities};
@@ -109,6 +114,13 @@ impl Backend for Bubblewrap {
         capabilities(&host())
     }
 
+    /// `/tmp`, `/run`, `/dev`, `/proc` and the rest, mounted before the
+    /// workspaces; `wrap` checks each workspace against them again as it
+    /// reads the host.
+    fn own_places(&self) -> OwnPlaces {
+        compile::OWN_PLACES
+    }
+
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError> {
         compile::compile(policy, ctx)
     }
@@ -146,10 +158,9 @@ impl Backend for Bubblewrap {
         wrap::command(&programs, compiled, &parsed, &host, ctx, launch)
     }
 
-    /// `listen = false` is not held (ADR 0041), nor a field this host does
-    /// not enforce (ADR 0038): every start says so.
+    /// `listen = false` is not held (ADR 0041): every start says so.
     fn said_at_start(&self, policy: &Policy, ctx: &SandboxContext) -> Vec<String> {
-        let listen = proposed::unenforced(policy)
+        proposed::unenforced(policy)
             .into_iter()
             .filter(|u| u.field == proposed::LISTEN)
             .map(|u| {
@@ -157,17 +168,21 @@ impl Backend for Bubblewrap {
                     "sandbox {}: `listen = false` is not held on bubblewrap: {} (enclos doctor)",
                     ctx.name, u.why
                 )
-            });
-        let here = self
-            .not_enforced_here(policy)
-            .into_iter()
-            .map(|gap| gap.said_at_start(ctx.name.as_str()));
-        listen.chain(here).collect()
+            })
+            .collect()
     }
 
     /// `memory`, where this host's cgroups do not hold it (ADR 0038).
     fn not_enforced_here(&self, policy: &Policy) -> Vec<NotEnforcedHere> {
         proposed::not_enforced_here(policy, &host())
+    }
+
+    /// The Landlock rules, where this kernel has no Landlock or too old an
+    /// ABI (ADR 0037).
+    fn compiled_not_applied_here(&self) -> Vec<String> {
+        degraded::landlock_rules_here(&degraded::Kernel::host())
+            .into_iter()
+            .collect()
     }
 
     /// The same probes for every compiled file, which must be one this
@@ -195,12 +210,23 @@ fn host() -> Host {
 }
 
 impl NamespaceHolder for Bubblewrap {
+    /// Started again while bubblewrap's setup meets a mount that changed
+    /// (`setup`).
     #[cfg(target_os = "linux")]
-    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError> {
+    fn run(&self, ctx: &SandboxContext, stderr: &File) -> Result<ExitStatus, WrapError> {
         let enclos = self.enclos.as_deref().ok_or_else(|| {
             WrapError("cannot find the enclos program, which runs the namespace holder".to_owned())
         })?;
-        holder::command(&self.bwrap, enclos, ctx)
+        setup::run(
+            || holder::command(&self.bwrap, enclos, ctx).map_err(std::io::Error::other),
+            stderr,
+            &setup::PAUSES,
+        )
+        .map_err(|e| {
+            WrapError(format!(
+                "cannot run bubblewrap for the namespace holder: {e}"
+            ))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -211,8 +237,12 @@ impl NamespaceHolder for Bubblewrap {
         })
     }
 
+    fn way_in(&self, ctx: &SandboxContext) -> WayIn {
+        WayIn::new(&ctx.inward_socket)
+    }
+
     #[cfg(not(target_os = "linux"))]
-    fn command(&self, _ctx: &SandboxContext) -> Result<Command, WrapError> {
+    fn run(&self, _ctx: &SandboxContext, _stderr: &File) -> Result<ExitStatus, WrapError> {
         Err(WrapError("the namespace holder runs on Linux".to_owned()))
     }
 

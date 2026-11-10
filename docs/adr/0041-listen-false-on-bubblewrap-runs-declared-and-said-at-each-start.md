@@ -11,3 +11,5 @@ Amends [0009](0009-refuse-what-cannot-be-enforced.md) for one field, and settles
 Decision: on bubblewrap, `listen = false` is declared not held, and no acceptance is asked. The compiled file lists it in `unenforced`, `doctor`'s capabilities say so, and each session's start prints one line saying it is not held on bubblewrap. Seatbelt holds the field, and nothing changes there. Milestone 3's M3-16, which has a sandbox's sessions share one namespace ([0039](0039-a-bubblewrap-sandbox-has-one-network-namespace-its-sessions-join.md)), adds Landlock's TCP bind right (ABI 4), so that the field holds where the kernel has it and stays declared below ABI 4 or without Landlock.
 
 Reason: an acceptance every sandbox needs tells the user nothing a line at each start does not, and the gap matters only once a listener is reachable from another session, which is when M3-16 closes it where the kernel can.
+
+The last sentence of the decision, and with it the reason's last clause, is superseded by [0057](0057-landlocks-tcp-bind-right-is-not-built.md): M3-16 shipped without Landlock's TCP bind right.

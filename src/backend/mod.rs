@@ -18,8 +18,10 @@ use std::process::Command;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::policy::own_places::OwnPlaces;
 use crate::policy::paths::real_path;
 use crate::probes::OwnProbes;
+use crate::relay::inward::WayIn;
 
 /// Whether a backend can run on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +82,9 @@ pub struct SandboxContext {
     /// The socket its namespace holder hands out the sandbox's network
     /// namespace on, for a backend whose sessions join one (ADR 0039).
     pub holder_socket: PathBuf,
+    /// The socket of the namespace holder's relay from the host to a port in
+    /// the sandbox's network namespace (ADR 0040).
+    pub inward_socket: PathBuf,
     /// What enclos stages for an install or an import, which the sandbox
     /// reads and never writes.
     pub installers: PathBuf,
@@ -102,6 +107,7 @@ impl SandboxContext {
             secrets: layout.sandbox_secrets_dir(name.as_str()),
             proxy_socket: layout.proxy_socket(name.as_str()),
             holder_socket: layout.holder_socket(name.as_str()),
+            inward_socket: layout.inward_socket(name.as_str()),
             installers: layout.sandbox_installers(name.as_str()),
         }
     }
@@ -310,8 +316,9 @@ pub enum CompileError {
     },
 }
 
-/// One isolation technology. Prepares, wraps and finds members; never
-/// supervises.
+/// One isolation technology. Compiles a policy and wraps a program in it;
+/// never supervises. Finding a sandbox's members is the lifecycle's (design
+/// §8), not a backend's.
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     /// Checks, without side effects, whether this backend works on this host.
@@ -328,6 +335,14 @@ pub trait Backend {
     fn host_checks(&self) -> Vec<crate::host::HostCheck> {
         Vec::new()
     }
+    /// The places each session has its own of, such as bubblewrap's `/run`,
+    /// which no workspace may put the host's back over: a policy's
+    /// workspaces, as written and where their links lead, are checked
+    /// against them before it is stored and each time it is compiled. None
+    /// by default.
+    fn own_places(&self) -> OwnPlaces {
+        OwnPlaces::NONE
+    }
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
     /// The command that runs `launch` inside the sandbox under `compiled`,
@@ -339,8 +354,9 @@ pub trait Backend {
         launch: &Launch,
     ) -> Result<Command, WrapError>;
     /// What each session's start says of `policy` on this backend, one line
-    /// each: a field it does not hold, which the policy still runs with.
-    /// Nothing by default.
+    /// each: a field it holds on no host, which the policy still runs with.
+    /// A field this host does not hold ([`Backend::not_enforced_here`]) is
+    /// the engine's to say. Nothing by default.
     fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
         Vec::new()
     }
@@ -352,6 +368,13 @@ pub trait Backend {
         &self,
         _policy: &Policy,
     ) -> Vec<crate::model::unenforced::NotEnforcedHere> {
+        Vec::new()
+    }
+    /// What a policy compiled for this backend holds less of on this host
+    /// than its compiled text shows, one line each, such as rules this
+    /// kernel cannot apply: for `policy show --compiled` to say beside it.
+    /// Compiling stays pure; this reads the host. Nothing by default.
+    fn compiled_not_applied_here(&self) -> Vec<String> {
         Vec::new()
     }
     /// Its escape probes and refusals for a sandbox whose compiled policy
@@ -369,15 +392,24 @@ pub trait Backend {
 /// The process that keeps a sandbox's one network namespace in being, so
 /// that every session of the sandbox joins it (ADR 0039). It is one of the
 /// sandbox's services: the engine installs it, and the service manager runs
-/// [`NamespaceHolder::command`]. Its socket, `SandboxContext::holder_socket`,
-/// is in the host-only part of the sandbox's run folder.
+/// [`NamespaceHolder::command`]. Its sockets, `SandboxContext::holder_socket`
+/// and `inward_socket`, are in the host-only part of the sandbox's run folder.
 pub trait NamespaceHolder {
-    /// The command that runs the sandbox's namespace holder in place of the
-    /// process that calls it, its socket already made, or why it cannot.
-    fn command(&self, ctx: &SandboxContext) -> Result<Command, WrapError>;
+    /// Runs the sandbox's namespace holder to its end, its sockets made
+    /// afresh at each start, with `stderr` as its stderr: how it ended, or
+    /// why it could not start.
+    fn run(
+        &self,
+        ctx: &SandboxContext,
+        stderr: &std::fs::File,
+    ) -> Result<std::process::ExitStatus, WrapError>;
     /// What the running namespace holder says of its namespace, or why none
     /// answers.
     fn ask(&self, ctx: &SandboxContext) -> Result<HeldNamespace, String>;
+    /// The host's way to a port of 127.0.0.1 in the sandbox's network
+    /// namespace, which the host does not reach otherwise: through the
+    /// namespace holder's relay from the host (ADR 0040).
+    fn way_in(&self, ctx: &SandboxContext) -> WayIn;
 }
 
 /// A sandbox's network namespace, as its namespace holder gives it.

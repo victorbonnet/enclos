@@ -5,7 +5,8 @@
 //! does replaces one that answers: its network namespace holds the sandbox's
 //! open sessions and services, and a new one would split them.
 
-use std::os::unix::process::CommandExt;
+use std::fs::File;
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 use super::Engine;
@@ -68,6 +69,8 @@ impl Engine {
             crate::notes::say(&format!(
                 "starting the namespace holder of sandbox {name}, whose network namespace its sessions join; it runs until `enclos sandbox stop {name}`"
             ));
+            // Made by no one else yet when nothing of the sandbox ran before.
+            self.create_logs_dir(name)?;
             self.services
                 .start(&self.service_unit(record, Unit::Holder, &[])?)?;
         }
@@ -101,36 +104,28 @@ impl Engine {
         }
     }
 
-    /// `enclos holder run`: becomes the sandbox's namespace holder, as the
-    /// service manager runs it (ADR 0039). Returns only why it could not.
-    pub fn run_holder(&self, name: &SandboxName) -> Error {
-        let became = || -> Result<Error> {
-            let record = self.record(name)?;
-            let backend = self.backend_of(name)?;
-            let holder = backend.namespace_holder().ok_or_else(|| Error::Holder {
-                why: format!(
-                    "sandbox {name} is on {}, whose sessions join no namespace holder",
-                    record.backend
-                ),
+    /// `enclos holder run`: runs the sandbox's namespace holder to its end,
+    /// as the service manager runs it (ADR 0039), with `stderr` as its
+    /// stderr. How it ended, or why it could not start.
+    pub fn run_holder(&self, name: &SandboxName, stderr: &File) -> Result<ExitStatus> {
+        let record = self.record(name)?;
+        let backend = self.backend_of(name)?;
+        let holder = backend.namespace_holder().ok_or_else(|| Error::Holder {
+            why: format!(
+                "sandbox {name} is on {}, whose sessions join no namespace holder",
+                record.backend
+            ),
+        })?;
+        // The proxy's socket folder too, which the relay reaches.
+        self.layout
+            .create_proxy_socket_dir(name.as_str())
+            .map_err(|source| crate::layout::LayoutError::Io {
+                path: self.layout.sandbox_run_dir(name.as_str()),
+                source,
             })?;
-            // The proxy's socket folder too, which the relay reaches.
-            self.layout
-                .create_proxy_socket_dir(name.as_str())
-                .map_err(|source| crate::layout::LayoutError::Io {
-                    path: self.layout.sandbox_run_dir(name.as_str()),
-                    source,
-                })?;
-            let ctx = self.sandbox_context(name, record.proxy_port);
-            let mut command = holder
-                .command(&ctx)
-                .map_err(|e| Error::Holder { why: e.to_string() })?;
-            let e = command.exec();
-            Ok(Error::Holder {
-                why: format!("cannot run bubblewrap for the namespace holder: {e}"),
-            })
-        };
-        match became() {
-            Ok(e) | Err(e) => e,
-        }
+        let ctx = self.sandbox_context(name, record.proxy_port);
+        holder
+            .run(&ctx, stderr)
+            .map_err(|e| Error::Holder { why: e.to_string() })
     }
 }

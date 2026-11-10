@@ -7,6 +7,7 @@ use super::policy::with_sandbox;
 use super::sandbox::{Sleeping, put, session_of, while_waiting};
 use super::*;
 use crate::engine::{ChangeOutcome, PendingEnd};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::policy::{NetMode, PendingPolicy};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
@@ -414,7 +415,10 @@ fn apply_asks_then_restarts_the_sandbox_into_the_pending_policy() {
     let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
     assert_eq!(restarted.version.version, 2);
     assert_eq!(restarted.stopped.unwrap().stopped, [id]);
-    assert!(restarted.started.is_empty(), "no services were installed");
+    assert!(
+        restarted.started.labels.is_empty(),
+        "no services were installed"
+    );
     assert!(engine.policy(&name).unwrap().pending.is_none());
     assert!(writes(&engine, &name, &work));
     let commands = commands(&engine);
@@ -774,7 +778,7 @@ fn apply_stops_the_services_then_starts_them_under_the_pending_policy() {
 
     let restarted = done(engine.policy_apply(&alice(), &name, Confirm::Yes).unwrap());
     assert_eq!(restarted.stopped.as_ref().unwrap().services, installed);
-    assert_eq!(restarted.started, installed);
+    assert_eq!(restarted.started.labels, installed);
     assert_eq!(*fake.stopped.borrow(), installed);
     assert!(writes(&engine, &name, &work));
     let commands = commands(&engine);
@@ -814,12 +818,13 @@ fn processes_that_survive_the_stop_keep_the_policy_pending_and_name_the_services
     // A program in a group made for it, which leaves a sleep there and
     // exits once its input closes: the sleep is only counted, so the stop
     // cannot end it.
-    let mut program = std::process::Command::new("/bin/sh")
-        .args(["-c", "/bin/sleep 30 & read line"])
-        .stdin(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut program = spawn_unmarked(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .unwrap();
     let session = SessionRecord {
         id: SessionId(0),
         sandbox: name.clone(),
@@ -1162,7 +1167,7 @@ fn a_runtime_install_is_refused_while_a_change_is_pending() {
 fn a_session_gone_after_a_crash_does_not_hold_a_change_back() {
     let (dir, engine, name) = with_sandbox();
     let mut session = session_of(&engine, &name, {
-        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let mut child = spawn_unmarked(&mut std::process::Command::new("/usr/bin/true")).unwrap();
         let recorded = crate::lifecycle::process::reference_of_child(&child).unwrap();
         child.wait().unwrap();
         recorded

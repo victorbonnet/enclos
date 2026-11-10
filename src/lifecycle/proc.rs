@@ -80,10 +80,12 @@ pub fn tcp_listeners_at_in(
 
 /// The program that `root` started in a PID namespace of its own: the
 /// process below it numbered 2 there, the first that the namespace's first
-/// process started. Under bubblewrap, `root` is bubblewrap's outer process,
-/// the namespace's first is `enclos inside`, and the second is the
-/// session's command (`inside::command`). None when no such process runs,
-/// as before the command starts.
+/// process started. That first process is a child of `root` or of a child
+/// of `root` in `root`'s own namespace. Under bubblewrap, `root` is `enclos
+/// holder join`, its child bubblewrap's outer process, the namespace's first
+/// is `enclos inside`, and the second is the session's command
+/// (`inside::command`). None when no such process runs, as before the
+/// command starts.
 pub fn program_in_pid_namespace(root: u32) -> Result<Option<u32>, ListenersError> {
     program_under(Path::new(PROC), root)
 }
@@ -92,6 +94,28 @@ pub fn program_in_pid_namespace(root: u32) -> Result<Option<u32>, ListenersError
 /// error when either cannot be read, as when it is gone.
 pub fn same_network(a: u32, b: u32) -> Result<bool, ListenersError> {
     same_network_under(Path::new(PROC), a, b)
+}
+
+/// The user owning the socket at `client` connected to `server`, both
+/// TCP addresses in this process's network namespace, from the kernel's
+/// tables: none unless they give exactly one, as when the client has closed
+/// its end already. A table that cannot be read is an error; `tcp6` is
+/// missing on a kernel without IPv6.
+pub fn tcp_client_owner(
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Result<Option<u32>, ListenersError> {
+    let net = Path::new(PROC).join("self/net");
+    let mut tables = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        let path = net.join(table);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => tables.push(text),
+            Err(e) if table == "tcp6" && e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(proc_error(format!("{}: {e}", path.display()))),
+        }
+    }
+    Ok(net::client_owner(&tables, client, server))
 }
 
 /// The first and last port the system picks from for a bind on port 0.
@@ -256,8 +280,25 @@ fn parse_status(text: &str) -> Option<(u32, Vec<u32>)> {
     (!pids.is_empty()).then_some((parent, pids))
 }
 
+/// What [`parse_status`] reads of `pid` under `proc`, or `None` when it is
+/// gone. One whose `status` is refused is an error of kind
+/// `PermissionDenied`.
+fn lineage_of(proc: &Path, pid: u32) -> io::Result<Option<(u32, Vec<u32>)>> {
+    let status = proc.join(pid.to_string()).join("status");
+    let named = |e: io::Error| io::Error::new(e.kind(), format!("{}: {e}", status.display()));
+    let text = match std::fs::read_to_string(&status) {
+        Err(e) if descriptors::is_gone(&e) => return Ok(None),
+        text => text.map_err(named)?,
+    };
+    parse_status(&text)
+        .map(Some)
+        .ok_or_else(|| io::Error::other(format!("{} does not read", status.display())))
+}
+
 /// What [`parse_status`] reads of every process under `proc`, by pid. A
-/// process that exits meanwhile is left out.
+/// process that exits meanwhile is left out; so is one `/proc` refuses,
+/// which is another user's on a `/proc` mounted with `hidepid=1`, as the
+/// process listing leaves it out.
 fn lineages(proc: &Path) -> Result<BTreeMap<u32, (u32, Vec<u32>)>, ListenersError> {
     let mut found = BTreeMap::new();
     for entry in std::fs::read_dir(proc).map_err(proc_error)? {
@@ -265,32 +306,40 @@ fn lineages(proc: &Path) -> Result<BTreeMap<u32, (u32, Vec<u32>)>, ListenersErro
         let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
             continue;
         };
-        let status = entry.path().join("status");
-        let text = match std::fs::read_to_string(&status) {
-            Ok(text) => text,
-            Err(e) if descriptors::is_gone(&e) => continue,
-            Err(e) => return Err(proc_error(format!("{}: {e}", status.display()))),
-        };
-        let lineage = parse_status(&text)
-            .ok_or_else(|| proc_error(format!("{} does not read", status.display())))?;
-        found.insert(pid, lineage);
+        match lineage_of(proc, pid) {
+            Ok(Some(lineage)) => {
+                found.insert(pid, lineage);
+            }
+            Ok(None) => {}
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(proc_error(e)),
+        }
     }
     Ok(found)
 }
 
+/// [`program_in_pid_namespace`] under `proc`. The root's own `status`
+/// refused is an error: a look that could not happen, not a session whose
+/// program has not started.
 fn program_under(proc: &Path, root: u32) -> Result<Option<u32>, ListenersError> {
-    let every = lineages(proc)?;
-    let Some((_, root_pids)) = every.get(&root) else {
+    let Some((_, root_pids)) = lineage_of(proc, root).map_err(proc_error)? else {
         return Ok(None);
     };
-    // One PID namespace below the root's, numbered `inside` there.
-    let below = |parent: u32, inside: u32| {
+    let depth = root_pids.len();
+    let every = lineages(proc)?;
+    // The children of `parent` `levels` PID namespaces below the root's,
+    // numbered `inside` in theirs.
+    let below = |parent: u32, levels: usize, inside: Option<u32>| {
         every.iter().filter_map(move |(pid, (ppid, pids))| {
-            let nested = pids.len() == root_pids.len() + 1 && pids.last() == Some(&inside);
+            let nested = pids.len() == depth + levels
+                && inside.is_none_or(|inside| pids.last() == Some(&inside));
             (*ppid == parent && nested).then_some(*pid)
         })
     };
-    Ok(below(root, 1).find_map(|first| below(first, 2).next()))
+    Ok(std::iter::once(root)
+        .chain(below(root, 0, None))
+        .flat_map(|outer| below(outer, 1, Some(1)))
+        .find_map(|first| below(first, 1, Some(2)).next()))
 }
 
 fn same_network_under(proc: &Path, a: u32, b: u32) -> Result<bool, ListenersError> {

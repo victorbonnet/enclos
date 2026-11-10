@@ -3,7 +3,8 @@
 //! Linux's ephemeral range holds the proxy range, so a bind on port 0 can
 //! land on a port a test sandbox's proxy wants, or one the engine refuses as
 //! a service's. Whatever binds on port 0 in a test comes through here: Rust
-//! through [`tcp_listener`] or [`clear_of_proxies`], the stand-ins through
+//! through [`tcp_listener`] (or [`tcp_listener_free_at`], for a port free at
+//! another address too) or [`clear_of_proxies`], the stand-ins through
 //! [`perl_listener`] or [`python_listener`], each with the same rule. A port
 //! rejected stays held while the next is asked for, so the system gives
 //! another; it is let go at the end.
@@ -50,6 +51,34 @@ pub(crate) fn tcp_listener(address: impl Into<IpAddr>) -> TcpListener {
     .unwrap_or_else(|| panic!("no port outside {PORT_FIRST} to {PORT_LAST} to listen on"))
 }
 
+/// A TCP listener at `address`, as [`tcp_listener`] gives, on a port free at
+/// `other` too. The system looks only at `address` when it chooses: on
+/// Linux, a port it gives `[::1]` may be one another test holds on
+/// 127.0.0.1. The port is free at `other` when this returns, and not held
+/// there.
+pub(crate) fn tcp_listener_free_at(
+    address: impl Into<IpAddr>,
+    other: impl Into<IpAddr>,
+) -> TcpListener {
+    let address = address.into();
+    free_at(other.into(), || tcp_listener(address))
+}
+
+/// The first listener `next` gives whose port is free at `other`. Panics
+/// after [`TRIES`].
+fn free_at(other: IpAddr, mut next: impl FnMut() -> TcpListener) -> TcpListener {
+    let mut rejected = Vec::new();
+    for _ in 0..TRIES {
+        let listener = next();
+        let port = listener.local_addr().unwrap().port();
+        if TcpListener::bind((other, port)).is_ok() {
+            return listener;
+        }
+        rejected.push(listener);
+    }
+    panic!("no port free at {other} too in {TRIES} tries")
+}
+
 /// Perl defining `listener($address, $port, $reuse)`: a listening socket at
 /// a packed address, on `$port` or else one the system chooses, shared with
 /// `SO_REUSEPORT` when `$reuse` is true.
@@ -91,7 +120,7 @@ def listener():
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::process::Command;
     #[cfg(target_os = "linux")]
     use std::process::Output;
@@ -143,6 +172,23 @@ mod tests {
         let listener = tcp_listener(Ipv4Addr::LOCALHOST);
         let port = listener.local_addr().unwrap().port();
         assert!(!(PORT_FIRST..=PORT_LAST).contains(&port), "{port}");
+    }
+
+    #[test]
+    fn a_port_held_at_the_other_address_is_passed_over() {
+        let held = tcp_listener(Ipv4Addr::LOCALHOST);
+        let taken = held.local_addr().unwrap().port();
+        // As Linux may: first the port 127.0.0.1 holds, then the system's.
+        let mut offered = std::iter::once(Some(taken)).chain(std::iter::repeat(None));
+        let listener = free_at(Ipv4Addr::LOCALHOST.into(), || {
+            match offered.next().unwrap() {
+                Some(port) => TcpListener::bind((Ipv6Addr::LOCALHOST, port)).unwrap(),
+                None => tcp_listener(Ipv6Addr::LOCALHOST),
+            }
+        });
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, taken);
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
     }
 
     #[cfg(target_os = "linux")]

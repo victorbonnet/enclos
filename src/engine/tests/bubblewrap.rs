@@ -76,7 +76,8 @@ exit 99"#,
             ),
         );
         script(&at("systemd-run"), "echo 'systemd 257 (257.1-1)'");
-        // `holder join`, which becomes what follows its `--`.
+        // `holder join`, which here becomes what follows its `--`, as the
+        // `holder enter` it runs does.
         script(
             &at("enclos"),
             &format!(
@@ -313,17 +314,20 @@ fn a_bubblewrap_session_starts_through_start_session_holding_its_marker() {
 /// The first session of a sandbox that was never started installs its
 /// namespace holder alone, as a service, and joins it once it answers
 /// (ADR 0039). Here the service manager is a stand-in, so the namespace
-/// holder that answers is one this test starts meanwhile.
+/// holder that answers is one this test starts as the unit is started:
+/// before, the engine finds none.
 #[test]
 fn a_first_session_installs_the_namespace_holder_and_waits_for_it() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let services = std::rc::Rc::new(FakeServices::default());
     let stood = Stood::with(true, Some(services.clone()));
     let socket = stood.engine.layout.holder_socket("lab");
-    let late = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
-    });
+    let holder = stood.engine.label(&stood.name, Unit::Holder).unwrap();
+    *services.on_start.borrow_mut() = Some(Box::new(move |label| {
+        if *label == holder {
+            crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+        }
+    }));
     let starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Own,
@@ -338,7 +342,6 @@ fn a_first_session_installs_the_namespace_holder_and_waits_for_it() {
             })
     });
     drop(lock);
-    late.join().unwrap();
     let mut started = started.unwrap();
     assert!(started.child.wait().unwrap().success());
     stood.end_proxy();
@@ -396,6 +399,23 @@ fn sandbox_start_keeps_a_namespace_holder_that_answers() {
     assert!(!services.stopped.borrow().contains(&label));
     assert!(services.stopped.borrow().contains(&proxy));
     assert_eq!(holders(), 1);
+}
+
+/// `status` looks for no listener of a bubblewrap sandbox: its sessions
+/// listen in its own network namespace, which the host's network does not
+/// reach (ADR 0040). A look at every member would not tell anyway, since
+/// `enclos inside`, each session's first process, is not dumpable. CI's
+/// `bubblewrap` job shows it with sessions running
+/// (`tests/bubblewrap/status.rs`).
+#[test]
+fn status_looks_for_no_listener_of_a_bubblewrap_sandbox() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let stood = Stood::new();
+    let view = stood.engine.status(Some(&stood.name)).unwrap();
+    assert_eq!(
+        view.sandboxes[0].network_listeners,
+        crate::engine::Fact::NotProvided
+    );
 }
 
 /// `listen = false`, which every template leaves, is not held on
@@ -664,4 +684,26 @@ fn an_import_session_is_shown_its_copy_of_the_archive_read_only() {
             "{after}"
         );
     }
+}
+
+/// The namespace holder installed alone, before anything of the sandbox
+/// ran, as `enclos dashboard` does: its log's folder is made first, since
+/// systemd starts no unit whose log it cannot open.
+#[test]
+fn a_namespace_holder_installed_alone_gets_its_logs_folder() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let stood = Stood::with(true, Some(services.clone()));
+    let logs = stood.engine.layout.sandbox_dir("lab").join("logs");
+    assert!(!logs.exists());
+    let socket = stood.engine.layout.holder_socket("lab");
+    let late = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        crate::backend::bubblewrap::holder::stand_in(&socket, (32768, 60999));
+    });
+    let record = stood.engine.record(&stood.name).unwrap();
+    let ((), _) = crate::notes::heard(|| stood.engine.ensure_holder(&record).unwrap());
+    late.join().unwrap();
+    assert!(logs.is_dir());
+    assert_eq!(services.started.borrow().len(), 1);
 }

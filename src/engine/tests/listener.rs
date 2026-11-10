@@ -1,6 +1,7 @@
 use super::policy::with_sandbox;
 use super::*;
 use crate::engine::listener::{Network, NoPort, outside_proxy_range, service_listener};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
@@ -8,11 +9,12 @@ use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 /// it listens on, one a line, then waits.
 fn perl(script: &str, ports: usize) -> (std::process::Child, Vec<u16>) {
     use std::io::BufRead;
-    let mut child = std::process::Command::new("/usr/bin/perl")
-        .args(["-MSocket=:all", "-e", script])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", script])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
     let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
     let ports = (0..ports)
         .map(|_| lines.next().unwrap().unwrap().parse().unwrap())
@@ -205,11 +207,12 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         crate::test_ports::perl_listener()
     );
     let (owner, port) = perl(&shared, 1);
-    let mut other = std::process::Command::new("/usr/bin/perl")
-        .args(["-MSocket=:all", "-e", &shared, &port[0].to_string()])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut other = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", &shared, &port[0].to_string()])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
     {
         use std::io::BufRead;
         let mut lines = std::io::BufReader::new(other.stdout.take().unwrap()).lines();

@@ -5,6 +5,7 @@ mod cgroups;
 
 use super::policy::with_sandbox_on;
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::agent::{AgentName, AgentRecord};
 use crate::model::runtime::RuntimeKind;
 use crate::runtime::RuntimeAgentName;
@@ -158,6 +159,14 @@ impl RuntimeAdapter for TestRuntime {
 
 /// An installer that puts a `hermes` stub on the sandbox's PATH, which
 /// records its calls in the home and fails while `hermes-fails` exists.
+/// While `identity-pending` exists, its delete answers as Hermes 0.23.0's
+/// does when the profile's session and routing records are not purged:
+/// the folder removed, exit 1, naming `purge-identity`, which then succeeds
+/// unless `purge-fails` exists. While `gateway-runs` exists, as a running
+/// gateway owns every profile, its delete stops halfway, as Hermes
+/// 0.23.0's does: the profile marked deleted, its folder kept, exit 1.
+/// Its create copies `default`'s `config.yaml`, when there is one, as
+/// `--clone-from` does.
 pub(super) const INSTALLS: &str = "#!/bin/sh
 mkdir -p \"$HOME/.local/bin\"
 cat > \"$HOME/.local/bin/hermes\" <<'STUB'
@@ -166,6 +175,22 @@ printf '%s\\n' \"$*\" >> \"$HOME/hermes-calls\"
 [ -f \"$HOME/hermes-fails\" ] && exit 3
 [ -f \"$HOME/hermes-token-fails\" ] && [ \"$5\" = platforms.telegram.token ] && exit 3
 [ -f \"$HOME/hermes-after-fails\" ] && [ \"$5\" = secrets.command.enabled ] && exit 3
+if [ \"$1 $2 $4 $5\" = \"profile create --clone-from default\" ] && [ -f \"$HOME/.hermes/config.yaml\" ]; then
+  mkdir -p \"$HOME/.hermes/profiles/$3\"
+  cp \"$HOME/.hermes/config.yaml\" \"$HOME/.hermes/profiles/$3/config.yaml\"
+fi
+if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/gateway-runs\" ]; then
+  mkdir -p \"$HOME/.hermes/profiles/.deleted\"
+  echo deleted > \"$HOME/.hermes/profiles/.deleted/$3\"
+  echo \"Error: Could not remove profile directory $HOME/.hermes/profiles/$3: a running gateway still owns this profile; retry the delete once it settles\" >&2
+  exit 1
+fi
+if [ \"$1 $2\" = \"profile delete\" ] && [ -f \"$HOME/identity-pending\" ]; then
+  rm -rf \"$HOME/.hermes/profiles/$3\"
+  echo \"Error: Profile '$3' was deleted, but its session/routing identity settlement is still pending — run: hermes profile purge-identity $3\" >&2
+  exit 1
+fi
+[ \"$1 $2\" = \"profile purge-identity\" ] && [ -f \"$HOME/purge-fails\" ] && exit 1
 if [ \"$1 $2\" = \"profile delete\" ] && [ ! -f \"$HOME/hermes-keeps\" ]; then
   rm -rf \"$HOME/.hermes/profiles/$3\"
 fi
@@ -768,6 +793,257 @@ fn removing_an_agent_runs_the_runtimes_delete_then_removes_the_record() {
     assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 2);
 }
 
+/// A sandbox with Hermes's stub installed and `agents` added, each with a
+/// profile folder Hermes lists.
+fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    for a in agents {
+        let dir = lab.home.join(".hermes/profiles").join(a);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), "").unwrap();
+        done(
+            lab.engine
+                .add_agent(&alice(), &lab.name, a.parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        );
+    }
+}
+
+#[test]
+fn an_agent_added_before_the_login_chose_a_provider_is_said_to_have_none() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    assert!(done(lab.install(INSTALLS, Confirm::Yes).unwrap()).installed);
+    let settings = lab.home.join(".hermes/config.yaml");
+    let add = |a: &str| {
+        done(
+            lab.engine
+                .add_agent(&alice(), &lab.name, a.parse().unwrap(), Confirm::Yes)
+                .unwrap(),
+        )
+    };
+    // Before the login: Hermes's own settings, which the new agent copies.
+    std::fs::create_dir_all(lab.home.join(".hermes")).unwrap();
+    std::fs::write(&settings, "model:\n  default: ''\n  provider: auto\n").unwrap();
+    let early = add("early");
+    assert_eq!(
+        early.choose_provider.as_deref(),
+        Some("hermes -p early model")
+    );
+    // After it, the new agent starts on the provider it chose.
+    std::fs::write(
+        &settings,
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    assert_eq!(add("late").choose_provider, None);
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join(".hermes/profiles/late/config.yaml")).unwrap(),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n"
+    );
+}
+
+#[test]
+fn a_delete_runs_with_the_gateway_stopped_and_a_half_deleted_agent_is_deleted_again() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    lab_with_profiles(&lab, &["writer", "reader", "other"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap();
+    let rm = |a: &str| {
+        lab.engine.remove_agent(
+            &alice(),
+            &lab.name,
+            &a.parse().unwrap(),
+            false,
+            Confirm::Yes,
+        )
+    };
+    let profile = |a: &str| lab.home.join(".hermes/profiles").join(a);
+    // A gateway that runs owns every profile; the service manager stops
+    // and starts it.
+    let runs = lab.home.join("gateway-runs");
+    std::fs::write(&runs, "").unwrap();
+
+    // Without its service installed, enclos cannot stop it: Hermes's
+    // delete stops halfway and the record stays, saying what is left.
+    let err = rm("writer").unwrap_err().to_string();
+    assert!(
+        err.contains("exited with 1 and left its folder (~/.hermes/profiles/writer), which Hermes no longer lists; its record stays")
+            && err.contains("`enclos agent rm home/writer` runs Hermes's delete again"),
+        "{err}"
+    );
+    assert!(profile("writer").exists());
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 3);
+
+    // Installed, as `sandbox start` leaves it, the gateway stops while
+    // Hermes deletes, then is installed again.
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let on = runs.clone();
+    *fake.on_stop.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            let _ = std::fs::remove_file(&on);
+        }
+    }));
+    let on = runs.clone();
+    *fake.on_start.borrow_mut() = Some(Box::new(move |l| {
+        if l.service() == "gateway" {
+            std::fs::write(&on, "").unwrap();
+        }
+    }));
+    let Planned::DryRun(plan) = lab
+        .engine
+        .remove_agent(
+            &alice(),
+            &lab.name,
+            &agent("reader"),
+            false,
+            Confirm::DryRun,
+        )
+        .unwrap()
+    else {
+        panic!("a dry run removed");
+    };
+    assert_eq!(
+        plan.changes,
+        [
+            format!("stop service {gateway}"),
+            "delete agent home/reader and its files, with Hermes's own command".to_owned(),
+            format!("install service {gateway} again"),
+        ]
+    );
+    let err = lab
+        .engine
+        .remove_agent(&alice(), &lab.name, &agent("reader"), false, Confirm::Ask)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "deleting agent home/reader and its files, its service gateway stopped meanwhile"
+        ),
+        "{err}"
+    );
+    // The half-deleted agent first: Hermes's delete runs again and
+    // finishes it.
+    for a in ["writer", "reader"] {
+        assert_eq!(
+            done(rm(a).unwrap()),
+            AgentRemoved::Deleted {
+                kind: RuntimeKind::Hermes
+            }
+        );
+        assert!(!profile(a).exists());
+        assert!(
+            calls().ends_with(&format!("profile delete {a} --yes\n")),
+            "{}",
+            calls()
+        );
+    }
+    assert_eq!(fake.stopped.borrow().len(), 2);
+    let started: Vec<String> = fake
+        .started
+        .borrow()
+        .iter()
+        .map(|u| u.label.to_string())
+        .collect();
+    assert_eq!(started, [gateway.to_string()]);
+    let args = fake.started.borrow()[0].args.clone();
+    assert_eq!(
+        args,
+        ["launch", "home", "gateway"].map(std::ffi::OsString::from)
+    );
+    assert!(runs.exists(), "the gateway runs again");
+    let audit = lab.audit();
+    assert!(
+        audit.contains("services remove") && audit.contains("services start"),
+        "{audit}"
+    );
+    assert_eq!(
+        lab.summary("services start"),
+        format!("installed {gateway} again")
+    );
+
+    // A gateway that cannot start again: the agent is deleted all the
+    // same, and enclos says how to start it.
+    *fake.refuse.borrow_mut() = Some("gateway".to_owned());
+    let err = rm("other").unwrap_err().to_string();
+    assert!(
+        err.contains("its gateway could not start again")
+            && err.contains("`enclos sandbox start home` starts its services again")
+            && err.contains("after deleting agent home/other and its files, and its record"),
+        "{err}"
+    );
+    assert!(!profile("other").exists());
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+}
+
+#[test]
+fn a_delete_hermes_leaves_to_purge_is_finished_with_its_purge() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    lab_with_profiles(&lab, &["main", "stuck"]);
+    let calls = || std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap();
+    let rm = |a: &str| {
+        lab.engine.remove_agent(
+            &alice(),
+            &lab.name,
+            &a.parse().unwrap(),
+            false,
+            Confirm::Yes,
+        )
+    };
+    // Hermes 0.23.0: the profile deleted, exit 1, the purge named.
+    std::fs::write(lab.home.join("identity-pending"), "").unwrap();
+    assert_eq!(
+        done(rm("main").unwrap()),
+        AgentRemoved::Deleted {
+            kind: RuntimeKind::Hermes
+        }
+    );
+    assert!(
+        calls().ends_with("profile delete main --yes\nprofile purge-identity main\n"),
+        "{}",
+        calls()
+    );
+    assert!(!lab.home.join(".hermes/profiles/main").exists());
+    let names: Vec<String> = lab
+        .engine
+        .agents(&lab.name)
+        .unwrap()
+        .iter()
+        .map(|a| a.name.to_string())
+        .collect();
+    assert_eq!(names, ["stuck"]);
+
+    // A purge that fails keeps the record, and says how to finish.
+    std::fs::write(lab.home.join("purge-fails"), "").unwrap();
+    let err = rm("stuck").unwrap_err().to_string();
+    assert!(
+        err.contains(
+            "`hermes profile purge-identity stuck`, which finishes its delete, exited with 1"
+        ) && err.contains("enclos connect home -- hermes profile purge-identity stuck")
+            && err.contains("its record stays"),
+        "{err}"
+    );
+    assert_eq!(lab.engine.agents(&lab.name).unwrap().len(), 1);
+    // Once it is finished by hand, nothing is left: the record goes.
+    assert_eq!(
+        done(rm("stuck").unwrap()),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/stuck".into(),
+            why: FilesKept::RuntimeLacksIt,
+        }
+    );
+    assert!(lab.engine.agents(&lab.name).unwrap().is_empty());
+}
+
 #[test]
 fn an_agent_is_imported_with_the_runtime_s_own_import_and_its_archive_recorded() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1271,9 +1547,8 @@ fn an_import_is_refused_when_the_runtimes_agents_cannot_be_read() {
 #[test]
 fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
     let (_dir, engine, name, make) = with_hermes();
-    make("scout");
-    make("ranger");
-    for a in ["scout", "ranger"] {
+    for a in ["scout", "ranger", "half"] {
+        make(a);
         done(
             engine
                 .add_agent(&alice(), &name, agent(a), Confirm::Yes)
@@ -1281,21 +1556,61 @@ fn an_agent_deleted_inside_the_sandbox_is_reported_missing() {
         );
     }
     let profiles = engine.sandbox_home(&name).join(".hermes/profiles");
-    // As `hermes profile delete` does: a tombstone, the folder kept.
-    std::fs::create_dir_all(profiles.join(".deleted/scout")).unwrap();
+    // As `hermes profile delete` does: a tombstone, then the folder
+    // removed. A delete that stopped halfway leaves the folder.
+    for a in ["scout", "half"] {
+        std::fs::create_dir_all(profiles.join(".deleted").join(a)).unwrap();
+    }
+    std::fs::remove_dir_all(profiles.join("scout")).unwrap();
     std::fs::remove_dir_all(profiles.join("ranger")).unwrap();
     let diff = compared(engine.check_agents(&name).unwrap());
-    assert_eq!(diff.missing, [agent("ranger"), agent("scout")]);
+    assert_eq!(
+        diff.missing,
+        [agent("half"), agent("ranger"), agent("scout")]
+    );
     assert!(diff.untracked.is_empty());
-    // Nothing left to delete: removing them takes only the record, and
+    // What is left of the half-deleted one is Hermes's to delete: its
+    // folder would refuse an agent of that name.
+    let Planned::DryRun(plan) = engine
+        .remove_agent(&alice(), &name, &agent("half"), false, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert_eq!(
+        plan.changes,
+        [
+            "delete what is left of agent home/half (~/.hermes/profiles/half), which Hermes no longer lists, with Hermes's own command"
+        ]
+    );
+    // `--keep-data` says what it leaves: the folder here, nothing there.
+    let kept = |a: &str| match done(
+        engine
+            .remove_agent(&alice(), &name, &agent(a), true, Confirm::Yes)
+            .unwrap(),
+    ) {
+        AgentRemoved::RecordOnly {
+            why: FilesKept::Asked { left },
+            ..
+        } => left,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(kept("half"), Ok(Leftover::Folder));
+    assert_eq!(kept("scout"), Ok(Leftover::Nothing));
+    // Nothing left to delete: removing it takes only the record, and
     // runs nothing in the sandbox (the fake backend would fail).
-    for a in ["scout", "ranger"] {
+    assert_eq!(
         done(
             engine
-                .remove_agent(&alice(), &name, &agent(a), false, Confirm::Yes)
+                .remove_agent(&alice(), &name, &agent("ranger"), false, Confirm::Yes)
                 .unwrap(),
-        );
-    }
+        ),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/ranger".into(),
+            why: FilesKept::RuntimeLacksIt,
+        }
+    );
     assert!(engine.agents(&name).unwrap().is_empty());
 }
 
@@ -1324,10 +1639,29 @@ fn removing_an_agent_with_its_files_asks_first() {
         ["delete agent home/scout and its files, with Hermes's own command"]
     );
     // `--keep-data` needs no confirmation and leaves the files.
-    done(
-        engine
-            .remove_agent(&alice(), &name, &scout, true, Confirm::Ask)
-            .unwrap(),
+    let Planned::DryRun(plan) = engine
+        .remove_agent(&alice(), &name, &scout, true, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert_eq!(
+        plan.changes,
+        ["remove the record of agent home/scout; its files stay (~/.hermes/profiles/scout)"]
+    );
+    assert_eq!(
+        done(
+            engine
+                .remove_agent(&alice(), &name, &scout, true, Confirm::Ask)
+                .unwrap(),
+        ),
+        AgentRemoved::RecordOnly {
+            kind: RuntimeKind::Hermes,
+            files: "~/.hermes/profiles/scout".into(),
+            why: FilesKept::Asked {
+                left: Ok(Leftover::Agent)
+            },
+        }
     );
     assert!(engine.agents(&name).unwrap().is_empty());
     assert!(
@@ -1560,11 +1894,12 @@ fn a_restart_is_not_sent_while_a_session_is_recorded_under_the_lock() {
     use std::os::unix::process::CommandExt;
     let lab = Lab::new();
     let sleep = || {
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .unwrap()
+        spawn_unmarked(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0),
+        )
+        .unwrap()
     };
     let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
         id: crate::model::session::SessionId(0),
@@ -1635,11 +1970,12 @@ fn an_exec_session_does_not_hold_back_a_settings_restart() {
     use std::os::unix::process::CommandExt;
     let lab = Lab::new();
     let sleep = || {
-        std::process::Command::new("/bin/sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .unwrap()
+        spawn_unmarked(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .process_group(0),
+        )
+        .unwrap()
     };
     let record = |child: &std::process::Child, kind| crate::model::session::SessionRecord {
         id: crate::model::session::SessionId(0),
@@ -1696,11 +2032,12 @@ fn a_settings_restart_waits_until_no_one_is_connected() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();
     assert!(done(lab.install(RESTARTS, Confirm::Yes).unwrap()).installed);
-    let mut setup = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut setup = spawn_unmarked(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0),
+    )
+    .unwrap();
     {
         let lock = lab.engine.state.lock().unwrap();
         let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
@@ -2980,7 +3317,7 @@ fn a_launch_ends_a_service_session_whose_launch_was_killed() {
     assert!(done(lab.install(LEAVES, Confirm::Yes).unwrap()).installed);
     // As the service manager's timeout leaves it: a session open, its
     // process gone.
-    let dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = spawn_unmarked(&mut std::process::Command::new("/usr/bin/true")).unwrap();
     let root = crate::lifecycle::process::reference_of_child(&dead).unwrap();
     let mut dead = dead;
     dead.wait().unwrap();
@@ -3035,11 +3372,12 @@ fn record_service_session(
 /// with nothing waiting for it but this test.
 fn orphan_runtime() -> (std::process::Child, crate::model::session::ProcessRef) {
     use std::os::unix::process::CommandExt;
-    let child = std::process::Command::new("/bin/sleep")
-        .arg("600")
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let child = spawn_unmarked(
+        std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0),
+    )
+    .unwrap();
     let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
     (child, root)
 }
@@ -3632,10 +3970,7 @@ fn a_start_ends_the_proxy_a_connect_started_and_leaves_other_sessions() {
         .expect("the install recorded a proxy")
         .clone();
     // Another session, which `start` has no reason to end.
-    let mut other = std::process::Command::new("/bin/sleep")
-        .arg("60")
-        .spawn()
-        .unwrap();
+    let mut other = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("60")).unwrap();
     let root = crate::lifecycle::process::reference_of_child(&other).unwrap();
     lab.engine
         .write(

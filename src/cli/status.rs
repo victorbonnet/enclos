@@ -102,15 +102,25 @@ fn fact<T>(f: &Fact<T>, shown: impl Fn(&T) -> String) -> String {
     }
 }
 
-/// What the sandbox serves on the host: its runtime's dashboard, and each
-/// member the host's network can reach (ADR 0028).
-fn listener_lines(dashboard: &Fact<String>, listeners: &Fact<Vec<NetworkListener>>) -> Vec<String> {
+/// What the sandbox serves on the host: its runtime's dashboard, or the
+/// command that opens it (ADR 0040), and each member the host's network can
+/// reach (ADR 0028).
+fn listener_lines(
+    dashboard: &Fact<String>,
+    command: Option<&str>,
+    listeners: &Fact<Vec<NetworkListener>>,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match dashboard {
         Fact::Known(page) => lines.push(format!("dashboard {page}")),
         Fact::CannotTell(why) => lines.push(format!("dashboard: cannot tell ({why})")),
         // Its service is not running, as the services line shows.
         Fact::Absent | Fact::NotProvided => {}
+    }
+    if let Some(command) = command {
+        lines.push(format!(
+            "dashboard: `{command}` serves it to you alone, until Ctrl-C; on a remote host, run it over ssh with -L"
+        ));
     }
     match listeners {
         Fact::Known(list) => lines.extend(list.iter().map(|l| {
@@ -193,7 +203,11 @@ fn print_sandbox(s: &SandboxStatus, width: usize, now: Timestamp) {
     if let Some(why) = &s.policy_refused {
         println!("  nothing new starts here, and what runs keeps its policy: {why}");
     }
-    for line in listener_lines(&s.dashboard, &s.network_listeners) {
+    for line in listener_lines(
+        &s.dashboard,
+        s.dashboard_command.as_deref(),
+        &s.network_listeners,
+    ) {
         println!("  {line}");
     }
 
@@ -251,9 +265,11 @@ fn print_agents(agents: &[AgentStatus], complete: bool, now: Timestamp) {
             fact(&a.bytes, |b| size(*b, complete)),
             fact(&a.model, Clone::clone),
         );
-        match note(a) {
-            Some(note) => println!("{line}    {note}"),
-            None => println!("{line}"),
+        let provider = a.choose_provider.as_ref().map(|_| "no provider chosen");
+        let notes: Vec<&str> = note(a).into_iter().chain(provider).collect();
+        match notes.is_empty() {
+            true => println!("{line}"),
+            false => println!("{line}    {}", notes.join("; ")),
         }
     }
 }
@@ -337,6 +353,7 @@ mod tests {
         assert_eq!(
             listener_lines(
                 &Fact::Known("http://127.0.0.1:61374/".into()),
+                None,
                 &Fact::Known(vec![perl])
             ),
             [
@@ -347,6 +364,7 @@ mod tests {
         assert_eq!(
             listener_lines(
                 &Fact::CannotTell("two ports".into()),
+                None,
                 &Fact::CannotTell("lsof failed".into())
             ),
             [
@@ -355,8 +373,26 @@ mod tests {
             ]
         );
         // Not running, no such page, nothing listening: nothing to say.
-        assert!(listener_lines(&Fact::Absent, &Fact::Known(Vec::new())).is_empty());
-        assert!(listener_lines(&Fact::NotProvided, &Fact::Known(Vec::new())).is_empty());
+        assert!(listener_lines(&Fact::Absent, None, &Fact::Known(Vec::new())).is_empty());
+        assert!(listener_lines(&Fact::NotProvided, None, &Fact::Known(Vec::new())).is_empty());
+    }
+
+    /// Where the host cannot reach the sandbox's listeners: the command,
+    /// with no address.
+    #[test]
+    fn a_dashboard_the_host_cannot_reach_is_named_by_its_command() {
+        let lines = listener_lines(
+            &Fact::NotProvided,
+            Some("enclos dashboard lab"),
+            &Fact::Known(Vec::new()),
+        );
+        assert_eq!(
+            lines,
+            [
+                "dashboard: `enclos dashboard lab` serves it to you alone, until Ctrl-C; on a remote host, run it over ssh with -L"
+            ]
+        );
+        assert!(!lines[0].contains("http"));
     }
 
     #[test]

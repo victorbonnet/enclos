@@ -81,6 +81,12 @@ impl Engine {
         Ok(self.compiled_file(name, record.proxy_port)?.1)
     }
 
+    /// What sandbox `name`'s compiled policy holds less of on this host
+    /// than its text shows, one line each (`Backend::compiled_not_applied_here`).
+    pub fn compiled_not_applied_here(&self, name: &SandboxName) -> Result<Vec<String>> {
+        Ok(self.backend_of(name)?.compiled_not_applied_here())
+    }
+
     /// The file the active policy compiles to, and its text, without
     /// writing it.
     pub(crate) fn compiled_file(
@@ -101,7 +107,7 @@ impl Engine {
         proxy_port: u16,
     ) -> Result<(PathBuf, String)> {
         let backend = self.backend_of(name)?;
-        self.check_before_compile(name, policy)?;
+        self.check_before_compile(name, policy, backend.kind())?;
         let ctx = self.sandbox_context(name, proxy_port);
         let compiled = backend.compile(policy, &ctx)?;
         let file = ctx.dir.join("compiled").join(format!(
@@ -115,9 +121,14 @@ impl Engine {
     /// What must hold of the paths each time a policy is compiled, since
     /// the backend resolves them through symlinks as they are then: the
     /// sandbox home is still a real folder at its path, not a link, a file
-    /// or missing, and the policy's write checks still pass on the paths as
-    /// they are now (design §5).
-    fn check_before_compile(&self, name: &SandboxName, policy: &Policy) -> Result<()> {
+    /// or missing, and the policy's write checks on `backend` still pass on
+    /// the paths as they are now (design §5).
+    fn check_before_compile(
+        &self,
+        name: &SandboxName,
+        policy: &Policy,
+        backend: BackendKind,
+    ) -> Result<()> {
         let home = self.layout.sandbox_home(name.as_str());
         let found = match std::fs::symlink_metadata(&home) {
             Ok(meta) if meta.is_dir() => None,
@@ -135,7 +146,7 @@ impl Engine {
                 found,
             });
         }
-        validate_writes(policy, &self.validation_context(name)).map_err(|source| {
+        validate_writes(policy, &self.validation_context(name, backend)).map_err(|source| {
             Error::ActivePolicyInvalid {
                 sandbox: name.to_string(),
                 policy_file: self.layout.policy_file(name.as_str()),

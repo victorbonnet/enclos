@@ -55,9 +55,11 @@ pub(super) struct Programs<'a> {
 }
 
 /// The command that runs `launch` under bubblewrap, in the sandbox's network
-/// namespace: `enclos holder join` enters the namespace holder's user and
-/// network namespaces (ADR 0039), then becomes bubblewrap, which makes the
-/// session's own namespaces inside them and runs `enclos inside` first. The
+/// namespace: `enclos holder join` runs `enclos holder enter`, which enters
+/// the namespace holder's user and network namespaces (ADR 0039), then
+/// becomes bubblewrap, which makes the session's own namespaces inside them
+/// and runs `enclos inside` first; `join` starts it again while
+/// bubblewrap's setup meets a mount that changed (`setup`). The
 /// sandbox's environment is set on the first process, which passes it on as
 /// it is given, never with `--setenv`, so no secret is ever on a command
 /// line another process can read.

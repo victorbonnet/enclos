@@ -257,8 +257,7 @@ impl Engine {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let listening = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-                .is_ok()
+            super::loopback::listens(addr, std::time::Duration::from_millis(100))
         };
         (PORT_FIRST..=PORT_LAST)
             .find(|port| !used.contains(port) && !listening(*port))
@@ -401,7 +400,7 @@ impl Engine {
         // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
         let services = self
-            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, None)?
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, &[])?
             .into_result()?;
         self.write(
             by,

@@ -2,7 +2,7 @@
 //! (ADR 0007, ADR 0021).
 
 use std::fs::OpenOptions;
-use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::net::{Ipv6Addr, SocketAddr};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::Engine;
+use super::loopback::listens;
 use super::service::PROXY_WAIT;
 use crate::error::{Error, Result};
 use crate::lifecycle::marker::spawn_unmarked;
@@ -36,9 +37,7 @@ pub(super) enum Reached {
 impl Reached {
     fn answers(&self) -> bool {
         match self {
-            Reached::Port(addr) => {
-                TcpStream::connect_timeout(addr, Duration::from_millis(200)).is_ok()
-            }
+            Reached::Port(addr) => listens(*addr, Duration::from_millis(200)),
             Reached::Socket(path) => UnixStream::connect(path).is_ok(),
         }
     }
@@ -156,7 +155,7 @@ impl Engine {
             let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, addr.port()));
             if let Some(taken) = [*addr, v6]
                 .into_iter()
-                .find(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
+                .find(|a| listens(*a, Duration::from_millis(200)))
             {
                 return Err(Error::proxy_port_taken(record.name.as_str(), taken));
             }
@@ -264,7 +263,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
     use std::os::unix::net::UnixListener;
 
     /// Where sessions reach the proxy over its socket, the proxy is seen

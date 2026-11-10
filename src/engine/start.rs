@@ -1,6 +1,6 @@
 //! Starting a recorded session (design §8 steps 2-5): one way, for
-//! `connect`, `exec`, the installers and agent commands, and `enclos
-//! launch`. What differs between them is [`Starting`] and what they do
+//! `connect`, `exec`, the installers and agent commands, `enclos
+//! dashboard` and `enclos launch`. What differs between them is [`Starting`] and what they do
 //! once the program runs and before it is recorded.
 //!
 //! The order is load-bearing. On a host whose systemd is too old for a
@@ -15,10 +15,11 @@
 //! program started meanwhile; with none, only the program is killed.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use super::Engine;
@@ -109,6 +110,10 @@ pub(super) enum Starting<'a> {
         group: Group,
         reads: &'a [PathBuf],
     },
+    /// The runtime's dashboard, for `enclos dashboard` (ADR 0040): as an
+    /// exec session, but in a group of its own and in no terminal, with no
+    /// input and its output appended to `log`.
+    Dashboard { log: &'a Path },
     /// A service of the sandbox's runtime, for the service manager. Its
     /// proxy already runs, and its secrets are as `service_secrets` says.
     Service { service: &'a str },
@@ -126,21 +131,29 @@ impl Starting<'_> {
     fn reads(self) -> Vec<PathBuf> {
         match self {
             Starting::Command { reads, .. } => reads.to_vec(),
-            Starting::Service { .. } => Vec::new(),
+            Starting::Dashboard { .. } | Starting::Service { .. } => Vec::new(),
         }
     }
 
     fn group(self) -> Group {
         match self {
             Starting::Command { group, .. } => group,
-            Starting::Service { .. } => Group::Own,
+            Starting::Dashboard { .. } | Starting::Service { .. } => Group::Own,
         }
+    }
+
+    /// Whether it starts as a command from the CLI does: the sandbox's
+    /// proxy and namespace holder started if need be, its runtime's service
+    /// reached, and its secrets as variables.
+    fn starts_as_a_command(self) -> bool {
+        matches!(self, Starting::Command { .. } | Starting::Dashboard { .. })
     }
 
     /// The session's kind, and its service if it is one.
     fn recorded_as(self) -> (SessionKind, Option<String>) {
         match self {
             Starting::Command { kind, .. } => (kind.into(), None),
+            Starting::Dashboard { .. } => (SessionKind::Exec, None),
             Starting::Service { service } => (SessionKind::Service, Some(service.to_owned())),
         }
     }
@@ -149,9 +162,24 @@ impl Starting<'_> {
     fn program(self) -> &'static str {
         match self {
             Starting::Command { .. } => "the program",
+            Starting::Dashboard { .. } => "the dashboard",
             Starting::Service { .. } => "the service",
         }
     }
+}
+
+/// `command` with no input and its output appended to `log`.
+fn output_to(command: &mut Command, log: &Path) -> io::Result<()> {
+    if let Some(folder) = log.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let out = OpenOptions::new().create(true).append(true).open(log)?;
+    let err = out.try_clone()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    Ok(())
 }
 
 /// A session that started.
@@ -268,7 +296,7 @@ impl Engine {
         let mut record = self.record(name)?;
         let compiled = self.compile_policy(name, record.proxy_port)?;
         // A service's `launch` waited for both before it took the lock.
-        if matches!(starting, Starting::Command { .. }) {
+        if starting.starts_as_a_command() {
             self.ensure_proxy(lock, &record)?;
             self.ensure_holder(&record)?;
         }
@@ -281,7 +309,7 @@ impl Engine {
         let tmp = ctx.home.join("tmp");
         fresh_tmp(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
         let (service_port, unreachable, env, named) = match starting {
-            Starting::Command { .. } => {
+            Starting::Command { .. } | Starting::Dashboard { .. } => {
                 // The runtime's clients reach its service on the port it
                 // holds now (ADR 0028), or the session says why it cannot.
                 let (port, unreachable) = match self.service_port(&record) {
@@ -302,13 +330,14 @@ impl Engine {
                 (None, None, env, named)
             }
         };
+        let (limits, not_applied) = self.launch_limits_saying(&record, &snapshot.policy)?;
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
             env,
             in_terminal: starting.in_terminal(),
             service_port,
-            limits: self.launch_limits(&record, &snapshot.policy)?,
+            limits,
             reads: starting.reads(),
         };
         let backend = self.backend_of(name)?;
@@ -317,12 +346,25 @@ impl Engine {
             .map_err(|e| Error::Session {
                 what: format!("cannot start {named}: {e}"),
             })?;
-        // What the policy says that this backend does not hold, before the
-        // program prints anything of its own.
-        for line in backend.said_at_start(&snapshot.policy, &ctx) {
+        // What the policy says that this backend or this host does not
+        // hold, before the program prints anything of its own.
+        let host = not_applied
+            .iter()
+            .map(|n| n.gap.said_at_start(name.as_str()));
+        for line in backend
+            .said_at_start(&snapshot.policy, &ctx)
+            .into_iter()
+            .chain(host)
+        {
             crate::notes::say(&line);
         }
         let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;
+        if let Starting::Dashboard { log } = starting {
+            output_to(&mut wrapped, log).map_err(|source| LayoutError::Io {
+                path: log.to_owned(),
+                source,
+            })?;
+        }
         let group = starting.group();
         if group == Group::Own {
             wrapped.process_group(0);
@@ -384,6 +426,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::lifecycle::cgroup::Hierarchy;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     const COMMAND: Starting = Starting::Command {
         kind: CommandKind::Exec,
@@ -391,6 +434,12 @@ mod tests {
         reads: &[],
     };
     const SERVICE: Starting = Starting::Service { service: "gateway" };
+
+    fn dashboard() -> Starting<'static> {
+        Starting::Dashboard {
+            log: Path::new("/data/enclos/sandboxes/lab/logs/dashboard.log"),
+        }
+    }
 
     /// A stand-in for the hierarchy with a cgroup holding `text`, and a
     /// program for a failed start to end.
@@ -400,7 +449,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         std::fs::write(folder.join("cgroup.procs"), text).unwrap();
         let cgroups = Hierarchy::at(dir.path());
-        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let child = spawn_unmarked(Command::new("/bin/sleep").arg("30")).unwrap();
         (dir, cgroups, child)
     }
 
@@ -481,12 +530,37 @@ mod tests {
     fn a_command_may_use_the_terminal_and_a_service_never_does() {
         assert!(COMMAND.in_terminal());
         assert!(!SERVICE.in_terminal());
+        assert!(!dashboard().in_terminal());
     }
 
     #[test]
     fn a_service_leads_a_group_of_its_own_and_a_command_where_it_was_told() {
         assert_eq!(COMMAND.group(), Group::Caller);
         assert_eq!(SERVICE.group(), Group::Own);
+        assert_eq!(dashboard().group(), Group::Own);
+    }
+
+    /// A dashboard starts as an exec does, recorded as one, and reads
+    /// nothing staged.
+    #[test]
+    fn a_dashboard_starts_as_an_exec_does() {
+        assert!(COMMAND.starts_as_a_command() && dashboard().starts_as_a_command());
+        assert!(!SERVICE.starts_as_a_command());
+        assert_eq!(dashboard().recorded_as(), (SessionKind::Exec, None));
+        assert!(dashboard().reads().is_empty());
+    }
+
+    #[test]
+    fn a_dashboards_output_goes_to_its_log_and_its_input_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/dashboard.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "kept\n").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read line; echo \"out $?\"; echo err >&2"]);
+        output_to(&mut command, &log).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept\nout 1\nerr\n");
     }
 
     #[test]

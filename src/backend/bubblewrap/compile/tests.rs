@@ -506,28 +506,34 @@ fn a_deny_entry_inside_a_workspace_is_listed_whether_or_not_it_exists() {
 }
 
 /// `--tmpfs /tmp` then `--bind /tmp /tmp` would bring back the host's
-/// X11 and agent sockets; `/var/run` the host's `/run`.
+/// X11 and agent sockets; `/var/run` the host's `/run`. Compile reads the
+/// text alone: where a link leads is `validate`'s and `wrap`'s.
 #[test]
 fn a_workspace_that_would_undo_a_masked_host_path_is_refused() {
-    for workspace in [
-        "/",
-        "/tmp",
-        "/var",
-        "/var/tmp",
-        "/run",
-        "/var/run",
-        "/dev",
-        "/dev/shm",
-        "/proc",
-        "/run/user",
-        "/run/user/1000",
-        "/var/run/docker",
-        "/dev/shm/x",
-        "/dev/pts",
-        "/proc/self",
+    for (workspace, place) in [
+        ("/", "/tmp"),
+        ("/tmp", "/tmp"),
+        ("/var", "/var/tmp"),
+        ("/var/tmp", "/var/tmp"),
+        ("/run", "/run"),
+        ("/var/run", "/var/run"),
+        ("/dev", "/dev"),
+        ("/dev/shm", "/dev/shm"),
+        ("/proc", "/proc"),
+        ("/run/user", "/run"),
+        ("/run/user/1000", "/run"),
+        ("/var/run/docker", "/var/run"),
+        ("/dev/shm/x", "/dev/shm"),
+        ("/dev/pts", "/dev"),
+        ("/proc/self", "/proc"),
     ] {
         let err = refusal(&policy(&[workspace], &[]));
-        assert!(err.contains("host's"), "{workspace}: {err}");
+        assert!(
+            err.contains(&format!(
+                "workspace {workspace} would bring back the host's {place}, which"
+            )),
+            "{workspace}: {err}"
+        );
     }
 }
 

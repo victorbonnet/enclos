@@ -19,6 +19,15 @@ use tempfile::TempDir;
 #[path = "bubblewrap/limits.rs"]
 mod limits;
 
+#[path = "bubblewrap/own_places.rs"]
+mod own_places;
+
+#[path = "bubblewrap/mount_race.rs"]
+mod mount_race;
+
+#[path = "bubblewrap/status.rs"]
+mod status;
+
 #[path = "support/inherited.rs"]
 mod inherited;
 use inherited::{HOLDS_NINE, holding_open};
@@ -774,8 +783,10 @@ wait"
 
 /// A session joins the namespace holder's namespaces through descriptors
 /// that close on `exec`: no process of the session holds one, inside its
-/// PID namespace or, read from the host, the bubblewrap that runs it. The
-/// control: the namespace holder itself, read from the host, holds its own.
+/// PID namespace or, read from the host, the bubblewrap that runs it and the
+/// `holder join` that waits for it, which is in none of the sandbox's
+/// namespaces. The control: the namespace holder itself, read from the
+/// host, holds its own.
 #[test]
 fn on_a_runner_a_session_holds_no_namespace_descriptor() {
     if !on_a_runner() {
@@ -835,13 +846,23 @@ print("held", held)
         "{}",
         text(&cmdline)
     );
-    let held: Vec<String> = [sleep, inside, bwrap]
+    // The join that waits for bubblewrap stays on the host, in none of the
+    // sandbox's namespaces.
+    let join = parent_of(bwrap).unwrap();
+    let cmdline = text(&std::fs::read(format!("/proc/{join}/cmdline")).unwrap());
+    let namespace = |pid: &str, kind: &str| std::fs::read_link(format!("/proc/{pid}/ns/{kind}"));
+    let joins_on_the_host = cmdline.contains("holder\0join")
+        && ["net", "user"]
+            .iter()
+            .all(|kind| namespace(&join.to_string(), kind).ok() == namespace("self", kind).ok());
+    let held: Vec<String> = [sleep, inside, bwrap, join]
         .into_iter()
         .flat_map(namespace_descriptors)
         .collect();
     // Ours alone: the test started it.
     let _ = Command::new("kill").arg(sleep.to_string()).status();
     let _ = running.wait();
+    assert!(joins_on_the_host, "{cmdline}");
     assert!(held.is_empty(), "{held:?}");
     // The control: the namespace holder holds its user and network
     // namespaces, as the host reads them.

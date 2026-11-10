@@ -5,17 +5,21 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
+mod agent_rm;
 mod agents;
 mod compile;
 mod configure;
+mod dashboard;
 mod doctor;
 mod history;
 mod holder;
 mod import;
 mod launch;
 mod listener;
+mod loopback;
 mod markers;
 mod net;
+mod pause;
 mod pending;
 mod policy;
 mod probe;
@@ -35,8 +39,10 @@ mod status;
 mod tests;
 mod unenforced;
 
-pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
+pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
+pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
+pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
     NextSession, RanFile, Running, SandboxCheck, Sandboxes, Written,
@@ -50,7 +56,7 @@ pub use probe::TestReport;
 pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
-pub use service::{PROXY_WAIT, Unit};
+pub use service::{PROXY_WAIT, SandboxStarted, Unit};
 pub use session::{Left, SessionEnd};
 pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]

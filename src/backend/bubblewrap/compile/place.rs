@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{CompileError, refused};
 use crate::backend::SandboxContext;
+use crate::policy::own_places::{OwnPlace, OwnPlaces};
 use crate::policy::paths::{FsPaths, is_within};
 
 /// The sandbox's own, empty places. They hide the host's sockets there
@@ -18,28 +19,38 @@ pub(in crate::backend::bubblewrap) const OWN_TMPFS: &[&str] =
 /// would not last.
 pub(in crate::backend::bubblewrap) const OWN_MOUNTS: &[&str] = &["/dev", "/proc"];
 
-/// What a later `--bind` must not uncover: a workspace may not be at or hold
-/// one of these. `/var/run` is the host's `/run` through a link.
-const MASKED_HOST_PATHS: &[&str] = &[
-    "/tmp", "/var/tmp", "/run", "/var/run", "/dev/shm", "/dev", "/proc",
-];
+/// What a later `--bind` must not uncover: [`OWN_TMPFS`], [`OWN_MOUNTS`],
+/// and `/var/run`, the host's `/run` through a link. `/tmp` and `/var/tmp`
+/// may hold a folder of the host's for a project.
+pub(in crate::backend::bubblewrap) const OWN_PLACES: OwnPlaces = OwnPlaces(&[
+    own("/tmp", true),
+    own("/var/tmp", true),
+    own("/run", false),
+    own("/var/run", false),
+    own("/dev/shm", false),
+    own("/dev", false),
+    own("/proc", false),
+]);
 
-/// Whose every folder is the host's: a workspace may not lie inside one,
-/// where `/tmp` and `/var/tmp` allow a folder of the host's for a project.
-const NO_WORKSPACE_INSIDE: &[&str] = &["/run", "/var/run", "/dev", "/proc"];
+const fn own(path: &'static str, holds_workspaces: bool) -> OwnPlace {
+    OwnPlace {
+        path,
+        holds_workspaces,
+    }
+}
 
 /// Refuses a workspace that would undo a mask, that the deny list hides, or
-/// that overlaps a protected root.
+/// that overlaps a protected root, as written: where a link leads is for
+/// `validate` and `wrap`, which read the host.
 pub(super) fn check_workspace(
     workspace: &Path,
     deny: &[PathBuf],
     protected: &[PathBuf],
 ) -> Result<(), CompileError> {
-    if undoes_a_masked_host_path(workspace) {
+    if let Some(place) = OWN_PLACES.undone_by(workspace) {
         return Err(refused(format!(
-            "workspace {} would bring back the host's {}, which the sandbox has its own of",
-            workspace.display(),
-            MASKED_HOST_PATHS.join(", ")
+            "workspace {} would bring back the host's {place}, which the sandbox has its own of",
+            workspace.display()
         )));
     }
     if let Some(entry) = deny.iter().find(|d| is_within(workspace, d)) {
@@ -60,17 +71,6 @@ pub(super) fn check_workspace(
         )));
     }
     Ok(())
-}
-
-/// `--bind` comes after the masks of the sandbox's own places, so a workspace
-/// at, holding or inside one puts the host's folder and sockets back.
-fn undoes_a_masked_host_path(workspace: &Path) -> bool {
-    MASKED_HOST_PATHS
-        .iter()
-        .any(|p| is_within(Path::new(p), workspace))
-        || NO_WORKSPACE_INSIDE
-            .iter()
-            .any(|p| is_within(workspace, Path::new(p)))
 }
 
 /// Of enclos's files, what is bound back into the sandbox, read-only and for

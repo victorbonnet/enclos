@@ -225,6 +225,7 @@ fn audit_since_keeps_recent_entries() {
 #[cfg(target_os = "linux")]
 mod bubblewrap;
 mod compile;
+mod dashboard;
 mod doctor;
 mod exec;
 mod history;

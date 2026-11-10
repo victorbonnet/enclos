@@ -1,7 +1,8 @@
 //! The relay (design §5, Linux networking): the part of enclos inside a
 //! session that listens on the session's own 127.0.0.1 and passes each
 //! connection to a Unix socket outside it, and nothing else. It reads and
-//! decides nothing: the proxy behind the socket does.
+//! decides nothing: the proxy behind the socket does. [`inward`] is the
+//! other way, from the host to a port in a sandbox's network namespace.
 //!
 //! A connection holds two threads, one per direction, so a direction blocked
 //! on a slow reader holds up neither the other direction nor other
@@ -26,6 +27,8 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::budget::{self, Slot};
+
+pub mod inward;
 
 /// The descriptors a relay keeps for itself: the standard streams, its
 /// listener, what the session's launcher left open.
@@ -72,14 +75,42 @@ pub fn serve(listener: TcpListener, socket: &Path) -> ! {
 
 fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration) -> ! {
     let socket: Arc<Path> = Arc::from(socket);
+    // Said once until it clears, not for every connection.
+    let unreachable = AtomicBool::new(false);
+    serve_each(
+        || listener.accept().map(|(client, _)| client),
+        max,
+        move |client: TcpStream| match UnixStream::connect(&socket) {
+            Ok(upstream) => {
+                unreachable.store(false, Ordering::Relaxed);
+                carry(&client, &upstream, limit);
+            }
+            Err(e) => {
+                if !unreachable.swap(true, Ordering::Relaxed) {
+                    say(format_args!("cannot reach {}: {e}", socket.display()));
+                }
+            }
+        },
+    )
+}
+
+/// Hands each connection `accept` gives to `pass`, on a thread of its own,
+/// until the process ends, with at most `max` at once: one over that is
+/// closed with nothing said to it. Accepting that fails, as when the process
+/// is out of descriptors, is tried again after a pause. Each is said once
+/// until it clears, not for every connection.
+fn serve_each<C: Send + 'static>(
+    mut accept: impl FnMut() -> io::Result<C>,
+    max: usize,
+    pass: impl Fn(C) + Send + Sync + 'static,
+) -> ! {
+    let pass = Arc::new(pass);
     let open = Arc::new(AtomicUsize::new(0));
-    // Each said once until it clears, not for every connection.
-    let unreachable = Arc::new(AtomicBool::new(false));
     let mut full = false;
     let mut failing = false;
     loop {
-        let client = match listener.accept() {
-            Ok((client, _)) => client,
+        let client = match accept() {
+            Ok(client) => client,
             Err(e) => {
                 if !std::mem::replace(&mut failing, true) {
                     say(format_args!("cannot accept a connection: {e}"));
@@ -98,21 +129,10 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
             continue;
         };
         full = false;
-        let socket = Arc::clone(&socket);
-        let unreachable = Arc::clone(&unreachable);
+        let pass = Arc::clone(&pass);
         let started = thread::Builder::new().spawn(move || {
             let _slot = slot;
-            match UnixStream::connect(&socket) {
-                Ok(upstream) => {
-                    unreachable.store(false, Ordering::Relaxed);
-                    carry(&client, &upstream, limit);
-                }
-                Err(e) => {
-                    if !unreachable.swap(true, Ordering::Relaxed) {
-                        say(format_args!("cannot reach {}: {e}", socket.display()));
-                    }
-                }
-            }
+            pass(client);
         });
         if let Err(e) = started {
             say(format_args!("cannot start a thread for a connection: {e}"));
@@ -120,10 +140,42 @@ fn serve_up_to(listener: TcpListener, socket: &Path, max: usize, limit: Duration
     }
 }
 
+/// A connected stream socket a relay carries: TCP or Unix.
+pub(crate) trait Stream: Sync {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+    fn set_write_timeout(&self, limit: Option<Duration>) -> io::Result<()>;
+}
+
+impl Stream for TcpStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+
+    fn set_write_timeout(&self, limit: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, limit)
+    }
+}
+
+impl Stream for UnixStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+
+    fn set_write_timeout(&self, limit: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_write_timeout(self, limit)
+    }
+}
+
 /// Carries both directions of one connection until both have ended. A read
 /// has no limit, as a quiet connection is not a stuck one, but a write has
 /// `limit`, and so does the upload once the proxy has left.
-fn carry(client: &TcpStream, upstream: &UnixStream, limit: Duration) {
+pub(crate) fn carry<C, U>(client: &C, upstream: &U, limit: Duration)
+where
+    C: Stream,
+    U: Stream,
+    for<'a> &'a C: Read + Write,
+    for<'a> &'a U: Read + Write,
+{
     let _ = client.set_write_timeout(Some(limit));
     let _ = upstream.set_write_timeout(Some(limit));
     let (up_ended, wait_up) = mpsc::channel::<()>();

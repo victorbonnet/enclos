@@ -66,13 +66,13 @@ enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provid
 
 `enclos runtime install` downloads Hermes's installer on your Mac, as Hermes serves it, and records its SHA-256 in the audit log. The install runs inside the sandbox, through its proxy, so it can write only to the sandbox's home.
 
-`enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login. To change only the provider or the model later, run `enclos connect lab -- hermes -p default model`.
+`enclos connect lab -- hermes -p default setup` runs Hermes's own setup wizard inside the sandbox, in your terminal, for its root profile, whose login every agent shares (`-p default` names it, since a bare `hermes` uses whichever profile `hermes profile use` last picked): pick your provider, log in the way Hermes asks, then pick a model. enclos has no login command of its own: whatever a runtime's documentation says to run, put `enclos connect lab --` in front of it. The sandbox cannot open a browser, so when the login shows a URL, open it in your browser on the Mac. Every agent in the sandbox shares this login, and an agent you add starts on the provider and model you pick here: each keeps its own from then on. To change only the built-in agent's provider or model later, run `enclos connect lab -- hermes -p default model`; for another agent, `enclos connect lab -- hermes -p main model`.
 
 The sandbox reaches the public web through its proxy, on ports 80 and 443, so any provider's login and API work, and every connection is logged as long as enclos can write its state. It never reaches your Mac's own services, your local network or cloud metadata addresses. To limit `lab` to the hosts you list, run `enclos policy edit lab`, which opens a copy of its `policy.toml` in your editor (`$VISUAL`, else `$EDITOR`, else `vi`), and set `mode = "allowlist"` under `[network]`; the edit applies when the editor closes. A sandbox can also start that way, with `enclos sandbox create lab --template minimal`: from `enclos runtime install` on, it reaches the hosts the Hermes adapter lists (those its install, login and model calls used in the prototype), `chatgpt.com` and `auth.openai.com` among them for a ChatGPT subscription; another provider is reached only once you allow its hosts with `enclos policy allow`. A change to what the sandbox may write or listen on, made while sessions run in it, waits as its pending policy until `enclos policy apply lab` restarts the sandbox (or run `policy edit` with `--yes` to restart at once); `enclos policy discard lab` drops it. `enclos policy history lab` lists every version of the policy, `enclos policy diff lab` shows what the latest change does, and `enclos policy rollback lab --to <version>` brings an earlier one back. The hosts Hermes needs to install, log in and run stay allowed, and `enclos policy show lab` lists them.
 
 ## Add agents
 
-Hermes already has one agent once it is installed: its built-in `default`, the root of its home, which `hermes` uses when you name no agent, unless `hermes profile use` picked another. `enclos agent add` adds more:
+Hermes already has one agent once it is installed: its built-in `default`, the root of its home, which `hermes` uses when you name no agent, unless `hermes profile use` picked another. Once the setup above has picked a provider and a model, `enclos agent add` adds more, each starting on them:
 
 ```bash
 enclos agent add lab/main
@@ -81,6 +81,8 @@ enclos agent list lab        # lab/default  built in, then lab/main and lab/scou
 ```
 
 enclos lists `default` but neither adds nor removes it: it exists as long as Hermes is installed in the sandbox.
+
+An agent added before the setup picked a provider has none of its own (Hermes's `auto`), and Hermes then says it is not connected to any AI provider: `enclos agent add` says so when it adds one, and `enclos status` while it lasts. Give it one with `enclos connect lab -- hermes -p main model`; it uses the sandbox's login.
 
 ## Reach an agent
 
@@ -98,7 +100,7 @@ enclos does not need to know how a runtime picks an agent: whatever its document
 
 The first `connect` or `exec` starts the sandbox's services, the Hermes gateway among them, since Hermes's own clients need it: it serves scheduled jobs and messaging for every agent. They come back at each login until `enclos sandbox stop lab`.
 
-Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login.
+Hermes prints its own next steps after creating an agent, such as `main setup` and `main chat`. Run them the same way. In that shell, `~` is the sandbox's home (`~/.enclos/sandboxes/lab/home` on your Mac), so `~/.hermes/profiles/main/SOUL.md` is the agent's personality file. `main setup` is optional: every agent already uses the sandbox's login, and the provider and model `default` had when you added it.
 
 ### Agents made inside the sandbox
 
@@ -110,7 +112,7 @@ lab/scout: Hermes has this agent; enclos does not track it. Track it with `enclo
 
 `enclos agent add lab/scout` then adopts it as it is, without creating it again. If you delete an agent inside the sandbox, enclos reports it the same way and `enclos agent rm` removes its record.
 
-`enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`); `--keep-data` removes only enclos's record and leaves the files, so Hermes still has the agent and enclos reports it as one it does not track. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
+`enclos agent rm lab/scout` deletes an agent with its files, using Hermes's own command, after asking you to confirm (`--yes`). While the sandbox's services run, enclos stops the Hermes gateway for the delete, since it holds every agent's files, and starts it again after; when Hermes says its delete is not finished and names `hermes profile purge-identity`, enclos runs that too. `--keep-data` removes only enclos's record and says what it leaves: usually the files, so Hermes still has the agent and enclos reports it as one it does not track. Agent names in enclos are a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens; `agent list` and `sandbox show` also report a Hermes agent named otherwise (`my_bot`), which enclos cannot track. If enclos cannot read Hermes's list, because something in the sandbox replaced `~/.hermes` with a link for example, these commands say so instead of showing nothing, and `agent add` refuses until you have looked.
 
 ### Bring an agent from your Mac
 
@@ -158,6 +160,8 @@ enclos policy allow lab api.example.com:8443
 ```
 
 The agent cannot allow anything itself.
+
+On Linux the host cannot reach a sandbox's listeners, so Hermes's dashboard opens with `enclos dashboard lab`: it prints the page's address and serves it to you alone until Ctrl-C. On a host you reach over ssh, such as a Raspberry Pi, forward that port from your own machine with `ssh -L <port>:127.0.0.1:<port> <host>` and open the address there; the host's sshd must allow TCP forwarding (`AllowTcpForwarding`), which some installs turn off.
 
 ## Look around
 
