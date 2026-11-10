@@ -85,7 +85,7 @@ jobs:
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
           import json, sys
           metadata = json.load(sys.stdin)
-          # The binary's package by name: the workspace has other members,
+          # The enclos package by name: the workspace has other members,
           # such as enclos-protocol, with versions of their own.
           print(next(package["version"] for package in metadata["packages"] if package["name"] == "enclos"))
           ')"
