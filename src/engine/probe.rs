@@ -338,6 +338,20 @@ impl Engine {
         let fs = FsPaths::of(&policy.fs, &paths).map_err(|reason| Error::Session {
             what: format!("the policy of sandbox {name} has a path enclos cannot expand: {reason}"),
         })?;
+        // enclos's program, where a grant covers it, as the compiler keeps it
+        // (ADR 0058).
+        let program: Vec<PathBuf> = ctx
+            .program
+            .iter()
+            .filter(|p| {
+                fs.writes
+                    .iter()
+                    .any(|w| crate::policy::paths::is_within(p, w))
+            })
+            .cloned()
+            .collect();
+        let protected: Vec<PathBuf> = ctx.protected.iter().chain(&program).cloned().collect();
+        let fs = fs.protecting(&protected);
         let unmovable = fs.unmovable();
         let home = fs.home.clone();
         let mut workspaces: Vec<PathBuf> = Vec::new();
@@ -370,6 +384,10 @@ impl Engine {
                 .map(|r| self.layout.sandbox_dir(r.name.as_str()))
                 .collect(),
             read_deny: fs.read_deny,
+            read_only: fs.read_only,
+            program,
+            every_port: policy.net.mode == crate::model::policy::NetMode::Public
+                && policy.net.public_ports == crate::model::policy::PublicPorts::Any,
             home,
             workspaces,
             unmovable,
@@ -787,6 +805,9 @@ mod tests {
             target: Some(target),
             other_terminal: None,
             tag: 7,
+            read_only: Vec::new(),
+            program: Vec::new(),
+            every_port: false,
             limits: Default::default(),
         }
     }

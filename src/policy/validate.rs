@@ -32,6 +32,9 @@ pub struct ValidationContext {
     pub protected: Vec<PathBuf>,
     /// The places the sandbox's backend gives each session of its own.
     pub own_places: OwnPlaces,
+    /// The sandbox's backend: a write grant of `/` and read-only paths
+    /// under a grant are built on Seatbelt only (ADR 0058).
+    pub backend: BackendKind,
 }
 
 pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyError> {
@@ -46,6 +49,17 @@ pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyEr
                 &mut problems,
             ),
             Err(e) => problems.push(Problem::Malformed(format!("filesystem.read_deny: {e}"))),
+        }
+    }
+    for entry in &policy.fs.read_only {
+        match ctx.paths.expand(entry) {
+            Ok(path) => check_holdable_in_a_compiled_policy(
+                "read_only",
+                entry,
+                &real_path(&path),
+                &mut problems,
+            ),
+            Err(e) => problems.push(Problem::Malformed(format!("filesystem.read_only: {e}"))),
         }
     }
     check_default_denies(policy, &mut problems);
@@ -314,6 +328,23 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
         };
         let path = real_path(&expanded);
         check_holdable_in_a_compiled_policy("write", entry, &path, problems);
+        // The whole filesystem (ADR 0058): the compiled policy denies
+        // enclos's own files after every write allow, so the grant holds
+        // them without reaching them. Only Seatbelt compiles it so far.
+        if path == Path::new("/") {
+            if ctx.backend != BackendKind::Seatbelt {
+                problems.push(Problem::Refused(format!(
+                    "filesystem.write: `{entry}` (the whole filesystem, as the `autonomous` template grants) is not built on the {} backend yet; list the folders the sandbox may write instead",
+                    ctx.backend
+                )));
+            }
+            granted.push(Granted {
+                entry,
+                expanded,
+                path,
+            });
+            continue;
+        }
         for root in &protected {
             let contains_root = is_within(root, &path);
             let inside_root = is_within(&path, root) && !is_within(&path, &own_home);
@@ -334,7 +365,38 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     check_nesting(&granted, &own_home, problems);
     check_links(&granted, &own_home, problems);
     check_hidden(&granted, policy, ctx, &own_home, problems);
-    check_own_places(&granted, ctx.own_places, &own_home, problems);
+    let whole = |g: &&Granted| g.path != Path::new("/");
+    let elsewhere: Vec<&Granted> = granted.iter().filter(whole).collect();
+    check_own_places(&elsewhere, ctx.own_places, &own_home, problems);
+    check_read_only_held(&granted, policy, ctx, &own_home, problems);
+}
+
+/// A read-only path the sandbox could write (ADR 0058): Seatbelt denies its
+/// writes after every allow; bubblewrap would need a read-only bind of it
+/// inside a writable one, which is not built yet, so there it is refused.
+/// One no grant covers is read-only already.
+fn check_read_only_held(
+    granted: &[Granted],
+    policy: &Policy,
+    ctx: &ValidationContext,
+    own_home: &Path,
+    problems: &mut Vec<Problem>,
+) {
+    if ctx.backend != BackendKind::Bubblewrap {
+        return;
+    }
+    for entry in &policy.fs.read_only {
+        let Ok(expanded) = ctx.paths.expand(entry) else {
+            continue;
+        };
+        let path = real_path(&expanded);
+        if let Some(outer) = writable_folder_holding(&path, own_home, granted, |_| false) {
+            problems.push(Problem::Refused(format!(
+                "filesystem.read_only: `{entry}` ({}) is inside {outer}, and the bubblewrap backend cannot keep a path read-only inside a folder the sandbox writes yet; take it out of read_only, or the folder out of write",
+                path.display()
+            )));
+        }
+    }
 }
 
 /// A workspace at, holding or inside a place the backend gives each session
@@ -343,7 +405,7 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
 /// sandbox's (`~/alias -> ../../run`). The sandbox home is left out, as the
 /// compiler binds it as its own.
 fn check_own_places(
-    granted: &[Granted],
+    granted: &[&Granted],
     own_places: OwnPlaces,
     own_home: &Path,
     problems: &mut Vec<Problem>,
@@ -776,6 +838,7 @@ mod tests {
             },
             protected: vec![enclos],
             own_places: OwnPlaces::NONE,
+            backend: BackendKind::Seatbelt,
         };
         Fixture { _dir: dir, ctx }
     }
@@ -1054,7 +1117,6 @@ mod tests {
             "~/work/dangling",
             "~/work/dangling/inner",
             "~/work/../.enclos",
-            "/",
         ] {
             let found = problems(&policy(&[entry], &[], &[]), &f);
             assert_eq!(found.len(), 1, "{entry}: {found:?}");
@@ -1063,6 +1125,45 @@ mod tests {
                 "{entry}: {found:?}"
             );
         }
+    }
+
+    /// A grant of the whole filesystem holds enclos's files without reaching
+    /// them, as the compiled policy denies them after every allow, so
+    /// Seatbelt takes it (ADR 0058); bubblewrap does not build it yet, nor a
+    /// read-only path inside a folder the sandbox writes.
+    #[test]
+    fn the_whole_filesystem_is_writable_on_seatbelt_and_refused_elsewhere() {
+        let mut f = fixture();
+        let mut p = policy(&["/"], &[], &[]);
+        p.fs.read_only = vec!["~/.zshrc".into()];
+        assert!(problems(&p, &f).is_empty(), "{:?}", problems(&p, &f));
+        // Another workspace inside it is said to be inside it.
+        let both = policy(&["/", "~/work"], &[], &[]);
+        let found = problems(&both, &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("inside `/`"), "{found:?}");
+
+        f.ctx.backend = BackendKind::Bubblewrap;
+        let found = problems(&p, &f);
+        assert!(
+            found
+                .iter()
+                .any(|e| e.contains("not built on the bubblewrap backend")),
+            "{found:?}"
+        );
+        let mut inside = policy(&["~/work"], &[], &[]);
+        inside.fs.read_only = vec!["~/work/notes".into(), "~/.zshrc".into()];
+        let found = problems(&inside, &f);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("filesystem.read_only: `~/work/notes`"),
+            "{found:?}"
+        );
+        assert!(
+            checked(&inside, &f)
+                .iter()
+                .all(|e| matches!(e, Problem::Refused(_)))
+        );
     }
 
     #[test]

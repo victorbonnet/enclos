@@ -398,6 +398,14 @@ pub struct ProbeInputs {
     pub writes: Vec<PathBuf>,
     /// The policy's read deny list, expanded.
     pub read_deny: Vec<PathBuf>,
+    /// The policy's read-only paths, expanded (ADR 0058).
+    pub read_only: Vec<PathBuf>,
+    /// enclos's own program, where a write grant covers it: it must stay
+    /// unchanged all the same (ADR 0058).
+    pub program: Vec<PathBuf>,
+    /// Whether the policy opens every port to any public address (ADR
+    /// 0058), so no port is refused for being unlisted.
+    pub every_port: bool,
     /// The sandbox home, resolved: the sandbox writes inside it, but may not
     /// remove or rename it.
     pub home: PathBuf,
@@ -560,6 +568,36 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
     {
         list.push(denied_under_grant_probe(path, i.tag));
     }
+    // A read-only path a grant covers is still never changed (ADR 0058): a
+    // new file in it when it is a folder, the file itself, unchanged, when
+    // it is a file, and creating it when it is missing.
+    for path in i
+        .read_only
+        .iter()
+        .filter(|p| i.writes.iter().any(|w| is_within(p, w)))
+    {
+        let name = format!("change {}, read-only under a write grant", path.display());
+        list.push(match (path.is_dir(), path.is_file()) {
+            (true, _) => write_probe(
+                "read-only paths",
+                &name,
+                path.join(format!("enclos-probe-{}", i.tag)),
+            ),
+            (false, true) => open_for_writing_probe("read-only paths", &name, path),
+            (false, false) => write_probe(
+                "read-only paths",
+                &format!("create {}, read-only under a write grant", path.display()),
+                path.clone(),
+            ),
+        });
+    }
+    for program in i.program.iter().filter(|p| p.is_file()) {
+        list.push(open_for_writing_probe(
+            "enclos files",
+            &format!("change enclos's own program, {}", program.display()),
+            program,
+        ));
+    }
     for folder in i.unmovable.iter().filter(|f| f.is_dir()) {
         list.extend(own.of_folder(folder, i));
     }
@@ -604,19 +642,23 @@ pub fn probes(i: &ProbeInputs, own: &dyn OwnProbes) -> Vec<Probe> {
             .join("compiled")
             .join(format!("enclos-probe-{}", i.tag)),
     ));
-    list.push(write_probe(
-        "writes",
-        "write outside the home",
-        i.user_home.join(format!("enclos-probe-{}", i.tag)),
-    ));
+    // Only where no grant covers it: a grant of the whole filesystem lets
+    // the sandbox write there, as its policy says (ADR 0058).
+    let outside = i.user_home.join(format!("enclos-probe-{}", i.tag));
+    if !i.writes.iter().any(|w| is_within(&outside, w)) {
+        list.push(write_probe("writes", "write outside the home", outside));
+    }
     list.extend(own.folders(i));
 
     // Refused in either network mode (ADR 0025): a port public mode does not
     // open, and addresses no mode reaches, asked for by name through the proxy.
-    list.push(proxy_probe(
-        "an unlisted port through the proxy",
-        "https://probe.enclos.invalid:8443/",
-    ));
+    // Unless the policy opens every port (ADR 0058).
+    if !i.every_port {
+        list.push(proxy_probe(
+            "an unlisted port through the proxy",
+            "https://probe.enclos.invalid:8443/",
+        ));
+    }
     for (what, address) in [
         ("loopback", "127.0.0.1"),
         ("the cloud metadata address", "169.254.169.254"),
@@ -965,6 +1007,9 @@ mod tests {
             target: Some(4242),
             other_terminal: Some(PathBuf::from("/dev/ttys042")),
             tag: 7,
+            read_only: Vec::new(),
+            program: Vec::new(),
+            every_port: false,
             limits: Default::default(),
         }
     }

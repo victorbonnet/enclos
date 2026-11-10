@@ -231,6 +231,107 @@ fn the_sandbox_writes_only_in_its_home() {
     assert!(!Path::new(&w.path("alice/outside")).exists());
 }
 
+/// A grant of the whole filesystem (ADR 0058): the sandbox writes the
+/// user's files anywhere, and still cannot change a read-only path, the
+/// deny list, enclos's own files or enclos's program, nor move a folder
+/// that holds one of them.
+#[test]
+fn a_grant_of_the_whole_filesystem_keeps_read_only_denied_and_enclos_paths() {
+    let mut w = world();
+    let program_dir = w.base.join("bin");
+    std::fs::create_dir_all(&program_dir).unwrap();
+    let program = program_dir.join("enclos");
+    std::fs::write(&program, "the program").unwrap();
+    w.ctx.program = vec![program.clone()];
+    std::fs::write(w.path("alice/.zshrc"), "export A=1\n").unwrap();
+    std::fs::create_dir_all(w.path("alice/.config/fish")).unwrap();
+    std::fs::create_dir_all(w.path("alice/Movies/new")).unwrap();
+    let mut p = Policy::default();
+    p.fs.write = vec!["/".into()];
+    p.fs.read_deny = vec!["~/.ssh".into()];
+    p.fs.read_only = vec![
+        "~/.zshrc".into(),
+        "~/.zlogin".into(),
+        "~/.config/fish".into(),
+    ];
+    w.enforce(&p);
+
+    // The user's own files, wherever they are.
+    assert!(w.sh(&format!("echo ok > '{}'", w.path("alice/outside"))));
+    assert!(w.sh(&format!("echo ok > '{}'", w.path("elsewhere"))));
+    assert!(w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/Movies/new"),
+        w.path("alice/Movies/sorted")
+    )));
+    assert!(w.sh("echo ok > \"$HOME/written\""));
+    assert!(w.sh("echo ok > /dev/null"));
+
+    // Read-only paths: read, never changed, removed, renamed or made.
+    let zshrc = w.path("alice/.zshrc");
+    assert!(w.sh(&format!("cat '{zshrc}'")));
+    assert!(!w.sh(&format!("echo x >> '{zshrc}'")));
+    assert!(!w.sh(&format!("rm '{zshrc}'")));
+    assert!(!w.sh(&format!("mv '{zshrc}' '{zshrc}.old'")));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.zlogin"))));
+    assert!(!w.sh(&format!(
+        "echo x > '{}'",
+        w.path("alice/.config/fish/config.fish")
+    )));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/.config"),
+        w.path("alice/config")
+    )));
+    assert_eq!(std::fs::read_to_string(&zshrc).unwrap(), "export A=1\n");
+    assert!(!Path::new(&w.path("alice/.zlogin")).exists());
+
+    // The deny list and enclos's own files.
+    assert!(!w.sh(&format!("cat '{}'", w.path("alice/.ssh/id_ed25519"))));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.ssh/new"))));
+    assert!(!w.sh(&format!("cat '{}'", w.path("alice/.enclos/state.db"))));
+    assert!(!w.sh(&format!("echo x > '{}'", w.path("alice/.enclos/new"))));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        w.path("alice/.enclos"),
+        w.path("alice/moved")
+    )));
+    assert!(!w.sh(&format!("mv '{}' '{}'", w.path("alice"), w.path("bob"))));
+
+    // A hard link elsewhere would name the same file by a path no rule
+    // names: making one is refused for each of them, while one to the
+    // user's own file is made.
+    assert!(w.sh(&format!(
+        "ln '{}' '{}'",
+        w.path("alice/outside"),
+        w.path("alice/link-ok")
+    )));
+    for (i, target) in [
+        zshrc.clone(),
+        w.path("alice/.ssh/id_ed25519"),
+        w.path("alice/.enclos/state.db"),
+        program.display().to_string(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let link = w.path(&format!("alice/link-{i}"));
+        assert!(!w.sh(&format!("ln '{target}' '{link}'")), "{target}");
+        assert!(!Path::new(&link).exists(), "{target}");
+    }
+
+    // enclos's program and the folder holding it.
+    let shown = program.display();
+    assert!(!w.sh(&format!("echo x > '{shown}'")));
+    assert!(!w.sh(&format!("rm '{shown}'")));
+    assert!(!w.sh(&format!(
+        "mv '{}' '{}'",
+        program_dir.display(),
+        w.path("bin2")
+    )));
+    assert_eq!(std::fs::read_to_string(&program).unwrap(), "the program");
+}
+
 #[test]
 fn sensitive_paths_and_enclos_files_are_unreadable_and_unwritable() {
     let w = world();
@@ -672,6 +773,9 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         other_terminal: None,
         target: None,
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: Default::default(),
     };
     let output = |mut command: Command| {
@@ -832,6 +936,9 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         other_terminal: None,
         target: None,
         tag: 7,
+        read_only: Vec::new(),
+        program: Vec::new(),
+        every_port: false,
         limits: Default::default(),
     };
     let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))

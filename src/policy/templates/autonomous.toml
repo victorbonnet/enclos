@@ -1,0 +1,38 @@
+# An agent that looks after the host (ADR 0058): it may write wherever the
+# user can, the user's own files and media included, so it can sort,
+# rename and remove them, and install tools. Higher risk: nothing stops it
+# removing your files, and anything the host later runs from a file it
+# wrote, such as a program on your PATH, runs outside the sandbox.
+#
+# What stays closed whatever this says: the sensitive deny list (keys,
+# credentials, keychains, browsers, password managers), enclos's own files
+# and other sandboxes, and the host services (opening apps or URLs, Apple
+# Events, launchd jobs). The shell's startup files below may be read but not
+# changed, since your next terminal would run what is written there.
+#
+# The agent reaches any public address on any port, through the sandbox's
+# proxy, which logs every connection. Narrow any of this in the sandbox's
+# policy.toml: `write = [...]` lists the folders it may write instead,
+# `read_only_add` keeps more paths unchanged, and `public_ports = "web"` or
+# `mode = "allowlist"` narrow the network.
+
+[filesystem]
+write = ["/"]
+read_only = [
+    "~/.zshrc",
+    "~/.zshenv",
+    "~/.zprofile",
+    "~/.zlogin",
+    "~/.zlogout",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.bash_logout",
+    "~/.profile",
+    "~/.config/fish",
+]
+
+[network]
+mode = "public"
+public_ports = "any"
+allow = []

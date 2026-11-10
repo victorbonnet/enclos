@@ -38,10 +38,11 @@ impl Destination {
 }
 
 /// Whether the policy lets the sandbox reach `dest`: in public mode any
-/// destination on a web port, and in either mode what the allowlist lists.
-/// Its addresses are checked after this, the same way in both modes.
+/// destination on a web port, or on any port when the policy opens them all
+/// (ADR 0058), and in either mode what the allowlist lists. Its addresses
+/// are checked after this, the same way in both modes.
 pub fn allowed(policy: &Policy, dest: &Destination) -> bool {
-    let public = policy.net.mode == NetMode::Public && NetMode::PUBLIC_PORTS.contains(&dest.port);
+    let public = policy.net.mode == NetMode::Public && policy.net.public_ports.open(dest.port);
     public
         || policy
             .net
@@ -137,6 +138,29 @@ mod tests {
             validated(&p, &any, &ips(&["192.168.1.20"]), classify),
             Err(Reason::PrivateAddress)
         );
+    }
+
+    #[test]
+    fn public_mode_on_every_port_opens_any_port_and_still_checks_addresses() {
+        let mut p = policy(&[], &[]);
+        p.net.mode = NetMode::Public;
+        p.net.public_ports = crate::model::policy::PublicPorts::Any;
+        let dest = |h: &str, port| Destination::parse(h, port).unwrap();
+        assert!(allowed(&p, &dest("weather.example.com", 443)));
+        assert!(allowed(&p, &dest("git.example.com", 22)));
+        assert!(allowed(&p, &dest("files.example.org", 8443)));
+        let any = dest("rebind.example.com", 22);
+        assert_eq!(
+            validated(&p, &any, &ips(&["127.0.0.1", "169.254.169.254"]), classify),
+            Err(Reason::BlockedAddress)
+        );
+        assert_eq!(
+            validated(&p, &any, &ips(&["192.168.1.20"]), classify),
+            Err(Reason::PrivateAddress)
+        );
+        // In allowlist mode the setting opens nothing.
+        p.net.mode = NetMode::Allowlist;
+        assert!(!allowed(&p, &dest("git.example.com", 22)));
     }
 
     #[test]

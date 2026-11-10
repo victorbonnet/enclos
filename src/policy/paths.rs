@@ -147,6 +147,12 @@ pub struct FsPaths {
     pub writes: Vec<PathBuf>,
     /// The policy's read deny list.
     pub read_deny: Vec<PathBuf>,
+    /// The policy's read-only paths (ADR 0058).
+    pub read_only: Vec<PathBuf>,
+    /// enclos's protected folders, as [`FsPaths::protecting`] sets them:
+    /// a folder the sandbox writes that holds one cannot move either, as
+    /// one holding a deny-list entry cannot.
+    pub protected: Vec<PathBuf>,
 }
 
 impl FsPaths {
@@ -163,13 +169,23 @@ impl FsPaths {
             home: real_path(&ctx.sandbox_home),
             writes: expand(&fs.write)?,
             read_deny: expand(&fs.read_deny)?,
+            read_only: expand(&fs.read_only)?,
+            protected: Vec::new(),
         })
+    }
+
+    /// The same paths, with enclos's protected folders kept in place too.
+    pub fn protecting(mut self, protected: &[PathBuf]) -> FsPaths {
+        self.protected = protected.iter().map(|p| real_path(p)).collect();
+        self
     }
 
     /// The folders the sandbox may write in but must not move (design §5):
     /// the sandbox home, every workspace, and every folder inside them that
-    /// holds a deny-list entry. Moving one of them would carry what it holds
-    /// to a path no deny rule names. Sorted, without repeats.
+    /// holds a deny-list entry, a read-only path or a protected folder.
+    /// Moving one of them would carry what it holds to a path no rule
+    /// names. `/`, which a grant of the whole filesystem writes, is left
+    /// out: nothing moves it. Sorted, without repeats.
     pub fn unmovable(&self) -> Vec<PathBuf> {
         let writable: Vec<&Path> = std::iter::once(self.home.as_path())
             .chain(self.writes.iter().map(PathBuf::as_path))
@@ -178,12 +194,15 @@ impl FsPaths {
         let holding_denied = self
             .read_deny
             .iter()
+            .chain(&self.read_only)
+            .chain(&self.protected)
             .flat_map(|entry| entry.ancestors().skip(1))
             .filter(|a| inside_writable(a));
         let mut folders: Vec<PathBuf> = writable
             .iter()
             .copied()
             .chain(holding_denied)
+            .filter(|f| *f != Path::new("/"))
             .map(Path::to_path_buf)
             .collect();
         folders.sort();
@@ -319,6 +338,7 @@ mod tests {
                 "{home}/c/private",
                 "~",
             ]),
+            read_only: Vec::new(),
         };
         let paths = FsPaths::of(&fs, &ctx).unwrap();
         assert_eq!(paths.home, ctx.sandbox_home);
@@ -338,6 +358,7 @@ mod tests {
         let bad = FsPolicy {
             write: s(&["work"]),
             read_deny: Vec::new(),
+            read_only: Vec::new(),
         };
         assert!(FsPaths::of(&bad, &ctx).unwrap_err().contains("`work`"));
     }

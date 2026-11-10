@@ -13,7 +13,7 @@
 //! `/private/tmp` on macOS). Every denial carries the sandbox's tag, which
 //! the unified log repeats, to tell sandboxes apart.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::super::{CompileError, Compiled, SandboxContext};
 use crate::model::policy::Policy;
@@ -161,11 +161,24 @@ pub fn compile(
         user_home: ctx.user_home.clone(),
         sandbox_home: ctx.home.clone(),
     };
+    // enclos's program, where a grant covers it (ADR 0058): left out
+    // otherwise, so a compiled policy does not change with where enclos
+    // is installed.
     let fs = FsPaths::of(&policy.fs, &paths).map_err(unsupported)?;
+    let program: Vec<PathBuf> = ctx
+        .program
+        .iter()
+        .filter(|p| fs.writes.iter().any(|w| is_within(p, w)))
+        .cloned()
+        .collect();
+    let protected: Vec<PathBuf> = ctx.protected.iter().chain(&program).cloned().collect();
+    let fs = fs.protecting(&protected);
     let FsPaths {
         home,
         writes,
         read_deny,
+        read_only,
+        protected: _,
     } = &fs;
 
     let mut sb = String::new();
@@ -184,7 +197,17 @@ pub fn compile(
     line(format!("(deny file-write* (with message \"{tag}\"))"));
     let mut allowed = vec![subpath(home)?];
     for path in writes {
-        allowed.push(subpath(path)?);
+        // The whole filesystem but `/dev`, whose devices keep the rules
+        // below (ADR 0058).
+        allowed.push(if path == Path::new("/") {
+            format!(
+                "(require-all {} (require-not {}))",
+                subpath(path)?,
+                subpath(Path::new("/dev"))?
+            )
+        } else {
+            subpath(path)?
+        });
     }
     allowed.extend(DEVICES.iter().map(|d| d.to_string()));
     line(format!("(allow file-write*\n  {})", allowed.join("\n  ")));
@@ -234,6 +257,31 @@ pub fn compile(
         line(format!(
             "(deny file-read* file-write* (with message \"{tag}\")\n  {})",
             denied.join("\n  ")
+        ));
+    }
+
+    if !read_only.is_empty() {
+        line(
+            "\n;; ---- Read-only paths: read, never changed, whatever a grant covers (ADR 0058)"
+                .into(),
+        );
+        let kept = read_only
+            .iter()
+            .map(|p| {
+                if is_within(home, p) {
+                    Ok(format!(
+                        "(require-all {} (require-not {}))",
+                        subpath(p)?,
+                        subpath(home)?
+                    ))
+                } else {
+                    subpath(p)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        line(format!(
+            "(deny file-write* (with message \"{tag}\")\n  {})",
+            kept.join("\n  ")
         ));
     }
 
@@ -317,6 +365,16 @@ pub fn compile(
             "(deny file-write* (with message \"{tag}\")\n  (require-all {} (require-not {})))",
             subpath(&real_path(root))?,
             subpath(home)?
+        ));
+    }
+    if !program.is_empty() {
+        let literals = program
+            .iter()
+            .map(|p| literal(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        line(format!(
+            "(deny file-write* (with message \"{tag}\")\n  {})",
+            literals.join("\n  ")
         ));
     }
     let mut hidden = Vec::new();
@@ -558,6 +616,52 @@ mod tests {
         assert!(text.contains(
             "(require-not (subpath \"/nonexistent-enclos-test/alice/.enclos/sandboxes/home\"))"
         ));
+    }
+
+    /// A grant of the whole filesystem (ADR 0058) leaves `/dev` to the
+    /// device rules, and read-only paths and enclos's program are denied
+    /// after every allow; `/` itself gets no literal rule against moving.
+    #[test]
+    fn the_whole_filesystem_leaves_dev_out_and_keeps_read_only_paths() {
+        let base = Path::new("/nonexistent-enclos-test");
+        let mut p = policy();
+        p.fs.write = vec!["/".into()];
+        p.fs.read_only = vec!["~/.zshrc".into()];
+        let mut c = ctx(base);
+        c.program = vec![base.join("bin/enclos")];
+        let text = compile(&p, &c, Baseline::DenyDefault).unwrap().text;
+        assert!(
+            text.contains("(require-all (subpath \"/\") (require-not (subpath \"/dev\")))"),
+            "{text}"
+        );
+        let last_allow = text.rfind("(allow ").unwrap();
+        let read_only = text
+            .find("(deny file-write* (with message \"enclos:home\")\n  (subpath \"/nonexistent-enclos-test/alice/.zshrc\")")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(text.find(";; ---- Read-only paths").unwrap() < read_only);
+        assert!(text.contains(
+            "(deny file-write* (with message \"enclos:home\")\n  (literal \"/nonexistent-enclos-test/bin/enclos\")"
+        ));
+        assert!(
+            last_allow
+                < text
+                    .find("(literal \"/nonexistent-enclos-test/bin/enclos\")")
+                    .unwrap()
+        );
+        // The folders holding the program and enclos's files cannot move;
+        // `/` is never named as one.
+        let unmovable = &text[text
+            .find(";; ---- Writable folders that cannot move")
+            .unwrap()..];
+        assert!(unmovable.contains("(literal \"/nonexistent-enclos-test/bin\")"));
+        assert!(unmovable.contains("(literal \"/nonexistent-enclos-test/alice\")"));
+        assert!(!unmovable[..unmovable.find("\n\n").unwrap()].contains("(literal \"/\")"));
+
+        // Without a grant covering it, the program is not named, so a
+        // compiled policy does not change with where enclos is installed.
+        let text = compile(&policy(), &c, Baseline::DenyDefault).unwrap().text;
+        assert!(!text.contains("bin/enclos"), "{text}");
+        assert!(!text.contains(";; ---- Read-only paths"), "{text}");
     }
 
     #[test]

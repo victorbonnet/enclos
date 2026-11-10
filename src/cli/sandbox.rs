@@ -34,8 +34,9 @@ enum SandboxVerb {
         backend: BackendKind,
         /// The policy it starts from, required so the widest is never
         /// picked by leaving it out: minimal (only what is listed; from
-        /// `runtime install` on, the runtime's hosts) or assistant (the
-        /// public web) (design §7).
+        /// `runtime install` on, the runtime's hosts), assistant (the
+        /// public web) or autonomous (writes everywhere but keys and
+        /// enclos's files, any port; higher risk) (design §7, ADR 0058).
         #[arg(long)]
         template: TemplateName,
     },
@@ -91,6 +92,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             backend,
             template,
         } => {
+            let autonomous = template.to_string() == "autonomous";
+            if autonomous {
+                eprintln!("{AUTONOMOUS_WARNING}");
+            }
             let planned = engine.create_sandbox(
                 by,
                 SandboxSpec {
@@ -320,6 +325,10 @@ fn show_json(v: &SandboxView) -> Value {
         }).collect::<Vec<_>>(),
     })
 }
+
+/// What `sandbox create --template autonomous` says first (ADR 0058), on
+/// standard error so that it reaches a person whatever the output format.
+const AUTONOMOUS_WARNING: &str = "warning: the autonomous template lets the sandbox write wherever you can, your own files included: nothing stops it changing or removing them, so keep backups. Anything the host later runs from a file it wrote, such as a program on your PATH, runs outside the sandbox. It still cannot read or write the sensitive paths (keys, credentials, browsers, password managers) or enclos's own files, change your shell's startup files, or use host services. Narrow it in the sandbox's policy.toml.";
 
 fn print_list(views: &[SandboxView]) {
     if views.is_empty() {

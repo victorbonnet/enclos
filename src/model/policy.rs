@@ -164,6 +164,12 @@ pub struct FsPolicy {
     pub write: Vec<String>,
     /// What the sandbox may not read; everything else is readable (ADR 0015).
     pub read_deny: Vec<String>,
+    /// What the sandbox may read but not change, although a write grant
+    /// covers it, such as a shell's startup file (ADR 0058). Left out of the
+    /// snapshot when empty, so a policy without any resolves as it did
+    /// before read-only paths existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +188,57 @@ pub struct NetPolicy {
     /// in the sandbox can serve the network.
     #[serde(default)]
     pub listen: bool,
+    /// Which ports `public` mode opens to any public address (ADR 0058).
+    /// Left out of the snapshot at its default, the web ports, so a policy
+    /// that does not set it resolves as it did before it existed.
+    #[serde(default, skip_serializing_if = "PublicPorts::is_web")]
+    pub public_ports: PublicPorts,
+}
+
+/// The ports `public` mode opens to any public address (ADR 0058).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicPorts {
+    /// The web ports, 80 and 443 (ADR 0025).
+    #[default]
+    Web,
+    /// Every port.
+    Any,
+}
+
+impl PublicPorts {
+    pub fn is_web(&self) -> bool {
+        *self == PublicPorts::Web
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublicPorts::Web => "web",
+            PublicPorts::Any => "any",
+        }
+    }
+
+    /// Where `public` mode reaches, as messages say it.
+    pub fn described(self) -> &'static str {
+        match self {
+            PublicPorts::Web => "on ports 80 and 443",
+            PublicPorts::Any => "on any port",
+        }
+    }
+
+    /// Whether `public` mode opens `port` to any public address.
+    pub fn open(self, port: u16) -> bool {
+        match self {
+            PublicPorts::Web => NetMode::PUBLIC_PORTS.contains(&port),
+            PublicPorts::Any => true,
+        }
+    }
+}
+
+impl fmt::Display for PublicPorts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
 }
 
 /// Which destinations a sandbox may reach (ADR 0025). Either way, every
@@ -199,7 +256,8 @@ pub enum NetMode {
 }
 
 impl NetMode {
-    /// The ports public mode opens to any public address.
+    /// The ports public mode opens to any public address, unless the policy
+    /// opens every port ([`PublicPorts::Any`]).
     pub const PUBLIC_PORTS: [u16; 2] = [80, 443];
 
     pub fn as_str(self) -> &'static str {

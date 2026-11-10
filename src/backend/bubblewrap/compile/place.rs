@@ -197,6 +197,9 @@ pub(super) fn unmovable(home: &Path, workspaces: &[PathBuf], placed: &Placed) ->
             .chain(&placed.in_workspace)
             .cloned()
             .collect(),
+        // Refused under a grant on bubblewrap (ADR 0058), so none to keep.
+        read_only: Vec::new(),
+        protected: Vec::new(),
     }
     .unmovable()
     .into_iter()

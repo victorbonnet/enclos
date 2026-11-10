@@ -477,6 +477,7 @@ impl Engine {
                 .iter()
                 .find(|b| b.kind() == backend)
                 .map_or(OwnPlaces::NONE, |b| b.own_places()),
+            backend,
         }
     }
 
@@ -572,6 +573,12 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
         "let it read {} (sessions started from now on)",
     );
     compare(
+        &old.fs.read_only,
+        &new.fs.read_only,
+        "keep {} unchanged (sessions started from now on)",
+        "let it change {} where it writes (sessions started from now on)",
+    );
+    compare(
         &old.net.allow,
         &new.net.allow,
         "allow {}",
@@ -585,11 +592,17 @@ pub(super) fn differences(old: &Policy, new: &Policy, expected: &[&str]) -> Vec<
     );
     if old.net.mode != new.net.mode {
         found.push(match new.net.mode {
-            NetMode::Public => {
-                "open the public web to it: any public address on ports 80 and 443".to_owned()
-            }
+            NetMode::Public => format!(
+                "open the public web to it: any public address {}",
+                new.net.public_ports.described()
+            ),
             NetMode::Allowlist => "limit its network to the allowlist".to_owned(),
         });
+    } else if old.net.public_ports != new.net.public_ports && new.net.mode == NetMode::Public {
+        found.push(format!(
+            "let it reach any public address {}",
+            new.net.public_ports.described()
+        ));
     }
     if old.net.listen != new.net.listen {
         found.push(listen_change(new.net.listen));

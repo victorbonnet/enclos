@@ -51,24 +51,27 @@ The compiled policy does not hold the network allowlist. It only sends every con
 
 ## The templates
 
-A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. The two differ only in what the sandbox reaches on the network:
+A sandbox starts from a template, named when it is created (`--template`) and kept in `extends`. Change `extends` with `enclos policy edit <sandbox>` to move it to another. `minimal` and `assistant` differ only in what the sandbox reaches on the network; `autonomous` also writes everywhere ([ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md), proposed):
 
-| Can it… | `minimal` | `assistant` |
-| --- | --- | --- |
-| Write to its own home | yes | yes |
-| Write to other folders | only those added | only those added |
-| Read your files, except sensitive paths | yes | yes |
-| Read sensitive paths, such as SSH keys | no | no |
-| Run programs, and install them in its home | yes | yes |
-| Reach what its runtime needs, once installed | yes | yes |
-| **Reach the public web** | **only what is listed** | **yes, ports 80 and 443** |
-| Reach other ports | only if listed | only if listed |
-| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` |
-| Reach your computer's own services or cloud metadata | no | no |
-| Open apps, send Apple Events or signal other processes | no | no |
+| Can it… | `minimal` | `assistant` | `autonomous` (Seatbelt only) |
+| --- | --- | --- | --- |
+| Write to its own home | yes | yes | yes |
+| **Write to other folders** | only those added | only those added | **everywhere you can, your own files included** |
+| Change your shell's startup files (`~/.zshrc`, …) | no | no | no: read-only |
+| Read your files, except sensitive paths | yes | yes | yes |
+| Read or write sensitive paths, such as SSH keys | no | no | no |
+| Write enclos's own files or its program | no | no | no |
+| Run programs, and install them in its home | yes | yes | yes, and anywhere it writes |
+| Reach what its runtime needs, once installed | yes | yes | yes |
+| **Reach the public web** | **only what is listed** | **yes, ports 80 and 443** | **yes, any port** |
+| Reach other ports | only if listed | only if listed | yes |
+| Reach a host on your local network | only if listed and in `private` | only if listed and in `private` | only if listed and in `private` |
+| Reach your computer's own services or cloud metadata | no | no | no |
+| Open apps, send Apple Events or signal other processes | no | no | no |
 
 - **`minimal`** reaches nothing until a runtime is installed, then only what that runtime needs and what you list. For Hermes that is its install sources and the ChatGPT subscription's hosts; another model provider's hosts need `enclos policy allow`. Use it when an agent should reach only what you name, such as one working on outside data through remote MCP servers: allow each server's host with `enclos policy allow`, then tell the runtime of it with its own commands.
 - **`assistant`** adds any public address on ports 80 and 443, so any model provider works without a grant. Use it for personal agents that browse, research and call public APIs. It can send what it reads to a public website: for sensitive work, use an allowlist.
+- **`autonomous`** is for an agent that looks after the host: sorting and moving your media, tidying folders, installing tools. It writes everywhere you can (`write = ["/"]`), except the sensitive paths, enclos's own files and program, and the read-only paths, by default your shell's startup files, since your next terminal would run what is written there. It reaches any public address on any port. Higher risk: nothing stops it changing or removing your own files, so keep backups, and anything your Mac later runs from a file it wrote, such as a program on your `PATH`, a Git hook or an app, runs outside the sandbox. Commands are not filtered: what `rm -rf` can remove is what the policy lets it write. `sandbox create` says so. Only the Seatbelt backend builds it; bubblewrap refuses a write grant of `/`. Narrow it in `policy.toml`: `write = [...]` to list the folders it may write instead, `read_only_add` to keep more paths unchanged, `public_ports = "web"` or `mode = "allowlist"` for the network.
 
 Under every template, each connection goes through the sandbox's proxy and is logged, as long as enclos can write its state. A runtime may also ask to listen on TCP, as Hermes does, and then anything in the sandbox can serve your network. The allowed hosts of a runtime can be broad: Hermes's include `github.com` and `storage.googleapis.com`, which could carry data out.
 
@@ -105,24 +108,27 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }
 
 | Setting | Accepts | Notes |
 | --- | --- | --- |
-| `extends` | `minimal`, `assistant` | Required. The template this policy builds on ([the templates](#the-templates)). |
+| `extends` | `minimal`, `assistant`, `autonomous` | Required. The template this policy builds on ([the templates](#the-templates)). |
 
 **`[filesystem]`.** A path starts with `/`, `~`, `{home}` or `{tmp}`, and may not hold `"` or `\`. While sessions run, a change waits as the pending policy until `enclos policy apply` restarts the sandbox into it.
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
-| `write` | a list of paths | `["{home}"]` | Replaces the folders the sandbox may write. The home stays writable either way. |
+| `write` | a list of paths | `["{home}"]`; `autonomous` is `["/"]` | Replaces the folders the sandbox may write. The home stays writable either way. `/` grants the whole filesystem but `/dev` (Seatbelt only), with enclos's own files and program, the deny list and `read_only` still denied after it. |
 | `write_add` | a list of paths | none | Adds folders. Each must exist before the sandbox uses it. Refused: enclos's own folders, and a folder inside the home or another workspace. Malformed: a folder at or inside a deny-list path. |
 | `read_deny` | a list of paths | the built-in sensitive list | Replaces the list, and must keep every built-in entry, so use `read_deny_add`. |
 | `read_deny_add` | a list of paths | none | Adds paths the sandbox may neither read nor write. |
+| `read_only` | a list of paths | none; `autonomous` lists the shell's startup files | Replaces the paths the sandbox may read but never change, remove, rename or create, although a write grant covers them. On bubblewrap, one inside a folder the sandbox writes is refused for now. |
+| `read_only_add` | a list of paths | none | Adds to that list. |
 
-There is no `read` list and no `write_deny` ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are open except `read_deny`, since agents and the tools they install read paths nobody can list upfront. Writes are closed except `write`, so there is nothing to deny, and a `read_deny` path refuses writes too.
+There is no `read` list ([ADR 0015](adr/0015-broad-reads-narrow-writes.md)). Reads are open except `read_deny`, since agents and the tools they install read paths nobody can list upfront. Writes are closed except `write`, and a `read_deny` path refuses writes too; `read_only` is the one write denial, for a grant as broad as `autonomous`'s ([ADR 0058](adr/0058-an-autonomous-template-writes-everywhere-but-keys.md), proposed).
 
 **`[network]`.** A change to `mode`, the lists or `log` applies at once, unless the same edit changes files, `listen`, secrets or limits: then it all waits as the pending policy while sessions run, as a change to `listen` does. A destination is a full domain name or an IP address, or `*.domain` for its subdomains, with `:port` when it is not 443. A wildcard over everything (`*`) or a public suffix (`*.com`), and `localhost`, loopback or link-local addresses, are refused; a private address needs `private`, and a single-label name such as `intranet` is malformed.
 
 | Setting | Accepts | Default | Notes |
 | --- | --- | --- | --- |
-| `mode` | `public`, `allowlist` | from the template: `assistant` is `public`, `minimal` is `allowlist` | `public` reaches any public address on ports 80 and 443, as well as what is listed. `allowlist` reaches only what is listed. |
+| `mode` | `public`, `allowlist` | from the template: `assistant` and `autonomous` are `public`, `minimal` is `allowlist` | `public` reaches any public address on ports 80 and 443 (on any port with `public_ports = "any"`), as well as what is listed. `allowlist` reaches only what is listed. |
+| `public_ports` | `web`, `any` | `web`; `autonomous` is `any` | The ports `public` mode opens to any public address: `web`, 80 and 443, or `any`. Loopback, link-local, metadata and private addresses stay closed either way. A runtime adapter may not set it. |
 | `allow` | a list of destinations | none | Replaces the list, the runtime adapter's endpoints too, so its install, login and model calls may stop working. Prefer `allow_add`. |
 | `allow_add` | a list of destinations | none | Adds destinations, as `enclos policy allow` does. |
 | `private` | a list of hosts | none | Replaces the list of hosts that may resolve to private addresses. Each must also be allowed. |
@@ -158,7 +164,7 @@ A variable granted to the whole sandbox cannot also be granted to an agent. An `
 | # | Layer | Where it comes from | What it may set |
 | --- | --- | --- | --- |
 | 1 | Built-in defaults | `src/policy/templates/defaults.toml`, compiled into enclos | everything: `write = ["{home}"]`, the sensitive read-deny list, `mode = "allowlist"`, `log = "metadata"` |
-| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal` and `assistant` | everything but `extends` (a template cannot extend another) |
+| 2 | Template | `src/policy/templates/<name>.toml`, compiled into enclos: `minimal`, `assistant` and `autonomous` | everything but `extends` (a template cannot extend another) |
 | 3 | Runtime adapter's endpoints | the installed runtime's adapter (`RuntimeAdapter::endpoints`) | only `[network] allow_add` and `listen` ([ADR 0028](adr/0028-a-runtime-listens-and-its-sessions-reach-its-service.md), proposed); anything else is refused |
 | 4 | The sandbox's `policy.toml` | `~/.enclos/sandboxes/<name>/policy.toml` | everything; `extends` names the template, and a file without it is an error (`names no template`) |
 
