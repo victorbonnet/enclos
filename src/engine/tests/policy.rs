@@ -130,6 +130,23 @@ fn a_hand_edit_the_policy_refuses_exits_2_and_one_that_does_not_parse_exits_1() 
 }
 
 #[test]
+fn an_edit_that_drops_a_hidden_path_is_refused_without_restore_advice() {
+    let (_dir, engine, name) = with_sandbox();
+    let before = engine.layout.read_policy("home").unwrap();
+    let after = before.replace("read_deny_add = []", "read_deny = []");
+    let err = engine
+        .policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+        .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let said = err.to_string();
+    assert!(said.contains("read_deny_add instead"), "{said}");
+    // Restoring a version is the rollback's business, not an edit's.
+    assert!(!said.contains("restore"), "{said}");
+    assert!(!said.contains("make its change again"), "{said}");
+    assert_eq!(engine.policy(&name).unwrap().version.version, 1);
+}
+
+#[test]
 fn a_dry_run_changes_nothing() {
     let (_dir, engine, name) = with_sandbox();
     let planned = engine
