@@ -5,6 +5,15 @@ use crate::backend::fake::FakeBackend;
 use crate::error::{Error, HomeFound};
 use crate::model::audit::AuditResult;
 
+/// The shell `connect` runs when given no command, as a plan shows it.
+fn default_shell() -> String {
+    crate::backend::environment::shell_command()
+        .iter()
+        .map(|word| word.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn alice() -> Actor {
     Actor {
         user: "alice".into(),
@@ -213,22 +222,23 @@ fn audit_since_keeps_recent_entries() {
     assert_eq!(recent.len(), 1);
 }
 
+#[cfg(target_os = "linux")]
+mod bubblewrap;
 mod compile;
+mod dashboard;
 mod doctor;
 mod exec;
 mod history;
 /// The runtime's own service, whose port the sandbox's sessions reach (ADR
-/// 0028). macOS only: the lookup reads `lsof` and `sysctl` at their macOS
-/// paths, and the stand-in gateways are `perl`.
-#[cfg(target_os = "macos")]
+/// 0028). The stand-in gateways are `perl`.
 mod listener;
 mod pending;
 mod policy;
+mod proxy_socket;
 mod runtime;
 mod sandbox;
 mod secrets;
 mod services;
-// `state check` lists program files with `lsof`, which only macOS has here.
-#[cfg(target_os = "macos")]
 mod state_check;
 mod status;
+mod unenforced;

@@ -45,6 +45,9 @@ pub enum Error {
     NoFreePorts,
     #[error("{what}")]
     Session { what: String },
+    /// `enclos dashboard` cannot serve, or ended on its own (ADR 0040).
+    #[error("{what}")]
+    Dashboard { what: String },
     /// A value enclos could not write as JSON.
     #[error("cannot write {what} as JSON: {source}")]
     Json {
@@ -106,9 +109,11 @@ pub enum Error {
     },
     #[error(transparent)]
     Compile(#[from] crate::backend::CompileError),
-    /// Its own proxy holds the port: there is nothing to stop or recreate.
-    #[error("the proxy of sandbox `{sandbox}` already runs on port {port}")]
-    ProxyRuns { sandbox: String, port: u16 },
+    /// Its own proxy holds the port, or the lock of a proxy without one:
+    /// there is nothing to stop or recreate. `on` says which: "port 41000",
+    /// or "its socket".
+    #[error("the proxy of sandbox `{sandbox}` already runs on {on}")]
+    ProxyRuns { sandbox: String, on: String },
     /// The sandbox's home is not a real folder (a link, a file, or missing),
     /// so its policy is not compiled: Seatbelt resolves the path when the
     /// policy is compiled, and a link would carry the grant elsewhere.
@@ -143,11 +148,23 @@ pub enum Error {
         addr: String,
         source: std::io::Error,
     },
+    /// The proxy cannot open the Unix socket a session with a network of
+    /// its own reaches it on, so it does not start.
+    #[error(
+        "the proxy of sandbox `{sandbox}` cannot listen on {path}: {source}{next}",
+        next = proxy_socket_next_step(.source)
+    )]
+    ProxySocket {
+        sandbox: String,
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Another program holds the sandbox's proxy port on `loopback`, and
     /// would receive its traffic. Ports are the host's, so it may be the
     /// proxy of another user's or another enclos install's sandbox, say.
     #[error(
-        "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names it), or recreate the sandbox to get another port"
+        "port {port} of sandbox `{sandbox}` is in use on {loopback} by another program; stop it (`{names}` names it), or recreate the sandbox to get another port",
+        names = crate::lifecycle::host::port_holders_command(*.port)
     )]
     ProxyPortTaken {
         sandbox: String,
@@ -158,6 +175,22 @@ pub enum Error {
     #[error("the proxy of sandbox `{sandbox}` stopped serving: {source}")]
     ProxyStopped {
         sandbox: String,
+        source: std::io::Error,
+    },
+    /// `enclos inside` could not bring a session up, before its command ran.
+    #[error("{why}")]
+    Inside { why: String },
+    /// A namespace holder could not run or serve, or a session could not
+    /// join one before its command ran (ADR 0039).
+    #[error("{why}")]
+    Holder { why: String },
+    /// The relay cannot hold its port in the session's network.
+    #[error("the relay cannot listen on 127.0.0.1:{port}: {source}")]
+    RelayListen { port: u16, source: std::io::Error },
+    /// The path the relay passes connections to can never be a Unix socket's.
+    #[error("the relay cannot use {path} as a Unix socket: {source}")]
+    RelaySocket {
+        path: PathBuf,
         source: std::io::Error,
     },
     #[error(
@@ -248,16 +281,17 @@ pub enum Error {
     },
     /// A secret the policy grants, which the secret store does not hold.
     #[error(
-        "the policy gives secret {secret} as ${variable}, but the Keychain has no value for it; set it with `enclos secret set {secret}`"
+        "the policy gives secret {secret} as ${variable}, but the secret store has no value for it; set it with `enclos secret set {secret}`"
     )]
     SecretMissing {
         secret: crate::model::secret::SecretRef,
         variable: String,
     },
     /// A service's secrets cannot be read without a dialog nobody would
-    /// see: the service is not started, and not started again.
+    /// see, or their store does not answer: the service is not started, and
+    /// not started again.
     #[error(
-        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; unlock it (logging in to the Mac does), then run `enclos sandbox start {sandbox}`"
+        "{why}, so sandbox `{sandbox}`'s {service} service, which its policy gives secrets, was not started; once it can be read (logging in usually unlocks it), run `enclos sandbox start {sandbox}`"
     )]
     SecretsLocked {
         sandbox: String,
@@ -325,6 +359,20 @@ impl std::fmt::Display for HomeFound {
     }
 }
 
+/// What to do about a socket the proxy could not open, where that is known.
+fn proxy_socket_next_step(source: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::{AddrInUse, AlreadyExists, InvalidInput, NotADirectory};
+    match source.kind() {
+        InvalidInput => {
+            ". The path is too long for a Unix socket: set ENCLOS_HOME to a shorter folder, or use a shorter sandbox name"
+        }
+        AddrInUse | AlreadyExists | NotADirectory => {
+            ". Something else is at that path or in its way: move it aside, then start the proxy again"
+        }
+        _ => "",
+    }
+}
+
 impl Error {
     /// [`Error::ProxyPortTaken`] for `addr`, the address found taken.
     pub fn proxy_port_taken(sandbox: &str, addr: std::net::SocketAddr) -> Error {
@@ -348,6 +396,7 @@ impl Error {
             Error::Policy(e) if e.is_refused() => exit::REFUSED,
             Error::BackendUnavailable { .. } => exit::REFUSED,
             Error::NeedsConfirmation { .. } => exit::NEEDS_CONFIRMATION,
+            Error::Inside { .. } | Error::Holder { .. } => exit::EXEC_FAILED,
             Error::Layout(_)
             | Error::State(_)
             | Error::Audit(_)
@@ -357,7 +406,10 @@ impl Error {
             | Error::ProxyPortTaken { .. }
             | Error::ProxyRuns { .. }
             | Error::ProxyListen { .. }
+            | Error::ProxySocket { .. }
             | Error::ProxyStopped { .. }
+            | Error::RelayListen { .. }
+            | Error::RelaySocket { .. }
             | Error::Compile(_)
             | Error::HomeNotAFolder { .. }
             | Error::ActivePolicyInvalid { .. }
@@ -367,6 +419,7 @@ impl Error {
             | Error::SandboxNotStopped { .. }
             | Error::NoFreePorts
             | Error::Session { .. }
+            | Error::Dashboard { .. }
             | Error::Json { .. }
             | Error::Service(_)
             | Error::Processes(_)
@@ -462,6 +515,22 @@ mod tests {
             done: "y".into(),
         };
         assert_eq!(after.exit_code(), 2);
+    }
+
+    /// The way to name what holds a port is one this host has.
+    #[test]
+    fn a_port_in_use_says_how_to_find_what_holds_it() {
+        let taken = Error::ProxyPortTaken {
+            sandbox: "home".into(),
+            port: 8080,
+            loopback: "127.0.0.1".into(),
+        }
+        .to_string();
+        let names = match cfg!(target_os = "macos") {
+            true => "`lsof -nP -iTCP:8080 -sTCP:LISTEN` names it",
+            false => "`ss -ltnp sport = :8080` names it",
+        };
+        assert!(taken.contains(names), "{taken}");
     }
 
     #[test]

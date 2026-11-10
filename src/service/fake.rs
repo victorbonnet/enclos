@@ -16,6 +16,9 @@ pub struct FakeServices {
     /// Runs after each stop that worked, given its label, for a test to act
     /// in between.
     pub on_stop: RefCell<Option<Meanwhile>>,
+    /// Runs after each start that worked, given its label, as the job the
+    /// manager would start.
+    pub on_start: RefCell<Option<Meanwhile>>,
     /// Processes a test started to stand in for a unit's job: stopping the
     /// unit ends and reaps them, as launchd's `bootout` waits for the job
     /// to exit.
@@ -31,6 +34,9 @@ pub struct FakeServices {
     pub refuse_status: RefCell<bool>,
     /// The manager is not available, as with no login session.
     pub refuse_available: RefCell<bool>,
+    /// `installed` cannot be trusted, as when the manager reads another
+    /// folder than this process.
+    pub refuse_list: RefCell<bool>,
 }
 
 pub type Meanwhile = Box<dyn Fn(&ServiceLabel)>;
@@ -59,6 +65,15 @@ impl ServiceManager for FakeServices {
         Ok(())
     }
 
+    fn can_list(&self) -> Result<(), ServiceError> {
+        if *self.refuse_list.borrow() {
+            return Err(ServiceError {
+                what: "the manager looks elsewhere".into(),
+            });
+        }
+        Ok(())
+    }
+
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
         if let Some(end) = self.refuse.borrow().as_deref()
             && unit.label.as_str().ends_with(end)
@@ -70,6 +85,9 @@ impl ServiceManager for FakeServices {
         // As launchd's `start`, a unit already there is replaced.
         self.started.borrow_mut().retain(|u| u.label != unit.label);
         self.started.borrow_mut().push(unit.clone());
+        if let Some(meanwhile) = self.on_start.borrow().as_ref() {
+            meanwhile(&unit.label);
+        }
         Ok(())
     }
 
@@ -124,12 +142,20 @@ impl ServiceManager for FakeServices {
             .filter(|l| l.as_str().starts_with(prefix))
             .collect())
     }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("fake-manager unset {var}")
+    }
 }
 
 /// Shared, so a test keeps a handle on what the engine asked.
 impl ServiceManager for std::rc::Rc<FakeServices> {
     fn available(&self) -> Result<(), ServiceError> {
         self.as_ref().available()
+    }
+
+    fn can_list(&self) -> Result<(), ServiceError> {
+        (**self).can_list()
     }
 
     fn start(&self, unit: &ServiceUnit) -> Result<(), ServiceError> {
@@ -146,5 +172,9 @@ impl ServiceManager for std::rc::Rc<FakeServices> {
 
     fn installed(&self, prefix: &str) -> Result<Vec<ServiceLabel>, ServiceError> {
         self.as_ref().installed(prefix)
+    }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        self.as_ref().unset_env_command(var)
     }
 }

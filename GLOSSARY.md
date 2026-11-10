@@ -16,6 +16,10 @@ _Avoid_: container, jail, environment, enclosure
 The isolation technology a sandbox is built on, such as Seatbelt or bubblewrap.
 _Avoid_: driver, provider, engine
 
+**Degraded control**:
+A control of a backend that depends on the host, such as Landlock or the memory controller, which the backend runs without where the host lacks it, saying what is not enforced, the risk and the fix.
+_Avoid_: missing feature, fallback mode
+
 **Policy**:
 What a sandbox may do with files, programs, network, resources and secrets. Built on a template, and stored as policy snapshots.
 _Avoid_: rules, permissions, config
@@ -83,6 +87,10 @@ _Avoid_: stale session, zombie session
 A value such as an API key or a bot token that enclos keeps on the host, outside every sandbox, and grants to a whole sandbox, or to one agent of it, through its policy. The runtime's own login is not a secret: it stays in the sandbox home.
 _Avoid_: credential (for a secret), key
 
+**Secret store**:
+Where enclos keeps secrets' values on the host, outside every sandbox: the macOS Keychain, the Secret Service through libsecret, or the file store, a `0600` file for a host where no Secret Service answers.
+_Avoid_: vault, keystore
+
 **Channel**:
 A messaging service, such as Telegram, through which a sandbox answers people.
 _Avoid_: platform, integration
@@ -92,8 +100,15 @@ The account on a channel through which the sandbox's runtime answers people, suc
 _Avoid_: agent (an agent is the runtime's identity, not the account)
 
 **Service**:
-A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
+A background process of a sandbox that the host's service manager runs while the user is logged in: the sandbox's proxy, on Linux its namespace holder, or one its runtime declares under a stable name. Services belong to the sandbox, not to its agents.
 _Avoid_: daemon, job, unit (the service manager's words), agent service
+
+**Relay**:
+On Linux, the part of enclos that passes connections between 127.0.0.1 in a sandbox's network namespace and a Unix socket outside it: to the sandbox's proxy, or from the host to its runtime's listening service.
+_Avoid_: forwarder, port forward, tunnel (the proxy's word for a connection it carries)
+
+**Namespace holder**:
+On Linux, the process that keeps a sandbox's network namespace in being, so that every session of the sandbox can join it.
 
 **Member**:
 Any process running inside a sandbox, whichever session started it, including helpers, browsers and installers.
@@ -102,16 +117,38 @@ _Avoid_: child, worker
 **Marker**:
 A file enclos gives a program as a session starts, which the program and everything it starts hold open, so that holding it proves a process is that session's member.
 
+**Scope**:
+On Linux, the unit of the user's systemd manager that holds one session's processes in a cgroup of their own.
+
+**Slice**:
+On Linux, the unit of the user's systemd manager that groups the scopes of one sandbox's sessions.
+
+**Limit**:
+A bound a policy sets on what a sandbox's processes use: open files on each process, or memory and a share of the CPU on the sandbox as a whole, its sessions and services together.
+_Avoid_: quota, resource cap
+
+**Acceptance**:
+The user's explicit, audited consent that a sandbox runs with a policy field this host does not enforce, such as a memory limit where the host has no memory controller. It is kept with the sandbox until the field's value changes.
+_Avoid_: override, waiver
+
 **Workspace**:
 A host folder outside the sandbox home that a policy lets the sandbox write, such as a coding agent's project folder.
 _Avoid_: mount, share, volume
+
+**Mask**:
+An empty, read-only stand-in over a denied path that cannot be left out, such as one a grant holds, so the path exists but shows nothing and what is around it stays as it was.
+_Avoid_: stub, overlay
+
+**Own place**:
+A place each session of a sandbox has its own of instead of the host's, such as bubblewrap's `/run`, `/tmp` and `/proc`. No workspace may put the host's back over one, by its path or through a link.
+_Avoid_: reserved path, private mount
 
 **Protected path**:
 A path enclos always denies to sandboxes whatever the policy says, such as the audit log, the state database and other sandboxes.
 _Avoid_: system path, reserved path
 
 **Escape probe**:
-A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call the filesystem itself always refuses, that the call gets as far as the filesystem there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.
+A check run by `enclos policy test` from inside a sandbox that tries one way out and must fail. It counts as closed only when its control, a harmless check run outside the sandbox, shows the same route works there (or, for a call refused outside too, that it gets as far there as the sandbox refuses it, such as to the filesystem; for what the host cannot reach either, that it is there; for the proxy, when the proxy refuses it); otherwise it is inconclusive.
 _Avoid_: test case, attack
 
 **Audit entry**:

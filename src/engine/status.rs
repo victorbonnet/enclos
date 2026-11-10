@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::Engine;
-use super::listener::{NoPort, outside_proxy_range, service_listener};
+use super::listener::{Network, NoPort, service_listener};
 use super::sandbox::{compile_refused, needs_restart};
 use crate::error::{Error, Result};
 use crate::lifecycle::listeners::tcp_listeners_of;
@@ -35,6 +35,7 @@ use crate::runtime::{RuntimeAdapter, RuntimeAgentName, RuntimeListener, adapter}
 use crate::state::StateStore;
 use disk::disk_usage;
 pub use disk::{Disk, human_bytes};
+pub(super) use facts::read_provider;
 use facts::{exists, newest, read_value};
 use printable::printable;
 pub use printable::printable_line;
@@ -121,11 +122,13 @@ impl Engine {
             .iter()
             .filter(|d| !d.reason.nothing_to_allow())
             .count();
-        let policy_unreadable_at = denied
-            .iter()
-            .filter(|d| d.reason == Reason::PolicyUnreadable)
-            .map(|d| d.last)
-            .max();
+        let unreadable = || {
+            denied
+                .iter()
+                .filter(|d| d.reason == Reason::PolicyUnreadable)
+        };
+        let policy_unreadable_at = unreadable().map(|d| d.last).max();
+        let policy_unreadable_refused = unreadable().map(|d| d.count).sum();
         let services = match self.service_status(&name) {
             Ok(list) => Fact::Known(
                 list.into_iter()
@@ -138,11 +141,23 @@ impl Engine {
         let agents = runtime
             .map(|rt| self.agent_list(&name, &home, rt))
             .transpose()?;
-        let network_listeners = network_listeners(&look, &running);
+        // The host does not reach a listener in the sandbox's own network
+        // namespace (ADR 0039, ADR 0040), so there is none to look for.
+        let own_network = self.holder_of(record.backend).is_some();
+        let network_listeners = match own_network {
+            true => Fact::NotProvided,
+            false => network_listeners(&look, &running),
+        };
         let dashboard = match runtime.and_then(|rt| rt.listener()) {
+            Some(_) if own_network => Fact::NotProvided,
             Some(listener) => dashboard(self.state.as_ref(), &name, &listener, &running),
             None => Fact::NotProvided,
         };
+        // There, `enclos dashboard` opens it, with no address to give now.
+        let dashboard_command = runtime
+            .and_then(|rt| rt.dashboard())
+            .filter(|_| own_network)
+            .map(|_| format!("enclos dashboard {name}"));
         let (disk, agent_bytes) = disk_usage(&dir, &home, runtime, agents.as_ref());
         let agents = agents.map(|mut list| {
             for a in &mut list.agents {
@@ -187,9 +202,11 @@ impl Engine {
             last_used,
             refused_recently,
             policy_unreadable_at,
+            policy_unreadable_refused,
             agents,
             disk,
             dashboard,
+            dashboard_command,
             network_listeners,
             name,
         })
@@ -239,7 +256,10 @@ impl Engine {
                     AgentKind::Untrackable
                 };
                 let facts = runtime.agent_facts(&agent);
+                let (provider, choose_provider) = read_provider(home, facts.provider.as_ref());
                 AgentStatus {
+                    provider,
+                    choose_provider,
                     kind,
                     last_active: newest(home, &facts.activity),
                     model: facts
@@ -292,7 +312,7 @@ fn dashboard(
     if !runs {
         return Fact::Absent;
     }
-    match service_listener(store, name, service).and_then(outside_proxy_range) {
+    match service_listener(store, name, service, &Network::Host) {
         Ok(port) => Fact::Known(format!("http://127.0.0.1:{port}{page}")),
         Err(NoPort::NotRunning(_)) => Fact::Absent,
         Err(why) => Fact::CannotTell(why.to_string()),
@@ -304,8 +324,8 @@ fn dashboard(
 /// reach: nothing narrows a sandbox's listener to loopback (ADR 0028). Each
 /// pid and address once, a listener on every address (`0.0.0.0` or `[::]`)
 /// shown as `*:<port>`. A pid is named only while it is still the member
-/// `look` listed, checked after `lsof` looked, so a pid reused meanwhile is
-/// not.
+/// `look` listed, checked after the look at its sockets, so a pid reused
+/// meanwhile is not.
 fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<NetworkListener>> {
     let mut members: BTreeMap<u32, (ProcessRef, String)> = BTreeMap::new();
     for session in running.iter().filter(|s| s.kind != SessionKind::Proxy) {
@@ -339,7 +359,9 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
     let mut found = Vec::new();
     for (pid, address) in shown {
         let Some((at, command)) = members.get(&pid) else {
-            return Fact::CannotTell(format!("lsof answered for pid {pid}, which was not asked"));
+            return Fact::CannotTell(format!(
+                "a look answered for pid {pid}, which was not asked"
+            ));
         };
         match is_same(at) {
             Ok(true) => found.push(NetworkListener {
@@ -355,12 +377,12 @@ fn network_listeners(look: &Look, running: &[SessionRecord]) -> Fact<Vec<Network
     Fact::Known(found)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     /// A running session of `kind` whose root is `root`.
-    #[cfg(target_os = "macos")]
     fn session_of(kind: SessionKind, root: crate::model::session::ProcessRef) -> SessionRecord {
         SessionRecord {
             id: crate::model::session::SessionId(1),
@@ -372,6 +394,7 @@ mod tests {
             compiled: None,
             root,
             pgid: None,
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -381,33 +404,37 @@ mod tests {
     /// Listens on every address and on loopback, and says both ports. Perl,
     /// which macOS signs, so the firewall asks nothing of whoever runs the
     /// tests.
-    #[cfg(target_os = "macos")]
-    const LISTENS: &str = "use Socket; for my $a (INADDR_ANY, INADDR_LOOPBACK) { socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, $a)) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); } $| = 1; STDOUT->flush; sleep 30";
+    fn listens() -> String {
+        format!(
+            "{}for my $a (INADDR_ANY, INADDR_LOOPBACK) {{ my $s = listener($a); push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30",
+            crate::test_ports::perl_listener()
+        )
+    }
 
-    // `lsof` at /usr/sbin is macOS's, where sandboxes listen (ADR 0028).
-    #[cfg(target_os = "macos")]
     #[test]
     fn listeners_beyond_loopback_are_named_and_loopback_ones_are_not() {
         use std::io::BufRead;
-        let mut child = std::process::Command::new("/usr/bin/perl")
-            .args(["-e", LISTENS])
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn_unmarked(
+            std::process::Command::new("/usr/bin/perl")
+                .args(["-e", &listens()])
+                .stdout(std::process::Stdio::piped()),
+        )
+        .unwrap();
         let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
         let mut port = || lines.next().unwrap().unwrap();
         let (wide, narrow) = (port(), port());
         let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
         let procs = crate::lifecycle::process::processes().unwrap();
         let running = [session_of(SessionKind::Interactive, root.clone())];
-        let look = Look::markers_unseen(&procs);
+        let hierarchy = crate::lifecycle::cgroup::Hierarchy::host();
+        let look = Look::markers_unseen(&procs, &hierarchy, &running).unwrap();
         let found = network_listeners(&look, &running);
         // The proxy runs on the host, not in the sandbox: never counted.
         let proxy = network_listeners(&look, &[session_of(SessionKind::Proxy, root)]);
         let _ = child.kill();
         let _ = child.wait();
         let Fact::Known(found) = found else {
-            panic!("lsof could not look: {found:?}");
+            panic!("could not look: {found:?}");
         };
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].pid, child.id());

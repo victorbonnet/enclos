@@ -9,6 +9,7 @@ use crate::audit::{AuditError, AuditTicket};
 use crate::engine::ServiceWait;
 use crate::engine::listener::ServiceTimes;
 use crate::engine::service::Unit;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::audit::{AuditEntry, AuditFilter, Intent, VerifyReport};
 use crate::model::plan::Planned;
 use crate::model::runtime::RuntimeKind;
@@ -24,16 +25,23 @@ const GATEWAY: ServiceName = ServiceName::new("gateway");
 pub(super) fn sandbox_with_services(
     runtime: Option<RuntimeKind>,
 ) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
+    sandbox_with_services_on(FakeBackend::available(BackendKind::Seatbelt), runtime)
+}
+
+/// [`sandbox_with_services`], on `backend`.
+pub(super) fn sandbox_with_services_on(
+    backend: FakeBackend,
+    runtime: Option<RuntimeKind>,
+) -> (TempDir, Engine, Rc<FakeServices>, SandboxName) {
     let fake = Rc::new(FakeServices::default());
-    let (dir, engine) = engine_with(vec![Box::new(FakeBackend::available(
-        BackendKind::Seatbelt,
-    ))]);
+    let kind = backend.kind();
+    let (dir, engine) = engine_with(vec![Box::new(backend)]);
     let engine = engine.with_services(Box::new(Rc::clone(&fake)));
     done(engine.init(&alice(), Confirm::Yes).unwrap());
     let name: SandboxName = "home".parse().unwrap();
     let spec = crate::engine::SandboxSpec {
         name: name.clone(),
-        backend: BackendKind::Seatbelt,
+        backend: kind,
         template: "assistant".parse().unwrap(),
     };
     done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
@@ -146,8 +154,8 @@ fn connect_waits_for_installed_services_and_starts_nothing() {
     assert_eq!(
         dry_run(&engine, &name),
         [
-            "wait for the gateway of sandbox home to listen",
-            "run `/bin/zsh -l` in sandbox home under policy v1"
+            "wait for the gateway of sandbox home to listen".to_owned(),
+            format!("run `{}` in sandbox home under policy v1", default_shell())
         ]
     );
     let (waited, said) = wait_for_gateway(&engine, &name);
@@ -156,6 +164,29 @@ fn connect_waits_for_installed_services_and_starts_nothing() {
     assert_eq!(said, ["waiting for the gateway of sandbox home to listen…"]);
     assert_eq!(fake.started.borrow().len(), installed);
     assert_eq!(fake.stopped.borrow().len(), stopped);
+}
+
+/// A manager that reads another folder than this shell lists nothing here,
+/// and its units keep running: `stop` says so rather than saying it stopped.
+#[test]
+fn stopping_a_running_sandbox_whose_manager_looks_elsewhere_fails() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    engine.start_sandbox(&alice(), &name).unwrap();
+    fake.started.borrow_mut().clear();
+    *fake.refuse_list.borrow_mut() = true;
+    let err = engine
+        .stop_sandbox(&alice(), &name, Confirm::Yes)
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("looks elsewhere"), "{err}");
+    assert_eq!(state_of(&engine, &name), SandboxState::Running);
+}
+
+#[test]
+fn a_stopped_sandbox_with_nothing_installed_does_not_ask_the_manager() {
+    let (_dir, engine, fake, name) = sandbox_with_services(None);
+    *fake.refuse_list.borrow_mut() = true;
+    assert!(engine.installed_labels(&name).unwrap().is_empty());
 }
 
 /// A limit no program could start under refuses the start before any
@@ -226,10 +257,7 @@ fn only_the_proxy_installed() -> (TempDir, Engine, Rc<FakeServices>, SandboxName
 /// sandbox's running proxy; stopping the service ends it.
 fn proxy_service_running(engine: &Engine, fake: &FakeServices, name: &SandboxName) {
     let label = engine.label(name, Unit::Proxy).unwrap();
-    let job = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let job = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("30")).unwrap();
     let root = crate::lifecycle::process::reference(job.id())
         .unwrap()
         .unwrap();
@@ -252,6 +280,7 @@ fn proxy_service_running(engine: &Engine, fake: &FakeServices, name: &SandboxNam
                     compiled: None,
                     pgid: None,
                     root: root.clone(),
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,
@@ -399,20 +428,20 @@ fn labels_of(status: &[(ServiceLabel, ServiceStatus)]) -> Vec<String> {
 /// A gateway whose session is open but which binds its listener only a
 /// second later, as one still starting: a `connect` then waits for it,
 /// and never starts the services again, which would stop it (ADR 0028).
-#[cfg(target_os = "macos")]
 #[test]
 fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
     let home = engine.layout.sandbox_home(name.as_str());
     std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
-    let mut gateway = std::process::Command::new("/usr/bin/perl")
-        .args([
-            "-MSocket",
-            "-e",
-            "sleep 1; socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; sleep 30",
-        ])
-        .spawn()
-        .unwrap();
+    let mut gateway = spawn_unmarked(std::process::Command::new("/usr/bin/perl").args([
+        "-MSocket",
+        "-e",
+        &format!(
+            "{}sleep 1; my $s = listener(INADDR_LOOPBACK); sleep 30",
+            crate::test_ports::perl_listener()
+        ),
+    ]))
+    .unwrap();
     let root = crate::lifecycle::process::reference_of_child(&gateway).unwrap();
     engine
         .write(
@@ -432,6 +461,7 @@ fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
                     compiled: None,
                     root,
                     pgid: None,
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,
@@ -454,7 +484,7 @@ fn connect_waits_for_a_gateway_still_starting_and_starts_nothing() {
 #[test]
 fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
     let (_dir, engine, fake, name) = sandbox_with_services(None);
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     assert_eq!(labels, [engine.label(&name, Unit::Proxy).unwrap()]);
     assert_eq!(engine.service_labels(&name).unwrap(), labels);
     assert_eq!(state_of(&engine, &name), SandboxState::Running);
@@ -475,7 +505,7 @@ fn a_sandbox_without_a_runtime_starts_only_its_proxy() {
 #[test]
 fn hermes_adds_one_gateway_for_the_whole_sandbox_and_stop_removes_both() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     let (proxy_label, gateway_label) = (
         engine.label(&name, Unit::Proxy).unwrap(),
         engine.label(&name, Unit::Runtime(GATEWAY)).unwrap(),
@@ -561,7 +591,7 @@ fn services_reach_the_keychain_of_the_enclos_that_started_them() {
 #[test]
 fn starting_again_replaces_the_services_and_a_failed_start_leaves_none() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     engine.start_sandbox(&alice(), &name).unwrap();
     // The earlier ones were removed first, so their processes end.
     assert_eq!(
@@ -1038,7 +1068,7 @@ fn a_sandbox_with_services_installed_is_not_removed() {
 #[test]
 fn stop_removes_every_service_under_the_sandbox_prefix_the_proxy_last() {
     let (_dir, engine, fake, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
-    let labels = engine.start_sandbox(&alice(), &name).unwrap();
+    let labels = engine.start_sandbox(&alice(), &name).unwrap().labels;
     let prefix = labels[0].as_str().strip_suffix("proxy").unwrap().to_owned();
     // Left by a runtime that no longer declares it, and by hand.
     fake.seed(&format!("{prefix}old-mail"));
@@ -1195,6 +1225,7 @@ fn stand_in_proxy(engine: &Engine, name: &SandboxName) {
                     compiled: None,
                     pgid: None,
                     root: crate::lifecycle::process::reference(me)?.unwrap(),
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,
@@ -1213,10 +1244,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
     fake.seed(label.as_str());
     // A sleep stands in for the proxy service's job, which ends when its
     // service is removed, before the stop looks at the sessions.
-    let job = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
+    let job = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("30")).unwrap();
     let root = crate::lifecycle::process::reference(job.id())
         .unwrap()
         .unwrap();
@@ -1239,6 +1267,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
                     compiled: None,
                     pgid: None,
                     root: root.clone(),
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,

@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use super::output;
 use enclos::engine::{
-    Engine, PROXY_WAIT, SandboxSpec, SandboxView, ServiceLine, StopReport, printable_line,
+    Engine, PROXY_WAIT, SandboxSpec, SandboxStarted, SandboxView, ServiceLine, StopReport,
+    printable_line,
 };
 use enclos::error::{Result, exit};
 use enclos::model::audit::Actor;
@@ -14,6 +15,7 @@ use enclos::model::plan::{Confirm, Plan, Planned};
 use enclos::model::policy::TemplateName;
 use enclos::model::sandbox::{BackendKind, SandboxName, SandboxState};
 use enclos::model::session::SessionKind;
+use enclos::model::unenforced::UnenforcedField;
 use enclos::service::{ServiceLabel, ServiceStatus};
 
 #[derive(Args)]
@@ -45,6 +47,11 @@ enum SandboxVerb {
     Start {
         #[arg(required = true)]
         names: Vec<SandboxName>,
+        /// Run with this field not applied where this host does not enforce
+        /// it, such as `memory` without the memory controller; recorded in
+        /// the audit log, and kept until the field's value changes.
+        #[arg(long, value_name = "FIELD")]
+        accept_unenforced: Vec<UnenforcedField>,
     },
     /// Stop every service, session and process of each sandbox.
     Stop {
@@ -65,6 +72,16 @@ enum SandboxVerb {
         #[arg(long)]
         keep_data: bool,
     },
+}
+
+/// The fields `args` accepts running not enforced (ADR 0038).
+pub fn accepted_unenforced(args: &SandboxArgs) -> Vec<UnenforcedField> {
+    match &args.verb {
+        SandboxVerb::Start {
+            accept_unenforced, ..
+        } => accept_unenforced.clone(),
+        _ => Vec::new(),
+    }
 }
 
 pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> Result<u8> {
@@ -183,7 +200,7 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 }
             }
         }
-        SandboxVerb::Start { names } => {
+        SandboxVerb::Start { names, .. } => {
             return each(
                 &names,
                 |n| engine.require_sandbox(n),
@@ -532,7 +549,7 @@ fn restart(
             (exit::OK, stopped) => {
                 let started = engine
                     .start_sandbox(by, name)
-                    .and_then(|labels| print_started(engine, name, &labels));
+                    .and_then(|started| print_started(engine, name, &started));
                 match started {
                     Ok((code, mut started)) => {
                         started["stop"] = stopped;
@@ -651,11 +668,14 @@ fn planned_start(name: &SandboxName, plan: &Plan, labels: &[ServiceLabel]) -> Va
 pub(super) fn print_started(
     engine: &Engine,
     name: &SandboxName,
-    labels: &[ServiceLabel],
+    started: &SandboxStarted,
 ) -> Result<(u8, Value)> {
+    let labels = &started.labels;
+    // Said in text as the start installed the services.
     let mut value = json!({
         "sandbox": name.to_string(),
         "services": labels.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "not_enforced": output::not_enforced(&started.not_enforced),
         "proxy_started": null,
     });
     let shown = labels

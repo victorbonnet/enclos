@@ -21,7 +21,6 @@ use crate::model::policy::{NetPolicy, PendingPolicy, PolicySnapshot, PolicyVersi
 use crate::model::sandbox::SandboxName;
 use crate::model::session::{SessionKind, SessionRecord};
 use crate::policy::PolicyError;
-use crate::service::ServiceLabel;
 use crate::state::StateLock;
 
 /// A change to record with `propose`.
@@ -70,9 +69,9 @@ pub struct Restarted {
     /// What stopping the sandbox did; none when nothing of it ran or was
     /// installed.
     pub stopped: Option<StopReport>,
-    /// The services `sandbox start` installed, when the sandbox had
-    /// services installed before the restart.
-    pub started: Vec<ServiceLabel>,
+    /// What `sandbox start` did, when the sandbox had services installed
+    /// before the restart: nothing otherwise.
+    pub started: super::SandboxStarted,
 }
 
 /// What `policy discard` dropped.
@@ -131,8 +130,31 @@ impl Engine {
     ///   that change. A change that also touches rules sessions keep waits
     ///   as a whole.
     ///
-    /// `policy.toml` holds `overrides` either way.
+    /// `policy.toml` holds `overrides` either way. The acceptances this
+    /// command gives for what the change runs with not enforced are
+    /// recorded with it (ADR 0038).
     pub(super) fn propose(
+        &self,
+        lock: &StateLock,
+        by: &Actor,
+        name: &SandboxName,
+        change: Change<'_>,
+    ) -> Result<Recorded> {
+        let snapshot = change.snapshot;
+        let recorded = self.propose_change(lock, by, name, change)?;
+        let at = match &recorded.applied.outcome {
+            ChangeOutcome::Pending(_) => format!(
+                "for the pending policy, with policy v{} in force",
+                recorded.applied.version.version
+            ),
+            _ => format!("at policy v{}", recorded.applied.version.version),
+        };
+        self.record_acceptances(lock, by, name, &snapshot.policy, &at)?;
+        Ok(recorded)
+    }
+
+    /// [`Engine::propose`], but for the acceptances it records.
+    fn propose_change(
         &self,
         lock: &StateLock,
         by: &Actor,
@@ -590,7 +612,7 @@ impl Engine {
                         version.version
                     ),
                 })?,
-            false => Vec::new(),
+            false => super::SandboxStarted::default(),
         };
         Ok(Restarted {
             version,

@@ -497,15 +497,19 @@ fn a_service_enclos_no_longer_runs_is_named_alone() {
 }
 
 /// A program run from the sandbox's folder that no session tracks is named
-/// by the file it runs, though `ps` lists it as `./sleeper`, and repair leaves
-/// it running.
+/// by the file it runs, though macOS's `ps` lists it as `./sleeper`, and
+/// repair leaves it running.
 #[test]
 fn a_process_no_session_tracks_is_named_and_never_stopped() {
     let (_dir, engine, name) = with_sandbox();
     let mut escaped = Sleeper::in_folder(&engine.layout.sandbox_home(name.as_str()));
     let pid = escaped.pid();
     let found = engine.state_check(None).unwrap();
-    let named = about(&found, &format!("process {pid}, listed as ./sleeper, has "));
+    let listed = match cfg!(target_os = "macos") {
+        true => "./sleeper",
+        false => "sleeper",
+    };
+    let named = about(&found, &format!("process {pid}, listed as {listed}, has "));
     assert_eq!(named.len(), 1, "{found:?}");
     assert!(named[0].what.contains("/home/sleeper mapped"), "{named:?}");
     assert!(named[0].remedy.is_left());
@@ -620,7 +624,7 @@ fn a_program_of_a_sandbox_whose_name_extends_anothers_is_not_the_others() {
 fn a_member_its_marker_keeps_running_from_the_folder_is_not_named() {
     let (_dir, engine, name) = with_sandbox();
     let home = engine.layout.sandbox_home(name.as_str());
-    std::fs::copy(std::env::current_exe().unwrap(), home.join("sleeper")).unwrap();
+    crate::test_scripts::copy_program(&std::env::current_exe().unwrap(), &home.join("sleeper"));
     let marker = engine.new_marker(&name).unwrap();
     let mut command = std::process::Command::new("./sleeper");
     command

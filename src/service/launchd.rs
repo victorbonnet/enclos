@@ -300,6 +300,10 @@ impl ServiceManager for Launchd {
         labels.sort();
         Ok(labels)
     }
+
+    fn unset_env_command(&self, var: &str) -> String {
+        format!("launchctl unsetenv {var}")
+    }
 }
 
 #[cfg(test)]
@@ -310,6 +314,15 @@ mod tests {
 
     fn label(text: &str) -> ServiceLabel {
         ServiceLabel::parse(text).unwrap()
+    }
+
+    #[test]
+    fn a_variable_is_unset_in_launchds_own_environment() {
+        let launchd = Launchd::for_user(Path::new("/Users/alice"));
+        assert_eq!(
+            launchd.unset_env_command("ENCLOS_SEATBELT_BASELINE"),
+            "launchctl unsetenv ENCLOS_SEATBELT_BASELINE"
+        );
     }
 
     #[test]

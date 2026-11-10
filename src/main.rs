@@ -53,7 +53,7 @@ enum Command {
     Connect(cli::connect::ConnectArgs),
     /// Run one command inside a sandbox, for a script or another program; exits with its code.
     Exec(cli::connect::ExecArgs),
-    /// Set, list or remove a sandbox's secrets, kept in the Keychain.
+    /// Set, list or remove a sandbox's secrets, kept in the secret store.
     Secret(cli::secret::SecretArgs),
     /// Check enclos's records against the host, or repair what it can.
     State(cli::state::StateArgs),
@@ -67,6 +67,8 @@ enum Command {
     Net(cli::net::NetArgs),
     /// Show the logs of a sandbox's background services.
     Logs(cli::launch::LogsArgs),
+    /// Open the runtime's dashboard of a sandbox the host cannot reach, as on Linux, to you alone, until Ctrl-C.
+    Dashboard(cli::dashboard::DashboardArgs),
     /// What is on this host, what it costs on disk, and what you could do.
     ///
     /// In JSON, sizes are in bytes, times in RFC 3339, and each fact read
@@ -79,6 +81,15 @@ enum Command {
     /// Run a sandbox's egress proxy; started by enclos itself.
     #[command(hide = true)]
     Proxy(cli::proxy::ProxyArgs),
+    /// Pass connections on a port of 127.0.0.1 to a Unix socket, as a namespace holder does.
+    #[command(hide = true)]
+    Relay(cli::relay::RelayArgs),
+    /// Apply a session's Landlock rules and seccomp filter to this process and run its command; run first by bubblewrap.
+    #[command(hide = true)]
+    Inside(cli::inside::InsideArgs),
+    /// Run, serve or join a bubblewrap sandbox's namespace holder; started by the service manager, and first in every session.
+    #[command(hide = true)]
+    Holder(cli::holder::HolderArgs),
 }
 
 #[derive(Args)]
@@ -107,6 +118,9 @@ fn main() -> ExitCode {
         Ok(parsed) => parsed,
         Err(err) => return usage_error(&err),
     };
+    if !passes_on_what_it_inherited(&cli.command) {
+        enclos::lifecycle::inherited::pass_on_none();
+    }
     cli::output::choose(&name, cli.json, cli.text);
     // The library's notes, said as this command says its own.
     enclos::notes::send_to(cli::output::note);
@@ -256,9 +270,20 @@ fn say(line: &str) {
 }
 
 fn run(cli: Cli) -> Result<u8> {
-    let engine = Engine::open(Layout::from_env()?);
+    let command = match cli.command {
+        Command::Relay(args) => return cli::relay::run(args),
+        Command::Inside(args) => return cli::inside::run(args),
+        Command::Holder(args) => return cli::holder::run(args),
+        command => command,
+    };
+    let accepted = match &command {
+        Command::Policy(args) => cli::policy::accepted_unenforced(args),
+        Command::Sandbox(args) => cli::sandbox::accepted_unenforced(args),
+        _ => Vec::new(),
+    };
+    let engine = Engine::open(Layout::from_env()?).accepting_unenforced(accepted);
     let confirm = Confirm::from_flags(cli.yes, cli.dry_run);
-    match cli.command {
+    match command {
         Command::Init => {
             let planned = engine.init(&current_actor(), confirm)?;
             match cli::output::json() {
@@ -313,8 +338,12 @@ fn run(cli: Cli) -> Result<u8> {
         Command::Policy(args) => cli::policy::run(&engine, &current_actor(), confirm, args),
         Command::Net(args) => cli::net::run(&engine, args),
         Command::Proxy(args) => cli::proxy::run(&engine, &current_actor(), args),
+        Command::Relay(_) | Command::Inside(_) | Command::Holder(_) => {
+            unreachable!("run above, before this engine opens")
+        }
         Command::Launch(args) => cli::launch::run(&engine, &current_actor(), args),
         Command::Logs(args) => cli::launch::logs(&engine, args),
+        Command::Dashboard(args) => cli::dashboard::run(&engine, &current_actor(), args),
         Command::Status(args) => cli::status::run(&engine, args),
     }
 }
@@ -323,9 +352,21 @@ fn run(cli: Cli) -> Result<u8> {
 /// as it ends any Unix tool, by SIGPIPE, not by a panic on the next print.
 /// In JSON the document's write fails instead, and the command says so.
 /// Not for those that run the user's or a runtime's programs (`connect`,
-/// `exec`, `runtime`, and the `agent` verbs but `list`), keep running
-/// (`proxy`, `launch`), or handle a closed output themselves (`logs`). No
+/// `exec`, `inside`, `runtime`, and the `agent` verbs but `list`), keep running
+/// (`proxy`, `relay`, `holder`, `launch`, `dashboard`), or handle a closed output themselves (`logs`). No
 /// arm takes the rest, so a new command is placed here to build.
+/// Whether `command` passes on to what it starts the descriptors it
+/// inherited: only those that start a session's program, whose descriptors
+/// are enclos's own, the session's marker among them. Every other command
+/// passes on its standard streams alone (`lifecycle::inherited`).
+fn passes_on_what_it_inherited(command: &Command) -> bool {
+    match command {
+        Command::Inside(_) => true,
+        Command::Holder(args) => args.joins(),
+        _ => false,
+    }
+}
+
 fn ends_on_closed_output(command: &Command) -> bool {
     match command {
         Command::Init
@@ -342,7 +383,11 @@ fn ends_on_closed_output(command: &Command) -> bool {
         | Command::Exec(_)
         | Command::Runtime(_)
         | Command::Proxy(_)
+        | Command::Relay(_)
+        | Command::Inside(_)
+        | Command::Holder(_)
         | Command::Launch(_)
+        | Command::Dashboard(_)
         | Command::Logs(_) => false,
     }
 }

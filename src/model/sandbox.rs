@@ -79,12 +79,53 @@ impl BackendKind {
         BackendKind::Libkrun,
     ];
 
+    /// The host, as a sentence names it: where enclos runs a sandbox of
+    /// this kind. OpenShell and a microVM are not built yet, and may run on
+    /// either system.
+    pub const fn host(self) -> &'static str {
+        match self {
+            BackendKind::Seatbelt => "this Mac",
+            BackendKind::Bubblewrap => "this Linux machine",
+            BackendKind::OpenShell | BackendKind::Libkrun => "this host",
+        }
+    }
+
+    /// Whether the `mktemp` a sandbox of this kind runs ignores `TMPDIR`
+    /// for a call with no template, `-d` or `-t`, as macOS's
+    /// `/usr/bin/mktemp` does (design §5, "System temp"). GNU `mktemp`, a
+    /// Linux sandbox's, follows it.
+    pub fn mktemp_ignores_tmpdir(self) -> bool {
+        matches!(self, BackendKind::Seatbelt)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             BackendKind::Seatbelt => "seatbelt",
             BackendKind::Bubblewrap => "bubblewrap",
             BackendKind::OpenShell => "openshell",
             BackendKind::Libkrun => "libkrun",
+        }
+    }
+
+    /// Whether the sandbox's sessions reach its proxy over its Unix socket
+    /// alone. A Seatbelt session shares the host's network and reaches the
+    /// proxy over TCP on loopback (design §5); a session of every other kind
+    /// has a network of its own, out of the host's loopback.
+    pub fn reaches_proxy_over_socket(self) -> bool {
+        match self {
+            BackendKind::Seatbelt => false,
+            BackendKind::Bubblewrap | BackendKind::OpenShell | BackendKind::Libkrun => true,
+        }
+    }
+
+    /// Whether a session sees the host's files through one bind of `/`, as
+    /// under bubblewrap's `--ro-bind / /`: a protected file behind a link is
+    /// then there at its real path too, and is probed there. Seatbelt's
+    /// rules name the real path already.
+    pub fn binds_the_hosts_root(self) -> bool {
+        match self {
+            BackendKind::Bubblewrap => true,
+            BackendKind::Seatbelt | BackendKind::OpenShell | BackendKind::Libkrun => false,
         }
     }
 }
@@ -178,6 +219,17 @@ mod tests {
             assert_eq!(kind.as_str().parse::<BackendKind>(), Ok(kind));
         }
         assert!("docker".parse::<BackendKind>().is_err());
+    }
+
+    #[test]
+    fn only_seatbelt_sessions_reach_the_proxy_over_tcp() {
+        for kind in BackendKind::ALL {
+            assert_eq!(
+                kind.reaches_proxy_over_socket(),
+                kind != BackendKind::Seatbelt,
+                "{kind}"
+            );
+        }
     }
 
     #[test]

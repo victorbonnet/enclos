@@ -43,10 +43,53 @@ impl FromStr for SecretName {
     }
 }
 
+/// Which secret store holds a secret's value (design §12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreName {
+    Keychain,
+    Libsecret,
+    File,
+}
+
+impl StoreName {
+    /// As `state.db` and `--json` write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreName::Keychain => "keychain",
+            StoreName::Libsecret => "libsecret",
+            StoreName::File => "file",
+        }
+    }
+
+    /// As a sentence names it.
+    pub fn shown(self) -> &'static str {
+        match self {
+            StoreName::Keychain => "the Keychain",
+            StoreName::Libsecret => "the Secret Service",
+            StoreName::File => "the file store",
+        }
+    }
+}
+
+impl FromStr for StoreName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "keychain" => Ok(StoreName::Keychain),
+            "libsecret" => Ok(StoreName::Libsecret),
+            "file" => Ok(StoreName::File),
+            other => Err(format!("`{other}` is no secret store")),
+        }
+    }
+}
+
 /// A secret a sandbox has: enclos's record of it, never its value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRecord {
     pub secret: SecretRef,
+    /// The store its value went to, the only one that holds it.
+    pub store: StoreName,
     pub created_at: Timestamp,
     /// When its value was last set.
     pub updated_at: Timestamp,
@@ -183,8 +226,8 @@ impl fmt::Debug for SecretValue {
 }
 
 /// Environment variables a session may not be given as a secret: the ones
-/// enclos sets itself or passes on from the host (a test of the Seatbelt
-/// backend holds this list to its environment), or that would change how
+/// enclos sets itself or passes on from the host (a test of the session
+/// environment holds this list to it), or that would change how
 /// the sandbox runs.
 pub fn reserved_variable(name: &str) -> bool {
     const RESERVED: &[&str] = &[
@@ -214,6 +257,14 @@ pub fn reserved_variable(name: &str) -> bool {
         "IFS",
         "CDPATH",
         "GLOBIGNORE",
+        // Read by glibc in `systemd-run` and `env`, which run a Linux
+        // session's program on the host, before any sandbox.
+        "GLIBC_TUNABLES",
+        // `systemd-run` reaches the user's manager through this one, which
+        // `env` then removes, so a program never gets it; the same for what
+        // `systemd-run` sets itself (see `lifecycle::cgroup`).
+        "DBUS_SESSION_BUS_ADDRESS",
+        "INVOCATION_ID",
         // Where Hermes's services find their secrets (ADR 0034).
         "HERMES_MANAGED_DIR",
         "HTTP_PROXY",
@@ -229,7 +280,13 @@ pub fn reserved_variable(name: &str) -> bool {
         || name.starts_with("LC_")
         || name.starts_with("ENCLOS_")
         || name.starts_with("DYLD_")
+        // Linux's dynamic linker reads these as soon as a host process with
+        // a session's variables starts (the `bash -p` that sets limits
+        // included), before any sandbox.
+        || name.starts_with("LD_")
         || name.starts_with("XDG_")
+        // Read by `systemd-run`, on the host, as a session starts.
+        || name.starts_with("SYSTEMD_")
         || name.starts_with("BASH_FUNC_")
 }
 
@@ -319,6 +376,10 @@ mod tests {
             "LC_ALL",
             "ENCLOS_HOME",
             "DYLD_INSERT_LIBRARIES",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "LD_SDK_KEY",
             "XDG_CONFIG_HOME",
             "NODE_USE_ENV_PROXY",
             "BROWSER",
@@ -334,6 +395,12 @@ mod tests {
             "CDPATH",
             "GLOBIGNORE",
             "BASH_FUNC_ulimit%%",
+            // What `systemd-run` and `env` read on the host, or remove.
+            "GLIBC_TUNABLES",
+            "SYSTEMD_LOG_LEVEL",
+            "SYSTEMD_PAGER",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "INVOCATION_ID",
         ] {
             assert!(reserved_variable(reserved), "{reserved}");
         }

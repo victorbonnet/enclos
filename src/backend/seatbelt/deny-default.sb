@@ -52,7 +52,14 @@
   (global-name "com.apple.SystemConfiguration.configd")
   ;; Certificate trust, for TLS through the Security framework: the Hermes
   ;; installer's downloads failed with OSStatus -26276 without it.
-  (global-name "com.apple.trustd.agent"))
+  (global-name "com.apple.trustd.agent")
+  ;; Certificate trust, for TLS through Apple's LibreSSL (/usr/bin/curl):
+  ;; when its CA bundle has no root for a chain, it asks this agent to check
+  ;; the chain against the system's roots. Without it, curl failed with
+  ;; "unable to get local issuer certificate" (CI's macOS 15 and 26
+  ;; runners on example.com from 2026-11-04; macOS 27.2 with a bundle that
+  ;; has no root for the chain).
+  (global-name "com.apple.TrustEvaluationAgent"))
 ;; The notification center's shared memory, read only: libinfo reads its
 ;; notification states there, and the shell workload failed without it
 ;; (prototype/adr-0006/README.md). Posting needs the lookup refused above.

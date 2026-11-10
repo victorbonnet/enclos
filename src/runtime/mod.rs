@@ -9,12 +9,13 @@ pub mod home;
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crate::lifecycle::process::Signal;
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::BackendKind;
 pub use home::HomePath;
 
 /// An installer enclos downloads on the host and runs inside the sandbox,
@@ -53,7 +54,13 @@ impl HomeFile {
 /// its words out, so an adapter's command cannot be started on the host by
 /// mistake.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxCommand(Vec<OsString>);
+pub struct SandboxCommand {
+    words: Vec<OsString>,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the command reads, which a backend whose sandbox does not see that
+    /// folder shows it read-only.
+    reads: Vec<PathBuf>,
+}
 
 /// `word` as a shell reads it back: quoted when it holds anything a shell
 /// would read otherwise, such as `${VAR}`, which it would expand, or starts
@@ -72,20 +79,35 @@ fn shell_word(word: &str) -> String {
 
 impl SandboxCommand {
     pub fn new(words: Vec<OsString>) -> SandboxCommand {
-        SandboxCommand(words)
+        SandboxCommand {
+            words,
+            reads: Vec::new(),
+        }
     }
 
     pub fn from_words(words: &[&str]) -> SandboxCommand {
-        SandboxCommand(words.iter().map(OsString::from).collect())
+        SandboxCommand::new(words.iter().map(OsString::from).collect())
+    }
+
+    /// The command, reading `staged`, files enclos put in the sandbox's
+    /// `installers/` folder.
+    pub fn reading(mut self, staged: Vec<PathBuf>) -> SandboxCommand {
+        self.reads = staged;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.words.is_empty()
+    }
+
+    /// The staged files it reads.
+    pub fn reads(&self) -> &[PathBuf] {
+        &self.reads
     }
 
     /// The command as a person would type it.
     pub fn shown(&self) -> String {
-        self.0
+        self.words
             .iter()
             .map(|w| shell_word(&w.to_string_lossy()))
             .collect::<Vec<_>>()
@@ -93,9 +115,15 @@ impl SandboxCommand {
     }
 
     /// The words to start it with: only the engine's code that starts a
-    /// program in a sandbox (sessions, and the service runner).
+    /// program in a sandbox (sessions, and the service runner, whose
+    /// commands are the adapter's and read nothing staged).
     pub(crate) fn into_words(self) -> Vec<OsString> {
-        self.0
+        self.into_parts().0
+    }
+
+    /// Its words and the staged files it reads, for the code that starts it.
+    pub(crate) fn into_parts(self) -> (Vec<OsString>, Vec<PathBuf>) {
+        (self.words, self.reads)
     }
 }
 
@@ -131,12 +159,25 @@ pub struct RuntimeFacts {
     pub install: Option<HomePath>,
 }
 
+/// Where a runtime keeps the provider an agent's model calls go to, and
+/// the values that mean the agent has none chosen: the runtime then picks
+/// one on its own, and may find none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAt {
+    pub at: ValueAt,
+    pub unchosen: &'static [&'static str],
+    /// What a person runs in the sandbox to choose the agent's provider and
+    /// model, for enclos's messages: `enclos connect <sandbox> -- <this>`.
+    pub choose: String,
+}
+
 /// Where a runtime keeps one agent's data and the facts `status` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentFacts {
     /// The folder holding the agent's own data.
     pub folder: Option<HomePath>,
     pub model: Option<ValueAt>,
+    pub provider: Option<ProviderAt>,
     /// Files that change when the agent is used: the newest gives its last
     /// activity.
     pub activity: Vec<HomePath>,
@@ -184,7 +225,9 @@ pub trait RuntimeAdapter {
     /// `[network] allow_add` and nothing else (design §7).
     fn endpoints(&self) -> &'static str;
     fn installer(&self) -> Installer;
-    fn home_files(&self) -> Vec<HomeFile>;
+    /// What the install puts in the sandbox's home, for a sandbox of
+    /// `backend`: a fix for a host tool goes only where that tool needs it.
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile>;
     /// What a person runs in the sandbox to log the runtime in and set it
     /// up, for enclos's messages: `enclos connect <sandbox> -- <this>`.
     /// enclos shows it, never runs it (ADR 0024).
@@ -211,6 +254,13 @@ pub trait RuntimeAdapter {
     /// sessions then reach (ADR 0028). `None` (the default): the runtime has
     /// no service its sessions must reach.
     fn listener(&self) -> Option<RuntimeListener> {
+        None
+    }
+    /// The runtime's dashboard, a page for a browser on the host, served by
+    /// a command of its own: what `enclos dashboard` runs where the host
+    /// cannot reach the sandbox's listeners (ADR 0040). `None` (the
+    /// default): the runtime has none.
+    fn dashboard(&self) -> Option<RuntimeDashboard> {
         None
     }
     /// The variable naming a folder whose `.env` the runtime's services
@@ -259,11 +309,19 @@ pub trait RuntimeAdapter {
     fn delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
         None
     }
+    /// The runtime's own command that finishes a delete of `name` which
+    /// [`delete_agent`](Self::delete_agent) left unfinished: run by `agent
+    /// rm` when that command failed after the runtime stopped listing the
+    /// agent and its folder went, and treated with it as the delete. `None`
+    /// (the default): such a failure is a failed delete.
+    fn finish_delete_agent(&self, _name: &AgentName) -> Option<SandboxCommand> {
+        None
+    }
     /// The runtime's own command that creates agent `name` from `archive`,
     /// an export made with the runtime's own command (for Hermes, `hermes
-    /// profile export`), run in the sandbox by `enclos agent add --from`
-    /// (issue #34). `archive` is a host path beside the sandbox home, which
-    /// the sandbox reads and never writes; the runtime extracts it inside
+    /// profile export`), run in the sandbox by `enclos agent add --from`.
+    /// `archive` is a host path beside the sandbox home, which the sandbox
+    /// reads and never writes; the runtime extracts it inside
     /// the sandbox, so the host never does. `None`: the runtime cannot
     /// import an agent.
     fn import_agent(&self, _name: &AgentName, _archive: &Path) -> Option<SandboxCommand> {
@@ -319,7 +377,7 @@ pub trait RuntimeAdapter {
         None
     }
 
-    // What `enclos status` shows (issue #29). Each answer may be "cannot
+    // What `enclos status` shows. Each answer may be "cannot
     // tell", and a runtime that names nothing still gets sizes.
 
     /// Parts of the home counted on their own.
@@ -442,12 +500,42 @@ pub struct RuntimeListener {
     pub page: Option<&'static str>,
 }
 
+/// A runtime's dashboard, served by a command run in its sandbox as a
+/// session of its own (ADR 0040).
+#[derive(Debug, Clone)]
+pub struct RuntimeDashboard {
+    /// Serves the dashboard on 127.0.0.1, at a port the kernel picks, in a
+    /// server of its own whatever else runs in the sandbox, and runs until
+    /// it is stopped: the port is read from the host, never from what the
+    /// command says.
+    pub command: SandboxCommand,
+    /// The path of its page, such as `/`.
+    pub page: &'static str,
+}
+
 /// A runtime's name for one of its services, stable across versions, as it
 /// names the service's label and log: the short-name rule, and never
-/// `proxy`, the sandbox's own service. Made in code, as a constant, so a
-/// name that breaks the rule does not compile.
+/// `proxy` or `holder`, the sandbox's own services. Made in code, as a
+/// constant, so a name that breaks the rule does not compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ServiceName(&'static str);
+
+/// Whether `a` and `b` are the same text, in a `const fn`, which has no
+/// string comparison.
+const fn same_bytes(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 impl ServiceName {
     pub const fn new(name: &'static str) -> ServiceName {
@@ -455,16 +543,13 @@ impl ServiceName {
             crate::model::sandbox::is_short_name(name),
             "a service name is a short name: a lowercase letter, then 1 to 40 lowercase letters, digits or hyphens"
         );
-        // `const` has no string comparison; the bytes of "proxy".
-        let b = name.as_bytes();
         assert!(
-            !(b.len() == 5
-                && b[0] == b'p'
-                && b[1] == b'r'
-                && b[2] == b'o'
-                && b[3] == b'x'
-                && b[4] == b'y'),
+            !same_bytes(name, "proxy"),
             "`proxy` is the sandbox's own service, not a runtime's"
+        );
+        assert!(
+            !same_bytes(name, "holder"),
+            "`holder` is the sandbox's own service, its namespace holder (ADR 0039), not a runtime's"
         );
         ServiceName(name)
     }
@@ -511,6 +596,18 @@ mod tests {
     #[should_panic(expected = "sandbox's own service")]
     fn a_service_named_proxy_is_refused() {
         ServiceName::new("proxy");
+    }
+
+    #[test]
+    #[should_panic(expected = "its namespace holder")]
+    fn a_service_named_holder_is_refused() {
+        ServiceName::new("holder");
+    }
+
+    #[test]
+    fn a_name_that_only_starts_like_the_sandboxs_own_is_a_runtimes() {
+        assert_eq!(ServiceName::new("holders").as_str(), "holders");
+        assert_eq!(ServiceName::new("proxys").as_str(), "proxys");
     }
 
     #[test]

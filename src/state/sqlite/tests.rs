@@ -5,13 +5,13 @@ use tempfile::TempDir;
 use super::*;
 use crate::model::sandbox::BackendKind;
 
-fn store() -> (TempDir, SqliteStateStore) {
+pub(super) fn store() -> (TempDir, SqliteStateStore) {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteStateStore::new(dir.path().join("state.db"), dir.path().join("state.lock"));
     (dir, store)
 }
 
-fn record(name: &str) -> SandboxRecord {
+pub(super) fn record(name: &str) -> SandboxRecord {
     SandboxRecord {
         name: name.parse().unwrap(),
         backend: BackendKind::Seatbelt,
@@ -40,6 +40,82 @@ fn migrate_creates_the_database_once() {
     assert!(!second.changed());
     let mode = std::fs::metadata(&store.db).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
+}
+
+/// The proxy reads the policy for each connection: a write that holds the
+/// database, as one waiting on a slow disk does, must not make it wait.
+#[test]
+fn a_read_does_not_wait_for_a_write_in_progress() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let writer = Connection::open(&store.db).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let started = Instant::now();
+    store.list().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+/// SQLite does not wait for the lock a transaction that read first needs to
+/// write: it fails at once with `database is locked`. Applying a pending
+/// policy reads it first, while a proxy may be logging a connection.
+#[test]
+fn a_write_that_reads_first_waits_for_a_write_in_progress() {
+    use crate::model::audit::Actor;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let by = Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let resolve = |text: &str| crate::policy::resolve(text, None).unwrap();
+    let active = resolve("extends = \"assistant\"\n");
+    let pending = resolve("extends = \"assistant\"\n[filesystem]\nwrite_add = [\"~/work\"]\n");
+    store.save_policy(&lock, &name, &active, &by, None).unwrap();
+    store
+        .save_pending(&lock, &name, &pending, None, &by, None)
+        .unwrap();
+
+    let writer = Connection::open(&store.db).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let done = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        writer.execute_batch("COMMIT")
+    });
+    let applied = store.apply_pending(&lock, &name, &pending.id, &by);
+    done.join().unwrap().unwrap();
+    assert_eq!(applied.unwrap().unwrap().version, 2);
+}
+
+/// Each call opens its own connection, so it is often the only one open as
+/// it closes. Closing must leave the write-ahead log in place: copying it
+/// into `state.db` and deleting it holds the whole database through two
+/// flushes, and the next write's new log takes a third under the write lock.
+#[test]
+fn a_connection_closing_alone_leaves_the_log_in_place() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let mut log = store.db.clone().into_os_string();
+    log.push("-wal");
+    let log = std::fs::metadata(&log).map(|m| m.len());
+    assert!(
+        log.as_ref().is_ok_and(|&len| len > 32),
+        "the log after the connection closed: {log:?}"
+    );
+    assert_eq!(
+        store.get(&"home".parse().unwrap()).unwrap(),
+        Some(record("home"))
+    );
 }
 
 #[test]
@@ -106,6 +182,22 @@ fn rejects_a_newer_schema() {
         store.migrate(&lock),
         Err(StateError::NewerSchema { .. })
     ));
+}
+
+#[test]
+fn a_new_database_has_each_sessions_cgroup() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    let declared: String = conn
+        .query_row(
+            "SELECT type FROM pragma_table_info('sessions') WHERE name = 'cgroup'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(declared, "TEXT");
 }
 
 #[test]
@@ -329,16 +421,100 @@ fn a_secret_set_again_keeps_when_it_was_made_and_goes_with_its_sandbox() {
         .create_sandbox(&lock, &record("home"), &snap, &by)
         .unwrap();
     let secret: SecretRef = "home/telegram".parse().unwrap();
-    assert!(store.put_secret(&lock, &secret).unwrap());
+    assert!(
+        store
+            .put_secret(&lock, &secret, StoreName::Keychain)
+            .unwrap()
+    );
     let first = store.secrets(&name).unwrap().remove(0);
     std::thread::sleep(std::time::Duration::from_millis(5));
-    assert!(!store.put_secret(&lock, &secret).unwrap());
+    assert!(
+        !store
+            .put_secret(&lock, &secret, StoreName::Keychain)
+            .unwrap()
+    );
     let again = store.secrets(&name).unwrap().remove(0);
     assert_eq!(again.created_at, first.created_at);
     assert!(again.updated_at > first.updated_at, "{again:?}");
     store.remove(&lock, &name).unwrap();
     assert!(store.secrets(&name).unwrap().is_empty());
     assert!(!store.remove_secret(&lock, &secret).unwrap());
+}
+
+/// A secret stays in the store it first went to, whatever replaces its value.
+#[test]
+fn a_secret_records_its_store_when_it_is_new_only() {
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let by = crate::model::audit::Actor {
+        user: "alice".into(),
+        host: "mac".into(),
+    };
+    let snap = crate::policy::resolve("extends = \"assistant\"\n", None).unwrap();
+    store
+        .create_sandbox(&lock, &record("home"), &snap, &by)
+        .unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    let secret: SecretRef = "home/telegram".parse().unwrap();
+    store.put_secret(&lock, &secret, StoreName::File).unwrap();
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::File);
+    store
+        .put_secret(&lock, &secret, StoreName::Libsecret)
+        .unwrap();
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::File);
+}
+
+/// The migrations of the last release, 0.2.0: what a user's database holds.
+const RELEASED_MIGRATIONS: usize = 9;
+
+/// A database as the release left it, rows and all, opens through `migrate`,
+/// and every secret it holds was in the Keychain.
+#[test]
+fn a_released_database_keeps_its_rows_and_its_secrets_are_in_the_keychain() {
+    let (_dir, store) = store();
+    let conn = Connection::open(&store.db).unwrap();
+    for sql in &schema::MIGRATIONS[..RELEASED_MIGRATIONS] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.pragma_update(None, "user_version", RELEASED_MIGRATIONS as u32)
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO sandboxes (name, backend, state, created_at)
+             VALUES ('home', 'seatbelt', 'created', '2026-01-02T03:04:05.678Z');
+         INSERT INTO sessions (id, sandbox, kind, version, snapshot, root_pid, root_start, started_at)
+             VALUES (7, 'home', 'exec', 1, 'snap', 42, 'start', '2026-01-02T03:04:06.678Z');
+         INSERT INTO secrets (sandbox, name, created_at, updated_at)
+             VALUES ('home', 'telegram', '2026-01-02T03:04:05.678Z', '2026-01-02T03:04:05.678Z');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let lock = store.lock().unwrap();
+    let migrated = store.migrate(&lock).unwrap();
+    assert_eq!(migrated.from, RELEASED_MIGRATIONS as u32);
+    assert_eq!(migrated.to, schema::current());
+
+    let name: SandboxName = "home".parse().unwrap();
+    let secrets = store.secrets(&name).unwrap();
+    assert_eq!(secrets.len(), 1);
+    assert_eq!(secrets[0].secret.to_string(), "home/telegram");
+    assert_eq!(secrets[0].store, StoreName::Keychain);
+    let secret = secrets[0].secret.clone();
+    assert!(!store.put_secret(&lock, &secret, StoreName::File).unwrap());
+    assert_eq!(store.secrets(&name).unwrap()[0].store, StoreName::Keychain);
+    assert!(store.get(&name).unwrap().is_some());
+    let sessions = store.sessions(&name, true).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, SessionId(7));
+    assert_eq!(sessions[0].root.pid, 42);
+    assert_eq!(sessions[0].cgroup, None);
+    store.track(&lock, SessionId(7), &[]).unwrap();
+    store.end_session(&lock, SessionId(7)).unwrap();
+    assert!(store.sessions(&name, true).unwrap().is_empty());
+    assert_eq!(store.sessions(&name, false).unwrap()[0].cgroup, None);
+    assert!(store.remove_secret(&lock, &secret).unwrap());
+    assert!(store.secrets(&name).unwrap().is_empty());
 }
 
 #[test]
@@ -516,6 +692,7 @@ fn sessions_keep_their_members_until_they_end() {
         compiled: Some("/Users/alice/.enclos/sandboxes/home/compiled/a.sb".into()),
         root: at(10),
         pgid: None,
+        cgroup: Some("/enclos.1f2e3d4c.home.slice/s.scope".parse().unwrap()),
         tracked: vec![at(11)],
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -541,6 +718,46 @@ fn sessions_keep_their_members_until_they_end() {
     assert!(store.sessions(&name, false).unwrap().is_empty());
 }
 
+/// A row is no way around what a `Cgroup` promises: `kill` writes to it.
+#[test]
+fn a_cgroup_in_the_database_that_is_no_scope_is_a_read_error() {
+    use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    let name: SandboxName = "home".parse().unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let session = SessionRecord {
+        id: SessionId(0),
+        sandbox: name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: crate::model::policy::SnapshotId("x".into()),
+        compiled: None,
+        root: ProcessRef {
+            pid: 10,
+            started: "start".into(),
+        },
+        pgid: None,
+        cgroup: None,
+        tracked: Vec::new(),
+        started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
+        ended_at: None,
+    };
+    store.put_session(&lock, &session).unwrap();
+    let conn = Connection::open(&store.db).unwrap();
+    for path in ["/", "/user.slice", "../up.scope"] {
+        conn.execute("UPDATE sessions SET cgroup = ?1", [path])
+            .unwrap();
+        let err = store.sessions(&name, true).unwrap_err();
+        assert!(
+            err.to_string().contains("is not the path of a scope"),
+            "{err}"
+        );
+    }
+}
+
 #[test]
 fn only_a_service_session_names_a_service() {
     use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
@@ -562,6 +779,7 @@ fn only_a_service_session_names_a_service() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,
@@ -602,6 +820,7 @@ fn a_session_and_its_sandboxs_state_are_written_together_or_not_at_all() {
             started: "Thu Oct 8 09:31:10 2026".into(),
         },
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: "2026-10-08T09:31:10Z".parse().unwrap(),
         ended_at: None,

@@ -9,7 +9,10 @@ use enclos::engine::{
 };
 use enclos::error::{Result, exit};
 use enclos::model::agent::AgentName;
+use enclos::model::unenforced::NotEnforced;
 use enclos::runtime::RuntimeAgentName;
+
+mod host;
 
 pub fn run(engine: &Engine) -> Result<u8> {
     use enclos::backend::seatbelt::{BASELINE_VAR, Baseline};
@@ -176,6 +179,7 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             "last_version": s.last_version,
             "drift": drift,
             "settings": settings,
+            "not_enforced": super::output::not_enforced(&s.not_enforced),
             "unreadable": s.unreadable,
         })
     };
@@ -189,11 +193,16 @@ fn json(doctor: &Doctor) -> serde_json::Value {
             "sandboxes": list.iter().map(sandbox).collect::<Vec<_>>(),
         }),
     };
-    json!({
+    let mut report = json!({
         "problems": doctor.has_problems(),
         "backends": backends,
         "records": sandboxes,
-    })
+    });
+    if let Some(systemd) = &doctor.systemd {
+        report["systemd"] = host::systemd_json(systemd);
+    }
+    report["host"] = host::checks_json(&doctor.host);
+    report
 }
 
 /// The report as text, one line per fact.
@@ -202,6 +211,7 @@ pub fn shown(doctor: &Doctor) -> String {
     for b in &doctor.backends {
         out += &backend(b);
     }
+    out += &host::shown(doctor.systemd.as_ref(), &doctor.host);
     out += "\nSandboxes\n";
     match &doctor.sandboxes {
         Sandboxes::NotInitialized => {
@@ -305,6 +315,9 @@ fn sandbox(s: &SandboxCheck) -> String {
     for drift in &s.drift {
         out += &drift_lines(name.as_str(), drift);
     }
+    for n in &s.not_enforced {
+        out += &not_enforced_line(name.as_str(), n);
+    }
     for finding in &s.settings {
         out += &settings_line(name.as_str(), finding);
     }
@@ -312,6 +325,20 @@ fn sandbox(s: &SandboxCheck) -> String {
         out += &format!("    enclos could not look: {what}\n");
     }
     out
+}
+
+/// A field the sandbox runs with not enforced on this host (ADR 0038),
+/// beside the Host section's report on the control it lacks, with what to
+/// do when it is not accepted.
+fn not_enforced_line(name: &str, n: &NotEnforced) -> String {
+    let mut line = format!("    not enforced: {}", n.said());
+    if !n.is_accepted() {
+        line += &format!(
+            "; its next start is refused until `enclos sandbox start {name} --accept-unenforced {}`",
+            n.gap.field
+        );
+    }
+    line + "\n"
 }
 
 fn drift_lines(name: &str, drift: &Drift) -> String {
@@ -491,11 +518,15 @@ mod tests {
     use enclos::backend::seatbelt::Baseline;
     use enclos::backend::{Capabilities, Enforcement};
     use enclos::engine::{Running, Written};
+    use enclos::host::{HostCheck, Verdict};
+    use enclos::lifecycle::cgroup::Systemd;
     use enclos::model::sandbox::BackendKind;
     use std::path::PathBuf;
 
     fn doctor(check: SandboxCheck) -> Doctor {
         Doctor {
+            systemd: None,
+            host: Vec::new(),
             backends: vec![BackendCheck {
                 kind: BackendKind::Seatbelt,
                 state: BackendState::Runs,
@@ -523,6 +554,7 @@ mod tests {
             drift: Vec::new(),
             settings: Vec::new(),
             unreadable: Vec::new(),
+            not_enforced: Vec::new(),
         }
     }
 
@@ -536,6 +568,134 @@ mod tests {
                 ran_file,
             },
         }
+    }
+
+    /// ADR 0038: each sandbox lists what it runs with not enforced, with
+    /// why and its acceptance, in text and in JSON; one not accepted says
+    /// how to accept it, and is a problem.
+    #[test]
+    fn each_field_not_enforced_is_listed_with_its_acceptance() {
+        use enclos::model::unenforced::{Acceptance, Accepted, NotEnforcedHere, UnenforcedField};
+        let why = "memory controller: turned off at boot";
+        let with = |accepted: Accepted| {
+            doctor(SandboxCheck {
+                backend: BackendKind::Bubblewrap,
+                not_enforced: vec![NotEnforced {
+                    gap: NotEnforcedHere {
+                        field: UnenforcedField::Memory,
+                        value: "1G".into(),
+                        why: why.into(),
+                    },
+                    accepted,
+                }],
+                ..compiles()
+            })
+        };
+        let accepted = with(Accepted::Kept(Acceptance {
+            field: UnenforcedField::Memory,
+            value: "1G".into(),
+            why: why.into(),
+            at: "2026-11-07T10:00:00Z".parse().unwrap(),
+        }));
+        assert!(!accepted.has_problems());
+        let text = shown(&accepted);
+        assert!(
+            text.contains(&format!(
+                "    not enforced: resources.memory = 1G is not applied on this host: {why}; accepted 2026-11-07 10:00 UTC\n"
+            )),
+            "{text}"
+        );
+        let listed = &json(&accepted)["records"]["sandboxes"][0]["not_enforced"][0];
+        assert_eq!(listed["field"], "memory");
+        assert_eq!(listed["why"], why);
+        assert_eq!(listed["accepted"], true);
+        assert_eq!(listed["acceptance"]["state"], "kept");
+
+        let missing = with(Accepted::Missing);
+        assert!(missing.has_problems());
+        let text = shown(&missing);
+        assert!(
+            text.contains("; not accepted; its next start is refused until `enclos sandbox start home --accept-unenforced memory`\n"),
+            "{text}"
+        );
+        let listed = &json(&missing)["records"]["sandboxes"][0]["not_enforced"][0];
+        assert_eq!(listed["accepted"], false);
+        assert_eq!(listed["acceptance"]["state"], "missing");
+        // None: an empty list.
+        let none = doctor(compiles());
+        assert_eq!(
+            json(&none)["records"]["sandboxes"][0]["not_enforced"],
+            serde_json::json!([])
+        );
+    }
+
+    /// Where sessions run in no scope, as on macOS, nothing is said of it.
+    #[test]
+    fn a_host_with_no_scopes_says_nothing_of_systemd() {
+        let d = doctor(compiles());
+        assert!(!shown(&d).contains("ystemd"), "{}", shown(&d));
+        assert!(json(&d).get("systemd").is_none());
+    }
+
+    #[test]
+    fn the_systemd_found_is_shown_with_what_enclos_needs() {
+        let mut d = doctor(compiles());
+        d.systemd = Some(Systemd::Enough(257));
+        assert!(!d.has_problems());
+        let text = shown(&d);
+        assert!(
+            text.contains("systemd 257: enclos needs 254 or later"),
+            "{text}"
+        );
+        assert_eq!(json(&d)["systemd"]["version"], 257);
+        assert_eq!(json(&d)["systemd"]["needed"], 254);
+        assert!(json(&d)["systemd"]["problem"].is_null());
+    }
+
+    #[test]
+    fn a_systemd_too_old_or_unreadable_is_a_problem() {
+        let mut d = doctor(compiles());
+        d.systemd = Some(Systemd::TooOld(252));
+        assert!(d.has_problems());
+        let text = shown(&d).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("this host has 252"), "{text}");
+        assert!(text.contains("Debian 13 or Ubuntu 24.04 work"), "{text}");
+        assert_eq!(json(&d)["systemd"]["version"], 252);
+        assert!(json(&d)["systemd"]["problem"].is_string());
+
+        d.systemd = Some(Systemd::Unreadable("no such file".into()));
+        assert!(d.has_problems());
+        let text = shown(&d).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("no such file"), "{text}");
+        assert!(json(&d)["systemd"]["version"].is_null());
+    }
+
+    /// A degraded control, lingering off or no Secret Service is said, and
+    /// doctor still exits 0; what keeps a backend from running is a problem.
+    #[test]
+    fn only_a_host_check_that_blocks_is_a_problem() {
+        let mut d = doctor(compiles());
+        d.host = vec![
+            HostCheck::new(
+                "Landlock",
+                "not in this kernel",
+                Verdict::Degraded {
+                    not_enforced: "an `[exec]` section".into(),
+                    risk: "any program can run".into(),
+                },
+                None,
+            ),
+            HostCheck::note("lingering", "off", None),
+        ];
+        assert!(!d.has_problems());
+        assert_eq!(json(&d)["host"][0]["verdict"], "degraded");
+        assert!(shown(&d).contains("\nHost\n  Landlock (degraded): not in this kernel\n"));
+        d.host.push(HostCheck::blocks(
+            "bubblewrap",
+            "/usr/bin/bwrap is missing",
+            None,
+        ));
+        assert!(d.has_problems());
     }
 
     /// Each capability is a line of its own, its value in one column, and a

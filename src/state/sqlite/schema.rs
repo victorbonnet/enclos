@@ -99,6 +99,21 @@ pub const MIGRATIONS: &[&str] = &[
     // (design §6, server name check)
     "ALTER TABLE net_events ADD COLUMN name_seen TEXT;
     ALTER TABLE net_events ADD COLUMN server_name TEXT;",
+    // 10: the secret store holding each secret's value (design §12); every
+    // secret before this was in the Keychain
+    "ALTER TABLE secrets ADD COLUMN store TEXT NOT NULL DEFAULT 'keychain';",
+    // 11: the cgroup of each session's scope, on Linux (design §8)
+    "ALTER TABLE sessions ADD COLUMN cgroup TEXT;",
+    // 12: each field a sandbox runs with not enforced on this host, as the
+    // user accepted it, at the value accepted (ADR 0038)
+    "CREATE TABLE unenforced_acceptances (
+        sandbox TEXT NOT NULL REFERENCES sandboxes (name) ON DELETE CASCADE,
+        field   TEXT NOT NULL,
+        value   TEXT NOT NULL,
+        why     TEXT NOT NULL,
+        at      TEXT NOT NULL,
+        PRIMARY KEY (sandbox, field)
+    ) STRICT;",
 ];
 
 /// The schema version this enclos reads and writes.

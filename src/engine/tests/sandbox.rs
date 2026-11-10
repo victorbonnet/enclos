@@ -2,7 +2,9 @@
 
 use super::policy::with_sandbox_on;
 use super::*;
+use crate::backend::Backend;
 use crate::engine::SandboxSpec;
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::lifecycle::process::reference;
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
@@ -116,6 +118,7 @@ pub(super) fn session_of(engine: &Engine, name: &SandboxName, root: ProcessRef) 
         compiled: None,
         root,
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,
@@ -126,23 +129,21 @@ pub(super) fn session_of(engine: &Engine, name: &SandboxName, root: ProcessRef) 
 /// any more (its pid is free, or used again with another start time), as
 /// a session's after a crash or a restart of the Mac.
 pub(super) fn gone_process() -> ProcessRef {
-    let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    let mut child = spawn_unmarked(&mut std::process::Command::new("/usr/bin/true")).unwrap();
     let recorded = crate::lifecycle::process::reference_of_child(&child).unwrap();
     child.wait().unwrap();
     recorded
 }
 
-/// A `sleep` this test started, ended and reaped when dropped.
+/// A `sleep` this test started, ended and reaped when dropped. Started
+/// unmarked, as every program an engine test starts: started while another
+/// test starts a program holding its session's marker, it would hold that
+/// marker too, and that test's stop would end it.
 pub(super) struct Sleeping(std::process::Child);
 
 impl Sleeping {
     pub(super) fn new() -> Sleeping {
-        Sleeping(
-            std::process::Command::new("/bin/sleep")
-                .arg("30")
-                .spawn()
-                .unwrap(),
-        )
+        Sleeping(spawn_unmarked(std::process::Command::new("/bin/sleep").arg("30")).unwrap())
     }
 
     pub(super) fn process(&self) -> ProcessRef {
@@ -166,11 +167,8 @@ fn mark(engine: &Engine, name: &SandboxName, state: SandboxState) {
 
 pub(super) fn put(engine: &Engine, session: &SessionRecord) -> SessionId {
     // As a session's start makes it, for its marker, when it can (a
-    // test may have put something else there): on macOS, where the
-    // markers are looked for with `lsof`.
-    if cfg!(target_os = "macos") {
-        let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
-    }
+    // test may have put something else there).
+    let _ = std::fs::create_dir_all(engine.markers(&session.sandbox));
     let lock = engine.state.lock().unwrap();
     engine.state.put_session(&lock, session).unwrap()
 }
@@ -279,6 +277,17 @@ fn rm_records_the_end_of_sessions_gone_after_a_crash_and_removes_the_sandbox() {
 /// Another engine on `engine`'s folder, on which the sandboxes' backend
 /// no longer runs: whatever starts a session fails half-way.
 pub(super) fn without_backend(engine: &Engine) -> Engine {
+    with_backends(
+        engine,
+        vec![Box::new(FakeBackend::unavailable(
+            BackendKind::Seatbelt,
+            "taken away by the test",
+        ))],
+    )
+}
+
+/// Another engine on `engine`'s folder, with these backends.
+pub(super) fn with_backends(engine: &Engine, backends: Vec<Box<dyn Backend>>) -> Engine {
     let layout = engine.layout.clone();
     Engine::new(
         layout.clone(),
@@ -287,10 +296,7 @@ pub(super) fn without_backend(engine: &Engine) -> Engine {
             layout.state_lock(),
         )),
         Box::new(JsonlAuditLog::new(layout.audit_log())),
-        vec![Box::new(FakeBackend::unavailable(
-            BackendKind::Seatbelt,
-            "taken away by the test",
-        ))],
+        backends,
     )
 }
 
@@ -703,7 +709,7 @@ fn dry_runs_of_stop_and_connect_change_nothing() {
     assert!(
         plan.changes
             .last()
-            .is_some_and(|c| c.starts_with("run `/bin/zsh -l` in sandbox home")),
+            .is_some_and(|c| c.starts_with(&format!("run `{}` in sandbox home", default_shell()))),
         "{plan:?}"
     );
     assert_eq!(
@@ -743,12 +749,13 @@ fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
     let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
     // A program in a group made for it, which leaves a sleep there and
     // exits once its input closes: the sleep is only counted.
-    let mut program = std::process::Command::new("/bin/sh")
-        .args(["-c", "/bin/sleep 30 & read line"])
-        .stdin(std::process::Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
+    let mut program = spawn_unmarked(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & read line"])
+            .stdin(std::process::Stdio::piped())
+            .process_group(0),
+    )
+    .unwrap();
     let session = SessionRecord {
         id: SessionId(0),
         sandbox: name.clone(),
@@ -759,6 +766,7 @@ fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
         compiled: None,
         root: reference(program.id()).unwrap().unwrap(),
         pgid: Some(program.id()),
+        cgroup: None,
         tracked: Vec::new(),
         started_at: crate::model::now(),
         ended_at: None,

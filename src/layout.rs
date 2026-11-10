@@ -39,6 +39,11 @@ pub struct Layout {
     config: PathBuf,
     /// The user's home folder, which `~` in policies means.
     user_home: PathBuf,
+    /// Where the user's systemd manager looks for units first, and where
+    /// `sandbox start` installs them.
+    units_dir: PathBuf,
+    /// Where the same manager looks for units in the user's data folder.
+    data_units_dir: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +69,8 @@ impl Layout {
         Layout {
             data: root.clone(),
             config: root,
+            units_dir: units_dir(&user_home.join(".config")),
+            data_units_dir: units_dir(&user_home.join(".local/share")),
             user_home,
         }
     }
@@ -71,6 +78,8 @@ impl Layout {
     /// The same layout, with `~` meaning `home`.
     pub fn with_user_home(mut self, home: impl Into<PathBuf>) -> Layout {
         self.user_home = home.into();
+        self.units_dir = units_dir(&self.user_home.join(".config"));
+        self.data_units_dir = units_dir(&self.user_home.join(".local/share"));
         self
     }
 
@@ -86,30 +95,37 @@ impl Layout {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         };
+        // The XDG spec says to ignore relative values.
+        let xdg =
+            |name: &str, default: PathBuf| set(name).filter(|p| p.is_absolute()).unwrap_or(default);
+        // Units follow the variables under `ENCLOS_HOME` too: it says where
+        // enclos keeps its files, not where the user's manager looks.
+        let units_of = |layout: Layout| match os {
+            Os::MacOs => layout,
+            Os::Linux => Layout {
+                units_dir: units_dir(&xdg("XDG_CONFIG_HOME", layout.user_home.join(".config"))),
+                data_units_dir: units_dir(&xdg(
+                    "XDG_DATA_HOME",
+                    layout.user_home.join(".local/share"),
+                )),
+                ..layout
+            },
+        };
         if let Some(root) = set(HOME_VAR) {
             let layout = Layout::at(absolute(HOME_VAR, root)?);
-            return Ok(match set("HOME").filter(|h| h.is_absolute()) {
+            return Ok(units_of(match set("HOME").filter(|h| h.is_absolute()) {
                 Some(home) => layout.with_user_home(home),
                 None => layout,
-            });
+            }));
         }
         let home = absolute("HOME", set("HOME").ok_or(LayoutError::NoHome)?)?;
         Ok(match os {
             Os::MacOs => Layout::at(home.join(".enclos")).with_user_home(home),
-            Os::Linux => {
-                // The XDG spec says to ignore relative values.
-                let xdg = |name: &str, default: &str| {
-                    set(name)
-                        .filter(|p| p.is_absolute())
-                        .unwrap_or_else(|| home.join(default))
-                        .join("enclos")
-                };
-                Layout {
-                    data: xdg("XDG_DATA_HOME", ".local/share"),
-                    config: xdg("XDG_CONFIG_HOME", ".config"),
-                    user_home: home.clone(),
-                }
-            }
+            Os::Linux => units_of(Layout {
+                data: xdg("XDG_DATA_HOME", home.join(".local/share")).join("enclos"),
+                config: xdg("XDG_CONFIG_HOME", home.join(".config")).join("enclos"),
+                ..Layout::at(home.join(".enclos")).with_user_home(home)
+            }),
         })
     }
 
@@ -146,6 +162,13 @@ impl Layout {
         &self.user_home
     }
 
+    /// The folder systemd units go in, as this process's environment names
+    /// it: `$XDG_CONFIG_HOME/systemd/user` when that is an absolute path,
+    /// else `~/.config/systemd/user`.
+    pub fn units_dir(&self) -> &Path {
+        &self.units_dir
+    }
+
     /// The variables with which another enclos process, such as a service
     /// started with only `HOME`, resolves this same layout: `ENCLOS_HOME`
     /// when everything is in one folder, else both XDG folders.
@@ -163,10 +186,20 @@ impl Layout {
         ]
     }
 
-    /// The enclos data and config folders: what sandboxes may never write
-    /// outside their own home (ADR 0010).
+    /// What sandboxes may never write outside their own home: the enclos
+    /// data and config folders (ADR 0010), and on Linux the user's manager's
+    /// unit folders, which follow the XDG variables as the deny list's
+    /// entries for them cannot.
     pub fn protected(&self) -> Vec<PathBuf> {
-        self.roots()
+        self.protected_on(Os::current())
+    }
+
+    pub(crate) fn protected_on(&self, os: Os) -> Vec<PathBuf> {
+        let mut protected = self.roots();
+        if os == Os::Linux {
+            protected.extend([self.units_dir.clone(), self.data_units_dir.clone()]);
+        }
+        protected
     }
 
     /// The folder holding every sandbox's folder.
@@ -191,6 +224,12 @@ impl Layout {
     pub fn agent_secrets_file(&self, name: &str, agent: &str) -> PathBuf {
         self.sandbox_secrets_dir(name)
             .join(format!("{agent}{AGENT_SECRETS_SUFFIX}"))
+    }
+
+    /// What enclos stages for an install or an import, beside the home:
+    /// the host writes it, and the sandbox reads it and never writes it.
+    pub fn sandbox_installers(&self, name: &str) -> PathBuf {
+        self.sandbox_dir(name).join("installers")
     }
 
     /// The sandbox's home folder: the runtime's home and the one place it may
@@ -221,21 +260,83 @@ impl Layout {
         self.data.join("audit.jsonl")
     }
 
-    /// The proxies' control sockets.
+    /// The file store's one file (design §12): for the host alone.
+    pub fn secrets_file(&self) -> PathBuf {
+        self.data.join("secrets.json")
+    }
+
+    /// What runs, a folder per sandbox, and each sandbox's `connect` lock.
     pub fn run_dir(&self) -> PathBuf {
         self.data.join("run")
+    }
+
+    /// The sandbox's folder of what runs. Only the host reads it.
+    pub fn sandbox_run_dir(&self, name: &str) -> PathBuf {
+        self.run_dir().join(name)
+    }
+
+    /// The socket a session with a network of its own reaches the sandbox's
+    /// proxy on, in the one folder of [`Layout::sandbox_run_dir`] that is for
+    /// the sandbox's sessions (design §5, Linux networking).
+    pub fn proxy_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("visible/proxy.sock")
+    }
+
+    /// The lock a sandbox's proxy holds while it runs, when it holds no port.
+    pub fn proxy_lock(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("proxy.lock")
+    }
+
+    /// The socket on which the sandbox's namespace holder hands out its
+    /// namespaces (ADR 0039): in the host-only part of the sandbox's run
+    /// folder, which no session mounts.
+    pub fn holder_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("holder.sock")
+    }
+
+    /// The namespace holder's way in, the socket on which it relays the
+    /// host's connections to a port in the sandbox's network namespace (ADR
+    /// 0040): beside its other socket, where no session reaches.
+    pub fn inward_socket(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("inward.sock")
+    }
+
+    /// The lock `enclos dashboard` holds while it runs for the sandbox,
+    /// which says who holds it: one at a time (ADR 0040).
+    pub fn dashboard_lock(&self, name: &str) -> PathBuf {
+        self.sandbox_run_dir(name).join("dashboard.lock")
+    }
+
+    /// Creates the sandbox's folder of what runs, this user's alone.
+    pub fn create_sandbox_run_dir(&self, name: &str) -> std::io::Result<()> {
+        users_alone(&self.sandbox_run_dir(name))
+    }
+
+    /// Creates the folder of the sandbox's proxy socket.
+    pub fn create_proxy_socket_dir(&self, name: &str) -> std::io::Result<()> {
+        users_alone(&self.sandbox_run_dir(name).join("visible"))
     }
 
     /// Files no sandbox may read (ADR 0010). Each covers every file whose
     /// name starts with it too, such as `state.db-journal` or
     /// `audit.jsonl.torn-12`.
     pub fn hidden_files(&self) -> Vec<PathBuf> {
-        vec![
+        self.hidden_files_on(Os::current())
+    }
+
+    fn hidden_files_on(&self, os: Os) -> Vec<PathBuf> {
+        let mut files = vec![
             self.state_db(),
             self.state_lock(),
             self.audit_log(),
             self.config_file(),
-        ]
+        ];
+        // Only Linux has the file store, as `secrets::host` picks the
+        // stores: the two change together.
+        if os == Os::Linux {
+            files.push(self.secrets_file());
+        }
+        files
     }
 
     /// Folders no sandbox may read (ADR 0010), besides other sandboxes'.
@@ -384,21 +485,74 @@ fn absolute(var: &'static str, path: PathBuf) -> Result<PathBuf, LayoutError> {
     }
 }
 
+/// The user's manager's folder of units under an XDG folder.
+fn units_dir(xdg_home: &Path) -> PathBuf {
+    xdg_home.join("systemd/user")
+}
+
 /// Creates `dir` and its missing parents, readable only by the user.
 fn create_dir(dir: &Path) -> Result<(), LayoutError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|source| LayoutError::Io {
-            path: dir.to_owned(),
-            source,
-        })
+    users_alone(dir).map_err(|source| LayoutError::Io {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// Creates `dir` and its parents, for the user alone.
+fn users_alone(dir: &Path) -> std::io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file store is on the list Seatbelt's rules and the probes read.
+    /// That a sandbox cannot read it is for the backend's rules and those
+    /// probes to show, not this list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_file_store_is_on_the_hidden_files() {
+        let layout = Layout::at("/data/enclos");
+        assert!(layout.hidden_files().contains(&layout.secrets_file()));
+        assert!(layout.secrets_file().starts_with(layout.data()));
+    }
+
+    /// The file store is hidden on Linux, the only system with one, and
+    /// macOS's list stays without it.
+    #[test]
+    fn the_hidden_files_are_each_systems_own() {
+        let layout = Layout::at("/data/enclos");
+        assert!(
+            layout
+                .hidden_files_on(Os::Linux)
+                .contains(&layout.secrets_file())
+        );
+        assert_eq!(
+            layout.hidden_files_on(Os::MacOs),
+            [
+                layout.state_db(),
+                layout.state_lock(),
+                layout.audit_log(),
+                layout.config_file()
+            ]
+        );
+        assert_eq!(layout.hidden_files(), layout.hidden_files_on(Os::current()));
+    }
+
+    #[test]
+    fn a_proxy_sockets_folders_are_the_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout::at(dir.path().join("enclos"));
+        layout.create_proxy_socket_dir("home").unwrap();
+        let socket = layout.proxy_socket("home");
+        let visible = socket.parent().unwrap();
+        for folder in [layout.sandbox_run_dir("home").as_path(), visible] {
+            let mode = std::fs::metadata(folder).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", folder.display());
+        }
+    }
 
     fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |name| {
@@ -470,6 +624,67 @@ mod tests {
         let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
         assert_eq!(layout.data(), Path::new("/home/alice/.local/share/enclos"));
         assert_eq!(layout.config(), Path::new("/home/alice/.config/enclos"));
+    }
+
+    #[test]
+    fn linux_protects_the_unit_folders_the_xdg_variables_name() {
+        let vars = [
+            ("HOME", "/home/alice"),
+            ("XDG_DATA_HOME", "/data"),
+            ("XDG_CONFIG_HOME", "/home/alice/dotfiles/config"),
+        ];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(
+            layout.units_dir(),
+            Path::new("/home/alice/dotfiles/config/systemd/user")
+        );
+        assert_eq!(
+            layout.protected_on(Os::Linux),
+            [
+                PathBuf::from("/data/enclos"),
+                PathBuf::from("/home/alice/dotfiles/config/enclos"),
+                PathBuf::from("/home/alice/dotfiles/config/systemd/user"),
+                PathBuf::from("/data/systemd/user"),
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_unit_folders_default_under_the_home_and_ignore_a_relative_variable() {
+        let vars = [("HOME", "/home/alice"), ("XDG_CONFIG_HOME", "relative")];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(
+            layout.units_dir(),
+            Path::new("/home/alice/.config/systemd/user")
+        );
+        assert!(
+            layout
+                .protected_on(Os::Linux)
+                .contains(&PathBuf::from("/home/alice/.local/share/systemd/user"))
+        );
+    }
+
+    #[test]
+    fn enclos_home_leaves_the_unit_folders_where_the_manager_looks() {
+        let vars = [
+            ("HOME", "/home/alice"),
+            (HOME_VAR, "/tmp/e"),
+            ("XDG_CONFIG_HOME", "/srv/config"),
+        ];
+        let layout = Layout::resolve(Os::Linux, env(&vars)).unwrap();
+        assert_eq!(layout.data(), Path::new("/tmp/e"));
+        assert_eq!(layout.units_dir(), Path::new("/srv/config/systemd/user"));
+    }
+
+    #[test]
+    fn macos_protects_only_enclos_folders() {
+        let vars = [("HOME", "/Users/alice"), ("XDG_CONFIG_HOME", "/cfg")];
+        let layout = Layout::resolve(Os::MacOs, env(&vars)).unwrap();
+        assert_eq!(
+            layout.protected_on(Os::MacOs),
+            [PathBuf::from("/Users/alice/.enclos")]
+        );
+        assert_eq!(layout, Layout::at("/Users/alice/.enclos"));
     }
 
     #[test]

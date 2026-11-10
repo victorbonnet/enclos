@@ -14,8 +14,10 @@ use crate::model::policy::{PendingPolicy, PolicyVersion, TemplateName};
 use crate::model::sandbox::{
     BackendKind, PORT_FIRST, PORT_LAST, SandboxName, SandboxRecord, SandboxState,
 };
+use crate::model::secret::SecretRecord;
 use crate::model::session::{Member, SessionId, SessionRecord};
 use crate::policy;
+use crate::secrets::SecretError;
 use crate::service::ServiceLabel;
 use std::path::{Path, PathBuf};
 
@@ -255,8 +257,7 @@ impl Engine {
         let used: Vec<u16> = self.state.list()?.iter().map(|r| r.proxy_port).collect();
         let listening = |port: u16| {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100))
-                .is_ok()
+            super::loopback::listens(addr, std::time::Duration::from_millis(100))
         };
         (PORT_FIRST..=PORT_LAST)
             .find(|port| !used.contains(port) && !listening(*port))
@@ -399,7 +400,7 @@ impl Engine {
         // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
         let services = self
-            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop)?
+            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, &[])?
             .into_result()?;
         self.write(
             by,
@@ -552,14 +553,29 @@ impl Engine {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
                 let gone = self.require_stopped(name)?;
-                // Kept data or not, the file its services read their
-                // secrets from goes before the record (ADR 0034).
-                self.remove_secrets_file(name)?;
                 let secrets = self.state.secrets(name)?;
+                let after_record = self.remove_sandbox_secrets(name, &secrets)?;
                 // The sessions' rows go with the record: only the audit
                 // entry keeps their ends.
                 self.state.remove(lock, name)?;
-                let left = self.forget_secrets(&secrets);
+                let left = self.forget_secrets(&after_record);
+                // Its slice, which held its scopes and stays active once
+                // one ran, holds nothing now: it goes, with its limits.
+                if let Some(scopes) = &self.scopes {
+                    let install = self.layout.install_id()?;
+                    if let Err(e) = scopes.release_slice(&install, name.as_str()) {
+                        crate::notes::say(&format!("the slice of sandbox {name} stays: {e}"));
+                    }
+                }
+                // Nothing in it outlives the sandbox's proxy, whatever
+                // `keep_data` keeps; left behind, the next proxy of the name
+                // takes its socket over.
+                let run = self.layout.sandbox_run_dir(name.as_str());
+                if let Err(e) = std::fs::remove_dir_all(&run)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::notes::say(&format!("cannot remove {}: {e}", run.display()));
+                }
                 if !keep_data
                     && dir.exists()
                     && let Err(source) = std::fs::remove_dir_all(&dir)
@@ -593,6 +609,36 @@ impl Engine {
         Ok(Planned::Done(secrets_left))
     }
 
+    /// Removes what of `name`'s secrets goes before its record: the file its
+    /// services read them from (ADR 0034), then each value whose store keeps
+    /// the sandbox while it cannot be removed, refusing while one stays.
+    /// Returns the secrets whose values go after the record.
+    fn remove_sandbox_secrets(
+        &self,
+        name: &SandboxName,
+        secrets: &[SecretRecord],
+    ) -> Result<Vec<SecretRecord>> {
+        self.remove_secrets_file(name)?;
+        let (before_record, after_record): (Vec<_>, Vec<_>) = secrets
+            .iter()
+            .cloned()
+            .partition(|r| self.secrets.value_goes_before_record(r.store));
+        let stay = self.forget_secrets(&before_record);
+        if !stay.is_empty() {
+            return Err(Error::Secret(SecretError {
+                what: format!(
+                    "sandbox {name} was not removed, as these secrets could not be: {}. Run `enclos sandbox rm {name}` again once they can be removed",
+                    stay.iter()
+                        .map(|l| l.why.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                untouched: false,
+            }));
+        }
+        Ok(after_record)
+    }
+
     /// Refuses a sandbox with services installed or sessions running, saying
     /// how to end them. Returns the open sessions of which nothing runs any
     /// more, whose end is left to record.
@@ -601,8 +647,9 @@ impl Engine {
             name: name.to_string(),
         })?;
         // Installed, a service comes back on its own, even with no session
-        // recorded: one whose proxy could not take its port has none.
-        if self.has_services(name)? {
+        // recorded: one whose proxy could not take its port has none. A
+        // namespace holder alone counts too.
+        if !self.installed_labels(name)?.is_empty() {
             return Err(Error::SandboxHasServices {
                 name: name.to_string(),
             });

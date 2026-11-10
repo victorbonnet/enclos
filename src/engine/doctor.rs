@@ -6,7 +6,11 @@
 //! enclos adds when it compiles a policy writes a new file at the next
 //! session start, without asking (ADR 0018); this is where that change is
 //! shown. It also looks for secrets in the runtime's settings files in the
-//! sandbox home.
+//! sandbox home. On a host where sessions run in scopes, it says which
+//! systemd it found; and what each backend, the service manager and the
+//! secret stores need from the host, with what to do; and, for each
+//! sandbox, what its policy sets that this host does not enforce, with its
+//! acceptance (ADR 0038).
 
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -19,11 +23,14 @@ use super::settings_secrets::SettingsFinding;
 use crate::backend::seatbelt::Baseline;
 use crate::backend::{Capabilities, Probe};
 use crate::error::Error;
+use crate::host::HostCheck;
 use crate::layout::LayoutError;
+use crate::lifecycle::cgroup::{Scopes, Systemd};
 use crate::lifecycle::look::Look;
 use crate::lifecycle::process::{Proc, PsError, processes};
 use crate::model::sandbox::{BackendKind, SandboxName, SandboxRecord};
 use crate::model::session::SessionRecord;
+use crate::model::unenforced::NotEnforced;
 use crate::state::StateError;
 
 /// What `enclos doctor` found.
@@ -31,6 +38,11 @@ use crate::state::StateError;
 pub struct Doctor {
     /// Every backend this build has.
     pub backends: Vec<BackendCheck>,
+    /// The host's systemd, where sessions run in scopes: on Linux.
+    pub systemd: Option<Systemd>,
+    /// What each backend, the service manager and the secret stores need
+    /// from this host, in that order.
+    pub host: Vec<HostCheck>,
     pub sandboxes: Sandboxes,
 }
 
@@ -94,6 +106,11 @@ pub struct SandboxCheck {
     /// What enclos could not look at for it: what is above may then be
     /// incomplete.
     pub unreadable: Vec<String>,
+    /// What its active policy sets that this host does not enforce, each
+    /// with whether it is accepted (ADR 0038): reported, and a problem
+    /// only when not accepted, since its next start is then refused.
+    /// Looked at only where its backend runs.
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 impl SandboxCheck {
@@ -210,10 +227,14 @@ pub const MAX_LINES: usize = 2000;
 
 impl Doctor {
     /// Whether something keeps enclos from working here: no backend runs,
-    /// enclos's records cannot be read, or a sandbox's backend does not
-    /// run, its next session cannot compile its policy, or enclos could not
-    /// look at all of it. A compiled policy that changed, and a secret found
-    /// in a runtime's settings, are reported, not problems.
+    /// a host check blocks a backend, systemd is too old or cannot be read,
+    /// enclos's records cannot be
+    /// read, or a sandbox's backend does not run, its next session cannot
+    /// compile its policy, it runs with a field not enforced that is not
+    /// accepted, or enclos could not look at all of it. A compiled policy
+    /// that changed, a secret found in a runtime's settings, a degraded
+    /// control and a field not enforced that is accepted are reported, not
+    /// problems.
     pub fn has_problems(&self) -> bool {
         let sandbox = |s: &SandboxCheck| {
             !s.backend_runs()
@@ -222,8 +243,11 @@ impl Doctor {
                     NextSession::Fails { .. } | NextSession::Unknown { .. }
                 )
                 || !s.unreadable.is_empty()
+                || s.not_enforced.iter().any(|n| !n.is_accepted())
         };
         !self.backends.iter().any(BackendCheck::runs_here)
+            || self.host.iter().any(HostCheck::blocks_backend)
+            || self.systemd.as_ref().is_some_and(|s| s.refusal().is_some())
             || match &self.sandboxes {
                 Sandboxes::NotInitialized => false,
                 Sandboxes::Unreadable { .. } => true,
@@ -276,8 +300,13 @@ impl Engine {
                 )
             }
         };
+        let mut host: Vec<HostCheck> = self.backends.iter().flat_map(|b| b.host_checks()).collect();
+        host.extend(self.services.host_checks());
+        host.extend(self.secrets.host_checks());
         Doctor {
             backends,
+            systemd: self.scopes.as_ref().map(Scopes::systemd),
+            host,
             sandboxes,
         }
     }
@@ -304,7 +333,11 @@ impl Engine {
             drift: Vec::new(),
             settings: Vec::new(),
             unreadable: Vec::new(),
+            not_enforced: Vec::new(),
         };
+        if backend_runs {
+            check.not_enforced = self.not_enforced_in(record, &mut check.unreadable);
+        }
         // Whatever its backend: the home is read on the host.
         check.settings = self.settings_secrets(record, &mut check.unreadable);
         let sessions = match self.state.sessions(name, false) {
@@ -338,7 +371,9 @@ impl Engine {
             // file is still compared, and its count said to be unsure.
             let look = match procs.get_or_init(processes) {
                 Ok(procs) => {
-                    Look::in_listing(procs, &self.markers(name)).map_err(|e| e.to_string())
+                    let markers = self.markers(name);
+                    Look::in_listing(procs, &markers, &self.cgroups(), open.iter().copied())
+                        .map_err(|e| e.to_string())
                 }
                 Err(e) => Err(e.to_string()),
             };
@@ -375,6 +410,27 @@ impl Engine {
             }
         }
         check
+    }
+
+    /// What sandbox `record`'s active policy sets that this host does not
+    /// enforce, with each acceptance. A policy that cannot be read is the
+    /// next session's to report; anything else that cannot be read is put
+    /// in `unreadable`.
+    fn not_enforced_in(
+        &self,
+        record: &SandboxRecord,
+        unreadable: &mut Vec<String>,
+    ) -> Vec<NotEnforced> {
+        let Ok((_, active)) = self.active_policy(&record.name) else {
+            return Vec::new();
+        };
+        self.not_enforced(&record.name, record.backend, &active.policy)
+            .unwrap_or_else(|e| {
+                unreadable.push(format!(
+                    "cannot tell whether what this host does not enforce is accepted: {e}"
+                ));
+                Vec::new()
+            })
     }
 
     /// Whether the sandbox's next session can compile its active policy,

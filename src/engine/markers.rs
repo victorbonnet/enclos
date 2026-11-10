@@ -68,17 +68,19 @@ impl Engine {
     ) -> Result<Look<'static>> {
         match open.is_empty() {
             true => Ok(Look::nothing_open()),
-            false => self.look_now(name),
+            false => Ok(Look::now(&self.markers(name), &self.cgroups(), open)?),
         }
     }
 
-    /// A look at what runs of sandbox `name` now.
+    /// A look at what runs of sandbox `name` now, its open sessions' cgroups
+    /// included.
     pub(super) fn look_now(&self, name: &SandboxName) -> Result<Look<'static>> {
-        Ok(Look::now(&self.markers(name))?)
+        let open = self.state.sessions(name, true)?;
+        Ok(Look::now(&self.markers(name), &self.cgroups(), &open)?)
     }
 
-    /// Stops `session`'s members, with what holds its marker now and what
-    /// gains it meanwhile (`look::stop_marked`).
+    /// Stops `session`'s members, with what holds its marker or is in its
+    /// cgroup now and what gains either meanwhile (`look::stop_marked`).
     pub(super) fn stop_marked(
         &self,
         session: &SessionRecord,
@@ -86,11 +88,12 @@ impl Engine {
         stop: super::StopMembers,
     ) -> Result<Stopped> {
         let dir = self.markers(&session.sandbox);
+        let cgroups = self.cgroups();
         Ok(look::stop_marked(
             session,
             grace,
-            || Look::now(&dir),
-            stop,
+            || Look::now(&dir, &cgroups, [session]),
+            |session, grace| stop(&cgroups, session, grace),
             is_same,
         )?)
     }

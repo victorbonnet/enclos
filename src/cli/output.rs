@@ -2,8 +2,9 @@
 //! its output is piped or with `--json`, errors and refusals included. A
 //! command whose stdout is a program's or the services' ([`RUNS_A_PROGRAM`])
 //! is never JSON because it is piped. With `--json`, its dry run's plan is
-//! JSON on stdout, `logs` writes its lines as JSON Lines there, and enclos's
-//! own words, its failure and its notes, are JSON on stderr.
+//! JSON on stdout, `logs` writes its lines as JSON Lines there, `dashboard`
+//! its address as one JSON line, and enclos's own words, its failure and its
+//! notes, are JSON on stderr.
 
 use std::fs::File;
 use std::io::{IsTerminal, Write};
@@ -32,9 +33,20 @@ pub enum Output {
 
 /// The commands, by their word, whose stdout is not enclos's to fill with a
 /// document: the program's they run (`connect`, `exec`, the hidden
-/// `launch`), the services' logs (`logs`), or a service's own log (the
-/// hidden `proxy`).
-pub const RUNS_A_PROGRAM: [&str; 5] = ["connect", "exec", "logs", "launch", "proxy"];
+/// `launch` and `inside`, and the hidden `holder`, whose `join` becomes a
+/// session's bubblewrap), the services' logs (`logs`), or a long-running
+/// command's own output (`dashboard`, and the hidden `proxy` and `relay`).
+pub const RUNS_A_PROGRAM: [&str; 9] = [
+    "connect",
+    "exec",
+    "logs",
+    "launch",
+    "inside",
+    "holder",
+    "proxy",
+    "relay",
+    "dashboard",
+];
 
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 
@@ -326,6 +338,35 @@ pub fn with_failure(mut result: Value, err: &Error) -> (u8, Value) {
 /// Who did something, as an audit entry records them.
 pub fn actor(by: &enclos::model::audit::Actor) -> Value {
     json!({"user": by.user, "host": by.host})
+}
+
+/// The fields a sandbox runs with not enforced on this host, each with its
+/// value, why, and its acceptance (ADR 0038), as `sandbox start`, `policy
+/// test` and `doctor` give them: `acceptance.state` is `kept` (with the
+/// value and time it was given), `given` by this command, `stale` (kept
+/// for another value, given with it) or `missing`.
+pub fn not_enforced(list: &[enclos::model::unenforced::NotEnforced]) -> Value {
+    use enclos::model::unenforced::Accepted;
+    let kept = |state: &str, a: &enclos::model::unenforced::Acceptance| json!({"state": state, "value": a.value, "at": a.at.to_string()});
+    Value::Array(
+        list.iter()
+            .map(|n| {
+                json!({
+                    "field": n.gap.field.as_str(),
+                    "setting": n.gap.field.policy_path(),
+                    "value": n.gap.value,
+                    "why": n.gap.why,
+                    "accepted": n.is_accepted(),
+                    "acceptance": match &n.accepted {
+                        Accepted::Kept(a) => kept("kept", a),
+                        Accepted::Stale(a) => kept("stale", a),
+                        Accepted::Given => json!({"state": "given"}),
+                        Accepted::Missing => json!({"state": "missing"}),
+                    },
+                })
+            })
+            .collect(),
+    )
 }
 
 /// A process: its pid and its command as `ps` lists it.

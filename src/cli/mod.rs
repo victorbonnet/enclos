@@ -3,12 +3,16 @@
 
 pub mod agent;
 pub mod connect;
+pub mod dashboard;
 pub mod doctor;
+pub mod holder;
+pub mod inside;
 pub mod launch;
 pub mod net;
 pub mod output;
 pub mod policy;
 pub mod proxy;
+pub mod relay;
 pub mod runtime;
 pub mod sandbox;
 pub mod secret;

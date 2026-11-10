@@ -16,6 +16,7 @@ use super::Engine;
 use super::listener::ConnectStep;
 use super::service::STOP_GRACE;
 use super::start::{CommandKind, Group, Started, Starting};
+use crate::backend::environment;
 use crate::error::{Error, Result};
 use crate::lifecycle::members::{Found, find};
 use crate::lifecycle::process::{
@@ -79,7 +80,7 @@ const EXIT_POLL: Duration = Duration::from_millis(20);
 pub(super) const END_WAIT: Duration = Duration::from_secs(120);
 
 impl Engine {
-    /// Runs `command` (a login shell by default) in the sandbox, in this
+    /// Runs `command` (a shell by default) in the sandbox, in this
     /// terminal, and returns when it exits.
     pub fn connect(
         &self,
@@ -89,7 +90,7 @@ impl Engine {
         confirm: Confirm,
     ) -> Result<Planned<SessionEnd>> {
         let command = if command.is_empty() {
-            vec![OsString::from("/bin/zsh"), OsString::from("-l")]
+            environment::shell_command()
         } else {
             command
         };
@@ -154,7 +155,7 @@ impl Engine {
         audit_name: &str,
         kind: CommandKind,
     ) -> Result<SessionEnd> {
-        let command = command.into_words();
+        let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
         let me = std::process::id();
         let leads_group = group_of(me)? == Some(me);
@@ -169,7 +170,11 @@ impl Engine {
             unreachable,
             prepared: keep_waiting,
         } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
-            let starting = Starting::Command { kind, group };
+            let starting = Starting::Command {
+                kind,
+                group,
+                reads: &reads,
+            };
             let started = self.start_session(lock, name, &command, starting, KeepWaiting::new);
             self.failed_on_error(lock, name, audit_name, started)
         })?;
@@ -254,11 +259,24 @@ impl Engine {
         session: &SessionRecord,
         waited: Waited,
     ) -> Result<SessionEnd> {
+        self.finish_session_saying(by, audit_name, session, waited, None)
+    }
+
+    /// `finish_session`, with `why` it ended in its audit entry.
+    pub(super) fn finish_session_saying(
+        &self,
+        by: &Actor,
+        audit_name: &str,
+        session: &SessionRecord,
+        waited: Waited,
+        why: Option<&str>,
+    ) -> Result<SessionEnd> {
         let signal = waited.status.signal();
-        let exit = waited
-            .status
-            .code()
-            .unwrap_or_else(|| 128 + signal.unwrap_or(0));
+        let code = exit_code(waited.status);
+        let exit = match why {
+            Some(why) => format!("{code}, {why}"),
+            None => code.to_string(),
+        };
         let summary = |_: &()| match &waited.left {
             Ok(left) if left.is_empty() => format!("exit {exit}"),
             Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
@@ -274,7 +292,7 @@ impl Engine {
         };
         Ok(SessionEnd {
             session: session.id,
-            exit,
+            exit: code,
             signal,
             left,
             notes: waited.notes,
@@ -378,8 +396,9 @@ impl Engine {
                 let mut members = session.clone();
                 members.tracked = known.clone();
                 let stop_members = self.stop_members;
+                let cgroups = self.cgroups().into_owned();
                 stopping = Some(std::thread::spawn(move || {
-                    stop_members(&members, STOP_GRACE)
+                    stop_members(&cgroups, &members, STOP_GRACE)
                 }));
             }
             if stopping
@@ -600,6 +619,15 @@ impl Engine {
                 record.proxy_port
             ));
         }
+        let holder = super::service::Unit::Holder;
+        if !starts_services
+            && self.holder_of(record.backend).is_some()
+            && !self.unit_installed(name, holder)?
+        {
+            changes.push(format!(
+                "start the namespace holder of sandbox {name}, whose network namespace its sessions join; it runs until `enclos sandbox stop {name}`"
+            ));
+        }
         let shown = command
             .iter()
             .map(|w| w.to_string_lossy())
@@ -614,6 +642,14 @@ impl Engine {
             ..Plan::default()
         })
     }
+}
+
+/// A program's exit status as a shell reports it: its code, or 128 plus
+/// the signal that ended it.
+pub(super) fn exit_code(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 pub(super) fn note(notes: &mut Vec<String>, note: String) {

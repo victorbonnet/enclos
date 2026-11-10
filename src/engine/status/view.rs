@@ -114,6 +114,8 @@ pub struct SandboxStatus {
     /// The last refusal, within the last 7 days, because the proxy could
     /// not read the sandbox's policy.
     pub policy_unreadable_at: Option<Timestamp>,
+    /// How many connections the proxy refused so, in the same 7 days.
+    pub policy_unreadable_refused: u64,
     /// `None` when the sandbox has no runtime.
     pub agents: Option<AgentList>,
     pub disk: Disk,
@@ -123,9 +125,16 @@ pub struct SandboxStatus {
     /// while it holds no such port or one that cannot be trusted, not
     /// provided for a runtime with no such page.
     pub dashboard: Fact<String>,
+    /// The command that opens the runtime's dashboard to the user who runs
+    /// it, for a sandbox whose listeners the host cannot reach, where
+    /// `dashboard` gives no address (ADR 0040); none elsewhere, and for a
+    /// runtime with no dashboard.
+    pub dashboard_command: Option<String>,
     /// Members listening on an address beyond loopback, which the host's
     /// network can reach: nothing narrows a sandbox's listener to loopback
-    /// (ADR 0028).
+    /// (ADR 0028). Not provided for a sandbox whose sessions listen in a
+    /// network namespace of its own, which the host's network does not
+    /// reach (ADR 0040).
     pub network_listeners: Fact<Vec<NetworkListener>>,
 }
 
@@ -223,6 +232,12 @@ pub struct AgentStatus {
     pub last_active: Fact<Timestamp>,
     pub bytes: Fact<u64>,
     pub model: Fact<String>,
+    pub provider: Fact<String>,
+    /// What a person runs in the sandbox to choose its provider and model,
+    /// when its settings name none: the runtime then picks one on its own,
+    /// and may find none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choose_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

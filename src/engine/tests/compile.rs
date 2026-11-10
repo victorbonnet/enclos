@@ -1,7 +1,10 @@
 //! Compiling a sandbox's active policy into the sandbox's folder.
 
 use super::policy::with_sandbox_on;
+use super::sandbox::{with_backends, without_backend};
 use super::*;
+use crate::lifecycle::marker::spawn_unmarked;
+use crate::probes::OwnProbes as _;
 
 #[test]
 fn the_active_policy_compiles_once_into_the_sandbox_folder() {
@@ -21,6 +24,15 @@ fn the_active_policy_compiles_once_into_the_sandbox_folder() {
             .unwrap(),
     );
     assert_ne!(engine.compile_policy(&name, 41001).unwrap(), file);
+}
+
+#[test]
+fn the_compiled_text_is_shown_without_being_written() {
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let text = engine.compiled_text(&name).unwrap();
+    assert!(text.contains("write {home}"), "{text}");
+    let compiled = engine.layout.sandbox_dir("home").join("compiled");
+    assert!(!compiled.exists());
 }
 
 #[test]
@@ -140,14 +152,7 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
     grant_writes(&engine, &name, r#""~/a", "~/b", "~/a/", "~/later""#);
     let ctx = engine.sandbox_context(&name, 41001);
     let inputs = engine
-        .probe_inputs(
-            &name,
-            &ctx,
-            None,
-            None,
-            Default::default(),
-            Default::default(),
-        )
+        .probe_inputs(&name, &ctx, None, None, Default::default())
         .unwrap();
     let home = ctx.home.canonicalize().unwrap();
     assert_eq!(inputs.home, home);
@@ -155,7 +160,10 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
         inputs.workspaces,
         [user.join("a"), user.join("b"), user.join("later")]
     );
-    let names: Vec<String> = crate::probes::probes(&inputs)
+    let own = crate::backend::seatbelt::probes::SeatbeltProbes::on(
+        crate::backend::seatbelt::Baseline::DenyDefault,
+    );
+    let names: Vec<String> = crate::probes::probes(&inputs, &own)
         .into_iter()
         .filter(|p| p.route == "writable folders")
         .map(|p| p.name)
@@ -170,12 +178,101 @@ fn policy_test_probes_each_workspace_once_and_names_one_not_made_yet() {
             rename(&user.join("b")),
         ]
     );
-    let missing = crate::probes::missing_workspaces(&inputs);
+    let missing = own.folders_not_run(&inputs);
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].name, rename(&user.join("later")));
     assert!(
         matches!(&missing[0].outcome, crate::probes::Outcome::NotRun(why) if why.contains("create it on the host"))
     );
+    // A backend with no such probe has none to call not run, which would
+    // fail its test.
+    let fake = FakeBackend::available(BackendKind::Seatbelt)
+        .own_probes(None)
+        .unwrap();
+    assert!(fake.folders_not_run(&inputs).is_empty());
+}
+
+/// A dry run asks nothing of the host, so a backend this host cannot run
+/// still counts its probes; one not in this build has none to count.
+#[test]
+fn a_policy_test_dry_run_counts_on_an_unavailable_backend_and_needs_it_in_the_build() {
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let unavailable = without_backend(&engine);
+    let Planned::DryRun(plan) = unavailable
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap()
+    else {
+        panic!("a dry run plans");
+    };
+    assert!(
+        plan.changes
+            .iter()
+            .any(|c| c.starts_with("run ") && c.contains(" escape probes in sandbox home ")),
+        "{:?}",
+        plan.changes
+    );
+    let not_in_this_build = with_backends(&engine, Vec::new());
+    let err = not_in_this_build
+        .policy_test(&alice(), &name, false, Confirm::DryRun)
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::BackendUnavailable { reason, .. } if reason.contains("does not include it")),
+        "{err}"
+    );
+}
+
+/// A backend with no probes of its own runs the shared set through its
+/// `wrap`: the fake holds nothing back, so a write and a signal get out
+/// and read open, on what the host sees.
+#[test]
+fn a_fake_backend_s_probes_run_through_the_shared_set() {
+    use crate::backend::{Launch, LaunchLimits};
+    use crate::probes::{Outcome, probes};
+    let (_dir, engine, name) = with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt));
+    let backend = engine.backend_of(&name).unwrap();
+    let own = backend.own_probes(Some("fake policy for home\n")).unwrap();
+    assert_eq!(own.notes().baseline_key, None);
+    assert_eq!(own.notes().comparison, None);
+    // This test's own child, the signal probe's target.
+    let mut target = spawn_unmarked(std::process::Command::new("/bin/sleep").arg("60")).unwrap();
+    let ctx = engine.sandbox_context(&name, 41001);
+    let inputs = engine
+        .probe_inputs(
+            &name,
+            &ctx,
+            Some(target.id()),
+            None,
+            LaunchLimits::default(),
+        )
+        .unwrap();
+    let list = probes(&inputs, own.as_ref());
+    assert!(own.host_services(&inputs).is_empty());
+    for route in ["writes", "signals"] {
+        let probe = list.iter().find(|p| p.route == route).unwrap();
+        let got = crate::engine::probe::run_probe(
+            probe,
+            |script| {
+                let launch = Launch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    env: Vec::new(),
+                    in_terminal: false,
+                    service_port: None,
+                    limits: LaunchLimits::default(),
+                    reads: Vec::new(),
+                };
+                backend
+                    .wrap(std::path::Path::new("unused"), &ctx, &launch)
+                    .unwrap()
+                    .stdin(std::process::Stdio::null())
+                    .output()
+            },
+            &mut target,
+        );
+        assert!(matches!(got, Outcome::Open(_)), "{route}: {got:?}");
+    }
+    let _ = target.kill();
+    let _ = target.wait();
 }
 
 #[test]
@@ -215,6 +312,39 @@ fn the_write_rules_are_checked_again_as_the_paths_are_when_compiled() {
     assert!(err.to_string().contains("through a link"), "{err}");
 }
 
+/// The backend's own places, checked when a policy is stored and each time
+/// it is compiled, through a link as it is then: a workspace that led to a
+/// folder of the user's may lead to `/dev` by the next session.
+#[test]
+fn a_workspace_that_leads_to_the_backends_own_place_is_refused_when_stored_and_compiled() {
+    use crate::policy::own_places::{OwnPlace, OwnPlaces, links};
+    let dev = OwnPlaces(&[OwnPlace {
+        path: "/dev",
+        holds_workspaces: false,
+    }]);
+    let (dir, engine, name) =
+        with_sandbox_on(FakeBackend::available(BackendKind::Seatbelt).with_own_places(dev));
+    let user = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(user.join("work")).unwrap();
+    let alias = user.join("alias");
+    std::os::unix::fs::symlink("work", &alias).unwrap();
+    grant_writes(&engine, &name, "\"~/alias\"");
+    engine.compile_policy(&name, 41001).unwrap();
+
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(links::relative(&user, "/dev"), &alias).unwrap();
+    let err = engine.compile_policy(&name, 41001).unwrap_err();
+    assert!(matches!(err, Error::ActivePolicyInvalid { .. }), "{err}");
+    assert!(err.to_string().contains("host's /dev"), "{err}");
+
+    // Stored again, as any change to the policy stores it.
+    let err = engine
+        .policy_allow(&alice(), &name, "api.example.org", Confirm::Yes)
+        .unwrap_err();
+    assert!(err.to_string().contains("host's /dev"), "{err}");
+    assert_eq!(err.exit_code(), 2);
+}
+
 /// With macOS's own Seatbelt: the sandbox cannot put a link in place of
 /// its home, and when the host does, the policy is not compiled.
 #[cfg(target_os = "macos")]
@@ -246,10 +376,12 @@ fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
         in_terminal: false,
         service_port: None,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let ctx = engine.sandbox_context(&name, 41001);
     let out = Seatbelt::default()
         .wrap(&compiled, &ctx, &launch)
+        .unwrap()
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -266,4 +398,58 @@ fn a_sandbox_cannot_swap_its_home_and_a_swapped_home_is_never_compiled() {
         matches!(&err, Error::HomeNotAFolder { found: HomeFound::Link { to }, .. } if *to == outside),
         "{err}"
     );
+}
+
+/// An engine whose data folder is reached through a link, with one sandbox
+/// on `kind`.
+fn behind_a_link_on(kind: BackendKind) -> (TempDir, Engine, SandboxName, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(base.join("real")).unwrap();
+    std::os::unix::fs::symlink(base.join("real"), base.join("e")).unwrap();
+    let layout = Layout::at(base.join("e"));
+    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let audit = JsonlAuditLog::new(layout.audit_log());
+    let backend = FakeBackend::available(kind);
+    let engine = Engine::new(
+        layout,
+        Box::new(state),
+        Box::new(audit),
+        vec![Box::new(backend)],
+    );
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    let name: SandboxName = "home".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: kind,
+        template: "assistant".parse().unwrap(),
+    };
+    done(engine.create_sandbox(&alice(), spec, Confirm::Yes).unwrap());
+    (dir, engine, name, base.join("real"))
+}
+
+/// The backend kind decides, not the host's system: under one bind of `/`
+/// the real folder shows, so a bubblewrap sandbox's probes read it too.
+#[test]
+fn a_protected_file_behind_a_link_is_probed_at_its_real_path_for_bubblewrap_alone() {
+    for (kind, probed) in [
+        (BackendKind::Bubblewrap, true),
+        (BackendKind::Seatbelt, false),
+    ] {
+        let (_dir, engine, name, real) = behind_a_link_on(kind);
+        let ctx = engine.sandbox_context(&name, 41001);
+        let inputs = engine
+            .probe_inputs(&name, &ctx, None, None, Default::default())
+            .unwrap();
+        let hidden = engine.layout.hidden_files();
+        assert_eq!(&inputs.hidden_files[..hidden.len()], hidden, "{kind:?}");
+        assert!(
+            inputs.hidden_files.contains(&real.join("state.db")) == probed,
+            "{kind:?}"
+        );
+        assert!(
+            inputs.hidden_files.contains(&real.join("run")) == probed,
+            "{kind:?}"
+        );
+    }
 }

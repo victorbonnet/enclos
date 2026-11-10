@@ -6,8 +6,8 @@
 //! (ADR 0027 proposes refusing it instead).
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,9 +15,11 @@ use std::time::{Duration, Instant};
 use super::Proxy;
 use super::decide::{Destination, allowed, validated};
 use super::request::{Request, origin_head, parse, read_head};
+use super::stream::{Listener, Stream};
 use super::tunnel::{NameCheck, relay};
 use crate::model::net::{NetEvent, Reason, Verdict, destination};
 use crate::model::now;
+use crate::net::budget::Slot;
 
 /// How long a client has to send its whole request head.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -72,15 +74,15 @@ impl Proxy {
     /// the process ends. Returns only if one of them stopped accepting, or
     /// an accept thread could not start: an error, so the service manager
     /// starts the proxy again.
-    pub fn serve_all(self: &Arc<Self>, listeners: Vec<TcpListener>) -> io::Error {
+    pub fn serve_all(self: &Arc<Self>, listeners: Vec<Listener>) -> io::Error {
         let proxy = Arc::clone(self);
         until_one_ends(listeners, move |listener| proxy.accept(listener))
     }
 
     /// Accepts connections on `listener`, each on its own thread.
-    fn accept(self: &Arc<Self>, listener: TcpListener) {
-        for client in listener.incoming() {
-            let Ok(mut client) = client else {
+    fn accept(self: &Arc<Self>, listener: Listener) {
+        loop {
+            let Ok(mut client) = listener.accept() else {
                 thread::sleep(ACCEPT_BACKOFF);
                 continue;
             };
@@ -99,7 +101,7 @@ impl Proxy {
         }
     }
 
-    fn handle(&self, mut client: TcpStream) {
+    fn handle(&self, mut client: Stream) {
         let started = Instant::now();
         let mut event = NetEvent {
             at: now(),
@@ -183,9 +185,9 @@ impl Proxy {
     /// the head.
     fn open(
         &self,
-        client: &TcpStream,
+        client: &Stream,
         event: &mut NetEvent,
-    ) -> Result<(TcpStream, Request, Vec<u8>), Reason> {
+    ) -> Result<(Stream, Request, Vec<u8>), Reason> {
         let mut slow = Until {
             stream: client,
             deadline: Instant::now() + HEAD_TIMEOUT,
@@ -310,7 +312,7 @@ impl Proxy {
         port: u16,
         deadline: Instant,
         event: &mut NetEvent,
-    ) -> Result<TcpStream, Reason> {
+    ) -> Result<Stream, Reason> {
         let order = interleaved(addrs);
         for (i, ip) in order.iter().enumerate() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -322,7 +324,7 @@ impl Proxy {
             let addr = SocketAddr::new(*ip, port);
             if let Ok(stream) = TcpStream::connect_timeout(&addr, budget) {
                 event.address = Some(ip.to_string());
-                return Ok(stream);
+                return Ok(stream.into());
             }
         }
         Err(Reason::ConnectFailed)
@@ -367,29 +369,9 @@ enum LookupFailed {
     Lost,
 }
 
-/// A place among the connections, or the lookups, the proxy runs at once;
-/// it frees when dropped, as the connection or lookup ends.
-struct Slot(Arc<AtomicUsize>);
-
-impl Slot {
-    fn take(open: &Arc<AtomicUsize>, max: usize) -> Option<Slot> {
-        open.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n < max).then_some(n + 1)
-        })
-        .ok()?;
-        Some(Slot(Arc::clone(open)))
-    }
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// Reads from a client until a deadline, however slowly it sends.
 pub(super) struct Until<'a> {
-    pub(super) stream: &'a TcpStream,
+    pub(super) stream: &'a Stream,
     pub(super) deadline: Instant,
 }
 
@@ -399,7 +381,13 @@ impl Read for Until<'_> {
         if left.is_zero() {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        self.stream.set_read_timeout(Some(left))?;
+        // A Unix peer gone already refuses it on macOS, and what it sent
+        // is still there to read.
+        if let Err(e) = self.stream.set_read_timeout(Some(left))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
+            return Err(e);
+        }
         let mut stream = self.stream;
         stream.read(buf)
     }
@@ -428,16 +416,20 @@ pub(super) fn interleaved(addrs: &[IpAddr]) -> Vec<IpAddr> {
 /// `event` the bytes moved, the reason `idle` when the proxy closed it for
 /// that, and what the check made of it.
 fn forward(
-    client: &TcpStream,
-    upstream: &TcpStream,
+    client: &Stream,
+    upstream: &Stream,
     request: Request,
     early: &[u8],
     limit: Duration,
     event: &mut NetEvent,
 ) {
     // A peer that stops reading holds up a write no longer than the limit.
+    // One gone already, which refuses this as a Unix socket on macOS, holds
+    // up nothing.
     for stream in [client, upstream] {
-        if let Err(e) = stream.set_write_timeout(Some(limit)) {
+        if let Err(e) = stream.set_write_timeout(Some(limit))
+            && e.kind() != io::ErrorKind::InvalidInput
+        {
             eprintln!(
                 "enclos proxy: cannot set a timeout on a connection to {}: {e}",
                 event.host
@@ -549,7 +541,7 @@ fn forward(
     }
 }
 
-fn refuse(client: &mut TcpStream, event: &NetEvent, reason: Reason) -> io::Result<()> {
+fn refuse(client: &mut Stream, event: &NetEvent, reason: Reason) -> io::Result<()> {
     let dest = destination(&event.host, event.port);
     let (status, body) = match (event.verdict, reason) {
         (Verdict::Allowed, _) => (

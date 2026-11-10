@@ -1,0 +1,688 @@
+//! A session's cgroup (design §8). Tests named `on_a_runner` start real
+//! scopes in the user's systemd manager, so only CI's `cgroups` job runs
+//! them; the others read a stand-in for the cgroup hierarchy or a stub
+//! `systemd-run`, and run anywhere.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::*;
+use crate::lifecycle::cgroup::{Hierarchy, SYSTEMD_RUN, Scopes, Systemd};
+use crate::lifecycle::marker::spawn_unmarked;
+use crate::lifecycle::process::{Signal, is_same, reference, signal_process};
+use crate::model::sandbox::SandboxState;
+use crate::model::session::{ProcessRef, SessionKind, SessionRecord};
+
+#[test]
+fn what_a_sessions_cgroup_holds_is_listed_whatever_its_group_and_parent() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let root_ended = spawn_unmarked(Command::new("/bin/sh").args(["-c", ":"]));
+    let mut root_ended = root_ended.unwrap();
+    let root = crate::lifecycle::process::reference_of_child(&root_ended).unwrap();
+    root_ended.wait().unwrap();
+    // Started apart: only the cgroup ties it to the session.
+    let mut member = spawn_unmarked(Command::new("/bin/sleep").arg("30")).unwrap();
+    let hierarchy = tempfile::tempdir().unwrap();
+    let scope = hierarchy.path().join("s.scope");
+    std::fs::create_dir(&scope).unwrap();
+    std::fs::write(scope.join("cgroup.procs"), format!("{}\n", member.id())).unwrap();
+    lab.engine.scopes = Some(in_stand_in(hierarchy.path()));
+    let session = SessionRecord {
+        id: crate::model::session::SessionId(0),
+        sandbox: lab.name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: lab.engine.active_policy(&lab.name).unwrap().1.id,
+        compiled: None,
+        root,
+        pgid: None,
+        cgroup: Some("/s.scope".parse().unwrap()),
+        tracked: Vec::new(),
+        started_at: crate::model::now(),
+        ended_at: None,
+    };
+    lab.engine
+        .write(
+            &alice(),
+            "test",
+            None,
+            |_| String::new(),
+            |lock| Ok(lab.engine.state.put_session(lock, &session).map(|_| ())?),
+        )
+        .unwrap();
+
+    let view = lab.engine.show_sandbox(&lab.name).unwrap();
+    let pids: Vec<u32> = view.sessions[0].members.iter().map(|m| m.pid).collect();
+    assert_eq!(pids, [member.id()]);
+
+    // Once the cgroup is gone, so is the session.
+    std::fs::remove_dir_all(&scope).unwrap();
+    let view = lab.engine.show_sandbox(&lab.name).unwrap();
+    assert!(view.sessions[0].gone(), "{:?}", view.sessions[0]);
+    member.kill().unwrap();
+    member.wait().unwrap();
+}
+
+/// Scopes whose cgroups are read in the stand-in hierarchy at `root`; no
+/// test using them starts a session, so `systemd-run` never runs.
+fn in_stand_in(root: &Path) -> Scopes {
+    Scopes::at(Path::new(SYSTEMD_RUN), Hierarchy::at(root))
+}
+
+/// A stop reads the cgroup where the engine's look does: a pid there that
+/// `ps` does not list is reported, and the kill reaches that cgroup.
+#[test]
+fn a_stop_reads_and_kills_the_cgroup_the_engine_looks_at() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let mut ended = spawn_unmarked(Command::new("/bin/sh").args(["-c", ":"])).unwrap();
+    let root = crate::lifecycle::process::reference_of_child(&ended).unwrap();
+    ended.wait().unwrap();
+    // A pid `ps` cannot list: the stand-in holds it for ever.
+    let unlisted = u32::MAX - 1;
+    let hierarchy = tempfile::tempdir().unwrap();
+    let scope = hierarchy.path().join("s.scope");
+    std::fs::create_dir(&scope).unwrap();
+    std::fs::write(scope.join("cgroup.procs"), format!("{unlisted}\n")).unwrap();
+    lab.engine.scopes = Some(in_stand_in(hierarchy.path()));
+    let session = SessionRecord {
+        id: crate::model::session::SessionId(0),
+        sandbox: lab.name.clone(),
+        kind: SessionKind::Exec,
+        service: None,
+        version: 1,
+        snapshot: lab.engine.active_policy(&lab.name).unwrap().1.id,
+        compiled: None,
+        root,
+        pgid: None,
+        cgroup: Some("/s.scope".parse().unwrap()),
+        tracked: Vec::new(),
+        started_at: crate::model::now(),
+        ended_at: None,
+    };
+
+    let stopped = lab
+        .engine
+        .stop_marked(
+            &session,
+            Duration::from_millis(100),
+            crate::lifecycle::stop::stop,
+        )
+        .unwrap();
+    let crate::lifecycle::stop::Stopped::Survivors(left) = stopped else {
+        panic!("{stopped:?}");
+    };
+    assert_eq!(left[0].member.pid, unlisted);
+    assert_eq!(left[0].why, crate::lifecycle::stop::Why::NotListed);
+    let asked = std::fs::read_to_string(scope.join("cgroup.kill"));
+    assert_eq!(asked.unwrap(), "1");
+}
+
+/// A `systemd-run` that prints `first line` for `--version`, and that nothing
+/// reaches a manager through.
+fn systemd_run_printing(first_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("systemd-run");
+    crate::test_scripts::write_script(&path, &format!("echo '{first_line}'"));
+    (dir, path)
+}
+
+/// `exec` on a host with this `systemd-run` fails with what it says, and no
+/// program starts and no session is recorded.
+fn refused_exec(first_line: &str) -> String {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let (_dir, stub) = systemd_run_printing(first_line);
+    lab.engine.scopes = Some(Scopes::at(&stub, Hierarchy::host()));
+    let ran = lab.home.join("ran");
+    let script = format!("/usr/bin/touch {}", ran.display());
+    let err = lab
+        .engine
+        .exec(
+            &alice(),
+            &lab.name,
+            vec!["/bin/sh".into(), "-c".into(), script.into()],
+            Confirm::Yes,
+        )
+        .unwrap_err();
+    assert!(!ran.exists(), "the program ran");
+    assert!(
+        lab.engine
+            .state
+            .sessions(&lab.name, false)
+            .unwrap()
+            .is_empty()
+    );
+    err.to_string()
+}
+
+#[test]
+fn a_systemd_too_old_refuses_a_session_before_its_program_starts() {
+    let why = refused_exec("systemd 252 (252.39-1~deb12u2)");
+    assert!(
+        why.contains("enclos needs systemd 254 or later; this host has 252."),
+        "{why}"
+    );
+    assert!(why.contains("Debian 13 or Ubuntu 24.04 work."), "{why}");
+}
+
+#[test]
+fn a_systemd_version_that_cannot_be_read_refuses_a_session_and_says_so() {
+    let why = refused_exec("nonsense");
+    assert!(why.contains("cannot tell which this host has"), "{why}");
+    assert!(why.contains("nonsense"), "{why}");
+}
+
+#[test]
+fn doctor_fails_on_a_systemd_too_old_and_only_where_sessions_run_in_scopes() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut lab = Lab::new();
+    let (_dir, stub) = systemd_run_printing("systemd 252 (252.39-1~deb12u2)");
+    assert_eq!(lab.engine.doctor().systemd, None);
+    lab.engine.scopes = Some(Scopes::at(&stub, Hierarchy::host()));
+    let doctor = lab.engine.doctor();
+    assert_eq!(doctor.systemd, Some(Systemd::TooOld(252)));
+    assert!(doctor.has_problems());
+}
+
+/// Whether to run the tests below, which start scopes in the user's systemd
+/// manager, so only in CI's `cgroups` job: it sets `ENCLOS_CGROUP_TESTS`, and
+/// they refuse anywhere else.
+fn on_a_runner() -> bool {
+    if std::env::var("ENCLOS_CGROUP_TESTS").as_deref() != Ok("1") {
+        eprintln!("cgroup tests not run: CI's cgroups job runs them");
+        return false;
+    }
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    assert!(
+        var("GITHUB_ACTIONS") == "true" && var("RUNNER_ENVIRONMENT") == "github-hosted",
+        "these tests start scopes in the user's manager: they run only on a GitHub-hosted runner"
+    );
+    true
+}
+
+fn lab_with_scopes() -> Lab {
+    let mut lab = Lab::new();
+    lab.engine.scopes = Some(Scopes::host());
+    lab
+}
+
+/// A program that detaches a process and exits once that process wrote its
+/// pid to `~/detached`: a double fork with `setsid`, then `more` Python
+/// statements, then a long sleep.
+fn detaching(more: &str) -> Vec<std::ffi::OsString> {
+    let script = format!(
+        "import os, signal, time
+path = os.environ['HOME'] + '/detached'
+if os.fork():
+    while not os.path.exists(path):
+        time.sleep(0.02)
+    os._exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+partial = path + '.partial'
+with open(partial, 'w') as f:
+    f.write(str(os.getpid()))
+os.rename(partial, path)
+{more}
+time.sleep(600)
+"
+    );
+    vec!["/usr/bin/python3".into(), "-c".into(), script.into()]
+}
+
+fn read_when_there(file: &Path) -> String {
+    let start = Instant::now();
+    while !file.exists() {
+        assert!(start.elapsed() < Duration::from_secs(30), "{file:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::read_to_string(file).unwrap()
+}
+
+/// `process` must not outlive a test that failed.
+struct Ended(ProcessRef);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        // The test's own process, checked by pid and start time.
+        let _ = signal_process(&self.0, Signal::Kill);
+    }
+}
+
+fn open_sessions(lab: &Lab) -> Vec<SessionRecord> {
+    let open = lab.engine.state.sessions(&lab.name, true).unwrap();
+    open.into_iter()
+        .filter(|s| s.kind == SessionKind::Exec)
+        .collect()
+}
+
+fn open_exec_session(lab: &Lab) -> SessionRecord {
+    open_sessions(lab).remove(0)
+}
+
+/// Runs `program`, and gives what it detached.
+fn detached_by(lab: &Lab, program: Vec<std::ffi::OsString>) -> ProcessRef {
+    done(
+        lab.engine
+            .exec(&alice(), &lab.name, program, Confirm::Yes)
+            .unwrap(),
+    );
+    let pid: u32 = read_when_there(&lab.home.join("detached"))
+        .trim()
+        .parse()
+        .unwrap();
+    reference(pid).unwrap().expect("the detached process runs")
+}
+
+/// Runs `program`, whose detached process is listed as a member of its
+/// session's cgroup, and is ended by `sandbox stop`, which leaves the sandbox
+/// stopped and the cgroup removed. Gives the descriptors it held.
+fn listed_and_stopped(lab: &Lab, program: Vec<std::ffi::OsString>) -> Vec<String> {
+    let detached = detached_by(lab, program);
+    let _ended = Ended(detached.clone());
+    let descriptors = std::fs::read_dir(format!("/proc/{}/fd", detached.pid))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    is_listed_then_stopped(lab, &detached);
+    descriptors
+}
+
+/// `detached` is listed as a member of the open session's cgroup, and is
+/// ended by `sandbox stop`, which leaves the sandbox stopped and the cgroup
+/// removed.
+fn is_listed_then_stopped(lab: &Lab, detached: &ProcessRef) {
+    let pid = detached.pid;
+    let session = open_exec_session(lab);
+    let cgroup = session.cgroup.clone().expect("the session has a cgroup");
+    let held = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert_eq!(held.trim(), format!("0::{cgroup}"));
+    let view = lab.engine.show_sandbox(&lab.name).unwrap();
+    assert!(
+        view.sessions
+            .iter()
+            .any(|v| v.session.id == session.id && v.members.iter().any(|m| m.pid == pid)),
+        "{:?}",
+        view.sessions
+    );
+
+    let report = done(
+        lab.engine
+            .stop_sandbox(&alice(), &lab.name, Confirm::Yes)
+            .unwrap(),
+    );
+    assert!(report.survivors.is_empty(), "{:?}", report.survivors);
+    assert!(!is_same(detached).unwrap(), "it survived the stop");
+    let record = lab.engine.state.get(&lab.name).unwrap().unwrap();
+    assert_eq!(record.state, SandboxState::Stopped);
+
+    let folder = format!("/sys/fs/cgroup{cgroup}");
+    let start = Instant::now();
+    while Path::new(&folder).exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{folder}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A start that fails once the program detached a process: nothing but the
+/// cgroup still ties that process to the start, and the kill of the program
+/// alone leaves it running.
+#[test]
+fn on_a_runner_a_failed_start_ends_what_the_program_forked() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let command = detaching("pass");
+    let starting = crate::engine::start::Starting::Command {
+        kind: crate::engine::start::CommandKind::Exec,
+        group: crate::engine::start::Group::Own,
+        reads: &[],
+    };
+    let detached = std::cell::OnceCell::new();
+    let failed = lab.engine.write(
+        &alice(),
+        "test",
+        None,
+        |_| String::new(),
+        |lock| {
+            lab.engine
+                .start_session(lock, &lab.name, &command, starting, || {
+                    let pid = read_when_there(&lab.home.join("detached"));
+                    let pid = pid.trim().parse().unwrap();
+                    let process = reference(pid).unwrap().expect("the detached process runs");
+                    detached.set(Ended(process)).ok();
+                    Err::<(), _>(Error::Session {
+                        what: "the start failed".into(),
+                    })
+                })
+                .map(|_| ())
+        },
+    );
+    assert!(failed.is_err());
+    let detached = detached.get().expect("the program detached a process");
+    assert!(
+        !is_same(&detached.0).unwrap(),
+        "it survived the failed start"
+    );
+    assert!(open_sessions(&lab).is_empty());
+}
+
+#[test]
+fn on_a_runner_a_double_fork_with_setsid_is_a_member_and_is_stopped() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    listed_and_stopped(&lab, detaching("pass"));
+}
+
+#[test]
+fn on_a_runner_one_that_also_closes_every_descriptor_is_a_member_and_is_stopped() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let descriptors = listed_and_stopped(&lab, detaching("os.closerange(0, 1 << 16)"));
+    assert!(descriptors.is_empty(), "{descriptors:?}");
+}
+
+#[test]
+fn on_a_runner_one_that_ignores_term_is_killed_through_the_cgroup() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    listed_and_stopped(
+        &lab,
+        detaching("signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
+    );
+}
+
+/// No signal is sent: the write to `cgroup.kill` alone empties the cgroup.
+#[test]
+fn on_a_runner_a_write_to_cgroup_kill_ends_what_ignores_term() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(
+        &lab,
+        detaching("signal.signal(signal.SIGTERM, signal.SIG_IGN)"),
+    );
+    let _ended = Ended(detached.clone());
+    let cgroup = open_exec_session(&lab).cgroup.expect("it has a cgroup");
+    let host = Hierarchy::host();
+    assert!(host.pids(&cgroup).unwrap().contains(&detached.pid));
+    host.kill(&cgroup).expect("cgroup.kill can be written");
+    let start = Instant::now();
+    while !host.pids(&cgroup).unwrap().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(10), "{cgroup}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!is_same(&detached).unwrap(), "it survived the kill");
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+}
+
+/// Its main thread is gone, so `ps` writes `Zl`; a worker thread runs on, and
+/// it ignores TERM, so only the kill ends it.
+#[test]
+fn on_a_runner_one_whose_main_thread_exited_is_listed_and_stopped() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(
+        &lab,
+        detaching(
+            "import ctypes, threading
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+threading.Thread(target=time.sleep, args=(600,)).start()
+ctypes.CDLL(None).pthread_exit(None)",
+        ),
+    );
+    let _ended = Ended(detached.clone());
+    let stat = format!("/proc/{}/stat", detached.pid);
+    let start = Instant::now();
+    while !std::fs::read_to_string(&stat).unwrap().contains(") Z ") {
+        assert!(start.elapsed() < Duration::from_secs(10), "{stat}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(is_same(&detached).unwrap(), "it reads as ended");
+    is_listed_then_stopped(&lab, &detached);
+}
+
+#[test]
+fn on_a_runner_a_program_keeps_its_exit_status_and_gets_no_way_to_the_manager() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let script = "/usr/bin/env > \"$HOME/seen\"; exit 7";
+    let end = done(
+        lab.engine
+            .exec(
+                &alice(),
+                &lab.name,
+                vec!["/bin/sh".into(), "-c".into(), script.into()],
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(end.exit, 7);
+    assert_eq!(end.left, crate::engine::Left::Nothing);
+    let seen = std::fs::read_to_string(lab.home.join("seen")).unwrap();
+    for variable in [
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "INVOCATION_ID",
+    ] {
+        assert!(!seen.contains(variable), "{seen}");
+    }
+    assert!(seen.contains("HOME="), "{seen}");
+}
+
+/// systemd 258 and later expand a scope's command line unless told not to, so
+/// these would reach the program as an empty word and a pid.
+#[test]
+fn on_a_runner_a_programs_arguments_reach_it_with_their_dollars() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let seen = lab.home.join("seen");
+    let script = format!("printf '%s\\n' \"$1\" \"$2\" > {}", seen.display());
+    let end = done(
+        lab.engine
+            .exec(
+                &alice(),
+                &lab.name,
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    script.into(),
+                    "sh".into(),
+                    "${HOME}".into(),
+                    "$$".into(),
+                ],
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    assert_eq!(end.exit, 0);
+    assert_eq!(std::fs::read_to_string(seen).unwrap(), "${HOME}\n$$\n");
+}
+
+/// While a detached process keeps the scope alive, the manager holds the
+/// fixed text and no word of the command line.
+#[test]
+fn on_a_runner_the_manager_is_told_no_command_line() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let detached = detached_by(&lab, detaching("pass"));
+    let _ended = Ended(detached);
+    let cgroup = open_exec_session(&lab).cgroup.expect("it has a cgroup");
+    let unit = cgroup.unit().to_owned();
+    let shown = Command::new("/usr/bin/systemctl")
+        .args(["--user", "show", "--property=Description", &unit])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        "Description=enclos session\n"
+    );
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+}
+
+#[test]
+fn on_a_runner_a_sandbox_with_a_hyphen_has_a_slice_of_its_own_with_no_parent() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    let name: SandboxName = "pi-bot".parse().unwrap();
+    let spec = crate::engine::SandboxSpec {
+        name: name.clone(),
+        backend: BackendKind::Seatbelt,
+        template: "assistant".parse().unwrap(),
+    };
+    done(
+        lab.engine
+            .create_sandbox(&alice(), spec, Confirm::Yes)
+            .unwrap(),
+    );
+    let home = lab.engine.layout.sandbox_home("pi-bot");
+    let script = format!("/bin/cat /proc/self/cgroup > {}/seen", home.display());
+    done(
+        lab.engine
+            .exec(
+                &alice(),
+                &name,
+                vec!["/bin/sh".into(), "-c".into(), script.into()],
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let install = lab.engine.layout.install_id().unwrap();
+    let seen = std::fs::read_to_string(home.join("seen")).unwrap();
+    let slice = format!("user@{}.service", rustix::process::getuid().as_raw());
+    let slice = format!("/{slice}/enclos.{install}.pi\\x2dbot.slice/");
+    let stopped = lab.engine.stop_sandbox(&alice(), &name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+    assert!(seen.contains(&slice), "{seen}");
+}
+
+#[test]
+fn on_a_runner_a_service_runs_in_a_scope_of_its_own() {
+    if !on_a_runner() {
+        return;
+    }
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    assert!(done(lab.install(GATEWAY, Confirm::Yes).unwrap()).installed);
+    let ended = Arc::new(AtomicBool::new(false));
+    let teller = end_once_started(lab.home.join("gateway-pids"), Arc::clone(&ended), || {});
+    lab.engine
+        .launch_until(&alice(), &lab.name, "gateway", &ended)
+        .unwrap();
+    teller.join().unwrap();
+    let sessions = lab.engine.state.sessions(&lab.name, false).unwrap();
+    let service = sessions.iter().find(|s| s.kind == SessionKind::Service);
+    let cgroup = service.and_then(|s| s.cgroup.clone());
+    assert!(
+        cgroup.is_some_and(|c| c.as_str().ends_with(".scope")),
+        "{sessions:?}"
+    );
+}
+
+#[test]
+fn on_a_runner_nothing_stays_in_a_slice_after_its_session() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    listed_and_stopped(&lab, detaching("pass"));
+    let install = lab.engine.layout.install_id().unwrap();
+    let units = Command::new("/usr/bin/systemctl")
+        .args(["--user", "list-units", "--all", "--plain", "--no-legend"])
+        .arg(format!("enclos.{install}.*.scope"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(units.status.success(), "{units:?}");
+    let listed = String::from_utf8_lossy(&units.stdout);
+    assert!(listed.trim().is_empty(), "{listed}");
+}
+
+/// A sandbox removed leaves no slice: systemd keeps one active once a scope
+/// ran in it, with the limits its sessions set on it for this boot, until
+/// `sandbox rm` stops it and drops them.
+#[test]
+fn on_a_runner_a_sandbox_removed_leaves_no_slice() {
+    if !on_a_runner() {
+        return;
+    }
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab_with_scopes();
+    done(
+        lab.engine
+            .exec(&alice(), &lab.name, vec!["/bin/true".into()], Confirm::Yes)
+            .unwrap(),
+    );
+    let install = lab.engine.layout.install_id().unwrap();
+    let slice = crate::lifecycle::cgroup::slice_name(&install, lab.name.as_str());
+    let show = || {
+        let out = Command::new("/usr/bin/systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=ActiveState",
+                "--property=DropInPaths",
+            ])
+            .arg(&slice)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // The control: the session left it active, with its limits.
+    let before = show();
+    assert!(before.contains("ActiveState=active"), "{before}");
+    assert!(!before.contains("DropInPaths=\n"), "{before}");
+    let stopped = lab.engine.stop_sandbox(&alice(), &lab.name, Confirm::Yes);
+    assert!(done(stopped.unwrap()).survivors.is_empty());
+    done(
+        lab.engine
+            .remove_sandbox(&alice(), &lab.name, false, Confirm::Yes)
+            .unwrap(),
+    );
+    let after = show();
+    assert!(after.contains("ActiveState=inactive"), "{after}");
+    assert!(after.contains("DropInPaths=\n"), "{after}");
+}

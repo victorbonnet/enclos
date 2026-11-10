@@ -5,16 +5,21 @@
 //! service told to end needs, and is audited before and after instead
 //! (`remove_services`).
 
+mod agent_rm;
 mod agents;
 mod compile;
 mod configure;
+mod dashboard;
 mod doctor;
 mod history;
+mod holder;
 mod import;
 mod launch;
 mod listener;
+mod loopback;
 mod markers;
 mod net;
+mod pause;
 mod pending;
 mod policy;
 mod probe;
@@ -32,9 +37,12 @@ mod state_check;
 mod status;
 #[cfg(test)]
 mod tests;
+mod unenforced;
 
-pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff, AgentRemoved, FilesKept};
+pub use agent_rm::{AgentRemoved, FilesKept, Leftover};
+pub use agents::{Added, AgentAdded, AgentCheck, AgentDiff};
 pub use configure::{ChannelRequest, ChannelSet, Configured, Setting};
+pub use dashboard::{DashboardEnd, DashboardOpen};
 pub use doctor::{
     BackendCheck, BackendState, Doctor, Drift, DriftKind, LineChange, Lines, MAX_LINES,
     NextSession, RanFile, Running, SandboxCheck, Sandboxes, Written,
@@ -48,7 +56,7 @@ pub use probe::TestReport;
 pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
-pub use service::{PROXY_WAIT, Unit};
+pub use service::{PROXY_WAIT, SandboxStarted, Unit};
 pub use session::{Left, SessionEnd};
 pub use settings_secrets::{Held, SettingsFinding};
 #[cfg(all(test, target_os = "macos"))]
@@ -69,7 +77,8 @@ use crate::audit::jsonl::JsonlAuditLog;
 use crate::backend::{self, Backend, Probe};
 use crate::config;
 use crate::error::{Error, Result};
-use crate::layout::Layout;
+use crate::layout::{Layout, Os};
+use crate::lifecycle::cgroup::{Hierarchy, Scopes};
 use crate::lifecycle::process::PsError;
 use crate::lifecycle::stop::Stopped;
 use crate::model::audit::{Actor, AuditEntry, AuditFilter, Intent, Outcome, Since, VerifyReport};
@@ -90,7 +99,7 @@ pub struct Engine {
     exe: Option<std::path::PathBuf>,
     services: Box<dyn crate::service::ServiceManager>,
     /// Where secrets' values are kept (ADR 0022).
-    secrets: Box<dyn crate::secrets::SecretStore>,
+    secrets: Box<dyn crate::secrets::Stores>,
     /// How an installer reaches the host.
     downloader: Box<dyn Downloader>,
     /// How a session's members are stopped when `enclos launch` is told to
@@ -98,11 +107,19 @@ pub struct Engine {
     /// replaces: `lifecycle::stop::stop`, unless a test stands in one that
     /// leaves them running.
     stop_members: StopMembers,
+    /// How a session's program runs in a scope of its own, with a cgroup
+    /// (design §8): set on Linux; none on macOS and in tests, so they never
+    /// reach the host's systemd.
+    scopes: Option<Scopes>,
+    /// The fields this command accepts running not enforced where the host
+    /// does not enforce them (`--accept-unenforced`, ADR 0038).
+    accepting: Vec<crate::model::unenforced::UnenforcedField>,
 }
 
-/// Stops a session's members within a grace period, as
-/// `lifecycle::stop::stop` does.
-type StopMembers = fn(&SessionRecord, Duration) -> std::result::Result<Stopped, PsError>;
+/// Stops a session's members within a grace period, reading its cgroup in
+/// the hierarchy given, as `lifecycle::stop::stop` does.
+type StopMembers =
+    fn(&Hierarchy, &SessionRecord, Duration) -> std::result::Result<Stopped, PsError>;
 
 /// What `enclos init` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,9 +186,9 @@ impl Engine {
     pub fn open(layout: Layout) -> Engine {
         let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
         let audit = JsonlAuditLog::new(layout.audit_log());
-        let services = crate::service::host(layout.user_home());
-        let secrets: Box<dyn crate::secrets::SecretStore> = match layout.install_id() {
-            Ok(install) => crate::secrets::host(format!("enclos.{install}")),
+        let services = crate::service::host(&layout);
+        let secrets: Box<dyn crate::secrets::Stores> = match layout.install_id() {
+            Ok(install) => crate::secrets::host(format!("enclos.{install}"), layout.secrets_file()),
             Err(e) => Box::new(crate::secrets::Unavailable {
                 why: format!("enclos cannot tell this install apart from others: {e}"),
             }),
@@ -184,6 +201,7 @@ impl Engine {
         )
         .with_services(services)
         .with_secrets(secrets)
+        .with_scopes((Os::current() == Os::Linux).then(Scopes::host))
     }
 
     pub fn new(
@@ -203,14 +221,32 @@ impl Engine {
             }),
             stop_members: crate::lifecycle::stop::stop,
             downloader: Box::new(Curl),
+            scopes: None,
+            accepting: Vec::new(),
             secrets: Box::new(crate::secrets::Unavailable {
                 why: "this engine has no secret store".to_owned(),
             }),
         }
     }
 
+    /// The same engine, running each session's program in a scope as
+    /// `scopes` says, or in none.
+    pub fn with_scopes(mut self, scopes: Option<Scopes>) -> Engine {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Where a session's cgroup is read: the scopes' hierarchy, or the
+    /// host's for an engine with no scopes, whose sessions record none.
+    fn cgroups(&self) -> std::borrow::Cow<'_, Hierarchy> {
+        match &self.scopes {
+            Some(scopes) => std::borrow::Cow::Borrowed(scopes.hierarchy()),
+            None => std::borrow::Cow::Owned(Hierarchy::host()),
+        }
+    }
+
     /// The same engine with another secret store.
-    pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::SecretStore>) -> Engine {
+    pub fn with_secrets(mut self, secrets: Box<dyn crate::secrets::Stores>) -> Engine {
         self.secrets = secrets;
         self
     }
@@ -309,7 +345,7 @@ impl Engine {
 
     /// The program started as the sandbox's proxy, for tests that stand one
     /// in.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn with_exe(mut self, exe: PathBuf) -> Engine {
         self.exe = Some(exe);
         self
@@ -317,7 +353,7 @@ impl Engine {
 
     /// The same engine stopping a session's members with `stop`, for tests
     /// of members that outlive being stopped.
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     pub(crate) fn with_stop_members(mut self, stop: StopMembers) -> Engine {
         self.stop_members = stop;
         self

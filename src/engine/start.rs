@@ -1,33 +1,44 @@
 //! Starting a recorded session (design §8 steps 2-5): one way, for
-//! `connect`, `exec`, the installers and agent commands, and `enclos
-//! launch`. What differs between them is [`Starting`] and what they do
+//! `connect`, `exec`, the installers and agent commands, `enclos
+//! dashboard` and `enclos launch`. What differs between them is [`Starting`] and what they do
 //! once the program runs and before it is recorded.
 //!
-//! The order is load-bearing. The program does not start until the policy
-//! compiles and the secrets are read; the proxy a command needs starts
-//! between the two, and stays if a later step fails. The program starts
-//! holding a marker, which is named after it before the session is
-//! recorded, so that a session started here has its marker. A failure
-//! before the session is recorded kills the program, so that no session
-//! stays open for a program that is ended; a kill that fails is reported.
-//! Only the program is killed, not what it started meanwhile.
+//! The order is load-bearing. On a host whose systemd is too old for a
+//! scope nothing starts, so the check comes first. The program does not
+//! start until the policy compiles and the secrets are read; the proxy a
+//! command needs starts between the two, and stays if a later step fails.
+//! The program starts holding a marker, which is named after it before the
+//! session is recorded, so that a session started here has its marker. A
+//! failure before the session is recorded kills the program, so that no
+//! session stays open for a program that is ended; a kill that fails is
+//! reported. In a scope (design §8) its cgroup is ended too, with what the
+//! program started meanwhile; with none, only the program is killed.
 
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::Child;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use super::Engine;
 use super::proxy::abandon;
-use crate::backend::Launch;
+use crate::backend::{Launch, LaunchLimits};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
-use crate::lifecycle::process::reference_of_child;
+use crate::lifecycle::cgroup::{Scope, Scopes, no_systemd_run};
+use crate::lifecycle::process::{PsError, reference_of_child};
+use crate::lifecycle::slice::SliceLimits;
+use crate::model::limits::CpuShare;
 use crate::model::now;
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{SessionId, SessionKind, SessionRecord};
 use crate::state::StateLock;
+
+/// How long what a failed start, or a probe, left in its cgroup has to die
+/// of the kill.
+pub(super) const SCOPE_END_WAIT: Duration = Duration::from_secs(5);
 
 /// Which process group a session's program starts in (design §8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +103,17 @@ impl From<CommandKind> for SessionKind {
 pub(super) enum Starting<'a> {
     /// A command run from the CLI: it starts the sandbox's proxy if need be,
     /// reaches the runtime's service, and gets the sandbox's secrets as
-    /// variables.
-    Command { kind: CommandKind, group: Group },
+    /// variables. It reads the files of the sandbox's `installers/` folder
+    /// in `reads`, which enclos staged for it.
+    Command {
+        kind: CommandKind,
+        group: Group,
+        reads: &'a [PathBuf],
+    },
+    /// The runtime's dashboard, for `enclos dashboard` (ADR 0040): as an
+    /// exec session, but in a group of its own and in no terminal, with no
+    /// input and its output appended to `log`.
+    Dashboard { log: &'a Path },
     /// A service of the sandbox's runtime, for the service manager. Its
     /// proxy already runs, and its secrets are as `service_secrets` says.
     Service { service: &'a str },
@@ -107,17 +127,33 @@ impl Starting<'_> {
         matches!(self, Starting::Command { .. })
     }
 
+    /// The staged files the program reads.
+    fn reads(self) -> Vec<PathBuf> {
+        match self {
+            Starting::Command { reads, .. } => reads.to_vec(),
+            Starting::Dashboard { .. } | Starting::Service { .. } => Vec::new(),
+        }
+    }
+
     fn group(self) -> Group {
         match self {
             Starting::Command { group, .. } => group,
-            Starting::Service { .. } => Group::Own,
+            Starting::Dashboard { .. } | Starting::Service { .. } => Group::Own,
         }
+    }
+
+    /// Whether it starts as a command from the CLI does: the sandbox's
+    /// proxy and namespace holder started if need be, its runtime's service
+    /// reached, and its secrets as variables.
+    fn starts_as_a_command(self) -> bool {
+        matches!(self, Starting::Command { .. } | Starting::Dashboard { .. })
     }
 
     /// The session's kind, and its service if it is one.
     fn recorded_as(self) -> (SessionKind, Option<String>) {
         match self {
             Starting::Command { kind, .. } => (kind.into(), None),
+            Starting::Dashboard { .. } => (SessionKind::Exec, None),
             Starting::Service { service } => (SessionKind::Service, Some(service.to_owned())),
         }
     }
@@ -126,9 +162,24 @@ impl Starting<'_> {
     fn program(self) -> &'static str {
         match self {
             Starting::Command { .. } => "the program",
+            Starting::Dashboard { .. } => "the dashboard",
             Starting::Service { .. } => "the service",
         }
     }
+}
+
+/// `command` with no input and its output appended to `log`.
+fn output_to(command: &mut Command, log: &Path) -> io::Result<()> {
+    if let Some(folder) = log.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let out = OpenOptions::new().create(true).append(true).open(log)?;
+    let err = out.try_clone()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    Ok(())
 }
 
 /// A session that started.
@@ -159,7 +210,72 @@ fn fresh_tmp(tmp: &Path) -> io::Result<()> {
     }
 }
 
+/// Ends `child`, whose session was not recorded, then what it left in its
+/// scope through `end_scope`: the scope's cgroup holds what it started,
+/// whatever its group and parent. The program goes first, so that nothing
+/// joins the scope after, and it goes whether or not the scope can be ended;
+/// what cannot be ended, or looked for, is reported with the failure.
+fn end_unrecorded(
+    child: Child,
+    end_scope: impl FnOnce() -> std::result::Result<(), PsError>,
+    error: Error,
+    what: &str,
+) -> Error {
+    let error = abandon(child, error, what);
+    match end_scope() {
+        Ok(()) => error,
+        Err(e) => Error::CleanupFailed {
+            error: Box::new(error),
+            left: format!("what {what} started ({e})"),
+        },
+    }
+}
+
+/// Why `named` did not start. In a scope, what ran is `systemd_run`: with none
+/// there, that is the failure, not a program the user named.
+fn failed_spawn(named: &str, systemd_run: Option<&Path>, e: &io::Error) -> String {
+    match systemd_run {
+        Some(path) if e.kind() == io::ErrorKind::NotFound && !path.exists() => no_systemd_run(path),
+        _ => format!("could not start {named}: {e}"),
+    }
+}
+
 impl Engine {
+    /// `wrapped` as the program of a new scope in sandbox `name`'s slice,
+    /// and that scope, when this engine runs programs in scopes (design §8).
+    /// The slice is held to the limits of `limits` a slice holds first, so
+    /// the program never runs outside them; with no scope, such a limit is
+    /// refused. `Scopes::wrap` keeps only the program, its arguments,
+    /// environment and folder, so anything else is set on what this
+    /// returns.
+    pub(super) fn in_scope(
+        &self,
+        name: &SandboxName,
+        wrapped: Command,
+        limits: &LaunchLimits,
+    ) -> Result<(Command, Option<Scope>)> {
+        let held = SliceLimits {
+            memory: limits.memory(),
+            cpu_percent: limits.cpu().map(CpuShare::percent),
+        };
+        let Some(scopes) = &self.scopes else {
+            if !held.is_unset() {
+                return Err(Error::Session {
+                    what: "resources.memory and resources.cpu hold the sandbox's slice, and enclos runs no session in one here".into(),
+                });
+            }
+            return Ok((wrapped, None));
+        };
+        let install = self.layout.install_id()?;
+        scopes
+            .limit_slice(&install, name.as_str(), &held)
+            .map_err(|e| Error::Session {
+                what: format!("cannot hold sandbox {name} to its limits: {e}"),
+            })?;
+        let (scoped, scope) = scopes.wrap(&install, name.as_str(), &wrapped);
+        Ok((scoped, Some(scope)))
+    }
+
     /// Starts `command` in the sandbox and records it as a session, under
     /// the state lock. `before_recording` runs once the program does, before
     /// the session is recorded, so that a failure there ends the program and
@@ -174,10 +290,15 @@ impl Engine {
         starting: Starting,
         before_recording: impl FnOnce() -> Result<T>,
     ) -> Result<Started<T>> {
+        if let Some(what) = self.scopes.as_ref().and_then(Scopes::refusal) {
+            return Err(Error::Session { what });
+        }
         let mut record = self.record(name)?;
         let compiled = self.compile_policy(name, record.proxy_port)?;
-        if matches!(starting, Starting::Command { .. }) {
+        // A service's `launch` waited for both before it took the lock.
+        if starting.starts_as_a_command() {
             self.ensure_proxy(lock, &record)?;
+            self.ensure_holder(&record)?;
         }
         let (version, snapshot) = self.active_policy(name)?;
         let (program, args) = command.split_first().ok_or_else(|| Error::Session {
@@ -188,7 +309,7 @@ impl Engine {
         let tmp = ctx.home.join("tmp");
         fresh_tmp(&tmp).map_err(|source| LayoutError::Io { path: tmp, source })?;
         let (service_port, unreachable, env, named) = match starting {
-            Starting::Command { .. } => {
+            Starting::Command { .. } | Starting::Dashboard { .. } => {
                 // The runtime's clients reach its service on the port it
                 // holds now (ADR 0028), or the session says why it cannot.
                 let (port, unreachable) = match self.service_port(&record) {
@@ -209,22 +330,48 @@ impl Engine {
                 (None, None, env, named)
             }
         };
+        let (limits, not_applied) = self.launch_limits_saying(&record, &snapshot.policy)?;
         let launch = Launch {
             program: program.clone(),
             args: args.to_vec(),
             env,
             in_terminal: starting.in_terminal(),
             service_port,
-            limits: self.launch_limits(&record, &snapshot.policy)?,
+            limits,
+            reads: starting.reads(),
         };
-        let mut wrapped = self.backend_of(name)?.wrap(&compiled, &ctx, &launch);
+        let backend = self.backend_of(name)?;
+        let wrapped = backend
+            .wrap(&compiled, &ctx, &launch)
+            .map_err(|e| Error::Session {
+                what: format!("cannot start {named}: {e}"),
+            })?;
+        // What the policy says that this backend or this host does not
+        // hold, before the program prints anything of its own.
+        let host = not_applied
+            .iter()
+            .map(|n| n.gap.said_at_start(name.as_str()));
+        for line in backend
+            .said_at_start(&snapshot.policy, &ctx)
+            .into_iter()
+            .chain(host)
+        {
+            crate::notes::say(&line);
+        }
+        let (mut wrapped, mut scope) = self.in_scope(name, wrapped, &launch.limits)?;
+        if let Starting::Dashboard { log } = starting {
+            output_to(&mut wrapped, log).map_err(|source| LayoutError::Io {
+                path: log.to_owned(),
+                source,
+            })?;
+        }
         let group = starting.group();
         if group == Group::Own {
             wrapped.process_group(0);
         }
         let marker = self.new_marker(name)?;
         let (child, marked) = marker.spawn(&mut wrapped).map_err(|e| Error::Session {
-            what: format!("could not start {named}: {e}"),
+            what: failed_spawn(&named, scope.as_ref().map(Scope::systemd_run), &e),
         })?;
         let recorded = (|| -> Result<(SessionRecord, T)> {
             let prepared = before_recording()?;
@@ -232,6 +379,10 @@ impl Engine {
             // session, with an exit status to report.
             let root = reference_of_child(&child)?;
             self.name_marker(name, marked, &root)?;
+            let cgroup = match &mut scope {
+                Some(scope) => Some(scope.cgroup_of(child.id())?),
+                None => None,
+            };
             let (kind, service) = starting.recorded_as();
             let mut session = SessionRecord {
                 id: SessionId(0),
@@ -243,6 +394,7 @@ impl Engine {
                 compiled: Some(compiled.display().to_string()),
                 root,
                 pgid: group.pgid(child.id(), std::process::id()),
+                cgroup,
                 tracked: Vec::new(),
                 started_at: now(),
                 ended_at: None,
@@ -260,7 +412,12 @@ impl Engine {
                 unreachable,
                 prepared,
             }),
-            Err(e) => Err(abandon(child, e, starting.program())),
+            Err(e) => Err(match &scope {
+                Some(scope) => {
+                    end_unrecorded(child, || scope.end(SCOPE_END_WAIT), e, starting.program())
+                }
+                None => abandon(child, e, starting.program()),
+            }),
         }
     }
 }
@@ -268,12 +425,91 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::cgroup::Hierarchy;
+    use crate::lifecycle::marker::spawn_unmarked;
 
     const COMMAND: Starting = Starting::Command {
         kind: CommandKind::Exec,
         group: Group::Caller,
+        reads: &[],
     };
     const SERVICE: Starting = Starting::Service { service: "gateway" };
+
+    fn dashboard() -> Starting<'static> {
+        Starting::Dashboard {
+            log: Path::new("/data/enclos/sandboxes/lab/logs/dashboard.log"),
+        }
+    }
+
+    /// A stand-in for the hierarchy with a cgroup holding `text`, and a
+    /// program for a failed start to end.
+    fn started_in_cgroup(text: &str) -> (tempfile::TempDir, Hierarchy, Child) {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("s.scope");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("cgroup.procs"), text).unwrap();
+        let cgroups = Hierarchy::at(dir.path());
+        let child = spawn_unmarked(Command::new("/bin/sleep").arg("30")).unwrap();
+        (dir, cgroups, child)
+    }
+
+    fn failed() -> Error {
+        Error::Session {
+            what: "the start failed".into(),
+        }
+    }
+
+    #[test]
+    fn a_failed_start_ends_the_program_and_its_cgroup() {
+        let (dir, cgroups, child) = started_in_cgroup("");
+        let pid = child.id();
+        let cgroup = "/s.scope".parse().unwrap();
+        let end = || cgroups.end(&cgroup, Duration::ZERO);
+        let e = end_unrecorded(child, end, failed(), "the program");
+        assert!(matches!(e, Error::Session { .. }), "{e}");
+        assert_eq!(crate::lifecycle::process::reference(pid).unwrap(), None);
+        let asked = std::fs::read_to_string(dir.path().join("s.scope/cgroup.kill"));
+        assert_eq!(asked.unwrap(), "1");
+    }
+
+    #[test]
+    fn a_failed_start_with_nothing_left_of_its_scope_is_only_that_failure() {
+        let (_dir, _cgroups, child) = started_in_cgroup("");
+        let e = end_unrecorded(child, || Ok(()), failed(), "the program");
+        assert!(matches!(e, Error::Session { .. }), "{e}");
+    }
+
+    /// With the failure, and the program is ended all the same.
+    #[test]
+    fn a_failed_start_says_when_its_cgroup_could_not_be_told() {
+        let (_dir, _cgroups, child) = started_in_cgroup("");
+        let no_answer = || Err(PsError::Cgroup("no systemctl".into()));
+        let e = end_unrecorded(child, no_answer, failed(), "the program");
+        let Error::CleanupFailed { error, left } = e else {
+            panic!("{e}");
+        };
+        assert!(matches!(*error, Error::Session { .. }));
+        assert!(left.contains("what the program started"), "{left}");
+    }
+
+    #[test]
+    fn a_missing_systemd_run_is_named_and_not_the_users_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("systemd-run");
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        let what = failed_spawn("/bin/sh in lab", Some(&missing), &not_found);
+        assert!(
+            what.contains("user manager") && !what.contains("/bin/sh"),
+            "{what}"
+        );
+        // Not in a scope, the program itself was not found.
+        let what = failed_spawn("/bin/sh in lab", None, &not_found);
+        assert!(what.contains("could not start /bin/sh in lab"), "{what}");
+        // There, something else was: the folder the program starts in.
+        std::fs::write(&missing, "").unwrap();
+        let what = failed_spawn("/bin/sh in lab", Some(&missing), &not_found);
+        assert!(what.contains("could not start /bin/sh in lab"), "{what}");
+    }
 
     #[test]
     fn a_terminal_and_who_leads_the_group_choose_where_a_program_starts() {
@@ -294,12 +530,37 @@ mod tests {
     fn a_command_may_use_the_terminal_and_a_service_never_does() {
         assert!(COMMAND.in_terminal());
         assert!(!SERVICE.in_terminal());
+        assert!(!dashboard().in_terminal());
     }
 
     #[test]
     fn a_service_leads_a_group_of_its_own_and_a_command_where_it_was_told() {
         assert_eq!(COMMAND.group(), Group::Caller);
         assert_eq!(SERVICE.group(), Group::Own);
+        assert_eq!(dashboard().group(), Group::Own);
+    }
+
+    /// A dashboard starts as an exec does, recorded as one, and reads
+    /// nothing staged.
+    #[test]
+    fn a_dashboard_starts_as_an_exec_does() {
+        assert!(COMMAND.starts_as_a_command() && dashboard().starts_as_a_command());
+        assert!(!SERVICE.starts_as_a_command());
+        assert_eq!(dashboard().recorded_as(), (SessionKind::Exec, None));
+        assert!(dashboard().reads().is_empty());
+    }
+
+    #[test]
+    fn a_dashboards_output_goes_to_its_log_and_its_input_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/dashboard.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "kept\n").unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "read line; echo \"out $?\"; echo err >&2"]);
+        output_to(&mut command, &log).unwrap();
+        assert!(command.status().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept\nout 1\nerr\n");
     }
 
     #[test]
@@ -308,6 +569,7 @@ mod tests {
         let interactive = Starting::Command {
             kind: CommandKind::Interactive,
             group: Group::Own,
+            reads: &[],
         };
         assert_eq!(interactive.recorded_as(), (SessionKind::Interactive, None));
         assert_eq!(

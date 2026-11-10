@@ -9,7 +9,7 @@ use rustix::fs::Stat;
 use super::{Fact, printable};
 use crate::model::Timestamp;
 use crate::runtime::home::{self, wide};
-use crate::runtime::{HomePath, ValueAt};
+use crate::runtime::{HomePath, ProviderAt, ValueAt};
 
 /// The largest file of the sandbox home read for a fact.
 const MAX_FACT_FILE: u64 = 256 * 1024;
@@ -73,6 +73,23 @@ pub(super) fn read_value(home: &Path, at: &ValueAt) -> Fact<String> {
         }
     }
     Fact::Absent
+}
+
+/// An agent's provider, as its settings name it, and, when that means it
+/// has none chosen, what a person runs in the sandbox to choose one.
+pub(in crate::engine) fn read_provider(
+    home: &Path,
+    at: Option<&ProviderAt>,
+) -> (Fact<String>, Option<String>) {
+    let Some(at) = at else {
+        return (Fact::NotProvided, None);
+    };
+    let value = read_value(home, &at.at);
+    let choose = match &value {
+        Fact::Known(v) if at.unchosen.contains(&v.trim()) => Some(at.choose.clone()),
+        _ => None,
+    };
+    (value, choose)
 }
 
 /// What [`yaml_value`] found.

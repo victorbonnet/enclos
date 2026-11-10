@@ -33,7 +33,7 @@ impl RuntimeAdapter for Bare {
             args: Vec::new(),
         }
     }
-    fn home_files(&self) -> Vec<HomeFile> {
+    fn home_files(&self, _: crate::model::sandbox::BackendKind) -> Vec<HomeFile> {
         Vec::new()
     }
     fn login(&self) -> String {
@@ -211,6 +211,83 @@ fn hermes_agents_logins_and_models_show_with_what_to_do() {
 }
 
 #[test]
+fn an_agent_whose_settings_name_no_provider_is_said_with_how_to_choose_one() {
+    let (_dir, engine, name) = with_runtime();
+    let home = engine.sandbox_home(&name);
+    // Added before the sandbox's login chose a provider, as Hermes 0.23.0
+    // clones `default`'s settings: `auto`, kept after the login.
+    let main = home.join(".hermes/profiles/main");
+    std::fs::create_dir_all(&main).unwrap();
+    std::fs::create_dir_all(home.join(".hermes/hermes-agent")).unwrap();
+    std::fs::write(
+        main.join("config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: auto\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".hermes/config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    let added = done(
+        engine
+            .add_agent(&alice(), &name, "main".parse().unwrap(), Confirm::Yes)
+            .unwrap(),
+    );
+    assert_eq!(
+        added.choose_provider.as_deref(),
+        Some("hermes -p main model")
+    );
+
+    let agents = |view: &crate::engine::StatusView| {
+        view.sandboxes[0].agents.as_ref().unwrap().agents.clone()
+    };
+    let view = engine.status(None).unwrap();
+    let [default, tracked] = &agents(&view)[..] else {
+        panic!("{:?}", agents(&view));
+    };
+    assert_eq!(
+        (&default.provider, &default.choose_provider),
+        (&Fact::Known("openai-codex".into()), &None)
+    );
+    assert_eq!(
+        (&tracked.provider, tracked.choose_provider.as_deref()),
+        (&Fact::Known("auto".into()), Some("hermes -p main model"))
+    );
+    // Not logged in yet: the login comes first, and chooses a provider.
+    assert_eq!(
+        commands(&view.suggestions),
+        ["enclos connect home -- hermes -p default setup"]
+    );
+    std::fs::write(home.join(".hermes/auth.json"), "{}").unwrap();
+    let view = engine.status(None).unwrap();
+    let suggested = &view.suggestions[0];
+    assert_eq!(
+        (suggested.kind(), suggested.target(), suggested.command()),
+        (
+            "choose_provider",
+            "home/main".to_owned(),
+            "enclos connect home -- hermes -p main model".to_owned()
+        )
+    );
+    assert_eq!(view.suggestions.len(), 1);
+    let json = serde_json::to_value(&view).unwrap();
+    let shown = &json["sandboxes"][0]["agents"]["agents"][1];
+    assert_eq!(shown["provider"], serde_json::json!({"known": "auto"}));
+    assert_eq!(shown["choose_provider"], "hermes -p main model");
+
+    // Chosen, nothing is said.
+    std::fs::write(
+        main.join("config.yaml"),
+        "model:\n  default: gpt-5.5\n  provider: openai-codex\n",
+    )
+    .unwrap();
+    let view = engine.status(None).unwrap();
+    assert_eq!(agents(&view)[1].choose_provider, None);
+    assert!(view.suggestions.is_empty(), "{:?}", view.suggestions);
+}
+
+#[test]
 fn enclos_neither_adds_nor_removes_the_built_in_agent() {
     let (_dir, engine, name) = with_runtime();
     let default: AgentName = "default".parse().unwrap();
@@ -323,6 +400,7 @@ fn put_session(
             .unwrap()
             .unwrap(),
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: start,
         ended_at: end,
@@ -370,6 +448,7 @@ fn the_last_use_counts_connect_and_service_sessions_and_the_network_not_the_prox
             .unwrap()
             .unwrap(),
         pgid: None,
+        cgroup: None,
         tracked: Vec::new(),
         started_at: start,
         ended_at: end,
@@ -504,9 +583,19 @@ fn a_refusal_because_the_policy_was_unreadable_is_not_a_destination_to_review() 
         .unwrap();
     assert_eq!(status.refused_recently, 0);
     assert_eq!(status.policy_unreadable_at, Some(now));
+    assert_eq!(status.policy_unreadable_refused, 1);
     // Not a destination to review, but a proxy to look at.
     let s = suggest(std::slice::from_ref(&status), now);
     let listed = commands(&s);
+    // What was refused, not every connection.
+    let reasons: Vec<String> = s.iter().map(Suggestion::reason).collect();
+    assert!(
+        reasons.contains(&format!(
+            "1 connection refused as the proxy could not read the policy, the last at {}",
+            now.strftime("%Y-%m-%d %H:%M UTC")
+        )),
+        "{reasons:?}"
+    );
     assert!(!listed.contains(&"enclos net denied home".into()), "{s:?}");
     assert!(listed.contains(&"enclos logs home".into()), "{s:?}");
 
@@ -548,6 +637,8 @@ fn each_rule_names_its_command_and_nothing_fires_without_its_fact() {
                     last_active: Fact::NotProvided,
                     bytes: Fact::NotProvided,
                     model: Fact::NotProvided,
+                    provider: Fact::NotProvided,
+                    choose_provider: None,
                 })
                 .collect(),
             unreadable: None,
@@ -659,6 +750,8 @@ fn the_json_view_names_each_state_and_fact() {
     assert_eq!(s["disk"]["incomplete"], serde_json::Value::Null);
     // The gateway is not running, and nothing in the sandbox listens.
     assert_eq!(s["dashboard"], "absent");
+    // The host reaches a Seatbelt sandbox's listeners: no command to name.
+    assert_eq!(s["dashboard_command"], serde_json::Value::Null);
     assert_eq!(s["network_listeners"], serde_json::json!({"known": []}));
     assert_eq!(json["complete"], true);
     assert_eq!(json["idle_days"], 30);

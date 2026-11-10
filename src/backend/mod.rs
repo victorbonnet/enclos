@@ -4,17 +4,24 @@
 //! full shape in design §9 (prepare, members, denials, ...) as the commands
 //! that use it arrive.
 
+pub mod bubblewrap;
+pub mod environment;
 #[cfg(test)]
 pub mod fake;
 pub mod seatbelt;
 
 use std::ffi::OsString;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::model::sandbox::{BackendKind, SandboxName};
+use crate::policy::own_places::OwnPlaces;
+use crate::policy::paths::real_path;
+use crate::probes::OwnProbes;
+use crate::relay::inward::WayIn;
 
 /// Whether a backend can run on this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +61,9 @@ pub struct SandboxContext {
     pub user_home: PathBuf,
     /// The enclos data and config folders (ADR 0010).
     pub protected: Vec<PathBuf>,
+    /// Where each of `protected` really is, read as the context is made so
+    /// that compiling looks at nothing.
+    pub protected_real: Vec<PathBuf>,
     /// The folder holding every sandbox's folder.
     pub sandboxes: PathBuf,
     /// Files the sandbox may not read, each with every file whose name
@@ -63,6 +73,21 @@ pub struct SandboxContext {
     pub hidden_dirs: Vec<PathBuf>,
     /// The sandbox's proxy port, on 127.0.0.1 and [::1]: its only way out.
     pub proxy_port: u16,
+    /// The folder of its secrets files, there while its services run (ADR
+    /// 0034, ADR 0036).
+    pub secrets: PathBuf,
+    /// The socket its proxy listens on for a session with a network of its
+    /// own.
+    pub proxy_socket: PathBuf,
+    /// The socket its namespace holder hands out the sandbox's network
+    /// namespace on, for a backend whose sessions join one (ADR 0039).
+    pub holder_socket: PathBuf,
+    /// The socket of the namespace holder's relay from the host to a port in
+    /// the sandbox's network namespace (ADR 0040).
+    pub inward_socket: PathBuf,
+    /// What enclos stages for an install or an import, which the sandbox
+    /// reads and never writes.
+    pub installers: PathBuf,
 }
 
 impl SandboxContext {
@@ -74,10 +99,16 @@ impl SandboxContext {
             home: layout.sandbox_home(name.as_str()),
             user_home: layout.user_home().to_owned(),
             protected: layout.protected(),
+            protected_real: layout.protected().iter().map(|p| real_path(p)).collect(),
             sandboxes: layout.sandboxes_dir(),
             hidden_files: layout.hidden_files(),
             hidden_dirs: layout.hidden_dirs(),
             proxy_port,
+            secrets: layout.sandbox_secrets_dir(name.as_str()),
+            proxy_socket: layout.proxy_socket(name.as_str()),
+            holder_socket: layout.holder_socket(name.as_str()),
+            inward_socket: layout.inward_socket(name.as_str()),
+            installers: layout.sandbox_installers(name.as_str()),
         }
     }
 }
@@ -112,15 +143,24 @@ pub struct Launch {
     pub service_port: Option<u16>,
     /// The limits each of its processes runs under (design §7).
     pub limits: LaunchLimits,
+    /// The files enclos staged in the sandbox's `installers/` folder that
+    /// the program reads, as an installer and an import do; none for any
+    /// other. A backend whose sandbox does not see that folder shows each
+    /// read-only, and no more of it.
+    pub reads: Vec<PathBuf>,
 }
 
-/// The limits a program runs under, as a backend sets them: only those a
-/// backend enforces as written, `open_files` for now (design §7, ADR 0033).
-/// The engine makes them from a policy's `[resources]` once checked for the
-/// sandbox's backend, so a limit nothing enforces never reaches a program.
+/// The limits a program runs under: only those a backend enforces as
+/// written (design §7, ADR 0033). `open_files` holds each process, and the
+/// backend sets it; `memory` and `cpu` hold the sandbox as a whole, and the
+/// engine sets them on the sandbox's slice. The engine makes them from a
+/// policy's `[resources]` once checked for the sandbox's backend, so a limit
+/// nothing enforces never reaches a program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchLimits {
     open_files: Option<u64>,
+    memory: Option<u64>,
+    cpu: Option<crate::model::limits::CpuShare>,
 }
 
 impl LaunchLimits {
@@ -139,19 +179,45 @@ impl LaunchLimits {
             memory,
             cpu,
         } = resources;
-        if file_size.is_some() || cpu_seconds.is_some() || memory.is_some() || cpu.is_some() {
+        if file_size.is_some() || cpu_seconds.is_some() {
             return Err(format!(
                 "a limit no backend enforces reached a launch: {resources:?}"
             ));
         }
         Ok(LaunchLimits {
             open_files: *open_files,
+            memory: match memory {
+                Some(written) => Some(crate::model::limits::memory(written)?.0),
+                None => None,
+            },
+            cpu: cpu.as_deref().map(str::parse).transpose()?,
         })
+    }
+
+    /// These limits with `memory` left out, for a host that does not hold
+    /// it, where the user accepted that it is not applied (ADR 0038).
+    pub(crate) fn without_memory(self) -> LaunchLimits {
+        LaunchLimits {
+            memory: None,
+            ..self
+        }
     }
 
     /// The file descriptors a process may hold, if limited.
     pub fn open_files(&self) -> Option<u64> {
         self.open_files
+    }
+
+    /// The bytes of memory the sandbox's processes may use together, with
+    /// no swap beyond it, if limited.
+    pub fn memory(&self) -> Option<u64> {
+        self.memory
+    }
+
+    /// The share of the CPU the sandbox's processes may use together, if
+    /// limited.
+    pub fn cpu(&self) -> Option<crate::model::limits::CpuShare> {
+        self.cpu
     }
 }
 
@@ -159,11 +225,11 @@ impl LaunchLimits {
 /// `/bin/bash` sets them with `ulimit`, hard and soft alike, so no process
 /// in the sandbox without root can raise them, then becomes the program;
 /// one it cannot set stops it with exit 125 and the field named, so no
-/// program runs without its limits. Only `open_files` is set: Seatbelt
-/// refuses the others (ADR 0033), and no other backend is built. In
-/// privileged mode (`-p`), as it runs on the host with the sandbox's
-/// variables: it then reads no `BASH_ENV` or `ENV` file, no `SHELLOPTS` and
-/// no function from them. Only `command`'s program and arguments are kept:
+/// program runs without its limits. Only `open_files` is set here: Seatbelt
+/// refuses the others (ADR 0033), and on bubblewrap `memory` and `cpu` hold
+/// the sandbox's slice, not each process. In privileged mode (`-p`), as it runs on
+/// the host with the sandbox's variables: it then reads no `BASH_ENV` or
+/// `ENV` file, no `SHELLOPTS` and no function from them. Only `command`'s program and arguments are kept:
 /// set its environment and folder on the result. Returns `command`
 /// unchanged when no limit is set.
 pub fn under_limits(command: Command, limits: &LaunchLimits) -> Command {
@@ -235,6 +301,12 @@ pub(crate) fn max_files_per_process() -> Option<u64> {
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
+/// Why a program cannot start in a sandbox as the host stands at launch,
+/// when a backend reads the host then (bubblewrap's masks).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct WrapError(pub String);
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CompileError {
     #[error("cannot compile the policy for {backend}: {reason}")]
@@ -244,8 +316,9 @@ pub enum CompileError {
     },
 }
 
-/// One isolation technology. Prepares, wraps and finds members; never
-/// supervises.
+/// One isolation technology. Compiles a policy and wraps a program in it;
+/// never supervises. Finding a sandbox's members is the lifecycle's (design
+/// §8), not a backend's.
 pub trait Backend {
     fn kind(&self) -> BackendKind;
     /// Checks, without side effects, whether this backend works on this host.
@@ -255,17 +328,128 @@ pub trait Backend {
     /// doctor` calls it.
     fn try_run(&self) -> Probe;
     fn capabilities(&self) -> Capabilities;
+    /// What `enclos doctor` shows of what the backend needs from this host,
+    /// each with what to do: what keeps it from running, and each degraded
+    /// control. Nothing by default, and nothing where it is not on this
+    /// host.
+    fn host_checks(&self) -> Vec<crate::host::HostCheck> {
+        Vec::new()
+    }
+    /// The places each session has its own of, such as bubblewrap's `/run`,
+    /// which no workspace may put the host's back over: a policy's
+    /// workspaces, as written and where their links lead, are checked
+    /// against them before it is stored and each time it is compiled. None
+    /// by default.
+    fn own_places(&self) -> OwnPlaces {
+        OwnPlaces::NONE
+    }
     /// Turns a policy into what the backend enforces. Pure.
     fn compile(&self, policy: &Policy, ctx: &SandboxContext) -> Result<Compiled, CompileError>;
-    /// The command that runs `launch` inside the sandbox under `compiled`.
-    fn wrap(&self, compiled: &Path, ctx: &SandboxContext, launch: &Launch) -> Command;
+    /// The command that runs `launch` inside the sandbox under `compiled`,
+    /// or why it cannot start as the host stands now.
+    fn wrap(
+        &self,
+        compiled: &Path,
+        ctx: &SandboxContext,
+        launch: &Launch,
+    ) -> Result<Command, WrapError>;
+    /// What each session's start says of `policy` on this backend, one line
+    /// each: a field it holds on no host, which the policy still runs with.
+    /// A field this host does not hold ([`Backend::not_enforced_here`]) is
+    /// the engine's to say. Nothing by default.
+    fn said_at_start(&self, _policy: &Policy, _ctx: &SandboxContext) -> Vec<String> {
+        Vec::new()
+    }
+    /// The fields of `policy` this host does not enforce, though the
+    /// backend holds them where the host has what they need (ADR 0038): a
+    /// sandbox runs with one only once the user accepted it. None by
+    /// default.
+    fn not_enforced_here(
+        &self,
+        _policy: &Policy,
+    ) -> Vec<crate::model::unenforced::NotEnforcedHere> {
+        Vec::new()
+    }
+    /// What a policy compiled for this backend holds less of on this host
+    /// than its compiled text shows, one line each, such as rules this
+    /// kernel cannot apply: for `policy show --compiled` to say beside it.
+    /// Compiling stays pure; this reads the host. Nothing by default.
+    fn compiled_not_applied_here(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Its escape probes and refusals for a sandbox whose compiled policy
+    /// has the text `compiled`; `None` on a dry run, which compiles nothing.
+    /// Fails, saying why, on a text this backend did not compile.
+    fn own_probes(&self, compiled: Option<&str>) -> Result<Box<dyn OwnProbes>, String>;
+    /// The namespace holder whose network namespace every session of a
+    /// sandbox joins (ADR 0039), for a backend that has one. None where a
+    /// session shares the host's network, as under Seatbelt.
+    fn namespace_holder(&self) -> Option<&dyn NamespaceHolder> {
+        None
+    }
+}
+
+/// The process that keeps a sandbox's one network namespace in being, so
+/// that every session of the sandbox joins it (ADR 0039). It is one of the
+/// sandbox's services: the engine installs it, and the service manager runs
+/// [`NamespaceHolder::command`]. Its sockets, `SandboxContext::holder_socket`
+/// and `inward_socket`, are in the host-only part of the sandbox's run folder.
+pub trait NamespaceHolder {
+    /// Runs the sandbox's namespace holder to its end, its sockets made
+    /// afresh at each start, with `stderr` as its stderr: how it ended, or
+    /// why it could not start.
+    fn run(
+        &self,
+        ctx: &SandboxContext,
+        stderr: &std::fs::File,
+    ) -> Result<std::process::ExitStatus, WrapError>;
+    /// What the running namespace holder says of its namespace, or why none
+    /// answers.
+    fn ask(&self, ctx: &SandboxContext) -> Result<HeldNamespace, String>;
+    /// The host's way to a port of 127.0.0.1 in the sandbox's network
+    /// namespace, which the host does not reach otherwise: through the
+    /// namespace holder's relay from the host (ADR 0040).
+    fn way_in(&self, ctx: &SandboxContext) -> WayIn;
+}
+
+/// A sandbox's network namespace, as its namespace holder gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldNamespace {
+    /// The namespace holder's pid as the host sees it: `/proc/<pid>/net`
+    /// shows the namespace's tables.
+    pub pid: u32,
+    /// The ports a bind on port 0 lands in there, which a namespace has of
+    /// its own.
+    pub ephemeral: RangeInclusive<u16>,
 }
 
 /// Every backend this build of enclos ships, in order of preference.
 ///
 /// This is the one explicit list of implementations.
+/// bubblewrap is in Linux builds alone, so a Mac's `doctor` and `sandbox
+/// create` stay as they were.
 pub fn registered() -> Vec<Box<dyn Backend>> {
-    vec![Box::new(seatbelt::Seatbelt::from_env())]
+    let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(seatbelt::Seatbelt::from_env())];
+    if cfg!(target_os = "linux") {
+        backends.push(Box::new(bubblewrap::Bubblewrap::on_host()));
+    }
+    backends
+}
+
+#[cfg(test)]
+mod registered_tests {
+    use super::*;
+
+    /// Seatbelt first, so a Mac's default and `doctor` stay as they were;
+    /// bubblewrap on Linux alone. Making the list probes nothing.
+    #[test]
+    fn linux_builds_register_bubblewrap_after_seatbelt() {
+        let kinds: Vec<BackendKind> = registered().iter().map(|b| b.kind()).collect();
+        match cfg!(target_os = "linux") {
+            true => assert_eq!(kinds, [BackendKind::Seatbelt, BackendKind::Bubblewrap]),
+            false => assert_eq!(kinds, [BackendKind::Seatbelt]),
+        }
+    }
 }
 
 #[cfg(test)]

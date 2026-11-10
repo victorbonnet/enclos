@@ -3,8 +3,10 @@
 //! Refused: a write to enclos's own folders except the sandbox's own home,
 //! also through a broad path or a symlink; a workspace inside the home or
 //! inside another workspace, or one reached through a symlink the sandbox
-//! can change; a dropped built-in read-deny entry; a path the compiled
-//! policy cannot hold; a destination the proxy never lets a sandbox reach.
+//! can change; a workspace that would put the host's back over a place the
+//! backend gives each session of its own, as written or through a symlink;
+//! a dropped built-in read-deny entry; a path the compiled policy cannot
+//! hold; a destination the proxy never lets a sandbox reach.
 //! Malformed: a path or destination that does not parse, a
 //! `network.private` opt-in for a host not in `network.allow`, or a write
 //! grant at or inside a deny-list path. A policy exits 2 only when every
@@ -13,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use super::file::PolicyFile;
+use super::own_places::OwnPlaces;
 use super::paths::{PathContext, is_within, links_on_the_way, real_path};
 use super::{PolicyError, Problem};
 use crate::model::policy::Policy;
@@ -27,6 +30,8 @@ pub struct ValidationContext {
     pub paths: PathContext,
     /// The enclos data and config folders.
     pub protected: Vec<PathBuf>,
+    /// The places the sandbox's backend gives each session of its own.
+    pub own_places: OwnPlaces,
 }
 
 pub fn validate(policy: &Policy, ctx: &ValidationContext) -> Result<(), PolicyError> {
@@ -109,11 +114,14 @@ fn check_grants(
 }
 
 /// Checks the limits a policy sets against what `backend` enforces (ADR
-/// 0033, proposed): one it cannot enforce as written is refused outright,
+/// 0033): one it cannot enforce as written is refused outright,
 /// never stored and ignored. Seatbelt holds a process to one of the limits
 /// macOS keeps for each process, open files; a process may ignore SIGXCPU
 /// and run past its CPU time, macOS refuses a memory limit, does not hold
 /// appends to a file size limit, and enclos has no means for a CPU share.
+/// bubblewrap holds `open_files` as Seatbelt does, and `memory` and `cpu` on
+/// the sandbox's slice; whether this host's cgroups hold `memory` is
+/// checked apart, as it depends on the host (ADR 0038).
 ///
 /// `most_open_files` is the host's own ceiling on the files one process
 /// holds (macOS's `kern.maxfilesperproc`), when it is known: a value above
@@ -178,6 +186,20 @@ pub fn validate_resources(
             )));
         }
     }
+    // The limits a sandbox's slice holds, kept as written for a backend
+    // that refuses them, read here for one that holds them.
+    if let Some(memory) = &r.memory
+        && accepted("memory")
+        && let Err(why) = crate::model::limits::memory(memory)
+    {
+        problems.push(Problem::Malformed(why));
+    }
+    if let Some(cpu) = &r.cpu
+        && accepted("cpu")
+        && let Err(why) = cpu.parse::<crate::model::limits::CpuShare>()
+    {
+        problems.push(Problem::Malformed(why));
+    }
     // A whole number of KiB, the unit of `ulimit -f`, for a backend that
     // sets it that way: a size of no whole KiB could only be cut, and one
     // under 1K would become `ulimit -f 0`, stopping every write.
@@ -222,7 +244,7 @@ fn refusals(
             }
             if let Some(memory) = &r.memory {
                 refused.push(("memory", format!(
-                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. Linux's backend is designed to hold one"
+                    "resources.memory = {memory}: the Seatbelt backend cannot enforce a memory limit, since macOS refuses to set one on a process; leave it out. The bubblewrap backend, on Linux, holds one"
                 )));
             }
             if let Some(seconds) = r.cpu_seconds {
@@ -236,7 +258,20 @@ fn refusals(
                 )));
             }
         }
-        // No other backend is built yet: none enforces a limit.
+        // `open_files` as on Seatbelt, and `memory` and `cpu` on each
+        // sandbox's slice; the per-process limits it does not set yet.
+        BackendKind::Bubblewrap => {
+            if let Some(size) = r.file_size {
+                refused.push(("file_size", format!(
+                    "resources.file_size = {size}: the bubblewrap backend does not set a file size limit yet; leave it out"
+                )));
+            }
+            if let Some(seconds) = r.cpu_seconds {
+                refused.push(("cpu_seconds", format!(
+                    "resources.cpu_seconds = {seconds}: the bubblewrap backend does not set a CPU time limit yet; leave it out, or hold the sandbox to a share of the CPU with `cpu`"
+                )));
+            }
+        }
         other if !r.is_unset() => refused.push((
             "resources",
             format!("resources: the {other} backend enforces no limit yet; leave [resources] out"),
@@ -299,6 +334,32 @@ fn check_writes(policy: &Policy, ctx: &ValidationContext, problems: &mut Vec<Pro
     check_nesting(&granted, &own_home, problems);
     check_links(&granted, &own_home, problems);
     check_hidden(&granted, policy, ctx, &own_home, problems);
+    check_own_places(&granted, ctx.own_places, &own_home, problems);
+}
+
+/// A workspace at, holding or inside a place the backend gives each session
+/// of its own, as written or where a symlink the user made leads: its bind
+/// comes after that place is made, so the host's would replace the
+/// sandbox's (`~/alias -> ../../run`). The sandbox home is left out, as the
+/// compiler binds it as its own.
+fn check_own_places(
+    granted: &[Granted],
+    own_places: OwnPlaces,
+    own_home: &Path,
+    problems: &mut Vec<Problem>,
+) {
+    for g in granted.iter().filter(|g| !is_within(&g.path, own_home)) {
+        let undone = own_places
+            .undone_by(&g.expanded)
+            .or_else(|| own_places.undone_by(&g.path));
+        if let Some(place) = undone {
+            problems.push(Problem::Refused(format!(
+                "filesystem.write: `{}` ({}) would bring back the host's {place}, which the sandbox has its own of; grant another folder",
+                g.entry,
+                g.path.display()
+            )));
+        }
+    }
 }
 
 /// A folder granted at or inside a path the deny list hides: the deny list wins
@@ -577,11 +638,11 @@ mod tests {
         let mut some = Policy::default();
         some.resources.open_files = Some(256);
         assert!(
-            validate_resources(&some, BackendKind::Bubblewrap, None)
+            validate_resources(&some, BackendKind::Libkrun, None)
                 .unwrap_err()
                 .is_refused()
         );
-        assert!(validate_resources(&Policy::default(), BackendKind::Bubblewrap, None).is_ok());
+        assert!(validate_resources(&Policy::default(), BackendKind::Libkrun, None).is_ok());
         for (memory, cpu) in [(Some("2G"), None), (None, Some("2.0"))] {
             policy.resources.memory = memory.map(str::to_owned);
             policy.resources.cpu = cpu.map(str::to_owned);
@@ -589,6 +650,44 @@ mod tests {
             assert!(err.is_refused(), "{err}");
             assert!(err.to_string().contains("Seatbelt"), "{err}");
         }
+    }
+
+    /// `open_files` as on Seatbelt, and the limits of a sandbox's slice.
+    #[test]
+    fn bubblewrap_accepts_open_files_memory_and_cpu() {
+        let mut policy = Policy::default();
+        policy.resources.open_files = Some(256);
+        policy.resources.memory = Some("512M".to_owned());
+        policy.resources.cpu = Some("0.5".to_owned());
+        validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap();
+        // Written wrong is malformed there, not refused.
+        for (memory, cpu, said) in [
+            ("lots", "1", "not a size"),
+            ("1M", "1", "from 64M"),
+            ("1G", "50%", "number of cores"),
+            ("1G", "0", "from 0.01"),
+        ] {
+            policy.resources.memory = Some(memory.to_owned());
+            policy.resources.cpu = Some(cpu.to_owned());
+            let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+            assert!(!err.is_refused(), "{err}");
+            assert!(err.to_string().contains(said), "{err}");
+        }
+    }
+
+    /// The per-process limits it does not set are refused, as on Seatbelt.
+    #[test]
+    fn bubblewrap_refuses_the_limits_it_does_not_set() {
+        let mut policy = Policy::default();
+        policy.resources.cpu_seconds = Some(60);
+        let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+        assert!(err.is_refused(), "{err}");
+        assert!(err.to_string().contains("cpu_seconds"), "{err}");
+        policy.resources.cpu_seconds = None;
+        policy.resources.file_size = Some("1M".parse().unwrap());
+        let err = validate_resources(&policy, BackendKind::Bubblewrap, None).unwrap_err();
+        assert!(err.is_refused(), "{err}");
+        assert!(err.to_string().contains("file_size"), "{err}");
     }
 
     #[test]
@@ -676,6 +775,7 @@ mod tests {
                 sandbox_home,
             },
             protected: vec![enclos],
+            own_places: OwnPlaces::NONE,
         };
         Fixture { _dir: dir, ctx }
     }
@@ -1007,4 +1107,6 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("~/.ssh"), "{found:?}");
     }
+
+    mod own_places;
 }

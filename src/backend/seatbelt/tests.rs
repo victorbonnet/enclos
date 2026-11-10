@@ -3,13 +3,14 @@
 //! policy denies. Only processes these tests start are ever signalled.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use super::super::{Backend, Launch, SandboxContext};
+use super::Baseline;
 use super::Seatbelt;
+use super::probes::SeatbeltProbes;
 use crate::layout::Layout;
 use crate::model::policy::Policy;
 use crate::policy::file::PolicyFile;
@@ -38,6 +39,7 @@ fn run_under(w: &World, compiled: &Path, script: &str) -> (bool, String) {
         in_terminal: false,
         service_port: None,
         limits: Default::default(),
+        reads: Vec::new(),
     };
     let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
         .stdin(Stdio::null())
@@ -161,8 +163,11 @@ impl World {
             in_terminal: false,
             service_port,
             limits: Default::default(),
+            reads: Vec::new(),
         };
-        let mut command: Command = Seatbelt::default().wrap(&self.compiled, &self.ctx, &launch);
+        let mut command: Command = Seatbelt::default()
+            .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap();
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().unwrap().success()
     }
@@ -177,9 +182,11 @@ impl World {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = Seatbelt::default()
             .wrap(&self.compiled, &self.ctx, &launch)
+            .unwrap()
             .stderr(Stdio::null())
             .output()
             .unwrap();
@@ -346,7 +353,7 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
     let v6 = TcpListener::bind(("::1", 0)).is_ok();
     // Each probe as `policy test` runs it: the sandbox, then the control.
     let judged = |w: &World, listen: bool| -> Vec<(String, Outcome)> {
-        crate::probes::listen_probes(listen, proxy)
+        super::probes::listen_probes(listen, proxy)
             .into_iter()
             .filter(|p| v6 || !p.name.ends_with("[::1]"))
             .map(|p| {
@@ -357,9 +364,11 @@ fn a_sandbox_that_listens_binds_any_port_but_the_proxy_ports() {
                     in_terminal: false,
                     service_port: None,
                     limits: Default::default(),
+                    reads: Vec::new(),
                 };
                 let out = Seatbelt::default()
                     .wrap(&w.compiled, &w.ctx, &launch)
+                    .unwrap()
                     .stdin(Stdio::null())
                     .output()
                     .unwrap();
@@ -649,6 +658,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         user_home: user.clone(),
         data: user.join(".enclos"),
         config_file: user.join(".enclos/config.toml"),
+        hidden_files: crate::probes::hidden_in(&user.join(".enclos")),
         sandbox_dir: user.join(".enclos/sandboxes/home"),
         other_sandboxes: Vec::new(),
         writes: w.fs.writes.clone(),
@@ -659,11 +669,9 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
-        keychain_item: Err("not probed here".into()),
         limits: Default::default(),
     };
     let output = |mut command: Command| {
@@ -671,7 +679,7 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         (out.status.success(), text(&out.stdout), text(&out.stderr))
     };
-    probes(&inputs)
+    probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
         .filter(|p| ["renames", "clones"].contains(&p.route))
         .map(|p| {
@@ -682,8 +690,10 @@ fn folder_probes(w: &World, compiled: &Path) -> Vec<(String, Outcome)> {
                 in_terminal: false,
                 service_port: None,
                 limits: Default::default(),
+                reads: Vec::new(),
             };
-            let (ok, stdout, stderr) = output(Seatbelt::default().wrap(compiled, &w.ctx, &launch));
+            let (ok, stdout, stderr) =
+                output(Seatbelt::default().wrap(compiled, &w.ctx, &launch).unwrap());
             let Proof::Control { control, .. } = &p.proof else {
                 panic!("{} has no control", p.name);
             };
@@ -808,6 +818,7 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         user_home: w.base.join("alice"),
         data: w.base.join("alice/.enclos"),
         config_file: w.base.join("alice/.enclos/config.toml"),
+        hidden_files: crate::probes::hidden_in(&w.base.join("alice/.enclos")),
         sandbox_dir: w.base.join("alice/.enclos/sandboxes/home"),
         other_sandboxes: Vec::new(),
         writes: Vec::new(),
@@ -818,14 +829,12 @@ fn the_home_and_each_workspace_stay_the_folders_the_policy_was_compiled_for() {
         host_sockets: Vec::new(),
         proxy_port: w.ctx.proxy_port,
         listen: false,
-        baseline: crate::backend::seatbelt::Baseline::DenyDefault,
         other_terminal: None,
         target: None,
         tag: 7,
-        keychain_item: Err("not probed here".into()),
         limits: Default::default(),
     };
-    let folders: Vec<_> = crate::probes::probes(&inputs)
+    let folders: Vec<_> = probes(&inputs, &SeatbeltProbes::on(Baseline::DenyDefault))
         .into_iter()
         .filter(|p| p.route == "writable folders")
         .collect();
@@ -892,6 +901,16 @@ const DENIED_FAKES: &[&str] = &[
     ".local/share/atuin/history.db",
     ".password-store/bank.gpg",
     ".gemini/oauth_creds.json",
+    ".config/google-chrome/Default/Cookies",
+    ".local/share/keyrings/login.keyring",
+    "Library/Application Support/Signal/sql/db.sqlite",
+    ".config/Signal/sql/db.sqlite",
+    ".pki/nssdb/key4.db",
+    ".local/share/pki/nssdb/key4.db",
+    ".1password/agent.sock",
+    ".bitwarden-ssh-agent.sock",
+    ".var/app/org.mozilla.firefox/.mozilla/firefox/x/logins.json",
+    "snap/firefox/common/.mozilla/firefox/x/logins.json",
     ".local/share/opencode/auth.json",
     "Library/HTTPStorages/com.example.app/httpstorages.sqlite",
     "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
@@ -1046,10 +1065,10 @@ fn the_host_services_close_on_the_baseline_and_on_the_rules() {
     for (compiled, opened, sent) in [
         (
             &w.compiled,
-            crate::probes::LS_LOOKUP_REFUSED,
-            crate::probes::AE_LOOKUP_REFUSED,
+            super::probes::LS_LOOKUP_REFUSED,
+            super::probes::AE_LOOKUP_REFUSED,
         ),
-        (&allow, crate::probes::LS_REFUSED, crate::probes::AE_REFUSED),
+        (&allow, super::probes::LS_REFUSED, super::probes::AE_REFUSED),
     ] {
         let (ok, out) = run_under(&w, compiled, open);
         assert!(!ok && out.contains(opened), "{}: {out}", compiled.display());
@@ -1095,6 +1114,7 @@ fn the_sandbox_opens_no_terminal_but_its_own() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         super::wrap::wrap_in(&w.compiled, &w.ctx, &launch, terminal)
             .stdout(Stdio::null())
@@ -1148,6 +1168,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
             in_terminal: false,
             service_port: None,
             limits: Default::default(),
+            reads: Vec::new(),
         };
         let out = super::wrap::wrap_in(compiled, &w.ctx, &launch, None)
             .stdin(Stdio::null())
@@ -1181,7 +1202,7 @@ fn the_sandbox_cannot_grant_itself_another_terminal() {
     std::fs::write(&open, without).unwrap();
     assert!(run(&open), "the route is gone: nothing to test");
     assert!(!run(&w.compiled));
-    // The rule alone closes it on the earlier baseline, and the baseline
+    // The rule alone closes it on `(allow default)`, and the baseline
     // alone closes it without the rule.
     let with_rule = on_allow_default(&text);
     let file = w.base.join("allow-default-with-the-rule.sb");
@@ -1304,8 +1325,13 @@ fn the_mktemp_wrapper_puts_temp_files_under_the_sandbox_tmp() {
     let bin = w.ctx.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let shim = bin.join("mktemp");
-    std::fs::write(&shim, include_str!("../../runtime/hermes/mktemp")).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_scripts::copy_program(
+        Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime/hermes/mktemp"
+        )),
+        &shim,
+    );
     let tmp = w.ctx.home.join("tmp").display().to_string();
     for (call, prefix) in [
         ("mktemp", "tmp."),

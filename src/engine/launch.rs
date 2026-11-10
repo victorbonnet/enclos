@@ -39,13 +39,13 @@ fn replaced_earlier(service: &str, ids: &[SessionId]) -> Option<String> {
 }
 
 /// Sets `ended` on TERM, INT and HUP while it lives, instead of ending this
-/// process: `launch` outlives them to stop the runtime, which runs in a
-/// group of its own that the service manager does not signal, and to
-/// record its end.
-struct EndOn(Vec<signal_hook::SigId>);
+/// process: `launch` and `dashboard` outlive them to stop their program,
+/// which runs in a group of its own that neither the service manager nor
+/// the terminal signals, and to record its end.
+pub(super) struct EndOn(Vec<signal_hook::SigId>);
 
 impl EndOn {
-    fn new(ended: &Arc<AtomicBool>) -> Result<Self> {
+    pub(super) fn new(ended: &Arc<AtomicBool>) -> Result<Self> {
         // The guard first, so what is registered is unregistered even when a
         // later registration fails.
         let mut guard = EndOn(Vec::new());
@@ -90,7 +90,8 @@ impl Engine {
         if let Some(why) = why {
             return Err(Error::Session {
                 what: format!(
-                    "{why}: a service runs only on (deny default) (`launchctl unsetenv {BASELINE_VAR}` unsets it in the service manager's environment)"
+                    "{why}: a service runs only on (deny default) (`{}` unsets it in the service manager's environment)",
+                    self.services.unset_env_command(BASELINE_VAR),
                 ),
             });
         }
@@ -143,6 +144,10 @@ impl Engine {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+        // The service manager starts the namespace holder beside this
+        // service, whose session joins it (ADR 0039); one missing, as in
+        // services a version of enclos without it installed, is installed.
+        self.ensure_holder(&record)?;
         let mut watch = self.settings_watch(name, kind, service);
         let summary = |(started, replaced): &(Started<()>, Vec<SessionId>)| {
             let session = started.session.id;
@@ -292,6 +297,7 @@ impl Engine {
                     // Its group only when it leads it, as under a service
                     // manager: otherwise the group is its caller's.
                     pgid: (group_of(me)? == Some(me)).then_some(me),
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: now(),
                     ended_at: None,

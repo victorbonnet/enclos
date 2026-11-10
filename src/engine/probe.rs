@@ -8,28 +8,28 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 
 use crate::backend::LaunchLimits;
-use crate::backend::seatbelt::Baseline;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use signal_hook::consts::SIGTERM;
 
 use super::Engine;
+use super::policy::leaving_out;
+use super::start::SCOPE_END_WAIT;
 use crate::backend::{Launch, SandboxContext};
 use crate::error::{Error, Result};
 use crate::layout::LayoutError;
+use crate::lifecycle::cgroup::Scopes;
 use crate::model::audit::Actor;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::SandboxName;
-use crate::model::secret::{SecretRef, SecretValue};
+use crate::model::unenforced::NotEnforced;
 use crate::policy::paths::{FsPaths, PathContext};
 use crate::probes::{
-    ClosedBy, HostCheck, KEYCHAIN_PROBE_VALUE, KeychainItem, Outcome, Probe, ProbeInputs,
-    ProbeResult, Proof, Run, host_service_probes, missing_workspaces, not_here, outcome, probes,
-    sandboxed_script,
+    Closer, HostCheck, Outcome, Probe, ProbeInputs, ProbeResult, Proof, ReportNotes, Run,
+    TARGET_VARIABLE, ToolCheck, not_here, outcome, probes, sandboxed_script, set_aside_notices,
+    with_real_paths,
 };
-use crate::secrets::SecretStore;
-use crate::secrets::keychain::Keychain;
 
 /// What `enclos policy test` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,9 +42,15 @@ pub struct TestReport {
     /// Whether the policy lets the sandbox listen on TCP (ADR 0028): open by
     /// the policy, so the report says so rather than probing it closed.
     pub listens: bool,
-    /// The baseline the probes ran on: `(allow default)` only when a
-    /// comparison asks for it (ADR 0006), which the report says.
-    pub baseline: Baseline,
+    /// What the report says of the backend's probes, the baseline they ran
+    /// on included.
+    pub notes: ReportNotes,
+    /// What enclos itself said on the probes' sessions, each once, such as
+    /// that the kernel has no Landlock (design §5): not any probe's answer.
+    pub notices: Vec<String>,
+    /// What the sandbox's policy sets that this host does not enforce, with
+    /// whether each is accepted (ADR 0038): the probes ran without it.
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 impl TestReport {
@@ -56,48 +62,33 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::Closed))
     }
 
-    /// Closed probes whose route the `(deny default)` baseline closed, on
-    /// something it refuses the tool before the rule the probe tests is
-    /// reached (likely a lookup; not traced).
-    pub fn closed_by_baseline(&self) -> usize {
-        self.count_closed(|r| r.closed_by == Some(ClosedBy::Baseline))
-    }
-
-    /// The closed probes that show something other than their route's
-    /// rule, as the report says them: ` (1 by Seatbelt itself, 2 by the
-    /// (deny default) baseline)`, or nothing.
+    /// The closed probes that show something other than their route's rule,
+    /// counted by what closed them (` (1 by ..., 2 by ...)`), or nothing.
     pub fn closed_apart(&self) -> String {
-        let said: Vec<String> = [
-            (self.closed_by_platform(), "by Seatbelt itself"),
-            (self.closed_by_baseline(), "by the (deny default) baseline"),
-        ]
-        .into_iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, by)| format!("{n} {by}"))
-        .collect();
+        let said: Vec<String> = [Closer::Backend, Closer::Baseline]
+            .into_iter()
+            .filter_map(|by| {
+                let closed = self
+                    .results
+                    .iter()
+                    .filter(|r| r.outcome == Outcome::Closed && closer(r) == Some(by));
+                let first = closed.clone().next()?.closed_by?;
+                Some(format!("{} {}", closed.count(), first.by()))
+            })
+            .collect();
         match said.is_empty() {
             true => String::new(),
             false => format!(" ({})", said.join(", ")),
         }
     }
 
-    /// Closed probes whose route Seatbelt itself closes, whatever the
-    /// compiled policy says: they show no rule enclos adds.
-    pub fn closed_by_platform(&self) -> usize {
-        self.count_closed(|r| r.closed_by == Some(ClosedBy::Seatbelt))
-    }
-
-    /// Closed probes their route's own rule closed: neither Seatbelt itself
-    /// nor the `(deny default)` baseline, which closes a route whether or
-    /// not its rule is there, so shows nothing of the rule.
+    /// Closed probes their route's own rule closed: neither the backend
+    /// itself nor the baseline, which closes a route whether or not its rule
+    /// is there, so shows nothing of the rule.
     pub fn closed_by_rule(&self) -> usize {
-        self.count_closed(|r| r.closed_by.is_none())
-    }
-
-    fn count_closed(&self, which: impl Fn(&ProbeResult) -> bool) -> usize {
         self.results
             .iter()
-            .filter(|r| r.outcome == Outcome::Closed && which(r))
+            .filter(|r| r.outcome == Outcome::Closed && r.closed_by.is_none())
             .count()
     }
 
@@ -114,14 +105,29 @@ impl TestReport {
         self.count(|o| matches!(o, Outcome::NotRun(_)))
     }
 
-    /// Whether the test passed: nothing got through, every probe ran, and at
-    /// least one was shown closed by its route's rule. An inconclusive probe
+    /// Whether the test passed: nothing got through, every probe ran, at
+    /// least one was shown closed by its route's rule, and every field this
+    /// host does not enforce is accepted (ADR 0038). An inconclusive probe
     /// does not fail it, but a test where none was closed, or only those
-    /// Seatbelt itself or the baseline closes, showed nothing about the
+    /// the backend itself or the baseline closes, showed nothing about the
     /// policy's rules.
     pub fn passed(&self) -> bool {
-        self.open() == 0 && self.not_run() == 0 && self.closed_by_rule() > 0
+        self.open() == 0
+            && self.not_run() == 0
+            && self.closed_by_rule() > 0
+            && self.not_accepted().next().is_none()
     }
+
+    /// The fields this host does not enforce that are not accepted, or
+    /// accepted at another value.
+    pub fn not_accepted(&self) -> impl Iterator<Item = &NotEnforced> {
+        self.not_enforced.iter().filter(|n| !n.is_accepted())
+    }
+}
+
+/// What closed a probe apart from its route's rule, if anything.
+fn closer(result: &ProbeResult) -> Option<Closer> {
+    result.closed_by.map(|by| by.closer)
 }
 
 /// How long the signal probe's target lives at most: longer than any test,
@@ -129,13 +135,15 @@ impl TestReport {
 const TARGET_LIFETIME: &str = "3600";
 
 /// The process the signal probe aims at, started by this command in a group
-/// of its own, and always ended when the test ends.
+/// of its own, and always ended when the test ends. It carries
+/// [`TARGET_VARIABLE`], so that a probe of its environment tells it apart.
 struct Target(Child);
 
 impl Target {
     fn start() -> Result<Target> {
         Command::new("/bin/sleep")
             .arg(TARGET_LIFETIME)
+            .env(TARGET_VARIABLE, "1")
             .process_group(0)
             .spawn()
             .map(Target)
@@ -149,74 +157,6 @@ impl Drop for Target {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-/// A throwaway item the "read a keychain item" probe tries to read from
-/// inside the sandbox: stored in the default keychain, or the one
-/// `ENCLOS_KEYCHAIN` names, under a service of its own,
-/// `enclos.<install>.probe`, so it never stands for a secret, and removed
-/// when the test ends. Where none can be stored (Linux, no default
-/// keychain, a store that failed or did not answer), the report says why
-/// the probe did not run.
-struct KeychainProbe {
-    store: Keychain,
-    secret: SecretRef,
-    item: KeychainItem,
-}
-
-impl KeychainProbe {
-    fn store(
-        layout: &crate::layout::Layout,
-        name: &SandboxName,
-    ) -> std::result::Result<KeychainProbe, String> {
-        if !cfg!(target_os = "macos") {
-            return Err("the Keychain is macOS's".to_owned());
-        }
-        let install = layout
-            .install_id()
-            .map_err(|e| format!("enclos cannot tell its install apart: {e}"))?;
-        let service = format!("enclos.{install}.probe");
-        let store = Keychain::from_env(service.clone());
-        let secret: SecretRef = format!("{name}/probe")
-            .parse()
-            .map_err(|e| format!("{e}"))?;
-        let value = SecretValue::new(KEYCHAIN_PROBE_VALUE.to_owned()).expect("not empty");
-        if let Err(e) = store.set(&secret, &value) {
-            // A store that went through but did not read back leaves an
-            // item: it goes too. One refused before anything ran left none.
-            let left = match e.untouched {
-                true => String::new(),
-                false => match store.remove(&secret) {
-                    Ok(_) => String::new(),
-                    Err(gone) => format!(
-                        "; removing what it may have left failed too ({gone}): it is {}",
-                        store.whereabouts(&secret)
-                    ),
-                },
-            };
-            return Err(format!("enclos could not store a test item: {e}{left}"));
-        }
-        Ok(KeychainProbe {
-            item: KeychainItem {
-                service,
-                account: secret.to_string(),
-                file: store.file().map(ToOwned::to_owned),
-            },
-            store,
-            secret,
-        })
-    }
-}
-
-impl Drop for KeychainProbe {
-    fn drop(&mut self) {
-        if let Err(e) = self.store.remove(&self.secret) {
-            crate::notes::say(&format!(
-                "the keychain item probe's test item stays: {e}; it is {}",
-                self.store.whereabouts(&self.secret)
-            ));
-        }
     }
 }
 
@@ -263,10 +203,11 @@ impl Engine {
         }
         let summary = |r: &TestReport| {
             let platform = r.closed_apart();
-            let baseline = match r.baseline {
-                Baseline::AllowDefault => ", on the (allow default) comparison baseline",
-                Baseline::DenyDefault => "",
-            };
+            let baseline = r
+                .notes
+                .comparison
+                .map(|c| format!(", on {c}"))
+                .unwrap_or_default();
             format!(
                 "{} probes: {} closed{platform}, {} open, {} inconclusive, {} not run{baseline}",
                 r.results.len(),
@@ -278,57 +219,59 @@ impl Engine {
         };
         self.wait_service_proxy(name)?;
         self.write(by, "policy test", Some(name.to_string()), summary, |lock| {
+            // Each probe runs in a scope, as a session's program does: on a
+            // host whose systemd cannot start one, nothing starts.
+            if let Some(what) = self.scopes.as_ref().and_then(Scopes::refusal) {
+                return Err(Error::Session { what });
+            }
             let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                 name: name.to_string(),
             })?;
             let compiled = self.compile_policy(name, record.proxy_port)?;
-            // The baseline's refused lookups count as closed only on
-            // `(deny default)`, as the file compiled for these probes says.
-            // Read before anything is started for the probes.
+            let backend = self.backend_of(name)?;
+            // Read before anything starts: the backend's probes depend on
+            // what was compiled.
             let text = std::fs::read_to_string(&compiled).map_err(|source| LayoutError::Io {
                 path: compiled.clone(),
                 source,
             })?;
-            let baseline = Baseline::of_compiled(&text).ok_or_else(
-                || Error::Session {
-                    what: format!(
-                        "{} names no baseline enclos writes, though enclos just wrote it: a bug of enclos, or the file was edited meanwhile",
-                        compiled.display()
-                    ),
-                },
-            )?;
+            let mut own = backend
+                .own_probes(Some(&text))
+                .map_err(|why| Error::Session {
+                    what: format!("{} {why}", compiled.display()),
+                })?;
             // The limits the sandbox's processes run under, which the
-            // resource probes show.
-            let limits = self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+            // resource probes show, without what this host does not
+            // enforce: the report names each, and fails on one not
+            // accepted rather than refusing to probe.
+            let policy = self.active_policy(name)?.1.policy;
+            let not_enforced = self.not_enforced(name, record.backend, &policy)?;
+            let limits = leaving_out(self.checked_limits(&record, &policy)?, &not_enforced);
             self.ensure_proxy(lock, &record)?;
+            self.ensure_holder(&record)?;
             let ctx = self.sandbox_context(name, record.proxy_port);
             // TMPDIR inside the sandbox (the policy denies /tmp): without it,
             // the probes would fail for a reason that is not the policy.
             let tmp = ctx.home.join("tmp");
             std::fs::create_dir_all(&tmp)
                 .map_err(|source| LayoutError::Io { path: tmp, source })?;
-            let backend = self.backend_of(name)?;
 
             let mut target = Target::start()?;
             let terminal = OtherTerminal::open()?;
-            let keychain = KeychainProbe::store(&self.layout, name);
-            let mut inputs = self.probe_inputs(
+            let inputs = self.probe_inputs(
                 name,
                 &ctx,
                 Some(target.0.id()),
                 Some(terminal.path.clone()),
                 limits.clone(),
-                baseline,
             )?;
-            inputs.keychain_item = keychain
-                .as_ref()
-                .map(|k| k.item.clone())
-                .map_err(Clone::clone);
-            let mut list = probes(&inputs);
+            let _set_up = own.set_up(&self.layout, name, &inputs);
+            let mut list = probes(&inputs, own.as_ref());
             if host_services {
-                list.extend(host_service_probes(&inputs));
+                list.extend(own.host_services(&inputs));
             }
             let mut results = Vec::new();
+            let mut notices: Vec<String> = Vec::new();
             for probe in list {
                 let run_in_sandbox = |script: String| {
                     let launch = Launch {
@@ -340,22 +283,33 @@ impl Engine {
                         in_terminal: false,
                         service_port: None,
                         limits: limits.clone(),
+                        reads: Vec::new(),
                     };
-                    backend
+                    let wrapped = backend
                         .wrap(&compiled, &ctx, &launch)
-                        .stdin(Stdio::null())
-                        .output()
+                        .map_err(std::io::Error::other)?;
+                    let mut out = self.run_scoped(name, wrapped, &launch.limits)?;
+                    let (stderr, said) = set_aside_notices(&out.stdout, &out.stderr);
+                    out.stderr = stderr;
+                    for notice in said {
+                        if !notices.contains(&notice) {
+                            notices.push(notice);
+                        }
+                    }
+                    Ok(out)
                 };
                 let outcome = run_probe(&probe, run_in_sandbox, &mut target.0);
                 results.push(ProbeResult::of(probe, outcome));
             }
-            results.extend(missing_workspaces(&inputs));
+            results.extend(own.folders_not_run(&inputs));
             Ok(TestReport {
                 results,
                 host_services,
-                not_here: not_here(&inputs),
+                not_here: not_here(&inputs, own.as_ref()),
                 listens: inputs.listen,
-                baseline,
+                notes: own.notes(),
+                notices,
+                not_enforced,
             })
         })
         .map(Planned::Done)
@@ -372,7 +326,6 @@ impl Engine {
         target: Option<u32>,
         other_terminal: Option<PathBuf>,
         limits: LaunchLimits,
-        baseline: Baseline,
     ) -> Result<ProbeInputs> {
         let policy = self.policy(name)?.snapshot.policy;
         let paths = PathContext {
@@ -395,10 +348,18 @@ impl Engine {
         }
         let mut writes = fs.writes.clone();
         writes.push(home.clone());
+        let record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
+            name: name.to_string(),
+        })?;
+        let mut hidden_files = self.layout.hidden_files();
+        if record.backend.binds_the_hosts_root() {
+            hidden_files = with_real_paths(&hidden_files, &self.layout.run_dir());
+        }
         Ok(ProbeInputs {
             user_home: ctx.user_home.clone(),
             data: self.layout.data().to_owned(),
             config_file: self.layout.config_file(),
+            hidden_files,
             sandbox_dir: self.layout.sandbox_dir(name.as_str()),
             writes,
             other_sandboxes: self
@@ -415,11 +376,9 @@ impl Engine {
             host_sockets: host_sockets(&ctx.user_home),
             proxy_port: ctx.proxy_port,
             listen: policy.net.listen,
-            baseline,
             target,
             other_terminal,
             tag: std::process::id(),
-            keychain_item: Err("not probed here".into()),
             limits,
         })
     }
@@ -433,27 +392,30 @@ impl Engine {
         let ctx = self.sandbox_context(name, record.proxy_port);
         // A dry run starts no target and opens no terminal: placeholders
         // stand for them, only to count the probes that use them.
-        let limits = self.launch_limits(&record, &self.policy(name)?.snapshot.policy)?;
-        // The baseline only changes what closes a probe, not how many run.
-        let mut inputs = self.probe_inputs(
+        let policy = self.policy(name)?.snapshot.policy;
+        let not_enforced = self.not_enforced(name, record.backend, &policy)?;
+        let limits = leaving_out(self.checked_limits(&record, &policy)?, &not_enforced);
+        // Not `backend_of`: a dry run asks nothing of the host, so it also
+        // counts for a backend this host cannot run. It reads no compiled
+        // file, which changes what closes a probe, not how many run.
+        let backend = match self.backends.iter().find(|b| b.kind() == record.backend) {
+            Some(backend) => backend.as_ref(),
+            None => self.backend_of(name)?,
+        };
+        let mut own = backend
+            .own_probes(None)
+            .map_err(|what| Error::Session { what })?;
+        let inputs = self.probe_inputs(
             name,
             &ctx,
             Some(0),
             Some(PathBuf::from("/dev/ttys0")),
             limits,
-            Baseline::default(),
         )?;
-        inputs.keychain_item = match cfg!(target_os = "macos") {
-            true => Ok(KeychainItem {
-                service: "enclos.probe".into(),
-                account: format!("{name}/probe"),
-                file: None,
-            }),
-            false => Err("the Keychain is macOS's".to_owned()),
-        };
-        let mut count = probes(&inputs).len();
+        own.count_only(&self.layout, name, &inputs);
+        let mut count = probes(&inputs, own.as_ref()).len();
         if host_services {
-            count += host_service_probes(&inputs).len();
+            count += own.host_services(&inputs).len();
         }
         let mut changes = Vec::new();
         if !self.proxy_runs(name)? {
@@ -465,9 +427,11 @@ impl Engine {
         changes.push(format!(
             "run {count} escape probes in sandbox {name} under policy v{version}{}",
             match host_services {
-                true =>
-                    ", host-service routes included: they act on this Mac if a rule does not hold",
-                false => "",
+                true => format!(
+                    ", host-service routes included: they act on {} if a rule does not hold",
+                    own.notes().host
+                ),
+                false => String::new(),
             }
         ));
         Ok(Plan {
@@ -475,12 +439,34 @@ impl Engine {
             ..Plan::default()
         })
     }
+
+    /// Runs `wrapped`, a probe of sandbox `name`, to its end with no input,
+    /// in a scope of the sandbox's slice held to `limits`, as a session's
+    /// program runs where this engine has scopes (design §8), then ends what
+    /// it left there.
+    fn run_scoped(
+        &self,
+        name: &SandboxName,
+        wrapped: Command,
+        limits: &LaunchLimits,
+    ) -> std::io::Result<std::process::Output> {
+        let (mut scoped, scope) = self
+            .in_scope(name, wrapped, limits)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let output = scoped.stdin(Stdio::null()).output()?;
+        if let Some(scope) = scope {
+            scope.end(SCOPE_END_WAIT).map_err(|e| {
+                std::io::Error::other(format!("cannot end what it left in its scope: {e}"))
+            })?;
+        }
+        Ok(output)
+    }
 }
 
 /// Runs one probe: its control on the host, a look at the host before, the
 /// probe in the sandbox through `run_in_sandbox`, and a look at the host
 /// after.
-fn run_probe(
+pub(super) fn run_probe(
     probe: &Probe,
     run_in_sandbox: impl FnOnce(String) -> std::io::Result<std::process::Output>,
     target: &mut Child,
@@ -541,37 +527,28 @@ fn present(check: &HostCheck) -> std::result::Result<bool, String> {
             .try_exists()
             .map_err(|e| format!("cannot look for {}: {e}", path.display())),
         // Absent when the tool says so; any other failure cannot tell.
-        HostCheck::LaunchdJob(label) => listed(
-            "/bin/launchctl",
-            &["list", label],
-            &["Could not find service"],
-        ),
-        // `does not exist` to macOS 26, `not found` on macOS 27.
-        HostCheck::PreferencesDomain(domain) => listed(
-            "/usr/bin/defaults",
-            &["read", domain],
-            &["does not exist", "not found"],
-        ),
+        HostCheck::Tool(tool) => listed(tool),
         HostCheck::Target => Ok(false),
     }
 }
 
-/// Whether `program` finds what `args` name, or, by one of the `absent`
+/// Whether `tool` finds what it looks up, or, by one of its `absent`
 /// messages, says it is not there.
-fn listed(program: &str, args: &[&str], absent: &[&str]) -> std::result::Result<bool, String> {
-    let out = Command::new(program)
-        .args(args)
+fn listed(tool: &ToolCheck) -> std::result::Result<bool, String> {
+    let out = Command::new(tool.program)
+        .args(&tool.look)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run {program}: {e}"))?;
+        .map_err(|e| format!("cannot run {}: {e}", tool.program))?;
     let text = output(&out);
-    let says_absent = absent.iter().any(|message| text.contains(message));
+    let says_absent = tool.absent.iter().any(|message| text.contains(message));
     match (out.status.success(), says_absent) {
         (true, _) => Ok(true),
         (false, true) => Ok(false),
         (false, false) => Err(format!(
-            "{program} {} failed ({}): {}",
-            args.join(" "),
+            "{} {} failed ({}): {}",
+            tool.program,
+            tool.look.join(" "),
             out.status,
             text.trim()
         )),
@@ -616,8 +593,7 @@ fn after(check: &HostCheck, target: &mut Child) -> std::result::Result<Option<St
     }
     let removed = match check {
         HostCheck::File(path) => std::fs::remove_file(path).map_err(|e| e.to_string()),
-        HostCheck::LaunchdJob(label) => removed("/bin/launchctl", &["remove", label]),
-        HostCheck::PreferencesDomain(domain) => removed("/usr/bin/defaults", &["delete", domain]),
+        HostCheck::Tool(tool) => removed(tool),
         HostCheck::Target => unreachable!("handled above"),
     };
     let cleanup = match removed {
@@ -627,23 +603,22 @@ fn after(check: &HostCheck, target: &mut Child) -> std::result::Result<Option<St
     Ok(Some(format!("left {} ({cleanup})", describe(check))))
 }
 
-fn removed(program: &str, args: &[&str]) -> std::result::Result<(), String> {
-    let out = Command::new(program)
-        .args(args)
+fn removed(tool: &ToolCheck) -> std::result::Result<(), String> {
+    let out = Command::new(tool.program)
+        .args(&tool.remove)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run {program}: {e}"))?;
+        .map_err(|e| format!("cannot run {}: {e}", tool.program))?;
     match out.status.success() {
         true => Ok(()),
-        false => Err(format!("{program} failed: {}", output(&out).trim())),
+        false => Err(format!("{} failed: {}", tool.program, output(&out).trim())),
     }
 }
 
 fn describe(check: &HostCheck) -> String {
     match check {
         HostCheck::File(path) => format!("the file {}", path.display()),
-        HostCheck::LaunchdJob(label) => format!("the launchd job {label}"),
-        HostCheck::PreferencesDomain(domain) => format!("the preferences domain {domain}"),
+        HostCheck::Tool(tool) => tool.what.clone(),
         HostCheck::Target => "the signal probe's target".to_owned(),
     }
 }
@@ -651,8 +626,7 @@ fn describe(check: &HostCheck) -> String {
 fn by_hand(check: &HostCheck) -> String {
     match check {
         HostCheck::File(path) => format!("remove it with `rm {}`", path.display()),
-        HostCheck::LaunchdJob(label) => format!("remove it with `launchctl remove {label}`"),
-        HostCheck::PreferencesDomain(d) => format!("delete it with `defaults delete {d}`"),
+        HostCheck::Tool(tool) => tool.by_hand.clone(),
         HostCheck::Target => String::new(),
     }
 }
@@ -664,6 +638,8 @@ fn host_sockets(user_home: &std::path::Path) -> Vec<PathBuf> {
         .into_iter()
         .collect();
     sockets.push(user_home.join(".docker/run/docker.sock"));
+    sockets.push(user_home.join(".1password/agent.sock"));
+    sockets.push(user_home.join(".bitwarden-ssh-agent.sock"));
     sockets.push(PathBuf::from("/var/run/docker.sock"));
     sockets.into_iter().filter(|s| s.exists()).collect()
 }
@@ -671,7 +647,24 @@ fn host_sockets(user_home: &std::path::Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::seatbelt::Baseline;
+    use crate::backend::seatbelt::probes::{BEFORE_THE_RULE, ITSELF, SeatbeltProbes, notes_on};
     use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn a_password_managers_ssh_agent_in_the_home_is_a_host_socket() {
+        let home = tempfile::tempdir().unwrap();
+        let (one, bit) = (
+            home.path().join(".1password/agent.sock"),
+            home.path().join(".bitwarden-ssh-agent.sock"),
+        );
+        assert!(!host_sockets(home.path()).contains(&one));
+        std::fs::create_dir(one.parent().unwrap()).unwrap();
+        std::fs::write(&one, "").unwrap();
+        std::fs::write(&bit, "").unwrap();
+        let found = host_sockets(home.path());
+        assert!(found.contains(&one) && found.contains(&bit), "{found:?}");
+    }
 
     fn report(outcomes: Vec<Outcome>) -> TestReport {
         TestReport {
@@ -687,7 +680,9 @@ mod tests {
             host_services: false,
             not_here: Vec::new(),
             listens: false,
-            baseline: Baseline::DenyDefault,
+            notes: notes_on(Baseline::DenyDefault),
+            notices: Vec::new(),
+            not_enforced: Vec::new(),
         }
     }
 
@@ -696,8 +691,27 @@ mod tests {
     fn a_launchd_job_or_preferences_domain_nobody_made_is_absent() {
         // Read-only lookups of names no one uses.
         let label = format!("org.enclos.probe.absent.{}", std::process::id());
-        assert_eq!(present(&HostCheck::LaunchdJob(label.clone())), Ok(false));
-        assert_eq!(present(&HostCheck::PreferencesDomain(label)), Ok(false));
+        let job = crate::backend::seatbelt::probes::launchd_job(&label);
+        let domain = crate::backend::seatbelt::probes::preferences_domain(&label);
+        assert_eq!(present(&HostCheck::Tool(job)), Ok(false));
+        assert_eq!(present(&HostCheck::Tool(domain)), Ok(false));
+    }
+
+    /// Either wording of a missing domain reads absent, whatever the macOS
+    /// here says; any other failure cannot tell.
+    #[test]
+    fn a_preferences_domain_is_absent_by_either_message_of_defaults() {
+        let saying = |message: &str| {
+            let script = format!("echo \"{message}\" >&2; exit 1");
+            HostCheck::Tool(ToolCheck {
+                program: "/bin/sh",
+                look: vec!["-c".to_owned(), script],
+                ..crate::backend::seatbelt::probes::preferences_domain("x")
+            })
+        };
+        assert_eq!(present(&saying("Domain 'x' not found.")), Ok(false));
+        assert_eq!(present(&saying("Domain x does not exist")), Ok(false));
+        assert!(present(&saying("Could not read it")).is_err());
     }
 
     /// What closed apart from a route's rule is said by who, and a test the
@@ -706,17 +720,16 @@ mod tests {
     #[test]
     fn closures_apart_from_the_rules_are_said_by_who() {
         let mut r = report(vec![Outcome::Closed; 4]);
-        r.results[0].closed_by = Some(ClosedBy::Seatbelt);
-        r.results[1].closed_by = Some(ClosedBy::Baseline);
-        r.results[2].closed_by = Some(ClosedBy::Baseline);
+        r.results[0].closed_by = Some(ITSELF);
+        r.results[1].closed_by = Some(BEFORE_THE_RULE);
+        r.results[2].closed_by = Some(BEFORE_THE_RULE);
         assert_eq!(
             r.closed_apart(),
             " (1 by Seatbelt itself, 2 by the (deny default) baseline)"
         );
-        assert_eq!((r.closed_by_platform(), r.closed_by_baseline()), (1, 2));
         assert_eq!(report(vec![Outcome::Closed]).closed_apart(), "");
         let mut baseline_only = report(vec![Outcome::Closed]);
-        baseline_only.results[0].closed_by = Some(ClosedBy::Baseline);
+        baseline_only.results[0].closed_by = Some(BEFORE_THE_RULE);
         assert!(!baseline_only.passed());
         assert_eq!(baseline_only.closed_by_rule(), 0);
         baseline_only
@@ -739,18 +752,16 @@ mod tests {
         // Seatbelt's own refusal of setuid programs shows no enclos rule.
         let mut platform = report(vec![Outcome::Closed, Outcome::Inconclusive("x".into())]);
         for r in &mut platform.results {
-            r.closed_by = Some(ClosedBy::Seatbelt);
+            r.closed_by = Some(ITSELF);
         }
         assert!(!platform.passed());
-        assert_eq!(platform.closed_by_platform(), 1);
+        assert_eq!(platform.closed_apart(), " (1 by Seatbelt itself)");
         platform
             .results
             .extend(report(vec![Outcome::Closed]).results);
         assert!(platform.passed());
-        assert_eq!(
-            (platform.closed_by_platform(), platform.closed_by_rule()),
-            (1, 1)
-        );
+        assert_eq!(platform.closed_apart(), " (1 by Seatbelt itself)");
+        assert_eq!(platform.closed_by_rule(), 1);
         assert!(!report(vec![Outcome::Closed, Outcome::Open("x".into())]).passed());
         // Nothing closed is nothing shown.
         assert!(!report(vec![Outcome::Inconclusive("x".into()); 2]).passed());
@@ -762,6 +773,7 @@ mod tests {
             user_home: dir.to_owned(),
             data: dir.join("enclos"),
             config_file: dir.join("enclos/config.toml"),
+            hidden_files: crate::probes::hidden_in(&dir.join("enclos")),
             sandbox_dir: dir.join("enclos/sandboxes/home"),
             other_sandboxes: Vec::new(),
             writes: Vec::new(),
@@ -772,20 +784,21 @@ mod tests {
             host_sockets: Vec::new(),
             proxy_port: 41001,
             listen: false,
-            baseline: crate::backend::seatbelt::Baseline::AllowDefault,
             target: Some(target),
             other_terminal: None,
             tag: 7,
-            keychain_item: Err("not probed here".into()),
             limits: Default::default(),
         }
     }
 
     fn probe_of(route: &str, dir: &std::path::Path, target: u32) -> Probe {
-        probes(&inputs(dir, target))
-            .into_iter()
-            .find(|p| p.route == route)
-            .unwrap()
+        probes(
+            &inputs(dir, target),
+            &SeatbeltProbes::on(Baseline::AllowDefault),
+        )
+        .into_iter()
+        .find(|p| p.route == route)
+        .unwrap()
     }
 
     /// A sandbox run that printed the marker and failed, as a refusal does.

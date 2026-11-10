@@ -1,6 +1,7 @@
 use super::policy::with_sandbox;
 use super::*;
-use crate::engine::listener::{NoPort, outside_proxy_range, service_listener};
+use crate::engine::listener::{Network, NoPort, outside_proxy_range, service_listener};
+use crate::lifecycle::marker::spawn_unmarked;
 use crate::model::runtime::RuntimeKind;
 use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 
@@ -8,11 +9,12 @@ use crate::model::session::{ProcessRef, SessionId, SessionKind, SessionRecord};
 /// it listens on, one a line, then waits.
 fn perl(script: &str, ports: usize) -> (std::process::Child, Vec<u16>) {
     use std::io::BufRead;
-    let mut child = std::process::Command::new("/usr/bin/perl")
-        .args(["-MSocket=:all", "-e", script])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", script])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
     let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
     let ports = (0..ports)
         .map(|_| lines.next().unwrap().unwrap().parse().unwrap())
@@ -24,7 +26,8 @@ fn perl(script: &str, ports: usize) -> (std::process::Child, Vec<u16>) {
 /// gateway binds `127.0.0.1:0`.
 fn listening(ports: usize, at: &str) -> String {
     format!(
-        "for (1..{ports}) {{ socket(my $s, PF_INET, SOCK_STREAM, 0) or die; bind($s, sockaddr_in(0, inet_aton(\"{at}\"))) or die; listen($s, 1) or die; push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30"
+        "{}for (1..{ports}) {{ my $s = listener(inet_aton(\"{at}\")); push @s, $s; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); }} $| = 1; STDOUT->flush; sleep 30",
+        crate::test_ports::perl_listener()
     )
 }
 
@@ -51,6 +54,7 @@ pub(super) fn record_gateway(engine: &Engine, name: &SandboxName, root: ProcessR
                     compiled: None,
                     root,
                     pgid: None,
+                    cgroup: None,
                     tracked: Vec::new(),
                     started_at: crate::model::now(),
                     ended_at: None,
@@ -69,10 +73,19 @@ pub(super) fn gateway(
     name: &SandboxName,
     ports: usize,
 ) -> (std::process::Child, u16) {
-    let (child, held) = perl(&listening(ports, "127.0.0.1"), ports);
-    let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
-    record_gateway(engine, name, root);
-    (child, held[0])
+    // The kernel's ephemeral ports hold the proxy's range, which the
+    // engine refuses in a gateway, so one that lands there is dropped.
+    let proxy_ports = crate::model::sandbox::PORT_FIRST..=crate::model::sandbox::PORT_LAST;
+    loop {
+        let (child, held) = perl(&listening(ports, "127.0.0.1"), ports);
+        if held.iter().any(|port| proxy_ports.contains(port)) {
+            end(child);
+            continue;
+        }
+        let root = crate::lifecycle::process::reference_of_child(&child).unwrap();
+        record_gateway(engine, name, root);
+        return (child, held[0]);
+    }
 }
 
 pub(super) fn end(mut child: std::process::Child) {
@@ -129,7 +142,7 @@ fn the_service_port_is_the_one_its_own_process_holds() {
 fn a_service_holding_several_ports_gets_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (child, _) = gateway(&engine, &name, 2);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(child);
     assert!(
         matches!(&got, Err(NoPort::Refused(why)) if why.contains("listens on 2 ephemeral ports")),
@@ -142,7 +155,7 @@ fn two_open_gateway_sessions_get_none_rather_than_a_guess() {
     let (_dir, engine, name) = with_sandbox();
     let (one, _) = gateway(&engine, &name, 1);
     let (two, _) = gateway(&engine, &name, 1);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(one);
     end(two);
     assert!(
@@ -156,13 +169,13 @@ fn a_pid_now_another_processs_is_not_taken_for_the_gateway() {
     let (_dir, engine, name) = with_sandbox();
     // This test process listens, under the gateway's recorded pid but
     // not its start time, as when the pid was reused.
-    let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
     let root = ProcessRef {
         pid: std::process::id(),
         started: "Thu Jan  1 00:00:00 1970".to_owned(),
     };
     record_gateway(&engine, &name, root);
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     assert!(
         matches!(&got, Err(NoPort::NotRunning(why)) if why.contains("not running")),
         "{got:?}"
@@ -179,7 +192,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&child).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(child);
     assert!(
         matches!(&got, Err(NoPort::NotYet(why)) if why.contains("no TCP listener at 127.0.0.1")),
@@ -189,13 +202,17 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
     // Sharing 127.0.0.1 at its port with another process (SO_REUSEPORT):
     // a session could reach that one too.
     let (_dir, engine, name) = with_sandbox();
-    let shared = "socket(my $s, PF_INET, SOCK_STREAM, 0) or die; setsockopt($s, SOL_SOCKET, SO_REUSEPORT, 1) or die; bind($s, sockaddr_in($ARGV[0] // 0, INADDR_LOOPBACK)) or die; listen($s, 1) or die; print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30";
-    let (owner, port) = perl(shared, 1);
-    let mut other = std::process::Command::new("/usr/bin/perl")
-        .args(["-MSocket=:all", "-e", shared, &port[0].to_string()])
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let shared = format!(
+        "{}my $s = listener(INADDR_LOOPBACK, $ARGV[0], 1); print((sockaddr_in(getsockname($s)))[0], qq(\\n)); $| = 1; STDOUT->flush; sleep 30",
+        crate::test_ports::perl_listener()
+    );
+    let (owner, port) = perl(&shared, 1);
+    let mut other = spawn_unmarked(
+        std::process::Command::new("/usr/bin/perl")
+            .args(["-MSocket=:all", "-e", &shared, &port[0].to_string()])
+            .stdout(std::process::Stdio::piped()),
+    )
+    .unwrap();
     {
         use std::io::BufRead;
         let mut lines = std::io::BufReader::new(other.stdout.take().unwrap()).lines();
@@ -206,7 +223,7 @@ fn a_gateway_on_every_address_or_sharing_its_port_gets_none() {
         &name,
         crate::lifecycle::process::reference_of_child(&owner).unwrap(),
     );
-    let got = service_listener(engine.state.as_ref(), &name, "gateway");
+    let got = service_listener(engine.state.as_ref(), &name, "gateway", &Network::Host);
     end(owner);
     end(other);
     let why = got.unwrap_err();

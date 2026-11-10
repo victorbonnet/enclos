@@ -13,14 +13,17 @@ use crate::layout::LayoutError;
 use crate::model::audit::{Actor, Outcome};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
 use crate::model::session::SessionKind;
+use crate::model::unenforced::NotEnforced;
 use crate::runtime::{RuntimeService, ServiceName, adapter};
 use crate::service::{LABEL_PREFIX, ServiceError, ServiceLabel, ServiceStatus, ServiceUnit};
 
-/// One of a sandbox's services: its proxy, or one its runtime declares,
-/// by the name the runtime gives it.
+/// One of a sandbox's services: its proxy, its namespace holder for a
+/// backend whose sessions join one (ADR 0039), or one its runtime declares,
+/// by the name the runtime gives it, which is never `proxy` or `holder`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     Proxy,
+    Holder,
     Runtime(ServiceName),
 }
 
@@ -28,9 +31,19 @@ impl Unit {
     pub fn as_str(self) -> &'static str {
         match self {
             Unit::Proxy => "proxy",
+            Unit::Holder => "holder",
             Unit::Runtime(name) => name.as_str(),
         }
     }
+}
+
+/// What `sandbox start` did: the services it installed, and what the
+/// sandbox runs with not enforced on this host, every one accepted (ADR
+/// 0038).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SandboxStarted {
+    pub labels: Vec<ServiceLabel>,
+    pub not_enforced: Vec<NotEnforced>,
 }
 
 /// How long `launch` and `connect` wait for the sandbox's proxy to record
@@ -64,25 +77,27 @@ impl Engine {
     }
 
     /// The services `start_sandbox` installs for a runtime declaring
-    /// `services`: the proxy, then those, as declared.
-    fn units_for(services: &[RuntimeService]) -> Vec<Unit> {
+    /// `services`: the proxy, the namespace holder when the sandbox's
+    /// sessions join one, then those, as declared.
+    fn units_for(services: &[RuntimeService], holder: bool) -> Vec<Unit> {
         std::iter::once(Unit::Proxy)
+            .chain(holder.then_some(Unit::Holder))
             .chain(services.iter().map(|s| Unit::Runtime(s.name)))
             .collect()
     }
 
-    fn units(record: &SandboxRecord) -> Vec<Unit> {
+    fn units(&self, record: &SandboxRecord) -> Vec<Unit> {
         let services = record
             .runtime
             .map(|kind| adapter(kind).services())
             .unwrap_or_default();
-        Self::units_for(&services)
+        Self::units_for(&services, self.holder_of(record.backend).is_some())
     }
 
     /// The labels `start_sandbox` installs.
     pub fn service_labels(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
         let record = self.record(name)?;
-        Self::units(&record)
+        self.units(&record)
             .into_iter()
             .map(|u| self.label(name, u))
             .collect()
@@ -93,6 +108,14 @@ impl Engine {
     /// as one a runtime no longer declares.
     pub(super) fn installed_labels(&self, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
         let mut labels = self.services.installed(&self.label_prefix(name)?)?;
+        // Recorded running with nothing to show: it may be that the manager
+        // is looking elsewhere, and calling that nothing to stop would leave
+        // units running and starting at each login.
+        if labels.is_empty()
+            && matches!(self.state.get(name)?, Some(r) if r.state == SandboxState::Running)
+        {
+            self.services.can_list()?;
+        }
         let proxy = self.label(name, Unit::Proxy)?;
         labels.sort_by_key(|l| (*l == proxy, l.clone()));
         Ok(labels)
@@ -106,10 +129,25 @@ impl Engine {
         self.logs_dir(name).join(format!("{}.log", unit.as_str()))
     }
 
+    /// Makes the folder of the sandbox's logs, which a service's unit
+    /// appends to: the service manager makes no folder, and does not start
+    /// a unit whose log it cannot open.
+    pub(super) fn create_logs_dir(&self, name: &SandboxName) -> Result<()> {
+        let logs = self.logs_dir(name);
+        std::fs::create_dir_all(&logs).map_err(|source| LayoutError::Io { path: logs, source })?;
+        Ok(())
+    }
+
     /// The proxy's log, whether the service manager or a session started
     /// it, so that `enclos logs` shows it either way.
     pub(super) fn proxy_log(&self, name: &SandboxName) -> PathBuf {
         self.log_file(name, Unit::Proxy)
+    }
+
+    /// The log of `enclos dashboard`'s program, beside the services' so
+    /// that `enclos logs` shows it.
+    pub(super) fn dashboard_log(&self, name: &SandboxName) -> PathBuf {
+        self.logs_dir(name).join("dashboard.log")
     }
 
     pub(super) fn record(&self, name: &SandboxName) -> Result<SandboxRecord> {
@@ -118,11 +156,16 @@ impl Engine {
         })
     }
 
-    /// Installs the sandbox's proxy and its runtime's services, replacing
-    /// those it has already. If one cannot be installed, none stays
-    /// installed and the sandbox is marked failed. The services start on
-    /// their own; `proxy_started` says when the proxy has.
-    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// Installs the sandbox's proxy, its namespace holder and its runtime's
+    /// services, replacing those it has already but a namespace holder that
+    /// answers, whose namespace holds the sessions still open (ADR 0039). If
+    /// one cannot be installed, none stays installed but that namespace
+    /// holder, and the sandbox is marked failed. The services start on their
+    /// own; `proxy_started` says when the proxy has. Each field the sandbox
+    /// runs with not enforced on this host, every one accepted, is said in
+    /// one line once its services are installed (ADR 0038), as each of its
+    /// sessions says it too.
+    pub fn start_sandbox(&self, by: &Actor, name: &SandboxName) -> Result<SandboxStarted> {
         self.require_sandbox(name)?;
         // Before anything is stopped: an unavailable manager (no login
         // session, another system) would leave the sandbox with nothing.
@@ -136,16 +179,27 @@ impl Engine {
         // them again, under the service manager's own hard limit.
         let record = self.record(name)?;
         self.launch_limits(&record, &self.active_policy(name)?.1.policy)?;
+        // Replacing it would split the sandbox: its open sessions would stay
+        // in the old namespace, cut off from the proxy (ADR 0039).
+        let kept = self.answering_holder(&record)?;
+        let kept_ref = kept.as_slice();
+        let kept = kept.as_ref();
         // Outside the lock, here and on failure: a runtime service told to
         // end stops its runtime and records its end, which needs the lock.
-        self.remove_services(by, name, "before sandbox start", IfUnrecorded::Stop)?
-            .into_result()?;
-        self.install_services(by, name).map_err(|error| {
+        self.remove_services(
+            by,
+            name,
+            "before sandbox start",
+            IfUnrecorded::Stop,
+            kept_ref,
+        )?
+        .into_result()?;
+        let started = self.install_services(by, name, kept).map_err(|error| {
             // None may stay installed: the undo removes them even when its
             // first entry cannot be written, as the start's entry records
             // the attempt.
             let undo = "after a failed sandbox start";
-            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway) {
+            match self.remove_services(by, name, undo, IfUnrecorded::RemoveAnyway, kept_ref) {
                 Err(left) => Error::CleanupFailed {
                     error: Box::new(error),
                     left: left.to_string(),
@@ -167,25 +221,96 @@ impl Engine {
                     },
                 },
             }
+        })?;
+        for n in &started.not_enforced {
+            crate::notes::say(&n.gap.said_at_start(name.as_str()));
+        }
+        Ok(started)
+    }
+
+    /// What the service manager runs for the sandbox's service `unit`: this
+    /// program, with the layout in its environment, and, but for the
+    /// namespace holder, which reads no secret, what reaches the sandbox's
+    /// secret stores (`store_env`).
+    pub(super) fn service_unit(
+        &self,
+        record: &SandboxRecord,
+        unit: Unit,
+        store_env: &[(String, String)],
+    ) -> Result<ServiceUnit> {
+        let name = &record.name;
+        let exe = self.exe.clone().ok_or_else(|| Error::Session {
+            what: "cannot find the enclos program".into(),
+        })?;
+        let words = |words: &[&str]| words.iter().map(|w| (*w).into()).collect();
+        let args = match unit {
+            Unit::Proxy => words(&[
+                "proxy",
+                "run",
+                name.as_str(),
+                "--record",
+                "--port",
+                &record.proxy_port.to_string(),
+            ]),
+            Unit::Holder => words(&["holder", "run", name.as_str()]),
+            Unit::Runtime(service) => words(&["launch", name.as_str(), service.as_str()]),
+        };
+        let stores = match unit {
+            Unit::Holder => &[][..],
+            Unit::Proxy | Unit::Runtime(_) => store_env,
+        };
+        Ok(ServiceUnit {
+            label: self.label(name, unit)?,
+            program: exe,
+            args,
+            log: self.log_file(name, unit),
+            env: self
+                .layout
+                .env()
+                .into_iter()
+                .chain(stores.iter().cloned())
+                .collect(),
+            stop_timeout: STOP_TIMEOUT,
         })
     }
 
-    fn install_services(&self, by: &Actor, name: &SandboxName) -> Result<Vec<ServiceLabel>> {
+    /// Installs the sandbox's services, but `kept`, which stays as it runs.
+    fn install_services(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        kept: Option<&ServiceLabel>,
+    ) -> Result<SandboxStarted> {
+        let view = self.policy(name)?;
         self.write(
             by,
             "sandbox start",
             Some(name.to_string()),
-            |labels: &Vec<ServiceLabel>| joined(labels),
+            // Its entry lists what the sandbox runs with not enforced (ADR
+            // 0038).
+            |started: &SandboxStarted| {
+                format!(
+                    "{}{}",
+                    joined(&started.labels),
+                    super::unenforced::not_enforced_note(&started.not_enforced)
+                )
+            },
             |lock| {
                 let mut record = self.record(name)?;
+                let at = format!("at policy v{}", view.version.version);
+                let not_enforced =
+                    self.record_acceptances(lock, by, name, &view.snapshot.policy, &at)?;
                 let installed = (|| -> Result<Vec<ServiceLabel>> {
                     self.backend_of(name)?;
-                    let exe = self.exe.clone().ok_or_else(|| Error::Session {
-                        what: "cannot find the enclos program".into(),
-                    })?;
-                    let logs = self.logs_dir(name);
-                    std::fs::create_dir_all(&logs)
-                        .map_err(|source| LayoutError::Io { path: logs, source })?;
+                    let store_env =
+                        self.service_store_env(&self.policy(name)?.snapshot.policy)?;
+                    let units = self
+                        .units(&record)
+                        .into_iter()
+                        .map(|unit| self.service_unit(&record, unit, &store_env))
+                        .filter(|unit| !matches!(unit, Ok(u) if Some(&u.label) == kept))
+                        .collect::<Result<Vec<ServiceUnit>>>()?;
+                    self.create_logs_dir(name)?;
                     // A proxy `connect` started would hold the port the
                     // service needs, and what a runtime service left running
                     // would run beside the new one.
@@ -198,38 +323,6 @@ impl Engine {
                         ),
                         &mut Vec::new(),
                     )?;
-                    let units = Self::units(&record)
-                        .into_iter()
-                        .map(|unit| {
-                            Ok(ServiceUnit {
-                                label: self.label(name, unit)?,
-                                program: exe.clone(),
-                                args: match unit {
-                                    Unit::Proxy => vec![
-                                        "proxy".into(),
-                                        "run".into(),
-                                        name.to_string().into(),
-                                        "--record".into(),
-                                        "--port".into(),
-                                        record.proxy_port.to_string().into(),
-                                    ],
-                                    Unit::Runtime(service) => vec![
-                                        "launch".into(),
-                                        name.to_string().into(),
-                                        service.as_str().into(),
-                                    ],
-                                },
-                                log: self.log_file(name, unit),
-                                env: self
-                                    .layout
-                                    .env()
-                                    .into_iter()
-                                    .chain(self.secrets.env())
-                                    .collect(),
-                                stop_timeout: STOP_TIMEOUT,
-                            })
-                        })
-                        .collect::<Result<Vec<ServiceUnit>>>()?;
                     for unit in &units {
                         self.services.start(unit)?;
                     }
@@ -242,14 +335,18 @@ impl Engine {
                     },
                 };
                 self.state.put(lock, &record)?;
-                installed
+                Ok(SandboxStarted {
+                    labels: installed?,
+                    not_enforced,
+                })
             },
         )
     }
 
-    /// Removes every service of the sandbox installed now, the proxy last;
-    /// `stop_sandbox` calls this first, and `start_sandbox` before it
-    /// installs and after a failed install, as `why` says.
+    /// Removes every service of the sandbox installed now but those `kept`, the
+    /// proxy last; `stop_sandbox` calls this first, keeping none, and
+    /// `start_sandbox` before it installs and after a failed install, keeping
+    /// a namespace holder that answers, as `why` says.
     ///
     /// Outside the lock, which a runtime service told to end needs to
     /// record its end, so two audit entries surround the removal: one
@@ -266,8 +363,10 @@ impl Engine {
         name: &SandboxName,
         why: &str,
         if_unrecorded: IfUnrecorded,
+        kept: &[ServiceLabel],
     ) -> Result<Removal> {
-        let labels = self.installed_labels(name)?;
+        let mut labels = self.installed_labels(name)?;
+        labels.retain(|l| !kept.contains(l));
         if labels.is_empty() {
             return Ok(Removal {
                 labels,
@@ -310,9 +409,13 @@ impl Engine {
         })
     }
 
-    /// Whether the sandbox has services installed, running or not.
+    /// Whether the sandbox was started, so services of it are installed,
+    /// running or not: its proxy's or its runtime's. A namespace holder
+    /// alone does not count, as the first session of a sandbox that was
+    /// never started installs it (ADR 0039).
     pub(super) fn has_services(&self, name: &SandboxName) -> Result<bool> {
-        Ok(!self.installed_labels(name)?.is_empty())
+        let holder = self.label(name, Unit::Holder)?;
+        Ok(self.installed_labels(name)?.iter().any(|l| *l != holder))
     }
 
     /// Whether the sandbox's service `unit` is installed, running or not.
@@ -438,12 +541,23 @@ mod tests {
             command: SandboxCommand::from_words(&["x"]),
             restart: None,
         };
-        assert_eq!(Engine::units_for(&[]), [Unit::Proxy]);
+        assert_eq!(Engine::units_for(&[], false), [Unit::Proxy]);
         assert_eq!(
-            Engine::units_for(&[service("mail"), service("gateway")]),
+            Engine::units_for(&[service("mail"), service("gateway")], false),
             [
                 Unit::Proxy,
                 Unit::Runtime(ServiceName::new("mail")),
+                Unit::Runtime(ServiceName::new("gateway")),
+            ]
+        );
+        // A sandbox whose sessions join a namespace holder has one, before
+        // its runtime's services, also with none of those.
+        assert_eq!(Engine::units_for(&[], true), [Unit::Proxy, Unit::Holder]);
+        assert_eq!(
+            Engine::units_for(&[service("gateway")], true),
+            [
+                Unit::Proxy,
+                Unit::Holder,
                 Unit::Runtime(ServiceName::new("gateway")),
             ]
         );

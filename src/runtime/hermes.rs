@@ -1,9 +1,8 @@
-//! The Hermes Agent adapter (Nous Research), from the milestone 1 prototype
-//! (issue #5): installed per sandbox with Hermes's own installer (ADR 0020),
-//! meant to be logged in with a ChatGPT subscription through Hermes's
-//! device-code flow, each agent a Hermes profile under `~/.hermes/profiles`,
-//! all sharing the sandbox's one Hermes login (`~/.hermes/auth.json`), as
-//! the prototype used them (design §14: to verify in this build).
+//! The Hermes Agent adapter (Nous Research): installed per sandbox with
+//! Hermes's own installer (ADR 0020), meant to be logged in with a ChatGPT
+//! subscription through Hermes's device-code flow, each agent a Hermes
+//! profile under `~/.hermes/profiles`, all sharing the sandbox's one Hermes
+//! login (`~/.hermes/auth.json`) (design §14: to verify in this build).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -12,13 +11,14 @@ use rustix::fs::{Dir, FileType};
 
 use super::home::{entry_stat, io, open_folder, open_home, unreadable};
 use super::{
-    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, RuntimeAdapter,
-    RuntimeAgentName, RuntimeFacts, RuntimeListener, RuntimeService, SandboxCommand, ServiceName,
-    Signal, Unreadable, ValueAt,
+    AgentFacts, BuiltinAgent, DiskPart, HomeFile, HomePath, Installer, NotRead, ProviderAt,
+    RuntimeAdapter, RuntimeAgentName, RuntimeDashboard, RuntimeFacts, RuntimeListener,
+    RuntimeService, SandboxCommand, ServiceName, Signal, Unreadable, ValueAt,
 };
 use crate::model::agent::AgentName;
 use crate::model::channel::{Channel, ChannelUser};
 use crate::model::runtime::RuntimeKind;
+use crate::model::sandbox::BackendKind;
 
 pub struct Hermes;
 
@@ -110,7 +110,12 @@ impl RuntimeAdapter for Hermes {
         }
     }
 
-    fn home_files(&self) -> Vec<HomeFile> {
+    fn home_files(&self, backend: BackendKind) -> Vec<HomeFile> {
+        // The shim makes up for macOS's `mktemp`; on a Linux sandbox's PATH
+        // it would only stand in front of a `mktemp` that needs no help.
+        if !backend.mktemp_ignores_tmpdir() {
+            return Vec::new();
+        }
         vec![HomeFile {
             path: "bin/mktemp",
             contents: include_str!("hermes/mktemp"),
@@ -121,7 +126,7 @@ impl RuntimeAdapter for Hermes {
     fn login(&self) -> String {
         // Hermes's setup wizard: the provider and its login, the model, and
         // optional sections. `hermes model` covers only provider, login and
-        // model, which the prototype used (`setup` in the sandbox: to verify).
+        // model, all a login needs (`setup` in the sandbox: to verify).
         // For the root profile, whose login every agent shares: without `-p`,
         // Hermes uses the profile `hermes profile use` last saved in
         // `~/.hermes/active_profile` (`hermes_cli/main.py`, Hermes 0.22.2).
@@ -257,6 +262,21 @@ impl RuntimeAdapter for Hermes {
         ]))
     }
 
+    fn finish_delete_agent(&self, name: &AgentName) -> Option<SandboxCommand> {
+        // Hermes 0.23.0's delete removes the profile, then exits 1 when the
+        // session and routing records under its name are not purged yet
+        // ("its session/routing identity settlement is still pending"),
+        // naming this command, which purges them, succeeds when they are
+        // already gone, and refuses while a profile of that name exists
+        // (`purge_profile_identity` in `hermes_cli/profile_identity.py`).
+        Some(SandboxCommand::from_words(&[
+            HERMES,
+            "profile",
+            "purge-identity",
+            name.as_str(),
+        ]))
+    }
+
     fn import_agent(&self, name: &AgentName, archive: &Path) -> Option<SandboxCommand> {
         // Hermes's own import of an archive its `profile export` made, by
         // Hermes 0.22.2's code: it extracts without following links or
@@ -265,7 +285,7 @@ impl RuntimeAdapter for Hermes {
         // folders, and writes the profile's wrapper unless the name
         // collides with a command. Its export leaves out `auth.json`, `.env`
         // and the browser's data and scrubs secret-shaped strings. Neither
-        // is shown by a prototype yet (design §14).
+        // is shown yet (design §14).
         let mut words: Vec<OsString> = [HERMES, "profile", "import"].map(OsString::from).to_vec();
         words.push(archive.as_os_str().to_owned());
         words.extend(["--name", name.as_str()].map(OsString::from));
@@ -284,7 +304,7 @@ impl RuntimeAdapter for Hermes {
             // Not on disk where enclos can rely on it: `pyproject.toml` says
             // 0.0.0 (to verify, design §14).
             version: None,
-            // Agents share the root login (prototype, issue #5).
+            // Agents share the root login.
             login: Some(at(".hermes/auth.json")),
             // Where the installer puts Hermes itself.
             install: Some(at(".hermes/hermes-agent")),
@@ -302,6 +322,22 @@ impl RuntimeAdapter for Hermes {
                 file: file("config.yaml"),
                 // Hermes reads either key.
                 keys: &["model.default", "model.model"],
+            }),
+            // Each profile keeps its own provider, which a new one copies
+            // from `default` as it is then: `auto` before the sandbox's
+            // login chose one, or after a setup that ended before the model.
+            // With `auto`, a profile falls back on the `active_provider` of
+            // its own `auth.json` only, not the root's, and says it is "not
+            // connected to any AI provider" (`resolve_provider` in
+            // `hermes_cli/auth.py`; seen with Hermes 0.23.0). Hermes's
+            // `model` command chooses a provider and model for the profile.
+            provider: Some(ProviderAt {
+                at: ValueAt {
+                    file: file("config.yaml"),
+                    keys: &["model.provider"],
+                },
+                unchosen: &["auto", ""],
+                choose: format!("{HERMES} -p {agent} model"),
             }),
             // What changed when an agent was used; `sessions/` did not (to
             // verify, design §14).
@@ -328,7 +364,7 @@ impl RuntimeAdapter for Hermes {
 
     fn services(&self) -> Vec<RuntimeService> {
         // One gateway per Hermes home serves every agent: cron, housekeeping
-        // and, later, messaging (prototype, issue #5). The backend starts
+        // and, later, messaging. The backend starts
         // programs from an empty environment, which clears the markers
         // Hermes reads to find its supervisor (`XPC_SERVICE_NAME` for
         // launchd, `INVOCATION_ID` for systemd), so the flag says that one
@@ -413,6 +449,26 @@ impl RuntimeAdapter for Hermes {
             // Hermes asks no login for it, by its code
             // (`listener_auth_required` in `gateway/run_api.py`).
             page: Some("/"),
+        })
+    }
+
+    fn dashboard(&self) -> Option<RuntimeDashboard> {
+        // `hermes dashboard` puts its session token in its page, which the
+        // gateway's own port withholds, so the page works there alone.
+        // `--isolated` and `--port 0` make its server its own: a plain one
+        // reports a dashboard another session left open, or one on Hermes's
+        // default port, and exits 0 (`_attach_to_host_backend`, read in
+        // Hermes 0.22.5's source; ADR 0040).
+        Some(RuntimeDashboard {
+            command: SandboxCommand::from_words(&[
+                HERMES,
+                "dashboard",
+                "--no-open",
+                "--isolated",
+                "--port",
+                "0",
+            ]),
+            page: "/",
         })
     }
 
@@ -517,6 +573,7 @@ mod tests {
                 "files.pythonhosted.org",
                 "github.com",
                 "nodejs.org",
+                "playwright.download.prss.microsoft.com",
                 "pypi.org",
                 "registry.npmjs.org",
                 "release-assets.githubusercontent.com",
@@ -675,6 +732,16 @@ mod tests {
         assert!(Hermes.services().iter().any(|s| s.name == listener.service));
     }
 
+    #[test]
+    fn the_dashboard_is_a_server_of_its_own_on_a_port_the_kernel_picks() {
+        let dashboard = Hermes.dashboard().unwrap();
+        assert_eq!(
+            dashboard.command.shown(),
+            "hermes dashboard --no-open --isolated --port 0"
+        );
+        assert_eq!(dashboard.page, "/");
+    }
+
     fn names(names: &[&str]) -> Vec<RuntimeAgentName> {
         names
             .iter()
@@ -821,6 +888,10 @@ mod tests {
                 "hermes", "profile", "delete", "main", "--yes"
             ]))
         );
+        assert_eq!(
+            Hermes.finish_delete_agent(&main).unwrap().shown(),
+            "hermes profile purge-identity main"
+        );
         let default: AgentName = "default".parse().unwrap();
         assert_eq!(Hermes.builtin_agent(), Some(DEFAULT_PROFILE));
         assert_eq!(Hermes.talk(&default), "hermes -p default");
@@ -890,12 +961,32 @@ mod tests {
                 "main"
             ]))
         );
-        assert!(
-            Hermes
-                .home_files()
-                .iter()
-                .all(HomeFile::path_is_inside_home)
-        );
+        for backend in BackendKind::ALL {
+            assert!(
+                Hermes
+                    .home_files(backend)
+                    .iter()
+                    .all(HomeFile::path_is_inside_home)
+            );
+        }
+    }
+
+    /// The `mktemp` shim makes up for macOS's own, which ignores `TMPDIR`:
+    /// a Seatbelt sandbox gets it, a Linux sandbox, whose GNU `mktemp`
+    /// follows `TMPDIR`, does not.
+    #[test]
+    fn the_mktemp_shim_goes_only_where_mktemp_ignores_tmpdir() {
+        let paths =
+            |backend| -> Vec<&str> { Hermes.home_files(backend).iter().map(|f| f.path).collect() };
+        assert_eq!(paths(BackendKind::Seatbelt), ["bin/mktemp"]);
+        assert!(paths(BackendKind::Bubblewrap).is_empty());
+        for backend in BackendKind::ALL {
+            assert_eq!(
+                paths(backend).contains(&"bin/mktemp"),
+                backend.mktemp_ignores_tmpdir(),
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

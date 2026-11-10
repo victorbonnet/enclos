@@ -20,7 +20,7 @@ THEMES = {
 }
 
 TITLE = "Every client goes through one core; each sandbox runs as its own services"
-SUBTITLE = "No daemon: the CLI writes state and audit, and launchd keeps each sandbox's proxy and gateway running"
+SUBTITLE = "No daemon: the CLI writes state and audit, and the service manager keeps each sandbox's proxy and gateway running"
 
 CLIENTS = [  # x, title, lines, kind
     (40, "enclos (CLI)", ["every operation", "milestone 1"], "accent"),
@@ -35,7 +35,7 @@ CORE = [
 ]
 BACKENDS = [
     (60, "Seatbelt", ["macOS, milestone 1"], "solid"),
-    (322, "bubblewrap", ["Linux, later"], "later"),
+    (322, "bubblewrap", ["Linux, milestone 3"], "solid"),
     (584, "OpenShell", ["later"], "later"),
     (846, "MicroVM", ["later: libkrun"], "later"),
 ]
@@ -45,24 +45,25 @@ SERVICES = [
     (780, "Allowed domains", ["at validated addresses", "everything else refused"]),
 ]
 
-SANDBOX_TITLE = "Everything in a sandbox runs under one compiled policy; its proxy is the only way out"
-SANDBOX_SUBTITLE = "On macOS today, with Seatbelt. Green is allowed and red is refused, by the sandbox's policy."
+SANDBOX_TITLE = "Everything in a sandbox runs under one compiled policy; only its proxy connects out"
+SANDBOX_SUBTITLE = "On macOS, with Seatbelt. Green is allowed and red is refused, by the sandbox's policy."
 
 INSIDE = [  # y, height, title, lines
-    (188, 112, "Hermes and its agents", ["the gateway, each session,", "and every process they start"]),
-    (314, 100, "Its home", ["read and write: the runtime,", "agents, login, caches"]),
-    (428, 94, "Workspaces you grant", ["read and write"]),
+    (188, 140, "Hermes and its agents", ["the gateway, each session,", "and every process they start"]),
+    (342, 130, "Its home", ["read and write: the runtime,", "agents, login, caches"]),
+    (486, 120, "Workspaces you grant", ["read and write"]),
 ]
-ROUTES = [  # y, verb, title, lines, kind
+ROUTES = [  # y, verb, title, lines, kind; "accept" points into the sandbox
     (116, "read", "The rest of your disk", ["read only"], "ok"),
     (202, "read", "The deny list", ["~/.ssh, keychains, browser data,", "other sandboxes, enclos's files"], "no"),
     (288, "reach", "Host services", ["Apple Events, launchd, preferences,", "pasteboard, other processes"], "no"),
     (374, "connect", "Egress proxy", ["on the host, outside the sandbox;", "logs every connection it decides on"], "ok"),
-    (460, "connect", "Any direct connection", ["the sandbox has no other route"], "no"),
+    (460, "connect", "Anywhere else", ["no direct connection, even to", "a host the proxy would allow"], "no"),
+    (546, "accept", "Peers of its gateway", ["your Mac and its network, answered", "without the proxy or network log"], "ok"),
 ]
 DESTINATIONS = [  # y, title, lines, kind
     (374, "Allowed", ["the public web, or", "only your allowlist"], "ok"),
-    (460, "Refused", ["local network, cloud", "metadata, the host itself"], "no"),
+    (460, "Refused", ["the host itself, cloud metadata,", "private hosts not opted in"], "no"),
 ]
 
 
@@ -143,7 +144,7 @@ def draw_architecture(t: dict) -> str:
     c.text(195, 455, "runs the runtime inside the sandbox", 13.5, t["sub"], anchor="start")
 
     c.rect(40, 476, 1060, 140)
-    c.text(1080, 500, "Services: launchd on macOS (systemd on Linux, later)", 15, t["text"], "600", "end")
+    c.text(1080, 500, "Services: launchd on macOS, systemd on Linux", 15, t["text"], "600", "end")
     for i, (x, title, lines) in enumerate(SERVICES):
         c.box(x, 520, 300, 76, title, lines)
         if i:
@@ -154,17 +155,17 @@ def draw_architecture(t: dict) -> str:
 
 
 def draw_sandbox(t: dict) -> str:
-    W, H = 1000, 578
+    W, H = 1040, 664
     c = Canvas(t, W, H)
     c.out.append(f'<rect width="{W}" height="{H}" rx="12" fill="{t["bg"]}"/>')
     c.text(24, 36, SANDBOX_TITLE, 19, t["text"], "600", "start")
     c.text(24, 62, SANDBOX_SUBTITLE, 14.5, t["sub"], anchor="start")
 
-    c.rect(24, 82, 714, 472)
+    c.rect(24, 82, 714, 558)
     c.text(44, 106, "Your Mac", 15, t["text"], "600", "start")
-    c.text(876, 106, "The network", 15, t["text"], "600")
+    c.text(896, 106, "The network", 15, t["text"], "600")
 
-    c.rect(44, 116, 340, 418, stroke=t["accent"], fill=t["accent_bg"])
+    c.rect(44, 116, 340, 504, stroke=t["accent"], fill=t["accent_bg"])
     c.text(214, 146, "Sandbox lab", 18, t["text"], "600")
     c.text(214, 168, "Seatbelt applies its compiled policy", 14.5, t["sub"])
     for y, h, title, lines in INSIDE:
@@ -172,7 +173,8 @@ def draw_sandbox(t: dict) -> str:
 
     for y, verb, title, lines, kind in ROUTES:
         mid = y + 37
-        c.route([(384, mid), (449, mid)], kind)
+        ends = [(384, mid), (449, mid)]
+        c.route(ends[::-1] if verb == "accept" else ends, kind)
         c.text(416, mid - 9, verb, 13.5, t["sub"])
         if kind == "no":
             c.text(416, mid + 6, "×", 19, t["no"], "600")
@@ -183,7 +185,7 @@ def draw_sandbox(t: dict) -> str:
     c.route([(720, proxy_y + 12), (756, proxy_y + 12), (756, refused_y), (775, refused_y)], "no")
     c.text(756, (proxy_y + refused_y) / 2 + 7, "×", 19, t["no"], "600")
     for y, title, lines, kind in DESTINATIONS:
-        c.box(776, y, 200, 74, title, lines, kind, big=True)
+        c.box(776, y, 240, 74, title, lines, kind, big=True)
 
     return c.svg(SANDBOX_TITLE, {"head": t["sub"], "head-ok": t["ok"], "head-no": t["no"]})
 

@@ -1,6 +1,8 @@
 //! Runs the `enclos` binary against a temporary `ENCLOS_HOME` and `HOME`, so
 //! tests never touch the real home folder, its `~/Library/LaunchAgents`
 //! included. No test runs `sandbox start`: it would install real services.
+//! `without_host_service_manager` keeps it so on Linux, where `systemctl
+//! --user` finds the user's manager from the environment, not from `HOME`.
 
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +11,14 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use tempfile::TempDir;
+
+/// Leaves `systemctl --user` no way to reach the manager of whoever runs the
+/// tests, and the unit files of `HOME`'s own folder.
+fn without_host_service_manager(cmd: &mut Command) {
+    cmd.env_remove("XDG_RUNTIME_DIR")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .env_remove("XDG_CONFIG_HOME");
+}
 
 struct Home {
     _dir: TempDir,
@@ -33,6 +43,7 @@ impl Home {
             // The baseline enclos ships, whatever the shell running the
             // tests exported; a test that compares sets it itself.
             .env_remove("ENCLOS_SEATBELT_BASELINE");
+        without_host_service_manager(&mut cmd);
         cmd
     }
 
@@ -47,6 +58,7 @@ impl Home {
             .env("ENCLOS_HOME", &self.root)
             .env("HOME", self._dir.path())
             .env_remove("ENCLOS_SEATBELT_BASELINE");
+        without_host_service_manager(&mut cmd);
         cmd
     }
 
@@ -457,8 +469,7 @@ fn policy_allow_of_a_destination_that_does_not_parse_is_an_error() {
 #[cfg(target_os = "macos")]
 fn editor(home: &Home, script: &str) -> String {
     let path = home._dir.path().join("editor.sh");
-    std::fs::write(&path, format!("#!/bin/sh\nset -e\n{script}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    test_scripts::write_script(&path, &format!("set -e\n{script}"));
     path.display().to_string()
 }
 
@@ -1199,6 +1210,15 @@ fn sandbox_list_lines_up_its_columns_for_names_of_any_length() {
 #[path = "../src/host_ports.rs"]
 mod host_ports;
 
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "../src/test_scripts.rs"]
+mod test_scripts;
+
+#[cfg(target_os = "macos")]
+#[path = "support/inherited.rs"]
+mod inherited;
+
 /// Tests that start proxies take turns: proxy ports are the host's, shared
 /// by every test's enclos folder and every other test run of this user.
 #[cfg(target_os = "macos")]
@@ -1876,6 +1896,59 @@ fn a_proxy_that_died_is_replaced_and_stop_works_from_another_time_zone() {
     assert!(eventually(|| long.0.try_wait().unwrap().is_some()));
 }
 
+/// The processes holding `file` open, as `lsof` lists them.
+#[cfg(target_os = "macos")]
+fn holders_of(file: &Path) -> Vec<u32> {
+    let out = Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .arg(file)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// A descriptor `connect`'s caller passed on reaches neither the session's
+/// program nor the proxy `connect` started, which runs on after it. The
+/// controls: a program the same shell starts on the host holds it, and
+/// `lsof` shows it held.
+#[cfg(target_os = "macos")]
+#[test]
+fn what_connect_starts_holds_none_of_its_callers_descriptors() {
+    use inherited::{HOLDS_NINE, holding_open};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let home = Home::new();
+    home.init(1);
+    home.run(&["sandbox", "create", "home", "--template", "assistant"])
+        .ok();
+    let _stop = StopOnDrop(&home, "home");
+    let lock = home._dir.path().join("caller.lock");
+    std::fs::write(&lock, "").unwrap();
+
+    let out = holding_open(&lock, Command::new("/bin/sh").args(["-c", HOLDS_NINE]))
+        .output()
+        .unwrap();
+    assert_eq!(Run(out).stdout().trim(), "held");
+    let sleeping = KillOnDrop(
+        holding_open(&lock, Command::new("/bin/sleep").arg("30"))
+            .spawn()
+            .unwrap(),
+    );
+    assert!(eventually(|| holders_of(&lock) == [sleeping.0.id()]));
+    drop(sleeping);
+
+    let connect = home.command(&["connect", "home", "--", "/bin/sh", "-c", HOLDS_NINE]);
+    let out = Run(holding_open(&lock, &connect).output().unwrap());
+    assert_eq!(out.ok().stdout().trim(), "none", "{}", out.stderr());
+    let proxy = proxy_pid(&home).expect("the proxy connect started runs on");
+    let held = holders_of(&lock);
+    assert!(!held.contains(&proxy), "{held:?}");
+    assert!(held.is_empty(), "{held:?}");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn stop_ends_an_interactive_shell_and_its_jobs() {
@@ -2131,7 +2204,7 @@ fn a_runtime_install_dry_run_starts_nothing() {
     ]);
     let plan = out.ok().stdout();
     assert!(
-        plan.contains("Would allow the 13 destinations hermes needs"),
+        plan.contains("Would allow the 14 destinations hermes needs"),
         "{plan}"
     );
     assert!(
@@ -2653,7 +2726,8 @@ fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     assert_eq!(code, 0, "{removed}");
     assert_eq!(removed["agent"], "home/scout", "{removed}");
     assert_eq!(removed["files_removed"], false, "{removed}");
-    assert!(removed["files_kept_because"].is_string(), "{removed}");
+    assert_eq!(removed["files_kept_because"], "asked", "{removed}");
+    assert_eq!(removed["files_left"], "agent", "{removed}");
     let list = home.run(&["agent", "list", "home"]);
     assert_eq!(list.ok().stdout().lines().nth(1), Some(untracked));
 
@@ -3554,6 +3628,27 @@ fn doctor_checks_the_backend_and_each_sandboxs_next_session() {
 /// A baseline value that is neither makes Seatbelt unusable, which doctor
 /// says with why, in text and JSON; on the comparison baseline it says what
 /// it compares against.
+/// `launch` refuses the comparison baseline before anything runs, and names
+/// the command that removes it from the host's own service manager.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn launch_on_the_comparison_baseline_names_the_hosts_manager() {
+    let home = Home::new();
+    home.init(1);
+    let out = Run(home
+        .command(&["launch", "home", "gateway"])
+        .env("ENCLOS_SEATBELT_BASELINE", "allow-default")
+        .output()
+        .unwrap());
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    let unset = if cfg!(target_os = "macos") {
+        "`launchctl unsetenv ENCLOS_SEATBELT_BASELINE`"
+    } else {
+        "`systemctl --user unset-environment ENCLOS_SEATBELT_BASELINE`"
+    };
+    assert!(out.stderr().contains(unset), "{}", out.stderr());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn doctor_says_what_a_baseline_value_does() {
@@ -4526,6 +4621,11 @@ fn init_says_why_a_bad_baseline_value_leaves_no_backend() {
 /// Programs run, and TLS goes through, on either baseline: a page the
 /// policy allows answers 200 over HTTP and HTTPS through the proxy. Needs
 /// the network, as CI has.
+///
+/// The last request gives curl a CA bundle with one root no server chains
+/// to, so it always checks the chain against the system's roots, as
+/// `/usr/bin/curl` does whenever its own bundle lacks the root: whether it
+/// does for a given site depends on the site's chain and the host's bundle.
 #[cfg(target_os = "macos")]
 #[test]
 fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
@@ -4537,16 +4637,29 @@ fn programs_and_tls_run_through_the_proxy_on_either_baseline() {
     let _stop = StopOnDrop(&home, "home");
     home.run(&["policy", "allow", "home", "example.com", "--yes"])
         .ok();
-    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' http://example.com/ && /usr/bin/curl -sS -o /dev/null -w '%{http_code}' https://example.com/";
+    let unrelated_root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/unrelated-root.pem"
+    );
+    let script = "echo hi && /usr/bin/python3 -c 'import ssl; print(2)' && /usr/bin/git --version >/dev/null && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' http://example.com/ && /usr/bin/curl -sS -o /dev/null -w '%{http_code} ' https://example.com/ && /usr/bin/curl --cacert \"$1\" -sS -o /dev/null -w '%{http_code}' https://example.com/";
     for baseline in ["allow-default", "deny-default"] {
         let out = Run(home
-            .command(&["exec", "home", "--", "/bin/sh", "-c", script])
+            .command(&[
+                "exec",
+                "home",
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "sh",
+                unrelated_root,
+            ])
             .env("ENCLOS_SEATBELT_BASELINE", baseline)
             .output()
             .unwrap());
         assert_eq!(
             out.stdout(),
-            "hi\n2\n200 200",
+            "hi\n2\n200 200 200",
             "{baseline}: stderr: {}",
             out.stderr()
         );
@@ -4739,4 +4852,176 @@ fn a_start_whose_proxy_cannot_listen_fails_in_json() {
     let one = &started["sandboxes"][0];
     assert_eq!(one["proxy_started"], false, "{started}");
     assert_eq!(one["error"]["exit_code"], 1, "{started}");
+}
+
+/// A running `enclos relay`, stopped when the test ends, passed or not.
+struct RelayCommand {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl RelayCommand {
+    /// `enclos relay` on a port that was free, to `socket`. Its home is
+    /// relative, which every command that opens the enclos folder refuses.
+    fn start(socket: &Path) -> RelayCommand {
+        Self::with_descriptors(socket, None).expect("the relay ended")
+    }
+
+    /// As `start`, limited to `descriptors` open files if given; `None` if
+    /// that left it too few to listen.
+    fn with_descriptors(socket: &Path, descriptors: Option<u64>) -> Option<RelayCommand> {
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let limit = descriptors.map_or(":".to_string(), |n| format!("ulimit -n {n}"));
+        let child = Command::new("sh")
+            .args(["-c", &format!(r#"{limit} && exec "$@""#), "sh"])
+            .arg(env!("CARGO_BIN_EXE_enclos"))
+            .args(["relay", "--port", &port.to_string(), "--socket"])
+            .arg(socket)
+            .env("ENCLOS_HOME", "not/absolute")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut relay = RelayCommand { child, port };
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if relay.child.try_wait().unwrap().is_some() {
+                return None;
+            }
+            assert!(started.elapsed().as_secs() < 30, "the relay never listened");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some(relay)
+    }
+}
+
+impl Drop for RelayCommand {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn the_relay_passes_curl_to_its_socket_with_no_enclos_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("proxy.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    // Stands in for the proxy, which the library's tests put behind the
+    // relay: this is the command that starts it.
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut conn in listener.incoming().flatten() {
+            let mut request = [0; 1024];
+            if conn.read(&mut request).unwrap_or(0) > 0 {
+                let _ = conn.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    let relay = RelayCommand::start(&socket);
+    let out = Command::new("curl")
+        .args(["--silent", "--max-time", "30", "--noproxy", ""])
+        .args(["--proxy", &format!("http://127.0.0.1:{}", relay.port)])
+        .args(["--output", "/dev/null", "--write-out", "%{http_code}"])
+        .arg("http://denied.test/")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "403");
+}
+
+#[test]
+fn the_relay_listens_on_127_0_0_1_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = RelayCommand::start(&dir.path().join("proxy.sock"));
+    // Neither another address of the loopback, which only a listener on
+    // every address would answer on, nor [::1].
+    for address in ["127.0.0.2", "::1"] {
+        let conn = std::net::TcpStream::connect((address, relay.port));
+        assert!(conn.is_err(), "it answers on {address}");
+    }
+}
+
+/// The next connection on `socket`, polled so a relay that died fails the
+/// test instead of hanging it.
+fn relay_opened(socket: &std::os::unix::net::UnixListener) -> std::os::unix::net::UnixStream {
+    socket.set_nonblocking(true).unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        match socket.accept() {
+            Ok((conn, _)) => return conn,
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        assert!(started.elapsed().as_secs() < 30, "no connection came");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_relay_whose_stderr_was_closed_lives_through_what_it_cannot_say() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // Ten descriptors make a limit of one connection.
+    let mut relay = RelayCommand::with_descriptors(&path, Some(10)).unwrap();
+    drop(relay.child.stderr.take());
+    // Starting it left one connection, already closed.
+    drop(relay_opened(&socket));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let held = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    let _upstream = relay_opened(&socket);
+    let mut over = std::net::TcpStream::connect(("127.0.0.1", relay.port)).unwrap();
+    assert_eq!(std::io::Read::read(&mut over, &mut [0; 1]).unwrap_or(0), 0);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(relay.child.try_wait().unwrap(), None, "the relay ended");
+    drop(held);
+}
+
+/// With the listener its last descriptor, every accept fails. The smallest
+/// limit it can listen on depends on what the system's startup keeps open.
+#[test]
+fn a_relay_that_cannot_accept_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let mut relay = (4..16)
+        .find_map(|limit| RelayCommand::with_descriptors(&path, Some(limit)))
+        .expect("it never listened");
+    // Its backoff is 100 ms: several tries.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    relay.child.kill().unwrap();
+    relay.child.wait().unwrap();
+    let mut said = String::new();
+    let stderr = relay.child.stderr.as_mut().unwrap();
+    std::io::Read::read_to_string(stderr, &mut said).unwrap();
+    assert_eq!(
+        said.matches("cannot accept a connection").count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(said.lines().count(), 1, "{said}");
+}
+
+#[test]
+fn a_relay_port_already_taken_is_an_error_naming_it() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let out = Home::new().run(&["relay", "--port", &port.to_string(), "--socket", "s.sock"]);
+    assert_eq!(out.code(), 1);
+    assert!(
+        out.stderr()
+            .contains(&format!("cannot listen on 127.0.0.1:{port}")),
+        "{}",
+        out.stderr()
+    );
+}
+
+#[test]
+fn a_relay_socket_path_no_socket_can_have_is_an_error_naming_it() {
+    let path = format!("/tmp/{}", "x".repeat(200));
+    let out = Home::new().run(&["relay", "--port", "1", "--socket", &path]);
+    assert_eq!(out.code(), 1);
+    assert!(out.stderr().contains(&path), "{}", out.stderr());
 }

@@ -4,11 +4,15 @@
 //! A group is signalled through its leader when the leader is a sure
 //! member; any sure member outside those groups is signalled alone; members
 //! that are only counted are never signalled, and are reported if they
-//! remain (see `members`), each survivor with why it survived.
+//! remain (see `members`), each survivor with why it survived. A session in
+//! a cgroup is looked at through it at every step: what the cgroup holds is
+//! signalled, KILL goes to the whole cgroup, and the check reads it again, so
+//! a process `ps` does not list is reported too.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use super::cgroup::{Hierarchy, members_in};
 use super::members::{Found, find};
 use super::process::{PsError, Signal, Signalled, processes, signal_group, signal_process};
 use crate::model::session::{Member, ProcessRef, SessionRecord};
@@ -44,6 +48,10 @@ pub enum Why {
     Survived,
     /// enclos could not signal it, with why.
     NotSent(String),
+    /// Its session's cgroup holds it, and `ps` does not list it.
+    NotListed,
+    /// `why`, and the write to `cgroup.kill` failed, with this error.
+    KillFailed { why: Box<Why>, error: String },
 }
 
 impl Why {
@@ -54,6 +62,19 @@ impl Why {
             }
             Why::Survived => "still runs after TERM and KILL".to_owned(),
             Why::NotSent(why) => format!("could not be signalled: {why}"),
+            Why::NotListed => "still in the session's cgroup, and not listed by ps".to_owned(),
+            Why::KillFailed { why, error } => {
+                format!("{}; cgroup.kill failed: {error}", why.describe())
+            }
+        }
+    }
+
+    /// Whether enclos tried to signal it.
+    pub fn signalled(&self) -> bool {
+        match self {
+            Why::NotSignalled | Why::NotListed => false,
+            Why::Survived | Why::NotSent(_) => true,
+            Why::KillFailed { why, .. } => why.signalled(),
         }
     }
 }
@@ -73,33 +94,96 @@ pub fn describe_survivors(left: &[Survivor]) -> String {
         .join("; ")
 }
 
-pub fn stop(session: &SessionRecord, grace: Duration) -> Result<Stopped, PsError> {
-    let first = find(&processes()?, session, &session.tracked);
+/// Stops `session`'s members within `grace`, reading its cgroup, if it has
+/// one, in `cgroups`.
+pub fn stop(
+    cgroups: &Hierarchy,
+    session: &SessionRecord,
+    grace: Duration,
+) -> Result<Stopped, PsError> {
+    let first = look(cgroups, session, &session.tracked)?;
     if first.is_empty() {
         return Ok(Stopped::Gone);
     }
-    if !first.iter().any(|f| f.sure) {
-        // Nothing enclos may signal: what is only counted is reported.
-        return Ok(survivors(first, &Signals::default()));
+    if session.cgroup.is_none() && !first.iter().any(|f| f.sure) {
+        // Nothing enclos may signal: what is only counted is reported. A
+        // cgroup is still killed, which takes no listing.
+        return Ok(survivors(first, &Signals::default(), session));
     }
     // What was found stays known while the signals end parents: a member
     // whose parent exits first is still the session's.
     let mut known = session.tracked.clone();
     known.extend(first.iter().filter_map(Found::sure_ref));
-    let now = || -> Result<Vec<Found>, PsError> { Ok(find(&processes()?, session, &known)) };
+    let now = || look(cgroups, session, &known);
     let mut signals = Signals::default();
     signals.send(&first, Signal::Term)?;
     if wait_empty(&now, grace)? {
         return Ok(Stopped::Clean);
     }
+    let killed = match &session.cgroup {
+        Some(cgroup) => cgroups.kill(cgroup),
+        None => Ok(()),
+    };
     signals.send(&now()?, Signal::Kill)?;
     if wait_empty(&now, grace)? {
         return Ok(Stopped::Clean);
     }
-    Ok(survivors(now()?, &signals))
+    let left = survivors(now()?, &signals, session);
+    Ok(match killed {
+        Ok(()) => left,
+        Err(e) => with_failed_kill(left, &e),
+    })
 }
 
-fn survivors(left: Vec<Found>, signals: &Signals) -> Stopped {
+/// `stopped`, each survivor saying the kill of its cgroup failed.
+fn with_failed_kill(stopped: Stopped, error: &std::io::Error) -> Stopped {
+    let Stopped::Survivors(left) = stopped else {
+        return stopped;
+    };
+    let left = left.into_iter().map(|s| Survivor {
+        member: s.member,
+        why: Why::KillFailed {
+            why: Box::new(s.why),
+            error: error.to_string(),
+        },
+    });
+    Stopped::Survivors(left.collect())
+}
+
+/// The members of `session` now, with what its cgroup holds as sure members.
+/// A process in the cgroup that a second listing does not show either is
+/// neither signalled nor forgotten: it is found, and not sure.
+fn look(
+    cgroups: &Hierarchy,
+    session: &SessionRecord,
+    known: &[ProcessRef],
+) -> Result<Vec<Found>, PsError> {
+    let mut procs = processes()?;
+    let Some(cgroup) = &session.cgroup else {
+        return Ok(find(&procs, session, known));
+    };
+    let mut inside = members_in(&procs, &cgroups.pids(cgroup)?);
+    if !inside.1.is_empty() {
+        procs = processes()?;
+        inside = members_in(&procs, &cgroups.pids(cgroup)?);
+    }
+    let (listed, unlisted) = inside;
+    let mut known = known.to_vec();
+    known.extend(listed);
+    let mut found = find(&procs, session, &known);
+    found.extend(unlisted.into_iter().map(|pid| Found {
+        member: Member {
+            pid,
+            started: String::new(),
+            command: "(not listed)".to_owned(),
+        },
+        pgid: 0,
+        sure: false,
+    }));
+    Ok(found)
+}
+
+fn survivors(left: Vec<Found>, signals: &Signals, session: &SessionRecord) -> Stopped {
     if left.is_empty() {
         return Stopped::Clean;
     }
@@ -108,6 +192,7 @@ fn survivors(left: Vec<Found>, signals: &Signals) -> Stopped {
         .map(|f| {
             let pid = f.member.pid;
             let why = match (f.sure, signals.failed.get(&pid)) {
+                (false, _) if session.cgroup.is_some() => Why::NotListed,
                 (false, _) => Why::NotSignalled,
                 (true, Some(why)) => Why::NotSent(why.clone()),
                 (true, None) if signals.tried.contains(&pid) => Why::Survived,
@@ -209,6 +294,7 @@ mod tests {
             compiled: None,
             root: reference(child.id()).unwrap().unwrap(),
             pgid: Some(child.id()),
+            cgroup: None,
             tracked: Vec::new(),
             started_at: now(),
             ended_at: None,
@@ -255,13 +341,166 @@ mod tests {
         }
     }
 
+    /// A stand-in for the cgroup hierarchy with one cgroup holding `pids`,
+    /// and `session` in it.
+    fn in_cgroup(session: &mut SessionRecord, pids: &[u32]) -> (tempfile::TempDir, Hierarchy) {
+        let dir = tempfile::tempdir().unwrap();
+        session.cgroup = Some("/s.scope".parse().unwrap());
+        write_cgroup(dir.path(), pids);
+        let cgroups = Hierarchy::at(dir.path());
+        (dir, cgroups)
+    }
+
+    fn write_cgroup(root: &std::path::Path, pids: &[u32]) {
+        let folder = root.join("s.scope");
+        std::fs::create_dir_all(&folder).unwrap();
+        let text: String = pids.iter().map(|p| format!("{p}\n")).collect();
+        // Whole, as the kernel's: a look must not read it truncated, as empty.
+        let written = root.join("cgroup.procs.new");
+        std::fs::write(&written, text).unwrap();
+        std::fs::rename(written, folder.join("cgroup.procs")).unwrap();
+    }
+
+    #[test]
+    fn a_member_that_left_its_group_and_parent_is_ended_through_the_cgroup() {
+        // Started apart: no group, parent or record ties it to the session.
+        let mut root = shell_until_input_closes("");
+        let mut other = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), other.id()]);
+        let other_ref = reference(other.id()).unwrap().unwrap();
+
+        // The stand-in does not empty itself: this thread does, as each exits.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let stopped = std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let left: Vec<u32> = [&session.root, &other_ref]
+                        .into_iter()
+                        .filter(|process| is_same(process).unwrap())
+                        .map(|process| process.pid)
+                        .collect();
+                    write_cgroup(dir.path(), &left);
+                    std::thread::sleep(POLL);
+                }
+            });
+            let stopped = stop(&cgroups, &session, GRACE).unwrap();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            stopped
+        });
+        assert_eq!(stopped, Stopped::Clean);
+        // Before the waits: closing its input would end it whatever `stop` did.
+        assert!(!is_same(&other_ref).unwrap());
+        let _ = root.wait();
+        let _ = other.wait();
+    }
+
+    #[test]
+    fn what_stays_in_the_cgroup_after_kill_is_reported_with_why() {
+        // A pid `ps` cannot list: this test's stand-in holds it for ever.
+        let unlisted = u32::MAX - 1;
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), unlisted]);
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let _ = root.wait();
+        let Stopped::Survivors(left) = stopped else {
+            panic!("{stopped:?}");
+        };
+        let why: Vec<_> = left.iter().map(|s| (s.member.pid, &s.why)).collect();
+        assert!(why.contains(&(unlisted, &Why::NotListed)), "{why:?}");
+        let asked = dir.path().join("s.scope/cgroup.kill");
+        assert_eq!(std::fs::read_to_string(asked).unwrap(), "1");
+    }
+
+    #[test]
+    fn a_kill_of_the_cgroup_that_fails_is_said_with_what_survived() {
+        let unlisted = u32::MAX - 1;
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        let (dir, cgroups) = in_cgroup(&mut session, &[root.id(), unlisted]);
+        std::fs::create_dir(dir.path().join("s.scope/cgroup.kill")).unwrap();
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let _ = root.wait();
+        let Stopped::Survivors(left) = stopped else {
+            panic!("{stopped:?}");
+        };
+        let what = left.iter().find(|s| s.member.pid == unlisted).unwrap();
+        assert!(!what.why.signalled());
+        let said = what.why.describe();
+        assert!(said.contains("not listed by ps"), "{said}");
+        assert!(said.contains("cgroup.kill failed"), "{said}");
+    }
+
+    /// Nothing `ps` lists is left to signal, and the kill of the cgroup, which
+    /// needs no listing, is still sent.
+    #[test]
+    fn a_cgroup_holding_only_what_ps_does_not_list_is_still_killed() {
+        let unlisted = u32::MAX - 1;
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        drop(root.stdin.take());
+        root.wait().unwrap();
+        let (dir, cgroups) = in_cgroup(&mut session, &[unlisted]);
+        let stopped = stop(&cgroups, &session, Duration::from_millis(100)).unwrap();
+        let Stopped::Survivors(left) = stopped else {
+            panic!("{stopped:?}");
+        };
+        assert_eq!(left[0].why, Why::NotListed);
+        let asked = dir.path().join("s.scope/cgroup.kill");
+        assert_eq!(std::fs::read_to_string(asked).unwrap(), "1");
+    }
+
+    /// `ps` writes `Zl` for it, and it runs on through its other threads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_exited_is_stopped_and_not_called_gone() {
+        use crate::lifecycle::process::{headless, headless_port};
+        let mut child = headless(&mut Command::new("/usr/bin/python3"))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        headless_port(&mut child);
+        let mut session = session_of(&child);
+        let (dir, cgroups) = in_cgroup(&mut session, &[child.id()]);
+        // The stand-in does not empty itself.
+        let stopped = std::thread::scope(|s| {
+            s.spawn(|| {
+                while is_same(&session.root).unwrap() {
+                    std::thread::sleep(POLL);
+                }
+                write_cgroup(dir.path(), &[]);
+            });
+            stop(&cgroups, &session, GRACE).unwrap()
+        });
+        assert_eq!(stopped, Stopped::Clean);
+        assert!(!is_same(&session.root).unwrap());
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn an_empty_cgroup_is_gone_and_a_cgroup_that_cannot_be_read_is_an_error() {
+        let mut root = shell_until_input_closes("");
+        let mut session = session_of(&root);
+        // The root is a member by its record, so only once it exited.
+        drop(root.stdin.take());
+        root.wait().unwrap();
+        let (dir, cgroups) = in_cgroup(&mut session, &[]);
+        assert_eq!(stop(&cgroups, &session, GRACE).unwrap(), Stopped::Gone);
+        std::fs::write(dir.path().join("s.scope/cgroup.procs"), "x\n").unwrap();
+        assert!(stop(&cgroups, &session, GRACE).is_err());
+    }
+
     #[test]
     fn a_session_of_which_nothing_runs_is_gone_and_nothing_is_signalled() {
         let mut child = shell_until_input_closes("");
         let session = session_of(&child);
         drop(child.stdin.take());
         child.wait().unwrap();
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Gone);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Gone
+        );
     }
 
     #[test]
@@ -274,7 +513,10 @@ mod tests {
             .unwrap();
         let session = session_of(&child);
         member_besides_root(&session, |_| true);
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         let _ = child.wait();
     }
 
@@ -289,7 +531,10 @@ mod tests {
             .unwrap();
         let session = session_of(&child);
         let job = member_besides_root(&session, |m| group_of(m.pid).unwrap() == Some(m.pid));
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         let _ = child.wait();
         assert!(!is_same(&reference_to(&job)).unwrap());
     }
@@ -305,7 +550,7 @@ mod tests {
         member_besides_root(&session, |_| true);
         let started = Instant::now();
         assert_eq!(
-            stop(&session, Duration::from_millis(500)).unwrap(),
+            stop(&Hierarchy::host(), &session, Duration::from_millis(500)).unwrap(),
             Stopped::Clean
         );
         // The shell ignored TERM: only KILL, after the grace, ended it.
@@ -323,7 +568,10 @@ mod tests {
         let session = session_of(&child);
         member_besides_root(&session, |_| true);
         let started = Instant::now();
-        assert_eq!(stop(&session, GRACE).unwrap(), Stopped::Clean);
+        assert_eq!(
+            stop(&Hierarchy::host(), &session, GRACE).unwrap(),
+            Stopped::Clean
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(child.wait().unwrap().code(), Some(7));
     }
@@ -345,7 +593,7 @@ mod tests {
         session.tracked = vec![reference_to(&job)];
         assert_eq!(members(&session).unwrap(), std::slice::from_ref(&job));
         assert_eq!(
-            stop(&session, Duration::from_millis(500)).unwrap(),
+            stop(&Hierarchy::host(), &session, Duration::from_millis(500)).unwrap(),
             Stopped::Clean
         );
         assert!(!is_same(&reference_to(&job)).unwrap());
@@ -360,7 +608,7 @@ mod tests {
         child.stdin.take().unwrap().write_all(b"\n").unwrap();
         child.wait().unwrap();
 
-        let stopped = stop(&session, Duration::from_millis(200)).unwrap();
+        let stopped = stop(&Hierarchy::host(), &session, Duration::from_millis(200)).unwrap();
         assert_eq!(
             stopped,
             Stopped::Survivors(vec![Survivor {

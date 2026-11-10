@@ -3,6 +3,7 @@
 //! snapshot (design §7, ADRs 0008, 0018). Pure functions, no I/O.
 
 pub mod file;
+pub mod own_places;
 pub mod paths;
 pub mod validate;
 
@@ -243,6 +244,22 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// What [`a_policy_file_resolves_to_the_same_policy_on_every_system`]'s
+    /// file resolves to, alone and through Hermes's adapter; regenerate only
+    /// for a change meant to show in every sandbox's policy.
+    const RESOLVED: &str = include_str!("resolved.snapshot");
+    const RESOLVED_HERMES: &str = include_str!("resolved-hermes.snapshot");
+
+    /// Compares against a snapshot, or writes it to `write_to` instead: the
+    /// compiled-in text is out of date until the next build.
+    fn same_as_snapshot(got: &str, expected: &str, write_to: Option<&std::path::Path>) {
+        if let Some(file) = write_to {
+            std::fs::write(file, format!("{got}\n")).unwrap();
+            return;
+        }
+        assert_eq!(got.trim_end(), expected.trim_end());
+    }
+
     /// A new sandbox's `policy.toml` with `allow_add` set to `allow`.
     fn overrides(allow: &str) -> String {
         initial_overrides("home", &"assistant".parse().unwrap())
@@ -395,12 +412,105 @@ mod tests {
             "~/Library/Calendars",
             "~/Library/Group Containers/group.com.apple.calendar",
             "~/Pictures/Photos Library.photoslibrary",
+            // Messaging apps' data on macOS
+            "~/Library/Application Support/Signal",
+            "~/Library/Application Support/Slack",
+            "~/Library/Application Support/discord",
+            "~/Library/Application Support/Telegram Desktop",
+            // The same kinds of data where Linux keeps them
+            "~/.local/share/com.vercel.cli",
+            "~/.local/share/keyrings",
+            "~/.local/share/kwalletd",
+            "~/.pki",
+            "~/.local/share/pki",
+            "~/.config/google-chrome",
+            "~/.config/google-chrome-beta",
+            "~/.config/google-chrome-unstable",
+            "~/.config/google-chrome-canary",
+            "~/.config/chromium",
+            "~/.config/BraveSoftware",
+            "~/.config/microsoft-edge",
+            "~/.config/microsoft-edge-beta",
+            "~/.config/microsoft-edge-dev",
+            "~/.config/vivaldi",
+            "~/.config/opera",
+            "~/.mozilla",
+            "~/.config/mozilla",
+            "~/.var/app",
+            "~/snap",
+            "~/.thunderbird",
+            "~/.config/evolution",
+            "~/.local/share/evolution",
+            "~/.config/Signal",
+            "~/.config/Slack",
+            "~/.config/discord",
+            "~/.local/share/TelegramDesktop",
+            "~/.config/1Password",
+            "~/.config/Bitwarden",
+            "~/.config/Bitwarden CLI",
+            "~/.config/Proton Pass",
+            "~/.config/keepassxc",
+            "~/.1password",
+            "~/.bitwarden-ssh-agent.sock",
+            "~/.config/Claude",
+            "~/.config/Cursor",
+            // What starts programs for the user outside the sandbox
+            "~/.config/systemd/user",
+            "~/.local/share/systemd/user",
+            "~/.config/autostart",
+            // Rootless containers' sockets, logins and storage
+            "/run/user",
+            "~/.config/containers",
+            "~/.local/share/containers",
+            "~/.local/share/docker",
+            "/var/snap/lxd",
+            "/var/lib/lxd",
+            "/var/lib/incus",
         ] {
             assert!(
                 snap.policy.fs.read_deny.contains(&entry.to_owned()),
                 "{entry} is not denied"
             );
         }
+    }
+
+    /// The snapshot `name` holds what `adapter` and the test's file resolve to.
+    fn resolves_as(name: &str, expected: &str, adapter: Option<&AdapterLayer>) {
+        let snap = resolve(&overrides("\"api.example.com\""), adapter).unwrap();
+        let resolved = serde_json::to_string_pretty(&snap.policy).unwrap();
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/policy")
+            .join(name);
+        let write = std::env::var_os("ENCLOS_WRITE_SNAPSHOTS").is_some();
+        same_as_snapshot(&resolved, expected, write.then_some(&file));
+    }
+
+    // Linux and macOS both run these against one file. Each layer is text
+    // built in, so what can differ is a `cfg` added to a layer or to `resolve`:
+    // one of the two systems then fails. The adapter is where a Linux-only
+    // destination would arrive.
+    #[test]
+    fn a_policy_file_resolves_to_the_same_policy_on_every_system() {
+        resolves_as("resolved.snapshot", RESOLVED, None);
+    }
+
+    #[test]
+    fn a_policy_file_resolves_through_hermes_to_the_same_policy_on_every_system() {
+        use crate::runtime::RuntimeAdapter;
+        let hermes = AdapterLayer {
+            runtime: "hermes".into(),
+            version: crate::runtime::hermes::Hermes.version().into(),
+            text: crate::runtime::hermes::Hermes.endpoints().into(),
+        };
+        resolves_as("resolved-hermes.snapshot", RESOLVED_HERMES, Some(&hermes));
+    }
+
+    #[test]
+    fn writing_a_snapshot_does_not_compare_against_the_one_compiled_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("resolved.snapshot");
+        same_as_snapshot("new", "old", Some(&file));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
     }
 
     #[test]

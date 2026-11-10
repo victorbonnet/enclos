@@ -2,12 +2,13 @@
 //! quiet, and a tunnel's server name check (design §6).
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::hello::{self, FirstBytes};
+use super::stream::Stream;
 use crate::model::net::{NameSeen, Reason};
 
 /// What a relay moved, whether the proxy ended it for the idle limit, and
@@ -149,8 +150,8 @@ impl Activity {
 /// anything is as any client done. The server's bytes come down from the
 /// start, so a protocol in which the server speaks first works.
 pub(super) fn relay(
-    client: &TcpStream,
-    upstream: &TcpStream,
+    client: &Stream,
+    upstream: &Stream,
     limit: Duration,
     unanswered: Option<&str>,
     room: Option<u64>,
@@ -253,8 +254,8 @@ enum Held {
 /// unless the check refuses them; stopped, as idle, at `deadline` (the
 /// proxy's is [`HELLO_WAIT`]) whatever moved.
 fn check_name(
-    mut client: &TcpStream,
-    upstream: &TcpStream,
+    mut client: &Stream,
+    upstream: &Stream,
     check: NameCheck,
     activity: &Activity,
     limit: Duration,
@@ -355,8 +356,8 @@ fn check_name(
 /// activity. Read, so that closing `from` later does not reset it and lose
 /// the answer on its way.
 fn copy(
-    mut from: &TcpStream,
-    to: &TcpStream,
+    mut from: &Stream,
+    to: &Stream,
     activity: &Activity,
     limit: Duration,
     mut room: Option<u64>,
@@ -417,7 +418,7 @@ fn copy(
 /// cut short still counts what got through. Each write is activity, so the
 /// other copy does not count the time a slow write took as quiet.
 fn write_counted(
-    mut to: &TcpStream,
+    mut to: &Stream,
     mut buf: &[u8],
     activity: &Activity,
     moved: &mut u64,
@@ -447,6 +448,7 @@ fn timed_out(e: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::Stream;
 
     /// What a hello naming no server, or under ECH another, comes to: for
     /// a host name, closed; for an address, which a client names no server
@@ -506,14 +508,14 @@ mod tests {
     #[test]
     fn a_hello_trickled_in_is_stopped_at_the_deadline() {
         use std::io::Write;
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpStream;
         use std::time::{Duration, Instant};
 
         let pair = || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
-            (near, far)
+            (Stream::from(near), Stream::from(far))
         };
         let (mut client, proxied) = pair();
         let (upstream, _server) = pair();
@@ -558,14 +560,14 @@ mod tests {
     #[test]
     fn an_answer_from_a_connection_closed_both_ways_is_copied() {
         use std::io::{Read, Write};
-        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::net::{Shutdown, TcpStream};
         use std::time::Duration;
 
         let pair = || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let listener = crate::test_ports::tcp_listener(std::net::Ipv4Addr::LOCALHOST);
             let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (far, _) = listener.accept().unwrap();
-            (near, far)
+            (Stream::from(near), Stream::from(far))
         };
         let (upstream, mut server) = pair();
         let (client, mut reader) = pair();

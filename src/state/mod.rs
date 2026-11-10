@@ -7,6 +7,7 @@ pub mod sqlite;
 
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::model::Timestamp;
 use crate::model::agent::{AgentName, AgentRecord};
@@ -14,8 +15,9 @@ use crate::model::audit::Actor;
 use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord};
-use crate::model::secret::{SecretRecord, SecretRef};
+use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
+use crate::model::unenforced::Acceptance;
 
 /// Proof that this process holds the exclusive state lock. Released on drop.
 ///
@@ -178,13 +180,26 @@ pub trait StateStore: NetLogStore {
     /// The sandbox's agents, by name.
     fn agents(&self, sandbox: &SandboxName) -> Result<Vec<AgentRecord>>;
 
-    /// Records that `secret` was set now; true when it is new. Its value
+    /// Records that `secret` was set now, in `store` when it is new: it
+    /// stays in the store it first went to. True when it is new. Its value
     /// is the secret store's alone.
-    fn put_secret(&self, lock: &StateLock, secret: &SecretRef) -> Result<bool>;
+    fn put_secret(&self, lock: &StateLock, secret: &SecretRef, store: StoreName) -> Result<bool>;
     /// Forgets `secret`; false when it was not recorded.
     fn remove_secret(&self, lock: &StateLock, secret: &SecretRef) -> Result<bool>;
     /// The sandbox's secrets, by name.
     fn secrets(&self, sandbox: &SandboxName) -> Result<Vec<SecretRecord>>;
+
+    /// Records that the sandbox runs with a field not enforced on this
+    /// host, as the user accepted it (ADR 0038), in place of an earlier
+    /// acceptance of that field.
+    fn accept_unenforced(
+        &self,
+        lock: &StateLock,
+        sandbox: &SandboxName,
+        accepted: &Acceptance,
+    ) -> Result<()>;
+    /// The sandbox's acceptances, by field.
+    fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>>;
 }
 
 /// The network log (design §6). The proxy appends to it as connections
@@ -235,7 +250,9 @@ pub enum StateError {
         "{path} was written by an unreleased build of enclos whose schema {found} differs from this one's, so it cannot be upgraded. Remove its sandboxes with that build (`enclos sandbox rm <name>`) or move the enclos folder aside, then run `enclos init` and create them again"
     )]
     UnknownSchema { path: PathBuf, found: u32 },
-    #[error("{path} holds a value enclos cannot read ({detail}). Restore state.db from a backup")]
+    #[error(
+        "{path} holds a value enclos cannot read ({detail}). Restore state.db from a backup, and remove the state.db-wal and state.db-shm beside it, which belong to the damaged one"
+    )]
     Corrupt { path: PathBuf, detail: String },
     #[error("cannot use {path}: {source}")]
     Io {
@@ -247,4 +264,7 @@ pub enum StateError {
         path: PathBuf,
         source: rusqlite::Error,
     },
+    /// One error for each of several writes made in one transaction.
+    #[error(transparent)]
+    Shared(Arc<StateError>),
 }

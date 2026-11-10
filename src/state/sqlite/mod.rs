@@ -1,7 +1,9 @@
 //! The state store in a SQLite database (`state.db`), with the state lock
 //! held on a separate lock file.
 
+mod acceptances;
 mod agents;
+mod log_writer;
 mod netlog;
 mod policy;
 mod schema;
@@ -16,7 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior, params};
+
+pub use log_writer::NetLogWriter;
 
 use super::{Migration, NetLogStore, Result, StateError, StateLock, StateStore, UnreadableRecord};
 use crate::model::Timestamp;
@@ -26,8 +31,9 @@ use crate::model::net::{DeniedDestination, NetEvent};
 use crate::model::now;
 use crate::model::policy::{PendingPolicy, PolicySnapshot, PolicyVersion, SnapshotId};
 use crate::model::sandbox::{SandboxName, SandboxRecord, SandboxState};
-use crate::model::secret::{SecretRecord, SecretRef};
+use crate::model::secret::{SecretRecord, SecretRef, StoreName};
 use crate::model::session::{ProcessRef, SessionId, SessionRecord};
+use crate::model::unenforced::Acceptance;
 
 /// How long `lock` waits for another enclos command to release the lock.
 const LOCK_WAIT: Duration = Duration::from_secs(10);
@@ -58,9 +64,27 @@ impl SqliteStateStore {
     }
 
     fn connect(&self, flags: OpenFlags) -> Result<Connection> {
-        let conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
+        let mut conn = Connection::open_with_flags(&self.db, flags).map_err(self.sqlite_err())?;
         conn.busy_timeout(LOCK_WAIT).map_err(self.sqlite_err())?;
+        // A transaction takes the write lock as it begins: one that read
+        // first would fail at once, without waiting, when it came to write
+        // while another connection writes.
+        conn.set_transaction_behavior(TransactionBehavior::Immediate);
         conn.pragma_update(None, "foreign_keys", true)
+            .map_err(self.sqlite_err())?;
+        // `init` puts the database in WAL mode, where a commit need not flush
+        // the disk: a power loss can lose the last commits, never corrupt it.
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(self.sqlite_err())?;
+        // A connection that closes leaves the log in place. Each call opens
+        // its own, so most close with no other one open, and SQLite would
+        // then copy the log into `state.db` and delete it, holding the whole
+        // database through two flushes; the next write would flush a new
+        // log's header, holding the write lock. A flush can take seconds on a
+        // loaded SD card, past `LOCK_WAIT` for the calls waiting. The commit
+        // that grows the log past 1000 pages copies it instead, while other
+        // connections read and write.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
             .map_err(self.sqlite_err())?;
         Ok(conn)
     }
@@ -272,9 +296,12 @@ impl StateStore for SqliteStateStore {
             self.connect(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)?;
         std::fs::set_permissions(&self.db, std::fs::Permissions::from_mode(0o600))
             .map_err(io_err(&self.db))?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        // WAL: a read never waits for a write, so the proxy's read of the
+        // policy is not held up by other commands' writes on a slow disk.
+        // Kept in the file; a file system without it keeps the old mode.
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
             .map_err(self.sqlite_err())?;
+        let tx = conn.transaction().map_err(self.sqlite_err())?;
         let from = user_version(&tx).map_err(self.sqlite_err())?;
         let current = schema::current();
         if from > current {
@@ -371,9 +398,7 @@ impl StateStore for SqliteStateStore {
         by: &Actor,
     ) -> Result<PolicyVersion> {
         let mut conn = self.open()?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(self.sqlite_err())?;
+        let tx = conn.transaction().map_err(self.sqlite_err())?;
         insert_sandbox(&tx, rec, "").map_err(self.sqlite_err())?;
         let version =
             policy::append(&tx, &rec.name, snapshot, by, now(), None).map_err(self.sqlite_err())?;
@@ -531,9 +556,9 @@ impl StateStore for SqliteStateStore {
         agents::list(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 
-    fn put_secret(&self, _lock: &StateLock, secret: &SecretRef) -> Result<bool> {
+    fn put_secret(&self, _lock: &StateLock, secret: &SecretRef, store: StoreName) -> Result<bool> {
         let conn = self.open()?;
-        secrets::put(&conn, secret, now()).map_err(self.sqlite_err())
+        secrets::put(&conn, secret, store, now()).map_err(self.sqlite_err())
     }
 
     fn remove_secret(&self, _lock: &StateLock, secret: &SecretRef) -> Result<bool> {
@@ -544,6 +569,21 @@ impl StateStore for SqliteStateStore {
     fn secrets(&self, sandbox: &SandboxName) -> Result<Vec<SecretRecord>> {
         let conn = self.open()?;
         secrets::list(&conn, sandbox).map_err(|e| self.read_err(e))
+    }
+
+    fn accept_unenforced(
+        &self,
+        _lock: &StateLock,
+        sandbox: &SandboxName,
+        accepted: &Acceptance,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        acceptances::put(&conn, sandbox, accepted).map_err(self.sqlite_err())
+    }
+
+    fn acceptances(&self, sandbox: &SandboxName) -> Result<Vec<Acceptance>> {
+        let conn = self.open()?;
+        acceptances::list(&conn, sandbox).map_err(|e| self.read_err(e))
     }
 }
 

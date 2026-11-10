@@ -1,6 +1,6 @@
 # Manual end-to-end test
 
-A walk through every enclos command and what it should do, to run by hand on a Mac before a release. Each step gives the commands, then what to expect; tick the box when it matches. Anything else is a finding: note the step, the command and its output.
+A walk through every enclos command and what it should do, to run by hand on a Mac before a release, and on Linux as [section 16](#16-on-linux) says. Each step gives the commands, then what to expect; tick the box when it matches. Anything else is a finding: note the step, the command and its output.
 
 It takes about an hour, a quarter of it Hermes's installs. It uses a throwaway enclos home, so your own `~/.enclos` and its sandboxes stay as they are, and it removes everything it made at the end. The steps that need no login, no bot and no logout were first run on macOS 26.5.2 with the release build of commit 06ad972; what they print is quoted where it helps. The whole guide ran on macOS 27.2 for milestone 2 (design §13).
 
@@ -80,7 +80,7 @@ enclos audit | grep -i runtime
 enclos doctor
 ```
 
-- [ ] The dry run lists the 13 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
+- [ ] The dry run lists the 14 hosts it would allow, that `lab` may listen on TCP (ADR 0028), the installer it would download and record, and changes nothing.
 - [ ] The install ends `Hermes is installed in sandbox lab (policy v2)`; `enclos audit` has `runtime installer lab` and `runtime installed lab hermes`, and the installer's SHA-256 is in the first one's summary.
 - [ ] Setup runs in your terminal. When the login shows a URL and a code, open the URL in your browser on the Mac and enter the code. Skip Hermes's own messaging setup: a token Hermes writes to `~/.hermes/.env` makes `runtime configure` refuse (§9).
 - [ ] `doctor` says `lab`'s next session compiles policy v2, and exits 0.
@@ -447,6 +447,133 @@ rm -rf "$ENCLOS_HOME" ~/enclos-e2e-work; unset ENCLOS_HOME
 - [ ] `sandbox rm` without `--yes` exits 3, naming the home and the secrets it would delete; with it, it removes them.
 - [ ] `status` shows no sandbox; neither `launchctl list` nor `~/Library/LaunchAgents` has a job of this home; `security` no longer finds either bot's token (exit 44 each).
 
+## 16. On Linux
+
+Run the guide on Linux too, on each kind of host a release supports that you have: an x86_64 desktop on Ubuntu 24.04 or later, and a Raspberry Pi on 64-bit Raspberry Pi OS (Debian 13) reached over ssh. The steps are the same, with the changes below; what a step shows only on a Mac (launchd, the Keychain, `pbpaste`, folders TCC guards) is checked here through systemd, libsecret or the secrets file, and bubblewrap instead.
+
+### Before you start
+
+```bash
+systemd-run --version | head -1          # systemd 254 or later
+bwrap --version
+bwrap --ro-bind / / true; echo "exit $?"
+loginctl show-user "$USER" -p Linger
+```
+
+- [ ] systemd is 254 or later (Debian 12's 252 is not supported); `bwrap` is installed (`sudo apt install bubblewrap`) and starts a program, exit 0. On Ubuntu 24.04 that needs the AppArmor profile in [getting started](getting-started.md#linux-requirements); on 26.04 it needs none.
+- [ ] The build to test is on your PATH: `cargo install --locked --path .` from a clone at the commit, or better the static binary the release will ship, from a manual run of `release.yml` on that commit (`gh run download <run id> -n release-x86_64-unknown-linux-musl`, or `release-aarch64-unknown-linux-musl` on the Pi). Once released, `install.sh` installs it: it names `Linux on x86_64` or `Linux on arm64`, and prints a warning only on a systemd older than 254.
+- [ ] Note whether lingering is on: with it off, the user's services stop at your last logout, so step 10's logout leaves the sandboxes stopped until you log in again.
+
+Throughout the guide: paths are under `/home/<you>`, not `/Users/<you>`; `sed -i ''` is `sed -i`; install `curl` if the host has none.
+
+### 1 and 2: the backend
+
+```bash
+enclos init
+enclos doctor; echo "exit $?"
+enclos sandbox create lab --backend bubblewrap --template assistant
+enclos sandbox create scout --backend bubblewrap --template minimal
+```
+
+- [ ] `init` records `bubblewrap` as the default backend and seatbelt as not available here.
+- [ ] `doctor` says bubblewrap runs here, names the systemd version it found against 254, says what the backend enforces, and exits 0. On Raspberry Pi OS, whose kernel has no Landlock, it says that writes are held by the mounts alone and that any program the sandbox can read can run. Its Host section names the bubblewrap version against 0.9.0, lingering as you noted it, and whether a Secret Service answers; on Raspberry Pi OS, Landlock and the `memory` controller as degraded, each with what is not enforced, the risk and the fix, and the `cpu` controller delegated.
+
+### 5 and 6: sessions in a cgroup, and `policy test`
+
+Run `enclos exec lab -- /bin/sleep 120` in a second terminal, then:
+
+```bash
+enclos sandbox show lab
+systemctl --user list-units --type=scope 'enclos.*'
+systemctl --user status 'enclos.<8 hex>.lab.slice'
+enclos policy test lab
+enclos policy test scout
+```
+
+- [ ] `show` lists the `exec` session and its process; the session runs in a scope `enclos.<8 hex>.lab.<session>.scope` in the sandbox's slice, and Ctrl-C in the second terminal ends it and its scope.
+- [ ] `policy test` runs the probes every backend shares and bubblewrap's own (design §5, bubblewrap's escape probes): the buses, the `systemd --user` manager, every Unix socket on the host that answers you, abstract sockets, `ptrace`, the other sandbox's processes and `secrets/` folder, TIOCSTI, a setgid program, namespaces, mounting and the session's cgroup. It is READY, or each probe that reads open is a finding to report; one it cannot run says why. On a kernel without Landlock, the report says so once. A socket in your home that no deny entry names, such as one of another enclos install, reads open.
+- [ ] On Raspberry Pi OS, `doctor` says the `memory` controller is turned off at boot (`cgroup_disable=memory`), and `enclos policy show lab --compiled` says that none of the compiled Landlock rules apply on this host. With `memory = "1G"` added under `[resources]` by `enclos policy edit lab --accept-unenforced memory`: `enclos sandbox restart lab` says `resources.memory = 1G is not applied`, `policy test lab` is READY and its verdict names `memory` as accepted (ADR 0038), and `doctor` lists `lab` with the field, why and when it was accepted, and exits 0.
+
+### 8: the secret store
+
+```bash
+enclos secret set lab/demo
+secret-tool lookup service enclos.<8 hex> account lab/demo; echo "exit $?"
+ls -l "$ENCLOS_HOME/secrets.json"
+```
+
+- [ ] `secret set` says where it stored the secret. On a desktop, where a Secret Service such as GNOME Keyring answers, it is libsecret: `secret-tool lookup` prints the value, and `secrets.json` does not exist. Where none answers, as over ssh on the Pi, it is the `0600` file: `secret-tool` finds nothing, and `secrets.json` is `-rw-------`, yours.
+- [ ] With the file store: after `chmod 644 "$ENCLOS_HOME/secrets.json"`, the next `enclos secret set lab/other` refuses, naming the file and its mode, and changes nothing; `chmod 600` puts it back.
+- [ ] After `enclos --yes secret rm lab/demo`, neither `secret-tool lookup` nor `secrets.json` has it.
+
+### 10: systemd units
+
+```bash
+enclos sandbox start lab
+enclos sandbox show lab
+systemctl --user list-units 'enclos.<8 hex>.*'
+ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
+systemctl --user kill --signal=KILL 'enclos.<8 hex>.lab.proxy.service'
+sleep 10; enclos sandbox show lab
+enclos sandbox stop lab
+systemctl --user list-units --all 'enclos.<8 hex>.*'
+ls ~/.config/systemd/user | grep "enclos\.<8 hex>\."
+```
+
+- [ ] `start` installs a unit for each service `show` lists, named `<its label>.service`, in `~/.config/systemd/user` (or `$XDG_CONFIG_HOME/systemd/user`), and `list-units` shows each active.
+- [ ] The proxy killed from outside comes back within a few seconds under a new pid: a unit restarts on failure, never after it exits 0.
+- [ ] `stop` ends every session and leaves no unit of this home installed or loaded.
+
+### 10: the dashboard
+
+With Hermes installed in `lab` (step 3). The host cannot reach a listener in the sandbox, so `enclos dashboard` opens its dashboard to you alone (design §6):
+
+```bash
+enclos dashboard lab                     # prints the address; Ctrl-C to end
+enclos status lab                        # in a second terminal, while it runs
+enclos dashboard lab; echo "exit $?"     # there too
+enclos audit --since 10m                 # once it has ended
+```
+
+- [ ] `dashboard` prints `http://127.0.0.1:<port>/` at the sandbox's reserved port and says it serves only you. The page opens in a browser on this host, or, on the Pi, on your own machine through `ssh -L <port>:127.0.0.1:<port> <host>`, and its pages and settings load. A reset connection through the tunnel, with ssh saying `administratively prohibited`, means the host's sshd does not allow TCP forwarding (`AllowTcpForwarding`): not a finding of enclos.
+- [ ] `status` names `enclos dashboard lab` and gives no address; the second `dashboard` is refused, naming the first's pid and address, exit 1, and the first still serves.
+- [ ] Ctrl-C ends it: the address no longer answers, `enclos sandbox show lab` lists no `exec` session of it, and the audit has a `dashboard` entry and a `dashboard end` entry that says it was told to end.
+
+### 11: state check against systemd units
+
+The first part of step 11 runs as written. Then, with `lab` started, stop its gateway's unit by hand, as `launchctl bootout` unloads it on a Mac:
+
+```bash
+systemctl --user stop 'enclos.<8 hex>.lab.gateway.service'
+enclos state check lab; echo "exit $?"
+enclos --dry-run state repair lab; echo "exit $?"
+enclos sandbox stop lab && enclos sandbox start lab
+enclos state check lab
+```
+
+- [ ] The check says the gateway is installed and stopped, as when its systemd unit was stopped by hand, that it does not run until your user's systemd starts again, and that `sandbox stop` then `sandbox start` starts every service again (exit 1); the dry run names the same, as left for you (exit 1); after stop and start, the records match (exit 0).
+
+### 14: isolation spot checks
+
+Each of these runs in `lab` and must fail:
+
+```bash
+enclos exec lab -- /bin/ls -A "$HOME/.ssh"
+enclos exec lab -- /bin/ls "$ENCLOS_HOME/sandboxes/scout/home"
+enclos exec lab -- /usr/bin/touch "$HOME/from-the-sandbox"
+enclos exec lab -- /bin/cat "$ENCLOS_HOME/state.db" > /dev/null
+enclos exec lab -- /usr/bin/curl -sS --noproxy '*' -o /dev/null https://example.com
+enclos exec lab -- /usr/bin/curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:22
+enclos exec lab -- /usr/bin/curl -sS --noproxy '*' -o /dev/null http://127.0.0.1:22
+```
+
+- [ ] `~/.ssh` is not there or is empty, whatever it holds on the host; scout's home, `state.db` and the write fail; nothing appears in your home. Without the proxy the request fails, through it loopback gets `403`, and loopback without it cannot connect.
+- [ ] With `enclos exec lab -- /bin/sleep 120` running in a second terminal, and `pid=$(pgrep -n -x sleep)` on the host, `enclos exec scout -- /bin/cat "/proc/$pid/environ"` fails.
+
+### 15: remove everything
+
+- [ ] After `sandbox rm`, `systemctl --user list-units --all 'enclos.<8 hex>.*'` and `~/.config/systemd/user` have nothing of this home, and neither `secret-tool lookup` nor `secrets.json` holds a secret of `lab` or `scout`.
+
 ## Known gaps: not findings
 
 These are stated in the design and the release notes, so a test that shows them is expected:
@@ -455,4 +582,4 @@ These are stated in the design and the release notes, so a test that shows them 
 - Hermes's browser tools do not start in a sandbox.
 - CPU time, memory and file size limits are refused: Seatbelt cannot hold them.
 - Agents of one sandbox share its files: an agent's secrets reach it alone, but another agent of the same sandbox can read its secrets file (ADR 0036). Isolation is per sandbox.
-- Linux is milestone 3.
+- On Linux, CPU time and file size limits are refused on bubblewrap too. On a host whose memory controller is off, as on Raspberry Pi OS, a `memory` limit runs not applied once accepted with `--accept-unenforced memory`, and every start, `policy test` and `doctor` say so (ADR 0038). On a kernel without Landlock, writes are held by the mounts alone and any program the sandbox can read can run (ADR 0037).

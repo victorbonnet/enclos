@@ -9,11 +9,12 @@ repository = "https://github.com/victorbonnet/enclos"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+close_fds = "0.3.2"
 icu_properties = "2.3.0"
 jiff = { version = "0.2.38", features = ["serde"] }
 psl = "2.1.242"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
-rustix = { version = "1.1.5", features = ["fs", "process", "pty", "stdio", "termios"] }
+rustix = { version = "1.1.5", features = ["fs", "net", "param", "process", "pty", "stdio", "termios", "thread"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
@@ -32,3 +33,7 @@ undocumented_unsafe_blocks = "deny"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+seccompiler = { version = "0.5.0", features = ["json"] }
