@@ -140,6 +140,14 @@ impl PluginWriter {
     pub fn ack(&mut self, of: &MessageId) -> Result<MessageId, PluginError> {
         self.send(FromBridge::Ack { of: of.clone() })
     }
+
+    /// Ends the connection both ways, for every reader and writer cloned
+    /// from it: dropping one writer closes only its own descriptor, while
+    /// the others keep the connection, and the plugin, waiting.
+    pub fn shutdown(&self) {
+        // Already closed by the plugin is as good as closed here.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl PluginReader {
@@ -260,6 +268,32 @@ mod tests {
         drop(writer);
         drop(reader);
         plugin.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_ends_the_connection_for_every_clone_of_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
+        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        // A clone keeps the descriptor open, as the reading thread's
+        // acknowledgements do in `enclos app chat`
+        let clone = writer.try_clone().unwrap();
+        let (done, waited) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let end = reader.receive().unwrap();
+            done.send(end.is_none()).unwrap();
+        });
+        writer.shutdown();
+        drop(writer);
+        let ended = waited
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader still waits for the plugin");
+        assert!(ended);
+        reading.join().unwrap();
+        // The plugin saw the end too, and stopped
+        plugin.join().unwrap();
+        drop(clone);
     }
 
     #[test]
