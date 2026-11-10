@@ -78,6 +78,58 @@ CREATE TABLE IF NOT EXISTS log (
 );
 ";
 
+/// Columns added after the first version of the database, which an older
+/// `app.db` gets when it is opened.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    // `<device>/<its envelope id>` for a device's message, so a message
+    // sent again is known (`docs/protocol.md`, Messages: ids drop
+    // duplicates).
+    ("messages", "origin", "TEXT"),
+    // 1 while a person's message has not reached the agent's plugin.
+    ("messages", "pending", "INTEGER NOT NULL DEFAULT 0"),
+    // The transport's id of the node the device was paired from.
+    ("devices", "node", "TEXT"),
+    ("pairings", "request_node", "TEXT"),
+    ("pairings", "request_node_id", "TEXT"),
+];
+
+fn add_column(
+    db: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> rusqlite::Result<()> {
+    let mut query = db.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+    let columns = query
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|c| c == column) {
+        db.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        ))?;
+    }
+    Ok(())
+}
+
+/// What became of a device's message given to [`Store::add_from_device`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Added {
+    /// Stored, with its place in the order.
+    New(i64),
+    /// Sent before: stored then, and not again.
+    Again,
+}
+
+/// A person's message still to give the agent's plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    /// The id it goes to the plugin with, the same on every try.
+    pub id: String,
+    pub conversation: String,
+    pub person: String,
+    pub text: String,
+}
+
 /// A paired device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -90,6 +142,9 @@ pub struct Device {
     pub push_token: Option<String>,
     pub paired: i64,
     pub seen: Option<i64>,
+    /// The transport's id of the node it was paired from; `None` for a
+    /// device paired before the bridge recorded it, which is refused.
+    pub node: Option<String>,
 }
 
 /// One line of the bridge's log: a connection, a disconnection, a refusal.
@@ -107,12 +162,23 @@ pub struct LogLine {
 pub struct PairingRequest {
     pub name: String,
     pub person: String,
+    /// The node it comes from, by name, for the terminal.
+    pub node: String,
+    /// The node's id, stored with the device.
+    pub node_id: String,
 }
 
 impl Store {
     pub fn open(path: &Path) -> rusqlite::Result<Store> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        for (table, column, declaration) in ADDED_COLUMNS {
+            add_column(&db, table, column, declaration)?;
+        }
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_origin ON messages(origin);
+             CREATE INDEX IF NOT EXISTS messages_pending ON messages(pending) WHERE pending = 1;",
+        )?;
         Ok(Store { db })
     }
 
@@ -155,6 +221,85 @@ impl Store {
             params![id, conversation, person, text, kind, now()],
         )?;
         Ok((added == 1).then(|| self.db.last_insert_rowid()))
+    }
+
+    /// Stores the pieces of one text, each with its id, all or none: when
+    /// the first id is known already the whole text is a duplicate, and
+    /// `None` comes back; else each piece's `seq`.
+    pub fn add_pieces(
+        &self,
+        pieces: &[(String, String)],
+        conversation: &str,
+        from: &From,
+        kind: &str,
+    ) -> rusqlite::Result<Option<Vec<i64>>> {
+        let transaction = self.db.unchecked_transaction()?;
+        let mut seqs = Vec::new();
+        for (id, text) in pieces {
+            match self.add(id, conversation, from, text, kind)? {
+                Some(seq) => seqs.push(seq),
+                None if seqs.is_empty() => return Ok(None),
+                None => return Err(rusqlite::Error::StatementChangedRows(0)),
+            }
+        }
+        transaction.commit()?;
+        Ok(Some(seqs))
+    }
+
+    /// Stores a person's message from a device, as pending for the agent,
+    /// once: `origin` names the device and its id for the message, and a
+    /// message with an `origin` known already is [`Added::Again`].
+    pub fn add_from_device(
+        &self,
+        origin: &str,
+        id: &str,
+        conversation: &str,
+        person: &str,
+        text: &str,
+    ) -> rusqlite::Result<Added> {
+        let added = self.db.execute(
+            "INSERT OR IGNORE INTO messages (id, origin, pending, conversation, person, text, kind, at) VALUES (?1, ?2, 1, ?3, ?4, ?5, 'message', ?6)",
+            params![id, origin, conversation, person, text, now()],
+        )?;
+        Ok(match added {
+            1 => Added::New(self.db.last_insert_rowid()),
+            _ => Added::Again,
+        })
+    }
+
+    /// The messages still to give `sandbox`/`agent`'s plugin, oldest first.
+    pub fn pending(&self, sandbox: &str, agent: &str) -> rusqlite::Result<Vec<Pending>> {
+        let mut query = self.db.prepare(
+            "SELECT m.id, m.conversation, m.person, m.text FROM messages m
+             JOIN conversations c ON c.id = m.conversation
+             WHERE m.pending = 1 AND c.sandbox = ?1 AND c.agent = ?2 ORDER BY m.seq",
+        )?;
+        let rows = query.query_map(params![sandbox, agent], |row| {
+            Ok(Pending {
+                id: row.get(0)?,
+                conversation: row.get(1)?,
+                person: row.get(2)?,
+                text: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// The agents with messages still to give them, as `(sandbox, agent)`.
+    pub fn agents_with_pending(&self) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut query = self.db.prepare(
+            "SELECT DISTINCT c.sandbox, c.agent FROM messages m
+             JOIN conversations c ON c.id = m.conversation WHERE m.pending = 1",
+        )?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// The plugin acknowledged message `id`: it is the runtime's now.
+    pub fn delivered(&self, id: &str) -> rusqlite::Result<()> {
+        self.db
+            .execute("UPDATE messages SET pending = 0 WHERE id = ?1", params![id])?;
+        Ok(())
     }
 
     /// The messages of `owner`'s conversations after `since`, in order.
@@ -214,15 +359,16 @@ impl Store {
             push_token: row.get(6)?,
             paired: row.get(7)?,
             seen: row.get(8)?,
+            node: row.get(9)?,
         })
     }
 
     const DEVICE_COLUMNS: &'static str =
-        "id, name, person, noise_key, device_key, push_key, push_token, paired, seen";
+        "id, name, person, noise_key, device_key, push_key, push_token, paired, seen, node";
 
     pub fn add_device(&self, device: &Device) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO devices (id, name, person, noise_key, device_key, push_key, push_token, paired, seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO devices (id, name, person, noise_key, device_key, push_key, push_token, paired, seen, node) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 device.id,
                 device.name,
@@ -232,7 +378,8 @@ impl Store {
                 device.push_key,
                 device.push_token,
                 device.paired,
-                device.seen
+                device.seen,
+                device.node
             ],
         )?;
         Ok(())
@@ -246,6 +393,17 @@ impl Store {
                     Self::DEVICE_COLUMNS
                 ),
                 params![key],
+                Self::device_from,
+            )
+            .optional()
+    }
+
+    /// A paired device by its id; `None` once it is unpaired.
+    pub fn device(&self, id: &str) -> rusqlite::Result<Option<Device>> {
+        self.db
+            .query_row(
+                &format!("SELECT {} FROM devices WHERE id = ?1", Self::DEVICE_COLUMNS),
+                params![id],
                 Self::device_from,
             )
             .optional()
@@ -328,8 +486,8 @@ impl Store {
     /// expired. Using it once is all it gets, whatever the answer.
     pub fn use_pairing(&self, code: &[u8], request: &PairingRequest) -> rusqlite::Result<bool> {
         Ok(self.db.execute(
-            "UPDATE pairings SET used = 1, request_name = ?2, request_person = ?3 WHERE code = ?1 AND used = 0 AND expires >= ?4",
-            params![code, request.name, request.person, now()],
+            "UPDATE pairings SET used = 1, request_name = ?2, request_person = ?3, request_node = ?4, request_node_id = ?5 WHERE code = ?1 AND used = 0 AND expires >= ?6",
+            params![code, request.name, request.person, request.node, request.node_id, now()],
         )? == 1)
     }
 
@@ -347,12 +505,14 @@ impl Store {
     pub fn pairing_request(&self, code: &[u8]) -> rusqlite::Result<Option<PairingRequest>> {
         self.db
             .query_row(
-                "SELECT request_name, request_person FROM pairings WHERE code = ?1 AND used = 1",
+                "SELECT request_name, request_person, request_node, request_node_id FROM pairings WHERE code = ?1 AND used = 1",
                 params![code],
                 |row| {
                     Ok(PairingRequest {
                         name: row.get(0)?,
                         person: row.get(1)?,
+                        node: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        node_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                     })
                 },
             )
@@ -454,6 +614,107 @@ mod tests {
             Some("alice@example.com")
         );
         assert_eq!(store.owner("c-9").unwrap(), None);
+    }
+
+    #[test]
+    fn a_device_message_is_stored_once_and_pending_until_delivered() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        let owner = "victor@example.com";
+        store.conversation("c-1", "lab", "main", owner).unwrap();
+        store.conversation("c-2", "lab", "scout", owner).unwrap();
+        let first = store
+            .add_from_device("d-1/m-1", "b-1", "c-1", owner, "hi")
+            .unwrap();
+        assert!(matches!(first, Added::New(_)));
+        // The same envelope again, whatever id the bridge would give it
+        assert_eq!(
+            store
+                .add_from_device("d-1/m-1", "b-2", "c-1", owner, "hi")
+                .unwrap(),
+            Added::Again
+        );
+        // Another device may use the same envelope id
+        assert!(matches!(
+            store
+                .add_from_device("d-2/m-1", "b-3", "c-2", owner, "yo")
+                .unwrap(),
+            Added::New(_)
+        ));
+        assert_eq!(store.since(owner, 0).unwrap().len(), 2);
+        let pending = store.pending("lab", "main").unwrap();
+        assert_eq!(
+            pending,
+            [Pending {
+                id: "b-1".into(),
+                conversation: "c-1".into(),
+                person: owner.into(),
+                text: "hi".into(),
+            }]
+        );
+        assert_eq!(
+            store.agents_with_pending().unwrap().len(),
+            2,
+            "both agents wait"
+        );
+        store.delivered("b-1").unwrap();
+        assert!(store.pending("lab", "main").unwrap().is_empty());
+        assert_eq!(
+            store.agents_with_pending().unwrap(),
+            [("lab".to_owned(), "scout".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_text_in_pieces_is_stored_whole_or_not_at_all() {
+        let folder = tempfile::tempdir().unwrap();
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@example.com")
+            .unwrap();
+        let pieces = [
+            ("a-1".to_owned(), "one".to_owned()),
+            ("a-2".to_owned(), "two".to_owned()),
+        ];
+        let seqs = store
+            .add_pieces(&pieces, "c-1", &From::Agent, "reply")
+            .unwrap()
+            .unwrap();
+        assert_eq!(seqs.len(), 2);
+        assert!(seqs[0] < seqs[1]);
+        // The plugin sent it again: a duplicate, nothing more stored
+        let again = [
+            ("a-1".to_owned(), "one".to_owned()),
+            ("a-3".to_owned(), "two".to_owned()),
+        ];
+        assert_eq!(
+            store
+                .add_pieces(&again, "c-1", &From::Agent, "reply")
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.since("victor@example.com", 0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_older_database_gets_the_new_columns() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("app.db");
+        // The first version's tables, with a device in them
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute(
+            "INSERT INTO devices (id, name, person, noise_key, device_key, push_key, paired) VALUES ('d-1', 'Pixel', 'v@example.com', x'01', x'02', x'03', 1)",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open(&path).unwrap();
+        let device = store.device("d-1").unwrap().unwrap();
+        assert_eq!(device.node, None);
+        // Opening it again changes nothing
+        drop(store);
+        Store::open(&path).unwrap();
     }
 
     #[test]

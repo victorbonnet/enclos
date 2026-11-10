@@ -116,9 +116,16 @@ impl PluginWriter {
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        self.stream
-            .write_all(&encode_line(&Envelope::new(id.clone(), body)))?;
+        self.send_as(id.clone(), body)?;
         Ok(id)
+    }
+
+    /// Sends `body` with `id`: the same on every try of one message, so the
+    /// plugin knows a message it has had already.
+    pub fn send_as(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+        self.stream
+            .write_all(&encode_line(&Envelope::new(id, body)))?;
+        Ok(())
     }
 
     /// A person's message to the agent, in `conversation`.

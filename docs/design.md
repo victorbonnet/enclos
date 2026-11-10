@@ -903,6 +903,11 @@ On macOS 27.2 the full test suite passes with #136: `defaults read` says `not fo
 
 The design depends on these, and they have not been shown yet. Items the milestone 1 prototype (`prototype/m1/`, issue #5) settled moved into the sections above, with what was shown: how Hermes keeps agents and shares one login per sandbox, its single gateway ([ADR 0021](adr/0021-one-runtime-service-per-sandbox.md)), the host-service rules (§5), the device-code login and its endpoints, DNS through the proxy only, the proxy variables, and denials in the unified log. Items marked **VM** run in a disposable macOS VM: escape probes that could act on the host, and member-tracking experiments, no longer run on a development Mac.
 
+**For the mobile app's bridge** (milestone 4, on both backends):
+
+- That the agent's app channel socket in the sandbox home is one the bridge reaches and nothing else of the host does without the agent's token (§3, the bridge): the end-to-end run on a Mac reached it, under Seatbelt; bubblewrap is not tried.
+- That `tailscale serve` gives the bridge the caller's tailnet address in `X-Forwarded-For`, last of its values, and its login in `Tailscale-User-Login`, overwriting any the caller sent. The bridge asks `tailscale whois` for the node at that address, checks its login against the header, and refuses a paired device calling from another node; tests show this with a stand-in for `whois`, not yet through `tailscale serve`.
+
 **On a development Mac**:
 
 - That Terminal.app, iTerm2 and a terminal over ssh mark a paste as enclos expects once it turns bracketed paste on (§12): the tests show enclos turning the mode on and off, and give the marks themselves.

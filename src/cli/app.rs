@@ -20,6 +20,7 @@ use enclos::bridge::transport::Transport;
 use enclos::engine::Engine;
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
+use enclos_protocol::device::ConversationMessage;
 use enclos_protocol::pairing::PairLink;
 use enclos_protocol::plugin::{FromPlugin, OutKind};
 use enclos_protocol::{ConversationId, Person};
@@ -89,9 +90,9 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             conversation,
         } => chat(engine, by, target, conversation),
         AppVerb::Serve { port, transport } => serve(engine, port, transport),
-        AppVerb::Pair { url, transport } => pair(engine, url, transport),
+        AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
-        AppVerb::Unpair { device } => unpair(engine, &device),
+        AppVerb::Unpair { device } => unpair(engine, by, &device),
         AppVerb::Log { lines } => log(engine, lines),
     }
 }
@@ -154,7 +155,7 @@ fn terminal_qr(drawn: &str) -> String {
         .join("\n")
 }
 
-fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8> {
+fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) -> Result<u8> {
     let url = url.or_else(|| transport.address()).ok_or_else(|| {
         failed(format!(
             "cannot read the bridge's address from {transport}: give it with --url {}",
@@ -207,8 +208,8 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
     print!(
-        "{} ({transport} login: {}) wants to pair. Accept? [y/N] ",
-        request.name, request.person
+        "{} ({transport} login: {}, node: {}) wants to pair. Accept? [y/N] ",
+        request.name, request.person, request.node
     );
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -219,36 +220,63 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
     let accept = matches!(answer.trim(), "y" | "Y" | "yes");
     let left =
         || failed("the device left before it was paired: run `enclos app pair` again".to_owned());
-    if !store
-        .decide_pairing(&code, if accept { "accept" } else { "decline" })
-        .map_err(|e| failed(e.to_string()))?
-    {
-        // The bridge had its word first: the device left.
-        return Err(left());
-    }
     if !accept {
+        if !store
+            .decide_pairing(&code, "decline")
+            .map_err(|e| failed(e.to_string()))?
+        {
+            return Err(left());
+        }
         println!("Declined: the device is not paired.");
         return Ok(exit::OK);
     }
-    // Paired once the device has its answer, which the bridge says.
-    for _ in 0..20 {
-        match store
-            .pairing_decision(&code)
-            .map_err(|e| failed(e.to_string()))?
-            .as_deref()
-        {
-            Some("paired") => {
-                println!("Paired.");
-                return Ok(exit::OK);
+    // The bridge stores the device only once it reads `accept`, which is
+    // written inside the audit entry
+    let target = format!(
+        "{} ({}, node {})",
+        request.name, request.person, request.node
+    );
+    let device = engine.app_access(
+        by,
+        "app pair",
+        target,
+        |device: &String| format!("paired as device {device}"),
+        || {
+            if !store
+                .decide_pairing(&code, "accept")
+                .map_err(|e| failed(e.to_string()))?
+            {
+                // The bridge had its word first: the device left.
+                return Err(left());
             }
-            Some("gone") => return Err(left()),
-            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
-        }
-    }
-    Err(failed(
-        "accepted, but the bridge did not answer the device: is `enclos app serve` running?"
-            .to_owned(),
-    ))
+            // Paired once the device has its answer, which the bridge says.
+            for _ in 0..20 {
+                match store
+                    .pairing_decision(&code)
+                    .map_err(|e| failed(e.to_string()))?
+                    .as_deref()
+                {
+                    Some("paired") => {
+                        let devices = store.devices().map_err(|e| failed(e.to_string()))?;
+                        return Ok(devices
+                            .into_iter()
+                            .filter(|d| d.node.as_deref() == Some(request.node_id.as_str()))
+                            .max_by_key(|d| d.paired)
+                            .map(|d| d.id)
+                            .unwrap_or_default());
+                    }
+                    Some("gone") => return Err(left()),
+                    _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+                }
+            }
+            Err(failed(
+                "accepted, but the bridge did not answer the device: is `enclos app serve` running?"
+                    .to_owned(),
+            ))
+        },
+    )?;
+    println!("Paired: device {device}.");
+    Ok(exit::OK)
 }
 
 fn when(seconds: Option<i64>) -> String {
@@ -306,24 +334,29 @@ fn devices(engine: &Engine) -> Result<u8> {
     Ok(exit::OK)
 }
 
-fn unpair(engine: &Engine, device: &str) -> Result<u8> {
+fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     let store = open_store(engine)?;
-    match store
-        .remove_device(device)
-        .map_err(|e| failed(e.to_string()))?
-    {
-        true => {
-            let _ = store.log(Some(device), None, "unpaired", None);
-            match output::json() {
-                true => output::emit(&json!({"device": device, "removed": true})),
-                false => println!("Device {device} removed: it can no longer connect."),
-            }
-            Ok(exit::OK)
-        }
-        false => Err(failed(format!(
-            "no paired device {device}: `enclos app devices` lists them"
-        ))),
+    // A connected device's session ends once its row is gone: the bridge
+    // looks for it before each message
+    engine.app_access(
+        by,
+        "app unpair",
+        device.to_owned(),
+        |_| "removed: it can no longer connect".to_owned(),
+        || match store.remove_device(device) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(failed(format!(
+                "no paired device {device}: `enclos app devices` lists them"
+            ))),
+            Err(e) => Err(failed(e.to_string())),
+        },
+    )?;
+    let _ = store.log(Some(device), None, "unpaired", None);
+    match output::json() {
+        true => output::emit(&json!({"device": device, "removed": true})),
+        false => println!("Device {device} removed: it can no longer connect."),
     }
+    Ok(exit::OK)
 }
 
 fn log(engine: &Engine, lines: i64) -> Result<u8> {
@@ -399,6 +432,7 @@ fn chat(
     // What the agent sends, printed as it comes and stored, then
     // acknowledged so its plugin drops it from its outbox.
     let store_path = engine.app_store_path();
+    let agent_name = format!("{sandbox}/{agent}");
     let mut acks = writer_ack(&mut writer)?;
     let printer = std::thread::spawn(move || -> std::result::Result<(), String> {
         let store = Store::open(&store_path).map_err(|e| e.to_string())?;
@@ -414,12 +448,21 @@ fn chat(
                     OutKind::Reply => "reply",
                     OutKind::Notify => "notify",
                 };
+                // In pieces a device can sync
+                let whole = ConversationMessage {
+                    conversation: conversation.clone(),
+                    agent: agent_name.clone(),
+                    from: "agent".to_owned(),
+                    text: text.clone(),
+                    kind: kind.to_owned(),
+                    time: now(),
+                    seq: 0,
+                };
                 let new = store
-                    .add(
-                        message.id.as_str(),
+                    .add_pieces(
+                        &server::pieces(&message.id, &whole)?,
                         conversation.as_str(),
                         &From::Agent,
-                        text,
                         kind,
                     )
                     .map_err(|e| e.to_string())?;
@@ -444,12 +487,20 @@ fn chat(
         let id = writer
             .message(&conversation, &person, text)
             .map_err(plugin_error)?;
+        let whole = ConversationMessage {
+            conversation: conversation.clone(),
+            agent: format!("{sandbox}/{agent}"),
+            from: person.to_string(),
+            text: text.to_owned(),
+            kind: "message".to_owned(),
+            time: now(),
+            seq: 0,
+        };
         store
-            .add(
-                id.as_str(),
+            .add_pieces(
+                &server::pieces(&id, &whole).map_err(failed)?,
                 conversation.as_str(),
                 &From::Person(person.to_string()),
-                text,
                 "message",
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;

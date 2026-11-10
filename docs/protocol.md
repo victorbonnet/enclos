@@ -30,7 +30,7 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 A Noise transport message holds at most 65,535 bytes, its 16-byte tag included, and this protocol defines no fragmentation. So **on the device leg a message is at most 65,519 bytes**, as it is sealed: its JSON and the line break after it. The 1 MiB limit holds on the plugin leg only.
 
 - **An agent's text that does not fit** (`message.out`, or a cron job's output) is split by the bridge, at character boundaries, into several `message`s of the same conversation, each with the next `seq` and stored as it is sent. A device sees them in order, as consecutive messages from the agent; the plugin and the runtime see one message.
-- **A device never sends more:** the app refuses, before sealing, a `message.send` that does not fit, and keeps the person's text. The bridge closes a connection whose frame does not decrypt, so a larger one ends it.
+- **A person's text is one message:** the app refuses, before sealing, a `message.send` whose text would not fit as a `message` (its echo, with the conversation's other fields), and keeps the person's text; `enclos-protocol`'s `split_text` giving one piece is the test. The bridge answers one that gets through with `bad_message` and stores nothing, and closes a connection whose frame does not decrypt, so a larger one ends it.
 
 ### Names
 
