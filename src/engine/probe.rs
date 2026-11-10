@@ -35,6 +35,7 @@ struct ProbeRun<'a> {
     store: &'a dyn crate::state::StateStore,
     tag: String,
 }
+
 impl Drop for ProbeRun<'_> {
     fn drop(&mut self) {
         if let Err(e) = self.store.end_probe(&self.tag) {
@@ -42,6 +43,7 @@ impl Drop for ProbeRun<'_> {
         }
     }
 }
+
 fn tag_probe(probe: &mut Probe, tag: &str) {
     let mark = |script: &str| {
         script.replace(
@@ -692,6 +694,34 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     #[test]
+    fn diagnostic_provenance_tags_the_sandbox_attempt_and_its_host_control() {
+        let script = format!(
+            "/usr/bin/curl --proxy http://127.0.0.1:41000 https://{}:8443/",
+            crate::probes::POLICY_PROBE_HOST
+        );
+        let mut probe = Probe {
+            route: "network",
+            name: "diagnostic destination".into(),
+            script: script.clone(),
+            proof: Proof::OnlyTheProxy {
+                control: crate::probes::HostScript::new(script),
+            },
+            host: None,
+            closed_by: None,
+        };
+        let tag = "a".repeat(64);
+        tag_probe(&mut probe, &tag);
+        let marker = format!("--proxy-header 'X-Enclos-Probe: {tag}'");
+        assert!(probe.script.contains(&marker));
+        assert!(probe.script.contains(crate::probes::POLICY_PROBE_HOST));
+        let Proof::OnlyTheProxy { control } = probe.proof else {
+            panic!("wrong proof")
+        };
+        assert!(control.as_str().contains(&marker));
+        assert!(control.as_str().contains(crate::probes::POLICY_PROBE_HOST));
+    }
+
+    #[test]
     fn a_password_managers_ssh_agent_in_the_home_is_a_host_socket() {
         let home = tempfile::tempdir().unwrap();
         let (one, bit) = (
@@ -918,35 +948,5 @@ mod tests {
             run_probe(&signal, refused, &mut target.0),
             Outcome::NotRun(why) if why.contains("ended before")
         ));
-    }
-}
-
-#[cfg(test)]
-mod diagnostic_source_tests {
-    use super::*;
-    #[test]
-    fn diagnostic_provenance_tags_the_sandbox_attempt_and_its_host_control() {
-        let script = "/usr/bin/curl --proxy http://127.0.0.1:41000 https://10.0.0.1/";
-        let mut probe = Probe {
-            route: "network",
-            name: "private address".into(),
-            script: script.into(),
-            proof: Proof::OnlyTheProxy {
-                control: crate::probes::HostScript::new(script),
-            },
-            host: None,
-            closed_by: None,
-        };
-        let tag = "a".repeat(64);
-        tag_probe(&mut probe, &tag);
-        assert!(
-            probe
-                .script
-                .contains(&format!("--proxy-header 'X-Enclos-Probe: {tag}'"))
-        );
-        let Proof::OnlyTheProxy { control } = probe.proof else {
-            panic!("wrong proof")
-        };
-        assert!(control.as_str().contains(&tag));
     }
 }

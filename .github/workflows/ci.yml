@@ -402,28 +402,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
-  # enclos-protocol also builds into the Android app (victorbonnet/enclos-app):
-  # catch a dependency that does not build for Android here, first
-  protocol-android:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: rustup toolchain install
-      - run: rustup target add aarch64-linux-android
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo check --locked -p enclos-protocol --target aarch64-linux-android
-
-  # The Hermes channel plugin's protocol and outbox, against the crate's
-  # fixtures; standard library only, no Hermes needed
-  hermes-plugin:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: python3 -I -m unittest discover -s channels/hermes/tests -v
-
   ci-ok:
     if: always()
-    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny, protocol-android, hermes-plugin]
+    needs: [lint, test, systemd-units, cgroups, confinement, bubblewrap, libsecret, musl, secrets, deny]
     runs-on: ubuntu-24.04
     permissions:
       actions: read

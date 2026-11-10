@@ -168,3 +168,67 @@ fn mobile_policy_restart_requirement_is_reviewed_and_pending_edits_block_new_cha
     );
     assert!(!e.mobile_policy(&name).unwrap().editable);
 }
+
+#[test]
+fn mobile_changes_keep_recorded_unenforced_acceptances_without_accepting_a_new_value() {
+    use crate::model::unenforced::UnenforcedField;
+
+    let (_dir, e) = engine_with(vec![Box::new(
+        FakeBackend::available(BackendKind::Bubblewrap)
+            .without_memory_controller("the test host has no memory controller"),
+    )]);
+    done(e.init(&alice(), Confirm::Yes).unwrap());
+    let name: crate::model::sandbox::SandboxName = "memory".parse().unwrap();
+    done(
+        e.create_sandbox(
+            &alice(),
+            SandboxSpec {
+                name: name.clone(),
+                backend: BackendKind::Bubblewrap,
+                template: "assistant".parse().unwrap(),
+            },
+            Confirm::Yes,
+        )
+        .unwrap(),
+    );
+    let e = e.accepting_unenforced(vec![UnenforcedField::Memory]);
+    let before = e.layout.read_policy(name.as_str()).unwrap();
+    let after = format!("{before}\n[resources]\nmemory = \"1G\"\n");
+    done(
+        e.policy_edit(&alice(), &name, &before, &after, Confirm::Yes)
+            .unwrap(),
+    );
+    let e = e.accepting_unenforced(Vec::new());
+    let accepted = e.state.acceptances(&name).unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert!(e.mobile_policy(&name).unwrap().editable);
+
+    let access = enclos_protocol::approval::Access {
+        kind: enclos_protocol::approval::AccessKind::Network,
+        target: "api.example.com".into(),
+        private: false,
+    };
+    let plan = e.access_plan(&name, &access).unwrap();
+    e.approve_access(&alice(), &name, &access, &plan.revision)
+        .unwrap();
+    save(&e, &name, &edit("mode", Some("public"), Some("allowlist")));
+    assert_eq!(e.state.acceptances(&name).unwrap(), accepted);
+    assert_eq!(
+        e.policy(&name).unwrap().snapshot.policy.resources.memory,
+        Some("1G".into())
+    );
+
+    let state = e.mobile_policy(&name).unwrap();
+    let error = e
+        .mobile_policy_preview(&name, &state.base, &edit("memory", Some("1G"), Some("2G")))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("resources.memory = 2G"),
+        "{error}"
+    );
+    assert_eq!(e.state.acceptances(&name).unwrap(), accepted);
+    assert_eq!(
+        e.policy(&name).unwrap().snapshot.policy.resources.memory,
+        Some("1G".into())
+    );
+}

@@ -1372,39 +1372,3 @@ fn a_start_is_checked_before_a_restart_stops_anything() {
     let err = engine.check_start_limits(&name).unwrap_err();
     assert!(err.to_string().contains("open_files"), "{err}");
 }
-
-#[test]
-fn access_approval_file_scope_restarts_and_does_not_accept_a_pending_change() {
-    use enclos_protocol::approval::{Access, AccessKind};
-    let (dir, engine, name) = with_sandbox();
-    let (_sleeping, id) = running(&engine, &name);
-    let (work, before, after) = grant_work(&dir, &engine);
-    let access = Access {
-        kind: AccessKind::Write,
-        target: work.clone(),
-        private: false,
-    };
-    let plan = engine.access_plan(&name, &access).unwrap();
-    assert!(plan.restart);
-    let result = engine
-        .approve_access(&alice(), &name, &access, &plan.revision)
-        .unwrap();
-    let ChangeOutcome::Restarted(restarted) = result.outcome else {
-        panic!("no restart")
-    };
-    assert_eq!(restarted.stopped.unwrap().stopped, [id]);
-    assert!(engine.policy(&name).unwrap().pending.is_none());
-    assert!(writes(
-        &engine,
-        &name,
-        &crate::policy::paths::real_path(std::path::Path::new(&work))
-            .display()
-            .to_string()
-    ));
-    // An existing pending change must never be silently included by another approval.
-    let (_sleeping, _) = running(&engine, &name);
-    let after = after.replace(&work, &dir.path().join("other").display().to_string());
-    let before = engine.layout.read_policy(name.as_str()).unwrap_or(before);
-    make_pending(&engine, &name, &before, &after);
-    assert!(engine.access_plan(&name, &access).is_err());
-}

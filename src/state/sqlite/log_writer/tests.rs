@@ -162,3 +162,101 @@ fn a_member_record_gets_its_turn_while_a_proxy_logs_a_burst_of_connections() {
     recorded.unwrap();
     assert_eq!(failed, 0, "log writes failed");
 }
+
+#[test]
+fn tagged_connections_keep_provenance_through_the_existing_batched_writer() {
+    use crate::model::net::Reason;
+    let (_dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let log = writer_of(&store);
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let registered = "a".repeat(64);
+    let forged = "b".repeat(64);
+    log.begin_probe(&sandbox, &registered).unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|thread| {
+            let log = Arc::clone(&log);
+            let registered = registered.clone();
+            let forged = forged.clone();
+            std::thread::spawn(move || {
+                for index in 0..20 {
+                    let mut connection = event("10.0.0.1");
+                    connection.verdict = Verdict::Denied;
+                    connection.reason = Some(Reason::PrivateAddress);
+                    let tag = if (thread + index) % 2 == 0 {
+                        &registered
+                    } else {
+                        &forged
+                    };
+                    let row = log.record_probe(&connection, Some(tag)).unwrap();
+                    connection.bytes_down = 1000 + index;
+                    log.finish(row, &connection).unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(log.events(&sandbox, None).unwrap().len(), 160);
+    assert_eq!(log.denied(&sandbox).unwrap()[0].count, 160);
+    assert_eq!(log.denied_for_approval(&sandbox).unwrap()[0].count, 80);
+    assert!(
+        log.events(&sandbox, None)
+            .unwrap()
+            .iter()
+            .all(|event| event.bytes_down >= 1000)
+    );
+    log.end_probe(&registered).unwrap();
+    let mut connection = event("10.0.0.1");
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(Reason::PrivateAddress);
+    log.record_probe(&connection, Some(&registered)).unwrap();
+    assert_eq!(
+        log.denied_for_approval(&sandbox).unwrap()[0].count,
+        81,
+        "closing the host run makes later tagged traffic ordinary"
+    );
+    let version: u32 = Connection::open(&store.db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 12,
+        "diagnostic metadata does not change the Pi's released schema"
+    );
+}
+
+#[test]
+fn a_failed_batch_rolls_back_both_log_rows_and_their_diagnostic_provenance() {
+    use super::Write;
+    use crate::model::net::Reason;
+    let (dir, store) = store();
+    let lock = store.lock().unwrap();
+    store.migrate(&lock).unwrap();
+    store.put(&lock, &record("home")).unwrap();
+    let sandbox: SandboxName = "home".parse().unwrap();
+    let tag = "a".repeat(64);
+    store.begin_probe(&sandbox, &tag).unwrap();
+    Connection::open(&store.db).unwrap().execute_batch("CREATE TRIGGER reject_batch BEFORE INSERT ON net_events WHEN NEW.host='fail.example.com' BEGIN SELECT RAISE(ABORT,'batch refused'); END;").unwrap();
+    let mut connection = event("10.0.0.1");
+    connection.verdict = Verdict::Denied;
+    connection.reason = Some(Reason::PrivateAddress);
+    let tagged = Write::Record(connection.clone(), Some(tag));
+    let failing = Write::Record(event("fail.example.com"), None);
+    assert!(store.write_log(&[&tagged, &failing]).is_err());
+    assert!(store.events(&sandbox, None).unwrap().is_empty());
+    let marked: i64 = Connection::open(dir.path().join("probe-sources.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(marked, 0, "no provenance survives without its log row");
+    writer_of(&store).record(&connection).unwrap();
+    assert_eq!(
+        store.denied_for_approval(&sandbox).unwrap()[0].count,
+        1,
+        "a later real connection is never hidden by rolled-back metadata"
+    );
+}

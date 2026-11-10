@@ -4,7 +4,7 @@ use super::*;
 use std::io::ErrorKind;
 
 impl SqliteStateStore {
-    fn attach_probe_sources(&self, conn: &Connection, create: bool) -> Result<bool> {
+    pub(super) fn attach_probe_sources(&self, conn: &Connection, create: bool) -> Result<bool> {
         let path = self.db.with_file_name("probe-sources.db");
         if !path.exists() && !create {
             return Ok(false);
@@ -74,8 +74,7 @@ impl SqliteStateStore {
         }
         // The log row and its provenance become visible together to other connections.
         let tx = conn.transaction().map_err(self.sqlite_err())?;
-        let row = netlog::record(&tx, event).map_err(self.sqlite_err())?;
-        tx.execute("INSERT INTO probe_sources.events SELECT ?1,?2,?3 WHERE EXISTS (SELECT 1 FROM probe_sources.runs WHERE tag=?4 AND sandbox=?2 AND expires>=?3)",params![row,event.sandbox.as_str(),netlog::fixed(event.at),tag]).map_err(self.sqlite_err())?;
+        let row = record(&tx, event, Some(tag), true).map_err(self.sqlite_err())?;
         tx.commit().map_err(self.sqlite_err())?;
         Ok(row)
     }
@@ -84,4 +83,18 @@ impl SqliteStateStore {
         let attached = matches!(self.attach_probe_sources(&conn, false), Ok(true));
         netlog::denied_from(&conn, sandbox, attached).map_err(|e| self.read_err(e))
     }
+}
+
+/// Record the row and any authenticated provenance in the caller's transaction.
+pub(super) fn record(
+    conn: &Connection,
+    event: &NetEvent,
+    tag: Option<&str>,
+    attached: bool,
+) -> rusqlite::Result<i64> {
+    let row = netlog::record(conn, event)?;
+    if attached && let Some(tag) = tag {
+        conn.execute("INSERT INTO probe_sources.events SELECT ?1,?2,?3 WHERE EXISTS (SELECT 1 FROM probe_sources.runs WHERE tag=?4 AND sandbox=?2 AND expires>=?3)",params![row,event.sandbox.as_str(),netlog::fixed(event.at),tag])?;
+    }
+    Ok(row)
 }

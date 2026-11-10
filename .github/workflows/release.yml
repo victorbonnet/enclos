@@ -85,8 +85,8 @@ jobs:
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
           import json, sys
           metadata = json.load(sys.stdin)
-          root = metadata["resolve"]["root"] if metadata["resolve"] else metadata["workspace_members"][0]
-          print(next(package["version"] for package in metadata["packages"] if package["id"] == root))
+          root_manifest = metadata["workspace_root"] + "/Cargo.toml"
+          print(next(package["version"] for package in metadata["packages"] if package["manifest_path"] == root_manifest))
           ')"
           if [[ "$EVENT" == push && "$RELEASE_TAG" != "v$version" ]]; then
             echo "Release tag must match Cargo.toml: expected v$version, got $RELEASE_TAG" >&2
