@@ -66,6 +66,10 @@ enum AgentVerb {
         /// Keep the agent's files in the sandbox home; remove only the record.
         #[arg(long)]
         keep_data: bool,
+        /// Delete this exact reviewed profile, including an untracked
+        /// existing profile. Requires --yes; never adopts or creates it.
+        #[arg(long, conflicts_with = "keep_data")]
+        reviewed: Option<String>,
     },
 }
 
@@ -300,8 +304,33 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: AgentArgs) -> Re
             }
             notes.iter().for_each(|n| println!("{n}"));
         }
-        AgentVerb::Rm { agent, keep_data } => {
+        AgentVerb::Rm {
+            agent,
+            keep_data,
+            reviewed,
+        } => {
             let AgentTarget { sandbox, agent } = agent;
+            if let Some(reviewed) = reviewed {
+                if confirm != Confirm::Yes {
+                    return Err(enclos::error::Error::NeedsConfirmation { what: "the reviewed removal of this agent and its files; use --yes after reviewing it".into() });
+                }
+                let runtime = engine.runtime(&sandbox)?.map(|runtime| runtime.to_string());
+                let outcome = engine.remove_reviewed(by, &sandbox, Some(&agent), &reviewed)?;
+                if output::json() {
+                    output::emit(
+                        &json!({ "sandbox": sandbox.to_string(), "agent": agent.to_string(), "runtime": runtime, "removed": outcome.removed, "files_removed": outcome.files_removed, "warnings": outcome.warnings }),
+                    );
+                } else {
+                    println!(
+                        "Agent {sandbox}/{agent}: removed={}, files removed={}",
+                        outcome.removed, outcome.files_removed
+                    );
+                    for warning in outcome.warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+                return Ok(exit::OK);
+            }
             let removed = match engine.remove_agent(by, &sandbox, &agent, keep_data, confirm)? {
                 Planned::DryRun(plan) => {
                     output::show_plan(&plan);

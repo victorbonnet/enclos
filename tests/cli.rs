@@ -2741,6 +2741,47 @@ fn agent_new_and_connect_report_safe_structured_results_without_running_setup() 
 
 #[cfg(target_os = "macos")]
 #[test]
+fn reviewed_sandbox_cli_requires_confirmation_and_reports_actual_removal() {
+    let home = Home::new();
+    home.init(1);
+    for name in ["home", "other"] {
+        home.run(&["sandbox", "create", name, "--template", "assistant"])
+            .ok();
+    }
+    let engine = enclos::engine::Engine::open(enclos::layout::Layout::at(&home.root));
+    let review = engine
+        .removal_review(&"home".parse().unwrap(), None)
+        .unwrap();
+    let (code, refused) = home.json(&["sandbox", "rm", "home", "--reviewed", &review.revision]);
+    assert_ne!(code, 0, "{refused}");
+    let (code, stale) = home.json(&[
+        "--yes",
+        "sandbox",
+        "rm",
+        "home",
+        "--reviewed",
+        "wrong-review",
+    ]);
+    assert_ne!(code, 0, "{stale}");
+    home.run(&["sandbox", "show", "home"]).ok();
+    let (code, removed) = home.json(&[
+        "--yes",
+        "sandbox",
+        "rm",
+        "home",
+        "--reviewed",
+        &review.revision,
+    ]);
+    assert_eq!(code, 0, "{removed}");
+    assert_eq!(removed["removed"], true);
+    assert_eq!(removed["files_removed"], true);
+    assert_eq!(removed["secrets_left_count"], 0);
+    assert_eq!(removed["warnings"], serde_json::json!([]));
+    home.run(&["sandbox", "show", "other"]).ok();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn agent_list_and_sandbox_show_report_an_agent_made_inside_the_sandbox() {
     let home = Home::new();
     home.init(1);

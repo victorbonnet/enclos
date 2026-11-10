@@ -9,6 +9,7 @@ pub mod keys;
 pub mod page;
 pub mod plugin;
 pub mod provisioning;
+mod removals;
 pub mod server;
 pub mod store;
 pub mod transport;

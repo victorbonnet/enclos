@@ -790,6 +790,12 @@ fn members_a_stop_cannot_end_fail_the_sandbox_until_they_are_gone() {
     program.stdin.take().unwrap().write_all(b"\n").unwrap();
     program.wait().unwrap();
 
+    let review = engine.removal_review(&name, None).unwrap();
+    let error = engine
+        .remove_reviewed(&alice(), &name, None, &review.revision)
+        .unwrap_err();
+    assert!(error.to_string().contains("survived"), "{error}");
+    assert!(engine.layout.sandbox_dir(name.as_str()).exists());
     let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
     assert!(report.stopped.is_empty());
     let survivors = &report.survivors;

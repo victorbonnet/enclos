@@ -128,6 +128,7 @@ impl Engine {
             SandboxCommand::new(command),
             "exec",
             CommandKind::Exec,
+            || Ok(()),
         )
         .map(Planned::Done)
     }
@@ -141,7 +142,32 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
     ) -> Result<SessionEnd> {
-        self.run_in_sandbox_as(by, name, command, audit_name, CommandKind::Interactive)
+        self.run_in_sandbox_as(
+            by,
+            name,
+            command,
+            audit_name,
+            CommandKind::Interactive,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn run_in_sandbox_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        command: SandboxCommand,
+        audit_name: &str,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<SessionEnd> {
+        self.run_in_sandbox_as(
+            by,
+            name,
+            command,
+            audit_name,
+            CommandKind::Interactive,
+            check,
+        )
     }
 
     /// Runs `command` in the sandbox as a recorded session of `kind`, with
@@ -154,6 +180,7 @@ impl Engine {
         command: SandboxCommand,
         audit_name: &str,
         kind: CommandKind,
+        check: impl FnOnce() -> Result<()>,
     ) -> Result<SessionEnd> {
         let (command, reads) = command.into_parts();
         let summary = |started: &Started<KeepWaiting>| format!("session {}", started.session.id);
@@ -170,6 +197,7 @@ impl Engine {
             unreachable,
             prepared: keep_waiting,
         } = self.write(by, audit_name, Some(name.to_string()), summary, |lock| {
+            check()?;
             let starting = Starting::Command {
                 kind,
                 group,

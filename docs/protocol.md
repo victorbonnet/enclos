@@ -249,6 +249,27 @@ Agent connection is separate from creation and requires the app to review and co
 
 Each request and its completion is logged with its device and person in `enclos app log`. The engine audit records creation by the authenticated person and runtime installation by the local host user running the CLI child. A runtime install has no terminal or stdin; stdout is a bounded CLI JSON result and installer stderr is discarded, never forwarded to the phone. Agents and their app endpoints are read again from host state on each `agents` request and plugin connection, so later host setup needs no bridge restart.
 
+### Reviewed resource removal
+
+The owner-only `resources.remove` capability adds the following messages. Removing a host uses the phone's existing forget/unpair flow; there is no host-delete command. There is no separate runtime uninstall: removing a sandbox deletes its runtime and all of its profiles.
+
+| `type` | From | Fields | Meaning |
+| --- | --- | --- | --- |
+| `removal.preview` | device | `kind` (`sandbox` or `agent`), `sandbox`, `agent` only for an agent | Read the current target and effects; no deletion or policy change |
+| `removal.previewed` | bridge | `of`, `preview`, `revision`, `kind`, `sandbox`, optional `agent`, nullable `runtime`, `agents`, `secret_count`, `session_count`, `services`, `effects`, `expires_in:120` | Exact host review and a one-use permit; a new preview replaces the previous permit on that connection |
+| `sandbox.remove` | device | `sandbox`, `preview`, `confirmation` | Confirm the reviewed sandbox by typing its exact short name |
+| `agent.remove` | device | `sandbox`, `agent`, `preview`, `confirmation` | Confirm the reviewed profile by typing its exact short agent name |
+| `sandbox.removed` | bridge | `of`, `preview`, `sandbox`, nullable `runtime`, `removed`, `files_removed`, `secrets_left_count`, `warnings` | Actual outcome, including known partial secret cleanup |
+| `agent.removed` | bridge | `of`, `preview`, `sandbox`, `agent`, `runtime`, `removed`, `files_removed`, `warnings` | Actual profile outcome; record-only cleanup and failed service resumption are explicit |
+
+Permits stay in the authenticated device connection and expire after two minutes; they are never stored or replayed. The exact target, permit and typed name must match, and the permit is consumed before a worker starts, including failed attempts. The existing per-sandbox busy guard covers removals, provisioning, managed policy applies and approval decisions; Close and read-only policy previews remain available. A disconnected phone cannot retry with an old permit. An accepted operation can finish after disconnection, and its state is read again from the host.
+
+Sandbox confirmation names all profiles, home files and stored secrets, and says that running work will stop. Agent confirmation explains that shared runtime services may pause and interrupt other agent work. A live interactive or exec session anywhere in that sandbox prevents agent removal; finish CLI work and review again. Built-in agents require removing their sandbox instead. Agent removal retains the sandbox's policy grants and stored secrets. A profile the runtime already lost can have only its tracked record removed, which returns a warning and `files_removed:false`.
+
+Complete success requires `removed:true`, `files_removed:true`, an empty `warnings` list and, for a sandbox, zero remaining secrets. Known partial outcomes carry truthful flags and warnings. When an error leaves cleanup state uncertain, the bridge returns the engine's error and refreshes inventory instead of inventing a successful receipt or secret count. No failure is retried automatically. Saved app conversations remain readable; pending policy requests for an absent sandbox are closed as retained history without changing policy. New policy-request IDs and engine access-plan revisions include the sandbox generation, so recreating a name with an identical policy receives fresh requests and cannot reuse an old approval. Legacy IDs retain seconds-based timestamp compatibility, including their ambiguous creation second.
+
+Requested `agents.list`, `sandboxes.list` and `sandbox.agents.list` carry their request's optional `of`; broadcasts omit it. Clients with `resources.remove` reconcile removal using exact correlated snapshots and receipts, so a delayed older inventory cannot restore a removed target. Uncorrelated updates invalidate and refresh metadata. [ADR 0057](adr/0057-mobile-removal-requires-a-fresh-target-review.md) records the review boundary.
+
 ### Notifications
 
 When a `message` arrives for a conversation whose owner has no device connected, the bridge sends a push to each of the owner's devices through FCM: a high-priority data message whose payload is

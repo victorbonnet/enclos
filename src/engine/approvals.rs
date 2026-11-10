@@ -140,10 +140,11 @@ impl Engine {
             && !self.sessions_under_rules(name)?.is_empty();
         let revision = sha256_hex(
             format!(
-                "{}:{}:{}:{restart}",
+                "{}:{}:{}:{restart}:{}",
                 view.snapshot.id,
                 sha256_hex(before.as_bytes()),
-                snapshot.id
+                snapshot.id,
+                self.sandbox_generation(name)?
             )
             .as_bytes(),
         );

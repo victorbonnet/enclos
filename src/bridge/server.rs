@@ -100,7 +100,37 @@ struct Hub {
     devices: Mutex<HashMap<String, (String, Sender<ToDevice>)>>,
 }
 
+struct SandboxBusy<'a> {
+    busy: &'a Mutex<HashSet<String>>,
+    sandbox: String,
+}
+
+impl Drop for SandboxBusy<'_> {
+    fn drop(&mut self) {
+        self.busy
+            .lock()
+            .expect("not poisoned")
+            .remove(&self.sandbox);
+    }
+}
+
 impl Hub {
+    fn claim_sandbox_busy(&self, sandbox: &str) -> Result<SandboxBusy<'_>, String> {
+        if !self
+            .provisioning_busy
+            .lock()
+            .expect("not poisoned")
+            .insert(sandbox.to_owned())
+        {
+            return Err(format!(
+                "An operation is already running in sandbox {sandbox}. Wait and review again."
+            ));
+        }
+        Ok(SandboxBusy {
+            busy: &self.provisioning_busy,
+            sandbox: sandbox.to_owned(),
+        })
+    }
     fn begin(
         self: &Arc<Self>,
         operation: Operation,
@@ -151,11 +181,23 @@ impl Hub {
                     Some(&sandbox),
                 );
             }
-            let result = hub
+            let mut result = hub
                 .provisioning
                 .as_ref()
                 .expect("provisioning request checked")
                 .execute(&operation, &person);
+            if let Operation::Remove { review, .. } = &operation
+                && review.agent.is_none()
+            {
+                let retired = hub.store().and_then(|store| {
+                    hub.retire_removed_sandbox_requests(&store, &sandbox, &device, &person)
+                });
+                if let Err(error) = retired
+                    && let Ok(Completed::Removed { outcome, .. }) = &mut result
+                {
+                    outcome.warnings.push(format!("The resource was removed, but policy-request cleanup needs host review: {}", error.chars().take(512).collect::<String>()));
+                }
+            }
             let failed = result.as_ref().err().cloned();
             let response = match result {
                 Ok(Completed::Created) => ToDevice::SandboxCreated {
@@ -187,6 +229,35 @@ impl Hub {
                     runtime,
                     app_channel: true,
                 },
+                Ok(Completed::Removed {
+                    review,
+                    preview,
+                    outcome,
+                }) => match review.agent {
+                    Some(agent) => ToDevice::AgentRemoved {
+                        of,
+                        preview,
+                        sandbox: sandbox.clone(),
+                        agent: agent.to_string(),
+                        runtime: review
+                            .runtime
+                            .map(|runtime| runtime.to_string())
+                            .unwrap_or_default(),
+                        removed: outcome.removed,
+                        files_removed: outcome.files_removed,
+                        warnings: outcome.warnings,
+                    },
+                    None => ToDevice::SandboxRemoved {
+                        of,
+                        preview,
+                        sandbox: sandbox.clone(),
+                        runtime: review.runtime.map(|runtime| runtime.to_string()),
+                        removed: outcome.removed,
+                        files_removed: outcome.files_removed,
+                        secrets_left_count: outcome.secrets_left_count,
+                        warnings: outcome.warnings,
+                    },
+                },
                 Err(message) => ToDevice::Error(ErrorBody {
                     of: Some(of),
                     code: ErrorCode::OperationFailed,
@@ -205,11 +276,19 @@ impl Hub {
                 .expect("provisioning request checked")
                 .sandboxes()
             {
-                hub.deliver(&person, ToDevice::SandboxesList { sandboxes });
+                hub.deliver(
+                    &person,
+                    ToDevice::SandboxesList {
+                        of: None,
+                        sandboxes,
+                    },
+                );
             }
             if matches!(
                 operation,
-                Operation::AgentCreate { .. } | Operation::AgentConnect { .. }
+                Operation::AgentCreate { .. }
+                    | Operation::AgentConnect { .. }
+                    | Operation::Remove { .. }
             ) && let Ok(agents) = hub
                 .provisioning
                 .as_ref()
@@ -1144,6 +1223,7 @@ fn connection(hub: &Arc<Hub>, stream: TcpStream) -> Result<(), String> {
                 "sandboxes".to_owned(),
                 "agents.create".to_owned(),
                 "agents.create.instructions".to_owned(),
+                "resources.remove".to_owned(),
             ]
         } else {
             vec!["approval.close".to_owned()]
@@ -1255,6 +1335,7 @@ fn run_session(
     person: &str,
     outbox: &Receiver<ToDevice>,
 ) -> Result<(), String> {
+    let mut removal_permit: Option<super::removals::Permit> = None;
     loop {
         while let Ok(message) = outbox.try_recv() {
             link.send(message)?;
@@ -1422,7 +1503,10 @@ fn run_session(
             | FromDevice::SandboxCreate { .. }
             | FromDevice::RuntimeInstall { .. }
             | FromDevice::AgentCreate { .. }
-            | FromDevice::AgentConnect { .. } => {
+            | FromDevice::AgentConnect { .. }
+            | FromDevice::RemovalPreview { .. }
+            | FromDevice::SandboxRemove { .. }
+            | FromDevice::AgentRemove { .. } => {
                 if !hub
                     .provisioning
                     .as_ref()
@@ -1437,6 +1521,30 @@ fn run_session(
                     continue;
                 }
                 let operation = match message.body {
+                    FromDevice::RemovalPreview { kind, sandbox, agent } => {
+                        removal_permit = None;
+                        let result = match (kind.as_str(), agent.as_deref()) {
+                            ("sandbox", None) | ("agent", Some(_)) => {
+                                if hub.provisioning_busy.lock().expect("not poisoned").contains(&sandbox) {
+                                    Err("An operation is already running in this sandbox. Wait and review removal again.".to_owned())
+                                } else {
+                                    hub.provisioning.as_ref().expect("owner checked").removal_review(&sandbox, agent.as_deref()).and_then(super::removals::Permit::new)
+                                }
+                            }
+                            _ => Err("Choose a sandbox or an agent removal with its exact target.".to_owned()),
+                        };
+                        match result {
+                            Ok(permit) => { link.send(ToDevice::RemovalPreviewed(permit.info(message.id)))?; removal_permit = Some(permit); }
+                            Err(message_text) => { link.send(ToDevice::Error(ErrorBody { of: Some(message.id), code: ErrorCode::OperationFailed, message: message_text }))?; }
+                        }
+                        continue;
+                    }
+                    FromDevice::SandboxRemove { sandbox, preview, confirmation } => {
+                        removal_permit.take().ok_or_else(|| "Review removal on this connection first; previews are not replayed after disconnecting.".to_owned()).and_then(|permit| permit.consume(&sandbox, None, &preview, &confirmation))
+                    }
+                    FromDevice::AgentRemove { sandbox, agent, preview, confirmation } => {
+                        removal_permit.take().ok_or_else(|| "Review removal on this connection first; previews are not replayed after disconnecting.".to_owned()).and_then(|permit| permit.consume(&sandbox, Some(&agent), &preview, &confirmation))
+                    }
                     FromDevice::Sandboxes => {
                         match hub
                             .provisioning
@@ -1444,7 +1552,7 @@ fn run_session(
                             .expect("provisioning request checked")
                             .sandboxes()
                         {
-                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { sandboxes })?,
+                            Ok(sandboxes) => link.send(ToDevice::SandboxesList { of: Some(message.id.clone()), sandboxes })?,
                             Err(why) => link.send(ToDevice::Error(ErrorBody {
                                 of: Some(message.id),
                                 code: ErrorCode::OperationFailed,
@@ -1545,8 +1653,11 @@ fn run_session(
                 drop(plugins);
                 match agent_names::agent_inventory_messages(agents) {
                     Ok(messages) => {
-                        for message in messages {
-                            link.send(message)?;
+                        for mut reply in messages {
+                            if let ToDevice::AgentsList { of, .. } = &mut reply {
+                                *of = Some(message.id.clone());
+                            }
+                            link.send(reply)?;
                         }
                     }
                     Err(reason) => {
@@ -1689,6 +1800,16 @@ fn run_session(
             FromDevice::Sync { since } => {
                 if hub.host.as_deref() == Some(person) {
                     hub.dismiss_probe_requests(store)?;
+                    let pending: std::collections::HashSet<_> = store
+                        .approvals()
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .filter(|approval| matches!(approval.state.as_str(), "pending" | "failed"))
+                        .map(|approval| approval.sandbox)
+                        .collect();
+                    for sandbox in pending {
+                        hub.retire_removed_sandbox_requests(store, &sandbox, &device.id, person)?;
+                    }
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         link.send(ToDevice::Approval(a))?;
                     }

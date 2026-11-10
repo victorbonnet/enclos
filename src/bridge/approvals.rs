@@ -6,6 +6,33 @@ use crate::{
 };
 use enclos_protocol::approval::{Access, AccessKind, Approval};
 
+struct ApprovalGeneration {
+    fingerprint: String,
+    created_second: i64,
+}
+
+impl ApprovalGeneration {
+    fn includes(&self, request: &Approval) -> bool {
+        match request.request.split_once(':') {
+            Some((generation, _)) => generation == self.fingerprint,
+            // Legacy cards predate generation-prefixed IDs. Their clock
+            // has seconds, so preserve the ambiguous creation second.
+            None => request.time >= self.created_second,
+        }
+    }
+
+    fn request_key(&self, digest: &str) -> String {
+        format!("{}:{digest}", self.fingerprint)
+    }
+}
+
+fn approval_generation(engine: &Engine, name: &SandboxName) -> Option<ApprovalGeneration> {
+    Some(ApprovalGeneration {
+        fingerprint: engine.sandbox_generation(name).ok()?,
+        created_second: engine.sandbox_created_at(name).ok()?.as_second(),
+    })
+}
+
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
         && crate::net::host::AllowEntry::parse(&access.target)
@@ -57,6 +84,26 @@ impl Hub {
         {
             return Err("invalid access target".into());
         }
+        let engine = Engine::open(self.layout.clone());
+        let name = sandbox.parse::<SandboxName>().ok();
+        let generation = name
+            .as_ref()
+            .and_then(|name| approval_generation(&engine, name));
+        if generation.is_none()
+            && name
+                .as_ref()
+                .is_some_and(|name| engine.require_sandbox(name).is_ok())
+        {
+            return Err("Cannot identify this sandbox generation. Review it on the host before requesting access.".into());
+        }
+        if generation.is_some()
+            && let Some(person) = &self.host
+        {
+            self.retire_removed_sandbox_requests(store, sandbox, "bridge", person)?;
+        }
+        let generation = name
+            .as_ref()
+            .and_then(|name| approval_generation(&engine, name));
         if let Some(mut existing) = store
             .approvals()
             .map_err(|e| e.to_string())?
@@ -64,7 +111,10 @@ impl Hub {
             .find(|a| {
                 a.sandbox == sandbox
                     && a.access == access
-                    && (a.state == "pending" || a.state == "applying")
+                    && generation
+                        .as_ref()
+                        .is_none_or(|generation| generation.includes(a))
+                    && matches!(a.state.as_str(), "pending" | "applying" | "failed")
             })
         {
             // An authenticated agent's explicit request must not be mistaken for a probe.
@@ -88,25 +138,47 @@ impl Hub {
             }
             return Ok(());
         }
-        let policy = sandbox
-            .parse::<SandboxName>()
-            .ok()
-            .and_then(|n| Engine::open(self.layout.clone()).policy(&n).ok())
+        let policy = name
+            .as_ref()
+            .and_then(|name| engine.policy(name).ok())
             .map(|v| v.snapshot.id.to_string())
             .unwrap_or_default();
-        let mut key = crate::policy::sha256_hex(
+        let legacy_key = crate::policy::sha256_hex(
             format!(
                 "{sandbox}:{policy}:{}",
                 serde_json::to_string(&access).map_err(|e| e.to_string())?
             )
             .as_bytes(),
         );
+        // Keep existing same-generation legacy decisions as history and
+        // deduplication, without binding them to a later sandbox of the name.
+        if let Some(generation) = &generation {
+            let after_diagnostic =
+                crate::policy::sha256_hex(format!("{legacy_key}:after-diagnostic").as_bytes());
+            for legacy in [&legacy_key, &after_diagnostic] {
+                if let Some(old) = store.approval(legacy).map_err(|error| error.to_string())?
+                    && generation.includes(&old)
+                    && old.state != "diagnostic"
+                {
+                    return Ok(());
+                }
+            }
+        }
+        let mut key = generation
+            .as_ref()
+            .map(|generation| generation.request_key(&legacy_key))
+            .unwrap_or_else(|| legacy_key.clone());
         if let Some(old) = store.approval(&key).map_err(|e| e.to_string())? {
             if old.state != "diagnostic" {
                 return Ok(());
             }
             // A later genuine attempt gets a new id; stale decisions for the test stay closed.
-            key = crate::policy::sha256_hex(format!("{key}:after-diagnostic").as_bytes());
+            let after_diagnostic =
+                crate::policy::sha256_hex(format!("{legacy_key}:after-diagnostic").as_bytes());
+            key = generation
+                .as_ref()
+                .map(|generation| generation.request_key(&after_diagnostic))
+                .unwrap_or(after_diagnostic);
             if store.approval(&key).map_err(|e| e.to_string())?.is_some() {
                 return Ok(());
             }
@@ -134,7 +206,7 @@ impl Hub {
             available: false,
             reason: None,
         };
-        preview(&Engine::open(self.layout.clone()), &mut a);
+        preview(&engine, &mut a);
         if !store.create_approval(&a).map_err(|e| e.to_string())? {
             return Ok(());
         }
@@ -179,6 +251,55 @@ impl Hub {
                 && (diagnostic_access(&a.access) || self.only_probe_events(&a))
                 && let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())?
                 && let Some(person) = &self.host
+            {
+                self.deliver(person, ToDevice::Approval(closed));
+            }
+        }
+        Ok(())
+    }
+
+    /// Retires attention for an absent sandbox or a request from an older
+    /// generation of its name. Legacy cards of the current generation stay.
+    /// The requests remain as history; an in-flight decision keeps its claim.
+    pub(super) fn retire_removed_sandbox_requests(
+        &self,
+        store: &Store,
+        sandbox: &str,
+        device: &str,
+        person: &str,
+    ) -> Result<(), String> {
+        use crate::state::{StateStore, sqlite::SqliteStateStore};
+
+        if self.host.as_deref() != Some(person) {
+            return Err("Only the host's person can retire its sandbox policy requests.".into());
+        }
+        let name = sandbox
+            .parse::<SandboxName>()
+            .map_err(|error| error.to_string())?;
+        let state = SqliteStateStore::new(self.layout.state_db(), self.layout.state_lock());
+        // A CLI create uses this same lock: no fresh sandbox of this name
+        // can appear between confirming absence and closing old attention.
+        let _lock = state.lock().map_err(|error| error.to_string())?;
+        let engine = Engine::open(self.layout.clone());
+        let generation = match engine.require_sandbox(&name) {
+            Ok(()) => Some(approval_generation(&engine, &name).ok_or(
+                "Cannot identify the sandbox generation; policy requests were left unchanged.",
+            )?),
+            Err(crate::error::Error::NoSuchSandbox { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        for request in store.approvals().map_err(|error| error.to_string())? {
+            if request.sandbox == sandbox
+                && matches!(request.state.as_str(), "pending" | "failed")
+                && generation
+                    .as_ref()
+                    .is_none_or(|generation| !generation.includes(&request))
+                && store
+                    .close_approval(&request.request, device, person)
+                    .map_err(|error| error.to_string())?
+                && let Some(closed) = store
+                    .approval(&request.request)
+                    .map_err(|error| error.to_string())?
             {
                 self.deliver(person, ToDevice::Approval(closed));
             }
@@ -314,10 +435,21 @@ impl Hub {
             }
             return Err("This is an Enclos diagnostic probe; no approval is needed.".into());
         }
+        if matches!(a.state.as_str(), "pending" | "failed") {
+            self.retire_removed_sandbox_requests(store, &a.sandbox, &device.id, person)?;
+            a = store
+                .approval(id)
+                .map_err(|error| error.to_string())?
+                .ok_or("Unknown policy request")?;
+            if a.state == "closed" {
+                return Ok(());
+            }
+        }
         if a.state != "pending" {
             self.deliver(person, ToDevice::Approval(a));
             return Ok(());
         }
+        let _busy = self.claim_sandbox_busy(&a.sandbox)?;
         let engine = Engine::open(self.layout.clone());
         if approve {
             preview(&engine, &mut a);

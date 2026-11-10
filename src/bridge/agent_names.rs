@@ -18,11 +18,11 @@ fn agent_message_fits(message: &ToDevice) -> Result<bool, String> {
 
 /// Keep ordinary names inline; a large inventory receives its names in bounded follow-up frames.
 pub(super) fn agent_inventory_messages(agents: Vec<AgentInfo>) -> Result<Vec<ToDevice>, String> {
-    let mut inventory = ToDevice::AgentsList { agents };
+    let mut inventory = ToDevice::AgentsList { of: None, agents };
     if agent_message_fits(&inventory)? {
         return Ok(vec![inventory]);
     }
-    let ToDevice::AgentsList { agents } = &mut inventory else {
+    let ToDevice::AgentsList { agents, .. } = &mut inventory else {
         unreachable!("constructed an agent inventory");
     };
     let names: Vec<_> = agents

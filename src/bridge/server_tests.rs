@@ -399,6 +399,125 @@ fn diagnostic_approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
 }
 
 #[test]
+fn policy_and_approval_mutations_share_the_removal_busy_guard_before_any_write() {
+    use crate::{
+        audit::jsonl::JsonlAuditLog,
+        backend::fake::FakeBackend,
+        engine::{Engine, SandboxSpec},
+        model::{audit::Actor, plan::Confirm, sandbox::BackendKind},
+        service::fake::FakeServices,
+        state::sqlite::SqliteStateStore,
+    };
+    use enclos_protocol::policy::{PolicyApply, PolicyChange};
+    let (_dir, mut hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let device = avatar_device("busy-phone", owner);
+    store.add_device(&device).unwrap();
+    let engine = Engine::new(
+        hub.layout.clone(),
+        Box::new(SqliteStateStore::new(
+            hub.layout.state_db(),
+            hub.layout.state_lock(),
+        )),
+        Box::new(JsonlAuditLog::new(hub.layout.audit_log())),
+        vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+    )
+    .with_services(Box::new(FakeServices::default()));
+    let actor = Actor {
+        user: "test".into(),
+        host: "local".into(),
+    };
+    engine.init(&actor, Confirm::Yes).unwrap();
+    let name = "lab".parse().unwrap();
+    engine
+        .create_sandbox(
+            &actor,
+            SandboxSpec {
+                name,
+                backend: BackendKind::Seatbelt,
+                template: "minimal".parse().unwrap(),
+            },
+            Confirm::Yes,
+        )
+        .unwrap();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/scout".into(),
+        runtime: "hermes".into(),
+        socket: "/unused/socket".into(),
+        token: "unused".into(),
+    });
+    let mut approval = approval_sample();
+    approval.time = now();
+    store.create_approval(&approval).unwrap();
+    let before = engine.policy(&"lab".parse().unwrap()).unwrap();
+    let audited = engine.audit(None).unwrap().len();
+    hub.provisioning_busy.lock().unwrap().insert("lab".into());
+    let error = hub
+        .decide_access(
+            &store,
+            &device,
+            owner,
+            &approval.request,
+            &approval.revision,
+            true,
+        )
+        .unwrap_err();
+    assert!(error.contains("already running"), "{error}");
+    assert_eq!(
+        store.approval(&approval.request).unwrap().unwrap(),
+        approval
+    );
+    let edit = PolicyApply {
+        base: "unused".into(),
+        revision: "unused".into(),
+        change: PolicyChange {
+            field: "allow".into(),
+            before: None,
+            after: Some("api.example.com".into()),
+        },
+    };
+    let error = hub
+        .apply_managed_policy(&store, &device, owner, &"lab".parse().unwrap(), &edit)
+        .unwrap_err();
+    assert!(error.contains("already running"), "{error}");
+    assert_eq!(engine.policy(&"lab".parse().unwrap()).unwrap(), before);
+    assert_eq!(engine.audit(None).unwrap().len(), audited);
+    hub.close_access(&store, &device, owner, &approval.request)
+        .unwrap();
+    assert_eq!(
+        store.approval(&approval.request).unwrap().unwrap().state,
+        "closed"
+    );
+    hub.provisioning_busy.lock().unwrap().clear();
+    let layout = hub.layout.clone();
+    Arc::get_mut(&mut hub).unwrap().provisioning = Some(Host::new(
+        layout,
+        actor,
+        "/unused/enclos".into(),
+        Some(owner.into()),
+    ));
+    let lease = hub.claim_sandbox_busy("lab").unwrap();
+    let review = engine
+        .removal_review(&"lab".parse().unwrap(), None)
+        .unwrap();
+    let error = hub
+        .begin(
+            Operation::Remove {
+                review: Box::new(review),
+                preview: "permit".into(),
+            },
+            MessageId::new("remove-busy").unwrap(),
+            &device,
+            owner,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Busy);
+    assert!(hub.provisioning_busy.lock().unwrap().contains("lab"));
+    drop(lease);
+    assert!(!hub.provisioning_busy.lock().unwrap().contains("lab"));
+}
+
+#[test]
 fn approval_close_requires_the_host_person_and_a_still_paired_device() {
     let (_dir, mut hub, store) = diagnostic_approval_hub();
     let owner = "owner@example.com";
@@ -483,6 +602,304 @@ fn approval_close_reaches_all_owner_devices_without_policy_or_runtime_work() {
     assert_eq!(store.log_lines(20).unwrap().len(), 1);
     assert!(store.accepted_access().unwrap().is_empty());
     assert!(!dir.path().join("enclos").exists());
+}
+
+#[test]
+fn removing_a_sandbox_retires_only_its_pending_and_failed_policy_attention() {
+    use crate::audit::jsonl::JsonlAuditLog;
+    use crate::backend::fake::FakeBackend;
+    use crate::engine::{Engine, SandboxSpec};
+    use crate::model::audit::Actor;
+    use crate::model::plan::Confirm;
+    use crate::model::sandbox::{BackendKind, SandboxName};
+    use crate::service::fake::FakeServices;
+    use crate::state::sqlite::SqliteStateStore;
+
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    let engine = Engine::new(
+        hub.layout.clone(),
+        Box::new(SqliteStateStore::new(
+            hub.layout.state_db(),
+            hub.layout.state_lock(),
+        )),
+        Box::new(JsonlAuditLog::new(hub.layout.audit_log())),
+        vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+    )
+    .with_services(Box::new(FakeServices::default()));
+    let actor = Actor {
+        user: "test".into(),
+        host: "fixture".into(),
+    };
+    engine.init(&actor, Confirm::Yes).unwrap();
+    for sandbox in ["lab", "kept"] {
+        engine
+            .create_sandbox(
+                &actor,
+                SandboxSpec {
+                    name: sandbox.parse().unwrap(),
+                    backend: BackendKind::Seatbelt,
+                    template: "minimal".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap();
+    }
+    for (id, state) in [
+        ("pending", "pending"),
+        ("failed", "failed"),
+        ("applying", "applying"),
+        ("approved", "approved"),
+        ("denied", "denied"),
+        ("closed", "closed"),
+        ("other", "pending"),
+    ] {
+        let mut request = approval_sample();
+        request.request = id.into();
+        request.state = state.into();
+        request.time = now();
+        if id == "other" {
+            request.sandbox = "kept".into();
+            request.agent = "kept/main".into();
+        }
+        store.create_approval(&request).unwrap();
+    }
+    let (phone_tx, phone_rx) = channel();
+    let (tablet_tx, tablet_rx) = channel();
+    let (guest_tx, guest_rx) = channel();
+    for (id, person) in [
+        ("phone", owner),
+        ("tablet", owner),
+        ("guest", "guest@example.com"),
+    ] {
+        store.add_device(&avatar_device(id, person)).unwrap();
+    }
+    hub.devices.lock().unwrap().extend([
+        ("phone".into(), (owner.into(), phone_tx)),
+        ("tablet".into(), (owner.into(), tablet_tx)),
+        ("guest".into(), ("guest@example.com".into(), guest_tx)),
+    ]);
+    assert!(
+        hub.retire_removed_sandbox_requests(&store, "lab", "guest", "guest@example.com")
+            .is_err()
+    );
+    hub.retire_removed_sandbox_requests(&store, "lab", "phone", owner)
+        .unwrap();
+    assert_eq!(store.approval("pending").unwrap().unwrap().state, "pending");
+    assert!(phone_rx.try_recv().is_err());
+
+    // Only these disposable fixture files are removed. The retirement
+    // itself writes no engine policy, sandbox record, or audit entry.
+    let lab: SandboxName = "lab".parse().unwrap();
+    engine
+        .remove_sandbox(&actor, &lab, false, Confirm::Yes)
+        .unwrap();
+    let kept = engine.policy(&"kept".parse().unwrap()).unwrap();
+    let entries = engine.audit(None).unwrap().len();
+    hub.retire_removed_sandbox_requests(&store, "lab", "phone", owner)
+        .unwrap();
+    for receiver in [&phone_rx, &tablet_rx] {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let ToDevice::Approval(request) = receiver.try_recv().unwrap() else {
+                panic!("expected a closed policy request")
+            };
+            assert_eq!(request.state, "closed");
+            ids.push(request.request);
+        }
+        ids.sort();
+        assert_eq!(ids, ["failed", "pending"]);
+        assert!(receiver.try_recv().is_err());
+    }
+    assert!(guest_rx.try_recv().is_err());
+    for (id, state) in [
+        ("applying", "applying"),
+        ("approved", "approved"),
+        ("denied", "denied"),
+        ("closed", "closed"),
+        ("other", "pending"),
+    ] {
+        assert_eq!(store.approval(id).unwrap().unwrap().state, state);
+    }
+    assert_eq!(
+        store.approvals().unwrap().len(),
+        7,
+        "history remains stored"
+    );
+    assert_eq!(engine.policy(&"kept".parse().unwrap()).unwrap(), kept);
+    assert_eq!(engine.audit(None).unwrap().len(), entries);
+    hub.retire_removed_sandbox_requests(&store, "lab", "phone", owner)
+        .unwrap();
+    assert_eq!(store.log_lines(20).unwrap().len(), 2);
+    assert!(phone_rx.try_recv().is_err());
+    assert!(tablet_rx.try_recv().is_err());
+}
+
+#[test]
+fn a_policy_decision_for_a_removed_sandbox_closes_attention_without_applying_it() {
+    use crate::engine::Engine;
+    use crate::model::audit::Actor;
+    use crate::model::plan::Confirm;
+
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let engine = Engine::open(hub.layout.clone());
+    engine
+        .init(
+            &Actor {
+                user: "test".into(),
+                host: "fixture".into(),
+            },
+            Confirm::Yes,
+        )
+        .unwrap();
+    let entries = engine.audit(None).unwrap().len();
+    let device = avatar_device("phone", "owner@example.com");
+    store.add_device(&device).unwrap();
+    let request = approval_sample();
+    store.create_approval(&request).unwrap();
+    hub.decide_access(
+        &store,
+        &device,
+        &device.person,
+        &request.request,
+        &request.revision,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        store.approval(&request.request).unwrap().unwrap().state,
+        "closed"
+    );
+    assert!(!store.claim_approval(&request.request).unwrap());
+    assert_eq!(engine.audit(None).unwrap().len(), entries);
+    assert!(engine.list_sandboxes().unwrap().is_empty());
+}
+
+#[test]
+fn policy_requests_keep_current_legacy_cards_but_recreated_sandboxes_get_new_ids() {
+    use crate::audit::jsonl::JsonlAuditLog;
+    use crate::backend::fake::FakeBackend;
+    use crate::engine::{Engine, SandboxSpec};
+    use crate::model::Timestamp;
+    use crate::model::audit::Actor;
+    use crate::model::plan::Confirm;
+    use crate::model::sandbox::{BackendKind, SandboxName};
+    use crate::service::fake::FakeServices;
+    use crate::state::{StateStore, sqlite::SqliteStateStore};
+
+    for legacy_state in ["pending", "failed", "closed"] {
+        let (_dir, hub, store) = diagnostic_approval_hub();
+        let state = SqliteStateStore::new(hub.layout.state_db(), hub.layout.state_lock());
+        let engine = Engine::new(
+            hub.layout.clone(),
+            Box::new(SqliteStateStore::new(
+                hub.layout.state_db(),
+                hub.layout.state_lock(),
+            )),
+            Box::new(JsonlAuditLog::new(hub.layout.audit_log())),
+            vec![Box::new(FakeBackend::available(BackendKind::Seatbelt))],
+        )
+        .with_services(Box::new(FakeServices::default()));
+        let actor = Actor {
+            user: "test".into(),
+            host: "fixture".into(),
+        };
+        let name: SandboxName = "lab".parse().unwrap();
+        let spec = || SandboxSpec {
+            name: name.clone(),
+            backend: BackendKind::Seatbelt,
+            template: "minimal".parse().unwrap(),
+        };
+        engine.init(&actor, Confirm::Yes).unwrap();
+        engine.create_sandbox(&actor, spec(), Confirm::Yes).unwrap();
+        let policy = engine.policy(&name).unwrap().snapshot.id;
+        let mut legacy = approval_sample();
+        legacy.time = now();
+        legacy.state = legacy_state.into();
+        legacy.request = crate::policy::sha256_hex(
+            format!(
+                "lab:{policy}:{}",
+                serde_json::to_string(&legacy.access).unwrap()
+            )
+            .as_bytes(),
+        );
+        store.create_approval(&legacy).unwrap();
+
+        // An upgrade preserves legitimate legacy attention and closed
+        // retry deduplication for the sandbox that still exists.
+        hub.request_access(
+            &store,
+            "lab/main",
+            Some("c1"),
+            legacy.access.clone(),
+            "same request",
+        )
+        .unwrap();
+        assert_eq!(store.approvals().unwrap().len(), 1);
+        assert_eq!(
+            store.approval(&legacy.request).unwrap().unwrap().state,
+            legacy_state
+        );
+
+        engine
+            .remove_sandbox(&actor, &name, false, Confirm::Yes)
+            .unwrap();
+        engine.create_sandbox(&actor, spec(), Confirm::Yes).unwrap();
+        assert_eq!(
+            engine.policy(&name).unwrap().snapshot.id,
+            policy,
+            "the policy alone cannot identify a new sandbox"
+        );
+        // Advance this disposable fixture's creation instant rather than
+        // wait for the legacy card's seconds-only clock to tick.
+        let mut recreated = engine.list_sandboxes().unwrap().remove(0).record;
+        recreated.created_at = Timestamp::from_second(legacy.time + 2).unwrap();
+        let lock = state.lock().unwrap();
+        state.put(&lock, &recreated).unwrap();
+        drop(lock);
+        let generation = engine.sandbox_generation(&name).unwrap();
+
+        hub.request_access(
+            &store,
+            "lab/main",
+            Some("c2"),
+            legacy.access.clone(),
+            "new sandbox request",
+        )
+        .unwrap();
+        let requests = store.approvals().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the old generation cannot suppress or reuse the new request"
+        );
+        let fresh = requests
+            .iter()
+            .find(|request| request.request != legacy.request)
+            .unwrap();
+        assert!(fresh.request.starts_with(&format!("{generation}:")));
+        assert_eq!(fresh.state, "pending");
+        assert_eq!(
+            store.approval(&legacy.request).unwrap().unwrap().state,
+            "closed"
+        );
+        store
+            .close_approval(&fresh.request, "fixture", "owner@example.com")
+            .unwrap();
+        hub.request_access(
+            &store,
+            "lab/main",
+            Some("c2"),
+            legacy.access.clone(),
+            "same new-generation retry",
+        )
+        .unwrap();
+        assert_eq!(
+            store.approvals().unwrap().len(),
+            2,
+            "closing still suppresses retries within the new generation"
+        );
+    }
 }
 
 #[test]
@@ -1172,6 +1589,7 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
     let raw = serde_json::to_vec(&enclos_protocol::Envelope::new(
         MessageId::new("m".repeat(128)).unwrap(),
         ToDevice::AgentsList {
+            of: None,
             agents: original.clone(),
         },
     ))
@@ -1187,7 +1605,10 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
         100,
         "one inventory, 98 labels and one cleared tombstone"
     );
-    let ToDevice::AgentsList { agents: inventory } = &messages[0] else {
+    let ToDevice::AgentsList {
+        agents: inventory, ..
+    } = &messages[0]
+    else {
         panic!("inventory must precede names");
     };
     assert_eq!(inventory.len(), original.len());
@@ -1252,6 +1673,7 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
     assert_eq!(
         normal,
         vec![ToDevice::AgentsList {
+            of: None,
             agents: original[2..3].to_vec()
         }],
         "ordinary inventories keep names inline"

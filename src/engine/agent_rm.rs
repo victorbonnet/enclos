@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use super::Engine;
+use super::removal::RemovalReview;
 use crate::error::{Error, Result};
 use crate::model::agent::AgentName;
 use crate::model::audit::Actor;
@@ -91,8 +92,46 @@ impl Engine {
         keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<AgentRemoved>> {
-        self.agent_of(name, agent.as_str())?;
+        self.remove_agent_with_review(by, name, agent, keep_data, confirm, None)
+    }
+
+    /// Removes the exact runtime profile reviewed for an explicit remote
+    /// deletion. An untracked profile is deleted as it stands, never adopted
+    /// or recreated. A tracked record whose files are already absent can be
+    /// removed, with the distinct record-only outcome.
+    pub(super) fn remove_existing_agent_reviewed(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        review: &RemovalReview,
+    ) -> Result<Planned<AgentRemoved>> {
+        if review.sandbox != *name || review.agent.as_ref() != Some(agent) {
+            return Err(Error::Session {
+                what: "The removal review names a different agent. Review this deletion again."
+                    .to_owned(),
+            });
+        }
+        self.remove_agent_with_review(by, name, agent, false, Confirm::Yes, Some(review))
+    }
+
+    fn remove_agent_with_review(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        agent: &AgentName,
+        keep_data: bool,
+        confirm: Confirm,
+        review: Option<&RemovalReview>,
+    ) -> Result<Planned<AgentRemoved>> {
+        match review {
+            Some(review) => self.validate_agent_removal_start(review)?,
+            None => {
+                self.agent_of(name, agent.as_str())?;
+            }
+        }
         let kind = self.runtime_of(name)?;
+        self.refuse_builtin(name, kind, agent.as_str())?;
         let shown = kind.display_name();
         let runtime = adapter(kind);
         let home = self.sandbox_home(name);
@@ -105,6 +144,25 @@ impl Engine {
                 .delete_agent(agent)
                 .ok_or(FilesKept::NoDeleteCommand),
         };
+        if let Some(review) = review {
+            match &delete {
+                Err(FilesKept::RuntimeLacksIt) if review.tracked.is_none() => {
+                    return Err(Error::Session {
+                        what: format!(
+                            "agent {name}/{agent} no longer has a runtime profile or an enclos record; nothing was adopted or deleted. Refresh before trying again"
+                        ),
+                    });
+                }
+                Err(FilesKept::NoDeleteCommand) => {
+                    return Err(Error::Session {
+                        what: format!(
+                            "{shown} has no command enclos can run to delete agent {name}/{agent}; no files or records were removed"
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
         let files = runtime.agent_files(agent);
         // The runtime's services may hold the agent's files (Hermes's
         // gateway serves every agent): they stop while the delete runs.
@@ -175,9 +233,22 @@ impl Engine {
         let deleted = match delete {
             Ok(command) => {
                 let why = format!("for agent rm {name}/{agent}");
-                let paused = self.pause_runtime(by, name, &why)?;
-                let deleted = self.delete_files(by, name, agent, command);
-                let resumed = self.resume_runtime(by, name, paused);
+                if let Some(review) = review {
+                    self.validate_agent_removal_start(review)?;
+                }
+                let paused = match review {
+                    Some(review) => self.pause_runtime_checked(by, name, &why, || {
+                        self.validate_agent_removal_start(review)
+                    })?,
+                    None => self.pause_runtime(by, name, &why)?,
+                };
+                let deleted = self.delete_files(by, name, agent, command, review);
+                let resumed = match review {
+                    Some(review) => self.resume_runtime_checked(by, name, paused, || {
+                        self.validate_removal_sandbox_identity(review)
+                    }),
+                    None => self.resume_runtime(by, name, paused),
+                };
                 match (deleted, resumed) {
                     (Ok(()), resumed) => not_restarted = resumed.err(),
                     (Err(e), Ok(())) => return Err(e),
@@ -204,15 +275,25 @@ impl Engine {
                 .to_owned()
             },
             |lock| {
-                self.agent_of(name, agent.as_str())?;
-                self.state
-                    .remove_agent(lock, name, agent)
-                    .map_err(Into::into)
+                if let Some(review) = review {
+                    self.validate_agent_removal_end(review, deleted.is_ok())?;
+                    if review.tracked.is_none() {
+                        return Ok(());
+                    }
+                } else {
+                    self.agent_of(name, agent.as_str())?;
+                }
+                self.state.remove_agent(lock, name, agent).map_err(Into::into)
             },
         )
         .map_err(|e| match deleted {
             // The files are gone already: say so, so a second try is not
             // read as a runtime that never had the agent.
+            Ok(()) if review.is_some_and(|review| review.tracked.is_none()) => Error::Session {
+                what: format!(
+                    "{shown} deleted the files of untracked agent {name}/{agent}, but enclos could not finalize the removal: {e}. Refresh the sandbox and check the remaining state on the host before trying again"
+                ),
+            },
             Ok(()) => Error::Session {
                 what: format!(
                     "{shown} deleted agent {agent} and its files, but enclos could not remove its record: {e}. Run `enclos agent rm {name}/{agent}` again: it removes the record"
@@ -242,13 +323,19 @@ impl Engine {
         name: &SandboxName,
         agent: &AgentName,
         delete: SandboxCommand,
+        review: Option<&RemovalReview>,
     ) -> Result<()> {
         let kind = self.runtime_of(name)?;
         let shown = kind.display_name();
         let runtime = adapter(kind);
         let home = self.sandbox_home(name);
         let files = runtime.agent_files(agent);
-        let end = self.run_in_sandbox(by, name, delete, "agent rm run")?;
+        let end = match review {
+            Some(review) => self.run_in_sandbox_checked(by, name, delete, "agent rm run", || {
+                self.validate_agent_removal_start(review)
+            }),
+            None => self.run_in_sandbox(by, name, delete, "agent rm run"),
+        }?;
         let left = leftover(&*runtime, &home, agent)
             .map_err(|why| cannot_tell_left(name, kind, agent, &why))?;
         let how = |end: &super::SessionEnd| match end.signal {
@@ -263,7 +350,14 @@ impl Engine {
                 // done: what it names finishes it.
                 Some(finish) => {
                     let finish_shown = finish.shown();
-                    let finished = self.run_in_sandbox(by, name, finish, "agent rm run")?;
+                    let finished = match review {
+                        Some(review) => {
+                            self.run_in_sandbox_checked(by, name, finish, "agent rm run", || {
+                                self.validate_agent_removal_finish(review)
+                            })
+                        }
+                        None => self.run_in_sandbox(by, name, finish, "agent rm run"),
+                    }?;
                     match finished.exit {
                         0 => Ok(()),
                         _ => Err(Error::Session {

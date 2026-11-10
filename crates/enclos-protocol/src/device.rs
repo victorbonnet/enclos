@@ -87,6 +87,26 @@ pub enum FromDevice {
     },
     #[serde(rename = "agent.connect")]
     AgentConnect { sandbox: String, agent: String },
+    #[serde(rename = "removal.preview")]
+    RemovalPreview {
+        kind: String,
+        sandbox: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    #[serde(rename = "sandbox.remove")]
+    SandboxRemove {
+        sandbox: String,
+        preview: String,
+        confirmation: String,
+    },
+    #[serde(rename = "agent.remove")]
+    AgentRemove {
+        sandbox: String,
+        agent: String,
+        preview: String,
+        confirmation: String,
+    },
     #[serde(rename = "sandbox.create")]
     SandboxCreate {
         sandbox: String,
@@ -175,6 +195,9 @@ pub const FROM_DEVICE_TYPES: &[&str] = &[
     "sandbox.agents",
     "agent.create",
     "agent.connect",
+    "removal.preview",
+    "sandbox.remove",
+    "agent.remove",
     "sandbox.create",
     "runtime.install",
     "conversation.new",
@@ -234,9 +257,41 @@ pub enum ToDevice {
     #[serde(rename = "pair.refused")]
     PairRefused { reason: String },
     #[serde(rename = "agents.list")]
-    AgentsList { agents: Vec<AgentInfo> },
+    AgentsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<MessageId>,
+        agents: Vec<AgentInfo>,
+    },
     #[serde(rename = "sandboxes.list")]
-    SandboxesList { sandboxes: Vec<SandboxInfo> },
+    SandboxesList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        of: Option<MessageId>,
+        sandboxes: Vec<SandboxInfo>,
+    },
+    #[serde(rename = "removal.previewed")]
+    RemovalPreviewed(RemovalPreviewInfo),
+    #[serde(rename = "sandbox.removed")]
+    SandboxRemoved {
+        of: MessageId,
+        preview: String,
+        sandbox: String,
+        runtime: Option<String>,
+        removed: bool,
+        files_removed: bool,
+        secrets_left_count: usize,
+        warnings: Vec<String>,
+    },
+    #[serde(rename = "agent.removed")]
+    AgentRemoved {
+        of: MessageId,
+        preview: String,
+        sandbox: String,
+        agent: String,
+        runtime: String,
+        removed: bool,
+        files_removed: bool,
+        warnings: Vec<String>,
+    },
     #[serde(rename = "runtimes.list")]
     RuntimesList { runtimes: Vec<RuntimeInfo> },
     /// Owner inventory, including profiles without an app channel yet.
@@ -349,6 +404,9 @@ pub const TO_DEVICE_TYPES: &[&str] = &[
     "sandbox.agents.list",
     "agent.created",
     "agent.connected",
+    "removal.previewed",
+    "sandbox.removed",
+    "agent.removed",
     "operation.progress",
     "sandbox.created",
     "runtime.installed",
@@ -523,6 +581,24 @@ pub struct SandboxInfo {
     pub sandbox: String,
     pub runtime: Option<String>,
     pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalPreviewInfo {
+    pub of: MessageId,
+    pub preview: String,
+    pub revision: String,
+    pub kind: String,
+    pub sandbox: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub runtime: Option<String>,
+    pub agents: Vec<String>,
+    pub secret_count: usize,
+    pub session_count: usize,
+    pub services: Vec<String>,
+    pub effects: Vec<String>,
+    pub expires_in: u32,
 }
 
 /// A runtime this host can install.
@@ -889,6 +965,7 @@ mod tests {
                 capabilities: vec!["sandboxes".into()],
             },
             ToDevice::SandboxesList {
+                of: None,
                 sandboxes: vec![SandboxInfo {
                     sandbox: "lab".into(),
                     runtime: None,
@@ -988,5 +1065,98 @@ mod tests {
                 template: "minimal".into()
             }
         );
+    }
+
+    #[test]
+    fn reviewed_removal_messages_and_correlated_inventories_round_trip() {
+        let id = MessageId::new("review-request").unwrap();
+        for body in [
+            FromDevice::RemovalPreview {
+                kind: "sandbox".into(),
+                sandbox: "lab".into(),
+                agent: None,
+            },
+            FromDevice::RemovalPreview {
+                kind: "agent".into(),
+                sandbox: "lab".into(),
+                agent: Some("scout".into()),
+            },
+            FromDevice::SandboxRemove {
+                sandbox: "lab".into(),
+                preview: "permit".into(),
+                confirmation: "lab".into(),
+            },
+            FromDevice::AgentRemove {
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+                preview: "permit".into(),
+                confirmation: "scout".into(),
+            },
+        ] {
+            assert_eq!(
+                decode_from_device(&encode_line(&Envelope::new(id.clone(), body.clone())))
+                    .unwrap()
+                    .body,
+                body
+            );
+        }
+        for body in [
+            ToDevice::RemovalPreviewed(RemovalPreviewInfo {
+                of: id.clone(),
+                preview: "permit".into(),
+                revision: "fingerprint".into(),
+                kind: "sandbox".into(),
+                sandbox: "lab".into(),
+                agent: None,
+                runtime: Some("hermes".into()),
+                agents: vec!["default".into(), "scout".into()],
+                secret_count: 2,
+                session_count: 1,
+                services: vec!["gateway".into()],
+                effects: vec!["Saved app history remains".into()],
+                expires_in: 120,
+            }),
+            ToDevice::SandboxRemoved {
+                of: id.clone(),
+                preview: "permit".into(),
+                sandbox: "lab".into(),
+                runtime: Some("hermes".into()),
+                removed: true,
+                files_removed: true,
+                secrets_left_count: 1,
+                warnings: vec!["One stored secret remains".into()],
+            },
+            ToDevice::AgentRemoved {
+                of: id.clone(),
+                preview: "permit".into(),
+                sandbox: "lab".into(),
+                agent: "scout".into(),
+                runtime: "hermes".into(),
+                removed: true,
+                files_removed: true,
+                warnings: vec![],
+            },
+            ToDevice::AgentsList {
+                of: Some(id.clone()),
+                agents: vec![],
+            },
+            ToDevice::SandboxesList {
+                of: Some(id.clone()),
+                sandboxes: vec![],
+            },
+        ] {
+            assert_eq!(
+                decode_to_device(&encode_line(&Envelope::new(id.clone(), body.clone())))
+                    .unwrap()
+                    .body,
+                body
+            );
+        }
+        assert!(matches!(
+            decode_to_device(br#"{"v":1,"id":"m","type":"agents.list","agents":[]}"#)
+                .unwrap()
+                .body,
+            ToDevice::AgentsList { of: None, .. }
+        ));
     }
 }

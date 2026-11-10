@@ -75,6 +75,7 @@ impl Hub {
     ) -> Result<PolicyState, String> {
         // Authorization is rechecked for every operation, not retained from a page opening.
         self.policy_authority(store, device, person, name.as_str())?;
+        let _busy = self.claim_sandbox_busy(name.as_str())?;
         let actor = Actor {
             user: format!("{person} (device {})", device.id),
             host: self.layout.data().display().to_string(),

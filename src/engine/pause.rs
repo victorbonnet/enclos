@@ -62,8 +62,20 @@ impl Engine {
         name: &SandboxName,
         why: &str,
     ) -> Result<Paused> {
+        self.pause_runtime_checked(by, name, why, || Ok(()))
+    }
+
+    pub(super) fn pause_runtime_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        why: &str,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<Paused> {
         let stopping = self.installed_runtime_services(name)?;
         if stopping.is_empty() {
+            let _lock = self.state.lock()?;
+            check()?;
             return Ok(Paused {
                 units: Vec::new(),
                 others: Vec::new(),
@@ -76,7 +88,7 @@ impl Engine {
             .filter(|l| !labels.contains(&l))
             .collect();
         self.audit.check()?;
-        self.remove_services(by, name, why, IfUnrecorded::Stop, &others)?
+        self.remove_services_checked(by, name, why, IfUnrecorded::Stop, &others, check)?
             .into_result()?;
         Ok(Paused {
             units: stopping.into_iter().map(|(u, _)| u).collect(),
@@ -92,6 +104,16 @@ impl Engine {
         by: &Actor,
         name: &SandboxName,
         paused: Paused,
+    ) -> Result<()> {
+        self.resume_runtime_checked(by, name, paused, || Ok(()))
+    }
+
+    pub(super) fn resume_runtime_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        paused: Paused,
+        check: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         if paused.units.is_empty() {
             return Ok(());
@@ -112,6 +134,7 @@ impl Engine {
                 None => "the sandbox was stopped meanwhile: nothing installed again".to_owned(),
             },
             |_lock| {
+                check()?;
                 let installed = self.installed_labels(name)?;
                 if paused.others.iter().any(|l| !installed.contains(l)) {
                     return Ok(None);

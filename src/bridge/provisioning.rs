@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use enclos_protocol::device::{RuntimeInfo, SandboxAgentInfo, SandboxInfo};
 use serde_json::Value;
 
-use crate::engine::{Engine, SandboxSpec};
+use crate::engine::{Engine, RemovalOutcome, RemovalReview, SandboxSpec};
 use crate::layout::Layout;
 use crate::model::agent::{AgentInstructions, AgentName};
 use crate::model::audit::Actor;
@@ -36,6 +36,10 @@ pub enum Operation {
     AgentConnect {
         name: SandboxName,
         agent: AgentName,
+    },
+    Remove {
+        review: Box<RemovalReview>,
+        preview: String,
     },
 }
 
@@ -98,6 +102,7 @@ impl Operation {
             | Self::Install { name, .. }
             | Self::AgentCreate { name, .. }
             | Self::AgentConnect { name, .. } => name.as_str(),
+            Self::Remove { review, .. } => review.sandbox.as_str(),
         }
     }
 
@@ -107,6 +112,13 @@ impl Operation {
             Self::Install { .. } => "runtime.install",
             Self::AgentCreate { .. } => "agent.create",
             Self::AgentConnect { .. } => "agent.connect",
+            Self::Remove { review, .. } => {
+                if review.agent.is_some() {
+                    "agent.remove"
+                } else {
+                    "sandbox.remove"
+                }
+            }
         }
     }
 
@@ -119,6 +131,13 @@ impl Operation {
             Self::AgentCreate { .. } => "Creating the agent inside its sandbox…",
             Self::AgentConnect { .. } => {
                 "Connecting the agent to the app and restarting its sandbox…"
+            }
+            Self::Remove { review, .. } => {
+                if review.agent.is_some() {
+                    "Removing the reviewed agent profile; shared runtime services may briefly stop…"
+                } else {
+                    "Stopping and removing the reviewed sandbox, runtime, agents, home and secrets…"
+                }
             }
         }
     }
@@ -139,6 +158,11 @@ pub enum Completed {
     AgentConnected {
         agent: String,
         runtime: String,
+    },
+    Removed {
+        review: Box<RemovalReview>,
+        preview: String,
+        outcome: RemovalOutcome,
     },
 }
 
@@ -192,6 +216,23 @@ impl Host {
         sandbox_agents(&Engine::open(self.layout.clone()), &name)
     }
 
+    pub fn removal_review(
+        &self,
+        sandbox: &str,
+        agent: Option<&str>,
+    ) -> Result<RemovalReview, String> {
+        let name = sandbox
+            .parse::<SandboxName>()
+            .map_err(|error| error.to_string())?;
+        let agent = agent
+            .map(str::parse::<AgentName>)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Engine::open(self.layout.clone())
+            .removal_review(&name, agent.as_ref())
+            .map_err(|error| error.to_string())
+    }
+
     /// Refreshes from host state, so setting up a new sandbox's app channel
     /// never needs a bridge restart.
     pub fn agents(&self) -> Result<Vec<super::server::AgentEndpoint>, String> {
@@ -240,6 +281,77 @@ impl Host {
             } => self.agent_operation(name, agent, false, instructions.as_ref()),
             Operation::AgentConnect { name, agent } => {
                 self.agent_operation(name, agent, true, None)
+            }
+            Operation::Remove { review, preview } => {
+                let target = review
+                    .agent
+                    .as_ref()
+                    .map(|agent| format!("{}/{agent}", review.sandbox))
+                    .unwrap_or_else(|| review.sandbox.to_string());
+                let kind = if review.agent.is_some() {
+                    "agent"
+                } else {
+                    "sandbox"
+                };
+                let result = self.command_result(
+                    &[
+                        "--json",
+                        "--yes",
+                        kind,
+                        "rm",
+                        &target,
+                        "--reviewed",
+                        &review.revision,
+                    ],
+                    "reviewed removal",
+                    None,
+                )?;
+                if result["sandbox"].as_str() != Some(review.sandbox.as_str())
+                    || result["agent"].as_str() != review.agent.as_ref().map(|agent| agent.as_str())
+                    || result["runtime"].as_str() != review.runtime.map(|runtime| runtime.as_str())
+                {
+                    return Err("The removal returned a mismatched target. Refresh its inventory and review again.".into());
+                }
+                let removed = result["removed"]
+                    .as_bool()
+                    .ok_or("The removal returned no confirmed outcome")?;
+                let files_removed = result["files_removed"]
+                    .as_bool()
+                    .ok_or("The removal returned no file outcome")?;
+                let warnings = result["warnings"]
+                    .as_array()
+                    .filter(|warnings| warnings.len() <= 8)
+                    .ok_or("The removal returned no bounded warnings")?
+                    .iter()
+                    .map(|warning| {
+                        warning
+                            .as_str()
+                            .filter(|text| text.len() <= 4096)
+                            .map(str::to_owned)
+                            .ok_or("The removal returned unreadable warnings")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let secrets_left_count = if review.agent.is_none() {
+                    result["secrets_left_count"]
+                        .as_u64()
+                        .and_then(|count| usize::try_from(count).ok())
+                        .ok_or("The removal returned no secret cleanup outcome")?
+                } else {
+                    0
+                };
+                if (!removed || !files_removed || secrets_left_count > 0) && warnings.is_empty() {
+                    return Err("The removal reported incomplete cleanup without an explanation. Review its state on the host.".into());
+                }
+                Ok(Completed::Removed {
+                    review: review.clone(),
+                    preview: preview.clone(),
+                    outcome: RemovalOutcome {
+                        removed,
+                        files_removed,
+                        secrets_left_count,
+                        warnings,
+                    },
+                })
             }
         }
     }
@@ -778,6 +890,51 @@ printf '%s\n' '{"agent":"lab/scout","runtime":"hermes","how":"created"}'
             assert!(
                 Operation::create_agent_with_instructions("lab", "scout", Some(invalid)).is_err()
             );
+        }
+    }
+
+    #[test]
+    fn reviewed_removal_children_are_bounded_and_preserve_partial_outcomes() {
+        let (_review_dir, review) = super::super::removals::review_fixture();
+        for (result, expected) in [
+            (
+                r#"{"sandbox":"lab","runtime":null,"removed":true,"files_removed":true,"secrets_left_count":0,"warnings":[]}"#,
+                Some(0),
+            ),
+            (
+                r#"{"sandbox":"lab","runtime":null,"removed":true,"files_removed":true,"secrets_left_count":2,"warnings":["Two secrets remain on the host"]}"#,
+                Some(2),
+            ),
+            (
+                r#"{"sandbox":"other","runtime":null,"removed":true,"files_removed":true,"secrets_left_count":0,"warnings":[]}"#,
+                None,
+            ),
+            (
+                r#"{"sandbox":"lab","runtime":null,"removed":true,"files_removed":false,"secrets_left_count":0,"warnings":[]}"#,
+                None,
+            ),
+            (
+                r#"{"error":{"message":"review is stale; no files were removed"}}"#,
+                None,
+            ),
+        ] {
+            let body = format!(
+                "test \"$#\" = 7 && test \"$1 $2 $3 $4 $5 $6\" = '--json --yes sandbox rm lab --reviewed' && test \"$7\" = '{}' || exit 10\nif read -r ignored; then exit 11; fi\nprintf '%s\\n' '{result}'\n",
+                review.revision
+            );
+            let (_dir, host) = fake_host(&body);
+            let operation = Operation::Remove {
+                review: Box::new(review.clone()),
+                preview: "one-use-preview".into(),
+            };
+            let result = host.execute(&operation, "owner@example.org");
+            if let Some(count) = expected {
+                assert!(
+                    matches!(result, Ok(Completed::Removed { preview, outcome, .. }) if preview == "one-use-preview" && outcome.secrets_left_count == count && (count == 0 || !outcome.warnings.is_empty()))
+                );
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 

@@ -334,6 +334,31 @@ impl Engine {
         name: &SandboxName,
         confirm: Confirm,
     ) -> Result<Planned<StopReport>> {
+        self.stop_sandbox_checked(by, name, confirm, None)
+    }
+
+    pub(super) fn stop_sandbox_for_removal(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        review: &super::RemovalReview,
+    ) -> Result<StopReport> {
+        match self.stop_sandbox_checked(by, name, Confirm::Yes, Some(review))? {
+            Planned::Done(report) => Ok(report),
+            Planned::DryRun(_) => unreachable!("reviewed removal is confirmed"),
+        }
+    }
+
+    fn stop_sandbox_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        confirm: Confirm,
+        review: Option<&super::RemovalReview>,
+    ) -> Result<Planned<StopReport>> {
+        if let Some(review) = review {
+            self.validate_removal_revision(review)?;
+        }
         if confirm == Confirm::DryRun {
             let view = self.show_sandbox(name)?;
             let mut changes: Vec<String> = view
@@ -399,8 +424,24 @@ impl Engine {
         // record its end, and audited on its own. A damaged audit log would
         // refuse the audited stop after the removal, so it is checked before.
         self.audit.check()?;
+        if let Some(review) = review {
+            let _lock = self.state.lock()?;
+            self.validate_removal_revision(review)?;
+        }
         let services = self
-            .remove_services(by, name, "for sandbox stop", IfUnrecorded::Stop, &[])?
+            .remove_services_checked(
+                by,
+                name,
+                "for sandbox stop",
+                IfUnrecorded::Stop,
+                &[],
+                || {
+                    if let Some(review) = review {
+                        self.validate_removal_revision(review)?;
+                    }
+                    Ok(())
+                },
+            )?
             .into_result()?;
         self.write(
             by,
@@ -408,6 +449,7 @@ impl Engine {
             Some(name.to_string()),
             summary,
             |lock| {
+                if let Some(review) = review { self.validate_removal_identity(review)?; }
                 let mut record = self.state.get(name)?.ok_or_else(|| Error::NoSuchSandbox {
                     name: name.to_string(),
                 })?;
@@ -490,6 +532,26 @@ impl Engine {
         keep_data: bool,
         confirm: Confirm,
     ) -> Result<Planned<Vec<SecretLeft>>> {
+        self.remove_sandbox_checked(by, name, keep_data, confirm, None)
+    }
+
+    pub(super) fn remove_sandbox_after_review(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        review: &super::RemovalReview,
+    ) -> Result<Planned<Vec<SecretLeft>>> {
+        self.remove_sandbox_checked(by, name, false, Confirm::Yes, Some(review))
+    }
+
+    fn remove_sandbox_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        keep_data: bool,
+        confirm: Confirm,
+        review: Option<&super::RemovalReview>,
+    ) -> Result<Planned<Vec<SecretLeft>>> {
         let gone = self.require_stopped(name)?;
         let dir = self.layout.sandbox_dir(name.as_str());
         let what = if keep_data {
@@ -552,6 +614,7 @@ impl Engine {
             |lock| {
                 // Checked again under the lock: a `connect` may have started
                 // while this command waited for it.
+                if let Some(review) = review { self.validate_removal_identity(review)?; }
                 let gone = self.require_stopped(name)?;
                 let secrets = self.state.secrets(name)?;
                 let after_record = self.remove_sandbox_secrets(name, &secrets)?;

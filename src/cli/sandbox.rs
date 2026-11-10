@@ -71,6 +71,10 @@ enum SandboxVerb {
         /// still.
         #[arg(long)]
         keep_data: bool,
+        /// Execute this exact host-generated removal review, stopping its
+        /// running work first. Requires --yes and deletes all data.
+        #[arg(long, conflicts_with = "keep_data")]
+        reviewed: Option<String>,
     },
 }
 
@@ -221,7 +225,32 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
                 |name| restart(engine, by, name, confirm),
             );
         }
-        SandboxVerb::Rm { name, keep_data } => {
+        SandboxVerb::Rm {
+            name,
+            keep_data,
+            reviewed,
+        } => {
+            if let Some(reviewed) = reviewed {
+                if confirm != Confirm::Yes {
+                    return Err(enclos::error::Error::NeedsConfirmation { what: "the reviewed removal of this sandbox, its runtime, agents, home and secrets; use --yes after reviewing it".into() });
+                }
+                let runtime = engine.runtime(&name)?.map(|runtime| runtime.to_string());
+                let outcome = engine.remove_reviewed(by, &name, None, &reviewed)?;
+                if output::json() {
+                    output::emit(
+                        &json!({ "sandbox": name.to_string(), "runtime": runtime, "removed": outcome.removed, "files_removed": outcome.files_removed, "secrets_left_count": outcome.secrets_left_count, "warnings": outcome.warnings }),
+                    );
+                } else {
+                    println!(
+                        "Sandbox {name}: removed={}, files removed={}",
+                        outcome.removed, outcome.files_removed
+                    );
+                    for warning in outcome.warnings {
+                        eprintln!("{warning}");
+                    }
+                }
+                return Ok(exit::OK);
+            }
             match engine.remove_sandbox(by, &name, keep_data, confirm)? {
                 Planned::DryRun(plan) => output::show_plan(&plan),
                 Planned::Done(left) => {

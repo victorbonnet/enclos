@@ -365,9 +365,23 @@ impl Engine {
         if_unrecorded: IfUnrecorded,
         kept: &[ServiceLabel],
     ) -> Result<Removal> {
+        self.remove_services_checked(by, name, why, if_unrecorded, kept, || Ok(()))
+    }
+
+    pub(super) fn remove_services_checked(
+        &self,
+        by: &Actor,
+        name: &SandboxName,
+        why: &str,
+        if_unrecorded: IfUnrecorded,
+        kept: &[ServiceLabel],
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<Removal> {
         let mut labels = self.installed_labels(name)?;
         labels.retain(|l| !kept.contains(l));
         if labels.is_empty() {
+            let _lock = self.state.lock()?;
+            check()?;
             return Ok(Removal {
                 labels,
                 failed: None,
@@ -376,7 +390,13 @@ impl Engine {
         }
         let target = Some(name.to_string());
         let message = format!("removing {} {why}", joined(&labels));
-        let begun = self.note(by, "services remove", target.clone(), Outcome::ok(message));
+        let begun = self.note_checked(
+            by,
+            "services remove",
+            target.clone(),
+            Outcome::ok(message),
+            check,
+        );
         if if_unrecorded == IfUnrecorded::Stop {
             begun?;
         }

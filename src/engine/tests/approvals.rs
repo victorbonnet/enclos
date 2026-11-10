@@ -57,6 +57,54 @@ fn access_approval_stale_policy_does_not_apply_the_old_decision() {
     );
     assert!(!e.allows(&name, "api.example.com").unwrap());
 }
+
+#[test]
+fn an_approval_revision_cannot_apply_to_a_recreated_same_name_sandbox() {
+    let (_dir, engine, name) = with_sandbox();
+    let access = network("api.example.com");
+    let old = engine.access_plan(&name, &access).unwrap();
+    let original_policy = engine.policy(&name).unwrap().snapshot.id;
+    let old_second = engine.sandbox_created_at(&name).unwrap().as_second();
+    done(
+        engine
+            .remove_sandbox(&alice(), &name, false, Confirm::Yes)
+            .unwrap(),
+    );
+    done(
+        engine
+            .create_sandbox(
+                &alice(),
+                SandboxSpec {
+                    name: name.clone(),
+                    backend: BackendKind::Seatbelt,
+                    template: "assistant".parse().unwrap(),
+                },
+                Confirm::Yes,
+            )
+            .unwrap(),
+    );
+    let lock = engine.state.lock().unwrap();
+    let mut record = engine.state.get(&name).unwrap().unwrap();
+    record.created_at = crate::model::Timestamp::from_second(old_second + 2).unwrap();
+    engine.state.put(&lock, &record).unwrap();
+    drop(lock);
+    assert_eq!(engine.policy(&name).unwrap().snapshot.id, original_policy);
+    assert!(
+        engine
+            .approve_access(&alice(), &name, &access, &old.revision)
+            .is_err()
+    );
+    assert!(
+        engine
+            .policy(&name)
+            .unwrap()
+            .snapshot
+            .policy
+            .net
+            .allow
+            .is_empty()
+    );
+}
 #[test]
 fn access_approval_never_applies_unrelated_edits_or_pending_changes() {
     let (dir, e, name) = with_sandbox();

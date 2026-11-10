@@ -1,0 +1,9 @@
+---
+status: proposed
+---
+
+# Mobile removal requires a fresh target review
+
+Extends [0055](0055-the-host-user-can-provision-sandboxes-from-a-paired-phone.md) and [0056](0056-mobile-agent-creation-and-explicit-app-connection.md): only the host's user may remove a sandbox or agent from a paired phone. Because a canonical name can be reused, a destructive request requires a host-generated preview, an exact typed target name and a one-use permit bound to that device connection for two minutes. The engine rechecks the target's creation record and filesystem identity, policy, profile and secret inventory before stopping work, then checks identity again at the destructive step; disconnects, expired previews and changed targets require a new review.
+
+A sandbox removal stops its work and refuses to delete files if processes survive, then removes its runtime, all profiles, home and stored secrets through the existing engine. Agent removal uses the runtime's native delete and its existing shared-service pause/resume behavior; it can explicitly delete an untracked profile without adopting it, refuses built-in agents and unsupported deletion, and refuses while any CLI session in that sandbox is live. Known partial cleanup is reported with explicit flags and warnings, never as complete deletion. App conversation history is retained, and pending policy requests for an absent sandbox are closed as history without approving or denying access. New policy-request identities and access-plan revisions include sandbox generation; a recreated name does not inherit or suppress the preceding sandbox’s requests. Legacy IDs retain their existing seconds-based timestamp compatibility. Policy application, approval decisions and removal share the bridge’s per-sandbox busy guard; no global CLI lifecycle lock is introduced. Removing a host from the phone remains the existing local forget/unpair operation.

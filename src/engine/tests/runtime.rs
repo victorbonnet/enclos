@@ -812,6 +812,275 @@ fn lab_with_profiles(lab: &Lab, agents: &[&str]) {
 }
 
 #[test]
+fn reviewed_removal_deletes_an_untracked_profile_without_adopting_or_changing_its_neighbors() {
+    use crate::model::secret::{SecretRef, SecretValue};
+    use crate::secrets::{InMemory, SecretStore};
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let store = std::rc::Rc::new(InMemory::default());
+    let lab = Lab::with_secrets(Box::new(std::rc::Rc::clone(&store)));
+    lab_with_profiles(&lab, &["reader"]);
+    let profile = lab.home.join(".hermes/profiles/writer");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("config.yaml"), "writer's settings").unwrap();
+    let secret: SecretRef = "home/shared-token".parse().unwrap();
+    let value = SecretValue::new("keep-this-value".into()).unwrap();
+    done(
+        lab.engine
+            .secret_set(&alice(), &secret, Some(&value), Confirm::Yes)
+            .unwrap(),
+    );
+    let records = lab.engine.agents(&lab.name).unwrap();
+    let policy = lab.engine.policy(&lab.name).unwrap();
+    let audit_before = lab.engine.audit(None).unwrap().len();
+    let writer = "writer".parse().unwrap();
+    let review = lab.engine.removal_review(&lab.name, Some(&writer)).unwrap();
+
+    let removed = done(
+        lab.engine
+            .remove_existing_agent_reviewed(&alice(), &lab.name, &writer, &review)
+            .unwrap(),
+    );
+    assert_eq!(
+        removed,
+        AgentRemoved::Deleted {
+            kind: RuntimeKind::Hermes
+        }
+    );
+    assert!(!profile.exists());
+    assert!(
+        lab.home
+            .join(".hermes/profiles/reader/config.yaml")
+            .exists()
+    );
+    assert_eq!(lab.engine.agents(&lab.name).unwrap(), records);
+    assert_eq!(lab.engine.policy(&lab.name).unwrap(), policy);
+    assert_eq!(lab.runtime(), Some(RuntimeKind::Hermes));
+    assert_eq!(store.get(&secret).unwrap(), Some(value));
+    assert!(
+        lab.engine.audit(None).unwrap()[audit_before..]
+            .iter()
+            .all(|entry| entry.intent.command != "agent add"
+                && entry.intent.command != "agent create")
+    );
+}
+
+#[test]
+fn reviewed_agent_removal_refuses_live_interactive_and_exec_sessions_before_pausing() {
+    use super::sandbox::{Sleeping, session_of};
+    use crate::model::session::SessionKind;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let fake = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+    lab_with_profiles(&lab, &["writer"]);
+    let writer = "writer".parse().unwrap();
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    fake.seed(gateway.as_str());
+    let calls_before = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    for kind in [SessionKind::Interactive, SessionKind::Exec] {
+        let review = lab.engine.removal_review(&lab.name, Some(&writer)).unwrap();
+        let sleeping = Sleeping::new();
+        let mut session = session_of(&lab.engine, &lab.name, sleeping.process());
+        session.kind = kind;
+        let lock = lab.engine.state.lock().unwrap();
+        lab.engine.state.put_session(&lock, &session).unwrap();
+        drop(lock);
+        let result =
+            lab.engine
+                .remove_existing_agent_reviewed(&alice(), &lab.name, &writer, &review);
+        drop(sleeping);
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("session"), "{error}");
+        assert!(fake.stopped.borrow().is_empty());
+        assert!(
+            lab.home
+                .join(".hermes/profiles/writer/config.yaml")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default(),
+            calls_before
+        );
+    }
+}
+
+#[test]
+fn reviewed_agent_removal_rechecks_a_profile_changed_while_pausing_or_resuming() {
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    for replace_on_resume in [false, true] {
+        let fake = std::rc::Rc::new(FakeServices::default());
+        let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&fake))));
+        lab_with_profiles(&lab, &["writer", "reader"]);
+        let writer = "writer".parse().unwrap();
+        let profile = lab.home.join(".hermes/profiles/writer");
+        let gateway = lab
+            .engine
+            .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+            .unwrap();
+        fake.seed(gateway.as_str());
+        let review = lab.engine.removal_review(&lab.name, Some(&writer)).unwrap();
+        let records = lab.engine.agents(&lab.name).unwrap();
+        let calls_before =
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        let changed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let once = std::rc::Rc::clone(&changed);
+        let folder = profile.clone();
+        let replace: crate::service::fake::Meanwhile = Box::new(move |label| {
+            if label.service() == "gateway" && !once.replace(true) {
+                if folder.exists() {
+                    std::fs::rename(&folder, folder.with_file_name(".writer-before-review"))
+                        .unwrap();
+                }
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("config.yaml"), "new profile, preserve it").unwrap();
+            }
+        });
+        if replace_on_resume {
+            *fake.on_start.borrow_mut() = Some(replace);
+        } else {
+            *fake.on_stop.borrow_mut() = Some(replace);
+        }
+
+        let error = lab
+            .engine
+            .remove_existing_agent_reviewed(&alice(), &lab.name, &writer, &review)
+            .unwrap_err();
+        assert!(changed.get());
+        assert!(
+            error.to_string().contains("review") || error.to_string().contains("changed"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile.join("config.yaml")).unwrap(),
+            "new profile, preserve it"
+        );
+        assert!(
+            lab.home
+                .join(".hermes/profiles/reader/config.yaml")
+                .exists()
+        );
+        assert_eq!(lab.engine.agents(&lab.name).unwrap(), records);
+        assert!(
+            fake.started
+                .borrow()
+                .iter()
+                .any(|unit| unit.label == gateway)
+        );
+        let calls_after =
+            std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+        if replace_on_resume {
+            assert!(
+                calls_after.ends_with("profile delete writer --yes\n"),
+                "{calls_after}"
+            );
+        } else {
+            assert_eq!(
+                calls_after, calls_before,
+                "the changed profile must not reach the native delete"
+            );
+        }
+    }
+}
+
+#[test]
+fn reviewed_removal_recovers_a_tracked_missing_profile_as_record_only() {
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = Lab::new();
+    lab_with_profiles(&lab, &["writer", "reader"]);
+    let writer = "writer".parse().unwrap();
+    std::fs::remove_dir_all(lab.home.join(".hermes/profiles/writer")).unwrap();
+    let review = lab.engine.removal_review(&lab.name, Some(&writer)).unwrap();
+    let calls_before = std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default();
+    let removed = done(
+        lab.engine
+            .remove_existing_agent_reviewed(&alice(), &lab.name, &writer, &review)
+            .unwrap(),
+    );
+    assert!(matches!(
+        removed,
+        AgentRemoved::RecordOnly {
+            why: FilesKept::RuntimeLacksIt,
+            ..
+        }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(lab.home.join("hermes-calls")).unwrap_or_default(),
+        calls_before
+    );
+    assert_eq!(
+        lab.engine
+            .agents(&lab.name)
+            .unwrap()
+            .iter()
+            .map(|record| record.name.as_str())
+            .collect::<Vec<_>>(),
+        ["reader"]
+    );
+    assert!(
+        lab.home
+            .join(".hermes/profiles/reader/config.yaml")
+            .exists()
+    );
+    assert!(lab.engine.removal_review(&lab.name, Some(&writer)).is_err());
+    assert!(
+        lab.engine
+            .removal_review(&lab.name, Some(&"default".parse().unwrap()))
+            .is_err()
+    );
+}
+
+#[test]
+fn reviewed_removal_reports_deleted_files_when_shared_runtime_resumption_fails() {
+    use crate::engine::Unit;
+    use crate::runtime::ServiceName;
+    use crate::service::fake::FakeServices;
+    let _turn = HOST_PORTS.lock().unwrap_or_else(|error| error.into_inner());
+    let services = std::rc::Rc::new(FakeServices::default());
+    let lab = Lab::with_services(Some(Box::new(std::rc::Rc::clone(&services))));
+    lab_with_profiles(&lab, &["writer", "reader"]);
+    let gateway = lab
+        .engine
+        .label(&lab.name, Unit::Runtime(ServiceName::new("gateway")))
+        .unwrap();
+    services.seed(gateway.as_str());
+    let agent = "writer".parse().unwrap();
+    let review = lab.engine.removal_review(&lab.name, Some(&agent)).unwrap();
+    *services.refuse.borrow_mut() = Some("gateway".into());
+    let outcome = lab
+        .engine
+        .remove_reviewed(&alice(), &lab.name, Some(&agent), &review.revision)
+        .unwrap();
+    assert!(outcome.removed && outcome.files_removed);
+    assert!(!outcome.warnings.is_empty());
+    assert!(
+        outcome.warnings[0].contains("could not start again"),
+        "{:?}",
+        outcome.warnings
+    );
+    assert!(
+        lab.home
+            .join(".hermes/profiles/reader/config.yaml")
+            .exists()
+    );
+    assert!(
+        lab.engine
+            .agents(&lab.name)
+            .unwrap()
+            .iter()
+            .all(|record| record.name != agent)
+    );
+}
+
+#[test]
 fn an_agent_added_before_the_login_chose_a_provider_is_said_to_have_none() {
     let _turn = HOST_PORTS.lock().unwrap_or_else(|e| e.into_inner());
     let lab = Lab::new();

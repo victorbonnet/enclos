@@ -28,6 +28,7 @@ mod pending;
 mod policy;
 mod probe;
 mod proxy;
+mod removal;
 mod restart;
 mod runtime;
 mod sandbox;
@@ -59,6 +60,7 @@ pub use listener::ServiceWait;
 pub use pending::{Discarded, EditFiles, Restarted};
 pub use policy::{ChangeOutcome, PendingEnd, PolicyApplied, PolicyView, policy_differences};
 pub use probe::TestReport;
+pub use removal::{RemovalOutcome, RemovalReview};
 pub use runtime::InstallEnd;
 pub use sandbox::{SandboxSpec, SandboxView, SessionView, StopReport};
 pub use secrets::{Grant, SecretLeft, SecretSet, SecretView};
@@ -422,7 +424,19 @@ impl Engine {
         target: Option<String>,
         outcome: Outcome,
     ) -> Result<()> {
+        self.note_checked(by, command, target, outcome, || Ok(()))
+    }
+
+    fn note_checked(
+        &self,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        outcome: Outcome,
+        check: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let lock = self.state.lock()?;
+        check()?;
         let intent = Intent {
             by: by.clone(),
             command: command.to_owned(),
