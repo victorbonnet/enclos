@@ -83,7 +83,9 @@ fn the_verdict_on_a_field_not_enforced_is_spelled_out_in_one_document() {
     // others name the rule and point to the one that gives it.
     let spelled_out: Vec<String> = docs_markdown()
         .into_iter()
-        .filter(|(_, text)| text.contains("field not enforced: ") || text.contains("not_enforced"))
+        .filter(|(_, text)| {
+            text.contains("field not enforced: ") || text.contains("`not_enforced`")
+        })
         .map(|(name, _)| name)
         .collect();
     assert_eq!(spelled_out.len(), 1, "{spelled_out:?}");
@@ -294,9 +296,15 @@ fn bare_holders(text: &str) -> Vec<String> {
     for line in text.lines().map(str::to_lowercase) {
         for (at, _) in line.match_indices("holder") {
             // A service's name, such as `enclos.<install>.<sandbox>.holder`,
-            // or the command's, `enclos holder`.
-            let named = line[..at].ends_with(['.', '`']) || line[..at].ends_with("enclos ");
-            if !named && !line[..at].ends_with("namespace ") {
+            // the command's, `enclos holder`, or a file's, `holder.rs`.
+            let named = line[..at].ends_with(['.', '`'])
+                || line[..at].ends_with("enclos ")
+                || line[at..].starts_with("holder.rs");
+            // Also the code's names: `namespace_holder`, `NamespaceHolder`.
+            let namespace = line[..at]
+                .trim_end_matches([' ', '_'])
+                .ends_with("namespace");
+            if !named && !namespace {
                 let start = (0..=at.saturating_sub(40))
                     .rev()
                     .find(|i| line.is_char_boundary(*i))

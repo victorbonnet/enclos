@@ -40,9 +40,9 @@
 <text x="177.0" y="387.0" font-size="16" font-weight="600" fill="#1f2328" text-anchor="middle">Seatbelt</text>
 <text x="177.0" y="407.0" font-size="13.5" font-weight="normal" fill="#59636e" text-anchor="middle">macOS, milestone 1</text>
 <line x1="439" y1="340" x2="439" y2="358" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
-<rect x="322" y="360" width="234" height="64" rx="9" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5" stroke-dasharray="6 5"/>
-<text x="439.0" y="387.0" font-size="16" font-weight="600" fill="#818b98" text-anchor="middle">bubblewrap</text>
-<text x="439.0" y="407.0" font-size="13.5" font-weight="normal" fill="#818b98" text-anchor="middle">Linux, later</text>
+<rect x="322" y="360" width="234" height="64" rx="9" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5"/>
+<text x="439.0" y="387.0" font-size="16" font-weight="600" fill="#1f2328" text-anchor="middle">bubblewrap</text>
+<text x="439.0" y="407.0" font-size="13.5" font-weight="normal" fill="#59636e" text-anchor="middle">Linux, milestone 3</text>
 <line x1="701" y1="340" x2="701" y2="358" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
 <rect x="584" y="360" width="234" height="64" rx="9" fill="#ffffff" stroke="#d1d9e0" stroke-width="1.5" stroke-dasharray="6 5"/>
 <text x="701.0" y="387.0" font-size="16" font-weight="600" fill="#818b98" text-anchor="middle">OpenShell</text>

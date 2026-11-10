@@ -34,7 +34,7 @@ CORE = [
 ]
 BACKENDS = [
     (60, "Seatbelt", ["macOS, milestone 1"], "solid"),
-    (322, "bubblewrap", ["Linux, later"], "later"),
+    (322, "bubblewrap", ["Linux, milestone 3"], "solid"),
     (584, "OpenShell", ["later"], "later"),
     (846, "MicroVM", ["later: libkrun"], "later"),
 ]
