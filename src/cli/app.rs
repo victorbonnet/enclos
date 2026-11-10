@@ -374,7 +374,7 @@ fn chat(
     };
     let conversation = ConversationId::new(conversation)
         .map_err(|e| failed(format!("not a conversation id: {e}")))?;
-    let (_, _, owner) = store
+    let (with_sandbox, with_agent, owner) = store
         .conversation(
             conversation.as_str(),
             sandbox.as_str(),
@@ -382,11 +382,12 @@ fn chat(
             person.as_str(),
         )
         .map_err(|e| failed(format!("cannot record the conversation: {e}")))?;
-    if owner != person.as_str() {
-        return Err(failed(format!(
-            "conversation {conversation} is {owner}'s, not yours"
-        )));
-    }
+    resumable(
+        conversation.as_str(),
+        (&with_sandbox, &with_agent, &owner),
+        (sandbox.as_str(), &agent, person.as_str()),
+    )
+    .map_err(failed)?;
     let plugin_error = |e: PluginError| failed(e.to_string());
     let (hello, mut reader, mut writer) =
         connect(&endpoint.socket, endpoint.token.expose()).map_err(plugin_error)?;
@@ -453,12 +454,37 @@ fn chat(
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
     }
+    // End of input: close the connection itself, so the reading thread
+    // sees its end and the plugin is free for the bridge.
+    writer.shutdown();
     drop(writer);
     match printer.join() {
         Ok(Ok(())) => Ok(exit::OK),
         Ok(Err(e)) => Err(failed(e)),
         Err(_) => Err(failed("the reading thread stopped".to_owned())),
     }
+}
+
+/// Whether a conversation, as stored (`sandbox`, `agent`, owner), may go
+/// on with this agent for this person. A conversation is one exchange with
+/// one agent: another agent's replies would land in its history.
+fn resumable(
+    conversation: &str,
+    stored: (&str, &str, &str),
+    wanted: (&str, &str, &str),
+) -> std::result::Result<(), String> {
+    let (sandbox, agent, owner) = stored;
+    if owner != wanted.2 {
+        return Err(format!(
+            "conversation {conversation} is {owner}'s, not yours"
+        ));
+    }
+    if (sandbox, agent) != (wanted.0, wanted.1) {
+        return Err(format!(
+            "conversation {conversation} is with {sandbox}/{agent}: carry it on with `enclos app chat {sandbox}/{agent} --conversation {conversation}`"
+        ));
+    }
+    Ok(())
 }
 
 /// A second writer on the same connection, for the acknowledgements the
@@ -469,4 +495,20 @@ fn writer_ack(
     writer.try_clone().map_err(|e| Error::Session {
         what: format!("cannot share the connection to the agent: {e}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_conversation_goes_on_only_with_its_own_agent_and_person() {
+        let stored = ("lab", "main", "victor@mac");
+        assert!(resumable("c-1", stored, ("lab", "main", "victor@mac")).is_ok());
+        let other_agent = resumable("c-1", stored, ("lab", "scout", "victor@mac")).unwrap_err();
+        assert!(other_agent.contains("is with lab/main"), "{other_agent}");
+        assert!(resumable("c-1", stored, ("work", "main", "victor@mac")).is_err());
+        let other_person = resumable("c-1", stored, ("lab", "main", "alice@mac")).unwrap_err();
+        assert!(other_person.contains("victor@mac's"), "{other_person}");
+    }
 }
