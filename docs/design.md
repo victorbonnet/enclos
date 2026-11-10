@@ -585,23 +585,30 @@ pub trait Downloader {
 ```text
 src/
   main.rs          CLI: parse args into models, call Engine, print the result
-  cli/             one file per command group (policy.rs, ...), a large one with a folder of its own (policy/): its arguments and output
+  cli/             one file per command group (policy.rs, ...), a large one with a folder of its own (policy/): its arguments and output; holder.rs, inside.rs and relay.rs are hidden commands enclos runs itself
   lib.rs           the core library every client uses
-  engine.rs        the API above; the only place components meet; engine/ holds its parts (policy.rs, ...)
+  engine.rs        the API above; the only place components meet; engine/ holds its parts (policy.rs, holder.rs for a sandbox's namespace holder as one of its services, ...)
   error.rs         the engine's typed errors and their exit codes
   layout.rs        where enclos keeps its files (§11);  config.rs  config.toml
-  model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs
-  policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  templates/*.toml
-  net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy
-  lifecycle/       process.rs  members.rs (which processes are a session's)  marker.rs  look.rs (one look at a sandbox: the listing, then the markers)  stop.rs  listeners.rs  programs.rs  bounded.rs  inherited.rs (what a started program inherits of enclos's caller)  ps.rs, lsof.rs (how macOS looks: `ps`, `lsof`, `sysctl`)  proc.rs, proc/{processes,programs,net}.rs, descriptors.rs (how Linux looks: `/proc`); mod.rs picks one as `host`
+  host.rs          what `doctor` finds on the host beyond whether a backend runs, each component giving its own checks (§10)
+  notes.rs         what the library says on stderr as the client says its own, so a client printing JSON gets JSON lines
+  model/           sandbox.rs  policy.rs  session.rs  net.rs  audit.rs  agent.rs  runtime.rs  channel.rs  secret.rs  limits.rs (a slice's `memory` and `cpu`)  unenforced.rs (fields a host may not hold, ADR 0038)  plan.rs (how a command is confirmed)
+  policy/          mod.rs (resolve, snapshots)  file.rs (one TOML layer)  paths.rs  validate.rs  own_places.rs (what a backend gives each session its own of)  templates/*.toml
+  net/             addr.rs (which addresses are reachable, ADR 0017)  host.rs (allowlist entries); shared by policy and proxy; budget.rs (the descriptors a long-running process plans for)
+  lifecycle/       process.rs  members.rs (which processes are a session's)  marker.rs  look.rs (one look at a sandbox: the listing, then the markers)  stop.rs  listeners.rs  programs.rs  bounded.rs  inherited.rs (what a started program inherits of enclos's caller)  ps.rs, lsof.rs (how macOS looks: `ps`, `lsof`, `sysctl`)  proc.rs, proc/{processes,programs,net}.rs, descriptors.rs (how Linux looks: `/proc`); mod.rs picks one as `host`;  cgroup.rs (a session's scope and its cgroup on Linux, ADR 0019)  slice.rs (the limits a sandbox's slice holds)
   probes/          mod.rs (the escape probes every backend runs for `policy test`, run by engine/probe.rs)
-  backend/         mod.rs (trait)  environment.rs (a session's variables, the same for every backend)  fake/  seatbelt/{compile.rs, wrap.rs, probes.rs, host-services.sb, deny-default.sb, denials.rs (later)}
-  proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  control.rs (later)
-  service/         mod.rs (trait)  launchd.rs  systemd.rs
+  backend/         mod.rs (trait)  environment.rs (a session's variables, the same for every backend)  fake/  seatbelt/{mod.rs, compile.rs, wrap.rs, probes.rs, probes_snapshot.rs, host-services.sb, deny-default.sb, denials.rs (later)}
+  backend/bubblewrap/  mod.rs  probe.rs (whether it runs here)  compile.rs, compile/ (arguments, Landlock rules and seccomp filter, as one file)  wrap.rs, wrap/ (a launch's masks)  setup.rs (started again when a mount changed)  inside/ (`enclos inside`: the rules, then the command)  seccomp.rs  sockets.rs (what a namespace listens on)  holder.rs (the namespace holder, ADR 0039)  degraded.rs (ADRs 0037, 0038)  proposed.rs (what rests on the host or is open)  probes/ (its own escape probes)
+  proxy/           decide.rs (pure checks)  request.rs  hello.rs  server.rs  tunnel.rs  stream.rs (TCP on the loopbacks or a Unix socket, served alike)  control.rs (later)
+  relay.rs         the relay from a sandbox's 127.0.0.1 to the proxy's Unix socket (§5, Linux networking); relay/inward.rs, the way in from the host (ADR 0040)
+  service/         mod.rs (trait)  launchd.rs  systemd.rs  linger.rs (whether the user's manager outlives a logout, §2)  fake.rs
   secrets/         mod.rs (trait)  keychain.rs  libsecret.rs  file.rs  tool.rs
   state/           mod.rs (trait)  sqlite/
   audit/           mod.rs (trait)  jsonl/
-  runtime/         mod.rs (trait)  hermes.rs  claude_code.rs  codex.rs
+  runtime/         mod.rs (trait)  hermes.rs, hermes/endpoints.toml  home.rs (reading a sandbox home from the host, ADR 0023); claude_code.rs, codex.rs later
+  host_ports.rs    tests only: the turn tests take to start proxies on this host's ports, shared with tests/cli.rs
+  test_ports.rs    tests only: ports for tests' own listeners, clear of the proxy range
+  test_scripts.rs  tests only: stand-in programs, written as shell scripts
 ```
 
 ## 10. CLI
