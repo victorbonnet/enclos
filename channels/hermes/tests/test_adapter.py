@@ -116,6 +116,18 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e.text for e in self.adapter.received], [text])
         writer.close()
 
+    async def test_a_message_sent_again_reaches_the_runtime_once(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        again = line("message.in", conversation="c-1", person="alice@example.com", text="hi")
+        for _ in range(2):
+            writer.write(again)
+            await writer.drain()
+            ack = json.loads(await asyncio.wait_for(reader.readline(), 5))
+            self.assertEqual(ack["of"], json.loads(again)["id"])
+        self.assertEqual([e.text for e in self.adapter.received], ["hi"])
+        writer.close()
+
     async def test_a_line_over_the_limit_closes_the_connection(self):
         reader, writer = await self.bridge()
         await self.hello(reader, writer)
