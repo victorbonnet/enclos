@@ -155,7 +155,7 @@ class Hint(unittest.TestCase):
     def test_it_explains_how_to_send_a_static_artefact_and_its_limits(self):
         for detail in ("static HTML artefact", "self-contained UTF-8 .html", "inline CSS",
                        "data images/fonts", "JavaScript", "external resources, forms and automatic navigation are blocked",
-                       "Tapped HTTP(S) links open the browser"):
+                       "A tapped HTTP(S) link opens the browser", "once the person confirms its address"):
             self.assertIn(detail, protocol.PLATFORM_HINT)
 
     def test_it_stays_short_for_every_prompt(self):

@@ -35,7 +35,8 @@ PLATFORM_HINT = (
     "shows in the conversation, another file as an attachment, and the person can share either. "
     "For a static HTML artefact, save a self-contained UTF-8 .html file and send it the same way: "
     "the person opens it in the app. Use inline CSS and data images/fonts; JavaScript, external "
-    "resources, forms and automatic navigation are blocked. Tapped HTTP(S) links open the browser. "
+    "resources, forms and automatic navigation are blocked. A tapped HTTP(S) link opens the browser "
+    "once the person confirms its address. "
     "A remote image in markdown is not loaded, "
     "and message HTML shows as literal text."
 )
