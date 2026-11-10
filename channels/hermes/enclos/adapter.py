@@ -12,6 +12,7 @@ this channel's own variable, which `enclos runtime configure` turns on.
 """
 
 import asyncio
+import collections
 import logging
 import os
 from datetime import UTC, datetime
@@ -29,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "enclos"
 HELLO_TIMEOUT_SECONDS = 10
+# The bridge sends a message again, with its id, until it has the ack: the
+# ids of the last ones the runtime had, to drop one that comes again
+SEEN_MESSAGES = 1024
 
 
 def _setting(config: Optional[PlatformConfig], key: str, env: str) -> str:
@@ -56,6 +60,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._server: Optional[asyncio.base_events.Server] = None
         self._bridge: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
+        self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -162,6 +167,13 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
+        if message["id"] in self._seen:
+            # The runtime has it: the ack was lost on the way
+            await self._write(protocol.ack(message["id"]))
+            return
+        self._seen[message["id"]] = None
+        while len(self._seen) > SEEN_MESSAGES:
+            self._seen.popitem(last=False)
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
