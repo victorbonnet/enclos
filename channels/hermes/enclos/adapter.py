@@ -65,7 +65,11 @@ class EnclosAdapter(BasePlatformAdapter):
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
             if os.path.exists(self._path):
                 os.unlink(self._path)
-            self._server = await asyncio.start_unix_server(self._on_connection, path=self._path)
+            # A line may hold a whole protocol message and its line break;
+            # asyncio's default limit (64 KiB) would end the connection on
+            # an ordinary long message
+            self._server = await asyncio.start_unix_server(
+                self._on_connection, path=self._path, limit=protocol.MAX_MESSAGE_BYTES + 1)
             os.chmod(self._path, 0o600)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
@@ -101,6 +105,12 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.warning("[%s] A connection without the agent's token was closed", self.name)
             writer.close()
             return
+        # Checked again once the hello is in: two connections may both have
+        # passed the first check while waiting for theirs. Nothing awaits
+        # between this check and taking the slot, so only one takes it.
+        if self._bridge is not None:
+            writer.close()
+            return
         self._bridge = writer
         logger.info("[%s] Bridge connected", self.name)
         try:
@@ -111,8 +121,15 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._on_line(line)
         except ConnectionError:
             pass
+        except ValueError:
+            # A line past the protocol's limit: no message of the bridge's
+            # is, so the connection is not one to go on with
+            logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
+            await self._write(protocol.error("bad_message", "larger than 1 MiB", None))
         finally:
-            self._bridge = None
+            # Only the connection that holds the slot gives it back
+            if self._bridge is writer:
+                self._bridge = None
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
