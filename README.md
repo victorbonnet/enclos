@@ -2,7 +2,7 @@
 
 *enclos* (French for an enclosure, said "ahn-KLOH") creates sandboxes on your machine, installs agent runtimes in them and runs agents there, with a policy and an audit log. It manages only the sandboxes it creates.
 
-> **Status: 0.3.0, the first release on Linux.** enclos runs [Hermes](https://hermes-agent.nousresearch.com) agents in sandboxes on an Apple silicon Mac, with Seatbelt, and on Linux (Ubuntu 24.04 and 26.04, Debian 13, 64-bit Raspberry Pi OS; x86_64 or arm64), with bubblewrap. It is early software: read the [release notes](docs/release-notes/0.3.0.md) and their known gaps, and expect state may not carry over between 0.x releases.
+> **Status: 0.3.1; on Linux since 0.3.0.** enclos runs [Hermes](https://hermes-agent.nousresearch.com) agents in sandboxes on an Apple silicon Mac, with Seatbelt, and on Linux (Ubuntu 24.04 and 26.04, Debian 13, 64-bit Raspberry Pi OS; x86_64 or arm64), with bubblewrap. It is early software: read the [release notes](docs/release-notes/0.3.1.md) and [the known gaps](docs/release-notes/0.3.0.md#known-gaps), and expect state may not carry over between 0.x releases.
 
 ## Why
 
