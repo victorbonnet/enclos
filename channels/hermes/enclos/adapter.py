@@ -2,7 +2,9 @@
 
 It listens on MOBILE_APP_SOCKET, a Unix socket in the sandbox home, for
 enclos's bridge, which must open with a `hello` holding the agent's token
-(MOBILE_APP_TOKEN, granted to this agent alone). Each conversation is a
+(MOBILE_APP_TOKEN). The token keeps the host's other programs out, and
+nothing more: the agent can read it too (docs/protocol.md, the plugin
+leg). Each conversation is a
 Hermes chat, so a cron job created in one delivers back to it. What the
 agent says is kept on disk until the bridge acknowledges it.
 
@@ -15,6 +17,7 @@ import asyncio
 import collections
 import logging
 import os
+import socket
 from datetime import UTC, datetime
 from typing import Any, Optional
 
@@ -70,12 +73,20 @@ class EnclosAdapter(BasePlatformAdapter):
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
             if os.path.exists(self._path):
                 os.unlink(self._path)
+            # Bound and made the user's alone before it listens, so no
+            # connection gets in under the mode the process's umask gives
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(self._path)
+                os.chmod(self._path, 0o600)
+            except OSError:
+                listener.close()
+                raise
             # A line may hold a whole protocol message and its line break;
             # asyncio's default limit (64 KiB) would end the connection on
             # an ordinary long message
             self._server = await asyncio.start_unix_server(
-                self._on_connection, path=self._path, limit=protocol.MAX_MESSAGE_BYTES + 1)
-            os.chmod(self._path, 0o600)
+                self._on_connection, sock=listener, limit=protocol.MAX_MESSAGE_BYTES + 1)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
             return False
@@ -103,7 +114,9 @@ class EnclosAdapter(BasePlatformAdapter):
         try:
             first = await asyncio.wait_for(reader.readline(), HELLO_TIMEOUT_SECONDS)
             hello = protocol.decode_from_bridge(first)
-        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError):
+        except (asyncio.TimeoutError, protocol.DecodeError, ConnectionError, ValueError, RecursionError):
+            # ValueError: a first line over the limit; RecursionError: one
+            # nested too deep. Either way, said by whoever, without the token
             writer.close()
             return
         if hello["type"] != "hello" or not protocol.token_matches(hello.get("token"), self._token):
@@ -121,16 +134,32 @@ class EnclosAdapter(BasePlatformAdapter):
         try:
             await self._write(protocol.hello("hermes", self._agent))
             for message in self._outbox.pending():
+                reason = protocol.unsendable(message)
+                if reason:
+                    # Sent again after every hello, it would be refused every time
+                    logger.warning("[%s] Outbox: %s cannot be sent (%s); it was set aside",
+                                   self.name, message.get("id"), reason)
+                    self._outbox.set_aside(str(message.get("id")))
+                    continue
                 await self._write(message)
-            while line := await reader.readline():
-                await self._on_line(line)
+            while True:
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # A line past the protocol's limit: no message of the
+                    # bridge's is, so the connection is not one to go on with
+                    logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
+                    await self._write(protocol.error("bad_message", "larger than 1 MiB", None))
+                    break
+                if not line or not await self._on_line(line):
+                    break
         except ConnectionError:
             pass
-        except ValueError:
-            # A line past the protocol's limit: no message of the bridge's
-            # is, so the connection is not one to go on with
-            logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
-            await self._write(protocol.error("bad_message", "larger than 1 MiB", None))
+        except Exception:
+            # The runtime did not take a message: the bridge, not acknowledged,
+            # sends it again on its next connection
+            logger.exception("[%s] A message could not be handed to the runtime; the connection was closed",
+                             self.name)
         finally:
             # Only the connection that holds the slot gives it back
             if self._bridge is writer:
@@ -150,12 +179,15 @@ class EnclosAdapter(BasePlatformAdapter):
             except ConnectionError:
                 return False
 
-    async def _on_line(self, line: bytes) -> None:
+    async def _on_line(self, line: bytes) -> bool:
+        """Acts on one line; False when the connection is to end."""
         try:
             message = protocol.decode_from_bridge(line)
         except protocol.DecodeError as e:
             await self._write(protocol.error(e.code, str(e), e.message_id))
-            return
+            # A version this plugin does not speak ends the connection
+            # (docs/protocol.md, Errors); any other bad message does not
+            return e.code != "version"
         kind = message["type"]
         if kind == "ack":
             self._outbox.acknowledge(message["of"])
@@ -163,23 +195,30 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._on_message(message)
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
+            of = message.get("of")
+            if message["code"] == "bad_message" and of and self._outbox.set_aside(of):
+                # The bridge cannot read it: sent again, it would be refused again
+                logger.warning("[%s] Outbox: %s was refused by the bridge; it was set aside", self.name, of)
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
+        return True
 
     async def _on_message(self, message: dict[str, Any]) -> None:
         if message["id"] in self._seen:
             # The runtime has it: the ack was lost on the way
             await self._write(protocol.ack(message["id"]))
             return
-        self._seen[message["id"]] = None
-        while len(self._seen) > SEEN_MESSAGES:
-            self._seen.popitem(last=False)
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])
         await self.handle_message(MessageEvent(
             text=message["text"], message_type=MessageType.TEXT, source=source, message_id=message["id"],
             raw_message=message, timestamp=datetime.now(tz=UTC)))
+        # Only once the runtime has it: if handle_message raised, the bridge
+        # sends it again and it must not read as a duplicate
+        self._seen[message["id"]] = None
+        while len(self._seen) > SEEN_MESSAGES:
+            self._seen.popitem(last=False)
         await self._write(protocol.ack(message["id"]))
 
     async def send(
@@ -187,6 +226,12 @@ class EnclosAdapter(BasePlatformAdapter):
         metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
         message = protocol.message_out(chat_id, content, reply_to)
+        reason = protocol.unsendable(message)
+        if reason:
+            # The bridge would refuse it, and kept, it would come first in
+            # the outbox after every hello
+            logger.warning("[%s] A message for %r was not sent: %s", self.name, chat_id, reason)
+            return SendResult(success=False, error=f"the enclos app cannot carry this message: {reason}")
         if not self._outbox.put(message):
             return SendResult(success=False, error="too many messages waiting for the bridge")
         await self._write(message)  # if it is not connected, it gets the message on its next hello
