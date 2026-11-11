@@ -12,6 +12,7 @@ this channel's own variable, which `enclos runtime configure` turns on.
 """
 
 import asyncio
+import collections
 import logging
 import os
 from datetime import UTC, datetime
@@ -29,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 PLATFORM = "enclos"
 HELLO_TIMEOUT_SECONDS = 10
+# The bridge sends a message again, with its id, until it has the ack: the
+# ids of the last ones the runtime had, to drop one that comes again
+SEEN_MESSAGES = 1024
 
 
 def _setting(config: Optional[PlatformConfig], key: str, env: str) -> str:
@@ -56,6 +60,7 @@ class EnclosAdapter(BasePlatformAdapter):
         self._server: Optional[asyncio.base_events.Server] = None
         self._bridge: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
+        self._seen: collections.OrderedDict[str, None] = collections.OrderedDict()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not (self._path and self._token):
@@ -65,7 +70,11 @@ class EnclosAdapter(BasePlatformAdapter):
             os.makedirs(os.path.dirname(self._path), mode=0o700, exist_ok=True)
             if os.path.exists(self._path):
                 os.unlink(self._path)
-            self._server = await asyncio.start_unix_server(self._on_connection, path=self._path)
+            # A line may hold a whole protocol message and its line break;
+            # asyncio's default limit (64 KiB) would end the connection on
+            # an ordinary long message
+            self._server = await asyncio.start_unix_server(
+                self._on_connection, path=self._path, limit=protocol.MAX_MESSAGE_BYTES + 1)
             os.chmod(self._path, 0o600)
         except OSError as e:
             logger.error("[%s] Cannot listen on %s: %s", self.name, self._path, e)
@@ -101,6 +110,12 @@ class EnclosAdapter(BasePlatformAdapter):
             logger.warning("[%s] A connection without the agent's token was closed", self.name)
             writer.close()
             return
+        # Checked again once the hello is in: two connections may both have
+        # passed the first check while waiting for theirs. Nothing awaits
+        # between this check and taking the slot, so only one takes it.
+        if self._bridge is not None:
+            writer.close()
+            return
         self._bridge = writer
         logger.info("[%s] Bridge connected", self.name)
         try:
@@ -111,8 +126,15 @@ class EnclosAdapter(BasePlatformAdapter):
                 await self._on_line(line)
         except ConnectionError:
             pass
+        except ValueError:
+            # A line past the protocol's limit: no message of the bridge's
+            # is, so the connection is not one to go on with
+            logger.warning("[%s] The bridge sent a line over 1 MiB; the connection was closed", self.name)
+            await self._write(protocol.error("bad_message", "larger than 1 MiB", None))
         finally:
-            self._bridge = None
+            # Only the connection that holds the slot gives it back
+            if self._bridge is writer:
+                self._bridge = None
             writer.close()
             logger.info("[%s] Bridge disconnected", self.name)
 
@@ -145,6 +167,13 @@ class EnclosAdapter(BasePlatformAdapter):
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
+        if message["id"] in self._seen:
+            # The runtime has it: the ack was lost on the way
+            await self._write(protocol.ack(message["id"]))
+            return
+        self._seen[message["id"]] = None
+        while len(self._seen) > SEEN_MESSAGES:
+            self._seen.popitem(last=False)
         source = self.build_source(
             chat_id=message["conversation"], chat_name=message["conversation"], chat_type="dm",
             user_id=message["person"], user_name=message["person"], message_id=message["id"])

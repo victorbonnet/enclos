@@ -14,6 +14,10 @@ use super::ids::new_id;
 
 /// How long the plugin has to answer the bridge's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a write to the plugin may wait for it to read: the socket is
+/// in the sandbox home, and an agent that never reads must not hold the
+/// bridge.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -64,6 +68,7 @@ pub fn connect(
         path: socket.display().to_string(),
         source,
     })?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let mut writer = PluginWriter {
         stream: stream.try_clone()?,
     };
@@ -116,9 +121,16 @@ impl PluginWriter {
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        self.stream
-            .write_all(&encode_line(&Envelope::new(id.clone(), body)))?;
+        self.send_as(id.clone(), body)?;
         Ok(id)
+    }
+
+    /// Sends `body` with `id`: the same on every try of one message, so the
+    /// plugin knows a message it has had already.
+    pub fn send_as(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+        self.stream
+            .write_all(&encode_line(&Envelope::new(id, body)))?;
+        Ok(())
     }
 
     /// A person's message to the agent, in `conversation`.
@@ -139,6 +151,14 @@ impl PluginWriter {
     /// drop from its outbox.
     pub fn ack(&mut self, of: &MessageId) -> Result<MessageId, PluginError> {
         self.send(FromBridge::Ack { of: of.clone() })
+    }
+
+    /// Ends the connection both ways, for every reader and writer cloned
+    /// from it: dropping one writer closes only its own descriptor, while
+    /// the others keep the connection, and the plugin, waiting.
+    pub fn shutdown(&self) {
+        // Already closed by the plugin is as good as closed here.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -260,6 +280,32 @@ mod tests {
         drop(writer);
         drop(reader);
         plugin.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_ends_the_connection_for_every_clone_of_it() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let plugin = echo_plugin(UnixListener::bind(&socket).unwrap(), "t0ken");
+        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        // A clone keeps the descriptor open, as the reading thread's
+        // acknowledgements do in `enclos app chat`
+        let clone = writer.try_clone().unwrap();
+        let (done, waited) = std::sync::mpsc::channel();
+        let reading = std::thread::spawn(move || {
+            let end = reader.receive().unwrap();
+            done.send(end.is_none()).unwrap();
+        });
+        writer.shutdown();
+        drop(writer);
+        let ended = waited
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader still waits for the plugin");
+        assert!(ended);
+        reading.join().unwrap();
+        // The plugin saw the end too, and stopped
+        plugin.join().unwrap();
+        drop(clone);
     }
 
     #[test]
