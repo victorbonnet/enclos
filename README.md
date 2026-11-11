@@ -99,7 +99,7 @@ enclos init
 enclos sandbox create lab --template assistant   # the public web; minimal for only Hermes's hosts
 enclos runtime install hermes --sandbox lab    # Hermes's own installer, inside the sandbox
 enclos connect lab -- hermes -p default setup  # Hermes's own setup: your provider, its login, a model
-enclos agent add lab/main
+enclos --yes agent add lab/main               # restarts the gateway the setup started, so it serves the agent
 enclos policy test lab                         # escape probes; every one must fail
 enclos sandbox start lab                       # proxy and gateway in the background
 enclos connect lab -- main                     # talk to the agent, with Hermes's own command
