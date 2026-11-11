@@ -88,7 +88,7 @@ use crate::model::policy::{PolicySnapshot, PolicyVersion};
 use crate::model::sandbox::{BackendKind, SandboxName};
 use crate::model::session::SessionRecord;
 use crate::state::sqlite::SqliteStateStore;
-use crate::state::{Migration, StateLock, StateStore};
+use crate::state::{Migration, StateLock, StateStore, Wait};
 
 pub struct Engine {
     layout: Layout,
@@ -182,9 +182,11 @@ impl InitReport {
 }
 
 impl Engine {
-    /// The engine with the real implementations, listed here explicitly.
-    pub fn open(layout: Layout) -> Engine {
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    /// The engine with the real implementations, listed here explicitly,
+    /// whose writes to the state database wait for another's as `wait`
+    /// says: whether a person waits on this program.
+    pub fn open(layout: Layout, wait: Wait) -> Engine {
+        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock(), wait);
         let audit = JsonlAuditLog::new(layout.audit_log());
         let services = crate::service::host(&layout);
         let secrets: Box<dyn crate::secrets::Stores> = match layout.install_id() {

@@ -72,7 +72,7 @@ pub(super) fn while_waiting<T>(
     let (held, wait) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            let other = Engine::open(layout);
+            let other = Engine::open(layout, crate::state::Wait::Command);
             let lock = other.state.lock().unwrap();
             held.send(()).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -294,6 +294,7 @@ pub(super) fn with_backends(engine: &Engine, backends: Vec<Box<dyn Backend>>) ->
         Box::new(SqliteStateStore::new(
             layout.state_db(),
             layout.state_lock(),
+            crate::state::Wait::Command,
         )),
         Box::new(JsonlAuditLog::new(layout.audit_log())),
         backends,

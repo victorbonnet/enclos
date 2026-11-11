@@ -968,7 +968,11 @@ fn a_removal_whose_lock_then_times_out_leaves_the_entry_naming_it() {
 
     // Another command takes the lock while the services are removed,
     // and keeps it past the wait.
-    let other = SqliteStateStore::new(engine.layout.state_db(), engine.layout.state_lock());
+    let other = SqliteStateStore::new(
+        engine.layout.state_db(),
+        engine.layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let held = Rc::new(RefCell::new(None));
     let holder = Rc::clone(&held);
     *fake.on_stop.borrow_mut() = Some(Box::new(move |_: &ServiceLabel| {
@@ -1124,7 +1128,11 @@ fn every_spelling_of_the_enclos_folder_names_the_same_services() {
     std::os::unix::fs::symlink(dir.path().join("enclos"), &link).unwrap();
     let other = |alias: PathBuf| {
         let layout = Layout::at(alias);
-        let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+        let state = SqliteStateStore::new(
+            layout.state_db(),
+            layout.state_lock(),
+            crate::state::Wait::Command,
+        );
         let audit = JsonlAuditLog::new(layout.audit_log());
         Engine::new(layout, Box::new(state), Box::new(audit), Vec::new())
             .with_services(Box::new(Rc::clone(&fake)))

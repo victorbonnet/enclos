@@ -408,7 +408,11 @@ fn behind_a_link_on(kind: BackendKind) -> (TempDir, Engine, SandboxName, PathBuf
     std::fs::create_dir(base.join("real")).unwrap();
     std::os::unix::fs::symlink(base.join("real"), base.join("e")).unwrap();
     let layout = Layout::at(base.join("e"));
-    let state = SqliteStateStore::new(layout.state_db(), layout.state_lock());
+    let state = SqliteStateStore::new(
+        layout.state_db(),
+        layout.state_lock(),
+        crate::state::Wait::Command,
+    );
     let audit = JsonlAuditLog::new(layout.audit_log());
     let backend = FakeBackend::available(kind);
     let engine = Engine::new(
