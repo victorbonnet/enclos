@@ -16,7 +16,7 @@ The words used here:
 
 ## Linux requirements
 
-enclos's Linux support is in development and is not in a release yet. Once a release has Linux archives, the installer below installs them on Linux on x86_64 or arm64 (aarch64), as on a Mac; until then, build from a clone. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
+The installer below installs enclos on Linux on x86_64 or arm64 (aarch64), as on a Mac, from 0.3.0 on. It needs systemd 254 or later. Debian 12 ships 252, so it does not work there: Debian 13 or Ubuntu 24.04 work. On a host with an older systemd, or one whose version cannot be read, enclos refuses to start a session and starts no program. `enclos doctor` shows the version it found, and reports it as a failure when it is too old.
 
 A Linux sandbox uses the bubblewrap backend, which needs the `bubblewrap` package (`sudo apt install bubblewrap`), 0.9.0 or later, and user namespaces. Create it with `--backend bubblewrap`: the default stays `seatbelt`, which runs only on macOS.
 
