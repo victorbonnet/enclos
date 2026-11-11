@@ -34,7 +34,7 @@
         <li><strong>The runtime’s needs:</strong> the hosts it lists for its install, login and model calls.</li>
         <li><strong>Your <code>policy.toml</code>:</strong> what you add.</li>
       </ol>
-      <p>A list written <code>write_add</code> adds to the layers below, and one written <code>write</code> replaces them. Unknown keys are errors, so a misspelling cannot pass unnoticed.</p>
+      <p>A list written <code>write_add</code> adds to the layers below, one written <code>write_remove</code> takes out of them only the entries it names, and one written <code>write</code> replaces them. In one file the replacement comes first, then the removals, then the additions. The runtime’s layer only adds. Unknown keys are errors, so a misspelling cannot pass unnoticed.</p>
 
       <h2>2. The policy is checked and stored</h2>
       <p>enclos checks the result before keeping it. It refuses what it will not grant, such as dropping an entry from the sensitive list, writing to enclos’s own folders, or allowing <code>localhost</code>. It rejects what it cannot read, such as a malformed address.</p>
@@ -131,8 +131,10 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
         <tbody>
           <tr><td><code>write</code></td><td>paths</td><td>Replaces the folders the sandbox may write. Its home stays writable either way.</td></tr>
           <tr><td><code>write_add</code></td><td>paths</td><td>Adds folders. Each must exist before the sandbox uses it. enclos’s own folders and folders inside the home are refused.</td></tr>
+          <tr><td><code>write_remove</code></td><td>paths</td><td>Takes out folders the layers below set, only those named; a name not there changes nothing. The home stays writable.</td></tr>
           <tr><td><code>read_deny</code></td><td>paths</td><td>Replaces the sensitive list, and must keep every built-in entry, so use <code>read_deny_add</code>.</td></tr>
           <tr><td><code>read_deny_add</code></td><td>paths</td><td>Adds paths the sandbox may neither read nor write.</td></tr>
+          <tr><td><code>read_deny_remove</code></td><td>paths</td><td>Takes out paths the template set. A built-in entry cannot be taken out: the policy is refused.</td></tr>
         </tbody>
       </table></div>
       <p>There is no <code>read</code> list and no <code>write_deny</code>. Reads are open except <code>read_deny</code>, since agents and the tools they install read paths nobody can list upfront. Writes are closed except <code>write</code>, so there is nothing to deny, and a <code>read_deny</code> path refuses writes too.</p>
@@ -145,8 +147,10 @@ env_add = { TELEGRAM_BOT_TOKEN = "secret:lab/main-telegram" }</code></pre></div>
           <tr><td><code>mode</code></td><td><code>public</code>, <code>allowlist</code></td><td><code>public</code> reaches any public address on ports 80 and 443, as well as what is listed. <code>allowlist</code> reaches only what is listed. <code>assistant</code> starts <code>public</code>, <code>minimal</code> <code>allowlist</code>.</td></tr>
           <tr><td><code>allow</code></td><td>destinations</td><td>Replaces the list, the runtime’s own hosts too, so its login and model calls may stop working. Prefer <code>allow_add</code>.</td></tr>
           <tr><td><code>allow_add</code></td><td>destinations</td><td>Adds destinations, as <code>enclos policy allow</code> does.</td></tr>
+          <tr><td><code>allow_remove</code></td><td>destinations</td><td>Takes out destinations the layers below set, only those named, and leaves the others, the runtime’s own hosts included.</td></tr>
           <tr><td><code>private</code></td><td>hosts</td><td>Replaces the hosts that may resolve to private addresses. Each must also be allowed.</td></tr>
           <tr><td><code>private_add</code></td><td>hosts</td><td>Adds to that list.</td></tr>
+          <tr><td><code>private_remove</code></td><td>hosts</td><td>Takes hosts out of that list.</td></tr>
           <tr><td><code>log</code></td><td><code>metadata</code></td><td>The only value: host, port, address, verdict, bytes and duration, never contents.</td></tr>
           <tr><td><code>listen</code></td><td><code>true</code>, <code>false</code></td><td>Whether the sandbox may listen on TCP. Off by default, and Hermes turns it on. Leave it unset: its gateway exits if it cannot listen.</td></tr>
         </tbody>

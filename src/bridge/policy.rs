@@ -4,6 +4,35 @@ use crate::engine::Engine;
 use crate::model::{audit::Actor, sandbox::SandboxName};
 use enclos_protocol::policy::{PolicyApply, PolicyState};
 
+/// Whether policy entry `value` of list `field` is what an approved
+/// `access` wrote: the request's target as the engine stored it, a
+/// destination normalized (`API.example.com:443` is `api.example.com`) and a
+/// writable path with its symlinks resolved.
+pub(super) fn accepted_entry(
+    field: &str,
+    value: &str,
+    access: &enclos_protocol::approval::Access,
+) -> bool {
+    use crate::net::host::AllowEntry;
+    use enclos_protocol::approval::AccessKind;
+    match (field, &access.kind) {
+        ("allow", AccessKind::Network) => {
+            AllowEntry::parse(&access.target).is_ok_and(|e| e.to_string() == value)
+        }
+        ("private", AccessKind::Network) if access.private => {
+            AllowEntry::parse(&access.target).is_ok_and(|e| e.host_text() == value)
+        }
+        ("write", AccessKind::Write) => {
+            access.target == value
+                || crate::policy::paths::real_path(std::path::Path::new(&access.target))
+                    .display()
+                    .to_string()
+                    == value
+        }
+        _ => false,
+    }
+}
+
 impl Hub {
     pub(super) fn policy_authority(
         &self,
@@ -44,19 +73,8 @@ impl Hub {
         for field in &mut state.fields {
             for value in &mut field.values {
                 let matches = accepted.iter().any(|a| {
-                    if a.sandbox != name.as_str() {
-                        return false;
-                    }
-                    use enclos_protocol::approval::AccessKind;
-                    match (field.key.as_str(), &a.access.kind) {
-                        ("allow", AccessKind::Network) => a.access.target == value.value,
-                        ("write", AccessKind::Write) => a.access.target == value.value,
-                        ("private", AccessKind::Network) if a.access.private => {
-                            crate::net::host::AllowEntry::parse(&a.access.target)
-                                .is_ok_and(|e| e.host_text() == value.value)
-                        }
-                        _ => false,
-                    }
+                    a.sandbox == name.as_str()
+                        && accepted_entry(&field.key, &value.value, &a.access)
                 });
                 if matches {
                     value.source = "Accepted access".into();

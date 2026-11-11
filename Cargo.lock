@@ -587,6 +587,7 @@ dependencies = [
  "image",
  "jiff",
  "landlock",
+ "p256",
  "psl",
  "qrcode",
  "rusqlite",
