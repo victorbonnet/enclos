@@ -1253,6 +1253,7 @@ fn run_session(
                 let agents = hub
                     .agents
                     .iter()
+                    .filter(|a| hub.can_see_agent(person, &a.name))
                     .map(|a| AgentInfo {
                         display_name: names.get(&a.name).and_then(|n| n.display_name.clone()),
                         name_revision: names.get(&a.name).map(|n| n.revision).unwrap_or(0),

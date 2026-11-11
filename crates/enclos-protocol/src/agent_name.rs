@@ -6,14 +6,14 @@ pub const MAX_NAME_BYTES: usize = 400;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameMetadata {
-    pub revision: i64,
+    pub revision: u64,
     pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentName {
     pub agent: String,
-    pub revision: i64,
+    pub revision: u64,
     pub display_name: Option<String>,
     pub of: String,
 }
@@ -21,7 +21,7 @@ pub struct AgentName {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameSet {
     pub agent: String,
-    pub revision: i64,
+    pub revision: u64,
     /// Required, but explicitly null restores the agent's stable identifier.
     #[serde(deserialize_with = "required_name")]
     pub display_name: Option<String>,
@@ -37,11 +37,15 @@ pub fn normalize(value: Option<&str>) -> Result<Option<String>, String> {
         return Ok(None);
     };
     // Check before trimming so a newline is not silently accepted at an edge.
-    if value
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    // A bidirectional override or a zero-width character would let a name
+    // read as another agent's (`"\u{202E}niam"` shows as "main").
+    if crate::visible::has_hidden(value, false)
+        || value.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}'))
     {
-        return Err("An agent name cannot contain control characters or line breaks.".into());
+        return Err(
+            "An agent name cannot contain control characters, invisible characters or line breaks."
+                .into(),
+        );
     }
     let value = value.trim();
     if value.is_empty() {
@@ -113,6 +117,11 @@ mod tests {
             "a\u{2028}b".into(),
             "a\u{2029}b".into(),
             "a\0b".into(),
+            "\u{202E}niam".into(),
+            "main\u{2066}".into(),
+            "ma\u{200B}in".into(),
+            "\u{FEFF}main".into(),
+            "ma\u{00AD}in".into(),
             "x".repeat(101),
             "🦀".repeat(101),
         ] {

@@ -276,6 +276,12 @@ pub struct PairingRequest {
     pub person: String,
 }
 
+/// A stored name revision, which the table keeps nonnegative.
+fn name_revision(row: &rusqlite::Row, column: usize) -> rusqlite::Result<u64> {
+    let revision: i64 = row.get(column)?;
+    u64::try_from(revision).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, revision))
+}
+
 impl Store {
     /// The host's shared display name, or the stable identifier at revision zero.
     pub fn agent_name(
@@ -287,12 +293,8 @@ impl Store {
                 "SELECT revision,display_name FROM agent_names WHERE agent=?1",
                 [agent],
                 |row| {
-                    let revision: i64 = row.get(0)?;
-                    if revision < 0 {
-                        return Err(rusqlite::Error::InvalidQuery);
-                    }
                     Ok(enclos_protocol::agent_name::NameMetadata {
-                        revision,
+                        revision: name_revision(row, 0)?,
                         display_name: row.get(1)?,
                     })
                 },
@@ -311,14 +313,10 @@ impl Store {
             .prepare("SELECT agent,revision,display_name FROM agent_names")?;
         query
             .query_map([], |row| {
-                let revision: i64 = row.get(1)?;
-                if revision < 0 {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
                 Ok((
                     row.get(0)?,
                     enclos_protocol::agent_name::NameMetadata {
-                        revision,
+                        revision: name_revision(row, 1)?,
                         display_name: row.get(2)?,
                     },
                 ))
@@ -330,13 +328,10 @@ impl Store {
     pub fn set_agent_name(
         &self,
         agent: &str,
-        expected: i64,
+        expected: u64,
         display_name: Option<&str>,
         by: (&str, &str),
     ) -> rusqlite::Result<Option<enclos_protocol::agent_name::NameMetadata>> {
-        if expected < 0 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
@@ -347,7 +342,7 @@ impl Store {
                 [agent],
                 |row| {
                     Ok(enclos_protocol::agent_name::NameMetadata {
-                        revision: row.get(0)?,
+                        revision: name_revision(row, 0)?,
                         display_name: row.get(1)?,
                     })
                 },
@@ -360,14 +355,17 @@ impl Store {
         if current.display_name.as_deref() == display_name {
             return Ok(Some(current));
         }
+        // SQLite's integers end at i64::MAX: the revision after it is refused.
+        let stored = current
+            .revision
+            .checked_add(1)
+            .and_then(|r| i64::try_from(r).ok())
+            .ok_or(rusqlite::Error::InvalidQuery)?;
         let next = enclos_protocol::agent_name::NameMetadata {
-            revision: current
-                .revision
-                .checked_add(1)
-                .ok_or(rusqlite::Error::InvalidQuery)?,
+            revision: current.revision + 1,
             display_name: display_name.map(str::to_owned),
         };
-        tx.execute("INSERT INTO agent_names (agent,revision,display_name) VALUES (?1,?2,?3) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,display_name=excluded.display_name", params![agent,next.revision,next.display_name])?;
+        tx.execute("INSERT INTO agent_names (agent,revision,display_name) VALUES (?1,?2,?3) ON CONFLICT(agent) DO UPDATE SET revision=excluded.revision,display_name=excluded.display_name", params![agent,stored,next.display_name])?;
         tx.execute(
             "INSERT INTO log(at,device,person,event,reason) VALUES (?1,?2,?3,'agent.name.set',?4)",
             params![

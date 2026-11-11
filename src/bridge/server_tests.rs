@@ -761,11 +761,16 @@ fn shared_name_revisions_never_overflow_or_accept_noninteger_values() {
     .unwrap();
     assert!(
         store
-            .set_agent_name("lab/main", i64::MAX, Some("Overflow"), ("phone", "owner"))
+            .set_agent_name(
+                "lab/main",
+                i64::MAX as u64,
+                Some("Overflow"),
+                ("phone", "owner")
+            )
             .is_err()
     );
     let kept = store.agent_name("lab/main").unwrap();
-    assert_eq!(kept.revision, i64::MAX);
+    assert_eq!(kept.revision, i64::MAX as u64);
     assert_eq!(kept.display_name.as_deref(), Some("Original"));
     assert_eq!(
         store
@@ -831,7 +836,7 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
             can_edit_avatar: true,
             can_edit_name: true,
             display_name: (i > 1).then(|| "🦀".repeat(100)),
-            name_revision: i64::from(i),
+            name_revision: u64::try_from(i).unwrap(),
         })
         .collect();
     let raw = serde_json::to_vec(&enclos_protocol::Envelope::new(
@@ -935,6 +940,21 @@ fn large_agent_names_use_bounded_noise_frames_without_losing_inventory_or_tombst
 }
 
 #[test]
+fn who_sees_an_agent_is_one_rule_for_its_list_its_name_and_its_name_changes() {
+    let (dir, mut hub, _store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/main".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("not-connected.sock"),
+        token: "fixture".into(),
+    });
+    for person in ["owner@example.com", "guest@example.com"] {
+        assert!(hub.can_see_agent(person, "lab/main"), "{person}");
+        assert!(!hub.can_see_agent(person, "lab/unlisted"), "{person}");
+    }
+}
+
+#[test]
 fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices() {
     use enclos_protocol::agent_name::NameSet;
     use enclos_protocol::plugin::ErrorCode;
@@ -1029,15 +1049,26 @@ fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices()
             ErrorCode::BadMessage
         );
     }
-    let negative = NameSet {
-        revision: -1,
-        ..edit.clone()
-    };
-    assert_eq!(
-        hub.set_agent_name(&store, &owner, &owner.person, &negative, "bad".into())
-            .unwrap_err()
-            .code,
-        ErrorCode::BadMessage
+    for hidden in ["\u{202E}niam", "Gégé\u{200B}", "\u{2066}Gégé"] {
+        let invalid = NameSet {
+            revision: 1,
+            display_name: Some(hidden.into()),
+            ..edit.clone()
+        };
+        assert_eq!(
+            hub.set_agent_name(&store, &owner, &owner.person, &invalid, "hidden".into())
+                .unwrap_err()
+                .code,
+            ErrorCode::BadMessage,
+            "{hidden:?}"
+        );
+    }
+    // A negative revision is not a revision: it does not decode.
+    assert!(
+        enclos_protocol::device::decode_from_device(
+            br#"{"v":1,"id":"m1","type":"agent.name.set","agent":"lab/comptoir-dev","revision":-1,"display_name":"x"}"#
+        )
+        .is_err()
     );
     assert_eq!(store.agent_name("lab/comptoir-dev").unwrap().revision, 1);
     assert_eq!(
@@ -1045,9 +1076,25 @@ fn name_changes_are_owner_only_validated_and_published_to_still_paired_devices()
         None,
         "equal handles on other sandboxes retain their names"
     );
+    // Another listed agent's handle would pass this agent off as that one.
+    for taken in ["Geg", "geg", "@GEG"] {
+        let collision = NameSet {
+            revision: 1,
+            display_name: Some(taken.into()),
+            ..edit.clone()
+        };
+        assert_eq!(
+            hub.set_agent_name(&store, &owner, &owner.person, &collision, "taken".into())
+                .unwrap_err()
+                .code,
+            ErrorCode::BadMessage,
+            "{taken}"
+        );
+    }
+    assert!(r1.try_recv().is_err());
     let same_handle = NameSet {
         revision: 1,
-        display_name: Some("Geg".into()),
+        display_name: Some("Gégé".into()),
         ..edit.clone()
     };
     hub.set_agent_name(
