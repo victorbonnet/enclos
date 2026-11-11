@@ -1206,6 +1206,33 @@ fn off_macos_a_sandbox_is_made_on_bubblewrap_unless_another_is_named() {
     assert!(!home.run(&["sandbox", "list"]).ok().stdout().contains("lab"));
 }
 
+/// Off macOS, `sandbox create --template autonomous` takes bubblewrap, which
+/// does not build the template yet: the create is refused, by the policy's
+/// grant of the whole filesystem, or by the backend's probe where bubblewrap
+/// cannot run here, and no sandbox is made (ADR 0058).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_autonomous_sandbox_is_refused() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    assert_eq!(out.code(), 2, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("is not built on the bubblewrap backend yet")
+            || out.stderr().contains("uses the bubblewrap backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        !home
+            .run(&["sandbox", "list"])
+            .ok()
+            .stdout()
+            .contains("keeper")
+    );
+}
+
 /// The backend this system does not run.
 #[cfg(target_os = "macos")]
 const OTHER_BACKEND: &str = "bubblewrap";
