@@ -380,6 +380,7 @@ fn approval_an_agent_asking_again_for_a_decided_scope_is_told_so() {
     hub.request_access(&store, "lab/main", None, access.clone(), "")
         .unwrap();
     let mut a = store.approvals().unwrap().remove(0);
+    assert!(store.claim_approval(&a.request).unwrap());
     a.state = "denied".into();
     store.put_approval(&a).unwrap();
     let told = hub
