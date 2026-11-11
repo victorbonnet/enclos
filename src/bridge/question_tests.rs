@@ -542,6 +542,7 @@ fn reconnect_reconciles_only_this_agents_pending_questions_in_bounded_batches() 
                 &ConversationId::new("owned").unwrap(),
                 &definition,
                 &format!("ask-{index}"),
+                Some(OWNER),
             )
             .unwrap();
     }
@@ -552,6 +553,7 @@ fn reconnect_reconciles_only_this_agents_pending_questions_in_bounded_batches() 
             &ConversationId::new("other-agent").unwrap(),
             &other,
             "other-ask",
+            Some(OWNER),
         )
         .unwrap();
     let mut native = native(&hub, vec![Capability::Questions]);
@@ -650,6 +652,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
             &ConversationId::new("owned").unwrap(),
             &definition,
             "introduction",
+            Some(OWNER),
         )
         .unwrap()
         .message
@@ -661,6 +664,7 @@ fn encrypted_device_sync_refreshes_pending_past_since_and_joins_current_terminal
             &ConversationId::new("foreign").unwrap(),
             &super::tests::definition("foreign-question"),
             "foreign-introduction",
+            Some(OWNER),
         )
         .unwrap();
     let bridge_key = generate_keypair().unwrap();
@@ -778,6 +782,11 @@ fn approval_definition(id: &str, smart_denied: bool) -> QuestionDefinition {
                 vec![Action::Once, Action::Session, Action::Always, Action::Deny]
             },
             smart_denied,
+            patterns: if smart_denied {
+                vec![]
+            } else {
+                vec!["package install scripts".into()]
+            },
         }),
     }
 }
@@ -879,6 +888,7 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
             &ConversationId::new("owned").unwrap(),
             &owned,
             "owned-intro",
+            Some(OWNER),
         )
         .unwrap();
     store
@@ -887,6 +897,7 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
             &ConversationId::new("foreign").unwrap(),
             &foreign,
             "foreign-intro",
+            Some(OWNER),
         )
         .unwrap();
     let (guest, _guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
@@ -916,6 +927,7 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
             &ConversationId::new("foreign").unwrap(),
             &ordinary,
             "ordinary-intro",
+            Some(OWNER),
         )
         .unwrap();
     hub.question_answer(
@@ -941,6 +953,7 @@ fn runtime_approval_decisions_require_known_host_person_and_current_conversation
                 &ConversationId::new("owned").unwrap(),
                 &definition,
                 "approval-intro",
+                Some(OWNER),
             )
             .unwrap();
         assert_eq!(
@@ -1059,6 +1072,7 @@ fn questions_capability_does_not_authorize_runtime_approval_controls_or_introduc
             &ConversationId::new("owned").unwrap(),
             &definition,
             "saved-intro",
+            Some(OWNER),
         )
         .unwrap();
     let error = hub
@@ -1267,4 +1281,228 @@ fn newline_heavy_command_is_preserved_in_bounded_native_and_legacy_history_frame
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].kind, "runtime_approval");
     assert!(history[0].text.contains(&command));
+}
+
+#[test]
+fn typed_approval_commands_are_read_as_the_runtime_reads_them() {
+    for text in [
+        "/approve",
+        "  /approve always",
+        "/APPROVE session",
+        "/approve@enclos_bot all",
+        "/deny",
+        "/Deny because no",
+        "@file:/tmp/x.txt\n/approve always",
+        "@IMAGE:/tmp/a.png\n@url:https://example.com\n  /deny all",
+        "\n\t/approve",
+    ] {
+        assert!(super::typed_approval(text), "{text:?}");
+    }
+    for text in [
+        "approve",
+        "please /approve",
+        "/approved",
+        "/approve/x",
+        "/denyall",
+        "",
+        "   ",
+        "\u{200B}/approve",
+        "/sethome",
+    ] {
+        assert!(!super::typed_approval(text), "{text:?}");
+    }
+}
+
+type DeviceSend = Box<dyn FnMut(&str, FromDevice) -> Option<ToDevice>>;
+
+/// An encrypted device session with the bridge, run on a thread: `send`
+/// returns the bridge's next message, if one comes in half a second.
+fn device_session(
+    hub: &Arc<Hub>,
+    device: Device,
+    person: &'static str,
+    rx: Receiver<ToDevice>,
+) -> (DeviceSend, std::thread::JoinHandle<Result<(), String>>) {
+    use enclos_protocol::device::decode_to_device;
+    use enclos_protocol::noise::{Initiator, Responder, generate_keypair};
+    let bridge_key = generate_keypair().unwrap();
+    let device_key = generate_keypair().unwrap();
+    let mut initiator = Initiator::new(&device_key.private, &bridge_key.public).unwrap();
+    let mut responder = Responder::new(&bridge_key.private).unwrap();
+    responder.read_hello(&initiator.hello().unwrap()).unwrap();
+    let (answer, bridge_session) = responder.answer().unwrap();
+    let mut device_noise = initiator.finish(&answer).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_hub = Arc::clone(hub);
+    let thread = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let socket = tungstenite::accept(stream).unwrap();
+        let mut link = Link {
+            socket,
+            session: bridge_session,
+        };
+        let store = server_hub.store().unwrap();
+        run_session(&server_hub, &store, &mut link, &device, person, &rx)
+    });
+    let stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let (mut socket, _) = tungstenite::client(format!("ws://{address}"), stream).unwrap();
+    let send = move |id: &str, body: FromDevice| {
+        let message = encode_line(&Envelope::new(MessageId::new(id).unwrap(), body));
+        socket
+            .send(Message::Binary(
+                device_noise.encrypt(&message).unwrap().into(),
+            ))
+            .unwrap();
+        match socket.read() {
+            Ok(Message::Binary(encoded)) => Some(
+                decode_to_device(&device_noise.decrypt(&encoded).unwrap())
+                    .unwrap()
+                    .body,
+            ),
+            _ => None,
+        }
+    };
+    (Box::new(send), thread)
+}
+
+#[test]
+fn only_the_hosts_person_can_type_a_runtime_approval() {
+    let (_dir, hub, store, device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let (guest, guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
+    let (mut guest_send, _guest) = device_session(&hub, guest, "guest@example.com", guest_rx);
+    for (index, text) in ["/approve always", "@file:/tmp/x\n/DENY all"]
+        .into_iter()
+        .enumerate()
+    {
+        let id = format!("typed-{index}");
+        let reply = guest_send(
+            &id,
+            FromDevice::MessageSend {
+                conversation: ConversationId::new("foreign").unwrap(),
+                text: text.into(),
+            },
+        );
+        assert!(
+            matches!(&reply, Some(ToDevice::Error(error)) if error.code == ErrorCode::NotAllowed
+                && error.of.as_ref().map(MessageId::as_str) == Some(id.as_str())),
+            "{reply:?}"
+        );
+    }
+    assert!(
+        store.since("guest@example.com", 0).unwrap().is_empty(),
+        "a refused approval is neither stored nor relayed"
+    );
+    // The guest's ordinary message still reaches the runtime, and nothing before it did.
+    guest_send(
+        "hello",
+        FromDevice::MessageSend {
+            conversation: ConversationId::new("foreign").unwrap(),
+            text: "hello".into(),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::MessageIn { text, person, .. } if text == "hello" && person.as_str() == "guest@example.com")
+    );
+    // The host's person's typed approval is passed on unchanged.
+    let (mut host_send, _host) = device_session(&hub, device, OWNER, rx);
+    host_send(
+        "host-approve",
+        FromDevice::MessageSend {
+            conversation: ConversationId::new("owned").unwrap(),
+            text: "/approve".into(),
+        },
+    );
+    assert!(
+        matches!(native.receive().body, FromBridge::MessageIn { text, .. } if text == "/approve")
+    );
+}
+
+#[test]
+fn an_unknown_host_passes_on_no_typed_runtime_approval() {
+    let (_dir, mut hub, _store, _device, _rx) = fixture();
+    assert!(!hub.refuses_typed_approval(OWNER, "/approve"));
+    assert!(hub.refuses_typed_approval("guest@example.com", "/approve"));
+    assert!(!hub.refuses_typed_approval("guest@example.com", "approve this plan"));
+    Arc::get_mut(&mut hub).unwrap().host = None;
+    assert!(hub.refuses_typed_approval(OWNER, "/deny"));
+}
+
+#[test]
+fn approval_history_names_typed_commands_only_in_the_hosts_conversations() {
+    let (_dir, hub, store, _device, _rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    for (conversation, owner, typed) in [
+        ("owned", OWNER, true),
+        ("foreign", "guest@example.com", false),
+    ] {
+        let definition = approval_definition(&format!("approval-{conversation}"), false);
+        native.send(
+            conversation,
+            FromPlugin::QuestionAsk {
+                conversation: ConversationId::new(conversation).unwrap(),
+                question: definition.clone(),
+            },
+        );
+        native.ack(conversation);
+        let text = store
+            .since(owner, 0)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.question.as_ref() == Some(&definition.id))
+            .unwrap()
+            .text;
+        assert_eq!(text.contains("/approve always"), typed, "{text}");
+        assert!(text.contains("npm install --ignore-scripts"));
+        assert!(text.contains("every command matching: package install scripts"));
+    }
+}
+
+#[test]
+fn a_guest_reads_an_approval_without_receiving_its_controls() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let (_guest, guest_rx) = phone(&hub, &store, "guest-phone", "guest@example.com");
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let definition = approval_definition("guest-approval", false);
+    native.send(
+        "guest-ask",
+        FromPlugin::QuestionAsk {
+            conversation: ConversationId::new("foreign").unwrap(),
+            question: definition.clone(),
+        },
+    );
+    native.ack("guest-ask");
+    let ToDevice::Message(message) = next(&guest_rx) else {
+        panic!("the guest gets the readable history, not the approval metadata")
+    };
+    assert_eq!(message.kind, "runtime_approval");
+    assert!(message.text.contains("Only the host's person"));
+    assert!(guest_rx.try_recv().is_err());
+    assert!(
+        rx.try_recv().is_err(),
+        "the host does not own this conversation"
+    );
+    assert!(!hub.shows_question("guest@example.com", &definition));
+    assert!(hub.shows_question(OWNER, &definition));
+    assert!(hub.shows_question("guest@example.com", &super::tests::definition("ordinary")));
+}
+
+#[test]
+fn approval_history_reveals_hidden_characters_in_the_command() {
+    let (_dir, hub, store, _device, rx) = fixture();
+    let mut native = native(&hub, vec![Capability::RuntimeApprovals]);
+    let mut definition = approval_definition("hidden", false);
+    definition.approval.as_mut().unwrap().command = "ls #\u{202E}fr- mr".into();
+    ask(&mut native, &rx, &definition);
+    let text = &store.since(OWNER, 0).unwrap()[0].text;
+    assert!(text.contains("ls #⟨U+202E⟩fr- mr"), "{text}");
+    assert!(!text.contains('\u{202E}'));
+    assert!(text.contains("outside ASCII"));
 }

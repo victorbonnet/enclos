@@ -187,12 +187,17 @@ impl Store {
             .collect()
     }
 
+    /// Creates the question and its readable introduction. A runtime
+    /// approval's introduction lists typed commands only when `host`, the
+    /// host's person, owns the conversation: no one else's typed decision is
+    /// passed on to the runtime.
     pub fn ask_question(
         &self,
         origin: &str,
         conversation: &ConversationId,
         definition: &QuestionDefinition,
         message_id: &str,
+        host: Option<&str>,
     ) -> Result<QuestionChange, QuestionStoreError> {
         definition.validate().map_err(QuestionStoreError::Invalid)?;
         let kind = introduction_kind(definition);
@@ -237,7 +242,7 @@ impl Store {
             .map_err(|e| QuestionStoreError::Invalid(e.to_string()))?;
         tx.execute("INSERT INTO questions(id,conversation,agent,owner,definition,state,revision,answer,ask_message) VALUES (?1,?2,?3,?4,?5,'pending',0,NULL,?6)", params![definition.id.as_str(),conversation.as_str(),origin,owner,encoded,message_id])?;
         let speaker = is_member.then(|| origin.split_once('/').expect("an agent has a sandbox").1);
-        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",params![message_id,conversation.as_str(),definition.fallback_text(),kind,now(),speaker,definition.id.as_str()])?;
+        tx.execute("INSERT INTO messages(id,conversation,person,text,kind,at,speaker,question) VALUES (?1,?2,NULL,?3,?4,?5,?6,?7)",params![message_id,conversation.as_str(),definition.fallback_text(host == Some(owner.as_str())),kind,now(),speaker,definition.id.as_str()])?;
         let question =
             question_in(&tx, definition.id.as_str())?.ok_or(QuestionStoreError::Unknown)?;
         let message = history_message(&tx, definition.id.as_str(), kind)?;
@@ -346,17 +351,29 @@ mod tests {
         let (dir, store, conversation) = fixture();
         let definition = definition("q-1");
         let created = store
-            .ask_question("lab/coder", &conversation, &definition, "ask-1")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask-1",
+                Some("owner"),
+            )
             .unwrap();
         assert_eq!(created.question.info.state, QuestionState::Pending);
         assert_eq!(created.question.info.revision, 0);
         let first = created.message.unwrap();
         assert_eq!(first.kind, "question");
         assert_eq!(first.question, Some(definition.id.clone()));
-        assert_eq!(first.text, definition.fallback_text());
+        assert_eq!(first.text, definition.fallback_text(true));
         assert_eq!(
             store
-                .ask_question("lab/coder", &conversation, &definition, "ask-replayed")
+                .ask_question(
+                    "lab/coder",
+                    &conversation,
+                    &definition,
+                    "ask-replayed",
+                    Some("owner")
+                )
                 .unwrap()
                 .message
                 .unwrap()
@@ -436,17 +453,35 @@ mod tests {
             .unwrap();
         let definition = definition("q-1");
         assert!(matches!(
-            store.ask_question("lab/helper", &conversation, &definition, "foreign"),
+            store.ask_question(
+                "lab/helper",
+                &conversation,
+                &definition,
+                "foreign",
+                Some("owner")
+            ),
             Err(QuestionStoreError::Unknown)
         ));
         assert!(store.question(&definition.id).unwrap().is_none());
         store
-            .ask_question("lab/coder", &conversation, &definition, "ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
             .unwrap();
         let mut changed = definition.clone();
         changed.choices.reverse();
         assert!(matches!(
-            store.ask_question("lab/coder", &conversation, &changed, "changed"),
+            store.ask_question(
+                "lab/coder",
+                &conversation,
+                &changed,
+                "changed",
+                Some("owner")
+            ),
             Err(QuestionStoreError::Conflict)
         ));
         assert!(matches!(
@@ -462,7 +497,13 @@ mod tests {
         let group = ConversationId::new("group").unwrap();
         let definition = definition_with_id("group-q");
         let created = store
-            .ask_question("lab/helper", &group, &definition, "group-ask")
+            .ask_question(
+                "lab/helper",
+                &group,
+                &definition,
+                "group-ask",
+                Some("owner"),
+            )
             .unwrap();
         assert_eq!(created.message.unwrap().from, From::Member("helper".into()));
         assert!(matches!(
@@ -470,7 +511,8 @@ mod tests {
                 "other/helper",
                 &group,
                 &definition_with_id("outsider"),
-                "outside"
+                "outside",
+                Some("owner")
             ),
             Err(QuestionStoreError::Unknown)
         ));
@@ -479,7 +521,8 @@ mod tests {
                 "lab/missing",
                 &group,
                 &definition_with_id("nonmember"),
-                "nonmember"
+                "nonmember",
+                Some("owner")
             ),
             Err(QuestionStoreError::Unknown)
         ));
@@ -496,7 +539,7 @@ mod tests {
         let home = ConversationId::new(home_id("lab/coder")).unwrap();
         let definition = definition("home-question");
         store
-            .ask_question("lab/coder", &home, &definition, "home-ask")
+            .ask_question("lab/coder", &home, &definition, "home-ask", Some("owner"))
             .unwrap();
         assert!(store.pending_questions_for("owner").unwrap().is_empty());
         store.ensure_home("lab/coder", "owner").unwrap();
@@ -521,7 +564,13 @@ mod tests {
         let (_dir, store, conversation) = fixture();
         let definition = definition("q-1");
         store
-            .ask_question("lab/coder", &conversation, &definition, "ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
             .unwrap();
         assert!(
             store
@@ -595,6 +644,7 @@ mod runtime_approval_tests {
                 reason: "Install dependencies.".into(),
                 actions: vec![Action::Once, Action::Session, Action::Always, Action::Deny],
                 smart_denied: false,
+                patterns: vec!["package install scripts".into()],
             }),
         }
     }
@@ -630,12 +680,13 @@ mod runtime_approval_tests {
                     &conversation,
                     &definition,
                     &format!("ask-{index}"),
+                    Some("owner"),
                 )
                 .unwrap();
             assert_eq!(created.message.as_ref().unwrap().kind, "runtime_approval");
             assert_eq!(
                 created.message.as_ref().unwrap().text,
-                definition.fallback_text()
+                definition.fallback_text(true)
             );
             assert_eq!(
                 store
@@ -643,7 +694,8 @@ mod runtime_approval_tests {
                         "lab/coder",
                         &conversation,
                         &definition,
-                        &format!("replayed-{index}")
+                        &format!("replayed-{index}"),
+                        Some("owner")
                     )
                     .unwrap()
                     .message
@@ -697,7 +749,13 @@ mod runtime_approval_tests {
         let conversation = ConversationId::new("owned").unwrap();
         let definition = definition("approval");
         store
-            .ask_question("lab/coder", &conversation, &definition, "ask")
+            .ask_question(
+                "lab/coder",
+                &conversation,
+                &definition,
+                "ask",
+                Some("owner"),
+            )
             .unwrap();
         for answer in [
             QuestionAnswer::Text {

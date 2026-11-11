@@ -1487,9 +1487,11 @@ fn run_session(
                     .pending_questions_for(person)
                     .map_err(|e| e.to_string())?
                 {
-                    link.send(ToDevice::Question {
-                        question: question.info,
-                    })?;
+                    if hub.shows_question(person, &question.info.definition) {
+                        link.send(ToDevice::Question {
+                            question: question.info,
+                        })?;
+                    }
                 }
                 let mut last = since;
                 // Where each group's discussion is, before its messages.
@@ -1511,6 +1513,7 @@ fn run_session(
                         && let Some(current) =
                             store.question(question).map_err(|e| e.to_string())?
                         && current.owner == person
+                        && hub.shows_question(person, &current.info.definition)
                     {
                         link.send(ToDevice::Question {
                             question: current.info,
@@ -1839,6 +1842,17 @@ fn send(
         return Ok(());
     };
     if owner != person {
+        return Ok(());
+    }
+    // A runtime reads `/approve` and `/deny` as its own approval commands,
+    // from whoever it is told speaks; the bridge passes them on from the
+    // host's person only (ADR 0053), as it does the app's approval controls.
+    if hub.refuses_typed_approval(person, text) {
+        let _ = link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
+            of: Some(id),
+            code: enclos_protocol::plugin::ErrorCode::NotAllowed,
+            message: "Only the host's person can answer a runtime approval.".into(),
+        }));
         return Ok(());
     }
     if group_of(store, conversation.as_str()).is_some() {

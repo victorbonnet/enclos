@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::visible::{has_hidden, revealed};
 use crate::{ConversationId, QuestionId};
 
 pub const MAX_CHOICES: usize = 12;
@@ -53,6 +54,9 @@ impl RuntimeApprovalAction {
     }
 }
 
+/// At most this many runtime patterns name what a session or always grant covers.
+pub const MAX_APPROVAL_PATTERNS: usize = 16;
+
 /// Only the native runtime supplies the already-redacted display command and allowed scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeApprovalDefinition {
@@ -61,6 +65,11 @@ pub struct RuntimeApprovalDefinition {
     pub actions: Vec<RuntimeApprovalAction>,
     #[serde(default)]
     pub smart_denied: bool,
+    /// The runtime's own names of the patterns a session or always grant
+    /// covers: every command matching one, not only this one. Required when
+    /// either is offered, so the person sees how far the grant reaches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patterns: Vec<String>,
 }
 
 impl RuntimeApprovalDefinition {
@@ -68,6 +77,11 @@ impl RuntimeApprovalDefinition {
         use RuntimeApprovalAction::{Always, Deny, Once, Session};
         text(&self.command, "Display command")?;
         text(&self.reason, "Approval reason")?;
+        // The command is shown with its hidden characters written out; that
+        // longer form must still fit, or the runtime keeps its text fallback.
+        if revealed(&self.command).len() > MAX_QUESTION_BYTES {
+            return Err("The display command is too long to show in full.".into());
+        }
         if !self.actions.contains(&Deny)
             || (self.actions != [Deny] && !self.actions.contains(&Once))
             || self.actions.windows(2).any(|pair| pair[0] >= pair[1])
@@ -76,7 +90,39 @@ impl RuntimeApprovalDefinition {
         {
             return Err("Runtime approval actions must be ordered, distinct and permitted by the native gate.".into());
         }
+        if self.patterns.len() > MAX_APPROVAL_PATTERNS
+            || self
+                .patterns
+                .iter()
+                .enumerate()
+                .any(|(i, p)| self.patterns[..i].contains(p))
+        {
+            return Err(format!(
+                "A runtime approval names at most {MAX_APPROVAL_PATTERNS} distinct patterns."
+            ));
+        }
+        for pattern in &self.patterns {
+            text(pattern, "Approval pattern")?;
+            if has_hidden(pattern, false) {
+                return Err("An approval pattern holds a hidden character.".into());
+            }
+        }
+        if self.grants_patterns() && self.patterns.is_empty() {
+            return Err(
+                "A session or always grant must name the runtime patterns it covers.".into(),
+            );
+        }
         Ok(())
+    }
+
+    /// Whether an offered action grants more than this one command.
+    pub fn grants_patterns(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                RuntimeApprovalAction::Session | RuntimeApprovalAction::Always
+            )
+        })
     }
 }
 
@@ -166,15 +212,19 @@ impl QuestionDefinition {
     }
 
     /// Old apps display ordinary text and answer through the runtime's text interceptor.
-    pub fn fallback_text(&self) -> String {
+    /// A runtime approval lists its typed commands only when `typed`: where the
+    /// host's person owns the conversation, the only person whose typed
+    /// decision the bridge passes on to the runtime.
+    pub fn fallback_text(&self, typed: bool) -> String {
         if let Some(approval) = &self.approval {
+            // What runs, with its hidden characters written out.
+            let shown = revealed(&approval.command);
             // A command may contain markdown fences. Pick the shorter safe fence;
             // its two copies add at most roughly one command's length to the frame.
             let (marker, length) = ['`', '~']
                 .into_iter()
                 .map(|marker| {
-                    let run = approval
-                        .command
+                    let run = shown
                         .split(|c| c != marker)
                         .map(str::len)
                         .max()
@@ -184,21 +234,42 @@ impl QuestionDefinition {
                 .min_by_key(|(_, length)| *length)
                 .expect("two fence markers");
             let fence = marker.to_string().repeat(length);
-            let command = format!("{fence}sh\n{}\n{fence}", approval.command);
-            let actions = approval
-                .actions
-                .iter()
-                .map(|action| format!("{}: `{}`", action.description(), action.typed_command()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let scopes = if approval.actions.contains(&RuntimeApprovalAction::Session) {
-                "Session and always grants apply to the runtime's pattern; always persists in the runtime. "
-            } else {
+            let command = format!("{fence}sh\n{shown}\n{fence}");
+            let warning = if approval.command.is_ascii() {
                 ""
+            } else {
+                "The command holds characters outside ASCII, some of which look like others. Check each one.\n\n"
+            };
+            let actions = if typed {
+                approval
+                    .actions
+                    .iter()
+                    .map(|action| format!("{}: `{}`", action.description(), action.typed_command()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                let offered = approval
+                    .actions
+                    .iter()
+                    .map(|action| action.description())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Offered: {offered}. Only the host's person can answer this approval, from an updated app."
+                )
+            };
+            let scopes = if approval.grants_patterns() {
+                format!(
+                    "A session or always grant covers every command matching: {}. An always grant persists in the runtime until removed there. ",
+                    approval.patterns.join("; ")
+                )
+            } else {
+                String::new()
             };
             return format!(
-                "{}\n\n{command}\n\nWhy: {}\n\n{actions}\n\n{scopes}The sandbox policy still applies.",
-                self.text, approval.reason
+                "{}\n\n{command}\n\n{warning}Why: {}\n\n{actions}\n\n{scopes}The sandbox policy still applies.",
+                self.text,
+                revealed(&approval.reason)
             );
         }
         let mut result = self.text.clone();
@@ -422,7 +493,7 @@ mod tests {
             .validate(&original)
             .is_err()
         );
-        let fallback = original.fallback_text();
+        let fallback = original.fallback_text(true);
         for label in &original.choices {
             assert!(fallback.contains(label));
         }
@@ -622,6 +693,7 @@ mod tests {
                     RuntimeApprovalAction::Deny,
                 ],
                 smart_denied: false,
+                patterns: vec!["recursive delete".into()],
             }),
         }
     }
@@ -827,7 +899,7 @@ mod tests {
             let mut question = approval_definition();
             question.approval.as_mut().unwrap().command = command.clone();
             question.validate().unwrap();
-            let fallback = question.fallback_text();
+            let fallback = question.fallback_text(true);
             assert!(fallback.contains(&command));
             assert!(fallback.contains("/approve always"));
             assert!(!fallback.contains("skip"));
@@ -869,5 +941,93 @@ mod tests {
         let mut too_large = approval_definition();
         too_large.approval.as_mut().unwrap().command = "x".repeat(MAX_QUESTION_BYTES);
         assert!(too_large.validate().is_err());
+    }
+
+    #[test]
+    fn session_and_always_grants_name_the_patterns_they_cover() {
+        use RuntimeApprovalAction::{Deny, Once, Session};
+        let original = approval_definition().approval.unwrap();
+        for patterns in [
+            vec![],
+            vec!["".into()],
+            vec!["recursive\u{202E} delete".into()],
+            vec!["a".into(), "a".into()],
+            (0..=MAX_APPROVAL_PATTERNS)
+                .map(|i| format!("p{i}"))
+                .collect(),
+        ] {
+            assert!(
+                RuntimeApprovalDefinition {
+                    patterns,
+                    ..original.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            RuntimeApprovalDefinition {
+                actions: vec![Once, Session, Deny],
+                patterns: vec![],
+                ..original.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        // Once and Deny grant nothing beyond this command.
+        RuntimeApprovalDefinition {
+            actions: vec![Once, Deny],
+            patterns: vec![],
+            ..original
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn approval_fallback_reveals_hidden_characters_and_flags_non_ascii() {
+        let mut question = approval_definition();
+        let approval = question.approval.as_mut().unwrap();
+        approval.command = "ls\u{202E} -la\r\ncurl https://ex\u{0430}mple.com".into();
+        approval.reason = "Pipe\u{200B} to shell".into();
+        let fallback = question.fallback_text(true);
+        assert!(fallback.contains("ls⟨U+202E⟩ -la⟨U+000D⟩\ncurl https://ex\u{0430}mple.com"));
+        assert!(fallback.contains("Why: Pipe⟨U+200B⟩ to shell"));
+        assert!(!fallback.contains('\u{202E}') && !fallback.contains('\u{200B}'));
+        assert!(fallback.contains("outside ASCII"));
+        assert!(fallback.contains("every command matching: recursive delete"));
+        assert!(fallback.contains("until removed there"));
+        let mut ascii = approval_definition();
+        ascii.approval.as_mut().unwrap().command = "rm -rf ./build\tdist".into();
+        let ascii = ascii.fallback_text(true);
+        assert!(!ascii.contains("outside ASCII"));
+        assert!(ascii.contains("rm -rf ./build⟨tab⟩dist"));
+        // A non-ASCII letter that is not hidden is shown as it is, and flagged.
+        assert!(
+            approval_definition()
+                .fallback_text(true)
+                .contains("outside ASCII")
+        );
+        let mut long = approval_definition();
+        // Each three-byte hidden character takes twelve once written out.
+        long.approval.as_mut().unwrap().command = "\u{200B}".repeat(MAX_QUESTION_BYTES / 9);
+        assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn approval_fallback_lists_typed_commands_only_where_they_are_passed_on() {
+        let question = approval_definition();
+        let typed = question.fallback_text(true);
+        assert!(typed.contains("/approve always") && typed.contains("/deny"));
+        let guest = question.fallback_text(false);
+        assert!(!guest.contains("/approve") && !guest.contains("/deny"));
+        assert!(guest.contains("Offered: Allow once, Allow for session, Always allow, Deny."));
+        assert!(guest.contains("Only the host's person"));
+        assert!(guest.contains("printf 'done'"));
+        // An ordinary question reads the same either way.
+        assert_eq!(
+            definition(false).fallback_text(false),
+            definition(false).fallback_text(true)
+        );
     }
 }

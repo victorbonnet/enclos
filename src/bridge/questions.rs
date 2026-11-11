@@ -59,6 +59,29 @@ fn rpc_id(device: &str, person: &str, original: &MessageId) -> MessageId {
     MessageId::new(format!("question-{suffix}")).expect("bounded digest")
 }
 
+/// Whether a runtime reads `text` as one of its typed approval commands:
+/// `/approve` or `/deny`, in any case, with or without arguments or an
+/// `@name` suffix, after any leading `@image:`, `@file:` or `@url:` lines
+/// (Hermes's own parsing of a command message).
+pub(super) fn typed_approval(text: &str) -> bool {
+    let mut rest = text.trim_start();
+    while ["@image:", "@file:", "@url:"].iter().any(|prefix| {
+        rest.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) {
+        rest = rest.split_once('\n').map_or("", |(_, after)| after);
+    }
+    let Some(name) = rest
+        .split_whitespace()
+        .next()
+        .and_then(|word| word.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    matches!(name.split('@').next(), Some("approve" | "deny"))
+}
+
 fn canonical_answer(mut answer: QuestionAnswer) -> QuestionAnswer {
     if let QuestionAnswer::Choices { indices } = &mut answer {
         indices.sort_unstable();
@@ -110,6 +133,20 @@ pub(super) fn acknowledge_question(
 }
 
 impl Hub {
+    /// Whether `person`'s `text` is a typed runtime approval the bridge must
+    /// not pass on: only the host's person decides runtime approvals, typed
+    /// or through the app's controls, and an unknown host decides none.
+    pub(super) fn refuses_typed_approval(&self, person: &str, text: &str) -> bool {
+        typed_approval(text) && self.host.as_deref() != Some(person)
+    }
+
+    /// Whether `person`'s devices get `definition`'s structured metadata. A
+    /// runtime approval's controls are the host's person's alone; anyone else
+    /// reads its history text, which says who can answer it.
+    pub(super) fn shows_question(&self, person: &str, definition: &QuestionDefinition) -> bool {
+        definition.approval.is_none() || self.host.as_deref() == Some(person)
+    }
+
     pub(super) fn question_connected(&self, agent: &str, connection: &str) {
         self.questions
             .lock()
@@ -155,28 +192,31 @@ impl Hub {
                 })
         {
             return Err(QuestionStoreError::Invalid(
-                "The runtime does not support native command approvals.".into(),
+                "The runtime does not support native runtime approvals.".into(),
             ));
         }
         question.validate().map_err(QuestionStoreError::Invalid)?;
-        // Refuse before persistence if a future fallback renderer exceeds the device frame.
-        let introduction = ToDevice::Message(ConversationMessage {
-            conversation: conversation.clone(),
-            agent: agent.into(),
-            from: "agent".into(),
-            text: question.fallback_text(),
-            kind: if question.approval.is_some() {
-                "runtime_approval"
-            } else {
-                "question"
-            }
-            .into(),
-            time: i64::MAX,
-            seq: i64::MAX,
-            attachments: vec![],
-            question: Some(question.id.clone()),
-        });
-        if !bounded(&introduction) {
+        // Refuse before persistence if a future fallback renderer exceeds the device frame,
+        // with or without the typed commands the host's person sees.
+        let introduction = |typed: bool| {
+            ToDevice::Message(ConversationMessage {
+                conversation: conversation.clone(),
+                agent: agent.into(),
+                from: "agent".into(),
+                text: question.fallback_text(typed),
+                kind: if question.approval.is_some() {
+                    "runtime_approval"
+                } else {
+                    "question"
+                }
+                .into(),
+                time: i64::MAX,
+                seq: i64::MAX,
+                attachments: vec![],
+                question: Some(question.id.clone()),
+            })
+        };
+        if !(bounded(&introduction(true)) && bounded(&introduction(false))) {
             return Err(QuestionStoreError::Invalid(
                 "The readable question history exceeds the device frame limit.".into(),
             ));
@@ -191,7 +231,13 @@ impl Hub {
                 "The question belongs to an old connection.".into(),
             ));
         }
-        let change = store.ask_question(agent, conversation, question, id.as_str())?;
+        let change = store.ask_question(
+            agent,
+            conversation,
+            question,
+            id.as_str(),
+            self.host.as_deref(),
+        )?;
         drop(requests);
         self.publish_question(store, change);
         Ok(())
@@ -558,6 +604,7 @@ impl Hub {
             })
         });
         let paired = store.devices().unwrap_or_default();
+        let shown = self.shows_question(&current.owner, &current.info.definition);
         let devices = self.devices.lock().expect("not poisoned");
         for (device, (person, sender)) in devices.iter() {
             if person == &current.owner
@@ -565,7 +612,9 @@ impl Hub {
                     .iter()
                     .any(|d| d.id == *device && d.person == *person)
             {
-                let _ = sender.send(question.clone());
+                if shown {
+                    let _ = sender.send(question.clone());
+                }
                 if let Some(message) = &message
                     && bounded(message)
                 {
