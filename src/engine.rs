@@ -116,6 +116,9 @@ pub struct Engine {
     accepting: Vec<crate::model::unenforced::UnenforcedField>,
 }
 
+/// How often [`Engine::write_in_background`] tries the state lock again.
+const LOCK_POLL: Duration = Duration::from_millis(50);
+
 /// Stops a session's members within a grace period, reading its cgroup in
 /// the hierarchy given, as `lifecycle::stop::stop` does.
 type StopMembers =
@@ -455,6 +458,60 @@ impl Engine {
         work: impl FnOnce(&StateLock) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
+        self.write_holding(lock, by, command, target, outcome, work)
+    }
+
+    /// As [`Engine::write`], for a program the service manager runs, which
+    /// no person waits on: it waits for the state lock as long as its writes
+    /// wait for `state.db` (`Wait::Background`, design §11), rather than the
+    /// 10 seconds a command waits, and returns `None`, having written
+    /// nothing, once `ended` is set. `sandbox start` holds the lock while it
+    /// installs the sandbox's services, and the service manager runs each as
+    /// it is installed, the proxy first, which records itself under the
+    /// lock: on a loaded host, installing the others took longer than 10
+    /// seconds, and the proxy gave up.
+    fn write_in_background<T>(
+        &self,
+        ended: &std::sync::atomic::AtomicBool,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        summary: impl FnOnce(&T) -> String,
+        work: impl FnOnce(&StateLock) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let waited = std::time::Instant::now();
+        let lock = loop {
+            if ended.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(None);
+            }
+            match self.state.try_lock()? {
+                Some(lock) => break lock,
+                None if waited.elapsed() < Wait::Background.limit() => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                None => {
+                    return Err(crate::state::StateError::Locked {
+                        path: self.layout.state_lock(),
+                    }
+                    .into());
+                }
+            }
+        };
+        let outcome = |v: &T| Outcome::ok(summary(v));
+        self.write_holding(lock, by, command, target, outcome, work)
+            .map(Some)
+    }
+
+    /// The rest of [`Engine::write_with_outcome`], once `lock` is taken.
+    fn write_holding<T>(
+        &self,
+        lock: StateLock,
+        by: &Actor,
+        command: &str,
+        target: Option<String>,
+        outcome: impl FnOnce(&T) -> Outcome,
+        work: impl FnOnce(&StateLock) -> Result<T>,
+    ) -> Result<T> {
         let intent = Intent {
             by: by.clone(),
             command: command.to_owned(),
