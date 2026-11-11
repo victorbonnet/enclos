@@ -162,6 +162,14 @@ fn upgrade(db: &Connection) -> rusqlite::Result<()> {
     if !columns.iter().any(|c| c == "speaker") {
         db.execute_batch("ALTER TABLE messages ADD COLUMN speaker TEXT")?;
     }
+    // Home is never archived (ADR 0049): a Home archived by a development
+    // build from before that rule is restored, with a new revision so a
+    // device that saw it archived takes the change.
+    db.execute(
+        "UPDATE conversations SET archived = 0, revision = revision + 1
+         WHERE archived != 0 AND substr(id, 1, 5) = 'home.'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1433,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn home_archive_is_refused_but_a_legacy_archive_can_be_restored() {
+    fn home_archive_is_refused_and_an_archived_home_is_restored_on_open() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("app.db");
         let store = Store::open(&path).unwrap();
@@ -1453,7 +1461,8 @@ mod tests {
             Some(false)
         );
 
-        // An older bridge could archive Home. Its owner can still restore it.
+        // A development build from before the rule could archive Home:
+        // opening the database restores it, once, with a new revision.
         store
             .db
             .execute(
@@ -1465,9 +1474,7 @@ mod tests {
             store.set_archived(&home, "another person", false).unwrap(),
             None
         );
-        assert_eq!(store.set_archived(&home, owner, true).unwrap(), None);
-        assert!(store.conversation_info(&home).unwrap().unwrap().archived);
-        assert_eq!(store.set_archived(&home, owner, false).unwrap(), Some(true));
+        let store = Store::open(&path).unwrap();
         let restored = store.conversation_info(&home).unwrap().unwrap();
         assert!(!restored.archived);
         assert_eq!(restored.revision, before.revision + 1);
@@ -1483,7 +1490,8 @@ mod tests {
                 .conversation_info(&home)
                 .unwrap()
                 .unwrap(),
-            restored
+            restored,
+            "only an archived Home is changed"
         );
 
         // A regular conversation called Home is still an ordinary conversation.
