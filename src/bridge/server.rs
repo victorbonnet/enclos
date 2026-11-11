@@ -1481,7 +1481,10 @@ fn run_session(
             }
             FromDevice::Sync { since } => {
                 if hub.host.as_deref() == Some(person) {
-                    hub.dismiss_probe_requests(store)?;
+                    // A log that cannot be read must not end the device's session.
+                    if let Err(e) = hub.dismiss_probe_requests(store) {
+                        eprintln!("enclos app approvals: {e}");
+                    }
                     for a in store.approvals().map_err(|e| e.to_string())? {
                         link.send(ToDevice::Approval(a))?;
                     }

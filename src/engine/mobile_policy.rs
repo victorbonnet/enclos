@@ -245,6 +245,18 @@ impl Engine {
                 ));
             }
         }
+        // What the phone writes is shown later in the policy page and the
+        // agents' context: nothing in it may change how it reads. An entry
+        // already in the file is named as it is, to be removed.
+        if edit
+            .after
+            .as_deref()
+            .is_some_and(|text| enclos_protocol::visible::has_hidden(text, false))
+        {
+            return Err(refused(
+                "This value contains hidden characters, which would change how it reads.",
+            ));
+        }
         if edit.before == edit.after {
             return Err(refused("This edit changes nothing."));
         }

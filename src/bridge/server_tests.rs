@@ -338,6 +338,37 @@ fn diagnostic_probe_matching_is_exact_and_real_destinations_still_request_access
     assert_eq!(store.approvals().unwrap().len(), 4);
 }
 #[test]
+fn diagnostic_probe_requests_are_matched_against_one_read_of_the_log() {
+    use crate::model::net::{DeniedDestination, Reason};
+    let denied = |host: &str, reason| DeniedDestination {
+        host: host.into(),
+        port: 443,
+        reason,
+        count: 1,
+        first: jiff::Timestamp::UNIX_EPOCH,
+        last: jiff::Timestamp::UNIX_EPOCH,
+    };
+    let mut a = approval_sample();
+    a.agent.clear();
+    a.access.target = "10.0.0.1:443".into();
+    let probe_only = (vec![denied("10.0.0.1", Reason::PrivateAddress)], vec![]);
+    assert!(approvals::only_probe_events(&a, &probe_only));
+    // Refused outside a diagnostic run too: a real request.
+    let both = (
+        vec![denied("10.0.0.1", Reason::PrivateAddress)],
+        vec![denied("10.0.0.1", Reason::PrivateAddress)],
+    );
+    assert!(!approvals::only_probe_events(&a, &both));
+    // Another destination, or an agent's explicit request, is not the probe's.
+    assert!(!approvals::only_probe_events(
+        &a,
+        &(vec![denied("10.0.0.2", Reason::PrivateAddress)], vec![])
+    ));
+    a.agent = "lab/main".into();
+    assert!(!approvals::only_probe_events(&a, &probe_only));
+}
+
+#[test]
 fn diagnostic_probe_existing_pending_notification_is_dismissed_and_broadcast() {
     let (_dir, hub, store) = diagnostic_approval_hub();
     let (tx, rx) = channel();
