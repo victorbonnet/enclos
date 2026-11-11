@@ -23,11 +23,18 @@ Every message is one JSON object: UTF-8, at most 1 MiB, with these fields first.
 | `type` | string | What the message is (below) |
 | `id` | string | Unique per sender, a UUID; used to acknowledge and to drop duplicates |
 
-Unknown fields are ignored. An unknown `type` is answered with an `error` of code `unknown_type` and otherwise ignored, so a newer peer can send optional messages to an older one.
+Unknown fields are ignored. An unknown `type` is answered with an `error` of code `unknown_type` and otherwise ignored, so a newer peer can send optional messages to an older one. A message the receiver cannot use (not JSON, too big, a field missing or wrong) is answered with an `error` of code `bad_message`, its `of` naming the message's `id` when one could be read, and the receiver goes on reading: one bad message never ends the connection. Two things do: a `v` the receiver does not speak, answered with `version` ([Errors](#errors)), and, on the plugin leg, a line over 1 MiB, which the receiver stops reading at the limit and answers with `bad_message` without `of`, so a sender checks the size of each message before it sends it. On the device leg a frame that does not decrypt ends the connection too (below).
 
 On the plugin leg, one message per line (`\n`, never inside a message). On the device leg, one message per WebSocket binary frame, inside a Noise transport message.
 
+A Noise transport message holds at most 65,535 bytes, its 16-byte tag included, and this protocol defines no fragmentation. So **on the device leg a message is at most 65,519 bytes**, as it is sealed: its JSON and the line break after it. The 1 MiB limit holds on the plugin leg only.
+
+- **An agent's text that does not fit** (`message.out`, or a cron job's output) is split by the bridge, at character boundaries, into several `message`s of the same conversation, each with the next `seq` and stored as it is sent. A device sees them in order, as consecutive messages from the agent; the plugin and the runtime see one message.
+- **A person's text is one message:** the app refuses, before sealing, a `message.send` whose text would not fit as a `message` (its echo, with the conversation's other fields), and keeps the person's text; `enclos-protocol`'s `split_text` giving one piece is the test. The bridge answers one that gets through with `bad_message` and stores nothing, and closes a connection whose frame does not decrypt, so a larger one ends it.
+
 ### Names
+
+Every id and name a message carries (`id`, `of`, `conversation`, `person`, and a plugin `hello`'s `runtime` and `agent`) is not empty, at most 128 bytes, and holds no control character; an `error`'s `message` holds no control character either. A message that breaks this is a bad message. The host prints some of them, so text from the sandbox can neither move a terminal's cursor nor break a log's line.
 
 - **An agent** is `<sandbox>/<agent>` on one host, as enclos names it. The app adds the host it reached.
 - **A conversation** is a UUID the app makes. The plugin gives it to the runtime as the chat's id, so a new conversation is a new chat for the runtime, and a cron job created in it remembers it as its origin.
@@ -37,13 +44,15 @@ On the plugin leg, one message per line (`\n`, never inside a message). On the d
 
 The plugin listens; the bridge connects. Several bridges never connect at once: the plugin refuses a second connection while one is open.
 
-1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent alone ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
+1. **`hello`, bridge to plugin, first:** `{"v":1,"type":"hello","id":…,"token":"…"}`. The token is the agent's, a secret granted to that agent ([ADR 0036](adr/0036-an-agent-has-its-own-bot.md)). The plugin compares it in constant time and closes the socket, saying nothing, on any other first message or token.
+
+   **What the token proves, and what it does not.** It keeps the host's other programs, and other sandboxes, off the agent's socket, and nothing more. The token is in the sandbox, where the agent and anything it runs can read it, as they can every secret of the agent's (ADR 0036), and the socket is in the sandbox home. So a program in the sandbox can connect to its own plugin while the bridge is not connected and send it any message the bridge sends, and a program that listens on the socket's path gets the token from the bridge. Hence the rule: **no message from the bridge to the plugin carries authority the agent must not have.** A message the plugin passes on is what a person said, never a decision the runtime then trusts more than the agent's own words; a decision that must come from the person needs its own proof, which version 1 does not define.
 2. **`hello`, plugin to bridge:** `{"v":1,"type":"hello","id":…,"runtime":"hermes","agent":"main","capabilities":[…]}`.
 3. Then, in either direction:
 
 | `type` | From | Fields | Meaning |
 | --- | --- | --- | --- |
-| `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? | A person's message to the agent |
+| `message.in` | bridge | `conversation`, `person`, `text`, `attachments`? (reserved; version 1 defines none, and a receiver ignores it) | A person's message to the agent |
 | `message.out` | plugin | `conversation`, `text`, `kind` (`reply` or `notify`), `reply_to`? | What the agent says: a reply, or `notify` for one nobody asked for now (a cron job, background work) |
 | `typing` | plugin | `conversation`, `on` (boolean) | The agent is working on an answer |
 | `conversation.title` | plugin | `conversation`, `title` (one line, at most 100 characters) | The runtime's short name for the conversation, from what was said in it |
@@ -53,7 +62,7 @@ The plugin listens; the bridge connects. Several bridges never connect at once: 
 
 **A conversation's name.** The bridge keeps one name per conversation and who gave it. The runtime's (`conversation.title`, for one of its own agent's conversations) replaces the runtime's; the person's (`conversation.rename` from a device) replaces any, and the runtime's no longer replaces it until the person clears it. Whoever gives it, the bridge keeps a name on one line, drops the hidden characters (control, bidirectional, zero-width and the like, as `enclos_protocol::visible` lists them) and cuts it to 100 characters: it does not rely on the plugin's cut, which runs in the sandbox. The bridge passes the person's name on to the plugin, so the runtime can keep it too (Hermes: the session's title, with the user's authority). Hermes names every session on its own and tells no plugin, so its plugin reads the title after each reply, and a little later, and sends it when it changed.
 
-**What the agent says is markdown.** The `text` of a `message.out` is CommonMark with GitHub's tables, strikethrough and bare links; a device draws it, and fetches and runs nothing in it: an image shows as a link, HTML as its text, and only `http`, `https` and `mailto` links open (the app's [ADR 0002](https://github.com/victorbonnet/enclos-app/blob/main/docs/adr/0002-messages-are-markdown-drawn-by-the-app.md), proposed). A plugin tells its runtime so (Hermes: the platform's `platform_hint`), so that the agent formats when it helps. What a person sends (`message.in`) is plain text, shown as typed.
+**What the agent says is markdown.** The `text` of a `message.out` is CommonMark with GitHub's tables, strikethrough and bare links; a device draws it, and fetches and runs nothing in it: an image shows as its alt text, a link to it, and is never loaded; HTML shows as its text; and only `http`, `https` and `mailto` links open (the app's [ADR 0002](https://github.com/victorbonnet/enclos-app/blob/main/docs/adr/0002-messages-are-markdown-drawn-by-the-app.md), proposed). A plugin tells its runtime so (Hermes: the platform's `platform_hint`), so that the agent formats when it helps. What a person sends (`message.in`) is plain text, shown as typed.
 
 **Delivery is at least once.** The plugin keeps each `message.out` on disk, in the sandbox home, until the bridge's `ack` for it, and sends what it kept again after each `hello`. The bridge drops an `id` it has already stored. The bridge acknowledges a `message.in` it sent only once it has stored it; the plugin acknowledges it once the runtime has it.
 
@@ -91,7 +100,7 @@ The bridge checks `proof`, then shows at the terminal the device's name, its tai
 3. asks Tailscale who is calling, and refuses a person or a node other than the device's own;
 4. writes each refusal, with its reason, in the bridge's log (`enclos app log`).
 
-The hardware key never signs anything but handshake hashes and pairing requests.
+The hardware key never signs anything but handshake hashes, the pairing handshake's included. `pair.request` itself carries no signature: it proves the one-time code (`proof`), and the device key it names is the one whose signature the same handshake already carried.
 
 ### Messages after the handshake
 
@@ -148,7 +157,7 @@ Hermes and OpenClaw are meant to have `notify` and `typing`; the Hermes plugin a
 | --- | --- |
 | `unknown_type` | The receiver does not know this `type` |
 | `bad_message` | Not JSON, too big, or a required field is missing |
-| `version` | `v` is one the receiver does not speak; it then closes |
+| `version` | `v` is one the receiver does not speak; it answers this, then closes the connection |
 | `not_allowed` | The person may not do this (no share, or not that ability) |
 | `unknown_agent`, `unknown_conversation` | No such agent or conversation for this person |
 | `agent_unavailable` | The plugin is not reachable (sandbox stopped, plugin not connected); the message is kept and sent when it is |
