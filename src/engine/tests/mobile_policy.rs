@@ -100,6 +100,29 @@ fn mobile_policy_cannot_drop_protected_defaults_or_edit_secret_grants() {
     }
 }
 #[test]
+fn mobile_policy_refuses_values_with_hidden_characters() {
+    let (dir, e, name) = with_sandbox();
+    let state = e.mobile_policy(&name).unwrap();
+    let plain = dir.path().join("work").display().to_string();
+    assert!(
+        e.mobile_policy_preview(&name, &state.base, &edit("write", None, Some(&plain)))
+            .is_ok()
+    );
+    for c in [
+        edit("write", None, Some(&format!("{plain}\u{202E}fdp"))),
+        edit("write", None, Some(&format!("{plain}\u{200B}"))),
+        edit("read_deny", None, Some("~/notes\u{2066}")),
+        edit("read_deny", None, Some("~/notes\u{E0041}")),
+    ] {
+        let refused = e
+            .mobile_policy_preview(&name, &state.base, &c)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refused.contains("hidden characters"), "{c:?}: {refused}");
+    }
+}
+#[test]
 fn mobile_policy_remove_private_destination_cleans_up_its_opt_in() {
     let (_dir, e, name) = with_sandbox();
     let a = enclos_protocol::approval::Access {

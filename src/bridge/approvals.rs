@@ -1,15 +1,54 @@
 //! Approval requests cross the trust boundary as data. Only the host's person decides.
 use super::*;
+use crate::model::net::DeniedDestination;
 use crate::{
     engine::Engine,
     model::{audit::Actor, sandbox::SandboxName},
 };
 use enclos_protocol::approval::{Access, AccessKind, Approval};
+use std::collections::HashMap;
 
 fn diagnostic_access(access: &Access) -> bool {
     access.kind == AccessKind::Network
         && crate::net::host::AllowEntry::parse(&access.target)
             .is_ok_and(|entry| entry.host_text() == crate::probes::POLICY_PROBE_HOST)
+}
+
+/// A sandbox's refused destinations: all of them, and those not from a
+/// host diagnostic run.
+pub(super) type Refusals = (Vec<DeniedDestination>, Vec<DeniedDestination>);
+
+fn refusals(engine: &Engine, sandbox: &str) -> Option<Refusals> {
+    let name = sandbox.parse::<SandboxName>().ok()?;
+    Some((
+        engine.net_denied(&name).ok()?,
+        engine.net_denied_for_approval(&name).ok()?,
+    ))
+}
+
+/// Whether `a` came from a proxy refusal, which names no agent.
+fn from_the_proxy(a: &Approval) -> bool {
+    a.agent.is_empty() && a.access.kind == AccessKind::Network
+}
+
+/// Whether `a`, a proxy refusal's request, was refused only in host
+/// diagnostic runs.
+pub(super) fn only_probe_events(a: &Approval, (all, ordinary): &Refusals) -> bool {
+    if !from_the_proxy(a) {
+        return false;
+    }
+    let Ok(target) = crate::net::host::AllowEntry::parse(&a.access.target) else {
+        return false;
+    };
+    let matches = |d: &DeniedDestination| {
+        d.host == target.host_text()
+            && d.port == target.port
+            && matches!(
+                d.reason,
+                crate::model::net::Reason::NotAllowed | crate::model::net::Reason::PrivateAddress
+            )
+    };
+    all.iter().any(matches) && !ordinary.iter().any(matches)
 }
 
 fn preview(engine: &Engine, a: &mut Approval) {
@@ -144,39 +183,24 @@ impl Hub {
         Ok(())
     }
 
-    fn only_probe_events(&self, a: &Approval) -> bool {
-        if !a.agent.is_empty() || a.access.kind != AccessKind::Network {
-            return false;
-        }
-        let Ok(name) = a.sandbox.parse::<SandboxName>() else {
-            return false;
-        };
-        let Ok(target) = crate::net::host::AllowEntry::parse(&a.access.target) else {
-            return false;
-        };
-        let engine = Engine::open(self.layout.clone());
-        let matches = |d: &crate::model::net::DeniedDestination| {
-            d.host == target.host_text()
-                && d.port == target.port
-                && matches!(
-                    d.reason,
-                    crate::model::net::Reason::NotAllowed
-                        | crate::model::net::Reason::PrivateAddress
-                )
-        };
-        let Ok(all) = engine.net_denied(&name) else {
-            return false;
-        };
-        let Ok(ordinary) = engine.net_denied_for_approval(&name) else {
-            return false;
-        };
-        all.iter().any(matches) && !ordinary.iter().any(matches)
+    /// Whether `a` is a pending request for a diagnostic probe's refusal.
+    /// `read` keeps each sandbox's refusals, so that one pass over the
+    /// requests reads the network log twice per sandbox, not per request.
+    fn is_probe(&self, a: &Approval, read: &mut HashMap<String, Option<Refusals>>) -> bool {
+        a.state == "pending"
+            && (diagnostic_access(&a.access)
+                || (from_the_proxy(a)
+                    && read
+                        .entry(a.sandbox.clone())
+                        .or_insert_with(|| refusals(&Engine::open(self.layout.clone()), &a.sandbox))
+                        .as_ref()
+                        .is_some_and(|r| only_probe_events(a, r))))
     }
 
     pub(super) fn dismiss_probe_requests(&self, store: &Store) -> Result<(), String> {
+        let mut read = HashMap::new();
         for a in store.approvals().map_err(|e| e.to_string())? {
-            if a.state == "pending"
-                && (diagnostic_access(&a.access) || self.only_probe_events(&a))
+            if self.is_probe(&a, &mut read)
                 && let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())?
                 && let Some(person) = &self.host
             {
@@ -271,7 +295,7 @@ impl Hub {
             .approval(id)
             .map_err(|e| e.to_string())?
             .ok_or("Unknown policy request")?;
-        if a.state == "pending" && (diagnostic_access(&a.access) || self.only_probe_events(&a)) {
+        if self.is_probe(&a, &mut HashMap::new()) {
             if let Some(closed) = store.dismiss_probe(&a).map_err(|e| e.to_string())? {
                 self.deliver(person, ToDevice::Approval(closed));
             }
