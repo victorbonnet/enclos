@@ -563,6 +563,59 @@ fn avatar_persistence_conflicts_and_removal_survive_other_connections_and_restar
     );
     assert_eq!(reopened.avatar("other/coder").unwrap().revision, 0);
 }
+
+#[test]
+fn avatar_edit_waits_for_another_connections_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("app.db");
+    let store = Store::open(&path).unwrap();
+    // A plugin thread's connection holds the write lock for a moment.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    other
+        .execute_batch(
+            "BEGIN IMMEDIATE; INSERT INTO log(at,device,person,event,reason) VALUES (0,'d','p','test','')",
+        )
+        .unwrap();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        other.execute_batch("END").unwrap();
+    });
+    // The edit waits for it, instead of failing at its own write.
+    let saved = store
+        .set_avatar("lab/coder", 0, Some(b"image"), ("d1", "owner"))
+        .unwrap()
+        .unwrap();
+    writer.join().unwrap();
+    assert_eq!(saved.revision, 1);
+    assert_eq!(store.avatar("lab/coder").unwrap(), saved);
+}
+
+#[test]
+fn avatar_storage_failure_keeps_the_databases_words_from_the_device() {
+    use enclos_protocol::plugin::ErrorCode;
+    let (dir, mut hub, store) = diagnostic_approval_hub();
+    Arc::get_mut(&mut hub).unwrap().agents.push(AgentEndpoint {
+        name: "lab/coder".into(),
+        runtime: "hermes".into(),
+        socket: dir.path().join("unused.sock"),
+        token: "fixture".into(),
+    });
+    let guest = avatar_device("tablet", "guest@example.com");
+    store.add_device(&guest).unwrap();
+    rusqlite::Connection::open(dir.path().join("app.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE agent_avatars")
+        .unwrap();
+    let failed = hub
+        .get_avatar(&store, &guest, &guest.person, "lab/coder", "read".into())
+        .unwrap_err();
+    assert_eq!(failed.code(), ErrorCode::Internal);
+    assert_eq!(
+        failed.message(),
+        "The agent photo could not be read or saved. Try again later."
+    );
+}
+
 #[test]
 fn avatar_owner_changes_broadcast_to_paired_devices_but_guests_and_revoked_devices_cannot_write() {
     use enclos_protocol::avatar::AvatarSet;
@@ -808,7 +861,15 @@ fn avatar_refuses_a_png_that_claims_huge_dimensions_before_allocating() {
     let bomb = png_claiming(100_000, 100_000);
     assert!(bomb.len() < 100);
     // Taken for a PNG, then refused on its claim: nothing of 30 GB is allocated.
-    assert!(avatars::normalize(&bomb).unwrap_err().contains("too large"));
+    assert_eq!(
+        avatars::normalize(&bomb).unwrap_err(),
+        "This image is too large."
+    );
+    // A small PNG whose data never decodes is unreadable, not too large.
+    assert_eq!(
+        avatars::normalize(&png_claiming(64, 64)).unwrap_err(),
+        "This image cannot be read."
+    );
     let mut reader = image::ImageReader::new(std::io::Cursor::new(&bomb))
         .with_guessed_format()
         .unwrap();

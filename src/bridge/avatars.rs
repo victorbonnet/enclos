@@ -24,7 +24,10 @@ pub(super) fn normalize(bytes: &[u8]) -> Result<Vec<u8>, String> {
     reader.limits(limits);
     let photo = reader
         .decode()
-        .map_err(|_| "This image cannot be read or is too large.".to_owned())?
+        .map_err(|e| match e {
+            image::ImageError::Limits(_) => "This image is too large.".to_owned(),
+            _ => "This image cannot be read.".to_owned(),
+        })?
         .resize_to_fill(256, 256, image::imageops::FilterType::Triangle)
         .to_rgb8();
     for quality in [85, 75, 60, 40] {
@@ -82,8 +85,11 @@ impl PhotoError {
     }
 }
 
+/// A storage failure: the database's own words go to the host's log, and
+/// the device, a guest's included, gets a fixed message.
 fn internal(e: impl std::fmt::Display) -> PhotoError {
-    PhotoError::Internal(e.to_string())
+    eprintln!("enclos app: an agent photo request failed: {e}");
+    PhotoError::Internal("The agent photo could not be read or saved. Try again later.".into())
 }
 
 fn photo_message(agent: &str, photo: StoredAvatar, of: String) -> ToDevice {

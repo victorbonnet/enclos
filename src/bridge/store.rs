@@ -303,7 +303,13 @@ impl Store {
         image: Option<&[u8]>,
         by: (&str, &str),
     ) -> rusqlite::Result<Option<StoredAvatar>> {
-        let tx = self.db.unchecked_transaction()?;
+        // Immediate: the write lock is taken (waiting out the busy timeout)
+        // before the revision is read, so a plugin thread writing meanwhile
+        // cannot make the later write fail at once with SQLITE_BUSY.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let revision: i64 = tx
             .query_row(
                 "SELECT revision FROM agent_avatars WHERE agent=?1",
