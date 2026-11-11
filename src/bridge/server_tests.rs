@@ -131,19 +131,16 @@ fn approval_restart_marks_interrupted_decisions_for_review_without_replaying() {
 #[test]
 fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Arc::new(Hub {
-        transport: Transport::Tailscale,
-        store_path: dir.path().join("app.db"),
-        layout: crate::layout::Layout::at(dir.path().join("enclos")),
-        bridge_private: vec![],
-        agents: vec![],
-        host: Some("owner@example.com".into()),
-        plugins: Mutex::new(HashMap::new()),
-        commands: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
-        stops: Mutex::new(Default::default()),
-        devices: Mutex::new(HashMap::new()),
-    });
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
     let store = hub.store().unwrap();
     let device = Device {
         id: "d1".into(),
@@ -155,6 +152,7 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
         push_token: None,
         paired: now(),
         seen: None,
+        node: None,
     };
     assert!(
         hub.decide_access(&store, &device, "guest@example.com", "r1", "rev1", true)
@@ -172,19 +170,16 @@ fn approval_authority_requires_the_host_person_and_a_still_paired_device() {
 /// A hub of the host's person, with no enclos set up beside it.
 fn approval_hub() -> (tempfile::TempDir, Arc<Hub>, Store) {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Arc::new(Hub {
-        transport: Transport::Tailscale,
-        store_path: dir.path().join("app.db"),
-        layout: crate::layout::Layout::at(dir.path().join("enclos")),
-        bridge_private: vec![],
-        agents: vec![],
-        host: Some("owner@example.com".into()),
-        plugins: Mutex::new(HashMap::new()),
-        commands: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
-        stops: Mutex::new(Default::default()),
-        devices: Mutex::new(HashMap::new()),
-    });
+    let hub = Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.path().join("app.db"),
+        crate::layout::Layout::at(dir.path().join("enclos")),
+        vec![],
+        vec![],
+        Some("owner@example.com".into()),
+        SILENCE,
+    ));
     let store = hub.store().unwrap();
     (dir, hub, store)
 }
@@ -302,4 +297,244 @@ fn approval_requests_name_only_the_agents_own_conversations_or_groups() {
     assert!(!approvals::speaks_in(&store, "lab/coder", &home));
     assert!(!approvals::speaks_in(&store, "other/main", &home));
     assert!(!approvals::speaks_in(&store, "lab/main", "unknown"));
+}
+
+/// A hub with no agent, its database in `dir`, and one connected device
+/// for each of `people`: what each of them receives.
+fn hub_with(
+    dir: &std::path::Path,
+    people: &[&str],
+) -> (Hub, Vec<std::sync::mpsc::Receiver<ToDevice>>) {
+    let mut devices = HashMap::new();
+    let mut received = Vec::new();
+    for (i, person) in people.iter().enumerate() {
+        let (sender, receiver) = channel();
+        devices.insert(format!("d-{i}"), ((*person).to_owned(), sender, i as u64));
+        received.push(receiver);
+    }
+    let hub = Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.join("app.db"),
+        crate::layout::Layout::at(dir.join("enclos")),
+        vec![0; 32],
+        Vec::new(),
+        None,
+        SILENCE,
+    );
+    *hub.devices.lock().unwrap() = devices;
+    (hub, received)
+}
+
+#[test]
+fn only_the_owner_moves_how_far_a_conversation_was_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hub, received) = hub_with(dir.path(), &["alice@example.com", "bob@example.com"]);
+    let store = hub.store().unwrap();
+    store
+        .conversation("c-1", "lab", "main", "alice@example.com")
+        .unwrap();
+    for id in ["m-1", "m-2", "m-3"] {
+        store.add(id, "c-1", &From::Agent, "hi", "reply").unwrap();
+    }
+    let c1 = ConversationId::new("c-1").unwrap();
+    let read_of = |store: &Store| store.conversation_info("c-1").unwrap().unwrap().read;
+    // Another person's device: nothing moves, and nobody is told.
+    read(&hub, &store, "bob@example.com", &c1, 2).unwrap();
+    assert_eq!(read_of(&store), None);
+    assert!(received.iter().all(|r| r.try_recv().is_err()));
+    // The owner's: kept, and sent to the owner's devices only.
+    read(&hub, &store, "alice@example.com", &c1, 2).unwrap();
+    assert_eq!(read_of(&store), Some(2));
+    match received[0].try_recv() {
+        Ok(ToDevice::Conversation(info)) => assert_eq!(info.read, Some(2)),
+        other => panic!("expected the conversation, got {other:?}"),
+    }
+    assert!(received[1].try_recv().is_err());
+}
+
+/// A hub serving `lab/<name>` for each of `names`, each with its plugin's
+/// socket in `dir`, and no device yet.
+fn hub(dir: &std::path::Path, names: &[&str]) -> Arc<Hub> {
+    let agents = names
+        .iter()
+        .map(|name| AgentEndpoint {
+            name: format!("lab/{name}"),
+            runtime: "hermes".to_owned(),
+            socket: dir.join(format!("{name}.sock")),
+            token: "t0ken".to_owned(),
+        })
+        .collect();
+    Arc::new(Hub::new(
+        Transport::Tailscale,
+        no_whois(),
+        dir.join("bridge.db"),
+        crate::layout::Layout::at(dir.join("enclos")),
+        vec![7; 32],
+        agents,
+        Some("alice@example.com".to_owned()),
+        SILENCE,
+    ))
+}
+
+/// A transport that knows no caller: these tests open no device connection.
+fn no_whois() -> Whois {
+    Arc::new(|_: &str| Err("no transport in this test".to_owned()))
+}
+
+/// One connection of a stand-in plugin: its `hello`'s capabilities, the
+/// `commands` it sends then, and whether it closes after.
+struct Answer {
+    capabilities: Vec<Capability>,
+    commands: Option<Vec<Command>>,
+    closes: bool,
+}
+
+/// A stand-in plugin at `socket`: answers each connection in turn as
+/// `answers` say, the last one kept open until the bridge closes it.
+fn stand_in_plugin(socket: &std::path::Path, answers: Vec<Answer>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    std::thread::spawn(move || {
+        for answer in answers {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).unwrap();
+            let mut send = |body: FromPlugin| {
+                let id = MessageId::new(new_id().unwrap()).unwrap();
+                out.write_all(&encode_line(&Envelope::new(id, body)))
+                    .unwrap();
+            };
+            send(FromPlugin::Hello {
+                runtime: "hermes".into(),
+                agent: "main".into(),
+                capabilities: answer.capabilities,
+            });
+            if let Some(commands) = answer.commands {
+                send(FromPlugin::Commands { commands });
+            }
+            if !answer.closes {
+                while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {}
+            }
+        }
+    });
+}
+
+fn command(name: &str, description: &str) -> Command {
+    Command {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        args: None,
+    }
+}
+
+/// Waits up to 5 seconds for `done`.
+fn until(done: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(5), "never came");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_agents_commands_are_cleaned_kept_and_sent_to_every_device() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["main"]);
+    stand_in_plugin(
+        &dir.path().join("main.sock"),
+        vec![
+            Answer {
+                capabilities: vec![Capability::Commands],
+                commands: Some(vec![
+                    command("new", "Start\u{202E} a new\n session"),
+                    command("Bad Name", "left out"),
+                ]),
+                closes: true,
+            },
+            Answer {
+                capabilities: Vec::new(),
+                commands: None,
+                closes: false,
+            },
+        ],
+    );
+    let (alice, from_alice) = channel();
+    let (bob, from_bob) = channel();
+    {
+        let mut devices = hub.devices.lock().unwrap();
+        devices.insert("d-1".to_owned(), ("alice@example.com".to_owned(), alice, 1));
+        devices.insert("d-2".to_owned(), ("bob@example.com".to_owned(), bob, 2));
+    }
+    let listed = |commands: Vec<Command>| ToDevice::Commands {
+        agent: "lab/main".to_owned(),
+        commands,
+    };
+    let cleaned = vec![command("new", "Start a new session")];
+
+    hub.plugin("lab/main").unwrap();
+    for device in [&from_alice, &from_bob] {
+        let got = device.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, listed(cleaned.clone()));
+    }
+    // Kept once the plugin is gone, and sent after the agents' list.
+    until(|| !hub.plugins.lock().unwrap().contains_key("lab/main"));
+    let answer = hub.agents_answer();
+    assert!(matches!(&answer[0], ToDevice::AgentsList { agents } if agents.len() == 1));
+    assert_eq!(answer[1..], [listed(cleaned)]);
+
+    // Connected again without the capability: its old list is dropped.
+    hub.plugin("lab/main").unwrap();
+    for device in [&from_alice, &from_bob] {
+        let got = device.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(got, listed(Vec::new()));
+    }
+    assert_eq!(hub.agents_answer().len(), 1);
+}
+
+#[test]
+fn a_plugin_that_stalls_its_hello_holds_up_no_other_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), &["slow", "main"]);
+    // `slow` takes the connection and says nothing until released.
+    let slow = std::os::unix::net::UnixListener::bind(dir.path().join("slow.sock")).unwrap();
+    let (accepted, was_accepted) = channel();
+    let (release, released) = channel::<()>();
+    std::thread::spawn(move || {
+        let (stream, _) = slow.accept().unwrap();
+        accepted.send(()).unwrap();
+        let _ = released.recv();
+        drop(stream);
+    });
+    stand_in_plugin(
+        &dir.path().join("main.sock"),
+        vec![Answer {
+            capabilities: vec![Capability::Commands],
+            commands: None,
+            closes: false,
+        }],
+    );
+
+    hub.open_plugins();
+    was_accepted.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(hub.opening_all.load(Ordering::SeqCst), "one pass, running");
+    hub.open_plugins(); // another request while it runs: no second pass
+
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        &hub.agents_answer()[0],
+        ToDevice::AgentsList { .. }
+    ));
+    hub.plugin("lab/main").unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "waited {:?} on another agent's hello",
+        started.elapsed()
+    );
+
+    drop(release);
+    until(|| !hub.opening_all.load(Ordering::SeqCst));
+    assert!(!hub.plugins.lock().unwrap().contains_key("lab/slow"));
 }

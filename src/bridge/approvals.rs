@@ -306,10 +306,13 @@ impl Hub {
         };
         if let Ok(text) = Engine::open(self.layout.clone()).access_context(&name) {
             let mut plugins = self.plugins.lock().expect("not poisoned");
-            for (agent, (writer, caps)) in plugins.iter_mut() {
-                if agent.split('/').next() == Some(sandbox) && caps.contains(&Capability::Approval)
+            for (agent, plugin) in plugins.iter_mut() {
+                if agent.split('/').next() == Some(sandbox)
+                    && plugin.capabilities.contains(&Capability::Approval)
                 {
-                    let _ = writer.send(FromBridge::PolicyContext { text: text.clone() });
+                    let _ = plugin
+                        .writer
+                        .send(FromBridge::PolicyContext { text: text.clone() });
                 }
             }
         }

@@ -222,6 +222,73 @@ fn audit_since_keeps_recent_entries() {
     assert_eq!(recent.len(), 1);
 }
 
+#[test]
+fn a_change_to_the_apps_devices_is_audited_or_not_made() {
+    let (_dir, engine) = engine();
+    // No audit log yet: the work does not run
+    let mut ran = false;
+    let refused = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-1".into(),
+        |_| String::new(),
+        || {
+            ran = true;
+            Ok(())
+        },
+    );
+    assert!(refused.is_err());
+    assert!(!ran);
+    done(engine.init(&alice(), Confirm::Ask).unwrap());
+    engine
+        .app_access(
+            &alice(),
+            "app pair",
+            "Pixel".into(),
+            |id: &String| format!("paired as {id}"),
+            || Ok("d-1".to_owned()),
+        )
+        .unwrap();
+    let failed = engine.app_access(
+        &alice(),
+        "app unpair",
+        "d-2".into(),
+        |_| String::new(),
+        || {
+            Err::<(), _>(Error::Session {
+                what: "no paired device d-2".into(),
+            })
+        },
+    );
+    assert!(failed.is_err());
+    let entries = engine.audit(None).unwrap();
+    let app: Vec<_> = entries
+        .iter()
+        .filter(|e| e.intent.command.starts_with("app "))
+        .map(|e| {
+            let outcome = &e.finished.as_ref().unwrap().outcome;
+            (
+                e.intent.command.as_str(),
+                e.intent.target.as_deref(),
+                outcome.result,
+                outcome.message.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        app,
+        [
+            ("app pair", Some("Pixel"), AuditResult::Ok, "paired as d-1"),
+            (
+                "app unpair",
+                Some("d-2"),
+                AuditResult::Failed,
+                "no paired device d-2"
+            ),
+        ]
+    );
+}
+
 mod approvals;
 #[cfg(target_os = "linux")]
 mod bubblewrap;
