@@ -13,6 +13,16 @@ const MAX_PENDING: usize = 64;
 const MAX_COMPLETED: usize = 64;
 const MAX_REPLY_BYTES: usize = 60 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(25);
+/// The most conversations a routine may choose from for one agent.
+const MAX_DELIVERIES: usize = 4096;
+/// The most delivery choices sent with a list, Home first.
+const LISTED_DELIVERIES: usize = 51;
+
+/// The bridge's database failed before the request reached the runtime.
+const NOT_READ_BEFORE: &str =
+    "The bridge could not read its database, so nothing was sent to the agent. Try again.";
+/// The bridge's database failed once the runtime had answered.
+const NOT_READ_AFTER: &str = "The bridge could not read its database to check the agent's answer. The outcome may be unknown; refresh routines before retrying.";
 
 struct Pending {
     device: String,
@@ -86,6 +96,43 @@ fn audit(store: &Store, pending: &Pending, outcome: &str) {
     }
 }
 
+/// Whether `result` answers `request` within what the bridge lets
+/// through: ids that show as themselves (a list leaves the others out), a
+/// page of at most `PAGE_SIZE`, an editable routine in the app's format,
+/// and a delivery among `deliveries`, the bridge's own choices, which also
+/// replace whatever a list carried.
+fn checked(
+    request: &RoutineRequest,
+    result: &mut RoutineResult,
+    mut deliveries: Vec<RoutineChoice>,
+) -> bool {
+    request.accepts(result)
+        && result.retain_valid_ids()
+        && match result {
+            RoutineResult::List {
+                routines,
+                deliveries: listed,
+                deliveries_limited,
+                ..
+            } => {
+                deliveries.sort_by_key(|d| !is_home(&d.id));
+                *deliveries_limited = deliveries.len() > LISTED_DELIVERIES;
+                deliveries.truncate(LISTED_DELIVERIES);
+                *listed = deliveries;
+                routines.len() <= PAGE_SIZE
+            }
+            RoutineResult::Routine { routine } => {
+                (!routine.summary.editable || routine.definition.validate().is_ok())
+                    && routine
+                        .definition
+                        .delivery
+                        .as_ref()
+                        .is_none_or(|id| deliveries.iter().any(|d| d.id == id.as_str()))
+            }
+            _ => true,
+        }
+}
+
 /// What the bridge already knows of a request id.
 enum Replay {
     /// Answered before: the same answer again.
@@ -143,24 +190,21 @@ impl Hub {
         self.avatar_authority(store, device, person, agent, false)
     }
 
+    /// Where a routine of `agent` may deliver for `person`: their direct
+    /// conversations with it, newest first, read in one query.
     fn routine_deliveries(
         &self,
         store: &Store,
         person: &str,
         agent: &str,
-    ) -> Result<Vec<RoutineChoice>, String> {
-        let mut choices = Vec::new();
-        for conversation in store.conversations(person).map_err(|e| e.to_string())? {
-            if format!("{}/{}", conversation.sandbox, conversation.agent) != agent
-                || !store
-                    .members(&conversation.id)
-                    .map_err(|e| e.to_string())?
-                    .is_empty()
-            {
-                continue;
-            }
-            choices.push(RoutineChoice {
-                id: conversation.id.clone(),
+    ) -> rusqlite::Result<Vec<RoutineChoice>> {
+        let Some((sandbox, name)) = agent.split_once('/') else {
+            return Ok(Vec::new());
+        };
+        let mut choices: Vec<_> = store
+            .direct_conversations(person, sandbox, name)?
+            .into_iter()
+            .map(|conversation| RoutineChoice {
                 label: if is_home(&conversation.id) {
                     "Home".into()
                 } else {
@@ -171,12 +215,10 @@ impl Hub {
                         .take(32)
                         .collect()
                 },
-            });
-        }
+                id: conversation.id,
+            })
+            .collect();
         choices.reverse();
-        if choices.len() > 4096 {
-            return Err("Too many delivery conversations. Use a different agent.".into());
-        }
         Ok(choices)
     }
 
@@ -194,9 +236,17 @@ impl Hub {
         request
             .validate()
             .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e))?;
-        let deliveries = self
-            .routine_deliveries(store, person, agent)
-            .map_err(|e| failure(original.clone(), ErrorCode::BadMessage, e))?;
+        let deliveries = self.routine_deliveries(store, person, agent).map_err(|e| {
+            eprintln!("enclos app: cannot read the delivery conversations of {agent}: {e}");
+            failure(original.clone(), ErrorCode::Unknown, NOT_READ_BEFORE)
+        })?;
+        if deliveries.len() > MAX_DELIVERIES {
+            return Err(failure(
+                original,
+                ErrorCode::BadMessage,
+                "Too many delivery conversations. Use a different agent.",
+            ));
+        }
         if let Some(target) = request.definition().and_then(|d| d.delivery.as_ref())
             && !deliveries.iter().any(|d| d.id == target.as_str())
         {
@@ -326,13 +376,27 @@ impl Hub {
         person: &str,
         response: ToDevice,
     ) {
-        let paired = store
-            .devices()
-            .unwrap_or_default()
-            .iter()
-            .any(|d| d.id == device && d.person == person);
-        if paired
-            && let Some((owner, sender)) = self.devices.lock().expect("not poisoned").get(device)
+        let response = match store.devices() {
+            Ok(devices) if devices.iter().any(|d| d.id == device && d.person == person) => response,
+            Ok(_) => return,
+            // The pairing cannot be read: the connected device, which the
+            // bridge authenticated, is told only that the outcome is
+            // unknown, never what the runtime answered.
+            Err(e) => {
+                eprintln!("enclos app: cannot read the paired devices to answer {device}: {e}");
+                let of = match &response {
+                    ToDevice::RoutineResponse { reply, .. } => Some(reply.of.clone()),
+                    ToDevice::Error(error) => error.of.clone(),
+                    _ => None,
+                };
+                ToDevice::Error(ErrorBody {
+                    of,
+                    code: ErrorCode::Unknown,
+                    message: NOT_READ_AFTER.into(),
+                })
+            }
+        };
+        if let Some((owner, sender)) = self.devices.lock().expect("not poisoned").get(device)
             && owner == person
         {
             let _ = sender.send(response);
@@ -346,11 +410,21 @@ impl Hub {
         connection: &str,
         mut reply: RoutineReply,
     ) {
-        let mut requests = self.routines.lock().expect("not poisoned");
-        let Some(pending) = requests.pending.get(reply.of.as_str()) else {
-            return;
+        let is_ours = |p: &Pending| p.agent == agent && p.connection == connection;
+        // The request stays pending while the delivery catalogue is read
+        // without the lock, so a retry of it waits instead of reaching the
+        // runtime a second time.
+        let person = {
+            let requests = self.routines.lock().expect("not poisoned");
+            match requests.pending.get(reply.of.as_str()) {
+                Some(p) if is_ours(p) => p.person.clone(),
+                _ => return,
+            }
         };
-        if pending.agent != agent || pending.connection != connection {
+        let canonical = self.routine_deliveries(store, &person, agent);
+        let mut requests = self.routines.lock().expect("not poisoned");
+        // Timed out or disconnected meanwhile: already answered.
+        if !requests.pending.get(reply.of.as_str()).is_some_and(is_ours) {
             return;
         }
         let pending = requests
@@ -359,66 +433,58 @@ impl Hub {
             .expect("looked up");
         let key = reply.of.to_string();
         reply.of = pending.original.clone();
-        let canonical = self.routine_deliveries(store, &pending.person, agent);
-        let valid = pending.request.accepts(&reply.result)
-            && match &mut reply.result {
-                RoutineResult::List {
-                    routines,
-                    deliveries,
-                    deliveries_limited,
-                    ..
-                } => {
-                    *deliveries = canonical.clone().unwrap_or_default();
-                    deliveries.sort_by_key(|d| !is_home(&d.id));
-                    *deliveries_limited = deliveries.len() > 51;
-                    deliveries.truncate(51);
-                    routines.len() <= PAGE_SIZE
+        let (response, outcome) = match canonical {
+            Err(e) => {
+                eprintln!(
+                    "enclos app: cannot read the delivery conversations of {agent} to check its routine answer: {e}"
+                );
+                // Not kept for a retry: once the database reads again, the
+                // runtime's own replay answers it.
+                drop(requests);
+                audit(store, &pending, "unknown: bridge database unreadable");
+                let error = failure(pending.original, ErrorCode::Unknown, NOT_READ_AFTER);
+                self.deliver_routine_device(
+                    store,
+                    &pending.device,
+                    &pending.person,
+                    ToDevice::Error(error),
+                );
+                return;
+            }
+            Ok(canonical) => {
+                let valid = checked(&pending.request, &mut reply.result, canonical);
+                let saved = match &reply.result {
+                    RoutineResult::Routine { routine } => Some(routine.summary.id.clone()),
+                    _ => None,
+                };
+                let response = ToDevice::RoutineResponse {
+                    agent: agent.into(),
+                    reply,
+                };
+                let valid = valid
+                    && serde_json::to_vec(&response).is_ok_and(|b| b.len() <= MAX_REPLY_BYTES);
+                match (valid, saved) {
+                    (true, Some(id)) => (response, format!("confirmed as {id}")),
+                    (true, None) => (response, "confirmed".to_owned()),
+                    (false, _) => (
+                        ToDevice::Error(failure(
+                            pending.original.clone(),
+                            ErrorCode::BadMessage,
+                            "The runtime returned an invalid or oversized routine response.",
+                        )),
+                        "unknown: invalid response".to_owned(),
+                    ),
                 }
-                RoutineResult::Routine { routine } => {
-                    (!routine.summary.editable || routine.definition.validate().is_ok())
-                        && routine.definition.delivery.as_ref().is_none_or(|id| {
-                            canonical
-                                .as_ref()
-                                .is_ok_and(|ds| ds.iter().any(|d| d.id == id.as_str()))
-                        })
-                }
-                _ => true,
-            };
-        let saved = match &reply.result {
-            RoutineResult::Routine { routine } => Some(routine.summary.id.clone()),
-            _ => None,
-        };
-        let response = ToDevice::RoutineResponse {
-            agent: agent.into(),
-            reply,
-        };
-        let valid =
-            valid && serde_json::to_vec(&response).is_ok_and(|b| b.len() <= MAX_REPLY_BYTES);
-        audit(
-            store,
-            &pending,
-            &match (valid, saved) {
-                (true, Some(id)) => format!("confirmed as {id}"),
-                (true, None) => "confirmed".to_owned(),
-                (false, _) => "unknown: invalid response".to_owned(),
-            },
-        );
-        let response = if valid {
-            response
-        } else {
-            ToDevice::Error(failure(
-                pending.original,
-                ErrorCode::BadMessage,
-                "The runtime returned an invalid or oversized routine response.",
-            ))
+            }
         };
         requests
             .completed
-            .push_back((key, pending.request, response.clone()));
+            .push_back((key, pending.request.clone(), response.clone()));
         while requests.completed.len() > MAX_COMPLETED {
             requests.completed.pop_front();
         }
         drop(requests);
+        audit(store, &pending, &outcome);
         self.deliver_routine_device(store, &pending.device, &pending.person, response);
     }
 
@@ -1012,6 +1078,190 @@ mod tests {
             lines,
             expected.map(|(e, r)| (e.to_owned(), r.to_owned())),
             "a list is not logged"
+        );
+    }
+
+    fn saved_as(id: &str) -> RoutineResult {
+        serde_json::from_value(serde_json::json!({"result":"routine","routine":{"id":id,"revision":"r1","schedule":{"kind":"interval","minutes":5},"enabled":true,"prompt_preview":"hello","delivery_label":"Nowhere","editable":true,"definition":{"prompt":"hello","schedule":{"kind":"interval","minutes":5}}}})).unwrap()
+    }
+
+    fn create() -> RoutineRequest {
+        serde_json::from_value(serde_json::json!({"action":"create","definition":{"prompt":"hello","schedule":{"kind":"interval","minutes":5}}})).unwrap()
+    }
+
+    #[test]
+    fn a_created_routine_whose_id_hides_characters_is_refused_and_never_logged() {
+        let long = "a".repeat(200);
+        for id in [
+            "x\n2026-11-11 routine.delete phone owner@example.com",
+            "x\u{1b}]52;c;cHduZWQ=\u{7}",
+            "x\u{202E}",
+            long.as_str(),
+        ] {
+            let (_dir, hub, store, device, rx) = fixture();
+            let rpc = claim(&hub, &device, "connection", create());
+            hub.routine_response(
+                &store,
+                AGENT,
+                "connection",
+                RoutineReply {
+                    of: rpc,
+                    result: saved_as(id),
+                },
+            );
+            assert!(
+                matches!(
+                    rx.recv().unwrap(),
+                    ToDevice::Error(ErrorBody {
+                        code: ErrorCode::BadMessage,
+                        ..
+                    })
+                ),
+                "{id:?}"
+            );
+            let reasons: Vec<_> = store
+                .log_lines(10)
+                .unwrap()
+                .into_iter()
+                .filter(|l| l.event.starts_with("routine."))
+                .filter_map(|l| l.reason)
+                .collect();
+            assert_eq!(reasons, ["lab/coder new unknown: invalid response"]);
+        }
+    }
+
+    #[test]
+    fn a_list_leaves_out_a_routine_whose_id_hides_characters() {
+        let (_dir, hub, store, device, rx) = fixture();
+        let mut result = list_result();
+        if let RoutineResult::List { routines, .. } = &mut result {
+            let RoutineResult::Routine { routine } = saved_as("good") else {
+                unreachable!()
+            };
+            let mut bad = routine.summary.clone();
+            bad.id = "bad\u{1b}[2J".into();
+            routines.extend([routine.summary, bad]);
+        }
+        let rpc = claim(
+            &hub,
+            &device,
+            "connection",
+            RoutineRequest::List { cursor: None },
+        );
+        hub.routine_response(
+            &store,
+            AGENT,
+            "connection",
+            RoutineReply { of: rpc, result },
+        );
+        let ToDevice::RoutineResponse { reply, .. } = rx.recv().unwrap() else {
+            panic!("routine list");
+        };
+        let RoutineResult::List { routines, .. } = reply.result else {
+            panic!("routine list");
+        };
+        assert_eq!(
+            routines.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+    }
+
+    #[test]
+    fn a_device_cannot_name_a_routine_with_hidden_characters() {
+        let (_dir, hub, store, device, _rx) = fixture();
+        let error = hub
+            .routine_request(
+                &store,
+                &device,
+                OWNER,
+                AGENT,
+                MessageId::new("bad-id").unwrap(),
+                RoutineRequest::Run {
+                    routine: "x\n[forged]".into(),
+                    revision: "r1".into(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadMessage);
+        assert!(store.log_lines(10).unwrap().is_empty());
+    }
+
+    /// Breaks the bridge's database under `store` by dropping `table`.
+    fn drop_table(hub: &Hub, table: &str) {
+        rusqlite::Connection::open(&hub.store_path)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA foreign_keys = OFF; DROP TABLE {table};"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_database_failure_is_answered_as_unknown_not_blamed_on_the_runtime() {
+        // Before the request is sent: nothing reaches the runtime.
+        let (_dir, hub, store, device, rx) = fixture();
+        drop_table(&hub, "members");
+        let error = hub
+            .routine_request(
+                &store,
+                &device,
+                OWNER,
+                AGENT,
+                MessageId::new("before").unwrap(),
+                RoutineRequest::List { cursor: None },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unknown);
+        assert!(!error.message.contains("members"), "{}", error.message);
+        // Once the runtime answered, a list or a saved routine.
+        for (request, result) in [
+            (RoutineRequest::List { cursor: None }, list_result()),
+            (create(), saved_as("native-1")),
+        ] {
+            let rpc = claim(&hub, &device, "connection", request);
+            hub.routine_response(
+                &store,
+                AGENT,
+                "connection",
+                RoutineReply { of: rpc, result },
+            );
+            assert!(
+                matches!(rx.recv().unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::Unknown, .. }) if id.as_str() == "app-request")
+            );
+            assert!(hub.routines.lock().unwrap().completed.is_empty());
+        }
+        let reasons: Vec<_> = store
+            .log_lines(10)
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.event.starts_with("routine."))
+            .filter_map(|l| l.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["lab/coder new unknown: bridge database unreadable"]
+        );
+    }
+
+    #[test]
+    fn an_answer_is_not_dropped_when_the_paired_devices_cannot_be_read() {
+        let (_dir, hub, store, device, rx) = fixture();
+        let rpc = claim(
+            &hub,
+            &device,
+            "connection",
+            RoutineRequest::List { cursor: None },
+        );
+        drop_table(&hub, "devices");
+        hub.routine_response(
+            &store,
+            AGENT,
+            "connection",
+            RoutineReply {
+                of: rpc,
+                result: list_result(),
+            },
+        );
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), ToDevice::Error(ErrorBody { of: Some(id), code: ErrorCode::Unknown, .. }) if id.as_str() == "app-request")
         );
     }
 
