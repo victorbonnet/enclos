@@ -4,12 +4,15 @@ ENCLOS_HERMES_SOURCE=/path/to/hermes-agent python3.13 -m unittest discover ...
 Only temporary profile homes are used; no scheduler is started or job executed.
 """
 
+import asyncio
+import contextlib
 import copy
 import importlib
 import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 import uuid
@@ -27,7 +30,8 @@ def definition(**values):
 
 def request(action, **values):
     return {"v": 1, "id": f"routine-{uuid.uuid4()}", "type": "routine.request", "action": action,
-            "allowed_deliveries": ["home.lab.main", "conversation.mine"], **values}
+            "allowed_deliveries": ["home.lab.main", "conversation.mine"],
+            "person": "owner@example.com", "device": "phone-1", **values}
 
 
 class RoutineProtocol(unittest.TestCase):
@@ -53,31 +57,133 @@ class RoutineProtocol(unittest.TestCase):
         with self.assertRaises(protocol.DecodeError):
             protocol.decode_from_bridge(protocol.encode_line(message))
 
-    def test_missing_native_runtime_does_not_advertise_routines(self):
-        with patch.dict(sys.modules, {"cron": None}):
+    def test_a_request_without_the_bridges_requester_is_refused(self):
+        for missing in ("person", "device"):
+            message = request("list")
+            del message[missing]
+            with self.subTest(missing=missing), self.assertRaises(protocol.DecodeError):
+                protocol.decode_from_bridge(protocol.encode_line(message))
+
+    def test_missing_native_runtime_does_not_advertise_routines_and_says_why(self):
+        with patch.dict(sys.modules, {"cron": None}), self.assertLogs("enclos.routines", "WARNING") as logs:
             manager = routines.Manager("/unused/socket")
             self.assertFalse(manager.available)
+            self.assertTrue(manager.unavailable.startswith("ModuleNotFoundError"), manager.unavailable)
+            self.assertIn("App routines are off", logs.output[0])
             with self.assertRaises(routines.RoutineError) as error:
                 manager.handle(request("run", routine="native", revision="r"))
             self.assertEqual(error.exception.code, "unsupported")
 
 
+class FakeJobs:
+    """Hermes's `cron.jobs` as far as creation uses it, in memory."""
+
+    def __init__(self):
+        self.jobs = {}
+
+    @contextlib.contextmanager
+    def _jobs_lock(self):
+        yield
+
+    @contextlib.contextmanager
+    def use_cron_store(self, home):
+        yield
+
+    def list_jobs(self, include_disabled=False):
+        return [copy.deepcopy(job) for job in self.jobs.values()]
+
+    def get_job(self, job_id):
+        return copy.deepcopy(self.jobs.get(job_id))
+
+    def create_job(self, schedule, **fields):
+        job_id = f"job-{len(self.jobs) + 1}"
+        minutes = int(schedule.removeprefix("every ").removesuffix("m"))
+        self.jobs[job_id] = {"id": job_id, "enabled": True, "schedule": {"kind": "interval", "minutes": minutes}, **fields}
+        return copy.deepcopy(self.jobs[job_id])
+
+
+class AppMadeRoutines(unittest.TestCase):
+    """Creation's attribution and bound, without a Hermes checkout."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        with patch.dict(sys.modules, {"cron": None}), self.assertLogs("enclos.routines", "WARNING"):
+            self.manager = routines.Manager(str(Path(self.temporary.name) / "main.sock"))
+        self.manager.jobs = FakeJobs()
+        self.manager.constants = types.SimpleNamespace(set_hermes_home_override=lambda home: None,
+                                                       reset_hermes_home_override=lambda token: None)
+        self.manager.home = Path(self.temporary.name)
+        self.manager.parameters = {"prompt", "schedule", "name", "deliver", "origin"}
+        self.manager.provider = lambda: Mock()
+        self.manager.home_channel = "home.lab.main"
+
+    def create(self, request_id):
+        return self.manager.handle(request("create", id=request_id, definition=definition()))["routine"]
+
+    def test_a_created_routine_keeps_who_made_it_from_which_device(self):
+        routine = self.create("create-1")
+        origin = self.manager.jobs.jobs[routine["id"]]["origin"]
+        self.assertEqual((origin["_enclos_person"], origin["_enclos_device"]), ("owner@example.com", "phone-1"))
+
+    def test_app_made_routines_are_capped_per_agent_and_the_agents_own_do_not_count(self):
+        self.manager.jobs.create_job(schedule="every 60m", prompt="its own", name=None, deliver="local", origin=None)
+        with patch.object(routines, "MAX_APP_ROUTINES", 2):
+            self.create("create-1")
+            self.create("create-2")
+            with self.assertRaises(routines.RoutineError) as error:
+                self.create("create-3")
+        self.assertEqual(error.exception.code, "not_allowed")
+        self.assertEqual(len(self.manager.jobs.jobs), 3)
+
+
+def gateway_stand_ins():
+    """The gateway modules the adapter imports, as stand-ins."""
+    config = types.ModuleType("gateway.config")
+    config.Platform = config.PlatformConfig = Mock
+    shared = types.ModuleType("gateway.platforms._shared")
+    shared.get_scoped_secret = Mock(return_value="")
+    base = types.ModuleType("gateway.platforms.base")
+    base.BasePlatformAdapter = object
+    base.SendResult = Mock
+    event = types.ModuleType("gateway.platforms.event")
+    event.MessageEvent = event.MessageType = Mock
+    return {"gateway": types.ModuleType("gateway"), "gateway.config": config,
+            "gateway.platforms": types.ModuleType("gateway.platforms"),
+            "gateway.platforms._shared": shared, "gateway.platforms.base": base,
+            "gateway.platforms.event": event}
+
+
 class TransientReply(unittest.IsolatedAsyncioTestCase):
+    async def test_a_slow_routine_control_does_not_hold_up_the_persons_messages(self):
+        with patch.dict(sys.modules, gateway_stand_ins()):
+            sys.modules.pop("enclos.adapter", None)
+            adapter_module = importlib.import_module("enclos.adapter")
+            adapter = adapter_module.EnclosAdapter.__new__(adapter_module.EnclosAdapter)
+            release = threading.Event()
+
+            def slow(message):
+                release.wait(5)
+                return {"result": "deleted", "routine": "native"}
+
+            adapter._routines = Mock()
+            adapter._routines.handle.side_effect = slow
+            adapter._routine_tasks = set()
+            adapter._write = AsyncMock(return_value=True)
+            adapter._on_message = AsyncMock()
+            await adapter._on_line(protocol.encode_line(
+                request("delete", id="routine-slow", routine="native", revision="r")))
+            line = b'{"v":1,"id":"m1","type":"message.in","conversation":"c-1","person":"p","text":"hi"}\n'
+            await asyncio.wait_for(adapter._on_line(line), 1)
+            adapter._on_message.assert_awaited_once()
+            adapter._write.assert_not_called()
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*adapter._routine_tasks), 5)
+            self.assertEqual(adapter._write.call_args.args[0]["of"], "routine-slow")
+        sys.modules.pop("enclos.adapter", None)
+
     async def test_control_result_is_written_without_chat_outbox(self):
-        config = types.ModuleType("gateway.config")
-        config.Platform = config.PlatformConfig = Mock
-        shared = types.ModuleType("gateway.platforms._shared")
-        shared.get_scoped_secret = Mock(return_value="")
-        base = types.ModuleType("gateway.platforms.base")
-        base.BasePlatformAdapter = object
-        base.SendResult = Mock
-        event = types.ModuleType("gateway.platforms.event")
-        event.MessageEvent = event.MessageType = Mock
-        modules = {"gateway": types.ModuleType("gateway"), "gateway.config": config,
-                   "gateway.platforms": types.ModuleType("gateway.platforms"),
-                   "gateway.platforms._shared": shared, "gateway.platforms.base": base,
-                   "gateway.platforms.event": event}
-        with patch.dict(sys.modules, modules):
+        with patch.dict(sys.modules, gateway_stand_ins()):
             sys.modules.pop("enclos.adapter", None)
             adapter_module = importlib.import_module("enclos.adapter")
             adapter = adapter_module.EnclosAdapter.__new__(adapter_module.EnclosAdapter)
@@ -85,7 +191,9 @@ class TransientReply(unittest.IsolatedAsyncioTestCase):
             adapter._routines.handle.return_value = {"result": "deleted", "routine": "native"}
             adapter._outbox = Mock()
             adapter._write = AsyncMock(return_value=True)
+            adapter._routine_tasks = set()
             await adapter._on_line(protocol.encode_line(request("delete", id="routine-request", routine="native", revision="r")))
+            await asyncio.gather(*adapter._routine_tasks)
             result = adapter._write.call_args.args[0]
             self.assertEqual((result["type"], result["of"], result["result"]),
                              ("routine.response", "routine-request", "deleted"))
@@ -131,6 +239,10 @@ class NativeHermesRoutines(unittest.TestCase):
     def native(self, routine):
         with self.manager._scope():
             return self.manager.jobs.get_job(routine["id"])
+
+    def test_a_created_routine_keeps_who_made_it_from_which_device(self):
+        origin = self.native(self.create())["origin"]
+        self.assertEqual((origin["_enclos_person"], origin["_enclos_device"]), ("owner@example.com", "phone-1"))
 
     def test_real_crud_and_pause_resume_run_queue_do_not_execute(self):
         routine = self.create(toolsets=[], delivery="home.lab.main")

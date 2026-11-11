@@ -315,6 +315,10 @@ pub struct AgentInfo {
     pub avatar: crate::avatar::AvatarMetadata,
     #[serde(default)]
     pub can_edit_avatar: bool,
+    /// Whether this person may manage the agent's routines: the host's
+    /// person only. Absent (an older host) means no.
+    #[serde(default)]
+    pub can_manage_routines: bool,
     /// `<sandbox>/<agent>`.
     pub agent: String,
     pub runtime: String,

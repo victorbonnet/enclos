@@ -15,6 +15,11 @@ pub enum FromBridge {
     RoutineRequest {
         /// Current owner-authorized targets, supplied by the bridge rather than the device.
         allowed_deliveries: Vec<ConversationId>,
+        /// Who asked, from which of their paired devices (its bridge id), as
+        /// the bridge authenticated them: a routine the request creates
+        /// keeps both, so the runtime says where it came from.
+        person: Person,
+        device: String,
         #[serde(flatten)]
         request: Box<crate::routine::RoutineRequest>,
     },

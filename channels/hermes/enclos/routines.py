@@ -10,6 +10,7 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import threading
@@ -17,6 +18,13 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# The most live routines the app may have made for one agent: each runs
+# unattended, so a lost phone cannot schedule work without bound.
+MAX_APP_ROUTINES = 50
+
 
 class RoutineError(Exception):
     def __init__(self, code, message):
@@ -103,6 +111,9 @@ def validate_request(message):
         raise RoutineError("bad_message", "Trusted delivery scope is required.")
     for conversation in allowed:
         _conversation(conversation)
+    # Who asked, as the bridge authenticated them: kept on what they create.
+    if not _text(message.get("person"), "person", 256) or not _text(message.get("device"), "device", 128):
+        raise RoutineError("bad_message", "The requesting person and device are required.")
     action = message.get("action")
     if action not in {"list", "get", "create", "update", "delete", "set_enabled", "run"}:
         raise RoutineError("bad_message", "Unknown routine action.")
@@ -159,32 +170,41 @@ class Manager:
         self._allowed = ContextVar("routine_allowed_deliveries", default=frozenset())
         self._replay_lock = threading.RLock()
         self._replies = OrderedDict()
+        # Why routines are off, said once in the gateway's log: a Hermes
+        # release that renames what this uses turns the capability off.
+        self.unavailable = None
         try:
             from cron import jobs
             import hermes_constants
             from cron.scheduler_provider import CronScheduler, resolve_cron_scheduler
             required = ("create_job", "get_job", "list_jobs", "update_job", "pause_job", "resume_job",
                         "remove_job", "use_cron_store", "_jobs_lock")
-            if not all(callable(getattr(jobs, key, None)) for key in required):
-                return
+            missing = [key for key in required if not callable(getattr(jobs, key, None))]
+            if missing:
+                return self._off(f"cron.jobs has no {', '.join(missing)}")
             # Hermes falls back to a process-only lock without this backend;
             # stale form revisions need the normal cross-process path.
             if not callable(getattr(getattr(jobs, "fcntl", None), "flock", None)):
-                return
+                return self._off("cron.jobs has no fcntl file lock")
             if not all(callable(getattr(hermes_constants, key, None)) for key in
                        ("set_hermes_home_override", "reset_hermes_home_override")):
-                return
+                return self._off("hermes_constants has no home override")
+            parameters = inspect.signature(jobs.create_job).parameters
+            if not {"prompt", "schedule", "name", "deliver", "origin"}.issubset(parameters):
+                return self._off("cron.jobs.create_job takes other parameters")
             self.jobs = jobs
             self.constants = hermes_constants
             self.provider = resolve_cron_scheduler
             self.home = Path(home or hermes_constants.get_hermes_home()).resolve()
-            self.parameters = inspect.signature(jobs.create_job).parameters
-            if not {"prompt", "schedule", "name", "deliver", "origin"}.issubset(self.parameters):
-                self.jobs = None
-                return
+            self.parameters = parameters
             self.run_supported = all(callable(getattr(CronScheduler, key, None)) for key in ("claim_fire", "fire_claimed"))
-        except Exception:
+        except Exception as error:
             self.jobs = None
+            self._off(f"{type(error).__name__}: {error}")
+
+    def _off(self, reason):
+        self.unavailable = reason
+        logger.warning("App routines are off for this Hermes: %s", reason)
 
     @property
     def available(self):
@@ -362,9 +382,17 @@ class Manager:
                 if job and job["origin"].get("_enclos_definition") != fingerprint:
                     raise RoutineError("conflict", "This create request was already used with another definition.")
                 if job is None:
+                    made = sum(1 for item in self.jobs.list_jobs(include_disabled=True)
+                               if isinstance(item.get("origin"), dict) and item["origin"].get("_enclos_request"))
+                    if made >= MAX_APP_ROUTINES:
+                        raise RoutineError("not_allowed", f"This agent already has {MAX_APP_ROUTINES} routines made "
+                                                          "from the app. Delete one before creating another.")
                     fields = self._native_fields(definition)
+                    # Who made it, from where: the routine runs long after,
+                    # and outlives the device that made it.
                     fields["origin"] = {"platform": "enclos", "chat_id": self.home_channel or "",
-                                        "_enclos_request": message["id"], "_enclos_definition": fingerprint}
+                                        "_enclos_request": message["id"], "_enclos_definition": fingerprint,
+                                        "_enclos_person": message["person"], "_enclos_device": message["device"]}
                     job = self.jobs.create_job(**fields)
                 self._save_receipt(message["id"], fingerprint, job)
         # Registration may call back into storage or a remote provider. Never hold the store lock.

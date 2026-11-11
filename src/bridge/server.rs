@@ -415,6 +415,30 @@ impl Hub {
             .map_err(|e| e.to_string())
     }
 
+    /// The agents `person` may reach, as `agents.list` gives them: what
+    /// only the host's person may change says so for that person alone.
+    fn agent_list(&self, store: &Store, person: &str) -> Result<Vec<AgentInfo>, String> {
+        let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
+        let host = self.host.as_deref() == Some(person);
+        let plugins = self.plugins.lock().expect("not poisoned");
+        Ok(self
+            .agents
+            .iter()
+            .map(|a| AgentInfo {
+                avatar: photos.get(&a.name).cloned().unwrap_or_default(),
+                can_edit_avatar: host,
+                can_manage_routines: host,
+                agent: a.name.clone(),
+                runtime: a.runtime.clone(),
+                capabilities: plugins
+                    .get(&a.name)
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_default(),
+                abilities: vec!["read".to_owned(), "chat".to_owned()],
+            })
+            .collect())
+    }
+
     /// Sends conversation `id`, with its name and how far it was read, to
     /// every connected device of `person`: after either changed.
     fn deliver_conversation(&self, store: &Store, person: &str, id: &str) {
@@ -705,17 +729,12 @@ pub fn serve(
         stops: Mutex::new(std::collections::HashSet::new()),
         devices: Mutex::new(HashMap::new()),
     });
-    // Each agent's Home, the host's person's, before anything is sent to it.
+    // Routine requests the runtime leaves unanswered end after a while.
     {
         let hub = Arc::clone(&hub);
-        std::thread::spawn(move || {
-            let Ok(store) = hub.store() else { return };
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                hub.expire_routines(&store);
-            }
-        });
+        std::thread::spawn(move || hub.expire_routines_forever());
     }
+    // Each agent's Home, the host's person's, before anything is sent to it.
     if let (Some(host), Ok(store)) = (hub.host.as_deref(), hub.store()) {
         for agent in &hub.agents {
             let _ = store.ensure_home(&agent.name, host);
@@ -1219,24 +1238,7 @@ fn run_session(
                 }
             }
             FromDevice::Agents => {
-                let photos = store.avatar_metadata().map_err(|e| e.to_string())?;
-                let plugins = hub.plugins.lock().expect("not poisoned");
-                let agents = hub
-                    .agents
-                    .iter()
-                    .map(|a| AgentInfo {
-                        avatar: photos.get(&a.name).cloned().unwrap_or_default(),
-                        can_edit_avatar: hub.host.as_deref() == Some(person),
-                        agent: a.name.clone(),
-                        runtime: a.runtime.clone(),
-                        capabilities: plugins
-                            .get(&a.name)
-                            .map(|(_, c)| c.clone())
-                            .unwrap_or_default(),
-                        abilities: vec!["read".to_owned(), "chat".to_owned()],
-                    })
-                    .collect();
-                drop(plugins);
+                let agents = hub.agent_list(store, person)?;
                 link.send(ToDevice::AgentsList { agents })?;
                 // Each agent's commands, as far as the bridge knows them;
                 // the others come once their plugin connects.

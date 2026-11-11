@@ -126,11 +126,17 @@ impl PluginWriter {
     }
 
     /// A correlated control request retains its stable id across a reconnect.
+    /// A write that fails, a timeout included, may have sent part of the
+    /// line: the connection is shut down then, so that the plugin never
+    /// reads the next line glued to that part, and the reader thread ends
+    /// it as a closed connection.
     pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
-        self.stream
-            .lock()
-            .expect("not poisoned")
-            .write_all(&encode_line(&Envelope::new(id, body)))?;
+        let stream = self.stream.lock().expect("not poisoned");
+        let mut out: &UnixStream = &stream;
+        if let Err(e) = out.write_all(&encode_line(&Envelope::new(id, body))) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -237,6 +243,35 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_closes_the_connection_rather_than_leave_half_a_line() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut writer = PluginWriter {
+            stream: Arc::new(Mutex::new(ours)),
+        };
+        // The plugin reads nothing: a line far larger than the socket's
+        // buffer times out after part of it was written.
+        let conversation = ConversationId::new("c-1").unwrap();
+        let person = Person::new("owner@example.com").unwrap();
+        assert!(
+            writer
+                .message(&conversation, &person, &"x".repeat(4 << 20))
+                .is_err()
+        );
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut partial = Vec::new();
+        let read = std::io::Read::read_to_end(&mut &theirs, &mut partial);
+        assert!(
+            read.is_ok(),
+            "the plugin sees the connection end, not a stalled half line: {read:?}"
+        );
+        assert!(!partial.is_empty() && !partial.ends_with(b"\n"));
     }
 
     #[test]

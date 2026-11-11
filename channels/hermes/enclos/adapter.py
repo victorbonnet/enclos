@@ -71,6 +71,8 @@ class EnclosAdapter(BasePlatformAdapter):
         # By conversation: the person's last message, and when it came, so a
         # file Hermes delivers after a reply (with no reply_to) answers it too.
         self._last_in: dict[str, tuple[str, float]] = {}
+        # Routine controls in progress, kept so that none is collected early.
+        self._routine_tasks: set[asyncio.Task] = set()
         self._routines = routines.Manager(self._path)
         self._routines.dispatch = self._dispatch_routine
         self._routines.runtime = self._routine_runtime
@@ -198,15 +200,28 @@ class EnclosAdapter(BasePlatformAdapter):
         elif kind == "conversation.rename":
             await self._rename(message["conversation"], message["title"])
         elif kind == "routine.request":
-            try:
-                result = await asyncio.to_thread(self._routines.handle, message)
-                await self._write(protocol._message("routine.response", of=message["id"], **result))
-            except routines.RoutineError as error:
-                await self._write(protocol.error(error.code, str(error), message["id"]))
+            # A routine control can wait on Hermes's cron lock, its model
+            # catalogue or its scheduler: it runs beside the connection, so
+            # the person's messages and the bridge's acks are read meanwhile.
+            task = asyncio.create_task(self._routine(message))
+            self._routine_tasks.add(task)
+            task.add_done_callback(self._routine_tasks.discard)
         elif kind == "error":
             logger.warning("[%s] The bridge reported %s: %s", self.name, message["code"], message["message"])
         else:
             await self._write(protocol.error("bad_message", "hello comes once", message["id"]))
+
+    async def _routine(self, message: dict[str, Any]) -> None:
+        """Answers one routine control; the manager serializes them."""
+        try:
+            result = await asyncio.to_thread(self._routines.handle, message)
+            await self._write(protocol._message("routine.response", of=message["id"], **result))
+        except routines.RoutineError as error:
+            await self._write(protocol.error(error.code, str(error), message["id"]))
+        except Exception:
+            logger.warning("[%s] A routine control could not answer", self.name, exc_info=True)
+            await self._write(protocol.error(
+                "conflict", "The operation's outcome is unknown. Refresh before trying again.", message["id"]))
 
     async def _on_message(self, message: dict[str, Any]) -> None:
         # enclos keeps the home channel (the agent's Home): /sethome is
