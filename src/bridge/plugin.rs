@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enclos_protocol::plugin::{
     Capability, ErrorBody, ErrorCode, FromBridge, FromPlugin, decode_from_plugin,
@@ -17,11 +17,13 @@ use enclos_protocol::{
 
 use super::ids::new_id;
 
-/// How long the plugin has to answer the bridge's `hello`.
+/// How long the plugin has, in all, to answer the bridge's `hello`.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a write to the plugin may wait for it to read: the socket is
-/// in the sandbox home, and an agent that never reads must not hold the
-/// bridge.
+/// The longest `hello` the bridge reads: a few names and capabilities.
+const MAX_HELLO_BYTES: usize = 64 * 1024;
+/// How long one write to the plugin may wait for it to read: a plugin that
+/// stops reading must not hold the bridge, which writes to it with its
+/// connections locked.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +80,19 @@ pub fn connect(
     token: &str,
     home: &str,
 ) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    connect_within(socket, token, home, HELLO_TIMEOUT)
+}
+
+/// [`connect`], with `wait` for the whole of the plugin's `hello`: a plugin
+/// that sends it a byte at a time, or never ends its line, is given up on
+/// once `wait` is over.
+fn connect_within(
+    socket: &Path,
+    token: &str,
+    home: &str,
+    wait: Duration,
+) -> Result<(PluginHello, PluginReader, PluginWriter), PluginError> {
+    let deadline = Instant::now() + wait;
     // The folder is in the sandbox home, which the sandbox writes: a link
     // there would send the agent's token to another socket of the host
     refuse_linked_folder(socket)?;
@@ -94,12 +109,11 @@ pub fn connect(
         token: token.to_owned(),
         home: ConversationId::new(home).ok(),
     })?;
-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut reader = PluginReader {
         lines: BufReader::new(stream),
         answers: writer.try_clone()?,
     };
-    let hello = match reader.receive() {
+    let hello = match reader.receive_hello(deadline, wait) {
         Ok(Some(message)) => message,
         Ok(None) => return Err(PluginError::Refused),
         Err(PluginError::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
@@ -219,6 +233,56 @@ fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
 }
 
 impl PluginReader {
+    /// The plugin's first message, by `deadline` whatever it sends until
+    /// then (`wait` is how long it was given), at most [`MAX_HELLO_BYTES`].
+    fn receive_hello(
+        &mut self,
+        deadline: Instant,
+        wait: Duration,
+    ) -> Result<Option<Envelope<FromPlugin>>, PluginError> {
+        use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+        loop {
+            let mut line = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(PluginError::Protocol(format!(
+                        "it did not answer the hello within {} ms",
+                        wait.as_millis()
+                    )));
+                }
+                self.lines.get_ref().set_read_timeout(Some(left))?;
+                let read = match self.lines.fill_buf() {
+                    Ok(read) => read,
+                    Err(e) if matches!(e.kind(), WouldBlock | TimedOut | Interrupted) => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                if read.is_empty() {
+                    return Ok(None);
+                }
+                let (taken, ended) = match read.iter().position(|&b| b == b'\n') {
+                    Some(end) => (end + 1, true),
+                    None => (read.len(), false),
+                };
+                line.extend_from_slice(&read[..taken]);
+                self.lines.consume(taken);
+                if line.len() > MAX_HELLO_BYTES {
+                    return Err(PluginError::Protocol(format!(
+                        "its hello is longer than {MAX_HELLO_BYTES} bytes"
+                    )));
+                }
+                if ended {
+                    break;
+                }
+            }
+            match decode_from_plugin(&line) {
+                Ok(message) => return Ok(Some(message)),
+                Err(DecodeError::UnknownType { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// The next message; `None` once the plugin closed the connection.
     ///
     /// As `docs/protocol.md` says: a line is read up to 1 MiB, and one
@@ -548,6 +612,60 @@ mod tests {
         assert!(matches!(
             connect(&socket, "other", "home.lab.main"),
             Err(PluginError::Refused)
+        ));
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_plugin_that_trickles_its_hello_is_given_up_on_in_time() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A byte at a time, never a line: each read gets something
+            // before a per-read timeout would end it.
+            for _ in 0..40 {
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let refused = connect_within(
+            &socket,
+            "t0ken",
+            "home.lab.main",
+            Duration::from_millis(400),
+        );
+        assert!(
+            matches!(refused, Err(PluginError::Protocol(_))),
+            "{:?}",
+            refused.map(|(hello, ..)| hello)
+        );
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        plugin.join().unwrap();
+    }
+
+    #[test]
+    fn a_hello_longer_than_its_bound_is_refused() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let plugin = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The bridge's hello read first, and the connection kept until
+            // the bridge leaves: closing on unread bytes would reset it.
+            let mut lines = BufReader::new(stream.try_clone().unwrap());
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).unwrap();
+            let _ = stream.write_all(&vec![b'x'; MAX_HELLO_BYTES + 2]);
+            while lines.read_until(b'\n', &mut line).unwrap_or(0) > 0 {}
+        });
+        assert!(matches!(
+            connect(&socket, "t0ken", "home.lab.main"),
+            Err(PluginError::Protocol(_))
         ));
         plugin.join().unwrap();
     }
