@@ -1196,6 +1196,38 @@ fn a_launch_told_to_end_before_its_proxy_runs_starts_nothing() {
     assert_eq!(engine.audit(None).unwrap().len(), entries);
 }
 
+/// A `launch` waits for the state lock longer than a command does, as the
+/// proxy recording itself does, and still ends as soon as it is told to.
+#[test]
+fn a_launch_told_to_end_while_it_waits_for_the_lock_starts_nothing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, engine, _, name) = sandbox_with_services(Some(RuntimeKind::Hermes));
+    stand_in_proxy(&engine, &name);
+    let entries = engine.audit(None).unwrap().len();
+    let held = engine.state.lock().unwrap();
+    let ended = Arc::new(AtomicBool::new(false));
+    let teller = {
+        let ended = Arc::clone(&ended);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            ended.store(true, Ordering::Relaxed);
+        })
+    };
+    let started = std::time::Instant::now();
+    let err = engine
+        .launch_until(&alice(), &name, "gateway", &ended)
+        .unwrap_err();
+    teller.join().unwrap();
+    drop(held);
+    assert!(err.to_string().contains("told to end before"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+    let sessions = engine.state.sessions(&name, true).unwrap();
+    assert!(sessions.iter().all(|s| s.kind == SessionKind::Proxy));
+    assert_eq!(engine.audit(None).unwrap().len(), entries);
+}
+
 #[test]
 fn the_proxy_is_started_once_a_live_proxy_session_is_recorded() {
     let (_dir, engine, _, name) = sandbox_with_services(None);
