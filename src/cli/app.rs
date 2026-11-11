@@ -12,14 +12,15 @@ use super::output;
 use super::runtime::ChannelTarget;
 use enclos::bridge::ids::{new_id, random_bytes};
 use enclos::bridge::keys::bridge_keypair;
-use enclos::bridge::plugin::{PluginError, connect};
+use enclos::bridge::plugin::{PluginError, PluginReader, PluginWriter, connect};
 use enclos::bridge::server::{self, AgentEndpoint};
 use enclos::bridge::store::now;
 use enclos::bridge::store::{From, Store};
 use enclos::bridge::transport::Transport;
-use enclos::engine::Engine;
+use enclos::engine::{Engine, printable_line};
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
+use enclos_protocol::device::ConversationMessage;
 use enclos_protocol::pairing::PairLink;
 use enclos_protocol::plugin::{FromPlugin, OutKind};
 use enclos_protocol::{ConversationId, Person};
@@ -89,9 +90,9 @@ pub fn run(engine: &Engine, by: &Actor, args: AppArgs) -> Result<u8> {
             conversation,
         } => chat(engine, by, target, conversation),
         AppVerb::Serve { port, transport } => serve(engine, port, transport),
-        AppVerb::Pair { url, transport } => pair(engine, url, transport),
+        AppVerb::Pair { url, transport } => pair(engine, by, url, transport),
         AppVerb::Devices | AppVerb::Status => devices(engine),
-        AppVerb::Unpair { device } => unpair(engine, &device),
+        AppVerb::Unpair { device } => unpair(engine, by, &device),
         AppVerb::Log { lines } => log(engine, lines),
     }
 }
@@ -154,7 +155,7 @@ fn terminal_qr(drawn: &str) -> String {
         .join("\n")
 }
 
-fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8> {
+fn pair(engine: &Engine, by: &Actor, url: Option<String>, transport: Transport) -> Result<u8> {
     let url = url.or_else(|| transport.address()).ok_or_else(|| {
         failed(format!(
             "cannot read the bridge's address from {transport}: give it with --url {}",
@@ -207,8 +208,10 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
         std::thread::sleep(std::time::Duration::from_secs(1));
     };
     print!(
-        "{} ({transport} login: {}) wants to pair. Accept? [y/N] ",
-        request.name, request.person
+        "{} ({transport} login: {}, node: {}) wants to pair. Accept? [y/N] ",
+        shown(&request.name),
+        shown(&request.person),
+        shown(&request.node)
     );
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
@@ -219,36 +222,80 @@ fn pair(engine: &Engine, url: Option<String>, transport: Transport) -> Result<u8
     let accept = matches!(answer.trim(), "y" | "Y" | "yes");
     let left =
         || failed("the device left before it was paired: run `enclos app pair` again".to_owned());
-    if !store
-        .decide_pairing(&code, if accept { "accept" } else { "decline" })
-        .map_err(|e| failed(e.to_string()))?
-    {
-        // The bridge had its word first: the device left.
-        return Err(left());
-    }
     if !accept {
+        if !store
+            .decide_pairing(&code, "decline")
+            .map_err(|e| failed(e.to_string()))?
+        {
+            return Err(left());
+        }
         println!("Declined: the device is not paired.");
         return Ok(exit::OK);
     }
-    // Paired once the device has its answer, which the bridge says.
-    for _ in 0..20 {
-        match store
-            .pairing_decision(&code)
-            .map_err(|e| failed(e.to_string()))?
-            .as_deref()
-        {
-            Some("paired") => {
-                println!("Paired.");
-                return Ok(exit::OK);
+    // The bridge stores the device only once it reads `accept`, which is
+    // written inside the audit entry
+    let target = format!(
+        "{} ({}, node {})",
+        request.name, request.person, request.node
+    );
+    let device = engine.app_access(
+        by,
+        "app pair",
+        target,
+        |device: &String| format!("paired as device {device}"),
+        || {
+            if !store
+                .decide_pairing(&code, "accept")
+                .map_err(|e| failed(e.to_string()))?
+            {
+                // The bridge had its word first: the device left.
+                return Err(left());
             }
-            Some("gone") => return Err(left()),
-            _ => std::thread::sleep(std::time::Duration::from_millis(500)),
-        }
-    }
-    Err(failed(
-        "accepted, but the bridge did not answer the device: is `enclos app serve` running?"
-            .to_owned(),
-    ))
+            // Paired once the device has its answer, which the bridge says.
+            for _ in 0..20 {
+                match store
+                    .pairing_decision(&code)
+                    .map_err(|e| failed(e.to_string()))?
+                    .as_deref()
+                {
+                    Some("paired") => {
+                        // The bridge records the device it made
+                        return store
+                            .paired_device(&code)
+                            .map_err(|e| failed(e.to_string()))?
+                            .ok_or_else(|| {
+                                failed(
+                                    "the bridge paired a device but did not say which".to_owned(),
+                                )
+                            });
+                    }
+                    Some("gone") => return Err(left()),
+                    _ => std::thread::sleep(std::time::Duration::from_millis(500)),
+                }
+            }
+            Err(failed(
+                "accepted, but the bridge did not answer the device: is `enclos app serve` running?"
+                    .to_owned(),
+            ))
+        },
+    )?;
+    println!("Paired: device {device}.");
+    Ok(exit::OK)
+}
+
+/// Text a device or a caller chose, as the terminal shows it: controls
+/// escaped, so it cannot move the cursor or redraw a line, then what
+/// `output::for_terminal` escapes (invisible and bidirectional marks). The
+/// bridge keeps names plain already; this covers rows stored before it did.
+fn shown(text: &str) -> String {
+    let escaped: String = text
+        .chars()
+        .map(|c| match c {
+            '\u{0}'..='\u{1f}' => format!("\\u{:04x}", c as u32),
+            c => c.to_string(),
+        })
+        .collect();
+    output::for_terminal(&escaped)
 }
 
 fn when(seconds: Option<i64>) -> String {
@@ -297,8 +344,8 @@ fn devices(engine: &Engine) -> Result<u8> {
         println!(
             "{}  {}  {}  paired {}, seen {}",
             d.id,
-            d.name,
-            d.person,
+            shown(&d.name),
+            shown(&d.person),
             when(Some(d.paired)),
             when(d.seen)
         );
@@ -306,24 +353,29 @@ fn devices(engine: &Engine) -> Result<u8> {
     Ok(exit::OK)
 }
 
-fn unpair(engine: &Engine, device: &str) -> Result<u8> {
+fn unpair(engine: &Engine, by: &Actor, device: &str) -> Result<u8> {
     let store = open_store(engine)?;
-    match store
-        .remove_device(device)
-        .map_err(|e| failed(e.to_string()))?
-    {
-        true => {
-            let _ = store.log(Some(device), None, "unpaired", None);
-            match output::json() {
-                true => output::emit(&json!({"device": device, "removed": true})),
-                false => println!("Device {device} removed: it can no longer connect."),
-            }
-            Ok(exit::OK)
-        }
-        false => Err(failed(format!(
-            "no paired device {device}: `enclos app devices` lists them"
-        ))),
+    // A connected device's session ends once its row is gone: the bridge
+    // looks for it before each message
+    engine.app_access(
+        by,
+        "app unpair",
+        device.to_owned(),
+        |_| "removed: it can no longer connect".to_owned(),
+        || match store.remove_device(device) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(failed(format!(
+                "no paired device {device}: `enclos app devices` lists them"
+            ))),
+            Err(e) => Err(failed(e.to_string())),
+        },
+    )?;
+    let _ = store.log(Some(device), None, "unpaired", None);
+    match output::json() {
+        true => output::emit(&json!({"device": device, "removed": true})),
+        false => println!("Device {device} removed: it can no longer connect."),
     }
+    Ok(exit::OK)
 }
 
 fn log(engine: &Engine, lines: i64) -> Result<u8> {
@@ -346,9 +398,11 @@ fn log(engine: &Engine, lines: i64) -> Result<u8> {
             "{}  {}  {}  {}{}",
             when(Some(line.at)),
             line.event,
-            line.device.as_deref().unwrap_or("-"),
-            line.person.as_deref().unwrap_or("-"),
-            line.reason.map(|r| format!("  ({r})")).unwrap_or_default()
+            shown(line.device.as_deref().unwrap_or("-")),
+            shown(line.person.as_deref().unwrap_or("-")),
+            line.reason
+                .map(|r| format!("  ({})", shown(&r)))
+                .unwrap_or_default()
         );
     }
     Ok(exit::OK)
@@ -374,7 +428,7 @@ fn chat(
     };
     let conversation = ConversationId::new(conversation)
         .map_err(|e| failed(format!("not a conversation id: {e}")))?;
-    let (_, _, owner) = store
+    let (with_sandbox, with_agent, owner) = store
         .conversation(
             conversation.as_str(),
             sandbox.as_str(),
@@ -382,56 +436,36 @@ fn chat(
             person.as_str(),
         )
         .map_err(|e| failed(format!("cannot record the conversation: {e}")))?;
-    if owner != person.as_str() {
-        return Err(failed(format!(
-            "conversation {conversation} is {owner}'s, not yours"
-        )));
-    }
+    resumable(
+        conversation.as_str(),
+        (&with_sandbox, &with_agent, &owner),
+        (sandbox.as_str(), &agent, person.as_str()),
+    )
+    .map_err(failed)?;
     let plugin_error = |e: PluginError| failed(e.to_string());
     let (hello, mut reader, mut writer) =
         connect(&endpoint.socket, endpoint.token.expose()).map_err(plugin_error)?;
     eprintln!(
         "Talking to {sandbox}/{agent} ({}) in conversation {conversation}; Ctrl-D to stop.",
-        hello.runtime
+        printable_line(&hello.runtime)
     );
 
     // What the agent sends, printed as it comes and stored, then
     // acknowledged so its plugin drops it from its outbox.
     let store_path = engine.app_store_path();
     let mut acks = writer_ack(&mut writer)?;
+    let (with, at) = (sandbox.to_string(), agent.clone());
     let printer = std::thread::spawn(move || -> std::result::Result<(), String> {
         let store = Store::open(&store_path).map_err(|e| e.to_string())?;
-        while let Some(message) = reader.receive().map_err(|e| e.to_string())? {
-            if let FromPlugin::MessageOut {
-                conversation,
-                text,
-                kind,
-                ..
-            } = &message.body
-            {
-                let kind = match kind {
-                    OutKind::Reply => "reply",
-                    OutKind::Notify => "notify",
-                };
-                let new = store
-                    .add(
-                        message.id.as_str(),
-                        conversation.as_str(),
-                        &From::Agent,
-                        text,
-                        kind,
-                    )
-                    .map_err(|e| e.to_string())?;
-                if new.is_some() {
-                    match kind {
-                        "notify" => println!("\n[{conversation}, on its own] {text}"),
-                        _ => println!("\n{text}"),
-                    }
-                }
-                acks.ack(&message.id).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(())
+        let stdout = std::io::stdout();
+        read_agent(
+            &mut reader,
+            &store,
+            &mut acks,
+            &mut stdout.lock(),
+            &with,
+            &at,
+        )
     });
 
     for line in std::io::stdin().lock().lines() {
@@ -443,22 +477,137 @@ fn chat(
         let id = writer
             .message(&conversation, &person, text)
             .map_err(plugin_error)?;
+        let whole = ConversationMessage {
+            conversation: conversation.clone(),
+            agent: format!("{sandbox}/{agent}"),
+            from: person.to_string(),
+            text: text.to_owned(),
+            kind: "message".to_owned(),
+            time: now(),
+            seq: 0,
+        };
         store
-            .add(
-                id.as_str(),
+            .add_pieces(
+                &server::pieces(&id, &whole).map_err(failed)?,
                 conversation.as_str(),
                 &From::Person(person.to_string()),
-                text,
                 "message",
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
     }
+    // End of input: close the connection itself, so the reading thread
+    // sees its end and the plugin is free for the bridge.
+    writer.shutdown();
     drop(writer);
     match printer.join() {
         Ok(Ok(())) => Ok(exit::OK),
         Ok(Err(e)) => Err(failed(e)),
         Err(_) => Err(failed("the reading thread stopped".to_owned())),
     }
+}
+
+/// Whether a conversation, as stored (`sandbox`, `agent`, owner), may go
+/// on with this agent for this person. A conversation is one exchange with
+/// one agent: another agent's replies would land in its history.
+fn resumable(
+    conversation: &str,
+    stored: (&str, &str, &str),
+    wanted: (&str, &str, &str),
+) -> std::result::Result<(), String> {
+    let (sandbox, agent, owner) = stored;
+    if owner != wanted.2 {
+        return Err(format!(
+            "conversation {conversation} is {owner}'s, not yours"
+        ));
+    }
+    if (sandbox, agent) != (wanted.0, wanted.1) {
+        return Err(format!(
+            "conversation {conversation} is with {sandbox}/{agent}: carry it on with `enclos app chat {sandbox}/{agent} --conversation {conversation}`"
+        ));
+    }
+    Ok(())
+}
+
+/// What the agent sends, until its plugin closes the connection: each
+/// message stored, printed to `out` and acknowledged, so the plugin drops
+/// it from its outbox. Only messages in a conversation of this agent's
+/// (`sandbox`/`agent`) are kept: one naming another agent's conversation
+/// is acknowledged and dropped, with a note, since its history is not this
+/// agent's to write. The text is the sandbox's, so it is printed escaped,
+/// line by line; the stored text stays as sent.
+fn read_agent(
+    reader: &mut PluginReader,
+    store: &Store,
+    acks: &mut PluginWriter,
+    out: &mut impl std::io::Write,
+    sandbox: &str,
+    agent: &str,
+) -> std::result::Result<(), String> {
+    while let Some(message) = reader.receive().map_err(|e| e.to_string())? {
+        let FromPlugin::MessageOut {
+            conversation,
+            text,
+            kind,
+            ..
+        } = &message.body
+        else {
+            continue;
+        };
+        let kind = match kind {
+            OutKind::Reply => "reply",
+            OutKind::Notify => "notify",
+        };
+        let ours = store
+            .conversation_of(conversation.as_str())
+            .map_err(|e| e.to_string())?
+            .is_some_and(|(s, a, _)| s == sandbox && a == agent);
+        let shown = |text: &str| {
+            text.split('\n')
+                .map(printable_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if !ours {
+            let _ = writeln!(
+                out,
+                "\n[dropped: {sandbox}/{agent} sent a message to conversation {}, which is not one of its own]",
+                printable_line(conversation.as_str())
+            );
+        } else if store
+            .add_pieces(
+                // In pieces a device can sync
+                &server::pieces(
+                    &message.id,
+                    &ConversationMessage {
+                        conversation: conversation.clone(),
+                        agent: format!("{sandbox}/{agent}"),
+                        from: "agent".to_owned(),
+                        text: text.clone(),
+                        kind: kind.to_owned(),
+                        time: now(),
+                        seq: 0,
+                    },
+                )?,
+                conversation.as_str(),
+                &From::Agent,
+                kind,
+            )
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            let _ = match kind {
+                "notify" => writeln!(
+                    out,
+                    "\n[{}, on its own] {}",
+                    printable_line(conversation.as_str()),
+                    shown(text)
+                ),
+                _ => writeln!(out, "\n{}", shown(text)),
+            };
+        }
+        acks.ack(&message.id).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// A second writer on the same connection, for the acknowledgements the
@@ -469,4 +618,154 @@ fn writer_ack(
     writer.try_clone().map_err(|e| Error::Session {
         what: format!("cannot share the connection to the agent: {e}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stand-in plugin: answers the hello, sends `messages`, and closes
+    /// once each is acknowledged; the acknowledged ids come back.
+    fn plugin_sending(
+        socket: &std::path::Path,
+        messages: Vec<(&'static str, &'static str, &'static str, OutKind)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use enclos_protocol::plugin::{FromBridge, decode_from_bridge};
+        use enclos_protocol::{Envelope, MessageId, encode_line};
+        use std::io::Write;
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut lines = std::io::BufReader::new(stream);
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).unwrap();
+            let mut send = |id: &str, body: FromPlugin| {
+                out.write_all(&encode_line(&Envelope::new(
+                    MessageId::new(id).unwrap(),
+                    body,
+                )))
+                .unwrap();
+            };
+            send(
+                "h-1",
+                FromPlugin::Hello {
+                    runtime: "hermes".into(),
+                    agent: "main".into(),
+                    capabilities: vec![],
+                },
+            );
+            for (id, conversation, text, kind) in &messages {
+                send(
+                    id,
+                    FromPlugin::MessageOut {
+                        conversation: ConversationId::new(*conversation).unwrap(),
+                        text: (*text).into(),
+                        kind: *kind,
+                        reply_to: None,
+                    },
+                );
+            }
+            let mut acked = Vec::new();
+            while acked.len() < messages.len() {
+                line.clear();
+                if lines.read_until(b'\n', &mut line).unwrap() == 0 {
+                    break;
+                }
+                if let FromBridge::Ack { of } = decode_from_bridge(&line).unwrap().body {
+                    acked.push(of.as_str().to_owned());
+                }
+            }
+            acked
+        })
+    }
+
+    #[test]
+    fn the_chat_keeps_its_agents_messages_only_and_prints_them_escaped() {
+        let folder = tempfile::tempdir().unwrap();
+        let socket = folder.path().join("main.sock");
+        let store = Store::open(&folder.path().join("app.db")).unwrap();
+        store
+            .conversation("c-1", "lab", "main", "victor@mac")
+            .unwrap();
+        store
+            .conversation("home.work.default", "work", "default", "victor@mac")
+            .unwrap();
+        let plugin = plugin_sending(
+            &socket,
+            vec![
+                (
+                    "m-1",
+                    "c-1",
+                    "line one\nline two \x1b]52;c;cGFzdGU=\x07\u{202e}",
+                    OutKind::Reply,
+                ),
+                (
+                    "m-2",
+                    "home.work.default",
+                    "I am work/default",
+                    OutKind::Notify,
+                ),
+                ("m-3", "c-1", "the weather", OutKind::Notify),
+            ],
+        );
+        let (_, mut reader, writer) = connect(&socket, "t0ken").unwrap();
+        let mut acks = writer.try_clone().unwrap();
+        let mut printed = Vec::new();
+        let done = std::thread::spawn(move || {
+            let r = read_agent(&mut reader, &store, &mut acks, &mut printed, "lab", "main");
+            (r, printed, store)
+        });
+        // Every message is acknowledged, the dropped one included
+        assert_eq!(plugin.join().unwrap(), ["m-1", "m-2", "m-3"]);
+        writer.shutdown();
+        let (ended, printed, store) = done.join().unwrap();
+        ended.unwrap();
+        let printed = String::from_utf8(printed).unwrap();
+        // Line breaks kept, the escape and the override shown, not run
+        assert!(printed.contains("line one\nline two "), "{printed}");
+        assert!(
+            !printed.contains('\x1b') && !printed.contains('\u{202e}'),
+            "{printed}"
+        );
+        assert!(printed.contains("\\u{1b}]52"), "{printed}");
+        assert!(
+            printed.contains("[c-1, on its own] the weather"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("[dropped: lab/main sent a message to conversation home.work.default"),
+            "{printed}"
+        );
+        assert!(!printed.contains("I am work/default"), "{printed}");
+        // Stored: this agent's two, as sent; nothing in work/default's
+        let mine = store.since("victor@mac", 0).unwrap();
+        assert_eq!(
+            mine.iter()
+                .map(|m| m.conversation.as_str())
+                .collect::<Vec<_>>(),
+            ["c-1", "c-1"]
+        );
+        assert!(mine[0].text.contains('\x1b'));
+    }
+
+    #[test]
+    fn text_from_a_device_cannot_redraw_the_terminal() {
+        assert_eq!(shown("Pixel 9"), "Pixel 9");
+        assert_eq!(
+            shown("Pixel\r\x1b[2Kok\u{202e}"),
+            "Pixel\\u000d\\u001b[2Kok\\u202e"
+        );
+    }
+
+    #[test]
+    fn a_conversation_goes_on_only_with_its_own_agent_and_person() {
+        let stored = ("lab", "main", "victor@mac");
+        assert!(resumable("c-1", stored, ("lab", "main", "victor@mac")).is_ok());
+        let other_agent = resumable("c-1", stored, ("lab", "scout", "victor@mac")).unwrap_err();
+        assert!(other_agent.contains("is with lab/main"), "{other_agent}");
+        assert!(resumable("c-1", stored, ("work", "main", "victor@mac")).is_err());
+        let other_person = resumable("c-1", stored, ("lab", "main", "alice@mac")).unwrap_err();
+        assert!(other_person.contains("victor@mac's"), "{other_person}");
+    }
 }

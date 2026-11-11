@@ -2,10 +2,27 @@
 //! socket in the sandbox home, one JSON object per line
 //! (`docs/protocol.md`, The plugin leg).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::{DecodeError, Envelope, decode};
-use crate::ids::{ConversationId, MessageId, Person};
+use crate::ids::{self, ConversationId, MessageId, Person};
+
+/// A name the sandbox sends, which the host may print: the id rule.
+fn name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    ids::check(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+/// Text for people, which the host may print: no control character, so it
+/// cannot move a terminal's cursor or break a log's line.
+fn line<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom("holds a control character"));
+    }
+    Ok(value)
+}
 
 /// What the bridge sends to a plugin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +62,11 @@ pub enum FromPlugin {
     /// The plugin's answer to the bridge's `hello`.
     #[serde(rename = "hello")]
     Hello {
+        /// The runtime's name (`hermes`), by the id rule.
+        #[serde(deserialize_with = "name")]
         runtime: String,
+        /// The agent's name in its runtime (`main`), by the id rule.
+        #[serde(deserialize_with = "name")]
         agent: String,
         capabilities: Vec<Capability>,
     },
@@ -155,6 +176,8 @@ pub struct ErrorBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub of: Option<MessageId>,
     pub code: ErrorCode,
+    /// For people, may be shown: one line, no control character.
+    #[serde(deserialize_with = "line")]
     pub message: String,
 }
 
