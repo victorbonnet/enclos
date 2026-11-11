@@ -275,9 +275,13 @@ class EnclosAdapter(BasePlatformAdapter):
 
     async def _send_files(self, chat_id: str, paths: list[tuple[str, Optional[str]]], text: str,
                           reply_to: Optional[str]) -> SendResult:
-        files = [a for a in (self._stage(p, n) for p, n in paths) if a]
+        staged = [(p, n, self._stage(p, n)) for p, n in paths]
+        files = [a for _, _, a in staged if a]
         if not files and not text:
             return SendResult(success=False, error="the file could not be sent")
+        # The person sees that a file is missing, not only the log.
+        text = protocol.with_files_not_sent(
+            text, [n or os.path.basename(p) for p, n, a in staged if not a])
         # Hermes delivers a reply's files apart from its text, without saying
         # what they answer: within minutes of the person's message, they answer
         # it; otherwise (a cron job's) they come on their own.
@@ -332,8 +336,17 @@ class EnclosAdapter(BasePlatformAdapter):
     ) -> SendResult:
         # A local markdown image (`![x](cache/generated/images/y.png)`), which
         # Hermes does not take for a file: sent as one, out of the text.
-        rest, images = protocol.local_images(content)
-        files = [(found, None) for found in (self._local_image(p) for _, p in images) if found]
+        # An image Hermes may not send stays in the text, as the agent wrote it.
+        sendable: dict[str, str] = {}
+
+        def take(path: str) -> bool:
+            found = self._local_image(path)
+            if found:
+                sendable[path] = found
+            return found is not None
+
+        rest, images = protocol.local_images(content, take)
+        files = [(sendable[p], None) for _, p in images]
         if files:
             return await self._send_files(chat_id, files, rest, reply_to)
         message = protocol.message_out(chat_id, content, reply_to)
