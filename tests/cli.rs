@@ -3419,6 +3419,39 @@ fn an_unknown_template_is_refused_with_the_ones_there_are() {
     assert!(!home.root.join("sandboxes/lab").exists());
 }
 
+/// `sandbox create --template autonomous` says, on standard error, that
+/// the sandbox may change or remove the user's own files (ADR 0058),
+/// and `policy show` names the whole filesystem, the read-only paths and
+/// every port.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_autonomous_sandbox_is_created_with_a_warning_and_shows_what_it_may_do() {
+    let home = Home::new();
+    home.init(1);
+    let out = home.run(&["sandbox", "create", "keeper", "--template", "autonomous"]);
+    out.ok();
+    assert!(
+        out.stderr()
+            .contains("warning: the autonomous template lets the sandbox write wherever you can"),
+        "{}",
+        out.stderr()
+    );
+    assert!(
+        out.stdout().contains("template autonomous"),
+        "{}",
+        out.stdout()
+    );
+    let shown = home.run(&["policy", "show", "keeper"]).ok().stdout();
+    assert!(shown.contains("writable:   /"), "{shown}");
+    assert!(shown.contains("read-only:"), "{shown}");
+    assert!(shown.contains("~/.zshrc"), "{shown}");
+    assert!(shown.contains("any public address on any port"), "{shown}");
+    // Another template says nothing of it.
+    let out = home.run(&["sandbox", "create", "lab", "--template", "assistant"]);
+    out.ok();
+    assert!(!out.stderr().contains("autonomous"), "{}", out.stderr());
+}
+
 /// `state check` finds nothing in a new sandbox, names what differs once a
 /// file is gone, and `state repair` puts it back.
 #[cfg(target_os = "macos")]
