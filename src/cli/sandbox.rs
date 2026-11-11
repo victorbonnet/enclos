@@ -30,9 +30,11 @@ enum SandboxVerb {
     /// Create a sandbox with its own home, policy and proxy port.
     Create {
         name: SandboxName,
-        /// The isolation technology.
-        #[arg(long, default_value = "seatbelt")]
-        backend: BackendKind,
+        /// The isolation technology: seatbelt (macOS) or bubblewrap
+        /// (Linux). Without it, the default backend `enclos init` wrote to
+        /// config.toml for this host.
+        #[arg(long)]
+        backend: Option<BackendKind>,
         /// The policy it starts from, required so the widest is never
         /// picked by leaving it out: minimal (only what is listed; from
         /// `runtime install` on, the runtime's hosts) or assistant (the
@@ -92,6 +94,10 @@ pub fn run(engine: &Engine, by: &Actor, confirm: Confirm, args: SandboxArgs) -> 
             backend,
             template,
         } => {
+            let backend = match backend {
+                Some(kind) => kind,
+                None => engine.default_backend()?,
+            };
             let planned = engine.create_sandbox(
                 by,
                 SandboxSpec {

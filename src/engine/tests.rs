@@ -138,6 +138,46 @@ fn init_records_the_first_available_backend() {
     );
 }
 
+/// The backend `sandbox create` takes when it names none: the one
+/// `config.toml` names, whether this host runs it or not; where it names
+/// none or is not there, the first available here; with none available,
+/// this system's own, whose probe then refuses the create.
+#[test]
+fn the_default_backend_is_config_tomls_else_the_first_available_else_the_systems() {
+    let (_dir, mut engine) = engine_with(vec![
+        Box::new(FakeBackend::unavailable(BackendKind::Seatbelt, "not here")),
+        Box::new(FakeBackend::available(BackendKind::Bubblewrap)),
+    ]);
+    // Not initialized: no config.toml.
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    done(engine.init(&alice(), Confirm::Yes).unwrap());
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+
+    let named = crate::config::initial(Some(BackendKind::Seatbelt));
+    std::fs::write(engine.layout.config_file(), named).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Seatbelt);
+
+    std::fs::write(engine.layout.config_file(), crate::config::initial(None)).unwrap();
+    assert_eq!(engine.default_backend().unwrap(), BackendKind::Bubblewrap);
+    engine.backends = vec![Box::new(FakeBackend::unavailable(
+        BackendKind::Bubblewrap,
+        "not here",
+    ))];
+    let system = match cfg!(target_os = "macos") {
+        true => BackendKind::Seatbelt,
+        false => BackendKind::Bubblewrap,
+    };
+    assert_eq!(engine.default_backend().unwrap(), system);
+
+    std::fs::write(engine.layout.config_file(), "not = [toml").unwrap();
+    let err = engine.default_backend().unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::DefaultBackend { .. }),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), crate::error::exit::ERROR);
+}
+
 /// A `config.toml` written while no backend was available gets the one
 /// available now, in place of init's own line for that; one changed by
 /// hand is said to name none and left; one that does not parse is said, and

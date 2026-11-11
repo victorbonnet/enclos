@@ -2,7 +2,7 @@
 
 *enclos* (French for an enclosure, said "ahn-KLOH") creates sandboxes on your machine, installs agent runtimes in them and runs agents there, with a policy and an audit log. It manages only the sandboxes it creates.
 
-> **Status: first release, 0.1.0.** enclos runs [Hermes](https://hermes-agent.nousresearch.com) agents in Seatbelt sandboxes on an Apple silicon Mac. It is early software: read its [known gaps](docs/release-notes/0.1.0.md), and expect state may not carry over between 0.x releases.
+> **Status: 0.3.0, the first release on Linux.** enclos runs [Hermes](https://hermes-agent.nousresearch.com) agents in sandboxes on an Apple silicon Mac, with Seatbelt, and on Linux (Ubuntu 24.04 and 26.04, Debian 13, 64-bit Raspberry Pi OS; x86_64 or arm64), with bubblewrap. It is early software: read the [release notes](docs/release-notes/0.3.0.md) and their known gaps, and expect state may not carry over between 0.x releases.
 
 ## Why
 
@@ -91,7 +91,7 @@ See [architecture](docs/architecture.md) for what runs on your Mac and a session
 
 ## Quick start
 
-On an Apple silicon Mac running macOS 15 or later, with an account with a model provider Hermes supports:
+On an Apple silicon Mac running macOS 15 or later, or on Linux with systemd 254 or later, bubblewrap 0.9.0 or later and user namespaces (the [Linux requirements](docs/getting-started.md#linux-requirements) say how to set each up), with an account with a model provider Hermes supports. The commands are the same on both: `enclos init` picks the backend this host runs, and `sandbox create` uses it.
 
 ```bash
 curl -fsSL https://enclos.dev/install.sh | bash
@@ -106,7 +106,7 @@ enclos connect lab -- main                     # talk to the agent, with Hermes'
 enclos net log lab                             # what it connected to
 ```
 
-The installer always takes the latest release: it checks the archive's SHA-256 checksum and the binary's version, then replaces `~/.local/bin/enclos` in one step. It never uses sudo, edits your shell startup files or creates enclos state. To build from a clone with Rust instead, run `cargo install --locked --path .`.
+The installer always takes the latest release, for your system and architecture: it checks the archive's SHA-256 checksum and the binary's version, then replaces `~/.local/bin/enclos` in one step. It never uses sudo, edits your shell startup files or creates enclos state. To build from a clone with Rust instead, run `cargo install --locked --path .`.
 
 The [getting started guide](docs/getting-started.md) explains each step and what does not work yet; [releases](docs/releases.md) says how a release is built and checked.
 
@@ -114,7 +114,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 
 | Command | What it does |
 | --- | --- |
-| `enclos init` | Create `~/.enclos`, the state database and the audit log |
+| `enclos init` | Create enclos's folders (`~/.enclos` on macOS), the state database and the audit log, and pick this host's default backend |
 | `enclos status [<sandbox>]` | Every sandbox and agent, its size on disk, and what you could do, such as removing an unused sandbox |
 | `enclos sandbox create \| list \| show \| start \| stop \| restart \| rm` | Manage sandboxes and their background services |
 | `enclos runtime install` | Install a runtime in a sandbox |
@@ -131,7 +131,7 @@ The [getting started guide](docs/getting-started.md) explains each step and what
 - [Getting started](docs/getting-started.md): from install to talking to an agent.
 - [Manual end-to-end test](docs/manual-e2e.md): every command, by hand, before a release.
 - [Architecture](docs/architecture.md): what runs where, and the code's components.
-- [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes the Seatbelt file a session runs under, and [every setting](docs/policy-compilation.md#every-setting) it can hold.
+- [Policy compilation](docs/policy-compilation.md): how a `policy.toml` becomes what a session runs under, a Seatbelt profile on macOS or bubblewrap's arguments on Linux, and [every setting](docs/policy-compilation.md#every-setting) it can hold.
 - [Design](docs/design.md): what enclos is meant to be, the threat model, milestones and open questions.
 - [Decisions](docs/adr/): one short record per architecture decision.
 - [Glossary](GLOSSARY.md): the words enclos uses.

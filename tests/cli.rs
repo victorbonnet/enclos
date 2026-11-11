@@ -1160,20 +1160,107 @@ fn policy_edit_applies_the_file_and_keeps_an_edit_it_refuses() {
     assert_eq!(out.code(), 1);
 }
 
+/// Off macOS, a sandbox named with no `--backend` is made on bubblewrap,
+/// the default backend: created where this host runs it (CI's `bubblewrap`
+/// job shows that), else refused naming bubblewrap, never Seatbelt. Named
+/// with `--backend seatbelt`, it is refused.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn a_seatbelt_sandbox_is_refused_off_macos() {
+fn off_macos_a_sandbox_is_made_on_bubblewrap_unless_another_is_named() {
     let home = Home::new();
     home.init(1);
     let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    match out.code() {
+        0 => assert!(
+            out.stdout().contains("Created sandbox home (bubblewrap,"),
+            "{}",
+            out.stdout()
+        ),
+        _ => {
+            assert_eq!(out.code(), 2, "{}", out.stderr());
+            assert!(
+                out.stderr().contains("uses the bubblewrap backend"),
+                "{}",
+                out.stderr()
+            );
+        }
+    }
+    assert!(!out.stderr().contains("seatbelt"), "{}", out.stderr());
+
+    let out = home.run(&[
+        "sandbox",
+        "create",
+        "lab",
+        "--backend",
+        "seatbelt",
+        "--template",
+        "assistant",
+    ]);
     assert_eq!(out.code(), 2, "{}", out.stderr());
-    assert!(out.stderr().contains("cannot run"), "{}", out.stderr());
     assert!(
-        home.run(&["sandbox", "list"])
-            .ok()
-            .stdout()
-            .contains("No sandboxes yet")
+        out.stderr()
+            .contains("uses the seatbelt backend, which this host cannot run"),
+        "{}",
+        out.stderr()
     );
+    assert!(!home.run(&["sandbox", "list"]).ok().stdout().contains("lab"));
+}
+
+/// The backend this system does not run.
+#[cfg(target_os = "macos")]
+const OTHER_BACKEND: &str = "bubblewrap";
+#[cfg(not(target_os = "macos"))]
+const OTHER_BACKEND: &str = "seatbelt";
+
+/// With no `--backend`, `sandbox create` takes the default backend
+/// `config.toml` names, as `init` wrote it or as the user changed it; one
+/// it cannot read is named, with nothing made.
+#[test]
+fn a_sandbox_is_made_on_the_default_backend_config_toml_names() {
+    let home = Home::new();
+    home.init(1);
+    let config = home.root.join("config.toml");
+    let written = std::fs::read_to_string(&config).unwrap();
+    assert!(written.contains("default_backend"), "{written}");
+
+    std::fs::write(
+        &config,
+        format!("schema_version = 1\ndefault_backend = \"{OTHER_BACKEND}\"\n"),
+    )
+    .unwrap();
+    for args in [
+        &["sandbox", "create", "home", "--template", "assistant"][..],
+        &[
+            "--dry-run",
+            "sandbox",
+            "create",
+            "home",
+            "--template",
+            "assistant",
+        ],
+    ] {
+        let out = home.run(args);
+        assert_eq!(out.code(), 2, "{args:?}: {}", out.stderr());
+        assert!(
+            out.stderr()
+                .contains(&format!("uses the {OTHER_BACKEND} backend")),
+            "{args:?}: {}",
+            out.stderr()
+        );
+    }
+
+    std::fs::write(&config, "schema_version = 1\ndefault_backend = \"jail\"\n").unwrap();
+    let out = home.run(&["sandbox", "create", "home", "--template", "assistant"]);
+    assert_eq!(out.code(), 1, "{}", out.stderr());
+    assert!(
+        out.stderr()
+            .contains("config.toml names no default backend")
+            && out.stderr().contains("unknown backend `jail`")
+            && out.stderr().contains("--backend"),
+        "{}",
+        out.stderr()
+    );
+    assert!(!home.root.join("sandboxes/home").exists());
 }
 
 /// Where each column of a table line starts: after two spaces or more.
