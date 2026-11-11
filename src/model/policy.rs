@@ -178,8 +178,11 @@ pub struct NetPolicy {
     pub log: NetLog,
     /// Whether the sandbox may bind and accept TCP on any port but enclos's
     /// proxy range (ADR 0028), for a runtime whose service listens, such as
-    /// Hermes's gateway. Nothing holds a listener to loopback: what listens
-    /// in the sandbox can serve the network.
+    /// Hermes's gateway. Who reaches a listener depends on the backend
+    /// (`BackendKind::listening`): on Seatbelt nothing holds it to
+    /// loopback, so it can serve the network; on bubblewrap it is in the
+    /// sandbox's own network namespace, which the host's network does not
+    /// reach (ADR 0040).
     #[serde(default)]
     pub listen: bool,
 }

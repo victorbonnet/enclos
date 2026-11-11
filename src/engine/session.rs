@@ -24,6 +24,7 @@ use crate::lifecycle::process::{
 };
 use crate::lifecycle::stop::{GRACE, Stopped, describe_survivors, stop};
 use crate::model::audit::Actor;
+use crate::model::count;
 use crate::model::plan::{Confirm, Plan, Planned};
 use crate::model::sandbox::{SandboxName, SandboxState};
 use crate::model::session::{Member, ProcessRef, SessionId, SessionRecord};
@@ -279,7 +280,10 @@ impl Engine {
         };
         let summary = |_: &()| match &waited.left {
             Ok(left) if left.is_empty() => format!("exit {exit}"),
-            Ok(left) => format!("exit {exit}, {} processes still running", left.len()),
+            Ok(left) => format!(
+                "exit {exit}, {} still running",
+                count(left.len(), "process", "processes")
+            ),
             Err(_) => format!("exit {exit}, could not look at what it left running"),
         };
         self.write_session_end(by, audit_name, session, summary, |lock| {

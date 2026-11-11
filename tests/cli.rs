@@ -1714,7 +1714,7 @@ fn a_session_stays_open_while_its_command_left_processes_running() {
     let out = home.run(&["connect", "home", "--", "/bin/sh", "-c", script]);
     assert_eq!(out.code(), 0, "{}", out.stderr());
     assert!(
-        out.stderr().contains("left 1 processes running"),
+        out.stderr().contains("left 1 process running"),
         "{}",
         out.stderr()
     );

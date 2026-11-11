@@ -1325,7 +1325,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
     };
     assert!(
         plan.changes
-            .contains(&format!("stop session {id} (proxy, 1 processes)")),
+            .contains(&format!("stop session {id} (proxy, 1 process)")),
         "{plan:?}"
     );
     let report = done(engine.stop_sandbox(&alice(), &name, Confirm::Yes).unwrap());
@@ -1337,7 +1337,7 @@ fn a_stop_counts_the_session_of_a_service_it_removed_as_stopped_not_gone() {
     let finished = entries.last().unwrap().finished.as_ref().unwrap();
     assert_eq!(
         finished.outcome.message,
-        "removed 1 services, stopped 1 sessions"
+        "removed 1 service, stopped 1 session"
     );
     assert_eq!(state_of(&engine, &name), SandboxState::Stopped);
 }
