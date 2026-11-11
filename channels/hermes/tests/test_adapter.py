@@ -1,5 +1,6 @@
 """The adapter over a real Unix socket, with stand-ins for the Hermes classes
-it uses: the long-message and one-bridge-at-a-time paths."""
+it uses: long messages, one bridge at a time, bad lines, and messages the
+bridge cannot read."""
 
 import asyncio
 import json
@@ -30,6 +31,7 @@ def _stub_hermes() -> None:
         def __init__(self, config, platform):
             self.config, self.platform, self.name = config, platform, str(platform)
             self.received = []
+            self.failures = []
 
         def _mark_connected(self):
             pass
@@ -44,6 +46,8 @@ def _stub_hermes() -> None:
             return fields
 
         async def handle_message(self, event):
+            if self.failures:
+                raise self.failures.pop(0)
             self.received.append(event)
 
     class MessageEvent:
@@ -155,6 +159,123 @@ class AdapterTest(unittest.IsolatedAsyncioTestCase):
         sent = json.loads(await asyncio.wait_for(first[0].readline(), 5))
         self.assertEqual((sent["type"], sent["text"]), ("message.out", "hello"))
         first[1].close()
+
+    async def test_the_socket_is_the_users_alone(self):
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+
+    async def test_a_first_line_over_the_limit_or_nested_too_deep_is_closed(self):
+        for first in (b"x" * (protocol.MAX_MESSAGE_BYTES + 10) + b"\n", b"[" * 100_000 + b"\n"):
+            with self.subTest(len(first)):
+                reader, writer = await self.bridge()
+                writer.write(first)
+                await writer.drain()
+                self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
+                writer.close()
+        # The slot is free: a bridge with the token still gets in
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.close()
+
+    async def test_a_line_nested_too_deep_after_the_hello_is_answered_and_the_connection_goes_on(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(b"[" * 100_000 + b"\n")
+        await writer.drain()
+        error = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((error["type"], error["code"]), ("error", "bad_message"))
+        writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="still here"))
+        await writer.drain()
+        ack = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(ack["type"], "ack")
+        writer.close()
+
+    async def test_a_version_it_does_not_speak_ends_the_connection(self):
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(b'{"v":2,"id":"m9","type":"ack","of":"m0"}\n')
+        await writer.drain()
+        error = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual((error["code"], error["of"]), ("version", "m9"))
+        self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
+        writer.close()
+
+    async def test_a_message_the_runtime_did_not_take_is_not_a_duplicate_when_sent_again(self):
+        self.adapter.failures.append(RuntimeError("the runtime is busy"))
+        again = line("message.in", conversation="c-1", person="alice@example.com", text="hi")
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(again)
+        await writer.drain()
+        # The runtime raised: no ack, and the connection ends
+        with self.assertLogs("enclos.adapter", "ERROR"):
+            self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
+        writer.close()
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(again)
+        await writer.drain()
+        ack = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(ack["of"], json.loads(again)["id"])
+        self.assertEqual([e.text for e in self.adapter.received], ["hi"])
+        writer.close()
+
+    async def test_a_value_error_of_the_runtime_is_not_taken_for_a_long_line(self):
+        self.adapter.failures.append(ValueError("the runtime's own"))
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        writer.write(line("message.in", conversation="c-1", person="alice@example.com", text="hi"))
+        await writer.drain()
+        with self.assertLogs("enclos.adapter", "ERROR") as logs:
+            self.assertEqual(await asyncio.wait_for(reader.read(), 5), b"")
+        writer.close()
+        self.assertNotIn("1 MiB", "\n".join(logs.output))
+        self.assertIn("could not be handed to the runtime", logs.output[0])
+
+    async def test_a_message_the_bridge_could_not_read_is_never_kept(self):
+        for chat_id, text in (("", "hi"), ("c" * 129, "hi"), ("c-1\n", "hi"),
+                              ("c-1", "x" * (protocol.MAX_MESSAGE_BYTES + 1))):
+            with self.subTest(chat_id[:8]):
+                with self.assertLogs("enclos.adapter", "WARNING"):
+                    result = await self.adapter.send(chat_id, text, None)
+                self.assertFalse(result.success)
+                self.assertIn("cannot carry", result.error)
+        self.assertEqual(self.adapter._outbox.pending(), [])
+
+    async def test_a_message_the_bridge_refused_leaves_the_outbox(self):
+        result = await self.adapter.send("c-1", "first", None)
+        self.assertTrue(result.success)
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(sent["text"], "first")
+        with self.assertLogs("enclos.adapter", "WARNING") as logs:
+            writer.write(line("error", of=sent["id"], code="bad_message", message="cannot read it"))
+            await writer.drain()
+            await asyncio.sleep(0.05)
+        self.assertIn("set aside", logs.output[-1])
+        writer.close()
+        self.assertEqual(self.adapter._outbox.pending(), [])
+        # The next bridge does not get it again
+        await asyncio.sleep(0.05)
+        reader, writer = await self.bridge()
+        await self.hello(reader, writer)
+        await self.adapter.send("c-1", "second", None)
+        sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(sent["text"], "second")
+        writer.close()
+
+    async def test_a_kept_message_the_bridge_could_not_read_is_set_aside_not_sent(self):
+        bad = protocol.message_out("c" * 129, "kept by an older plugin")
+        good = protocol.message_out("c-1", "fine")
+        self.assertTrue(self.adapter._outbox.put(bad))
+        self.assertTrue(self.adapter._outbox.put(good))
+        reader, writer = await self.bridge()
+        with self.assertLogs("enclos.adapter", "WARNING"):
+            await self.hello(reader, writer)
+            sent = json.loads(await asyncio.wait_for(reader.readline(), 5))
+        self.assertEqual(sent["id"], good["id"])
+        self.assertEqual([m["id"] for m in self.adapter._outbox.pending()], [good["id"]])
+        writer.close()
 
 
 if __name__ == "__main__":
