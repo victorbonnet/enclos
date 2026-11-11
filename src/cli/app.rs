@@ -13,8 +13,8 @@ use enclos::bridge::store::{From, Store};
 use enclos::engine::{Engine, printable_line};
 use enclos::error::{Error, Result, exit};
 use enclos::model::audit::Actor;
-use enclos_protocol::plugin::{FromPlugin, OutKind};
-use enclos_protocol::{ConversationId, Person};
+use enclos_protocol::plugin::{FromBridge, FromPlugin, OutKind};
+use enclos_protocol::{ConversationId, MessageId, Person};
 
 #[derive(Args)]
 pub struct AppArgs {
@@ -113,9 +113,11 @@ fn chat(
         if text.is_empty() {
             continue;
         }
-        let id = writer
-            .message(&conversation, &person, text)
-            .map_err(plugin_error)?;
+        // Stored first, so what the agent has is in the history.
+        let id = new_id()
+            .ok()
+            .and_then(|id| MessageId::new(id).ok())
+            .ok_or_else(|| failed("cannot make a message id".to_owned()))?;
         store
             .add(
                 id.as_str(),
@@ -125,6 +127,16 @@ fn chat(
                 "message",
             )
             .map_err(|e| failed(format!("cannot store your message: {e}")))?;
+        writer
+            .send_with_id(
+                id,
+                FromBridge::MessageIn {
+                    conversation: conversation.clone(),
+                    person: person.clone(),
+                    text: text.to_owned(),
+                },
+            )
+            .map_err(plugin_error)?;
     }
     // End of input: close the connection itself, so the reading thread
     // sees its end and the plugin is free for the bridge.

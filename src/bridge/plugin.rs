@@ -134,10 +134,16 @@ impl PluginWriter {
     /// Sends `body` with a new id, which it returns.
     pub fn send(&mut self, body: FromBridge) -> Result<MessageId, PluginError> {
         let id = MessageId::new(new_id()?).map_err(|e| PluginError::Protocol(e.to_string()))?;
-        let line = encode_line(&Envelope::new(id.clone(), body));
+        self.send_with_id(id.clone(), body)?;
+        Ok(id)
+    }
+
+    /// Sends `body` with `id`, one the bridge made, and stored, first.
+    pub fn send_with_id(&mut self, id: MessageId, body: FromBridge) -> Result<(), PluginError> {
+        let line = encode_line(&Envelope::new(id, body));
         let _held = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         self.stream.write_all(&line)?;
-        Ok(id)
+        Ok(())
     }
 
     /// Answers the plugin's message `of` (when its id could be read) with
@@ -185,22 +191,28 @@ impl PluginWriter {
     }
 }
 
-/// Refuses a socket whose folder is a link (`docs/protocol.md`, the plugin
-/// leg: the bridge sends the agent's token to whatever listens there).
+/// Refuses a socket whose folder, or which itself, is a link
+/// (`docs/protocol.md`, the plugin leg: the bridge sends the agent's token
+/// to whatever listens there). Checked just before connecting: a link put
+/// in place between this check and the connection is not caught.
 fn refuse_linked_folder(socket: &Path) -> Result<(), PluginError> {
     let Some(folder) = socket.parent() else {
         return Ok(());
     };
-    match std::fs::symlink_metadata(folder) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(PluginError::Connect {
-            path: socket.display().to_string(),
-            source: std::io::Error::other(format!(
-                "{} is a link, not the sandbox home's own folder",
-                folder.display()
-            )),
-        }),
-        _ => Ok(()),
+    for (path, what) in [
+        (folder, "the sandbox home's own folder"),
+        (socket, "the channel's own socket"),
+    ] {
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(PluginError::Connect {
+                path: socket.display().to_string(),
+                source: std::io::Error::other(format!("{} is a link, not {what}", path.display())),
+            });
+        }
     }
+    Ok(())
 }
 
 impl PluginReader {
@@ -224,6 +236,9 @@ impl PluginReader {
                 let _ = self
                     .answers
                     .error(None, ErrorCode::BadMessage, "a line over 1 MiB");
+                // Ended now, for every clone of the connection, not when
+                // the last one is dropped.
+                self.answers.shutdown();
                 return Err(PluginError::TooLong);
             }
             match decode_from_plugin(&line) {
@@ -245,6 +260,7 @@ impl PluginReader {
                     let _ =
                         self.answers
                             .error(id, ErrorCode::Version, "this bridge speaks version 1");
+                    self.answers.shutdown();
                     return Err(PluginError::Version(v));
                 }
             }
@@ -485,6 +501,16 @@ mod tests {
         assert!(matches!(reader.receive(), Err(PluginError::TooLong)));
         let error = answer(&lines_back);
         assert_eq!((error.code, error.of), (ErrorCode::BadMessage, None));
+        // Ended for the plugin too, though a writer of it is still held.
+        assert_ended(&lines_back);
+    }
+
+    /// The stand-in plugin saw the connection end, and stopped.
+    fn assert_ended(lines_back: &std::sync::mpsc::Receiver<Vec<u8>>) {
+        assert_eq!(
+            lines_back.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
     }
 
     #[test]
@@ -501,6 +527,7 @@ mod tests {
             (error.code, error.of.unwrap().as_str().to_owned()),
             (ErrorCode::Version, "p-1".to_owned())
         );
+        assert_ended(&lines_back);
     }
 
     #[test]
@@ -517,6 +544,25 @@ mod tests {
         };
         assert!(source.to_string().contains("is a link"), "{source}");
         // The stand-in never got a connection
+        drop(plugin);
+    }
+
+    #[test]
+    fn a_socket_that_is_a_link_is_not_connected_to() {
+        let folder = tempfile::tempdir().unwrap();
+        let elsewhere = folder.path().join("elsewhere.sock");
+        let plugin = echo_plugin(UnixListener::bind(&elsewhere).unwrap(), "t0ken");
+        let own = folder.path().join(".enclos-app");
+        std::fs::create_dir(&own).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, own.join("main.sock")).unwrap();
+        let Err(PluginError::Connect { source, .. }) = connect(&own.join("main.sock"), "t0ken")
+        else {
+            panic!("connected through a link");
+        };
+        assert!(
+            source.to_string().contains("not the channel's own socket"),
+            "{source}"
+        );
         drop(plugin);
     }
 
