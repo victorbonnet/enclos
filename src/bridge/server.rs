@@ -1329,11 +1329,7 @@ fn run_session(
                     link.send(ToDevice::Conversation(info))?;
                     link.send(ToDevice::Ack { of: message.id })?;
                 }
-                Err(e) => link.send(ToDevice::Error(enclos_protocol::plugin::ErrorBody {
-                    of: Some(message.id),
-                    code: enclos_protocol::plugin::ErrorCode::NotAllowed,
-                    message: e,
-                }))?,
+                Err(e) => link.send(ToDevice::Error(e.body(message.id)))?,
             },
             FromDevice::Sync { since } => {
                 if hub.host.as_deref() == Some(person) {
@@ -1578,6 +1574,44 @@ fn conversation_info(store: &Store, c: Conversation) -> Option<ConversationInfo>
     })
 }
 
+/// Why an archive change was not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveError {
+    /// Not one of the person's conversations, said the same way for an
+    /// unknown id and another person's, so the answer tells neither apart.
+    Refused(String),
+    /// The bridge's database failed; what it said stays on the host.
+    Storage(String),
+}
+
+impl ArchiveError {
+    fn storage(e: rusqlite::Error) -> ArchiveError {
+        ArchiveError::Storage(e.to_string())
+    }
+
+    /// The device's error: a refusal as it is, a storage failure without
+    /// the database's own words, which the host's log keeps instead.
+    fn body(self, of: MessageId) -> enclos_protocol::plugin::ErrorBody {
+        let (code, message) = match self {
+            ArchiveError::Refused(message) => {
+                (enclos_protocol::plugin::ErrorCode::NotAllowed, message)
+            }
+            ArchiveError::Storage(detail) => {
+                eprintln!("enclos app: an archive change failed: {detail}");
+                (
+                    enclos_protocol::plugin::ErrorCode::Unknown,
+                    "The archive state could not be saved. Try again later.".to_owned(),
+                )
+            }
+        };
+        enclos_protocol::plugin::ErrorBody {
+            of: Some(of),
+            code,
+            message,
+        }
+    }
+}
+
 /// Archive is bridge metadata, independent of every runtime's session lifecycle.
 fn archive_conversation(
     hub: &Hub,
@@ -1585,19 +1619,20 @@ fn archive_conversation(
     person: &str,
     id: &str,
     archived: bool,
-) -> Result<ConversationInfo, String> {
+) -> Result<ConversationInfo, ArchiveError> {
+    let refused = || ArchiveError::Refused("no such conversation".to_owned());
     let changed = store
         .set_archived(id, person, archived)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no such conversation".to_owned())?;
+        .map_err(ArchiveError::storage)?
+        .ok_or_else(refused)?;
     if changed {
         hub.deliver_conversation(store, person, id);
     }
     store
         .conversation_info(id)
-        .map_err(|e| e.to_string())?
+        .map_err(ArchiveError::storage)?
         .and_then(|c| conversation_info(store, c))
-        .ok_or_else(|| "no such conversation".to_owned())
+        .ok_or_else(refused)
 }
 
 /// A group's sandbox and its members' handles, in its order; none for a

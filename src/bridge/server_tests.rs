@@ -313,6 +313,36 @@ fn archive_changes_are_owner_only_and_reach_all_of_their_devices() {
 }
 
 #[test]
+fn an_archive_storage_failure_is_not_a_refusal_and_keeps_the_database_words_on_the_host() {
+    let (_dir, hub, store) = diagnostic_approval_hub();
+    let owner = "owner@example.com";
+    store.conversation("c-full", "lab", "main", owner).unwrap();
+    // The next revision overflows: SQLite turns it into a real, which the column refuses.
+    rusqlite::Connection::open(&hub.store_path)
+        .unwrap()
+        .execute(
+            "UPDATE conversations SET revision = ?1 WHERE id = 'c-full'",
+            [i64::MAX],
+        )
+        .unwrap();
+    let error = archive_conversation(&hub, &store, owner, "c-full", true).unwrap_err();
+    assert!(matches!(error, ArchiveError::Storage(_)), "{error:?}");
+    let body = error.body(MessageId::new("a-1").unwrap());
+    assert_eq!(body.code, enclos_protocol::plugin::ErrorCode::Unknown);
+    assert_eq!(body.of.unwrap().as_str(), "a-1");
+    assert!(
+        !body.message.to_lowercase().contains("constraint"),
+        "{}",
+        body.message
+    );
+    let refused = archive_conversation(&hub, &store, owner, "missing", true)
+        .unwrap_err()
+        .body(MessageId::new("a-2").unwrap());
+    assert_eq!(refused.code, enclos_protocol::plugin::ErrorCode::NotAllowed);
+    assert_eq!(refused.message, "no such conversation");
+}
+
+#[test]
 fn delayed_archive_read_and_rename_snapshots_keep_their_revision() {
     let (_dir, hub, first) = diagnostic_approval_hub();
     let second = hub.store().unwrap();
