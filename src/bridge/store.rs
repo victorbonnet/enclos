@@ -164,9 +164,15 @@ fn add_column(
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !columns.iter().any(|c| c == column) {
-        db.execute_batch(&format!(
+        // Another process opening the database at the same moment (`app
+        // serve` and `app pair`) may add it between the look and the change
+        match db.execute_batch(&format!(
             "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
-        ))?;
+        )) {
+            Err(rusqlite::Error::SqliteFailure(_, Some(why)))
+                if why.starts_with("duplicate column name") => {}
+            other => other?,
+        }
     }
     Ok(())
 }
@@ -973,6 +979,30 @@ mod tests {
             lines.last().unwrap().reason.as_deref(),
             Some((LOG_KEPT + 4).to_string().as_str())
         );
+    }
+
+    #[test]
+    fn opening_it_from_two_places_at_once_adds_each_column_once() {
+        for _ in 0..20 {
+            let folder = tempfile::tempdir().unwrap();
+            let path = folder.path().join("app.db");
+            let opens: Vec<_> = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || Store::open(&path).map(|_| ()))
+                })
+                .collect();
+            for open in opens {
+                // "database is locked" is the other way two opens can meet;
+                // it is not this test's
+                match open.join().unwrap() {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::DatabaseBusy => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
     }
 
     #[test]
