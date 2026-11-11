@@ -362,9 +362,10 @@ impl Hub {
         let conversation = ConversationId::new(conversation).map_err(|e| e.to_string())?;
         let person = Person::new(person).map_err(|e| e.to_string())?;
         let mut plugins = self.plugins.lock().expect("not poisoned");
-        let (writer, _) = plugins
+        let writer = &mut plugins
             .get_mut(agent)
-            .ok_or_else(|| format!("{agent}'s app channel closed"))?;
+            .ok_or_else(|| format!("{agent}'s app channel closed"))?
+            .writer;
         writer
             .send_as(
                 sent,

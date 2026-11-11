@@ -8,6 +8,8 @@
 //! - [`plugin`]: the bridge and an agent's channel plugin.
 //! - [`device`], [`noise`], [`pairing`], [`preview`]: the bridge and a
 //!   paired device.
+//! - [`visible`]: text checked for hidden characters before a person
+//!   reads it.
 
 pub mod device;
 mod envelope;

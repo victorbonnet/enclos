@@ -33,18 +33,15 @@ fn hub(dir: &Path, names: &[&str]) -> Arc<Hub> {
             }
         })
         .collect();
-    Arc::new(Hub {
-        transport: Transport::Tailscale,
-        store_path: dir.join("bridge.db"),
-        bridge_private: vec![7; 32],
+    Arc::new(Hub::new(
+        Transport::Tailscale,
+        Arc::new(|_: &str| Err("no transport in this test".to_owned())),
+        dir.join("bridge.db"),
+        vec![7; 32],
         agents,
-        host: Some(ALICE.to_owned()),
-        plugins: Mutex::new(HashMap::new()),
-        commands: Mutex::new(HashMap::new()),
-        groups: Mutex::new(HashMap::new()),
-        stops: Mutex::new(std::collections::HashSet::new()),
-        devices: Mutex::new(HashMap::new()),
-    })
+        Some(ALICE.to_owned()),
+        SILENCE,
+    ))
 }
 
 fn send(out: &mut std::os::unix::net::UnixStream, id: &str, body: FromPlugin) {
@@ -220,7 +217,7 @@ fn a_group_is_two_to_six_known_agents_of_one_sandbox_each_once() {
     hub.devices
         .lock()
         .unwrap()
-        .insert("d-1".into(), (ALICE.into(), alice));
+        .insert("d-1".into(), (ALICE.into(), alice, 1));
     assert_eq!(
         new_group(&hub, &store, ALICE, "g-1", &two, None),
         Ok(Ok(()))

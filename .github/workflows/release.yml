@@ -85,8 +85,9 @@ jobs:
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
           import json, sys
           metadata = json.load(sys.stdin)
-          root = metadata["resolve"]["root"] if metadata["resolve"] else metadata["workspace_members"][0]
-          print(next(package["version"] for package in metadata["packages"] if package["id"] == root))
+          # The enclos package by name: the workspace has other members,
+          # such as enclos-protocol, with versions of their own.
+          print(next(package["version"] for package in metadata["packages"] if package["name"] == "enclos"))
           ')"
           if [[ "$EVENT" == push && "$RELEASE_TAG" != "v$version" ]]; then
             echo "Release tag must match Cargo.toml: expected v$version, got $RELEASE_TAG" >&2
